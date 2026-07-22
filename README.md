@@ -65,7 +65,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Durable local playback history | ✅ Exact accepted local occurrences persist a saturating play count and monotonic last-played timestamp, with live Plays refresh ([contract](docs/playback-history.md)) |
 | Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ Recently Played and Top 25 use deterministic authoritative history, safe untouched-default migration, and live projection refresh ([P1.3](docs/task.md#p13--record-trustworthy-local-playback-history)) |
 | Track ratings | ✅ Exact 1–100 local editing, read-only/unsupported source states, deterministic sorting, live refresh, and smart-playlist rules ([contract](docs/ratings.md)) |
-| Last.fm scrobbling | 🚧 Internal foundation only — bounded protocol/vault storage, a private durable FIFO, a latest-only desktop-authorization owner, frozen generation-owned playback evidence, a GTK-free move-only playback-owner/handoff boundary, registry-instance-bound real-tag external/removable attribution, runtime-owned one-shot now-playing, and a non-recreatable process playback coordinator with production event/terminal/source/output/shutdown ingress are implemented. A sealed headless Active bridge can bind one exact window to one private playback-only runtime capability, create the sole coordinator-minted playback owner, revalidate source policy, and order NowPlaying/Enqueue/Clear admission and retirement. Startup deliberately remains Dormant: no production path starts the Last.fm runtime, claims its playback ingress, issues activation, or wires authorization, settings, and live policy, so no Last.fm work is emitted and the feature remains unavailable to users. Exact local/authenticated-remote profiles, production remote opt-in, consent/browser launch, vault installation and account-transition policy, account/recovery/status UX, localization/accessibility, production credentials/verification, and live final acceptance testing remain ([complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary)) |
+| Last.fm scrobbling | 🚧 Internal foundation only — bounded protocol/vault storage, a private durable FIFO, a latest-only desktop-authorization owner, frozen generation-owned playback evidence, a GTK-free move-only playback-owner/handoff boundary, registry-instance-bound real-tag external/removable attribution, runtime-owned one-shot now-playing, and a non-recreatable process playback coordinator with production event/terminal/source/output/shutdown ingress are implemented. A sealed headless Active bridge can bind one exact window to one private playback-only runtime capability, create the sole coordinator-minted playback owner, revalidate source policy, order ephemeral NowPlaying/Clear work, and supervise admitted Enqueue work through its runtime completion before retirement; only `Inserted`/`AlreadyQueued` proves SQLite durability. Startup deliberately remains Dormant: no production path starts the Last.fm runtime, claims its playback ingress, issues activation, or wires authorization, settings, and live policy, so no Last.fm work is emitted and the feature remains unavailable to users. Exact local/authenticated-remote profiles, production remote opt-in, consent/browser launch, vault installation and account-transition policy, account/recovery/status UX, localization/accessibility, production credentials/verification, and live final acceptance testing remain ([complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary)) |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
 | Linux and macOS file associations | ✅ |
@@ -91,7 +91,8 @@ parsed tags—filenames and a display-only `Unknown` album never substitute. Rem
 asks the live registry to mint the exact current session reference before freezing the occurrence.
 Authenticated remotes remain closed because their exact profiles and production opt-in source set
 do not exist yet. Lock-linearized freshness leaves delayed accepted loads and superseded
-NowPlaying/Clear handoffs inert, while a qualified Enqueue is not retroactively revoked. Issuing a
+NowPlaying/Clear handoffs inert, while a qualified Enqueue is not retroactively revoked and, once
+runtime-admitted, remains owned through its one-shot durable completion. Issuing a
 successor NowPlaying does not discard a predecessor Clear prematurely: source rejection or failed
 runtime admission preserves that Clear, and only successful successor admission retires it.
 
@@ -102,12 +103,17 @@ one-shot playback capability already claimed from a running runtime, use a modul
 construct its sole playback owner, and snapshot the enabled authenticated-remote source set.
 Accepted loads, playback events and discontinuities, source revalidation, and typed retirement then
 produce ordered NowPlaying, Enqueue, and Clear admissions through that restricted runtime
-capability. Activation close, window rebind, owner shutdown, and owner drop first revoke admission,
-drain in-flight operations, retire the occurrence, and share the exact retirement result before a
-successor can become Dormant or Active; owner, gate, closed-runtime, and retirement failures close
-the environment terminally rather than admitting a replacement. The lazy accepted-load metadata
-extractor runs only inside that drain barrier, outside the coordinator mutex, and must remain
-bounded and non-reentrant; a race-losing result is revoked without dispatch.
+capability. Enqueue admission reports asynchronous durability supervision and transfers a bounded
+child drain lease to the one-shot runtime completion task; only `Inserted`/`AlreadyQueued` proves
+SQLite durability, while a late queue, storage, stale-account, or owner-stop result is retained as
+a terminal fixed failure.
+Activation close, window rebind, owner shutdown, and owner drop first revoke admission, drain
+in-flight operations and supervised enqueue completions, retire the occurrence, and share the exact
+retirement result before a successor can become Dormant or Active; owner, gate, closed-runtime,
+late Enqueue-completion, and retirement failures close the environment terminally rather than
+admitting a replacement. The lazy accepted-load metadata extractor runs only inside that drain
+barrier, outside the coordinator mutex, and must remain bounded and non-reentrant; a race-losing
+result is revoked without dispatch.
 
 Production playback already reports output intent before invocation, handles the accepted/rejected
 session result, hands accepted loads to the lazy coordinator boundary, and reports current events,

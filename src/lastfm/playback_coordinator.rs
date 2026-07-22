@@ -10,6 +10,8 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
@@ -18,12 +20,18 @@ use crate::audio::{PlayerEvent, PlayerEventGeneration};
 use crate::source_registry::SourceRegistry;
 
 use super::playback_owner::{
-    LastFmAcceptedOutputLoad, LastFmOutputIntent, LastFmPlaybackHandoff, LastFmPlaybackOwner,
-    LastFmPlaybackOwnerError, LastFmPlaybackOwnerUpdate,
+    LastFmAcceptedOutputLoad, LastFmOutputIntent, LastFmPlaybackHandoff, LastFmPlaybackHandoffKind,
+    LastFmPlaybackOwner, LastFmPlaybackOwnerError, LastFmPlaybackOwnerUpdate,
+    LastFmPlaybackRuntimeOperation,
 };
-use super::runtime::{LastFmPlaybackRuntimeIngress, LastFmRuntimeAdmissionError};
+use super::runtime::{
+    LastFmPlaybackRuntimeIngress, LastFmRuntimeAdmissionError, LastFmRuntimeCommandError,
+};
 
 static PROCESS_OWNER_CLAIMED: AtomicBool = AtomicBool::new(false);
+// The bridge must never retain more enqueue receipts than the runtime's
+// bounded metadata ingress can admit.
+const ENQUEUE_COMPLETION_CAPACITY: usize = 64;
 
 /// Fixed category returned when process ownership has already been consumed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -79,6 +87,8 @@ pub(crate) enum LastFmPlaybackCoordinatorFailure {
     Playback(LastFmPlaybackOwnerError),
     #[error("Last.fm runtime playback ingress rejected an operation")]
     Runtime(LastFmRuntimeAdmissionError),
+    #[error("Last.fm runtime failed to durably accept playback evidence")]
+    RuntimeCommand(LastFmRuntimeCommandError),
 }
 
 /// Content-free disposition of one coordinator operation.
@@ -89,6 +99,8 @@ pub(crate) enum LastFmPlaybackCoordinatorOutcome {
     Dormant,
     /// A state transition was applied.
     Applied,
+    /// A runtime enqueue was admitted for supervised durable completion.
+    PendingDurability,
     /// Exact source authority or opt-in rejected an action at dispatch.
     SourceRejected,
     /// The caller belongs to a superseded window epoch.
@@ -112,6 +124,7 @@ impl LastFmPlaybackCoordinatorOutcome {
                     | LastFmPlaybackCoordinatorFailure::Runtime(
                         LastFmRuntimeAdmissionError::Closed
                     )
+                    | LastFmPlaybackCoordinatorFailure::RuntimeCommand(_)
             )
         )
     }
@@ -150,13 +163,21 @@ enum LastFmPlaybackCoordinatorState {
     Shutdown,
 }
 
+type LastFmEnqueueCompletion =
+    Pin<Box<dyn Future<Output = Result<(), LastFmRuntimeCommandError>> + Send + 'static>>;
+
+enum LastFmPlaybackRuntimeDispatch {
+    Immediate(LastFmPlaybackCoordinatorOutcome),
+    PendingEnqueue(LastFmEnqueueCompletion),
+}
+
 trait LastFmPlaybackRuntimePort: Send + Sync {
     fn dispatch(
         &self,
         handoff: LastFmPlaybackHandoff,
         registry: &SourceRegistry,
         enabled_remote_sources: &HashSet<SourceId>,
-    ) -> LastFmPlaybackCoordinatorOutcome;
+    ) -> LastFmPlaybackRuntimeDispatch;
 }
 
 impl LastFmPlaybackRuntimePort for LastFmPlaybackRuntimeIngress {
@@ -165,30 +186,42 @@ impl LastFmPlaybackRuntimePort for LastFmPlaybackRuntimeIngress {
         handoff: LastFmPlaybackHandoff,
         registry: &SourceRegistry,
         enabled_remote_sources: &HashSet<SourceId>,
-    ) -> LastFmPlaybackCoordinatorOutcome {
+    ) -> LastFmPlaybackRuntimeDispatch {
         match handoff.try_admit(self, registry, enabled_remote_sources) {
-            None => LastFmPlaybackCoordinatorOutcome::SourceRejected,
-            Some(Ok(operation)) => {
-                // Admission is the commit point for this synchronous bridge.
-                // Dropping the result receiver neither cancels nor retracts
-                // work already serialized by the runtime owner.
-                drop(operation);
-                LastFmPlaybackCoordinatorOutcome::Applied
-            }
-            Some(Err(error)) => LastFmPlaybackCoordinatorOutcome::Failed(
-                LastFmPlaybackCoordinatorFailure::Runtime(error),
+            None => LastFmPlaybackRuntimeDispatch::Immediate(
+                LastFmPlaybackCoordinatorOutcome::SourceRejected,
             ),
+            Some(Ok(LastFmPlaybackRuntimeOperation::Enqueue(operation))) => {
+                LastFmPlaybackRuntimeDispatch::PendingEnqueue(Box::pin(async move {
+                    operation.wait().await.map(|_| ())
+                }))
+            }
+            Some(Ok(operation)) => {
+                // Ephemeral NowPlaying/Clear completion does not establish
+                // durable evidence. Runtime status remains its asynchronous
+                // reporting boundary, so synchronous admission is the bridge
+                // commit and its receipt is deliberately released here.
+                drop(operation);
+                LastFmPlaybackRuntimeDispatch::Immediate(LastFmPlaybackCoordinatorOutcome::Applied)
+            }
+            Some(Err(error)) => {
+                LastFmPlaybackRuntimeDispatch::Immediate(LastFmPlaybackCoordinatorOutcome::Failed(
+                    LastFmPlaybackCoordinatorFailure::Runtime(error),
+                ))
+            }
         }
     }
 }
 
 struct LastFmActivePlaybackEnvironment {
-    operation_gate: Mutex<LastFmActivePlaybackGate>,
-    operation_drained: Condvar,
+    operation_gate: Arc<Mutex<LastFmActivePlaybackGate>>,
+    operation_drained: Arc<Condvar>,
     retirement: Mutex<LastFmActivePlaybackRetirement>,
     retirement_completed: Condvar,
     owner: Mutex<LastFmPlaybackOwner>,
     runtime: Box<dyn LastFmPlaybackRuntimePort>,
+    completion_runtime: tokio::runtime::Handle,
+    enqueue_completion_slots: Arc<tokio::sync::Semaphore>,
     registry: SourceRegistry,
     enabled_remote_sources: HashSet<SourceId>,
 }
@@ -207,29 +240,110 @@ enum LastFmActivePlaybackRetirement {
     Complete(LastFmPlaybackCoordinatorOutcome),
 }
 
-struct LastFmActivePlaybackOperation<'a> {
-    environment: &'a LastFmActivePlaybackEnvironment,
+struct LastFmActivePlaybackOperation {
+    operation_gate: Arc<Mutex<LastFmActivePlaybackGate>>,
+    operation_drained: Arc<Condvar>,
+    cancellation_failure: Option<LastFmPlaybackCoordinatorOutcome>,
     completed: bool,
 }
 
-impl LastFmActivePlaybackOperation<'_> {
+impl LastFmActivePlaybackOperation {
+    fn reserve_child(&self) -> Result<Self, LastFmPlaybackCoordinatorOutcome> {
+        let mut gate = match self.operation_gate.lock() {
+            Ok(gate) => gate,
+            Err(poisoned) => {
+                let mut gate = poisoned.into_inner();
+                gate.live = false;
+                gate.poisoned = true;
+                gate.terminal_failure = Some(LastFmPlaybackCoordinatorOutcome::Failed(
+                    LastFmPlaybackCoordinatorFailure::OperationGatePoisoned,
+                ));
+                self.operation_gate.clear_poison();
+                return Err(gate
+                    .terminal_failure
+                    .expect("poisoned operation gate has a fixed failure"));
+            }
+        };
+        if let Some(failure) = gate.terminal_failure {
+            return Err(failure);
+        }
+        if gate.poisoned || gate.in_flight == 0 {
+            gate.live = false;
+            gate.poisoned = true;
+            let failure = LastFmPlaybackCoordinatorOutcome::Failed(
+                LastFmPlaybackCoordinatorFailure::OperationGatePoisoned,
+            );
+            gate.terminal_failure = Some(failure);
+            return Err(failure);
+        }
+        let Some(in_flight) = gate.in_flight.checked_add(1) else {
+            gate.live = false;
+            let failure = LastFmPlaybackCoordinatorOutcome::Failed(
+                LastFmPlaybackCoordinatorFailure::OperationCapacityExhausted,
+            );
+            gate.terminal_failure = Some(failure);
+            return Err(failure);
+        };
+        gate.in_flight = in_flight;
+        drop(gate);
+        Ok(Self {
+            operation_gate: Arc::clone(&self.operation_gate),
+            operation_drained: Arc::clone(&self.operation_drained),
+            cancellation_failure: None,
+            completed: false,
+        })
+    }
+
+    fn arm_owner_stopped(mut self) -> Self {
+        self.cancellation_failure = Some(LastFmPlaybackCoordinatorOutcome::Failed(
+            LastFmPlaybackCoordinatorFailure::RuntimeCommand(
+                LastFmRuntimeCommandError::OwnerStopped,
+            ),
+        ));
+        self
+    }
+
     fn complete(
         mut self,
         outcome: LastFmPlaybackCoordinatorOutcome,
     ) -> LastFmPlaybackCoordinatorOutcome {
-        let outcome = self
-            .environment
-            .finish_operation(Some(outcome))
-            .expect("completed operation always returns an outcome");
+        let outcome = LastFmActivePlaybackEnvironment::finish_operation_gate(
+            &self.operation_gate,
+            &self.operation_drained,
+            Some(outcome),
+        )
+        .expect("completed operation always returns an outcome");
         self.completed = true;
         outcome
     }
+
+    fn complete_without_outcome(mut self) {
+        let _ = LastFmActivePlaybackEnvironment::finish_operation_gate(
+            &self.operation_gate,
+            &self.operation_drained,
+            None,
+        );
+        self.completed = true;
+    }
 }
 
-impl Drop for LastFmActivePlaybackOperation<'_> {
+impl Drop for LastFmActivePlaybackOperation {
     fn drop(&mut self) {
         if !self.completed {
-            let _ = self.environment.finish_operation(None);
+            if let Some(LastFmPlaybackCoordinatorOutcome::Failed(
+                LastFmPlaybackCoordinatorFailure::RuntimeCommand(error),
+            )) = self.cancellation_failure
+            {
+                tracing::error!(
+                    error = %error,
+                    "Last.fm durable enqueue completion supervisor stopped"
+                );
+            }
+            let _ = LastFmActivePlaybackEnvironment::finish_operation_gate(
+                &self.operation_gate,
+                &self.operation_drained,
+                self.cancellation_failure,
+            );
         }
     }
 }
@@ -276,23 +390,28 @@ impl LastFmPlaybackOwnerMint {
 impl LastFmActivePlaybackEnvironment {
     fn new(
         runtime: Box<dyn LastFmPlaybackRuntimePort>,
+        completion_runtime: tokio::runtime::Handle,
         registry: SourceRegistry,
         enabled_remote_sources: HashSet<SourceId>,
     ) -> Self {
         Self {
-            operation_gate: Mutex::new(LastFmActivePlaybackGate {
+            operation_gate: Arc::new(Mutex::new(LastFmActivePlaybackGate {
                 live: true,
                 in_flight: 0,
                 poisoned: false,
                 terminal_failure: None,
-            }),
-            operation_drained: Condvar::new(),
+            })),
+            operation_drained: Arc::new(Condvar::new()),
             retirement: Mutex::new(LastFmActivePlaybackRetirement::Pending),
             retirement_completed: Condvar::new(),
             owner: Mutex::new(LastFmPlaybackOwner::new_for_coordinator(
                 LastFmPlaybackOwnerMint::issue(),
             )),
             runtime,
+            completion_runtime,
+            enqueue_completion_slots: Arc::new(tokio::sync::Semaphore::new(
+                ENQUEUE_COMPLETION_CAPACITY,
+            )),
             registry,
             enabled_remote_sources,
         }
@@ -315,7 +434,7 @@ impl LastFmActivePlaybackEnvironment {
 
     fn begin_operation(
         &self,
-    ) -> Result<LastFmActivePlaybackOperation<'_>, LastFmPlaybackCoordinatorOutcome> {
+    ) -> Result<LastFmActivePlaybackOperation, LastFmPlaybackCoordinatorOutcome> {
         let mut gate = match self.operation_gate.lock() {
             Ok(gate) => gate,
             Err(poisoned) => {
@@ -355,16 +474,19 @@ impl LastFmActivePlaybackEnvironment {
         gate.in_flight = in_flight;
         drop(gate);
         Ok(LastFmActivePlaybackOperation {
-            environment: self,
+            operation_gate: Arc::clone(&self.operation_gate),
+            operation_drained: Arc::clone(&self.operation_drained),
+            cancellation_failure: None,
             completed: false,
         })
     }
 
-    fn finish_operation(
-        &self,
+    fn finish_operation_gate(
+        operation_gate: &Mutex<LastFmActivePlaybackGate>,
+        operation_drained: &Condvar,
         outcome: Option<LastFmPlaybackCoordinatorOutcome>,
     ) -> Option<LastFmPlaybackCoordinatorOutcome> {
-        let mut gate = match self.operation_gate.lock() {
+        let mut gate = match operation_gate.lock() {
             Ok(gate) => gate,
             Err(poisoned) => {
                 let mut gate = poisoned.into_inner();
@@ -373,7 +495,7 @@ impl LastFmActivePlaybackEnvironment {
                 gate.terminal_failure = Some(LastFmPlaybackCoordinatorOutcome::Failed(
                     LastFmPlaybackCoordinatorFailure::OperationGatePoisoned,
                 ));
-                self.operation_gate.clear_poison();
+                operation_gate.clear_poison();
                 gate
             }
         };
@@ -390,13 +512,13 @@ impl LastFmActivePlaybackEnvironment {
                 LastFmPlaybackCoordinatorFailure::OperationGatePoisoned,
             ));
             let outcome = gate.terminal_failure.or(outcome);
-            self.operation_drained.notify_all();
+            operation_drained.notify_all();
             return outcome;
         }
         gate.in_flight -= 1;
         let outcome = gate.terminal_failure.or(outcome);
         if gate.in_flight == 0 {
-            self.operation_drained.notify_all();
+            operation_drained.notify_all();
         }
         outcome
     }
@@ -445,18 +567,103 @@ impl LastFmActivePlaybackEnvironment {
         Ok(owner)
     }
 
-    fn dispatch_handoff(&self, handoff: LastFmPlaybackHandoff) -> LastFmPlaybackCoordinatorOutcome {
-        self.runtime
+    fn dispatch_handoff(
+        &self,
+        handoff: LastFmPlaybackHandoff,
+        parent: &LastFmActivePlaybackOperation,
+    ) -> LastFmPlaybackCoordinatorOutcome {
+        // Reserve the child drain lease before runtime admission. A concurrent
+        // close may revoke new top-level ingress, but work which already owns
+        // its parent lease must never admit an enqueue whose durable receipt
+        // can then escape the retirement barrier.
+        let completion_reservation = if handoff.kind() == LastFmPlaybackHandoffKind::Enqueue {
+            match parent.reserve_child() {
+                Ok(lease) => match Arc::clone(&self.enqueue_completion_slots).try_acquire_owned() {
+                    Ok(slot) => Some((lease, slot)),
+                    Err(_) => {
+                        lease.complete_without_outcome();
+                        drop(handoff);
+                        return LastFmPlaybackCoordinatorOutcome::Failed(
+                            LastFmPlaybackCoordinatorFailure::OperationCapacityExhausted,
+                        );
+                    }
+                },
+                Err(outcome) => {
+                    drop(handoff);
+                    return outcome;
+                }
+            }
+        } else {
+            None
+        };
+        match self
+            .runtime
             .dispatch(handoff, &self.registry, &self.enabled_remote_sources)
+        {
+            LastFmPlaybackRuntimeDispatch::Immediate(outcome) => {
+                if let Some((lease, slot)) = completion_reservation {
+                    lease.complete_without_outcome();
+                    drop(slot);
+                }
+                outcome
+            }
+            LastFmPlaybackRuntimeDispatch::PendingEnqueue(completion) => {
+                let Some((lease, slot)) = completion_reservation else {
+                    drop(completion);
+                    return LastFmPlaybackCoordinatorOutcome::Failed(
+                        LastFmPlaybackCoordinatorFailure::OperationGatePoisoned,
+                    );
+                };
+                let lease = lease.arm_owner_stopped();
+                let task = self.completion_runtime.spawn(async move {
+                    match completion.await {
+                        Ok(()) => lease.complete_without_outcome(),
+                        Err(error) => {
+                            tracing::error!(
+                                error = %error,
+                                "Last.fm durable enqueue completion failed"
+                            );
+                            let _ = lease.complete(LastFmPlaybackCoordinatorOutcome::Failed(
+                                LastFmPlaybackCoordinatorFailure::RuntimeCommand(error),
+                            ));
+                        }
+                    }
+                    drop(slot);
+                });
+                // The owned lease makes cancellation fail closed, while the
+                // detached task remains bounded by runtime enqueue admission.
+                drop(task);
+                LastFmPlaybackCoordinatorOutcome::PendingDurability
+            }
+        }
+    }
+
+    fn dispatch_retirement_handoff(
+        &self,
+        handoff: LastFmPlaybackHandoff,
+    ) -> LastFmPlaybackCoordinatorOutcome {
+        match self
+            .runtime
+            .dispatch(handoff, &self.registry, &self.enabled_remote_sources)
+        {
+            LastFmPlaybackRuntimeDispatch::Immediate(outcome) => outcome,
+            LastFmPlaybackRuntimeDispatch::PendingEnqueue(completion) => {
+                drop(completion);
+                LastFmPlaybackCoordinatorOutcome::Failed(
+                    LastFmPlaybackCoordinatorFailure::OperationGatePoisoned,
+                )
+            }
+        }
     }
 
     fn finish_update(
         &self,
         update: LastFmPlaybackOwnerUpdate,
         base: LastFmPlaybackCoordinatorOutcome,
+        operation: &LastFmActivePlaybackOperation,
     ) -> LastFmPlaybackCoordinatorOutcome {
         let (handoff, owner_error) = update.into_parts();
-        let dispatch = handoff.map(|handoff| self.dispatch_handoff(handoff));
+        let dispatch = handoff.map(|handoff| self.dispatch_handoff(handoff, operation));
         if let Some(outcome) = dispatch.filter(|outcome| outcome.terminal_environment_failure()) {
             return outcome;
         }
@@ -492,12 +699,18 @@ impl LastFmActivePlaybackEnvironment {
             };
             owner.observe_output_intent(intent)
         };
-        operation.complete(self.finish_update(update, LastFmPlaybackCoordinatorOutcome::Applied))
+        let outcome = self.finish_update(
+            update,
+            LastFmPlaybackCoordinatorOutcome::Applied,
+            &operation,
+        );
+        operation.complete(outcome)
     }
 
     fn accept_output_load_admitted(
         &self,
         load: LastFmAcceptedOutputLoad,
+        operation: &LastFmActivePlaybackOperation,
     ) -> LastFmPlaybackCoordinatorOutcome {
         let admission = {
             let mut owner = match self.lock_owner() {
@@ -516,7 +729,7 @@ impl LastFmActivePlaybackEnvironment {
         } else {
             LastFmPlaybackCoordinatorOutcome::SourceRejected
         };
-        self.finish_update(admission.into_update(), base)
+        self.finish_update(admission.into_update(), base, operation)
     }
 
     fn observe_event(&self, event: &PlayerEvent) -> LastFmPlaybackCoordinatorOutcome {
@@ -531,7 +744,12 @@ impl LastFmActivePlaybackEnvironment {
             };
             owner.observe_event(event)
         };
-        operation.complete(self.finish_update(update, LastFmPlaybackCoordinatorOutcome::Applied))
+        let outcome = self.finish_update(
+            update,
+            LastFmPlaybackCoordinatorOutcome::Applied,
+            &operation,
+        );
+        operation.complete(outcome)
     }
 
     fn observe_discontinuity(
@@ -565,7 +783,12 @@ impl LastFmActivePlaybackEnvironment {
             };
             owner.revalidate_active_source(&self.registry, &self.enabled_remote_sources)
         };
-        operation.complete(self.finish_update(update, LastFmPlaybackCoordinatorOutcome::Applied))
+        let outcome = self.finish_update(
+            update,
+            LastFmPlaybackCoordinatorOutcome::Applied,
+            &operation,
+        );
+        operation.complete(outcome)
     }
 
     fn retire(&self) -> LastFmPlaybackCoordinatorOutcome {
@@ -581,7 +804,7 @@ impl LastFmActivePlaybackEnvironment {
             owner.retire()
         };
         let outcome = handoff.map_or(LastFmPlaybackCoordinatorOutcome::Applied, |handoff| {
-            self.dispatch_handoff(handoff)
+            self.dispatch_retirement_handoff(handoff)
         });
         operation.complete(outcome)
     }
@@ -678,7 +901,7 @@ impl LastFmActivePlaybackEnvironment {
             }
         };
         let dispatch = handoff.map_or(LastFmPlaybackCoordinatorOutcome::Applied, |handoff| {
-            self.dispatch_handoff(handoff)
+            self.dispatch_retirement_handoff(handoff)
         });
         let outcome = if let Some(failure) = gate_failure {
             failure
@@ -1272,22 +1495,32 @@ impl LastFmPlaybackCoordinatorBinding {
 
     /// Activate the sealed headless bridge with playback-only runtime
     /// authority which has already been claimed from a successfully started
-    /// Last.fm runtime. No production caller issues this activation yet.
+    /// Last.fm runtime. The supplied executor must remain independently
+    /// driven while GTK callers synchronously wait in close, rebind, or
+    /// shutdown; those waits must never run on its only worker. No production
+    /// caller issues this activation yet.
     pub(crate) fn activate(
         &self,
         runtime: LastFmPlaybackRuntimeIngress,
+        completion_runtime: tokio::runtime::Handle,
         enabled_remote_sources: HashSet<SourceId>,
     ) -> Result<LastFmPlaybackCoordinatorActivation, LastFmPlaybackCoordinatorActivationError> {
-        self.activate_with_runtime_port(Box::new(runtime), enabled_remote_sources)
+        self.activate_with_runtime_port(
+            Box::new(runtime),
+            completion_runtime,
+            enabled_remote_sources,
+        )
     }
 
     fn activate_with_runtime_port(
         &self,
         runtime: Box<dyn LastFmPlaybackRuntimePort>,
+        completion_runtime: tokio::runtime::Handle,
         enabled_remote_sources: HashSet<SourceId>,
     ) -> Result<LastFmPlaybackCoordinatorActivation, LastFmPlaybackCoordinatorActivationError> {
         let environment = Arc::new(LastFmActivePlaybackEnvironment::new(
             runtime,
+            completion_runtime,
             self.source_registry.clone(),
             enabled_remote_sources,
         ));
@@ -1413,7 +1646,7 @@ impl LastFmPlaybackCoordinatorBinding {
             let outcome = operation.complete(recheck);
             return self.finish_environment_outcome(&environment, outcome);
         }
-        let outcome = environment.accept_output_load_admitted(load);
+        let outcome = environment.accept_output_load_admitted(load, &operation);
         let outcome = operation.complete(outcome);
         self.finish_environment_outcome(&environment, outcome)
     }
@@ -1521,7 +1754,7 @@ mod tests {
     use std::fs::File;
     use std::future::pending;
     use std::panic::{catch_unwind, AssertUnwindSafe};
-    use std::sync::mpsc;
+    use std::sync::{mpsc, OnceLock};
     use std::thread;
     use std::time::Duration;
 
@@ -1618,7 +1851,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingRuntimePort {
         calls: Arc<Mutex<Vec<LastFmPlaybackHandoffKind>>>,
-        scripted: Arc<Mutex<VecDeque<LastFmPlaybackCoordinatorOutcome>>>,
+        scripted: Arc<Mutex<VecDeque<LastFmPlaybackRuntimeDispatch>>>,
+        rejected_kind: Arc<Mutex<Option<LastFmPlaybackHandoffKind>>>,
         lock_probe: Arc<Mutex<Option<LockProbe>>>,
         dispatch_barrier: Arc<(Mutex<DispatchBarrier>, Condvar)>,
     }
@@ -1639,7 +1873,28 @@ mod tests {
             self.scripted
                 .lock()
                 .expect("lock scripted outcomes")
-                .push_back(outcome);
+                .push_back(LastFmPlaybackRuntimeDispatch::Immediate(outcome));
+        }
+
+        fn script_pending_enqueue(
+            &self,
+        ) -> tokio::sync::oneshot::Sender<Result<(), LastFmRuntimeCommandError>> {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            self.scripted
+                .lock()
+                .expect("lock scripted outcomes")
+                .push_back(LastFmPlaybackRuntimeDispatch::PendingEnqueue(Box::pin(
+                    async move {
+                        receiver
+                            .await
+                            .unwrap_or(Err(LastFmRuntimeCommandError::OwnerStopped))
+                    },
+                )));
+            sender
+        }
+
+        fn reject_next(&self, kind: LastFmPlaybackHandoffKind) {
+            *self.rejected_kind.lock().expect("lock scripted rejection") = Some(kind);
         }
 
         fn set_lock_probe(&self, probe: LockProbe) {
@@ -1685,7 +1940,23 @@ mod tests {
             handoff: LastFmPlaybackHandoff,
             registry: &SourceRegistry,
             enabled_remote_sources: &HashSet<SourceId>,
-        ) -> LastFmPlaybackCoordinatorOutcome {
+        ) -> LastFmPlaybackRuntimeDispatch {
+            let kind = handoff.kind();
+            let rejected = {
+                let mut rejected_kind = self.rejected_kind.lock().expect("lock scripted rejection");
+                if *rejected_kind == Some(kind) {
+                    rejected_kind.take();
+                    true
+                } else {
+                    false
+                }
+            };
+            if rejected {
+                drop(handoff);
+                return LastFmPlaybackRuntimeDispatch::Immediate(
+                    LastFmPlaybackCoordinatorOutcome::SourceRejected,
+                );
+            }
             let admitted = handoff.try_admit_with_callbacks_for_test(
                 registry,
                 enabled_remote_sources,
@@ -1694,7 +1965,9 @@ mod tests {
                 || LastFmPlaybackHandoffKind::ClearNowPlaying,
             );
             let Some(kind) = admitted else {
-                return LastFmPlaybackCoordinatorOutcome::SourceRejected;
+                return LastFmPlaybackRuntimeDispatch::Immediate(
+                    LastFmPlaybackCoordinatorOutcome::SourceRejected,
+                );
             };
             self.calls.lock().expect("lock recorded calls").push(kind);
             let probe = self.lock_probe.lock().expect("lock probe").clone();
@@ -1716,7 +1989,9 @@ mod tests {
                 .lock()
                 .expect("lock scripted outcomes")
                 .pop_front()
-                .unwrap_or(LastFmPlaybackCoordinatorOutcome::Applied)
+                .unwrap_or(LastFmPlaybackRuntimeDispatch::Immediate(
+                    LastFmPlaybackCoordinatorOutcome::Applied,
+                ))
         }
     }
 
@@ -1727,6 +2002,20 @@ mod tests {
             .expect("build coordinator test runtime");
         let registry = SourceRegistry::new(runtime.handle().clone());
         (runtime, registry)
+    }
+
+    fn test_completion_runtime() -> tokio::runtime::Handle {
+        static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        RUNTIME
+            .get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .expect("build coordinator completion runtime")
+            })
+            .handle()
+            .clone()
     }
 
     fn accepted_local_load(
@@ -1883,8 +2172,35 @@ mod tests {
         enabled_remote_sources: HashSet<SourceId>,
     ) -> LastFmPlaybackCoordinatorActivation {
         binding
-            .activate_with_runtime_port(Box::new(port.clone()), enabled_remote_sources)
+            .activate_with_runtime_port(
+                Box::new(port.clone()),
+                test_completion_runtime(),
+                enabled_remote_sources,
+            )
             .expect("activate test playback bridge")
+    }
+
+    fn prime_local_scrobble(
+        binding: &LastFmPlaybackCoordinatorBinding,
+        generation: PlayerEventGeneration,
+        track_id: &str,
+    ) {
+        assert_eq!(
+            binding.accept_output_load_lazy(
+                generation,
+                || Some(accepted_local_load(generation, track_id)),
+                || panic!("active bridge must not discard"),
+            ),
+            LastFmPlaybackCoordinatorOutcome::Applied
+        );
+        assert_eq!(
+            binding.observe_event(&PlayerEvent::state(generation, PlayerState::Playing)),
+            LastFmPlaybackCoordinatorOutcome::Applied
+        );
+        assert_eq!(
+            binding.observe_event(&PlayerEvent::position(generation, 1_000, 100_000)),
+            LastFmPlaybackCoordinatorOutcome::Applied
+        );
     }
 
     #[test]
@@ -2040,6 +2356,7 @@ mod tests {
         assert!(matches!(
             binding.activate_with_runtime_port(
                 Box::new(RecordingRuntimePort::default()),
+                test_completion_runtime(),
                 HashSet::new(),
             ),
             Err(LastFmPlaybackCoordinatorActivationError::AlreadyActive)
@@ -2061,7 +2378,11 @@ mod tests {
         drop(successor);
         let current = owner.bind_window(registry).expect("rebind window");
         assert!(matches!(
-            binding.activate_with_runtime_port(Box::new(port.clone()), HashSet::new()),
+            binding.activate_with_runtime_port(
+                Box::new(port.clone()),
+                test_completion_runtime(),
+                HashSet::new(),
+            ),
             Err(LastFmPlaybackCoordinatorActivationError::StaleWindow)
         ));
         assert_eq!(
@@ -2361,6 +2682,197 @@ mod tests {
                 LastFmPlaybackHandoffKind::NowPlaying,
                 LastFmPlaybackHandoffKind::ClearNowPlaying,
             ]
+        );
+    }
+
+    #[test]
+    fn pending_enqueue_blocks_rebind_until_durable_success_before_successor_activation() {
+        let (_runtime, registry) = registry();
+        let mut owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
+        let binding = owner
+            .bind_window(registry.clone())
+            .expect("bind predecessor window");
+        let port = RecordingRuntimePort::default();
+        let activation = activate_for_test(&binding, &port, HashSet::new());
+        let generation = PlayerEventGeneration::from_raw(47);
+        prime_local_scrobble(&binding, generation, "pending-success-private");
+        let completion = port.script_pending_enqueue();
+        assert_eq!(
+            binding.observe_event(&PlayerEvent::position(generation, 51_000, 100_000)),
+            LastFmPlaybackCoordinatorOutcome::PendingDurability
+        );
+
+        let core = Arc::clone(&binding.core);
+        let (finished, completion_observed) = mpsc::channel();
+        let rebinder = thread::spawn(move || {
+            let result = owner.bind_window(registry);
+            finished.send(()).expect("report completed rebind");
+            (owner, result)
+        });
+        loop {
+            if matches!(
+                &*core.state.lock().expect("inspect retiring state"),
+                LastFmPlaybackCoordinatorState::Retiring { .. }
+            ) {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert_eq!(
+            completion_observed.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "successor window must remain unavailable before durable completion"
+        );
+
+        completion
+            .send(Ok(()))
+            .expect("complete durable enqueue successfully");
+        completion_observed
+            .recv_timeout(Duration::from_secs(2))
+            .expect("rebind completes after durable receipt");
+        let (mut owner, successor) = rebinder.join().expect("join rebind");
+        let successor = successor.expect("bind successor after durable completion");
+        let successor_activation = activate_for_test(&successor, &port, HashSet::new());
+        drop(activation);
+        assert_eq!(
+            successor.revalidate_active_authority(),
+            LastFmPlaybackCoordinatorOutcome::Applied
+        );
+        assert_eq!(
+            successor_activation.close(),
+            LastFmPlaybackCoordinatorOutcome::Applied
+        );
+        assert_eq!(owner.shutdown(), LastFmPlaybackCoordinatorOutcome::Applied);
+        assert_eq!(
+            port.calls(),
+            vec![
+                LastFmPlaybackHandoffKind::NowPlaying,
+                LastFmPlaybackHandoffKind::Enqueue,
+                LastFmPlaybackHandoffKind::ClearNowPlaying,
+            ]
+        );
+    }
+
+    #[test]
+    fn delayed_enqueue_failure_is_sticky_and_fails_waiting_close() {
+        for error in [
+            LastFmRuntimeCommandError::QueueFull,
+            LastFmRuntimeCommandError::Queue,
+            LastFmRuntimeCommandError::StaleAccount,
+            LastFmRuntimeCommandError::OwnerStopped,
+        ] {
+            let (_runtime, registry) = registry();
+            let mut owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
+            let binding = owner.bind_window(registry).expect("bind window");
+            let port = RecordingRuntimePort::default();
+            let activation = activate_for_test(&binding, &port, HashSet::new());
+            let generation = PlayerEventGeneration::from_raw(48);
+            prime_local_scrobble(&binding, generation, "pending-failure-private");
+            let completion = port.script_pending_enqueue();
+            assert_eq!(
+                binding.observe_event(&PlayerEvent::position(generation, 51_000, 100_000)),
+                LastFmPlaybackCoordinatorOutcome::PendingDurability
+            );
+            completion
+                .send(Err(error))
+                .expect("complete durable enqueue with fixed failure");
+
+            let failure = LastFmPlaybackCoordinatorOutcome::Failed(
+                LastFmPlaybackCoordinatorFailure::RuntimeCommand(error),
+            );
+            assert_eq!(activation.close(), failure);
+            assert_eq!(
+                binding.revalidate_active_authority(),
+                LastFmPlaybackCoordinatorOutcome::Shutdown
+            );
+            assert!(matches!(
+                owner.bind_window(binding.source_registry.clone()),
+                Err(LastFmPlaybackCoordinatorBindError::Shutdown)
+            ));
+        }
+    }
+
+    #[test]
+    fn rejected_enqueue_admission_releases_neutral_completion_reservation() {
+        let (_runtime, registry) = registry();
+        let mut owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
+        let binding = owner.bind_window(registry).expect("bind window");
+        let port = RecordingRuntimePort::default();
+        let activation = activate_for_test(&binding, &port, HashSet::new());
+        let generation = PlayerEventGeneration::from_raw(49);
+        prime_local_scrobble(&binding, generation, "rejected-enqueue-private");
+        let rejection = LastFmPlaybackCoordinatorOutcome::Failed(
+            LastFmPlaybackCoordinatorFailure::Runtime(LastFmRuntimeAdmissionError::Busy),
+        );
+        port.script(rejection);
+        assert_eq!(
+            binding.observe_event(&PlayerEvent::position(generation, 51_000, 100_000)),
+            rejection
+        );
+        assert_eq!(
+            activation.close(),
+            LastFmPlaybackCoordinatorOutcome::Applied,
+            "retirement must not wait on a receipt which runtime never admitted"
+        );
+    }
+
+    #[test]
+    fn source_rejected_enqueue_releases_neutral_completion_reservation() {
+        let (_runtime, registry) = registry();
+        let mut owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
+        let binding = owner.bind_window(registry).expect("bind window");
+        let port = RecordingRuntimePort::default();
+        let activation = activate_for_test(&binding, &port, HashSet::new());
+        let generation = PlayerEventGeneration::from_raw(50);
+        prime_local_scrobble(&binding, generation, "source-rejected-private");
+        port.reject_next(LastFmPlaybackHandoffKind::Enqueue);
+        assert_eq!(
+            binding.observe_event(&PlayerEvent::position(generation, 51_000, 100_000)),
+            LastFmPlaybackCoordinatorOutcome::SourceRejected
+        );
+        assert_eq!(
+            activation.close(),
+            LastFmPlaybackCoordinatorOutcome::Applied,
+            "source rejection must not leave a phantom durable receipt"
+        );
+    }
+
+    #[test]
+    fn cancelled_enqueue_supervisor_latches_owner_stopped_via_raii() {
+        let (_runtime, registry) = registry();
+        let completion_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build cancellable completion runtime");
+        let mut owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
+        let binding = owner.bind_window(registry).expect("bind window");
+        let port = RecordingRuntimePort::default();
+        let activation = binding
+            .activate_with_runtime_port(
+                Box::new(port.clone()),
+                completion_runtime.handle().clone(),
+                HashSet::new(),
+            )
+            .expect("activate with cancellable completion runtime");
+        let generation = PlayerEventGeneration::from_raw(51);
+        prime_local_scrobble(&binding, generation, "cancelled-receipt-private");
+        let _completion = port.script_pending_enqueue();
+        assert_eq!(
+            binding.observe_event(&PlayerEvent::position(generation, 51_000, 100_000)),
+            LastFmPlaybackCoordinatorOutcome::PendingDurability
+        );
+
+        drop(completion_runtime);
+        let failure = LastFmPlaybackCoordinatorOutcome::Failed(
+            LastFmPlaybackCoordinatorFailure::RuntimeCommand(
+                LastFmRuntimeCommandError::OwnerStopped,
+            ),
+        );
+        assert_eq!(activation.close(), failure);
+        assert_eq!(
+            binding.revalidate_active_authority(),
+            LastFmPlaybackCoordinatorOutcome::Shutdown
         );
     }
 
@@ -2873,7 +3385,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_runtime_ingress_persists_coordinator_enqueue() {
         let database = Database::connect("sqlite::memory:")
             .await
@@ -2911,7 +3423,7 @@ mod tests {
             .bind_window(source_registry.clone())
             .expect("bind coordinator window");
         let activation = binding
-            .activate(ingress, HashSet::new())
+            .activate(ingress, tokio::runtime::Handle::current(), HashSet::new())
             .expect("activate with genuine claimed runtime ingress");
         let generation = PlayerEventGeneration::from_raw(80);
         assert_eq!(
@@ -2932,7 +3444,7 @@ mod tests {
         );
         assert_eq!(
             binding.observe_event(&PlayerEvent::position(generation, 51_000, 100_000)),
-            LastFmPlaybackCoordinatorOutcome::Applied
+            LastFmPlaybackCoordinatorOutcome::PendingDurability
         );
 
         tokio::time::timeout(Duration::from_secs(2), async {

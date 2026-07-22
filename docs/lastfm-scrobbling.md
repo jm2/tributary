@@ -83,7 +83,8 @@ The implemented internal foundation includes:
   makes a delayed accepted load inert after a successor wins. A Clear owed for a published
   predecessor survives a source-rejected or runtime-Busy successor NowPlaying and is cancelled only
   once the successor crosses runtime admission successfully; older NowPlaying and consumed Clear
-  handoffs are inert, while qualified Enqueue is deliberately not retroactively revoked. An
+  handoffs are inert, while a qualified Enqueue is deliberately not retroactively revoked and,
+  after runtime admission, remains owned until its one-shot durable result settles. An
   ineligible or policy-rejected
   accepted replacement terminally retires its predecessor and emits at most one explicit clear.
   A separate move-only intent closes predecessor delivery before output invocation. The exact same
@@ -115,14 +116,20 @@ The implemented internal foundation includes:
   and is rechecked before owner mutation. Its builder is contractually bounded and must not
   synchronously re-enter activation close, owner rebind/shutdown, or another API waiting for the
   same operation drain. Owner mutation precedes registry-locked source-policy admission and bounded
-  runtime handoff while the operation remains admitted;
+  runtime handoff while the operation remains admitted. Before an Enqueue can enter the runtime, its
+  parent operation reserves one of 64 supervisor slots and a child drain lease. Synchronous ingress
+  reports `PendingDurability`; the child remains armed until the runtime Enqueue completion settles,
+  only `Inserted`/`AlreadyQueued` proves SQLite durability, and task cancellation maps to owner-stop
+  rather than silently releasing it;
 - lifecycle retirement for that Active bridge. Close, rebind, and shutdown first revoke new
-  admission, wait for every admitted operation, retire the owner and dispatch any required Clear,
-  then observe the same immutable retirement result. No successor activation/window is exposed
-  before that result. Owner/operation/retirement/coordinator poison and closed runtime admission
-  fail terminally rather than allowing a successor after an unproven retirement. Focused tests
-  cover exact activation scoping, lazy-builder retirement, in-flight dispatch, shared concurrent
-  close/rebind/shutdown success and failure, Clear-before-successor ordering, and poison paths;
+  admission, wait for every admitted operation and supervised enqueue receipt, retire the owner and
+  dispatch any required Clear, then observe the same immutable retirement result. No successor
+  activation/window is exposed before that result. A late queue, storage, stale-account, owner-stop,
+  or supervisor-cancellation result is retained as a sticky terminal failure. Owner/operation/
+  retirement/coordinator poison and closed runtime admission likewise fail terminally rather than
+  allowing a successor after an unproven retirement. Focused tests cover exact activation scoping,
+  lazy-builder retirement, in-flight dispatch, delayed enqueue success/failure, shared concurrent
+  close/rebind/shutdown results, Clear-before-successor ordering, and poison paths;
 - a serialized actor with bounded admission for 64 ordinary metadata commands and four reserved
   control slots: one delivery result, two lifecycle markers, and one explicit now-playing clear.
   Delivery, lifecycle, and playback retirement therefore cannot be starved by the ordinary FIFO;
@@ -190,10 +197,11 @@ coordinator is Dormant; the countable P2.1 record stays open at **14/38 (36.8%)*
 layers land.
 
 The current headless-runtime-bridge slice includes focused capability, activation-epoch,
-lazy-builder, real-runtime durable-enqueue, exact-managed-source revocation, dispatch-order,
-source/runtime-rejection, operation-drain, shared-retirement, close/rebind/shutdown, and poison
-regressions. Locked debug and release suites each pass 20 library, 1,672 application, and 14
-repository-metadata tests (1,706 total). Strict Clippy passes in debug, release, and the fuzz
+lazy-builder, real-runtime durable-enqueue, supervised delayed-enqueue completion/failure,
+exact-managed-source revocation, dispatch-order, source/runtime-rejection, operation-drain,
+shared-retirement, close/rebind/shutdown, and poison regressions. Locked debug and release suites
+each pass 20 library, 1,677 application, and 14
+repository-metadata tests (1,711 total). Strict Clippy passes in debug, release, and the fuzz
 workspace; the declared Rust 1.92 locked all-target check, formatting, and diff checks are clean;
 and the dependency audit is green apart from the two documented allowed unmaintained warnings.
 
@@ -631,9 +639,12 @@ The implementation is complete only when all of the following are covered:
   source retirement, and one-shot now-playing/scrobble latches;
 - one-winner playback-ingress claim and permanent consumption; exact window/activation scoping;
   bounded non-reentrant lazy metadata construction; owner-before-source-before-runtime ordering;
-  operation drain; immutable shared close/rebind/shutdown retirement success or failure; terminal
-  owner/gate/coordinator poison and closed-runtime behavior; predecessor Clear retention across
-  source rejection or runtime Busy and cancellation only after successful successor admission;
+  operation drain; bounded enqueue-completion reservation before runtime admission; pending versus
+  durable enqueue disposition; delayed SQLite success, queue/storage/stale-account/owner-stop and
+  supervisor-cancellation results; immutable shared close/rebind/shutdown retirement success or
+  failure; terminal owner/gate/coordinator poison and closed-runtime behavior; predecessor Clear
+  retention across source rejection or runtime Busy and cancellation only after successful
+  successor admission;
 - exact half-duration ceiling and four-minute cap edges based only on accumulated forward evidence;
 - atomic admission-before-network, exact 10,000-row contention at the transaction boundary,
   fail-visible refusal without eviction, FIFO ordering, 50-item batch boundaries, and account

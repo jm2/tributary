@@ -24,9 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   epoch-bound boundary with output intent, lazy accepted-load handoff, events, discontinuities,
   source-revalidation points, terminal causes, committed output replacement, and shutdown. A
   sealed headless Active bridge now exists: it can consume a running runtime's one-shot
-  playback-only ingress, mint the coordinator's sole playback owner, and synchronously carry
-  accepted playback through source admission into ordered NowPlaying, Enqueue, and Clear runtime
-  commands. Exact real-tag external/removable proofs can reach that bridge, but startup remains
+  playback-only ingress, mint the coordinator's sole playback owner, synchronously carry accepted
+  playback through source admission into ordered NowPlaying and Clear runtime commands, and retain
+  each admitted Enqueue through its one-shot runtime completion; only `Inserted`/`AlreadyQueued`
+  proves SQLite durability. Exact real-tag external/removable proofs can reach that bridge, but
+  startup remains
   Dormant and revokes them through a metadata-free discard closure. No production path starts the
   Last.fm runtime, claims playback ingress, issues activation, constructs the authorization owner,
   or supplies settings and live source policy, so the feature emits no Last.fm work and remains
@@ -121,13 +123,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     state can now bind the exact current window to one already-claimed playback runtime ingress and
     one immutable remote-source opt-in snapshot. A module-private mint creates the sole playback
     owner; accepted loads, events, discontinuities, source revalidation, and typed retirement drive
-    exact source admission and ordered NowPlaying, Enqueue, and Clear dispatch. The accepted-load
+    exact source admission and ordered NowPlaying, Enqueue, and Clear dispatch. Enqueue admission
+    returns a distinct pending-durability disposition and transfers a bounded child operation lease
+    to its completion task; only SQLite `Inserted`/`AlreadyQueued` completion settles successfully,
+    while a late queue, storage, stale-account, owner-stop, or cancelled-supervisor result becomes a
+    sticky terminal failure. The accepted-load
     extractor is lazy, runs outside the coordinator mutex but inside the activation drain barrier,
     and has an explicit bounded, non-reentrant contract; stale activation results are revoked
-    without dispatch. Close, rebind, shutdown, and drop revoke admission, drain in-flight work, and
-    publish one shared retirement result before a successor can activate. Fatal owner/gate/runtime
-    failures and failed retirement fail closed terminally instead of exposing a replacement
-    environment. The production application nevertheless issues no activation: startup remains
+    without dispatch. Close, rebind, shutdown, and drop revoke admission, drain in-flight work and
+    every supervised enqueue receipt, and publish one shared retirement result before a successor
+    can activate. Fatal owner/gate failures, delayed Enqueue-completion failures, and failed
+    retirement fail closed terminally instead of exposing a replacement environment. The
+    production application nevertheless issues no activation: startup remains
     Dormant with no playback owner, Last.fm runtime, transport, vault, credentials, or policy. Its
     accepted authority is consumed and revoked exactly once through a separate content-free discard
     closure in Dormant, stale-window, and shutdown states, so external/removable metadata and action
