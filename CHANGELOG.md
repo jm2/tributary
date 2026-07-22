@@ -8,16 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Last.fm now has a fail-closed protocol, credential-vault, durable-queue, and delivery/lifecycle
-  runtime foundation**
+- **Last.fm now has a fail-closed protocol, credential-vault, durable-queue, playback-evidence, and
+  delivery/lifecycle runtime foundation**
   ([#50](https://github.com/jm2/tributary/issues/50),
   [#151](https://github.com/jm2/tributary/pull/151),
-  [runtime/lifecycle slice](https://github.com/jm2/tributary/pull/153)). This
-  is an internal foundation, not yet a user-visible scrobbling feature, and the runtime is
-  deliberately not connected to application startup. Playback evidence and now-playing, the
-  desktop authorization flow, explicit consent and per-source policy, settings/status UI,
-  localization and accessibility, application startup/shutdown wiring, and production package
-  credentials remain follow-on work; the
+  [runtime/lifecycle slice](https://github.com/jm2/tributary/pull/153),
+  [playback/now-playing slice](https://github.com/jm2/tributary/pull/154)).
+  This is an internal foundation, not yet a user-visible scrobbling feature. The standalone
+  playback observer and runtime-owned now-playing lane are deliberately not connected to
+  production playback or application startup. The desktop authorization flow, explicit consent
+  and exact per-source/session policy, settings/status UI, localization and accessibility,
+  application startup/shutdown wiring, and production package credentials remain follow-on work;
+  the
   [complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary) also tracks
   activation/unavailable-state issuance, structured source-owner conversion, account replacement
   and recovery, package verification/API registration, and the remaining acceptance matrix.
@@ -38,6 +40,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     construction is retryable per operation rather than process-poisoning after a transient vault
     failure, and the Flatpak permission policy narrowly allows only
     `org.freedesktop.secrets` in addition to its existing reviewed grants.
+  - **Frozen generation-owned playback evidence:** a GTK-, policy-, credential-, and network-free
+    state machine validates and freezes only structured artist/title, optional album/album artist,
+    optional positive track number, and known duration greater than 30 seconds. Each eligible
+    occurrence mints a distinct opaque RFC 4122 v4 UUID, is deliberately uncloneable, attaches only
+    an accepted output generation, and captures one bounded UTC whole-second start exactly when the
+    first current-generation `Playing` state or accepted no-credit position proof establishes
+    playback. Initial and post-discontinuity samples only anchor; strictly observed forward deltas
+    alone count toward `min(ceil(duration_ms / 2), 240,000 ms)`. Pause, buffering, seek, Previous
+    restart, retry, duplicate/regressed/stale events, wall time, and natural end cannot manufacture
+    credit. A retry retains the same occurrence, credit, timestamp, and closed latches while
+    re-anchoring its new accepted generation; Stop, EOS, queue/source retirement, output-target
+    replacement, and application shutdown terminate it. Now-playing and scrobble actions each
+    consume one latch before handoff, and metadata, exact duration/start, occurrence identity, and
+    generation remain absent from diagnostics.
   - **Private offline FIFO and durable delivery gate:** migration 17 creates and revalidates a
     constrained queue containing
     only bounded submission metadata, opaque occurrence/order identity, one-way account binding,
@@ -59,12 +75,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     atomically replaces the emptied queue and any delivery pause with a cleanup tombstone, then
     clears it only after exact vault deletion; missing/corrupt-vault recovery separately purges both
     tables transactionally. Downgrade is refused while either private rows or a pause marker remain.
-  - **Single-flight durable delivery:** one cancellable worker reads the exact oldest due FIFO prefix
-    of at most 50 rows, defensively converts it to one ordered protocol batch, performs one bounded
-    request, and then waits for the serialized owner to acknowledge the exact durable mutation
-    before it can inspect another row. Only timeouts, transport failures, service-unavailable, and
-    rate-limit outcomes—including provider codes 8/11/16/29—reschedule the complete receipt, with
-    deterministic exponential delays from 30 seconds through a one-hour cap. Valid
+  - **Single-flight durable delivery:** one cancellable worker reads the exact oldest due FIFO
+    prefix of at most 50 rows, defensively converts it to one ordered protocol batch, performs one
+    bounded request, and then waits for the serialized owner to acknowledge the exact durable
+    mutation before it can inspect another row. Only timeouts, transport failures,
+    service-unavailable, and rate-limit outcomes—including provider codes 8/11/16/29—reschedule
+    the complete receipt, with deterministic exponential delays from 30 seconds through a one-hour
+    cap. Valid
     accepted/ignored results and recognized terminal service rejections settle the exact receipt;
     ordinary HTTP status failures, oversized bodies, malformed or cardinality-incoherent responses,
     invalid stored data, and local capability failures retain the queue and pause or quarantine
@@ -72,8 +89,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Bounded serialized runtime:** during an active runtime, its lifecycle-owned actor is the sole
     SQLite and credential-vault mutator. Explicit missing/corrupt-vault recovery is the only
     separate mutating path and holds the same process-global lease. The actor's bounded metadata
-    FIFO reserves three slots for delivery and lifecycle control,
-    including a delivery result followed by disconnect and shutdown, while one ingress gate
+    FIFO reserves four slots for control: one delivery result, two lifecycle markers, and one
+    explicit now-playing clear. This preserves delivery-result/disconnect/shutdown ordering while
+    a full 64-command ordinary metadata backlog still cannot starve playback retirement. One
+    ingress gate
     linearizes admission against every lifecycle transition. Playback-facing input is deliberately
     unbound: only the runtime ingress gate can attach the vault-derived account binding. Startup
     additionally requires an opaque capability intended for a future consent/build-enablement
@@ -81,6 +100,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     reject stale events; watched phase, pending count, fixed failure category, and saturating
     non-persistent accepted/ignored/rejected counters update only after the matching durable
     mutation.
+  - **Runtime-owned one-shot now-playing:** playback submits one validated, uncloneable,
+    account-independent `LastFmNowPlaying`; the ingress gate attaches the exact current account and
+    epoch without exposing the vault session. A monotonic latest-only generation synchronously
+    cancels its predecessor before the successor crosses the bounded FIFO. Stop or an ineligible
+    successor uses the separately reserved clear command, which advances ingress ownership and
+    cancels under the ingress lock, then makes the actor join the predecessor before acknowledging
+    the clear in FIFO order. Now-playing is
+    never persisted or retried. Accepted, ignored, rejected, transient-unavailable, incompatible,
+    and capability-unavailable results are fixed content-free outcomes and do not settle, pause,
+    or otherwise disturb durable scrobble delivery. Only provider code 9 may claim the exact
+    current now-playing generation/account/epoch, atomically commit the durable reauthorization
+    pause, and then retire delivery; a stale result or failed claim mutates nothing. Normal
+    supersession, clear, disconnect, reauthorization, and shutdown paths, plus supervised owner
+    failure and caught actor panic, cancel and join the task before releasing account or vault
+    authority. A hard external abort of the owner cannot claim joined quiescence: its drain barrier
+    becomes `Failed`. Owner drop still cancels the child before releasing the primary lease share,
+    while the request future retains its own shared vault-lifecycle lease until transport state is
+    actually dropped; a successor therefore cannot overlap the abandoned request.
   - **Exhaustive reauthorization and replay policy:** Last.fm code 9 cancels network delivery but
     keeps FIFO admission available and retains every queued row. Exactly one live reauthorization
     may be pending; it must name the same account, replace that exact account's vault session while
@@ -101,9 +138,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     cleanup-only across restart; an already-absent vault may close only the matching tombstone, and
     a different stored account is never deletion authority. Normal shutdown closes admission,
     cancels delivery, drains the serialized owner, and deliberately leaves durable queue and vault
-    state for a later run. Separate cancellation-safe recovery acts only when the vault is missing or
-    structurally corrupt, deletes the closed queue snapshot before a corrupt record, and refuses to
-    mutate anything for a valid or merely unavailable vault.
+    state for a later run. Separate cancellation-safe recovery acts only when the vault is missing
+    or structurally corrupt, deletes the closed queue snapshot before a corrupt record, and refuses
+    to mutate anything for a valid or merely unavailable vault.
   - **Process-wide panic privacy:** queue models, generated SeaORM `ActiveModel` values,
     client/vault values, errors, status, and diagnostics redact credentials, account bindings,
     listening metadata (including exact duration), and start evidence. Because Rust invokes its
@@ -116,10 +153,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     before releasing the lease. If SQLite cannot establish that pause, the shutdown proof remains
     failed rather than claiming a durable commit; successor ownership still cannot overlap the
     predecessor's request or database task.
-    Validation: 127 focused Last.fm tests; locked debug and release suites each pass 20 library,
-    1,473 application, and 14 repository-metadata tests (1,507 total), alongside strict debug and
-    release Clippy, the Rust 1.92 locked all-target check, formatting and diff checks, and the
-    dependency audit.
+    Validation: 168 focused Last.fm tests pass, including 29 playback-evidence and 12
+    now-playing runtime tests. Locked debug and release suites each pass 20 library, 1,514
+    application, and 14 repository-metadata tests (1,548 total). Strict Clippy is green in both
+    profiles, the Rust 1.92 locked all-target check passes, formatting and diff checks are clean,
+    and the dependency audit reports only the two already documented allowed unmaintained warnings.
 - **Rhythmbox profiles can now be migrated through a bounded, preview-first, transactional
   workflow** ([#57](https://github.com/jm2/tributary/issues/57),
   [#150](https://github.com/jm2/tributary/pull/150)):

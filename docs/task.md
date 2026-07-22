@@ -44,15 +44,23 @@ authoritative now-playing/scrobble evidence, 10,000-row account-bound FIFO, retr
 disconnect purge, and shutdown boundary. In addition to the bounded protocol client, retryable
 native-vault boundary, strict migrations 17/18, a transactional account-bound FIFO and durable
 pause gate, and missing-vault recovery authority, an internal runtime slice now owns account
-binding, serialized bounded ingress,
-oldest-first one-flight delivery, durable retry/terminal settlement, same-account reauthorization,
-and disconnect/shutdown barriers. It is deliberately not wired into production application or UI
-lifecycle yet. Continue with generation-owned playback threshold and now-playing evidence, browser
-authorization and localized consent/source policy, account/status UI and localization, application
-startup/shutdown integration, and package-time credentials. Production API-key registration and
-package-time key/secret injection remain explicit external release prerequisites rather than
-reasons to weaken development behavior. Smart playlists and XSPF import/export remain local-only,
-while mixed-source metadata export still requires its own no-locator policy.
+binding, serialized bounded ingress, oldest-first one-flight delivery, durable retry/terminal
+settlement, same-account reauthorization, and disconnect/shutdown barriers. A standalone
+frozen-metadata occurrence state machine now owns generation-checked playback evidence, its one
+UTC start instant, observed-forward scrobble credit, retry continuity, and terminal retirement.
+The runtime now owns an account-independent, latest-only now-playing lane with synchronous
+predecessor cancellation and an explicit reserved clear. Normal lifecycle and supervised-failure
+paths cancel and join that child before releasing authority. A hard external owner abort instead
+fails the drain barrier, while the request future's shared vault lease continues to exclude a
+successor until transport state is actually dropped.
+Both pieces are deliberately unwired from production application and UI lifecycle. Continue with
+exact source/session policy, the production playback owner and structured action/clear handoff,
+browser authorization and localized consent, account/recovery/status UI and localization,
+application ownership, package-time credentials, and final acceptance coverage. Production
+API-key registration and package-time key/secret injection remain explicit external release
+prerequisites rather than reasons to weaken development behavior. Smart playlists and XSPF
+import/export remain local-only, while mixed-source metadata export still requires its own
+no-locator policy.
 
 The independent Linux watcher correctness fix tracked in
 [#103](https://github.com/jm2/tributary/pull/103) does not change the **14/38** feature total.
@@ -62,11 +70,12 @@ evidence for authoritative reconciliation. It intentionally omits the original p
 unparseable-file cache so transient parser and I/O failures remain retryable. It is tracked outside
 the 38-record feature backlog.
 
-The cross-platform release-component containment work implemented in PR #152 on 2026-07-20 likewise does not
-change the feature total. It removes the observed path by which broad Windows/macOS GStreamer
-bundling could pull unused optical-disc access and decryption components into an artifact, adds a
-single reviewed deny policy, and makes Windows, macOS, native Linux, and Flatpak payload validation
-fail closed. Review and CI follow-up also pinned production macOS inspection inputs, covered
+The cross-platform release-component containment work implemented in PR #152 on 2026-07-20
+likewise does not change the feature total. It removes the observed path by which broad
+Windows/macOS GStreamer bundling could pull unused optical-disc access and decryption components
+into an artifact, adds a single reviewed deny policy, and makes Windows, macOS, native Linux, and
+Flatpak payload validation fail closed. Review and CI follow-up also pinned production macOS
+inspection inputs, covered
 nonstandard Mach-O and ELF reference paths, made Windows source-copy and final PE gates complete
 across DLL/DRV/EXE module forms, and distinguished FFmpeg's non-decrypting `libbluray` dependency
 from the denied `gstbluray`,
@@ -588,7 +597,8 @@ selecting and validating a maintained AirPlay path.
   durable retry/offline behavior, privacy UX, and source-aware metadata on authoritative playback
   events ([contract](lastfm-scrobbling.md); [#50](https://github.com/jm2/tributary/issues/50);
   [foundation #151](https://github.com/jm2/tributary/pull/151);
-  [runtime/lifecycle slice](https://github.com/jm2/tributary/pull/153)).
+  [runtime/lifecycle slice](https://github.com/jm2/tributary/pull/153);
+  [playback/now-playing slice](https://github.com/jm2/tributary/pull/154)).
 
   Acceptance criteria:
 
@@ -669,19 +679,48 @@ selecting and validating a maintained AirPlay path.
     requires opaque proof of closed and FIFO-drained admission and deletes only the captured row-ID
     snapshot, including corrupt non-positive identities. The process-global lifecycle owner proves
     that barrier before it can issue the capability.
+  - Added a standalone policy- and network-free `LastFmPlaybackOccurrence` which freezes one
+    validated structured-metadata snapshot and owns an uncloneable random RFC 4122 version-4
+    occurrence identity. Required artist/title and optional album/album-artist, track number, and
+    duration are independently validated before admission. The first current-generation `Playing`
+    or accepted-position proof captures one bounded whole-second UTC start and emits now-playing;
+    the first position only anchors. Strictly observed forward deltas qualify exactly once at
+    `min(ceil(duration / 2), 240 seconds)`. Pause, buffering, seek/restart discontinuities,
+    retries, duplicate/regressed/stale events, wall time, natural end, and errors cannot fabricate
+    credit. Retry retains UUID, accumulated credit, timestamp, and one-shot latches while
+    re-anchoring a new generation; explicit retirement is terminal. `Debug` redacts metadata,
+    duration, timestamp, UUID, and generation.
   - Added a single serialized runtime owner whose public enqueue boundary accepts only validated
     unbound payloads. The runtime ingress gate attaches the active vault account binding before it
-    sends the bound command to that owner. Its bounded metadata ingress reserves control capacity
-    for delivery and lifecycle markers, linearizing enqueue, reauthorization, disconnect, and
-    shutdown without letting callers forge account authority.
+    sends the bound command to that owner. Its bounded metadata ingress admits 64 ordinary
+    commands and reserves four control slots: one delivery result, two lifecycle markers, and one
+    explicit now-playing clear. This linearizes enqueue, reauthorization, disconnect, shutdown,
+    and playback retirement without letting callers forge account authority or a saturated
+    ordinary queue starve control.
+  - Added runtime-owned one-shot now-playing. Playback submits one validated, uncloneable,
+    account-independent `LastFmNowPlaying`; the ingress gate attaches the exact current account and
+    epoch and allocates a monotonic latest-only generation. Successor admission and explicit clear
+    synchronously cancel the predecessor under that gate, and explicit clear advances ingress
+    ownership before the actor joins the predecessor and acknowledges the command in FIFO order.
+    The operation is never persisted or retried. Accepted, ignored, rejected, unavailable,
+    incompatible, and capability-unavailable outcomes are fixed and cannot settle, pause, or
+    otherwise alter durable delivery. Only provider code 9 may atomically claim the exact current
+    now-playing generation/account/epoch, commit the durable reauthorization pause, and then retire
+    delivery; stale or failed claims mutate nothing. Normal supersession, clear, disconnect,
+    reauthorization, and shutdown paths, plus supervised owner failure and caught actor panic,
+    cancel and join the task before account or vault authority is released. A hard external owner
+    abort cannot prove joined quiescence and marks the drain barrier `Failed`. Owner drop still
+    cancels the child before its primary vault-lease share is released, while a child-held shared
+    lease prevents successor ownership until the request future and its transport state are
+    actually dropped.
   - Added one generation-owned, non-mutating worker which reads the exact oldest FIFO prefix, sends
     at most 50 rows with only one request in flight, transfers its opaque receipt to the runtime,
     and cannot inspect a successor batch until the actor acknowledges durable handling. Typed
     disposition settles accepted/ignored and recognized permanent failures, quarantines malformed
     cardinality or unclassifiable results, and durably retries only timeouts/transport failures,
-    HTTP 429/5xx without a recognized provider error envelope, provider codes 8/11/16/29 with 30-second
-    exponential backoff capped at one hour. Code 9 retains
-    the queue and permits only exact same-account vault reauthorization before delivery restarts.
+    HTTP 429/5xx without a recognized provider error envelope, provider codes 8/11/16/29 with
+    30-second exponential backoff capped at one hour. Code 9 retains the queue and permits only
+    exact same-account vault reauthorization before delivery restarts.
   - SQLite settlement is the commit point: aggregate accepted/ignored/rejected counters advance
     only after the exact receipt is deleted transactionally. Remote acceptance followed by actor or
     process loss retains the byte-exact row for at-least-once replay by a successor runtime; stale
@@ -702,26 +741,29 @@ selecting and validating a maintained AirPlay path.
     remains failed rather than claiming a durable commit. The process-wide panic hook omits every
     panic payload. Private metadata, credentials, provider bodies, receipt contents, exact
     durations, and panic payloads remain absent from status and diagnostics.
-  - Validation passes 127 focused Last.fm tests. The focused matrix includes exact 10,000-row
-    capacity/contention and full-refusal behavior, every accepted/ignored/permanent/transient/
-    cardinality disposition including provider codes 8/11/16/29, durable backoff across restart,
-    same-account code-9 recovery, stale generations, ambiguous accepted-before-settlement replay,
-    disconnect/shutdown and staged-restart races, process-global vault ownership, cleanup crash
-    windows, missing/corrupt recovery, durable pause/restart/manual-clear and restart-visible backoff
-    state, actor-panic quiescence, and panic/duration redaction boundaries.
-    Locked debug and release suites each pass 20 library, 1,473 application, and 14
-    repository-metadata tests (1,507 total), alongside strict debug and release Clippy, the Rust
-    1.92 locked all-target check, formatting and diff checks, and the dependency audit.
+  - Validation passes 168 focused Last.fm tests, including 29 playback-evidence and 12
+    now-playing runtime tests. The new matrix covers exact metadata/threshold/clock/redaction
+    boundaries; Playing and no-credit position proof; pause, stop, buffering, discontinuity,
+    retry, stale-event, EOS, and uncloneable occurrence authority; every closed now-playing result;
+    latest-only and explicit-clear cancellation/join; ready-result arbitration without metadata
+    starvation; saturated reserved-control admission;
+    both sides of the code-9 generation-claim/persistence race; normal disconnect/shutdown and
+    supervised owner/panic retirement; and hard-abort failed-barrier plus delayed child-retirement
+    behavior. Locked debug and release suites each pass 20 library, 1,514 application, and 14
+    repository-metadata tests (1,548 total). Strict Clippy is green in both profiles, the
+    Rust 1.92 locked all-target check passes, formatting and diff checks are clean, and the
+    dependency audit reports only the two already documented allowed unmaintained warnings.
 
   Remaining production work: this internal runtime is not yet instantiated by application startup
   or joined by application shutdown. Add a production activation/unavailable-capability issuer;
-  structured `Track` eligibility and source-owner conversion; generation-owned threshold,
-  now-playing, queue-admission, and rate-limited-toast integration; latest-only browser
-  authorization; explicit consent and per-source policy; same-account reauthorization and
-  different-account replacement/purge flows; disconnect, missing/corrupt/valid-vault queue recovery,
-  queue-full, account, and status UX; complete localization and accessibility; package credential
-  injection, verification, and production API registration; and the remaining end-to-end and
-  platform acceptance matrix.
+  exact source/session eligibility and structured `Track` source-owner conversion; a production
+  playback owner that feeds the occurrence state machine and dispatches now-playing, explicit
+  clear, durable queue admission, and rate-limited feedback outside GTK borrow boundaries;
+  latest-only browser authorization; explicit consent and per-source policy; same-account
+  reauthorization and different-account replacement/purge flows; disconnect,
+  missing/corrupt/valid-vault queue recovery, queue-full, account, recovery, and status UX;
+  complete localization and accessibility; package credential injection, verification, and
+  production API registration; and the remaining end-to-end and platform acceptance matrix.
 
 ### P2.2 — Drag and drop
 
@@ -824,6 +866,7 @@ selecting and validating a maintained AirPlay path.
 
 | Date | Task | PR | Result |
 |---|---|---|---|
+| 2026-07-21 | P2.1 Last.fm playback evidence and now-playing internals | [#154](https://github.com/jm2/tributary/pull/154) | Added an uncloneable frozen-metadata occurrence authority with random version-4 identity, one first-evidence UTC start, strictly observed-forward threshold credit, retry continuity, explicit terminal retirement, and redacted diagnostics. Added runtime-owned account-independent latest-only now-playing with synchronous predecessor cancellation, a fourth reserved explicit-clear control, fixed non-durable outcomes, and an atomic exact-generation/account/epoch code-9 reauthorization claim. Normal lifecycle and supervised failure cancel and join the child before authority release; hard external owner abort reports a failed drain while a child-held shared vault lease excludes successors until the request future drops. This slice remains deliberately unwired pending consent, exact source/session policy, the production playback/action owner, application/auth/UI/build-credential integration, and final acceptance validation; [#50](https://github.com/jm2/tributary/issues/50) and the 14/38 P2.1 record remain open. |
 | 2026-07-21 | P2.1 Last.fm durable delivery and lifecycle internals | [#153](https://github.com/jm2/tributary/pull/153) | Added runtime-owned account binding and bounded serialized ingress; exact oldest-first one-flight batches of at most 50; typed terminal and durable transient retry handling, including provider codes 8/11/16/29; migration 18's restart-stable reauthentication/compatibility/capability gates plus its sessionless credential-cleanup tombstone and exact-runtime/account/revision/category recovery; exact same-account code-9 reauthorization; post-SQLite counters and accepted-before-settlement replay; disconnect/shutdown barriers; process-global vault ownership and missing/corrupt recovery; and content-redacted worker/actor panic supervision that joins predecessor work before releasing vault authority. This slice remains deliberately unwired from production application/UI lifecycle, so [#50](https://github.com/jm2/tributary/issues/50) and the 14/38 P2.1 record remain open. |
 | 2026-07-20 | Cross-platform release-component containment | [#152](https://github.com/jm2/tributary/pull/152) | Replaced permissive disc-component bundling with one shared deny policy; filtered before native dependency traversal; rejected denied transitive dependencies and recognizable path references; rejected link-based, test-hook, and incomplete-inspection escapes; and added final Windows ZIP/PE, macOS, native Linux, Packit/COPR, and complete Flatpak app-commit gates, including stale-tree and installer-only paths. Review regressions cover nonstandard Mach-O placement, all bracket-valued ELF dynamic tags plus the program interpreter, source-copy reparse points, Windows DLL/DRV/EXE import forms, failure-cleaned temporary state, and the deliberate `libbluray`/decryptor distinction. The dependency audit also removed false `gst-plugins-bad`/`raopsink` install guidance and folded maintained AirPlay sender selection into P2.4. Ordinary codecs and transport cryptography remain intentionally available. This distribution safeguard does not advance the 14/38 feature numerator. |
 | 2026-07-18 | Backlog reset | — | Archived the holistic-review tracker and established the audited feature backlog; no implementation record completed. |

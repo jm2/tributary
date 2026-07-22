@@ -1,15 +1,18 @@
 //! Serialized lifecycle owner for the private Last.fm scrobble queue.
 //!
-//! Metadata commands use a bounded FIFO while three slots remain reserved for
-//! one delivery result and two lifecycle markers. One shared ingress mutex is
-//! the linearization point: an
+//! Metadata commands use a bounded FIFO while four slots remain reserved for
+//! one delivery result, two lifecycle markers, and one now-playing clear. One
+//! shared ingress mutex is the linearization point: an
 //! enqueue which wins it is ordered before disconnect or shutdown, and an
 //! enqueue which loses is rejected. Only the receiver mutates SQLite or the
 //! protected credential store.
 
 use std::fmt;
+use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::task::{Context, Poll};
 
 use futures::FutureExt;
 use sea_orm::DatabaseConnection;
@@ -17,12 +20,13 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::client::{LastFmClientError, SubmissionResult};
+use super::client::{LastFmClientError, LastFmTrack, SubmissionResult};
 use super::credentials::{
     CredentialError, LastFmAccountBinding, ProtectedString, SessionCredentialStore, StoredSession,
 };
 use super::delivery::{
-    delivery_disposition, next_retry_at_ms, LastFmClock, LastFmDeliveryDisposition, LastFmTransport,
+    delivery_disposition, disposition_for_client_error, next_retry_at_ms, LastFmClock,
+    LastFmDeliveryDisposition, LastFmTransport,
 };
 use super::lifecycle::{acquire_vault_lifecycle, LastFmVaultLifecycleLease};
 use super::storage::{
@@ -35,8 +39,9 @@ use super::worker::{
 };
 
 const METADATA_INGRESS_CAPACITY: usize = 64;
-const CONTROL_RESERVED_CAPACITY: usize = 3;
+const CONTROL_RESERVED_CAPACITY: usize = 4;
 const COMMAND_CAPACITY: usize = METADATA_INGRESS_CAPACITY + CONTROL_RESERVED_CAPACITY;
+const MAX_NOW_PLAYING_METADATA_BYTES: usize = 1_024;
 
 /// Monotonic identity of the account admitted by one runtime instance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,10 +84,19 @@ struct IngressGate {
     queued_metadata: usize,
     delivery_event_queued: bool,
     reauthorization_queued: bool,
+    now_playing_clear_queued: bool,
+    now_playing_clear_generation: Option<LastFmNowPlayingGeneration>,
+    now_playing_generation: LastFmNowPlayingGeneration,
+    now_playing_reauthorization_commit: bool,
     delivery_cancellation: Option<CancellationToken>,
+    now_playing_cancellation: Option<CancellationToken>,
     shutdown_queued: bool,
     #[cfg(test)]
     recovery_clear_gate: Option<RecoveryClearGate>,
+    #[cfg(test)]
+    now_playing_result_gate: Option<RecoveryClearGate>,
+    #[cfg(test)]
+    now_playing_reauthorization_commit_gate: Option<RecoveryClearGate>,
 }
 
 #[cfg(test)]
@@ -102,6 +116,59 @@ struct HandleInner {
 #[derive(Clone)]
 pub struct LastFmRuntimeHandle {
     inner: Arc<HandleInner>,
+}
+
+/// Validated account-independent metadata for one now-playing occurrence.
+///
+/// The wrapper has no account or credential field. Validation happens before
+/// admission so the actor never retains malformed private metadata while it
+/// waits behind other bounded commands.
+pub struct LastFmNowPlaying(LastFmTrack);
+
+impl LastFmNowPlaying {
+    /// Validate one protocol track without attaching runtime account state.
+    pub fn try_new(mut track: LastFmTrack) -> Result<Self, LastFmNowPlayingInputError> {
+        if !valid_now_playing_required_text(&track.artist)
+            || !valid_now_playing_required_text(&track.title)
+            || !canonicalize_now_playing_optional_text(&mut track.album)
+            || !canonicalize_now_playing_optional_text(&mut track.album_artist)
+            || matches!(track.track_number, Some(0))
+            || track.duration_seconds <= 30
+        {
+            return Err(LastFmNowPlayingInputError);
+        }
+        Ok(Self(track))
+    }
+}
+
+impl TryFrom<LastFmTrack> for LastFmNowPlaying {
+    type Error = LastFmNowPlayingInputError;
+
+    fn try_from(track: LastFmTrack) -> Result<Self, Self::Error> {
+        Self::try_new(track)
+    }
+}
+
+impl fmt::Debug for LastFmNowPlaying {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LastFmNowPlaying([REDACTED])")
+    }
+}
+
+/// Fixed-category validation failure for account-independent metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("Last.fm now-playing metadata is invalid")]
+pub struct LastFmNowPlayingInputError;
+
+/// Content-free terminal disposition of one now-playing occurrence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LastFmNowPlayingOutcome {
+    Accepted,
+    Ignored,
+    Rejected,
+    Unavailable,
+    Incompatible,
+    CapabilityUnavailable,
 }
 
 impl LastFmRuntimeHandle {
@@ -159,6 +226,126 @@ impl LastFmRuntimeHandle {
         Ok(LastFmRuntimeOperation { receiver })
     }
 
+    /// Submit one latest-only now-playing occurrence without exposing account
+    /// identity or the vault-owned session to playback code.
+    ///
+    /// Admission is bounded with durable metadata commands. A later admitted
+    /// occurrence supersedes the previous network task; this path never
+    /// retries a failed now-playing request.
+    pub fn try_update_now_playing(
+        &self,
+        now_playing: LastFmNowPlaying,
+    ) -> Result<LastFmRuntimeOperation<LastFmNowPlayingOutcome>, LastFmRuntimeAdmissionError> {
+        let mut ingress = self.lock_ingress()?;
+        let (account_binding, account_epoch) = match ingress.phase {
+            IngressPhase::Active {
+                account_binding,
+                account_epoch,
+            } => (account_binding, account_epoch),
+            IngressPhase::Transitioning { .. } => {
+                return Err(LastFmRuntimeAdmissionError::Transitioning);
+            }
+            IngressPhase::Closed => return Err(LastFmRuntimeAdmissionError::Closed),
+        };
+        if !matches!(
+            self.inner.status.borrow().phase,
+            LastFmRuntimePhase::Active | LastFmRuntimePhase::BackingOff
+        ) {
+            return Err(LastFmRuntimeAdmissionError::Paused);
+        }
+        if ingress.now_playing_reauthorization_commit {
+            return Err(LastFmRuntimeAdmissionError::Transitioning);
+        }
+        if ingress.queued_metadata >= METADATA_INGRESS_CAPACITY {
+            return Err(LastFmRuntimeAdmissionError::Busy);
+        }
+        let Some(generation) = ingress.now_playing_generation.checked_next() else {
+            ingress.phase = IngressPhase::Closed;
+            cancel_gate_now_playing(&mut ingress);
+            self.inner.commands.close();
+            return Err(LastFmRuntimeAdmissionError::Closed);
+        };
+        ingress.now_playing_generation = generation;
+        cancel_gate_now_playing(&mut ingress);
+
+        let (completion, receiver) = oneshot::channel();
+        let command = Command::NowPlaying {
+            account_binding,
+            account_epoch,
+            generation,
+            now_playing,
+            completion,
+        };
+        match self.inner.commands.try_send(command) {
+            Ok(()) => ingress.queued_metadata += 1,
+            Err(async_channel::TrySendError::Full(_)) => {
+                self.inner.commands.close();
+                return Err(LastFmRuntimeAdmissionError::Busy);
+            }
+            Err(async_channel::TrySendError::Closed(_)) => {
+                ingress.phase = IngressPhase::Closed;
+                return Err(LastFmRuntimeAdmissionError::Closed);
+            }
+        }
+        Ok(LastFmRuntimeOperation { receiver })
+    }
+
+    /// Retire the latest now-playing occurrence when playback stops or its
+    /// successor is not eligible for Last.fm metadata publication.
+    pub fn try_clear_now_playing(
+        &self,
+    ) -> Result<LastFmRuntimeOperation<()>, LastFmRuntimeAdmissionError> {
+        let mut ingress = self.lock_ingress()?;
+        let (account_binding, account_epoch) = match ingress.phase {
+            IngressPhase::Active {
+                account_binding,
+                account_epoch,
+            } => (account_binding, account_epoch),
+            IngressPhase::Transitioning { .. } => {
+                return Err(LastFmRuntimeAdmissionError::Transitioning);
+            }
+            IngressPhase::Closed => return Err(LastFmRuntimeAdmissionError::Closed),
+        };
+        if ingress.now_playing_reauthorization_commit {
+            return Err(LastFmRuntimeAdmissionError::Transitioning);
+        }
+        let Some(generation) = ingress.now_playing_generation.checked_next() else {
+            ingress.phase = IngressPhase::Closed;
+            cancel_gate_now_playing(&mut ingress);
+            self.inner.commands.close();
+            return Err(LastFmRuntimeAdmissionError::Closed);
+        };
+        ingress.now_playing_generation = generation;
+        ingress.now_playing_clear_generation = Some(generation);
+        cancel_gate_now_playing(&mut ingress);
+        if ingress.now_playing_clear_queued {
+            return Err(LastFmRuntimeAdmissionError::Busy);
+        }
+
+        let (completion, receiver) = oneshot::channel();
+        let command = Command::ClearNowPlaying {
+            account_binding,
+            account_epoch,
+            completion,
+        };
+        match self.inner.commands.try_send(command) {
+            Ok(()) => {
+                ingress.now_playing_clear_queued = true;
+            }
+            Err(async_channel::TrySendError::Full(_)) => {
+                ingress.now_playing_clear_generation = None;
+                self.inner.commands.close();
+                return Err(LastFmRuntimeAdmissionError::Busy);
+            }
+            Err(async_channel::TrySendError::Closed(_)) => {
+                ingress.phase = IngressPhase::Closed;
+                ingress.now_playing_clear_generation = None;
+                return Err(LastFmRuntimeAdmissionError::Closed);
+            }
+        }
+        Ok(LastFmRuntimeOperation { receiver })
+    }
+
     /// Install a renewed session for the exact retained account and restart
     /// delivery. Queue admission remains available while code 9 is waiting so
     /// already-consented offline listening can continue to be retained.
@@ -208,7 +395,10 @@ impl LastFmRuntimeHandle {
             completion,
         };
         match self.inner.commands.try_send(command) {
-            Ok(()) => ingress.reauthorization_queued = true,
+            Ok(()) => {
+                ingress.reauthorization_queued = true;
+                cancel_gate_now_playing(&mut ingress);
+            }
             Err(async_channel::TrySendError::Full(_)) => {
                 ingress.phase = previous_phase;
                 return Err(LastFmRuntimeAdmissionError::Busy);
@@ -321,6 +511,7 @@ impl LastFmRuntimeHandle {
             Ok(()) => {
                 ingress.queue_admission_open = false;
                 cancel_gate_delivery(&mut ingress);
+                cancel_gate_now_playing(&mut ingress);
                 Ok(LastFmRuntimeOperation { receiver })
             }
             Err(async_channel::TrySendError::Full(_)) => {
@@ -504,6 +695,8 @@ pub enum LastFmRuntimeCommandError {
     CredentialStore,
     #[error("Last.fm command no longer belongs to the active account")]
     StaleAccount,
+    #[error("Last.fm now-playing occurrence was superseded")]
+    Superseded,
     #[error("Last.fm authorization belongs to a different account")]
     AccountReplacementRequired,
     #[error("Last.fm runtime owner stopped")]
@@ -657,12 +850,99 @@ impl TerminalOutcomeCounts {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct LastFmNowPlayingGeneration(u64);
+
+impl LastFmNowPlayingGeneration {
+    const INITIAL_PREDECESSOR: Self = Self(0);
+
+    fn checked_next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
+enum NowPlayingTaskExit {
+    Cancelled,
+    Completed(Result<SubmissionResult, LastFmClientError>),
+}
+
+struct NowPlayingRuntime {
+    account_binding: LastFmAccountBinding,
+    account_epoch: LastFmAccountEpoch,
+    generation: LastFmNowPlayingGeneration,
+    cancellation: CancellationToken,
+    task: JoinHandle<NowPlayingTaskExit>,
+    completion: Option<oneshot::Sender<Result<LastFmNowPlayingOutcome, LastFmRuntimeCommandError>>>,
+}
+
+type SharedVaultLifecycleLease = Arc<LastFmVaultLifecycleLease>;
+
+/// Keeps the process-global account generation until the request future has
+/// actually been dropped. Field declaration order is intentional: a hard
+/// owner abort may only release this lease share after transport state has
+/// been retired, rather than merely after its task was asked to abort.
+struct VaultOwnedNowPlayingRequest {
+    request:
+        Pin<Box<dyn Future<Output = Result<SubmissionResult, LastFmClientError>> + Send + 'static>>,
+    _vault_lease: SharedVaultLifecycleLease,
+}
+
+impl Future for VaultOwnedNowPlayingRequest {
+    type Output = Result<SubmissionResult, LastFmClientError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        self.request.as_mut().poll(context)
+    }
+}
+
+impl NowPlayingRuntime {
+    async fn cancel_and_join(mut self, reason: LastFmRuntimeCommandError) {
+        self.cancellation.cancel();
+        self.task.abort();
+        let _ = (&mut self.task).await;
+        self.complete(Err(reason));
+    }
+
+    fn complete(&mut self, result: Result<LastFmNowPlayingOutcome, LastFmRuntimeCommandError>) {
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.send(result);
+        }
+    }
+}
+
+impl Drop for NowPlayingRuntime {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.task.abort();
+    }
+}
+
+enum RuntimeEvent {
+    Command(Option<Command>),
+    NowPlaying {
+        generation: LastFmNowPlayingGeneration,
+        result: Result<NowPlayingTaskExit, tokio::task::JoinError>,
+    },
+}
+
 enum Command {
     Enqueue {
         account_binding: LastFmAccountBinding,
         account_epoch: LastFmAccountEpoch,
         scrobble: PendingLastFmScrobble,
         completion: oneshot::Sender<Result<LastFmEnqueueOutcome, LastFmRuntimeCommandError>>,
+    },
+    NowPlaying {
+        account_binding: LastFmAccountBinding,
+        account_epoch: LastFmAccountEpoch,
+        generation: LastFmNowPlayingGeneration,
+        now_playing: LastFmNowPlaying,
+        completion: oneshot::Sender<Result<LastFmNowPlayingOutcome, LastFmRuntimeCommandError>>,
+    },
+    ClearNowPlaying {
+        account_binding: LastFmAccountBinding,
+        account_epoch: LastFmAccountEpoch,
+        completion: oneshot::Sender<Result<(), LastFmRuntimeCommandError>>,
     },
     Reauthorize {
         account_binding: LastFmAccountBinding,
@@ -745,9 +1025,10 @@ struct ActiveAccount {
     session: Option<StoredSession>,
     queue_purged: bool,
     last_delivery_generation: LastFmDeliveryGeneration,
+    last_now_playing_generation: LastFmNowPlayingGeneration,
     delivery: Option<DeliveryRuntime>,
-    #[allow(dead_code)] // Exclusively owns this process's vault generation.
-    vault_lease: Option<LastFmVaultLifecycleLease>,
+    #[allow(dead_code)] // Retains the runtime's primary vault-generation share.
+    vault_lease: Option<SharedVaultLifecycleLease>,
 }
 
 struct RuntimeOwner {
@@ -758,16 +1039,39 @@ struct RuntimeOwner {
     ingress: Arc<Mutex<IngressGate>>,
     status_sender: watch::Sender<LastFmRuntimeStatus>,
     status: LastFmRuntimeStatus,
+    // Field order is intentional. A hard owner abort has a failed barrier (not
+    // joined quiescence), but Drop still asks the child to abort before the
+    // account releases its primary vault-lease share. The child independently
+    // retains its share until its request future has actually been dropped.
+    now_playing: Option<NowPlayingRuntime>,
     account: Option<ActiveAccount>,
     transport: Arc<dyn LastFmTransport>,
     clock: Arc<dyn LastFmClock>,
 }
 
 impl RuntimeOwner {
+    async fn next_event(&mut self) -> RuntimeEvent {
+        let commands = &self.commands;
+        let Some(now_playing) = self.now_playing.as_mut() else {
+            return RuntimeEvent::Command(commands.recv().await.ok());
+        };
+        let generation = now_playing.generation;
+        tokio::select! {
+            biased;
+            result = &mut now_playing.task => RuntimeEvent::NowPlaying { generation, result },
+            command = commands.recv() => RuntimeEvent::Command(command.ok()),
+        }
+    }
+
     async fn run(&mut self) -> Result<LastFmRuntimeShutdownReason, LastFmRuntimeShutdownError> {
         loop {
-            let Ok(command) = self.commands.recv().await else {
-                return self.fail_and_retire().await;
+            let command = match self.next_event().await {
+                RuntimeEvent::Command(Some(command)) => command,
+                RuntimeEvent::Command(None) => return self.fail_and_retire().await,
+                RuntimeEvent::NowPlaying { generation, result } => {
+                    self.handle_now_playing_result(generation, result).await;
+                    continue;
+                }
             };
             match command {
                 Command::Enqueue {
@@ -781,6 +1085,40 @@ impl RuntimeOwner {
                         return self.fail_and_retire().await;
                     }
                     self.enqueue(account_binding, account_epoch, scrobble, completion)
+                        .await;
+                }
+                Command::NowPlaying {
+                    account_binding,
+                    account_epoch,
+                    generation,
+                    now_playing,
+                    completion,
+                } => {
+                    if !self.metadata_received() {
+                        let _ = completion.send(Err(LastFmRuntimeCommandError::OwnerStopped));
+                        return self.fail_and_retire().await;
+                    }
+                    self.start_now_playing(
+                        account_binding,
+                        account_epoch,
+                        generation,
+                        now_playing,
+                        completion,
+                    )
+                    .await;
+                }
+                Command::ClearNowPlaying {
+                    account_binding,
+                    account_epoch,
+                    completion,
+                } => {
+                    let Some(generation) =
+                        self.now_playing_clear_received(account_binding, account_epoch)
+                    else {
+                        let _ = completion.send(Err(LastFmRuntimeCommandError::OwnerStopped));
+                        return self.fail_and_retire().await;
+                    };
+                    self.clear_now_playing(account_binding, account_epoch, generation, completion)
                         .await;
                 }
                 Command::Reauthorize {
@@ -852,6 +1190,8 @@ impl RuntimeOwner {
                         .as_ref()
                         .filter(|account| !account.queue_purged)
                         .map(|account| account.binding);
+                    self.retire_now_playing(LastFmRuntimeCommandError::OwnerStopped)
+                        .await;
                     let retirement = self.retire_delivery().await;
                     let failure_paused = if let Some(binding) =
                         binding.filter(|_| !retirement.joined || retirement.failure.is_some())
@@ -891,6 +1231,8 @@ impl RuntimeOwner {
             .as_ref()
             .filter(|account| !account.queue_purged)
             .map(|account| account.binding);
+        self.retire_now_playing(LastFmRuntimeCommandError::OwnerStopped)
+            .await;
         let _retirement = self.retire_delivery().await;
         if let Some(binding) = binding {
             let _ = self.ensure_worker_failure_pause(binding).await;
@@ -910,8 +1252,11 @@ impl RuntimeOwner {
             ingress.queue_admission_open = false;
             ingress.shutdown_queued = true;
             cancel_gate_delivery(&mut ingress);
+            cancel_gate_now_playing(&mut ingress);
         }
         self.commands.close();
+        self.retire_now_playing(LastFmRuntimeCommandError::OwnerStopped)
+            .await;
         let _ = self.retire_delivery().await;
         if let Some(binding) = unpurged_binding {
             let _ = self.ensure_worker_failure_pause(binding).await;
@@ -975,6 +1320,373 @@ impl RuntimeOwner {
         }
     }
 
+    async fn start_now_playing(
+        &mut self,
+        binding: LastFmAccountBinding,
+        epoch: LastFmAccountEpoch,
+        generation: LastFmNowPlayingGeneration,
+        now_playing: LastFmNowPlaying,
+        completion: oneshot::Sender<Result<LastFmNowPlayingOutcome, LastFmRuntimeCommandError>>,
+    ) {
+        if !self.account_matches(binding, epoch) {
+            let _ = completion.send(Err(LastFmRuntimeCommandError::StaleAccount));
+            return;
+        }
+
+        self.retire_now_playing(LastFmRuntimeCommandError::Superseded)
+            .await;
+        if !self.now_playing_command_is_latest(binding, epoch, generation) {
+            let _ = completion.send(Err(LastFmRuntimeCommandError::Superseded));
+            return;
+        }
+
+        let Some((session, vault_lease)) = self
+            .account
+            .as_ref()
+            .and_then(|account| {
+                (account.last_now_playing_generation.0 < generation.0).then_some(account)
+            })
+            .and_then(|account| {
+                account
+                    .session
+                    .clone()
+                    .zip(account.vault_lease.as_ref().map(Arc::clone))
+            })
+        else {
+            let _ = completion.send(Err(LastFmRuntimeCommandError::DeliveryCapability));
+            return;
+        };
+        let cancellation = CancellationToken::new();
+        {
+            let Ok(mut ingress) = self.ingress.lock() else {
+                self.commands.close();
+                let _ = completion.send(Err(LastFmRuntimeCommandError::OwnerStopped));
+                return;
+            };
+            if !matches!(
+                ingress.phase,
+                IngressPhase::Active {
+                    account_binding,
+                    account_epoch,
+                } if account_binding == binding && account_epoch == epoch
+            ) || ingress.now_playing_generation != generation
+                || ingress.now_playing_reauthorization_commit
+                || ingress.now_playing_cancellation.is_some()
+            {
+                let _ = completion.send(Err(LastFmRuntimeCommandError::Superseded));
+                return;
+            }
+            ingress.now_playing_cancellation = Some(cancellation.clone());
+        }
+        let Some(account) = self
+            .account
+            .as_mut()
+            .filter(|account| account.binding == binding && account.epoch == epoch)
+        else {
+            if let Ok(mut ingress) = self.ingress.lock() {
+                cancel_gate_now_playing(&mut ingress);
+            }
+            let _ = completion.send(Err(LastFmRuntimeCommandError::StaleAccount));
+            return;
+        };
+        account.last_now_playing_generation = generation;
+
+        let transport = Arc::clone(&self.transport);
+        let task_cancellation = cancellation.clone();
+        let track = now_playing.0;
+        let request = VaultOwnedNowPlayingRequest {
+            request: Box::pin(async move { transport.update_now_playing(&session, &track).await }),
+            _vault_lease: vault_lease,
+        };
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                () = task_cancellation.cancelled() => NowPlayingTaskExit::Cancelled,
+                result = request => {
+                    NowPlayingTaskExit::Completed(result)
+                }
+            }
+        });
+        self.now_playing = Some(NowPlayingRuntime {
+            account_binding: binding,
+            account_epoch: epoch,
+            generation,
+            cancellation,
+            task,
+            completion: Some(completion),
+        });
+    }
+
+    async fn handle_now_playing_result(
+        &mut self,
+        generation: LastFmNowPlayingGeneration,
+        result: Result<NowPlayingTaskExit, tokio::task::JoinError>,
+    ) {
+        let Some(mut now_playing) = self.now_playing.take() else {
+            self.commands.close();
+            return;
+        };
+        if now_playing.generation != generation {
+            self.now_playing = Some(now_playing);
+            return;
+        }
+
+        let binding = now_playing.account_binding;
+        let epoch = now_playing.account_epoch;
+
+        #[cfg(test)]
+        self.wait_at_now_playing_test_gate(false).await;
+
+        let result = match result {
+            Ok(NowPlayingTaskExit::Completed(result)) => result,
+            Ok(NowPlayingTaskExit::Cancelled) | Err(_) => {
+                let current = self.finish_current_now_playing_result(binding, epoch, generation);
+                now_playing.complete(Err(if current {
+                    LastFmRuntimeCommandError::OwnerStopped
+                } else {
+                    LastFmRuntimeCommandError::Superseded
+                }));
+                return;
+            }
+        };
+        if result == Err(LastFmClientError::ReauthenticationRequired) {
+            if !self.claim_now_playing_reauthorization(binding, epoch, generation) {
+                now_playing.complete(Err(LastFmRuntimeCommandError::Superseded));
+                return;
+            }
+            #[cfg(test)]
+            self.wait_at_now_playing_test_gate(true).await;
+            let persisted = storage::persist_pause_for_account(
+                &self.database,
+                binding,
+                storage::LastFmDurablePause::ReauthenticationRequired,
+            )
+            .await
+            .is_ok();
+            if !self
+                .finish_now_playing_reauthorization_commit(binding, epoch, generation, persisted)
+            {
+                now_playing.complete(Err(LastFmRuntimeCommandError::StaleAccount));
+                return;
+            }
+            self.retire_delivery().await;
+            now_playing.complete(Err(if persisted {
+                LastFmRuntimeCommandError::ReauthenticationRequired
+            } else {
+                LastFmRuntimeCommandError::Queue
+            }));
+            return;
+        }
+
+        if !self.finish_current_now_playing_result(binding, epoch, generation) {
+            now_playing.complete(Err(LastFmRuntimeCommandError::Superseded));
+            return;
+        }
+
+        let outcome = match result {
+            Ok(SubmissionResult::Accepted { .. }) => LastFmNowPlayingOutcome::Accepted,
+            Ok(SubmissionResult::Ignored { .. }) => LastFmNowPlayingOutcome::Ignored,
+            Err(error) => match disposition_for_client_error(error) {
+                LastFmDeliveryDisposition::SettleTerminal => LastFmNowPlayingOutcome::Rejected,
+                LastFmDeliveryDisposition::RetryTransient => LastFmNowPlayingOutcome::Unavailable,
+                LastFmDeliveryDisposition::QuarantineCompatibility => {
+                    LastFmNowPlayingOutcome::Incompatible
+                }
+                LastFmDeliveryDisposition::PauseCapabilityOrInternal => {
+                    LastFmNowPlayingOutcome::CapabilityUnavailable
+                }
+                LastFmDeliveryDisposition::PauseForReauthentication => {
+                    now_playing.complete(Err(LastFmRuntimeCommandError::ReauthenticationRequired));
+                    return;
+                }
+            },
+        };
+        now_playing.complete(Ok(outcome));
+    }
+
+    async fn clear_now_playing(
+        &mut self,
+        binding: LastFmAccountBinding,
+        epoch: LastFmAccountEpoch,
+        generation: LastFmNowPlayingGeneration,
+        completion: oneshot::Sender<Result<(), LastFmRuntimeCommandError>>,
+    ) {
+        if !self.account_matches(binding, epoch) {
+            let _ = completion.send(Err(LastFmRuntimeCommandError::StaleAccount));
+            return;
+        }
+        self.retire_now_playing(LastFmRuntimeCommandError::Superseded)
+            .await;
+        let Some(account) = self
+            .account
+            .as_mut()
+            .filter(|account| account.binding == binding && account.epoch == epoch)
+        else {
+            let _ = completion.send(Err(LastFmRuntimeCommandError::StaleAccount));
+            return;
+        };
+        if account.last_now_playing_generation.0 >= generation.0 {
+            let _ = completion.send(Err(LastFmRuntimeCommandError::DeliveryCapability));
+            return;
+        }
+        account.last_now_playing_generation = generation;
+        let _ = completion.send(Ok(()));
+    }
+
+    fn now_playing_command_is_latest(
+        &self,
+        binding: LastFmAccountBinding,
+        epoch: LastFmAccountEpoch,
+        generation: LastFmNowPlayingGeneration,
+    ) -> bool {
+        self.account_matches(binding, epoch)
+            && matches!(
+                self.status.phase,
+                LastFmRuntimePhase::Active | LastFmRuntimePhase::BackingOff
+            )
+            && self.now_playing_ingress_matches(binding, epoch, generation)
+    }
+
+    fn now_playing_ingress_matches(
+        &self,
+        binding: LastFmAccountBinding,
+        epoch: LastFmAccountEpoch,
+        generation: LastFmNowPlayingGeneration,
+    ) -> bool {
+        let Ok(ingress) = self.ingress.lock() else {
+            self.commands.close();
+            return false;
+        };
+        self.account_matches(binding, epoch)
+            && matches!(
+                ingress.phase,
+                IngressPhase::Active {
+                    account_binding,
+                    account_epoch,
+                } if account_binding == binding && account_epoch == epoch
+            )
+            && ingress.now_playing_generation == generation
+            && !ingress.now_playing_reauthorization_commit
+    }
+
+    fn finish_current_now_playing_result(
+        &self,
+        binding: LastFmAccountBinding,
+        epoch: LastFmAccountEpoch,
+        generation: LastFmNowPlayingGeneration,
+    ) -> bool {
+        let Ok(mut ingress) = self.ingress.lock() else {
+            self.commands.close();
+            return false;
+        };
+        let current = matches!(
+            ingress.phase,
+            IngressPhase::Active {
+                account_binding,
+                account_epoch,
+            } if account_binding == binding && account_epoch == epoch
+        ) && ingress.now_playing_generation == generation
+            && !ingress.now_playing_reauthorization_commit;
+        if current {
+            cancel_gate_now_playing(&mut ingress);
+        }
+        current
+    }
+
+    fn claim_now_playing_reauthorization(
+        &self,
+        binding: LastFmAccountBinding,
+        epoch: LastFmAccountEpoch,
+        generation: LastFmNowPlayingGeneration,
+    ) -> bool {
+        let Ok(mut ingress) = self.ingress.lock() else {
+            self.commands.close();
+            return false;
+        };
+        let current = matches!(
+            ingress.phase,
+            IngressPhase::Active {
+                account_binding,
+                account_epoch,
+            } if account_binding == binding && account_epoch == epoch
+        ) && ingress.now_playing_generation == generation
+            && !ingress.now_playing_reauthorization_commit;
+        if current {
+            cancel_gate_now_playing(&mut ingress);
+            ingress.now_playing_reauthorization_commit = true;
+        }
+        current
+    }
+
+    fn finish_now_playing_reauthorization_commit(
+        &mut self,
+        binding: LastFmAccountBinding,
+        epoch: LastFmAccountEpoch,
+        generation: LastFmNowPlayingGeneration,
+        persisted: bool,
+    ) -> bool {
+        let ingress_owner = Arc::clone(&self.ingress);
+        let Ok(mut ingress) = ingress_owner.lock() else {
+            self.commands.close();
+            return false;
+        };
+        if !ingress.now_playing_reauthorization_commit {
+            self.commands.close();
+            return false;
+        }
+        ingress.now_playing_reauthorization_commit = false;
+        if !matches!(
+            ingress.phase,
+            IngressPhase::Active {
+                account_binding,
+                account_epoch,
+            } if account_binding == binding && account_epoch == epoch
+        ) || ingress.now_playing_generation != generation
+        {
+            return false;
+        }
+        cancel_gate_delivery(&mut ingress);
+        ingress.queue_admission_open = persisted;
+        if persisted {
+            self.publish(
+                LastFmRuntimePhase::ReauthenticationRequired,
+                Some(LastFmRuntimeCommandError::ReauthenticationRequired),
+            );
+        } else {
+            self.publish(
+                LastFmRuntimePhase::CapabilityPaused,
+                Some(LastFmRuntimeCommandError::Queue),
+            );
+        }
+        true
+    }
+
+    #[cfg(test)]
+    async fn wait_at_now_playing_test_gate(&self, after_claim: bool) {
+        let gate = self.ingress.lock().ok().and_then(|mut ingress| {
+            if after_claim {
+                ingress.now_playing_reauthorization_commit_gate.take()
+            } else {
+                ingress.now_playing_result_gate.take()
+            }
+        });
+        if let Some(gate) = gate {
+            let _ = gate.reached.send(()).await;
+            let _ = gate.release.recv().await;
+        }
+    }
+
+    async fn retire_now_playing(&mut self, reason: LastFmRuntimeCommandError) {
+        if let Ok(mut ingress) = self.ingress.lock() {
+            cancel_gate_now_playing(&mut ingress);
+        } else {
+            self.commands.close();
+        }
+        if let Some(now_playing) = self.now_playing.take() {
+            now_playing.cancel_and_join(reason).await;
+        }
+    }
+
     async fn reauthorize(
         &mut self,
         binding: LastFmAccountBinding,
@@ -983,6 +1695,8 @@ impl RuntimeOwner {
         key: ProtectedString,
         completion: oneshot::Sender<Result<(), LastFmRuntimeCommandError>>,
     ) {
+        self.retire_now_playing(LastFmRuntimeCommandError::ReauthenticationRequired)
+            .await;
         if !self.account_matches(binding, epoch)
             || self.status.phase != LastFmRuntimePhase::ReauthenticationRequired
         {
@@ -1259,6 +1973,8 @@ impl RuntimeOwner {
             return;
         }
 
+        self.retire_now_playing(LastFmRuntimeCommandError::OwnerStopped)
+            .await;
         let delivery_retired = self.retire_delivery().await.joined;
 
         let deleted = match storage::purge_account(&self.database, binding).await {
@@ -1577,6 +2293,7 @@ impl RuntimeOwner {
             .await
             .is_ok();
         self.finish_persisted_pause(binding, epoch, pause, persisted);
+        self.retire_now_playing(pause.runtime_failure()).await;
         let _ = acknowledgement.acknowledge(LastFmDeliveryDirective::Stop);
     }
 
@@ -1590,6 +2307,7 @@ impl RuntimeOwner {
             .await
             .is_ok();
         self.finish_persisted_pause(binding, epoch, pause, persisted);
+        self.retire_now_playing(pause.runtime_failure()).await;
     }
 
     fn finish_persisted_pause(
@@ -2130,7 +2848,7 @@ impl RuntimeOwner {
     fn take_vault_lease(
         &mut self,
         binding: LastFmAccountBinding,
-    ) -> Result<LastFmVaultLifecycleLease, LastFmRuntimeCommandError> {
+    ) -> Result<SharedVaultLifecycleLease, LastFmRuntimeCommandError> {
         self.account
             .as_mut()
             .filter(|account| account.binding == binding)
@@ -2141,7 +2859,7 @@ impl RuntimeOwner {
     fn restore_vault_lease(
         &mut self,
         binding: LastFmAccountBinding,
-        lease: LastFmVaultLifecycleLease,
+        lease: SharedVaultLifecycleLease,
     ) -> Result<(), LastFmRuntimeCommandError> {
         let Some(account) = self
             .account
@@ -2159,6 +2877,7 @@ impl RuntimeOwner {
             ingress.phase = IngressPhase::Closed;
             ingress.queue_admission_open = false;
             cancel_gate_delivery(&mut ingress);
+            cancel_gate_now_playing(&mut ingress);
         }
         self.commands.close();
     }
@@ -2254,6 +2973,36 @@ impl RuntimeOwner {
         }
         ingress.delivery_event_queued = false;
         true
+    }
+
+    fn now_playing_clear_received(
+        &self,
+        binding: LastFmAccountBinding,
+        epoch: LastFmAccountEpoch,
+    ) -> Option<LastFmNowPlayingGeneration> {
+        let Ok(mut ingress) = self.ingress.lock() else {
+            self.commands.close();
+            return None;
+        };
+        if !ingress.now_playing_clear_queued {
+            self.commands.close();
+            return None;
+        }
+        ingress.now_playing_clear_queued = false;
+        let generation = ingress.now_playing_clear_generation.take()?;
+        let belongs_to_account = match ingress.phase {
+            IngressPhase::Active {
+                account_binding,
+                account_epoch,
+            }
+            | IngressPhase::Transitioning {
+                account_binding,
+                account_epoch,
+                ..
+            } => account_binding == binding && account_epoch == epoch,
+            IngressPhase::Closed => true,
+        };
+        belongs_to_account.then_some(generation)
     }
 
     fn set_transition_from(
@@ -2655,10 +3404,19 @@ pub async fn spawn_lastfm_runtime(
         queued_metadata: 0,
         delivery_event_queued: false,
         reauthorization_queued: false,
+        now_playing_clear_queued: false,
+        now_playing_clear_generation: None,
+        now_playing_generation: LastFmNowPlayingGeneration::INITIAL_PREDECESSOR,
+        now_playing_reauthorization_commit: false,
         delivery_cancellation,
+        now_playing_cancellation: None,
         shutdown_queued: false,
         #[cfg(test)]
         recovery_clear_gate: None,
+        #[cfg(test)]
+        now_playing_result_gate: None,
+        #[cfg(test)]
+        now_playing_reauthorization_commit_gate: None,
     }));
     let inner = Arc::new(HandleInner {
         commands: command_sender.clone(),
@@ -2699,9 +3457,11 @@ pub async fn spawn_lastfm_runtime(
             },
             queue_purged: cleanup_only,
             last_delivery_generation: generation,
+            last_now_playing_generation: LastFmNowPlayingGeneration::INITIAL_PREDECESSOR,
             delivery,
-            vault_lease: Some(vault_lease),
+            vault_lease: Some(Arc::new(vault_lease)),
         }),
+        now_playing: None,
     };
     let (completion_sender, completion) = watch::channel(LastFmRuntimeDrainState::Pending);
     let owner_task = tokio::spawn(async move {
@@ -2752,6 +3512,7 @@ fn request_shutdown(inner: &Arc<HandleInner>) -> bool {
     match inner.commands.try_send(Command::Shutdown) {
         Ok(()) => {
             ingress.shutdown_queued = true;
+            cancel_gate_now_playing(&mut ingress);
             if !restart_committed {
                 ingress.phase = IngressPhase::Closed;
                 cancel_gate_delivery(&mut ingress);
@@ -2761,6 +3522,7 @@ fn request_shutdown(inner: &Arc<HandleInner>) -> bool {
         Err(_) => {
             ingress.phase = IngressPhase::Closed;
             cancel_gate_delivery(&mut ingress);
+            cancel_gate_now_playing(&mut ingress);
             inner.commands.close();
             false
         }
@@ -2773,6 +3535,42 @@ fn cancel_gate_delivery(ingress: &mut IngressGate) {
     }
 }
 
+fn cancel_gate_now_playing(ingress: &mut IngressGate) {
+    if let Some(cancellation) = ingress.now_playing_cancellation.take() {
+        cancellation.cancel();
+    }
+}
+
+fn valid_now_playing_required_text(value: &str) -> bool {
+    !value.trim().is_empty() && valid_now_playing_text(value)
+}
+
+fn canonicalize_now_playing_optional_text(value: &mut Option<String>) -> bool {
+    let omit = {
+        let Some(value) = value.as_deref() else {
+            return true;
+        };
+        if value.len() > MAX_NOW_PLAYING_METADATA_BYTES
+            || value.contains('\0')
+            || value.chars().any(char::is_control)
+        {
+            return false;
+        }
+        value.trim().is_empty()
+    };
+    if omit {
+        *value = None;
+    }
+    true
+}
+
+fn valid_now_playing_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_NOW_PLAYING_METADATA_BYTES
+        && !value.contains('\0')
+        && !value.chars().any(char::is_control)
+}
+
 #[cfg(test)]
 #[path = "runtime_delivery_tests.rs"]
 mod runtime_delivery_tests;
@@ -2780,6 +3578,10 @@ mod runtime_delivery_tests;
 #[cfg(test)]
 #[path = "runtime_reauthorization_tests.rs"]
 mod runtime_reauthorization_tests;
+
+#[cfg(test)]
+#[path = "runtime_now_playing_tests.rs"]
+mod runtime_now_playing_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3050,10 +3852,17 @@ mod tests {
             queued_metadata: 0,
             delivery_event_queued: false,
             reauthorization_queued: false,
+            now_playing_clear_queued: false,
+            now_playing_clear_generation: None,
+            now_playing_generation: LastFmNowPlayingGeneration::INITIAL_PREDECESSOR,
+            now_playing_reauthorization_commit: false,
             delivery_cancellation: Some(cancellation.clone()),
+            now_playing_cancellation: None,
             shutdown_queued: false,
             #[cfg(test)]
             recovery_clear_gate: None,
+            now_playing_result_gate: None,
+            now_playing_reauthorization_commit_gate: None,
         }));
         let (command_sender, commands) = async_channel::bounded(COMMAND_CAPACITY);
         let (_status_sender, status) = watch::channel(LastFmRuntimeStatus::active(0));
@@ -3143,10 +3952,17 @@ mod tests {
             queued_metadata: 0,
             delivery_event_queued: false,
             reauthorization_queued: false,
+            now_playing_clear_queued: false,
+            now_playing_clear_generation: None,
+            now_playing_generation: LastFmNowPlayingGeneration::INITIAL_PREDECESSOR,
+            now_playing_reauthorization_commit: false,
             delivery_cancellation: None,
+            now_playing_cancellation: None,
             shutdown_queued: false,
             #[cfg(test)]
             recovery_clear_gate: None,
+            now_playing_result_gate: None,
+            now_playing_reauthorization_commit_gate: None,
         }));
         let (command_sender, commands) = async_channel::bounded(COMMAND_CAPACITY);
         let initial_status = LastFmRuntimeStatus::active(0);
@@ -3166,9 +3982,11 @@ mod tests {
                 session: Some(stored_session),
                 queue_purged: false,
                 last_delivery_generation: LastFmDeliveryGeneration::new(1),
+                last_now_playing_generation: LastFmNowPlayingGeneration::INITIAL_PREDECESSOR,
                 delivery: None,
-                vault_lease: Some(vault_lease),
+                vault_lease: Some(Arc::new(vault_lease)),
             }),
+            now_playing: None,
             clock: fixed_clock(),
         };
         let (completion, completed) = oneshot::channel();
@@ -3228,10 +4046,17 @@ mod tests {
             queued_metadata: 0,
             delivery_event_queued: false,
             reauthorization_queued: false,
+            now_playing_clear_queued: false,
+            now_playing_clear_generation: None,
+            now_playing_generation: LastFmNowPlayingGeneration::INITIAL_PREDECESSOR,
+            now_playing_reauthorization_commit: false,
             delivery_cancellation: Some(cancellation),
+            now_playing_cancellation: None,
             shutdown_queued: false,
             #[cfg(test)]
             recovery_clear_gate: None,
+            now_playing_result_gate: None,
+            now_playing_reauthorization_commit_gate: None,
         }));
         let (command_sender, commands) = async_channel::bounded(COMMAND_CAPACITY);
         let initial_status = LastFmRuntimeStatus::active(1);
@@ -3253,13 +4078,15 @@ mod tests {
                 session: Some(stored_session),
                 queue_purged: false,
                 last_delivery_generation: generation,
+                last_now_playing_generation: LastFmNowPlayingGeneration::INITIAL_PREDECESSOR,
                 delivery: Some(DeliveryRuntime {
                     generation,
                     worker,
                     relay,
                 }),
-                vault_lease: Some(vault_lease),
+                vault_lease: Some(Arc::new(vault_lease)),
             }),
+            now_playing: None,
             clock: fixed_clock(),
         };
 
@@ -3520,10 +4347,17 @@ mod tests {
             queued_metadata: 0,
             delivery_event_queued: false,
             reauthorization_queued: false,
+            now_playing_clear_queued: false,
+            now_playing_clear_generation: None,
+            now_playing_generation: LastFmNowPlayingGeneration::INITIAL_PREDECESSOR,
+            now_playing_reauthorization_commit: false,
             delivery_cancellation: Some(cancellation),
+            now_playing_cancellation: None,
             shutdown_queued: false,
             #[cfg(test)]
             recovery_clear_gate: None,
+            now_playing_result_gate: None,
+            now_playing_reauthorization_commit_gate: None,
         }));
         let (command_sender, commands) = async_channel::bounded(COMMAND_CAPACITY);
         let initial_status = LastFmRuntimeStatus::active(1);
@@ -3545,13 +4379,15 @@ mod tests {
                 session: Some(stored_session),
                 queue_purged: false,
                 last_delivery_generation: generation,
+                last_now_playing_generation: LastFmNowPlayingGeneration::INITIAL_PREDECESSOR,
                 delivery: Some(DeliveryRuntime {
                     generation,
                     worker,
                     relay,
                 }),
-                vault_lease: Some(vault_lease),
+                vault_lease: Some(Arc::new(vault_lease)),
             }),
+            now_playing: None,
             clock: fixed_clock(),
         };
 
@@ -4017,9 +4853,16 @@ mod tests {
             queued_metadata: 0,
             delivery_event_queued: false,
             reauthorization_queued: false,
+            now_playing_clear_queued: false,
+            now_playing_clear_generation: None,
+            now_playing_generation: LastFmNowPlayingGeneration::INITIAL_PREDECESSOR,
+            now_playing_reauthorization_commit: false,
             delivery_cancellation: None,
+            now_playing_cancellation: None,
             shutdown_queued: false,
             recovery_clear_gate: None,
+            now_playing_result_gate: None,
+            now_playing_reauthorization_commit_gate: None,
         }));
         let (command_sender, commands) = async_channel::bounded(COMMAND_CAPACITY);
         let mut initial_status = LastFmRuntimeStatus::active(0);
@@ -4039,9 +4882,11 @@ mod tests {
                 session: None,
                 queue_purged: true,
                 last_delivery_generation: LastFmDeliveryGeneration::new(1),
+                last_now_playing_generation: LastFmNowPlayingGeneration::INITIAL_PREDECESSOR,
                 delivery: None,
-                vault_lease: Some(vault_lease),
+                vault_lease: Some(Arc::new(vault_lease)),
             }),
+            now_playing: None,
             transport: pending_transport(),
             clock: fixed_clock(),
         };

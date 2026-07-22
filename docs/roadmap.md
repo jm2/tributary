@@ -21,10 +21,13 @@ The current implementation focus is Last.fm [#50](https://github.com/jm2/tributa
 Its accepted [`lastfm-scrobbling.md`](lastfm-scrobbling.md) contract fixes the product, privacy,
 authority, offline queue, and lifecycle boundaries. The internal implementation now supplies the
 bounded signed transport, native protected-session boundary, strict queue schema, transactional
-offline FIFO, and a serialized durable-delivery/lifecycle runtime. It remains intentionally
-unwired from the production application. Generation-owned playback threshold and now-playing
-evidence, browser authorization and consent/source policy, localized account/status UI,
-application startup/shutdown integration, and packaged credentials remain the next slices.
+offline FIFO, a serialized durable-delivery/lifecycle runtime, a standalone generation-owned
+playback-evidence state machine, and a runtime-owned latest-only now-playing lane with joined normal
+retirement and shared-vault exclusion across hard owner abort. Those playback pieces remain
+intentionally unwired from the production application. Exact source/session policy, structured
+source-owner conversion and action/clear handoff, browser authorization and consent, localized
+account/recovery/status UI, application ownership, packaged credentials, and final acceptance
+testing remain the next slices.
 
 ## Current baseline
 
@@ -32,8 +35,9 @@ application startup/shutdown integration, and packaged credentials remain the ne
   physical removable hardware, an installed interactive Flatpak environment, or packaged Windows
   playback against live DAAP and Subsonic servers.
 - Local, Subsonic, Jellyfin, Plex, and DAAP publish complete catalogues through the shared
-  `MediaBackend` seam. Connected remotes, Radio-Browser, removable media, and operating-system-opened
-  files use the common `SourceRegistry` lifecycle and playback-time authority model.
+  `MediaBackend` seam. Connected remotes, Radio-Browser, removable media, and
+  operating-system-opened files use the common `SourceRegistry` lifecycle and playback-time
+  authority model.
 - Chromecast, MPD, and local playback are implemented. AirPlay discovery and a fail-closed
   `raopsink` integration seam exist, but current supported GStreamer/Homebrew/MSYS2 packages do not
   supply that sender; AirPlay 1 and AirPlay 2 therefore still need a maintained implementation.
@@ -129,17 +133,34 @@ application startup/shutdown integration, and packaged credentials remain the ne
   access. The internal runtime accepts account-independent payloads and binds them only inside the
   current account's vault-owned runtime ingress gate, including during that exact account's
   reauthorization; one bounded serialized owner orders metadata, delivery, code-9 same-account
-  reauthorization, disconnect, and shutdown. A generation-owned non-mutating worker
-  reads the oldest exact prefix, sends at most 50 rows with one request in flight, and waits for
-  actor acknowledgement before continuing. Typed outcomes settle terminal rows, quarantine
-  incoherent mappings, or durably retry transport/timeout, bare HTTP 429/5xx, and provider
-  8/11/16/29 outcomes with 30-second exponential backoff capped at one hour. Successful pause
-  writes commit before worker stop; a failed write closes ingress and stops delivery with a fixed
-  failure without claiming restart durability. Restart restores an exact committed phase without a
-  worker, and only exact reauthorization or exact-runtime/account/revision/category recovery clears
-  a delivery pause. Aggregate counters move only after exact SQLite settlement, so acceptance before
-  actor/process loss remains queued for at-least-once successor replay; stale generations cannot
-  mutate current state. Disconnect and shutdown use explicit close/cancel/join/drain barriers.
+  reauthorization, disconnect, and shutdown. Its fourth reserved control slot admits an explicit
+  now-playing clear even when all 64 ordinary metadata slots are full. A standalone uncloneable
+  occurrence observer freezes bounded structured metadata and a random version-4 UUID, captures
+  one UTC start instant from first current-generation playback evidence, and credits only observed
+  forward progress toward `min(ceil(duration / 2), 240 seconds)`. Retry continuity preserves the
+  occurrence while terminal retirement is explicit; pause, buffering, seeks, restarts, stale or
+  regressed evidence, wall time, and natural end cannot fabricate credit. Its diagnostics redact
+  metadata, duration, timestamp, UUID, and generation. The runtime's uncloneable,
+  account-independent now-playing input receives the exact current account and epoch internally.
+  A monotonic latest-only generation synchronously cancels its predecessor before admission;
+  normal clear, disconnect, reauthorization, shutdown, supervised owner failure, and caught panic
+  cancel and join it before authority release. A hard external owner abort cannot prove joined
+  quiescence and marks the drain barrier `Failed`; owner drop cancels the child first, while the
+  request future's shared vault lease excludes a successor until transport state is actually
+  dropped. Now-playing is never persisted or retried, and its fixed outcomes remain isolated from
+  durable delivery except that provider code 9 must atomically claim the exact current generation,
+  account, and epoch before committing the durable reauthorization pause. A generation-owned
+  non-mutating worker reads the oldest exact prefix, sends at most 50 rows with one request in
+  flight, and waits for actor acknowledgement before continuing. Typed outcomes settle terminal
+  rows, quarantine incoherent mappings, or durably retry transport/timeout, bare HTTP 429/5xx, and
+  provider 8/11/16/29 outcomes with 30-second exponential backoff capped at one hour. Successful
+  pause writes commit before worker stop; a failed write closes ingress and stops delivery with a
+  fixed failure without claiming restart durability. Restart restores an exact committed phase
+  without a worker, and only exact reauthorization or exact-runtime/account/revision/category
+  recovery clears a delivery pause. Aggregate counters move only after exact SQLite settlement, so
+  acceptance before actor/process loss remains queued for at-least-once successor replay; stale
+  generations cannot mutate current state. Disconnect and shutdown use explicit
+  close/cancel/join/drain barriers.
   Disconnect atomically converts the emptied account state to a cleanup tombstone, then
   clears it only after exact vault deletion; either failure restarts sessionless and cleanup-only.
   A process-global vault lease and closed/drained missing-or-corrupt recovery keep native credential
@@ -152,10 +173,11 @@ application startup/shutdown integration, and packaged credentials remain the ne
   Remaining work is production integration rather than a claim that this internal slice is
   available. The complete inventory lives in the
   [dated contract boundary](lastfm-scrobbling.md#dated-implementation-boundary); it includes
-  playback evidence, authorization/consent/source policy, activation and source-owner conversion,
-  account/recovery/status UX, localization/accessibility, application lifecycle wiring, production
-  credential injection and verification/API registration, and final acceptance testing. Missing
-  build credentials must leave an honest unavailable feature, never a plaintext runtime fallback.
+  the production playback owner and action/clear handoff, authorization/consent and exact
+  source/session policy, activation and source-owner conversion, account/recovery/status UX,
+  localization/accessibility, application lifecycle ownership, production credential injection
+  and verification/API registration, and final acceptance testing. Missing build credentials must
+  leave an honest unavailable feature, never a plaintext runtime fallback.
 
 ## Proposed implementation order
 
@@ -336,9 +358,15 @@ The playback-history contract makes the remaining Last.fm behavior much less amb
    hour, restart-stable fixed-category pauses, exact same-account code-9 reauthorization,
    post-SQLite counters, at-least-once replay,
    lifecycle barriers, global vault ownership/recovery, and redacted panic supervision are covered.
-   This code is not yet instantiated by production startup or joined by production shutdown.
-   Next add authoritative generation-owned playback threshold and one-shot now-playing evidence,
-   then complete the production-integration inventory in the
+   A standalone frozen-metadata occurrence observer now owns the version-4 identity, first-evidence
+   UTC clock, observed-forward threshold, retry continuity, terminal retirement, and redacted
+   diagnostics. The runtime now owns latest-only, synchronously cancelling, never-retried
+   now-playing plus an explicit reserved clear; only an exact code-9 generation/account/epoch claim
+   can move durable delivery into reauthorization. Normal lifecycle and supervised-failure paths
+   cancel and join before authority release; a hard owner abort fails the drain barrier while a
+   child-held shared vault lease continues to exclude successors until the request future drops.
+   This code is not yet instantiated by production startup, connected to authoritative playback,
+   or joined by production shutdown. Next complete the production-integration inventory in the
    [dated contract boundary](lastfm-scrobbling.md#dated-implementation-boundary). The complete
    target still keeps the session
    key, username, and opaque account UUID only in the OS credential vault, makes each authenticated
@@ -397,7 +425,7 @@ not mistaken for work already underway.
 
 | Issue | Current implementation state | Likely implementation shape |
 |---|---|---|
-| [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | Accepted [contract](lastfm-scrobbling.md), bounded client, native-vault authority, migrations 17/18, transactional private FIFO, durable delivery/cleanup gate, and internal delivery/lifecycle runtime; not production-wired and no playback observer or settings UI yet. | Add authoritative threshold/now-playing evidence, browser authorization and consent/source policy, localized account/status UI, application startup/shutdown integration, and package credential injection. |
+| [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | Accepted [contract](lastfm-scrobbling.md), bounded client, native-vault authority, migrations 17/18, transactional private FIFO, durable delivery/cleanup gate, standalone playback-evidence observer, and internal delivery/lifecycle/latest-only-now-playing runtime with request-scoped hard-abort-safe shared vault exclusion; not production-wired and no settings UI yet. | Connect an exact source/session-qualified playback owner and structured action/clear handoff, then add browser authorization and consent/source policy, localized account/recovery/status UI, application startup/shutdown ownership, package credentials, and final acceptance coverage. |
 | [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
 | [#46 — Drag and drop](https://github.com/jm2/tributary/issues/46) | Column-header reordering exists; track/file drag-and-drop does not. | Local playlist DnD first; file export, remote rows, and device copies as distinct policies. |
 | [#39 — Album art in browser](https://github.com/jm2/tributary/issues/39) | Artwork is shown for now-playing, not in the Genre/Artist/Album browser. | Virtualized art UI with bounded async cache, cancellation, accessibility, and authenticated art. |
