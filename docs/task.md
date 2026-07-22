@@ -1,6 +1,6 @@
 # Tributary active implementation backlog
 
-Last audited: 2026-07-21
+Last audited: 2026-07-22
 
 This is the executable backlog for feature fixes and additions. It replaces the completed
 holistic-review tracker, which is preserved as
@@ -53,9 +53,18 @@ predecessor cancellation and an explicit reserved clear. Normal lifecycle and su
 paths cancel and join that child before releasing authority. A hard external owner abort instead
 fails the drain barrier, while the request future's shared vault lease continues to exclude a
 successor until transport state is actually dropped.
-Both pieces are deliberately unwired from production application and UI lifecycle. Continue with
+The GTK-free desktop-authorization core now also owns a bounded latest-only flow: it measures a
+request token's exact one-hour lifetime from response observation, retains its token-bearing URL
+entirely inside owner authority with no production URL accessor or browser handoff, consumes
+one-shot finish authority before exchange, joins ordinary cancellation/supersession/shutdown, and
+returns only a move-only staged username/session-key grant.
+Its strict borrowed response parser keeps partial bodies and decoded secrets zeroizing and rejects
+malformed escapes, surrogate pairs, envelopes, and status/provider combinations without retaining
+generic secret-bearing JSON values.
+These pieces are deliberately unwired from production application and UI lifecycle. Continue with
 exact source/session policy, the production playback owner and structured action/clear handoff,
-browser authorization and localized consent, account/recovery/status UI and localization,
+localized consent and browser invocation, authorization-owner construction, atomic vault install
+and same/different-account transition policy, account/recovery/status UI and localization,
 application ownership, package-time credentials, and final acceptance coverage. Production
 API-key registration and package-time key/secret injection remain explicit external release
 prerequisites rather than reasons to weaken development behavior. Smart playlists and XSPF
@@ -598,7 +607,8 @@ selecting and validating a maintained AirPlay path.
   events ([contract](lastfm-scrobbling.md); [#50](https://github.com/jm2/tributary/issues/50);
   [foundation #151](https://github.com/jm2/tributary/pull/151);
   [runtime/lifecycle slice](https://github.com/jm2/tributary/pull/153);
-  [playback/now-playing slice](https://github.com/jm2/tributary/pull/154)).
+  [playback/now-playing slice](https://github.com/jm2/tributary/pull/154);
+  [desktop-authorization slice](https://github.com/jm2/tributary/pull/155)).
 
   Acceptance criteria:
 
@@ -649,7 +659,22 @@ selecting and validating a maintained AirPlay path.
     now-playing, and ordered 50-row scrobble requests. Typed response classification is
     content-free; unknown provider codes and incoherent item mappings quarantine rather than
     guess. Provable worst-case form and JSON-echo fixtures pin 1 MiB request and 2 MiB response
-    caps.
+    caps. Authentication envelopes remain borrowed from zeroizing response storage, validate the
+    complete JSON string/escape/surrogate grammar, decode token, username, and session key directly
+    into zeroizing allocations, reject unknown success fields and blank usernames, and preserve
+    fixed provider/HTTP failure classification without generic secret-bearing JSON values.
+  - Added a GTK-free latest-only desktop-authorization owner with an eight-command bounded lane.
+    Request-token expiry is exactly 60 monotonic minutes from response observation, with automatic
+    owner expiry and synchronous enforcement at Finish admission. The token-bearing browser URL
+    remains entirely inside exact current owner authority: the opaque challenge has no production
+    URL accessor or browser handoff. Begin, Finish, cancel, expiry, terminal failure, and close
+    revoke the internal URL allocation; Finish consumes its exact opaque seal and token before
+    exchange. Supersession and normal shutdown cancel and join network children, hard owner loss
+    closes admission and publishes a fixed stopped failure, and poisoned authority fails the drain
+    proof. Success produces only a move-only staged username/session-key grant—no account UUID,
+    vault mutation, browser invocation, consent bypass, or production factory exists in this slice.
+    Product integration must add a concrete consent-gated browser-launch operation and must not
+    describe the unavoidable external handoff as synchronously revocable.
   - Added a versioned native-vault record with exact RFC 4122 v4 account UUID, nonblank control-free
     username, and 32-hex session validation. Secret Service, Keychain, and Credential Manager are
     selected explicitly per operation with no plaintext fallback or sticky failed initializer;
@@ -741,7 +766,8 @@ selecting and validating a maintained AirPlay path.
     remains failed rather than claiming a durable commit. The process-wide panic hook omits every
     panic payload. Private metadata, credentials, provider bodies, receipt contents, exact
     durations, and panic payloads remain absent from status and diagnostics.
-  - Validation passes 168 focused Last.fm tests, including 29 playback-evidence and 12
+  - Validation passes 208 focused Last.fm tests, including 29 desktop-authorization, 26 client,
+    29 playback-evidence, and 12
     now-playing runtime tests. The new matrix covers exact metadata/threshold/clock/redaction
     boundaries; Playing and no-credit position proof; pause, stop, buffering, discontinuity,
     retry, stale-event, EOS, and uncloneable occurrence authority; every closed now-playing result;
@@ -749,8 +775,8 @@ selecting and validating a maintained AirPlay path.
     starvation; saturated reserved-control admission;
     both sides of the code-9 generation-claim/persistence race; normal disconnect/shutdown and
     supervised owner/panic retirement; and hard-abort failed-barrier plus delayed child-retirement
-    behavior. Locked debug and release suites each pass 20 library, 1,514 application, and 14
-    repository-metadata tests (1,548 total). Strict Clippy is green in both profiles, the
+    behavior. Locked debug and release suites each pass 20 library, 1,559 application, and 14
+    repository-metadata tests (1,593 total). Strict Clippy is green in both profiles, the
     Rust 1.92 locked all-target check passes, formatting and diff checks are clean, and the
     dependency audit reports only the two already documented allowed unmaintained warnings.
 
@@ -759,8 +785,10 @@ selecting and validating a maintained AirPlay path.
   exact source/session eligibility and structured `Track` source-owner conversion; a production
   playback owner that feeds the occurrence state machine and dispatches now-playing, explicit
   clear, durable queue admission, and rate-limited feedback outside GTK borrow boundaries;
-  latest-only browser authorization; explicit consent and per-source policy; same-account
-  reauthorization and different-account replacement/purge flows; disconnect,
+  localized consent and browser invocation around the completed latest-only authorization core;
+  one process-wide production owner; staged-session vault installation with exact same-account
+  reauthorization and different-account replacement/purge policy; explicit per-source policy;
+  disconnect,
   missing/corrupt/valid-vault queue recovery, queue-full, account, recovery, and status UX;
   complete localization and accessibility; package credential injection, verification, and
   production API registration; and the remaining end-to-end and platform acceptance matrix.
@@ -866,6 +894,7 @@ selecting and validating a maintained AirPlay path.
 
 | Date | Task | PR | Result |
 |---|---|---|---|
+| 2026-07-22 | P2.1 Last.fm desktop-authorization internals | [#155](https://github.com/jm2/tributary/pull/155) | Added strict borrowed zeroizing authentication-envelope parsing and zeroizing partial HTTP response collection, then added an eight-command GTK-free latest-only authorization owner with response-observed monotonic one-hour expiry, owner-private token-bearing URL storage with no production accessor or handoff, opaque one-shot Finish authority, joined ordinary retirement, deterministic closed/poison/hard-abort outcomes, content-free status, and a move-only staged username/session-key grant. It deliberately creates no account UUID, installs no vault record, opens no browser, and has no production factory, so a concrete consent-gated browser handoff, exact account transition, global ownership, UI/application integration, credentials, and acceptance work remain; [#50](https://github.com/jm2/tributary/issues/50) and the 14/38 P2.1 record stay open. |
 | 2026-07-21 | P2.1 Last.fm playback evidence and now-playing internals | [#154](https://github.com/jm2/tributary/pull/154) | Added an uncloneable frozen-metadata occurrence authority with random version-4 identity, one first-evidence UTC start, strictly observed-forward threshold credit, retry continuity, explicit terminal retirement, and redacted diagnostics. Added runtime-owned account-independent latest-only now-playing with synchronous predecessor cancellation, a fourth reserved explicit-clear control, fixed non-durable outcomes, and an atomic exact-generation/account/epoch code-9 reauthorization claim. Normal lifecycle and supervised failure cancel and join the child before authority release; hard external owner abort reports a failed drain while a child-held shared vault lease excludes successors until the request future drops. This slice remains deliberately unwired pending consent, exact source/session policy, the production playback/action owner, application/auth/UI/build-credential integration, and final acceptance validation; [#50](https://github.com/jm2/tributary/issues/50) and the 14/38 P2.1 record remain open. |
 | 2026-07-21 | P2.1 Last.fm durable delivery and lifecycle internals | [#153](https://github.com/jm2/tributary/pull/153) | Added runtime-owned account binding and bounded serialized ingress; exact oldest-first one-flight batches of at most 50; typed terminal and durable transient retry handling, including provider codes 8/11/16/29; migration 18's restart-stable reauthentication/compatibility/capability gates plus its sessionless credential-cleanup tombstone and exact-runtime/account/revision/category recovery; exact same-account code-9 reauthorization; post-SQLite counters and accepted-before-settlement replay; disconnect/shutdown barriers; process-global vault ownership and missing/corrupt recovery; and content-redacted worker/actor panic supervision that joins predecessor work before releasing vault authority. This slice remains deliberately unwired from production application/UI lifecycle, so [#50](https://github.com/jm2/tributary/issues/50) and the 14/38 P2.1 record remain open. |
 | 2026-07-20 | Cross-platform release-component containment | [#152](https://github.com/jm2/tributary/pull/152) | Replaced permissive disc-component bundling with one shared deny policy; filtered before native dependency traversal; rejected denied transitive dependencies and recognizable path references; rejected link-based, test-hook, and incomplete-inspection escapes; and added final Windows ZIP/PE, macOS, native Linux, Packit/COPR, and complete Flatpak app-commit gates, including stale-tree and installer-only paths. Review regressions cover nonstandard Mach-O placement, all bracket-valued ELF dynamic tags plus the program interpreter, source-copy reparse points, Windows DLL/DRV/EXE import forms, failure-cleaned temporary state, and the deliberate `libbluray`/decryptor distinction. The dependency audit also removed false `gst-plugins-bad`/`raopsink` install guidance and folded maintained AirPlay sender selection into P2.4. Ordinary codecs and transport cryptography remain intentionally available. This distribution safeguard does not advance the 14/38 feature numerator. |

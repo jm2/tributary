@@ -65,17 +65,20 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Durable local playback history | ✅ Exact accepted local occurrences persist a saturating play count and monotonic last-played timestamp, with live Plays refresh ([contract](docs/playback-history.md)) |
 | Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ Recently Played and Top 25 use deterministic authoritative history, safe untouched-default migration, and live projection refresh ([P1.3](docs/task.md#p13--record-trustworthy-local-playback-history)) |
 | Track ratings | ✅ Exact 1–100 local editing, read-only/unsupported source states, deterministic sorting, live refresh, and smart-playlist rules ([contract](docs/ratings.md)) |
-| Last.fm scrobbling | 🚧 Internal foundation only — bounded protocol/vault storage, a private durable FIFO, a standalone generation-owned playback-evidence state machine, and runtime-owned one-shot now-playing are implemented. They remain deliberately unwired from production playback and application/UI lifecycle. Authorization, consent and exact source/session policy, activation and source-owner conversion, account/recovery/status UX, localization/accessibility, production credentials/verification, and final acceptance testing remain ([complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary)) |
+| Last.fm scrobbling | 🚧 Internal foundation only — bounded protocol/vault storage, a private durable FIFO, a latest-only desktop-authorization owner, a standalone generation-owned playback-evidence state machine, and runtime-owned one-shot now-playing are implemented. They remain deliberately unwired from production playback and application/UI lifecycle. Production consent/browser launch, vault installation and account-transition policy, exact source/session policy, activation and source-owner conversion, account/recovery/status UX, localization/accessibility, production credentials/verification, and final acceptance testing remain ([complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary)) |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
 | Linux and macOS file associations | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 
-The internal Last.fm runtime distinguishes joined lifecycle retirement from a hard task abort.
-Normal lifecycle and supervised-failure paths cancel and join now-playing before authority release;
-an external owner abort marks the drain barrier failed, while the child request keeps a shared vault
-lease until its future is actually dropped so a successor cannot overlap it.
+The internal Last.fm authorization and playback runtimes distinguish joined lifecycle retirement
+from a hard task abort. Authorization keeps its one-hour request token and token-bearing browser URL
+entirely behind latest-only owner authority, with no production URL accessor or browser handoff yet;
+an explicit consent-gated handoff remains product-integration work. Normal lifecycle and
+supervised-failure paths cancel and join network work before releasing authority. An external
+playback-runtime owner abort marks the drain barrier failed, while the child request keeps a shared
+vault lease until its future is actually dropped so a successor cannot overlap it.
 
 See the [implementation roadmap](docs/roadmap.md) for the audited open-issue backlog, proposed
 ordering, and explicit current limitations. The countable working list is
@@ -550,6 +553,7 @@ src/
 │   └── backend.rs          # MediaBackend impl (in-memory cache)
 ├── lastfm/
 │   ├── mod.rs              # Private Last.fm integration boundary
+│   ├── authorization.rs    # Latest-only desktop authorization owner
 │   ├── client.rs           # Bounded signed Last.fm 2.0 protocol client
 │   ├── credentials.rs      # Native-vault session and account binding
 │   ├── storage.rs          # Private durable FIFO and opaque receipts

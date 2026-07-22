@@ -1,6 +1,6 @@
 # Tributary implementation roadmap
 
-Last audited: 2026-07-21
+Last audited: 2026-07-22
 
 This document explains the product and engineering work that remains **after** the holistic-review
 remediation. [`task.md`](task.md) is the countable active implementation backlog; the completed
@@ -22,10 +22,12 @@ Its accepted [`lastfm-scrobbling.md`](lastfm-scrobbling.md) contract fixes the p
 authority, offline queue, and lifecycle boundaries. The internal implementation now supplies the
 bounded signed transport, native protected-session boundary, strict queue schema, transactional
 offline FIFO, a serialized durable-delivery/lifecycle runtime, a standalone generation-owned
-playback-evidence state machine, and a runtime-owned latest-only now-playing lane with joined normal
-retirement and shared-vault exclusion across hard owner abort. Those playback pieces remain
-intentionally unwired from the production application. Exact source/session policy, structured
-source-owner conversion and action/clear handoff, browser authorization and consent, localized
+playback-evidence state machine, a runtime-owned latest-only now-playing lane with joined normal
+retirement and shared-vault exclusion across hard owner abort, and a GTK-free latest-only desktop
+authorization owner with one-shot exchange and exact monotonic token expiry. Those internal pieces
+remain intentionally unwired from the production application. Exact source/session policy,
+structured source-owner conversion and action/clear handoff, consent and browser invocation,
+authorization-owner construction plus atomic vault/account transition, localized
 account/recovery/status UI, application ownership, packaged credentials, and final acceptance
 testing remain the next slices.
 
@@ -125,7 +127,15 @@ testing remain the next slices.
   evidence, one-shot now-playing, a 10,000-row account-bound FIFO with 50-item batches and
   at-least-once retry, disconnect purge, and a bounded shutdown drain. The implemented foundation
   includes an HTTPS-only redirect-safe signed client with provable request/response caps and typed
-  response policy; exact versioned native-vault credentials with only a one-way SQLite account
+  response policy. Authentication responses use borrowed strict envelopes over zeroizing storage,
+  validate the complete JSON string/escape/surrogate grammar, and decode secrets directly into
+  zeroizing allocations. A bounded GTK-free latest-only authorization owner enforces the exact
+  response-observed monotonic 60-minute token life automatically and at Finish admission, retains
+  the token-bearing URL solely inside exact current owner authority with no production accessor or
+  browser handoff, consumes one-shot finish authority before exchange, joins normal retirement, and
+  returns a move-only staged session without minting account identity or touching the vault. The
+  foundation also includes exact versioned native-vault
+  credentials with only a one-way SQLite account
   binding; migration 17's validated private queue; migration 18's binding-only fixed-category
   delivery-pause and credential-cleanup singleton; atomic capped admission; oldest-prefix receipts
   with transactional settlement/rescheduling; binding-safe disconnect purge; closed-and-drained
@@ -173,8 +183,9 @@ testing remain the next slices.
   Remaining work is production integration rather than a claim that this internal slice is
   available. The complete inventory lives in the
   [dated contract boundary](lastfm-scrobbling.md#dated-implementation-boundary); it includes
-  the production playback owner and action/clear handoff, authorization/consent and exact
-  source/session policy, activation and source-owner conversion, account/recovery/status UX,
+  the production playback owner and action/clear handoff, exact source/session policy, activation
+  and source-owner conversion, consent/browser invocation and construction of the completed
+  authorization core, atomic staged-session vault/account transitions, account/recovery/status UX,
   localization/accessibility, application lifecycle ownership, production credential injection
   and verification/API registration, and final acceptance testing. Missing build credentials must
   leave an honest unavailable feature, never a plaintext runtime fallback.
@@ -365,8 +376,15 @@ The playback-history contract makes the remaining Last.fm behavior much less amb
    can move durable delivery into reauthorization. Normal lifecycle and supervised-failure paths
    cancel and join before authority release; a hard owner abort fails the drain barrier while a
    child-held shared vault lease continues to exclude successors until the request future drops.
+   A separate bounded GTK-free authorization owner now provides latest-only request/exchange,
+   response-observed exact one-hour expiry, an owner-private token-bearing URL with no production
+   accessor or handoff, joined cancellation/supersession/shutdown, fixed terminal status, and a
+   move-only staged username/session-key grant without minting durable account authority.
    This code is not yet instantiated by production startup, connected to authoritative playback,
-   or joined by production shutdown. Next complete the production-integration inventory in the
+   joined by production shutdown, or wrapped in consent/browser/vault account-transition policy.
+   The browser work must be a concrete consent-gated launch operation and must not claim that an
+   unavoidable URL handoff outside the process can be synchronously revoked.
+   Next complete the production-integration inventory in the
    [dated contract boundary](lastfm-scrobbling.md#dated-implementation-boundary). The complete
    target still keeps the session
    key, username, and opaque account UUID only in the OS credential vault, makes each authenticated
@@ -419,13 +437,13 @@ The playback-history contract makes the remaining Last.fm behavior much less amb
 
 ## Live open issues
 
-This is a snapshot of the remaining open issue set on 2026-07-21. GitHub remains authoritative for
+This is a snapshot of the remaining open issue set on 2026-07-22. GitHub remains authoritative for
 whether an issue is open; this table records the implementation assessment so a feature request is
 not mistaken for work already underway.
 
 | Issue | Current implementation state | Likely implementation shape |
 |---|---|---|
-| [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | Accepted [contract](lastfm-scrobbling.md), bounded client, native-vault authority, migrations 17/18, transactional private FIFO, durable delivery/cleanup gate, standalone playback-evidence observer, and internal delivery/lifecycle/latest-only-now-playing runtime with request-scoped hard-abort-safe shared vault exclusion; not production-wired and no settings UI yet. | Connect an exact source/session-qualified playback owner and structured action/clear handoff, then add browser authorization and consent/source policy, localized account/recovery/status UI, application startup/shutdown ownership, package credentials, and final acceptance coverage. |
+| [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | Accepted [contract](lastfm-scrobbling.md), bounded client with zeroizing strict auth parsing, latest-only desktop-authorization core, native-vault authority, migrations 17/18, transactional private FIFO, durable delivery/cleanup gate, standalone playback-evidence observer, and internal delivery/lifecycle/latest-only-now-playing runtime with request-scoped hard-abort-safe shared vault exclusion; not production-wired and no settings UI yet. | Connect an exact source/session-qualified playback owner and structured action/clear handoff, then wrap the completed authorization core in consent, browser launch, atomic vault/account transition and one global application owner; add per-source policy, localized account/recovery/status UI, startup/shutdown ownership, package credentials, and final acceptance coverage. |
 | [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
 | [#46 — Drag and drop](https://github.com/jm2/tributary/issues/46) | Column-header reordering exists; track/file drag-and-drop does not. | Local playlist DnD first; file export, remote rows, and device copies as distinct policies. |
 | [#39 — Album art in browser](https://github.com/jm2/tributary/issues/39) | Artwork is shown for now-playing, not in the Genre/Artist/Album browser. | Virtualized art UI with bounded async cache, cancellation, accessibility, and authenticated art. |
