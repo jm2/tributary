@@ -16,8 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [playback/now-playing slice](https://github.com/jm2/tributary/pull/154),
   [desktop-authorization slice](https://github.com/jm2/tributary/pull/155),
   [playback-ownership slice](https://github.com/jm2/tributary/pull/156),
-  [removable-attribution slice](https://github.com/jm2/tributary/pull/157), and the
-  [process-coordinator slice](https://github.com/jm2/tributary/pull/158)).
+  [removable-attribution slice](https://github.com/jm2/tributary/pull/157),
+  [process-coordinator slice](https://github.com/jm2/tributary/pull/158), and the
+  [headless runtime-bridge slice](https://github.com/jm2/tributary/pull/159)).
   This is an internal foundation, not yet a user-visible scrobbling feature. Application startup
   claims a non-recreatable Dormant playback coordinator, and production call sites feed its
   epoch-bound boundary with output intent, lazy accepted-load handoff, events, discontinuities,
