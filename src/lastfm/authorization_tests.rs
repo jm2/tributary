@@ -1242,7 +1242,7 @@ async fn poisoned_internal_ingress_fails_the_entire_owner_closed() {
 
 #[test]
 fn production_challenge_source_surface_exposes_only_flow() {
-    let source = include_str!("authorization.rs");
+    let source = include_str!("authorization.rs").replace("\r\n", "\n");
     let implementation = source
         .split_once("impl LastFmAuthorizationChallenge {")
         .expect("challenge implementation remains present")
