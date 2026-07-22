@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [desktop-authorization slice](https://github.com/jm2/tributary/pull/155),
   [playback-ownership slice](https://github.com/jm2/tributary/pull/156),
   [removable-attribution slice](https://github.com/jm2/tributary/pull/157), and the
-  process-coordinator slice in this PR).
+  [process-coordinator slice](https://github.com/jm2/tributary/pull/158)).
   This is an internal foundation, not yet a user-visible scrobbling feature. The standalone
   playback observer, GTK-free playback owner/handoffs, and runtime-owned now-playing lane still have
   no active production instance. Application startup now claims a non-recreatable Dormant playback
