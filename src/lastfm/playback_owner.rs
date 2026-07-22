@@ -18,7 +18,7 @@ use crate::architecture::MediaKey;
 use crate::architecture::SourceId;
 use crate::audio::{PlayerEvent, PlayerEventGeneration, PlayerState};
 use crate::source_registry::{PlaybackSourceReference, SourceRegistry};
-use crate::ui::playback::LastFmAcceptedOutputMint;
+use crate::ui::playback::{LastFmAcceptedOutputMint, LastFmOutputIntentMint};
 
 use super::playback::{
     LastFmPlaybackAction, LastFmPlaybackClock, LastFmPlaybackEvidenceError, LastFmPlaybackMetadata,
@@ -59,6 +59,61 @@ impl Eq for LastFmPlaybackOccurrenceIdentity {}
 impl fmt::Debug for LastFmPlaybackOccurrenceIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("LastFmPlaybackOccurrenceIdentity(<opaque>)")
+    }
+}
+
+/// Move-only notice that playback has committed a successor output attempt.
+///
+/// The notice is emitted before the output is stopped or otherwise invoked.
+/// It therefore closes the predecessor delivery generation before a backend
+/// can synchronously publish a stale event. The optional opaque identity says
+/// only whether the successor attempt belongs to an eligible frozen queue
+/// occurrence; it exposes no metadata or source authority.
+#[must_use = "output intent must be observed before invoking the output"]
+#[allow(clippy::redundant_pub_crate)] // Shared only with the playback coordinator.
+pub(crate) struct LastFmOutputIntent {
+    previous_generation: PlayerEventGeneration,
+    next_generation: PlayerEventGeneration,
+    candidate: Option<LastFmPlaybackOccurrenceIdentity>,
+}
+
+impl LastFmOutputIntent {
+    /// Bind a committed playback-session transition to its exact generations
+    /// and frozen queue-occurrence identity.
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) fn new(
+        _mint: LastFmOutputIntentMint,
+        previous_generation: PlayerEventGeneration,
+        next_generation: PlayerEventGeneration,
+        candidate: Option<LastFmPlaybackOccurrenceIdentity>,
+    ) -> Self {
+        Self {
+            previous_generation,
+            next_generation,
+            candidate,
+        }
+    }
+
+    /// Construct isolated coordinator/owner fixtures without granting a
+    /// production caller playback-session mint authority.
+    #[cfg(test)]
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) fn for_test(
+        previous_generation: PlayerEventGeneration,
+        next_generation: PlayerEventGeneration,
+        candidate: Option<LastFmPlaybackOccurrenceIdentity>,
+    ) -> Self {
+        Self {
+            previous_generation,
+            next_generation,
+            candidate,
+        }
+    }
+}
+
+impl fmt::Debug for LastFmOutputIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LastFmOutputIntent(<redacted>)")
     }
 }
 
@@ -680,6 +735,12 @@ struct ActiveOccurrence {
     source: LastFmPlaybackSource,
     metadata: LastFmPlaybackMetadata,
     occurrence: LastFmPlaybackOccurrence<PlayerEventGeneration>,
+    /// Exact playback-session cursor expected in the next output intent.
+    /// Resolved async errors advance that cursor once before a retry, while a
+    /// synchronous rejection leaves the already-observed attempt generation
+    /// as the next intent's predecessor.
+    output_generation: PlayerEventGeneration,
+    delivery_active: bool,
     now_playing_needs_clear: bool,
 }
 
@@ -730,6 +791,62 @@ where
                 unclaimed: false,
             })),
         }
+    }
+
+    /// Suspend or retire the predecessor before a committed output attempt.
+    ///
+    /// A same-identity retry closes only the exact predecessor delivery
+    /// generation, retaining occurrence UUID, first-evidence time, credit,
+    /// metadata, and one-shot latches until an accepted successor generation
+    /// arrives. A different or ineligible successor is terminal immediately.
+    /// An identity match with an incoherent generation fails closed instead of
+    /// letting a stale output continue contributing evidence.
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) fn observe_output_intent(
+        &mut self,
+        intent: LastFmOutputIntent,
+    ) -> LastFmPlaybackOwnerUpdate {
+        let LastFmOutputIntent {
+            previous_generation,
+            next_generation,
+            candidate,
+        } = intent;
+
+        if next_generation != previous_generation.next() {
+            let clear = self.retire();
+            return update_with_optional_handoff_and_error(
+                clear,
+                LastFmPlaybackOwnerError::Evidence(LastFmPlaybackEvidenceError::Invariant),
+            );
+        }
+
+        let Some(active) = self.active.as_mut() else {
+            return LastFmPlaybackOwnerUpdate::none();
+        };
+        if candidate.as_ref() == Some(&active.identity) {
+            if active.output_generation != previous_generation {
+                let clear = self.retire();
+                return update_with_optional_handoff_and_error(
+                    clear,
+                    LastFmPlaybackOwnerError::Evidence(LastFmPlaybackEvidenceError::Invariant),
+                );
+            }
+            if active.delivery_active && !active.occurrence.retire_generation(previous_generation) {
+                let clear = self.retire();
+                return update_with_optional_handoff_and_error(
+                    clear,
+                    LastFmPlaybackOwnerError::Evidence(LastFmPlaybackEvidenceError::Invariant),
+                );
+            }
+            active.output_generation = next_generation;
+            active.delivery_active = false;
+            return LastFmPlaybackOwnerUpdate::none();
+        }
+
+        self.retire().map_or_else(
+            LastFmPlaybackOwnerUpdate::none,
+            LastFmPlaybackOwnerUpdate::handoff,
+        )
     }
 
     /// Consume one exact accepted output load and update occurrence ownership.
@@ -850,7 +967,18 @@ where
                         LastFmPlaybackOwnerError::InconsistentOccurrence,
                     );
                 }
-                let _accepted = active.occurrence.accept_generation(generation);
+                if active.delivery_active
+                    || active.output_generation != generation
+                    || !active.occurrence.accept_generation(generation)
+                {
+                    let needs_clear = active.retire();
+                    let clear = self.issue_clear_if_needed_with_lane(needs_clear, lane);
+                    return update_with_optional_handoff_and_error(
+                        clear,
+                        LastFmPlaybackOwnerError::Evidence(LastFmPlaybackEvidenceError::Invariant),
+                    );
+                }
+                active.delivery_active = true;
                 return LastFmPlaybackOwnerUpdate::none();
             }
         }
@@ -872,6 +1000,8 @@ where
             source,
             metadata,
             occurrence,
+            output_generation: generation,
+            delivery_active: true,
             now_playing_needs_clear: false,
         });
 
@@ -935,6 +1065,13 @@ where
                 if !active.occurrence.observe_error(*generation) {
                     return LastFmPlaybackOwnerUpdate::none();
                 }
+                // Resolved output failures advance `PlaybackSession` once to
+                // reject delayed events before the next attempt. Direct
+                // failures are terminal/non-retryable, so anticipating the
+                // same cursor is harmless and makes an accidental direct
+                // retry fail closed.
+                active.output_generation = generation.next();
+                active.delivery_active = false;
                 let needs_clear = active.take_clear();
                 let clear = self.issue_clear_if_needed(needs_clear);
                 return clear.map_or_else(
@@ -1310,6 +1447,186 @@ mod tests {
     }
 
     #[test]
+    fn output_intent_debug_redacts_generations_and_candidate() {
+        let intent = LastFmOutputIntent::for_test(
+            generation(8_736_451),
+            generation(9_999_999),
+            Some(LastFmPlaybackOccurrenceIdentity::fresh()),
+        );
+        let debug = format!("{intent:?}");
+        assert_eq!(debug, "LastFmOutputIntent(<redacted>)");
+        assert!(!debug.contains("8736451"));
+        assert!(!debug.contains("9999999"));
+    }
+
+    #[test]
+    fn same_occurrence_output_intent_suspends_only_exact_delivery() {
+        let (clock, calls) = TestClock::successful();
+        let mut owner = LastFmPlaybackOwner::with_clock(clock);
+        let identity = LastFmPlaybackOccurrenceIdentity::fresh();
+        let source = local_source("same-intent-retry");
+
+        assert_empty(owner.accept_load(accepted(identity.clone(), source.clone()), generation(1)));
+        expect_now_playing(
+            owner.observe_event(&PlayerEvent::state(generation(1), PlayerState::Playing)),
+        );
+        assert_empty(owner.observe_event(&PlayerEvent::position(generation(1), 0, 100_000)));
+        assert_empty(owner.observe_event(&PlayerEvent::position(generation(1), 30_000, 100_000)));
+
+        assert_empty(owner.observe_output_intent(LastFmOutputIntent::for_test(
+            generation(1),
+            generation(2),
+            Some(identity.clone()),
+        )));
+        assert_empty(owner.observe_event(&PlayerEvent::position(generation(1), 100_000, 100_000)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        assert_empty(owner.accept_load(accepted(identity, source), generation(2)));
+        assert_empty(owner.observe_event(&PlayerEvent::state(generation(2), PlayerState::Playing)));
+        assert_empty(owner.observe_event(&PlayerEvent::position(generation(2), 30_000, 100_000)));
+        expect_enqueue(owner.observe_event(&PlayerEvent::position(generation(2), 50_000, 100_000)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn rejected_attempt_and_resolved_async_error_keep_exact_retry_cursor() {
+        let identity = LastFmPlaybackOccurrenceIdentity::fresh();
+        let source = local_source("intent-failure-retry");
+
+        let (clock, _) = TestClock::successful();
+        let mut rejected = LastFmPlaybackOwner::with_clock(clock);
+        assert_empty(
+            rejected.accept_load(accepted(identity.clone(), source.clone()), generation(10)),
+        );
+        assert_empty(rejected.observe_output_intent(LastFmOutputIntent::for_test(
+            generation(10),
+            generation(11),
+            Some(identity.clone()),
+        )));
+        // Generation 11 was synchronously rejected, so the next retry begins
+        // from that already-observed attempt without an accepted load.
+        assert_empty(rejected.observe_output_intent(LastFmOutputIntent::for_test(
+            generation(11),
+            generation(12),
+            Some(identity.clone()),
+        )));
+        assert_empty(
+            rejected.accept_load(accepted(identity.clone(), source.clone()), generation(12)),
+        );
+
+        let (clock, _) = TestClock::successful();
+        let mut asynchronous = LastFmPlaybackOwner::with_clock(clock);
+        assert_empty(
+            asynchronous.accept_load(accepted(identity.clone(), source.clone()), generation(20)),
+        );
+        assert_empty(
+            asynchronous
+                .observe_event(&PlayerEvent::error(generation(20), "PRIVATE-ASYNC-FAILURE")),
+        );
+        // Resolved failure advances the PlaybackSession cursor once before a
+        // later retry commits its own new output generation.
+        assert_empty(
+            asynchronous.observe_output_intent(LastFmOutputIntent::for_test(
+                generation(21),
+                generation(22),
+                Some(identity.clone()),
+            )),
+        );
+        assert_empty(asynchronous.accept_load(accepted(identity, source), generation(22)));
+    }
+
+    #[test]
+    fn skipped_or_stale_same_identity_acceptance_fails_closed() {
+        for accepted_generation in [generation(30), generation(32)] {
+            let (clock, _) = TestClock::successful();
+            let mut owner = LastFmPlaybackOwner::with_clock(clock);
+            let identity = LastFmPlaybackOccurrenceIdentity::fresh();
+            let source = local_source("intent-generation-mismatch");
+            load_and_prove_playing(&mut owner, identity.clone(), source.clone(), generation(30));
+            assert_empty(owner.observe_output_intent(LastFmOutputIntent::for_test(
+                generation(30),
+                generation(31),
+                Some(identity.clone()),
+            )));
+
+            let (handoff, error) = owner
+                .accept_load(accepted(identity, source), accepted_generation)
+                .into_parts();
+            assert_eq!(
+                handoff.map(|handoff| handoff.kind()),
+                Some(LastFmPlaybackHandoffKind::ClearNowPlaying)
+            );
+            assert_eq!(
+                error,
+                Some(LastFmPlaybackOwnerError::Evidence(
+                    LastFmPlaybackEvidenceError::Invariant
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_or_ineligible_intent_terminally_retires_predecessor_once() {
+        for candidate in [Some(LastFmPlaybackOccurrenceIdentity::fresh()), None] {
+            let (clock, _) = TestClock::successful();
+            let mut owner = LastFmPlaybackOwner::with_clock(clock);
+            let predecessor = LastFmPlaybackOccurrenceIdentity::fresh();
+            load_and_prove_playing(
+                &mut owner,
+                predecessor,
+                local_source("intent-predecessor"),
+                generation(3),
+            );
+
+            expect_clear(owner.observe_output_intent(LastFmOutputIntent::for_test(
+                generation(3),
+                generation(4),
+                candidate,
+            )));
+            assert_empty(owner.observe_output_intent(LastFmOutputIntent::for_test(
+                generation(4),
+                generation(5),
+                None,
+            )));
+            assert_empty(
+                owner.observe_event(&PlayerEvent::state(generation(3), PlayerState::Playing)),
+            );
+        }
+    }
+
+    #[test]
+    fn incoherent_same_identity_intent_fails_closed_with_fixed_error() {
+        let (clock, _) = TestClock::successful();
+        let mut owner = LastFmPlaybackOwner::with_clock(clock);
+        let identity = LastFmPlaybackOccurrenceIdentity::fresh();
+        load_and_prove_playing(
+            &mut owner,
+            identity.clone(),
+            local_source("incoherent-intent"),
+            generation(6),
+        );
+
+        let (handoff, error) = owner
+            .observe_output_intent(LastFmOutputIntent::for_test(
+                generation(5),
+                generation(6),
+                Some(identity),
+            ))
+            .into_parts();
+        assert_eq!(
+            handoff.map(|handoff| handoff.kind()),
+            Some(LastFmPlaybackHandoffKind::ClearNowPlaying)
+        );
+        assert_eq!(
+            error,
+            Some(LastFmPlaybackOwnerError::Evidence(
+                LastFmPlaybackEvidenceError::Invariant
+            ))
+        );
+        assert_empty(owner.observe_event(&PlayerEvent::state(generation(6), PlayerState::Playing)));
+    }
+
+    #[test]
     fn source_construction_rejects_nonlocal_local_claim_and_redacts_identity() {
         let secret_track = "SOURCE-TRACK-SENTINEL";
         let local = local_source(secret_track);
@@ -1372,7 +1689,19 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_empty(owner.observe_event(&PlayerEvent::state(generation(1), PlayerState::Playing)));
-        assert_empty(owner.accept_load(accepted(identity, source), generation(1)));
+        let (handoff, error) = owner
+            .accept_load(accepted(identity, source), generation(1))
+            .into_parts();
+        assert_eq!(
+            handoff.map(|handoff| handoff.kind()),
+            Some(LastFmPlaybackHandoffKind::ClearNowPlaying)
+        );
+        assert_eq!(
+            error,
+            Some(LastFmPlaybackOwnerError::Evidence(
+                LastFmPlaybackEvidenceError::Invariant
+            ))
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -1565,7 +1894,16 @@ mod tests {
             Some(LastFmPlaybackHandoffKind::ClearNowPlaying)
         );
 
-        assert_empty(owner.accept_load(accepted(identity, source), generation(15)));
+        let (handoff, error) = owner
+            .accept_load(accepted(identity, source), generation(15))
+            .into_parts();
+        assert!(handoff.is_none());
+        assert_eq!(
+            error,
+            Some(LastFmPlaybackOwnerError::Evidence(
+                LastFmPlaybackEvidenceError::Invariant
+            ))
+        );
         assert_empty(
             owner.observe_event(&PlayerEvent::state(generation(15), PlayerState::Playing)),
         );
@@ -1722,16 +2060,25 @@ mod tests {
         assert!(!debug.contains("CLOCK-ARTIST-SENTINEL"));
         assert!(!debug.contains("CLOCK-TITLE-SENTINEL"));
 
-        assert_empty(owner.accept_load(
-            accepted_with(
-                identity,
-                source,
-                "CLOCK-ARTIST-SENTINEL",
-                "CLOCK-TITLE-SENTINEL",
-                100,
-            ),
-            generation(24),
-        ));
+        let (handoff, error) = owner
+            .accept_load(
+                accepted_with(
+                    identity,
+                    source,
+                    "CLOCK-ARTIST-SENTINEL",
+                    "CLOCK-TITLE-SENTINEL",
+                    100,
+                ),
+                generation(24),
+            )
+            .into_parts();
+        assert!(handoff.is_none());
+        assert_eq!(
+            error,
+            Some(LastFmPlaybackOwnerError::Evidence(
+                LastFmPlaybackEvidenceError::Invariant
+            ))
+        );
         assert_empty(
             owner.observe_event(&PlayerEvent::state(generation(24), PlayerState::Playing)),
         );

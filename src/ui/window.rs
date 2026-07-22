@@ -64,6 +64,129 @@ type PlaybackUiReset = Rc<dyn Fn()>;
 type SourcePlaybackInvalidator = Rc<dyn Fn(&str)>;
 type PlaylistPlaybackInvalidator = Rc<dyn Fn(crate::architecture::SourceId)>;
 
+/// Keep coordinator ingress ahead of the history/UI reducers for one current
+/// player event.  The two callbacks make the ordering explicit and keep the
+/// rule independently testable without a GTK main loop.
+fn observe_player_event_before_history<T>(
+    observe: impl FnOnce(),
+    record_history: impl FnOnce() -> T,
+) -> T {
+    observe();
+    record_history()
+}
+
+/// Apply one scrubber intent without carrying a session or output borrow
+/// across the coordinator discontinuity boundary.
+///
+/// Every callback is invoked to completion before the next one begins.  A
+/// stale generation returns before reading the output or mutating any owner.
+fn apply_current_seek_intent(
+    generation: PlayerEventGeneration,
+    target_ms: u64,
+    accepts: impl FnOnce(PlayerEventGeneration) -> bool,
+    position_ms: impl FnOnce() -> u64,
+    record_history: impl FnOnce(PlayerEventGeneration, u64, u64),
+    observe_discontinuity: impl FnOnce(PlayerEventGeneration),
+    seek_output: impl FnOnce(u64),
+) -> bool {
+    if !accepts(generation) {
+        return false;
+    }
+
+    let actual_position_ms = position_ms();
+    record_history(generation, actual_position_ms, target_ms);
+    observe_discontinuity(generation);
+    seek_output(target_ms);
+    true
+}
+
+/// Close the process-scoped playback ingress before revoking registry
+/// authority.  Returning the source barrier keeps the existing async close
+/// drain unchanged while making the ordering deterministic.
+fn shutdown_playback_before_sources<T>(
+    shutdown_playback: impl FnOnce(),
+    retire_local_playback: impl FnOnce(),
+    shutdown_sources: impl FnOnce() -> T,
+) -> T {
+    shutdown_playback();
+    retire_local_playback();
+    shutdown_sources()
+}
+
+/// Registry transitions re-check the active proof rather than globally
+/// retiring playback.  This preserves an unrelated source's occurrence and
+/// lets same-session catalogue refreshes be decided by exact authority.
+fn revalidate_before_source_reconciliation<T>(
+    revalidate_active_authority: impl FnOnce(),
+    reconcile_source_projection: impl FnOnce() -> T,
+) -> T {
+    revalidate_active_authority();
+    reconcile_source_projection()
+}
+
+/// Apply a synchronous registry-driven invalidation without waiting for the
+/// asynchronous lifecycle reducer. Exact authority is revalidated first; an
+/// unrelated source therefore stops at `clear_owned == false`. If the local
+/// queue must still be cleared, typed retirement precedes the first output
+/// call and is idempotent when revalidation already retired the occurrence.
+fn invalidate_owned_playback_after_registry_change(
+    revalidate_active_authority: impl FnOnce(),
+    clear_owned: impl FnOnce() -> bool,
+    retire_cleared_occurrence: impl FnOnce(),
+    stop_output: impl FnOnce(),
+    reset_ui: impl FnOnce(),
+) -> bool {
+    revalidate_active_authority();
+    if !clear_owned() {
+        return false;
+    }
+
+    retire_cleared_occurrence();
+    stop_output();
+    reset_ui();
+    true
+}
+
+/// Terminal event handling must revoke the session proof before coordinator
+/// retirement, then stop output before releasing source authority. Keeping
+/// the sequence behind one helper prevents EOS and error branches from
+/// drifting apart as active Last.fm ownership is introduced.
+fn retire_terminal_playback_in_order(
+    clear_session: impl FnOnce(),
+    retire_coordinator: impl FnOnce(),
+    stop_output: impl FnOnce(),
+    retire_source: impl FnOnce(),
+) {
+    clear_session();
+    retire_coordinator();
+    stop_output();
+    retire_source();
+}
+
+/// A receiver-facing external lease cannot be retried after its registry
+/// owner is retired. Local/protected failures keep their queue item and exact
+/// retry path, so only the external branch receives terminal retirement.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PlaybackErrorDisposition {
+    Retry,
+    RetireExternal {
+        source_id: crate::architecture::SourceId,
+        retirement: crate::lastfm::playback_coordinator::LastFmPlaybackRetirement,
+    },
+}
+
+fn playback_error_disposition(
+    external_source: Option<crate::architecture::SourceId>,
+) -> PlaybackErrorDisposition {
+    match external_source {
+        Some(source_id) => PlaybackErrorDisposition::RetireExternal {
+            source_id,
+            retirement: crate::lastfm::playback_coordinator::LastFmPlaybackRetirement::Terminal,
+        },
+        None => PlaybackErrorDisposition::Retry,
+    }
+}
+
 fn configured_server_url(variable: &'static str) -> Option<String> {
     let raw = std::env::var(variable).ok()?;
     match crate::http_security::parse_base_url(&raw) {
@@ -1125,6 +1248,7 @@ fn setup_source_lifecycle_reducer(
     invalidate_playlist_playback: PlaylistPlaybackInvalidator,
     server_playlist_recovery: super::server_playlist_recovery::ServerPlaylistRecoveryController,
     server_playlist_browser: super::server_playlists::ServerPlaylistBrowserController,
+    lastfm_playback: crate::lastfm::playback_coordinator::LastFmPlaybackCoordinatorBinding,
 ) {
     let context = SourceReducerContext::from_window(
         state,
@@ -1136,7 +1260,12 @@ fn setup_source_lifecycle_reducer(
         let baseline = context.source_registry.snapshot_all();
         let mut revision = baseline.revision;
         let shutting_down = baseline.shutting_down;
-        reconcile_source_baseline(&context, &mut reducer, baseline);
+        revalidate_before_source_reconciliation(
+            || {
+                let _ = lastfm_playback.revalidate_active_authority();
+            },
+            || reconcile_source_baseline(&context, &mut reducer, baseline),
+        );
         server_playlist_recovery.source_lifecycle_changed();
         server_playlist_browser.source_lifecycle_changed();
         if shutting_down {
@@ -1156,7 +1285,12 @@ fn setup_source_lifecycle_reducer(
             let baseline = context.source_registry.snapshot_all();
             revision = baseline.revision;
             let shutting_down = baseline.shutting_down;
-            reconcile_source_baseline(&context, &mut reducer, baseline);
+            revalidate_before_source_reconciliation(
+                || {
+                    let _ = lastfm_playback.revalidate_active_authority();
+                },
+                || reconcile_source_baseline(&context, &mut reducer, baseline),
+            );
             // Reconcile the authoritative sidebar first. The browser derives
             // its source choices from that store, so an independent watch
             // listener could otherwise observe a newly accepted session
@@ -1171,11 +1305,13 @@ fn setup_source_lifecycle_reducer(
 }
 
 /// Build and present the main Tributary window.
-pub fn build_window(
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn build_window(
     app: &adw::Application,
     rt_handle: tokio::runtime::Handle,
     engine_tx: async_channel::Sender<LibraryEvent>,
     engine_rx: async_channel::Receiver<LibraryEvent>,
+    mut lastfm_playback_owner: crate::lastfm::playback_coordinator::LastFmPlaybackCoordinatorOwner,
 ) {
     info!("Building main window (Phase 4 — audio + desktop integration)");
 
@@ -1210,6 +1346,13 @@ pub fn build_window(
         configured_server_url("DAAP_URL").map(|url| (url, std::env::var("DAAP_PASSWORD").ok()));
 
     let source_registry = crate::source_registry::SourceRegistry::new(rt_handle.clone());
+    let lastfm_playback = lastfm_playback_owner
+        .bind_window(source_registry.clone())
+        .expect("the unique process playback coordinator binds one window epoch");
+    // The owner is deliberately non-cloneable. Keep the unique value alive
+    // for the native window and mutate it only at the close barrier; all
+    // ordinary playback callbacks receive the epoch-scoped binding instead.
+    let lastfm_playback_owner = Rc::new(RefCell::new(lastfm_playback_owner));
     // Subscribe before the first provenance claim or constructor. The GTK
     // reducer takes an atomic baseline later, then discards queued revisions
     // already represented by that baseline.
@@ -1427,39 +1570,70 @@ pub fn build_window(
         let playback_session = playback_session.clone();
         let active_output_slot = active_output_slot.clone();
         let playback_ui_reset_slot = playback_ui_reset_slot.clone();
+        let lastfm_playback = lastfm_playback.clone();
         Rc::new(move |source_key| {
-            if !playback_session.borrow_mut().clear_if_source(source_key) {
-                return;
+            if invalidate_owned_playback_after_registry_change(
+                || {
+                    let _ = lastfm_playback.revalidate_active_authority();
+                },
+                || playback_session.borrow_mut().clear_if_source(source_key),
+                || {
+                    let _ = lastfm_playback.retire(
+                        crate::lastfm::playback_coordinator::LastFmPlaybackRetirement::SourceRetirement,
+                    );
+                },
+                || {
+                    let active_output = active_output_slot.borrow().as_ref().cloned();
+                    if let Some(active_output) = active_output {
+                        active_output.borrow().stop();
+                    }
+                },
+                || {
+                    let clear_ui = playback_ui_reset_slot.borrow().as_ref().cloned();
+                    if let Some(clear_ui) = clear_ui {
+                        clear_ui();
+                    }
+                },
+            ) {
+                info!("Stopped playback owned by a retired source");
             }
-
-            if let Some(active_output) = active_output_slot.borrow().as_ref().cloned() {
-                active_output.borrow().stop();
-            }
-            if let Some(clear_ui) = playback_ui_reset_slot.borrow().as_ref().cloned() {
-                clear_ui();
-            }
-            info!("Stopped playback owned by a retired source");
         })
     };
     let invalidate_playlist_playback: PlaylistPlaybackInvalidator = {
         let playback_session = playback_session.clone();
         let active_output_slot = active_output_slot.clone();
         let playback_ui_reset_slot = playback_ui_reset_slot.clone();
+        let lastfm_playback = lastfm_playback.clone();
         Rc::new(move |source_id| {
-            if !playback_session
-                .borrow_mut()
-                .clear_if_playlist_authority(source_id)
-            {
-                return;
+            if invalidate_owned_playback_after_registry_change(
+                || {
+                    let _ = lastfm_playback.revalidate_active_authority();
+                },
+                || {
+                    playback_session
+                        .borrow_mut()
+                        .clear_if_playlist_authority(source_id)
+                },
+                || {
+                    let _ = lastfm_playback.retire(
+                        crate::lastfm::playback_coordinator::LastFmPlaybackRetirement::QueueAbandoned,
+                    );
+                },
+                || {
+                    let active_output = active_output_slot.borrow().as_ref().cloned();
+                    if let Some(active_output) = active_output {
+                        active_output.borrow().stop();
+                    }
+                },
+                || {
+                    let clear_ui = playback_ui_reset_slot.borrow().as_ref().cloned();
+                    if let Some(clear_ui) = clear_ui {
+                        clear_ui();
+                    }
+                },
+            ) {
+                info!(%source_id, "Stopped playlist playback after catalogue authority changed");
             }
-
-            if let Some(active_output) = active_output_slot.borrow().as_ref().cloned() {
-                active_output.borrow().stop();
-            }
-            if let Some(clear_ui) = playback_ui_reset_slot.borrow().as_ref().cloned() {
-                clear_ui();
-            }
-            info!(%source_id, "Stopped playlist playback after catalogue authority changed");
         })
     };
 
@@ -1631,6 +1805,7 @@ pub fn build_window(
     let shutdown_server_playlists = server_playlist_coordinator.clone();
     let shutdown_server_playlist_barrier = server_playlist_coordinator_barrier.clone();
     let shutdown_server_playlist_browser = server_playlist_browser.clone();
+    let shutdown_lastfm_playback_owner = lastfm_playback_owner.clone();
     let shutdown_started = Rc::new(Cell::new(false));
     let shutdown_started_for_close = shutdown_started.clone();
     let shutdown_complete = Rc::new(Cell::new(false));
@@ -1665,18 +1840,27 @@ pub fn build_window(
             // actions also consult the shared command-admission gate below.
             w.set_sensitive(false);
             super::open_files::invalidate_admission();
-            let external_source = shutdown_playback.borrow().current_external_source_id();
-            // Revoke the event generation before stopping the output so no
-            // terminal callback can enqueue behind the FIFO flush marker.
-            shutdown_playback.borrow_mut().clear();
-            let shutdown_output = shutdown_output_slot.borrow().as_ref().cloned();
-            if let Some(shutdown_output) = shutdown_output {
-                shutdown_output.borrow().stop();
-            }
-            if let Some(source_id) = external_source {
-                let _ = shutdown_sources.retire_external(source_id);
-            }
-            let barrier = shutdown_sources.shutdown();
+            let barrier = shutdown_playback_before_sources(
+                || {
+                    let _ = shutdown_lastfm_playback_owner.borrow_mut().shutdown();
+                },
+                || {
+                    let external_source = shutdown_playback.borrow().current_external_source_id();
+                    // Revoke the event generation before stopping the output
+                    // so no terminal callback can enqueue behind the FIFO
+                    // flush marker. Coordinator ingress is already closed,
+                    // and no owner borrow crosses either output call.
+                    shutdown_playback.borrow_mut().clear();
+                    let shutdown_output = shutdown_output_slot.borrow().as_ref().cloned();
+                    if let Some(shutdown_output) = shutdown_output {
+                        shutdown_output.borrow().stop();
+                    }
+                    if let Some(source_id) = external_source {
+                        let _ = shutdown_sources.retire_external(source_id);
+                    }
+                },
+                || shutdown_sources.shutdown(),
+            );
             let window = w.clone();
             let shutdown_complete = shutdown_complete.clone();
             let server_playlist_barrier = shutdown_server_playlist_barrier.clone();
@@ -2006,6 +2190,7 @@ pub fn build_window(
         invalidate_playlist_playback,
         server_playlist_recovery.clone(),
         server_playlist_browser.clone(),
+        lastfm_playback.clone(),
     );
 
     // Playlist management, including the server-playlist browser, remains
@@ -2228,6 +2413,7 @@ pub fn build_window(
             let playback_rt = rt_handle.clone();
             let playback_config = app_config.clone();
             let playback_source_registry = source_registry.clone();
+            let playback_lastfm = lastfm_playback.clone();
             let media_playback_admission = library_commands.clone();
 
             glib::MainContext::default().spawn_local(async move {
@@ -2250,6 +2436,7 @@ pub fn build_window(
                         rt_handle: playback_rt.clone(),
                         column_view: column_view_for_keys.clone(),
                         source_registry: playback_source_registry.clone(),
+                        lastfm_playback: playback_lastfm.clone(),
                     };
                     match action {
                         MediaAction::Play => {
@@ -2322,6 +2509,7 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_lastfm = lastfm_playback.clone();
         let playback_admission = library_commands.clone();
 
         hb.play_button.connect_clicked(move |_| {
@@ -2342,6 +2530,7 @@ pub fn build_window(
                     rt_handle: playback_rt.clone(),
                     column_view: column_view_c.clone(),
                     source_registry: playback_source_registry.clone(),
+                    lastfm_playback: playback_lastfm.clone(),
                 },
                 shuffle.is_active(),
             );
@@ -2377,6 +2566,7 @@ pub fn build_window(
             &hb.volume_scale,
             &rt_handle,
             &source_registry,
+            &lastfm_playback,
         );
     }
 
@@ -2423,6 +2613,7 @@ pub fn build_window(
         let active_output = active_output.clone();
         let playback_session = playback_session.clone();
         let seeking = seeking.clone();
+        let playback_lastfm = lastfm_playback.clone();
         let playback_admission = library_commands.clone();
         let pending: Rc<Cell<Option<(PlayerEventGeneration, u64)>>> = Rc::new(Cell::new(None));
         let scheduled = Rc::new(Cell::new(false));
@@ -2444,6 +2635,7 @@ pub fn build_window(
             let pending = pending.clone();
             let seeking = seeking.clone();
             let scheduled = scheduled.clone();
+            let playback_lastfm = playback_lastfm.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
                 scheduled.set(false);
                 let intent = pending.take();
@@ -2458,20 +2650,27 @@ pub fn build_window(
                 let Some((generation, target_ms)) = intent else {
                     return;
                 };
-                if !playback_session
-                    .borrow()
-                    .accepts_event_generation(generation)
-                {
-                    return;
-                }
-
-                let actual_position_ms = active_output.borrow().position_ms().unwrap_or(0);
-                let _ = playback_session.borrow_mut().observe_history_seek(
+                let _ = apply_current_seek_intent(
                     generation,
-                    actual_position_ms,
                     target_ms,
+                    |generation| {
+                        playback_session
+                            .borrow()
+                            .accepts_event_generation(generation)
+                    },
+                    || active_output.borrow().position_ms().unwrap_or(0),
+                    |generation, actual_position_ms, target_ms| {
+                        let _ = playback_session.borrow_mut().observe_history_seek(
+                            generation,
+                            actual_position_ms,
+                            target_ms,
+                        );
+                    },
+                    |generation| {
+                        let _ = playback_lastfm.observe_discontinuity(generation);
+                    },
+                    |target_ms| active_output.borrow().seek_to(target_ms),
                 );
-                active_output.borrow().seek_to(target_ms);
             });
         });
     }
@@ -2508,6 +2707,7 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_lastfm = lastfm_playback.clone();
         let playback_admission = library_commands.clone();
 
         column_view.connect_activate(move |_view, position| {
@@ -2529,6 +2729,7 @@ pub fn build_window(
                     rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
                     source_registry: playback_source_registry.clone(),
+                    lastfm_playback: playback_lastfm.clone(),
                 },
             );
         });
@@ -2577,6 +2778,7 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_lastfm = lastfm_playback.clone();
         let playback_admission = library_commands.clone();
 
         hb.next_button.connect_clicked(move |_| {
@@ -2597,6 +2799,7 @@ pub fn build_window(
                     rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
                     source_registry: playback_source_registry.clone(),
+                    lastfm_playback: playback_lastfm.clone(),
                 },
                 repeat_mode.get(),
                 shuffle.is_active(),
@@ -2620,6 +2823,7 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_lastfm = lastfm_playback.clone();
         let playback_admission = library_commands.clone();
 
         hb.prev_button.connect_clicked(move |_| {
@@ -2640,6 +2844,7 @@ pub fn build_window(
                     rt_handle: playback_rt.clone(),
                     column_view: cv.clone(),
                     source_registry: playback_source_registry.clone(),
+                    lastfm_playback: playback_lastfm.clone(),
                 },
                 repeat_mode.get(),
                 shuffle.is_active(),
@@ -2671,6 +2876,7 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_lastfm = lastfm_playback.clone();
         let playback_history_commands = library_commands.clone();
 
         // Pre-build a spinner widget for the buffering state.
@@ -2699,8 +2905,13 @@ pub fn build_window(
                 // the occurrence. The session latches exactly once and the
                 // unbounded FIFO accepts synchronously, so no detached send
                 // task can outlive the normal-shutdown drain marker.
-                if let Some(track_id) = playback_session.borrow_mut().observe_history_event(&event)
-                {
+                let history_track_id = observe_player_event_before_history(
+                    || {
+                        let _ = playback_lastfm.observe_event(&event);
+                    },
+                    || playback_session.borrow_mut().observe_history_event(&event),
+                );
+                if let Some(track_id) = history_track_id {
                     let counted_at_ms = Utc::now().timestamp_millis();
                     if !playback_history_commands.try_send(LibraryCommand::RecordPlaybackHistory {
                         track_id,
@@ -2826,6 +3037,7 @@ pub fn build_window(
                                 rt_handle: playback_rt.clone(),
                                 column_view: cv.clone(),
                                 source_registry: playback_source_registry.clone(),
+                                lastfm_playback: playback_lastfm.clone(),
                             })
                         {
                             continue;
@@ -2846,6 +3058,7 @@ pub fn build_window(
                                 rt_handle: playback_rt.clone(),
                                 column_view: cv.clone(),
                                 source_registry: playback_source_registry.clone(),
+                                lastfm_playback: playback_lastfm.clone(),
                             },
                             mode,
                             shuffle.is_active(),
@@ -2863,11 +3076,20 @@ pub fn build_window(
                             if external_source.is_some() {
                                 super::open_files::invalidate_admission();
                             }
-                            playback_session.borrow_mut().clear();
-                            active_output.borrow().stop();
-                            if let Some(source_id) = external_source {
-                                let _ = playback_source_registry.retire_external(source_id);
-                            }
+                            retire_terminal_playback_in_order(
+                                || playback_session.borrow_mut().clear(),
+                                || {
+                                    let _ = playback_lastfm.retire(
+                                        crate::lastfm::playback_coordinator::LastFmPlaybackRetirement::QueueAbandoned,
+                                    );
+                                },
+                                || active_output.borrow().stop(),
+                                || {
+                                    if let Some(source_id) = external_source {
+                                        let _ = playback_source_registry.retire_external(source_id);
+                                    }
+                                },
+                            );
                             clear_playback_ui();
                         }
                     }
@@ -2884,11 +3106,22 @@ pub fn build_window(
                         let external_source = playback_session
                             .borrow()
                             .external_source_for_terminal(event_generation, false);
-                        if let Some(source_id) = external_source {
+                        if let PlaybackErrorDisposition::RetireExternal {
+                            source_id,
+                            retirement,
+                        } = playback_error_disposition(external_source)
+                        {
                             super::open_files::invalidate_admission();
-                            playback_session.borrow_mut().clear();
-                            active_output.borrow().stop();
-                            let _ = playback_source_registry.retire_external(source_id);
+                            retire_terminal_playback_in_order(
+                                || playback_session.borrow_mut().clear(),
+                                || {
+                                    let _ = playback_lastfm.retire(retirement);
+                                },
+                                || active_output.borrow().stop(),
+                                || {
+                                    let _ = playback_source_registry.retire_external(source_id);
+                                },
+                            );
                             clear_playback_ui();
                             continue;
                         }
@@ -2970,6 +3203,7 @@ pub fn build_window(
         let playback_rt = rt_handle.clone();
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
+        let playback_lastfm = lastfm_playback.clone();
         let playback_admission = library_commands.clone();
 
         let play_pending = gtk::gio::SimpleAction::new("play-pending-files", None);
@@ -3002,6 +3236,7 @@ pub fn build_window(
             let playback_rt = playback_rt.clone();
             let playback_config = playback_config.clone();
             let playback_source_registry = playback_source_registry.clone();
+            let playback_lastfm = playback_lastfm.clone();
             let playback_admission = playback_admission.clone();
             glib::MainContext::default().spawn_local(async move {
                 match admission.await {
@@ -3022,6 +3257,7 @@ pub fn build_window(
                             rt_handle: playback_rt,
                             column_view: cv,
                             source_registry: playback_source_registry,
+                            lastfm_playback: playback_lastfm,
                         };
                         if super::playback::play_external_session(pending.session(), &ctx) {
                             pending.commit();
@@ -4393,6 +4629,172 @@ mod identity_tests {
         SourceId,
     };
     use crate::local::playlist_sidebar::{PlaylistSidebarEntry, PlaylistSidebarKind};
+
+    #[test]
+    fn coordinator_observes_current_event_before_history_and_ui_mutation() {
+        let order = RefCell::new(Vec::new());
+        observe_player_event_before_history(
+            || order.borrow_mut().push("coordinator"),
+            || order.borrow_mut().push("history"),
+        );
+        order.borrow_mut().push("ui");
+        assert_eq!(*order.borrow(), ["coordinator", "history", "ui"]);
+    }
+
+    #[test]
+    fn current_seek_records_history_then_discontinuity_before_output() {
+        let order = RefCell::new(Vec::new());
+        assert!(apply_current_seek_intent(
+            PlayerEventGeneration::from_raw(7),
+            42_000,
+            |generation| {
+                order.borrow_mut().push("generation");
+                generation == PlayerEventGeneration::from_raw(7)
+            },
+            || {
+                order.borrow_mut().push("position");
+                9_000
+            },
+            |generation, actual, target| {
+                assert_eq!(generation, PlayerEventGeneration::from_raw(7));
+                assert_eq!((actual, target), (9_000, 42_000));
+                order.borrow_mut().push("history");
+            },
+            |generation| {
+                assert_eq!(generation, PlayerEventGeneration::from_raw(7));
+                order.borrow_mut().push("coordinator");
+            },
+            |target| {
+                assert_eq!(target, 42_000);
+                order.borrow_mut().push("output");
+            },
+        ));
+        assert_eq!(
+            *order.borrow(),
+            ["generation", "position", "history", "coordinator", "output"]
+        );
+    }
+
+    #[test]
+    fn stale_seek_never_reads_or_mutates_playback_owners() {
+        let callbacks = Cell::new(0);
+        assert!(!apply_current_seek_intent(
+            PlayerEventGeneration::from_raw(8),
+            42_000,
+            |_| false,
+            || {
+                callbacks.set(callbacks.get() + 1);
+                0
+            },
+            |_, _, _| callbacks.set(callbacks.get() + 1),
+            |_| callbacks.set(callbacks.get() + 1),
+            |_| callbacks.set(callbacks.get() + 1),
+        ));
+        assert_eq!(callbacks.get(), 0);
+    }
+
+    #[test]
+    fn source_changes_revalidate_and_shutdown_precedes_registry_revocation() {
+        let order = RefCell::new(Vec::new());
+        revalidate_before_source_reconciliation(
+            || order.borrow_mut().push("revalidate"),
+            || order.borrow_mut().push("source-specific invalidation"),
+        );
+        let barrier = shutdown_playback_before_sources(
+            || order.borrow_mut().push("coordinator shutdown"),
+            || order.borrow_mut().push("local playback retirement"),
+            || {
+                order.borrow_mut().push("registry shutdown");
+                "barrier"
+            },
+        );
+        assert_eq!(barrier, "barrier");
+        assert_eq!(
+            *order.borrow(),
+            [
+                "revalidate",
+                "source-specific invalidation",
+                "coordinator shutdown",
+                "local playback retirement",
+                "registry shutdown"
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_source_invalidation_revalidates_then_retires_before_output() {
+        let order = RefCell::new(Vec::new());
+        assert!(invalidate_owned_playback_after_registry_change(
+            || order.borrow_mut().push("revalidate"),
+            || {
+                order.borrow_mut().push("clear queue proof");
+                true
+            },
+            || order.borrow_mut().push("typed retirement"),
+            || order.borrow_mut().push("output stop"),
+            || order.borrow_mut().push("ui reset"),
+        ));
+        assert_eq!(
+            *order.borrow(),
+            [
+                "revalidate",
+                "clear queue proof",
+                "typed retirement",
+                "output stop",
+                "ui reset"
+            ]
+        );
+    }
+
+    #[test]
+    fn unrelated_source_invalidation_only_revalidates_exact_authority() {
+        let order = RefCell::new(Vec::new());
+        assert!(!invalidate_owned_playback_after_registry_change(
+            || order.borrow_mut().push("revalidate"),
+            || {
+                order.borrow_mut().push("source-specific clear check");
+                false
+            },
+            || order.borrow_mut().push("unexpected retirement"),
+            || order.borrow_mut().push("unexpected output stop"),
+            || order.borrow_mut().push("unexpected ui reset"),
+        ));
+        assert_eq!(
+            *order.borrow(),
+            ["revalidate", "source-specific clear check"]
+        );
+    }
+
+    #[test]
+    fn only_receiver_facing_external_errors_force_terminal_retirement() {
+        assert_eq!(
+            playback_error_disposition(None),
+            PlaybackErrorDisposition::Retry
+        );
+        let source_id = crate::architecture::SourceId::external();
+        assert_eq!(
+            playback_error_disposition(Some(source_id)),
+            PlaybackErrorDisposition::RetireExternal {
+                source_id,
+                retirement: crate::lastfm::playback_coordinator::LastFmPlaybackRetirement::Terminal,
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_events_clear_session_before_coordinator_output_and_source() {
+        let order = RefCell::new(Vec::new());
+        retire_terminal_playback_in_order(
+            || order.borrow_mut().push("session proof"),
+            || order.borrow_mut().push("coordinator"),
+            || order.borrow_mut().push("output"),
+            || order.borrow_mut().push("source"),
+        );
+        assert_eq!(
+            *order.borrow(),
+            ["session proof", "coordinator", "output", "source"]
+        );
+    }
 
     fn local_history_row(track_id: &str, uri: &str, play_count: u32) -> TrackObject {
         let row = TrackObject::new(

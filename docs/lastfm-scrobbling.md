@@ -1,8 +1,9 @@
 # Last.fm scrobbling contract
 
 - Status: accepted P2.1 design; internal protocol/desktop-authorization/vault/queue/playback-evidence,
-  registry-bound external and removable attribution, playback-owner, delivery/lifecycle, and
-  now-playing boundaries implemented; product integration pending
+  registry-bound external and removable attribution, playback-owner, delivery/lifecycle,
+  now-playing, and Dormant process-coordinator/production-ingress boundaries implemented; product
+  integration pending
 - Decision date: 2026-07-20
 - Implementation status date: 2026-07-22
 - Tracking issue: [#50](https://github.com/jm2/tributary/issues/50)
@@ -64,9 +65,10 @@ The implemented internal foundation includes:
   already carry their registry-minted proof; removable queue capture asks the live registry to mint
   an exact current-session proof before freezing the redacted profile and source reference into the
   `QueueItem` occurrence. Authenticated remotes remain closed because neither their exact profiles
-  nor a production remote-source opt-in set exists. External/removable profile and proof
-  construction is implemented, but production playback does not consume it yet; exact local and
-  authenticated-remote profiles remain;
+  nor a production remote-source opt-in set exists. Accepted external/removable authority now
+  reaches the production coordinator boundary, but its Dormant path consumes and revokes the exact
+  proof through a metadata-free discard closure without constructing `LastFmAcceptedOutputLoad`;
+  exact local and authenticated-remote profiles remain;
 - a GTK-free playback owner around that state machine. One move-only accepted-output proof binds an
   exact output generation to either validated eligible playback or an explicit ineligible accepted
   replacement, so a caller cannot attach one metadata decision to another generation. Eligible
@@ -76,9 +78,28 @@ The implemented internal foundation includes:
   makes a delayed accepted load and stale NowPlaying/Clear handoff inert after a successor wins;
   qualified Enqueue is deliberately not retroactively revoked. An ineligible or policy-rejected
   accepted replacement terminally retires its predecessor and emits at most one explicit clear.
+  A separate move-only intent closes predecessor delivery before output invocation. The exact same
+  queue occurrence may retry while preserving UUID, first-evidence time, credit, metadata, and
+  one-shot latches; a different or ineligible replacement retires terminally, and an incoherent or
+  skipped generation fails closed.
   Typed, move-only now-playing/scrobble/clear handoffs keep payloads private until the exact registry
   and runtime admission boundary, and fixed diagnostics redact source, generation, identity, and
-  metadata. This owner deliberately has no production constructor or coordinator yet;
+  metadata. No production `LastFmPlaybackOwner` instance exists yet;
+- one non-cloneable, non-recreatable process playback coordinator claimed before GTK activation and
+  transferable only to the first window. Its cloneable redacted binding carries a checked window
+  epoch, makes stale-window callbacks inert, converts poison into terminal shutdown, and cannot be
+  recreated after owner drop. Production call sites report move-only output intent before invoking
+  an output, handle accepted/rejected session settlement, hand accepted loads to the lazy boundary,
+  and report current player events before history/UI reduction, seek/Previous/resume
+  discontinuities, Stop, committed output replacement, queue/external-terminal retirement,
+  source-authority revalidation points, and application shutdown without retaining a GTK `RefCell`
+  borrow across coordinator ingress. Source changes invoke that boundary before selective queue
+  invalidation; Dormant mode has no active proof to revalidate, unrelated-source changes remain
+  otherwise inert, and output reselection or failed preflight likewise does not retire. The coordinator remains deliberately `Dormant` and
+  contains no playback owner, runtime, transport, vault, credentials, activation capability,
+  metadata, or policy. Dormant, stale, failed, and shutdown load settlement never invokes its lazy
+  metadata extractor and instead calls one separate metadata-free exact-discard closure after
+  releasing the coordinator lock;
 - a serialized actor with bounded admission for 64 ordinary metadata commands and four reserved
   control slots: one delivery result, two lifecycle markers, and one explicit now-playing clear.
   Delivery, lifecycle, and playback retirement therefore cannot be starved by the ordinary FIFO;
@@ -129,22 +150,20 @@ The implemented internal foundation includes:
   capability pause for any still-unpurged account before releasing the lease. If SQLite cannot
   establish that pause, the shutdown proof remains failed and no durable-pause claim is made.
 
-This foundation is intentionally not exposed as a partial user feature. Still remaining are one
-process-lifetime, non-recreatable production owner/coordinator for the internal playback owner;
-production consumption of the implemented external-file and removable profiles/proofs; exact local
-and authenticated-remote profile construction plus production remote-source opt-in; and production
-wiring for accepted/rejected load results, runtime playback events, every terminal path, source
-retirement, and application shutdown.
-The coordinator must dispatch the owner's move-only action/clear handoffs without crossing GTK
-borrow boundaries. Also remaining are
+This foundation is intentionally not exposed as a partial user feature. Still remaining are active
+construction of the internal `LastFmPlaybackOwner` and delivery/runtime owner inside the existing
+process coordinator; metadata extraction and dispatch of the owner's move-only action/clear
+handoffs; exact local and authenticated-remote profile construction plus production remote-source
+opt-in; and activation/per-source policy. Also remaining are
 localized consent and browser invocation around the completed authorization core; one process-wide
 authorization/runtime owner; atomic staged-session vault installation, exact same-account
 reauthorization and different-account replacement/purge policy; enablement, exact per-source/session
 policy, and a production activation issuer; settings, account/recovery/status, valid-vault
 corrupt-queue recovery, accessibility, and all localization UI; release-time production credential
 injection and package verification; and the remaining live end-to-end and platform acceptance
-matrix. The internal observer, playback owner, and now-playing lane are complete boundaries but
-deliberately unwired; the countable P2.1 record stays open until those product layers land.
+matrix. The internal observer, playback owner, runtime, and now-playing lane are complete boundaries
+but remain uninstantiated or unconnected while the coordinator is Dormant; the countable P2.1
+record stays open until those product layers land.
 
 The central rule is:
 
