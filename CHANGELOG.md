@@ -15,13 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [runtime/lifecycle slice](https://github.com/jm2/tributary/pull/153),
   [playback/now-playing slice](https://github.com/jm2/tributary/pull/154),
   [desktop-authorization slice](https://github.com/jm2/tributary/pull/155),
-  [playback-ownership slice](https://github.com/jm2/tributary/pull/156)).
+  [playback-ownership slice](https://github.com/jm2/tributary/pull/156),
+  [removable-attribution slice](https://github.com/jm2/tributary/pull/157)).
   This is an internal foundation, not yet a user-visible scrobbling feature. The standalone
   playback observer, GTK-free playback owner/handoffs, and runtime-owned now-playing lane are
   deliberately not connected to production playback or application startup. Exact real-tag
-  external profiles and registry-bound proofs are constructed, but their production playback
-  consumer is still unwired. One process-lifetime, non-recreatable production playback
-  owner/coordinator, exact local/removable/authenticated-remote profiles, runtime event and
+  external and removable profiles, registry-bound proofs, and registry-minted removable queue
+  capture are constructed, but their production playback consumer is still unwired.
+  Authenticated remotes remain closed because exact remote profiles and a production remote-source
+  opt-in set do not exist. One process-lifetime, non-recreatable production playback
+  owner/coordinator, exact local/authenticated-remote profiles, runtime event and
   terminal/source-retirement/shutdown wiring, construction of the authorization owner, explicit
   consent and browser launch, staged-session vault installation and account transition policy,
   exact per-source/session policy, settings/status UI, localization and accessibility, and
@@ -81,19 +84,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     binds one exact accepted output generation to either eligible frozen occurrence data or an
     explicit ineligible replacement. Each `QueueItem` freezes that occurrence's structured
     metadata, and only `PlaybackSession` can issue the private production mint witness after the
-    exact generation crosses output acceptance. Managed external input carries an opaque
-    registry-minted attribution reference bound to one registry instance, one exact session or
-    catalogue authority, and one exact source-owned profile. Minting and admission revalidate
+    exact generation crosses output acceptance. Managed external and removable input carries an
+    opaque registry-minted attribution reference bound to one registry instance, one exact session
+    or catalogue authority, and one exact source-owned profile. Minting and admission revalidate
     capability, provenance, source opt-in, profile, epoch/generation, catalogue authority, and
-    membership under the lifecycle lock. External profiles require parser-attested title and
-    artist; filenames and the display-only `Unknown` album are never substituted. Ineligible or
-    policy-rejected replacements terminally retire their predecessor and emit at most one explicit
-    clear. Lock-linearized freshness makes delayed accepted loads and stale NowPlaying/Clear
-    handoffs inert after a successor, while a qualified Enqueue is not retroactively revoked.
-    Move-only redacted handoffs keep payloads private through exact source and runtime admission.
-    No process-lifetime, non-recreatable production owner/coordinator exists yet to own this
-    internal boundary; external proof consumption and exact local/removable/authenticated-remote
-    profiles remain unwired.
+    membership under the lifecycle lock. External and removable profiles require parser-attested
+    title and artist; filenames and the display-only `Unknown` album are never substituted. The
+    removable queue path asks the live registry to mint that exact session-bound proof while it
+    captures the `QueueItem`; authenticated-remote capture remains denied without both an exact
+    profile and a production opt-in source set. Ineligible or policy-rejected replacements
+    terminally retire their predecessor and emit at most one explicit clear. Lock-linearized
+    freshness makes delayed accepted loads and stale NowPlaying/Clear handoffs inert after a
+    successor, while a qualified Enqueue is not retroactively revoked. Move-only redacted handoffs
+    keep payloads private through exact source and runtime admission. No process-lifetime,
+    non-recreatable production owner/coordinator exists yet to own this internal boundary; proof
+    consumption and exact local/authenticated-remote profiles remain unwired.
   - **Private offline FIFO and durable delivery gate:** migration 17 creates and revalidates a
     constrained queue containing
     only bounded submission metadata, opaque occurrence/order identity, one-way account binding,

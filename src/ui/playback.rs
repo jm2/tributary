@@ -23,7 +23,10 @@ use crate::lastfm::playback_owner::{
     LastFmPlaybackOccurrenceIdentity, LastFmPlaybackSource,
 };
 use crate::local::playback_history::PlaybackHistoryProgress;
-use crate::source_registry::{PlaybackAttributionProfile, RegularPlaylistCatalogueGuard};
+use crate::source_registry::{
+    PlaybackAttributionProfile, PlaybackSourceReference, RegularPlaylistCatalogueGuard,
+    SourceRegistry,
+};
 use crate::ui::header_bar::RepeatMode;
 use crate::ui::objects::{PlaylistOccurrenceState, TrackObject};
 
@@ -256,8 +259,8 @@ pub struct QueueItem {
     /// shape alone cannot safely recover this lifecycle distinction later.
     external_session: bool,
     /// Exact attribution authority captured before this queue occurrence was
-    /// created. Production TrackObject paths remain `None`; external files
-    /// receive this only from an opaque registry-minted reference.
+    /// created. Eligible managed rows receive it only through a registry-minted
+    /// session/catalogue reference; external files carry their session proof.
     lastfm_source: Option<LastFmPlaybackSource>,
     /// Exact structured payload bound into `lastfm_source`. Candidate fields
     /// are derived from this profile, never from mutable/display metadata.
@@ -283,6 +286,7 @@ impl QueueItem {
         track: &TrackObject,
         occurrence: usize,
         regular_playlist_guard: Option<RegularPlaylistCatalogueGuard>,
+        playback_source: Option<PlaybackSourceReference>,
     ) -> Self {
         let is_library = is_library_source(identity.media_key.source_id);
         let raw_duration_secs = track.duration_secs();
@@ -290,6 +294,10 @@ impl QueueItem {
         let duration_ms = duration_secs.map(|duration_secs| duration_secs.saturating_mul(1_000));
         let album_artist = track.album_artist();
         let track_number = track.track_number();
+        let lastfm_profile = playback_source
+            .as_ref()
+            .map(|reference| reference.profile().clone());
+        let lastfm_source = playback_source.map(LastFmPlaybackSource::managed);
         Self {
             identity,
             occurrence,
@@ -299,11 +307,12 @@ impl QueueItem {
                 .or_else(|| track.source_session_epoch()),
             regular_playlist_guard,
             external_session: false,
-            // TrackObject intentionally has no provenance channel yet. Local
-            // parser and remote adapter display fallbacks must not silently
-            // become Last.fm attribution.
-            lastfm_source: None,
-            lastfm_profile: None,
+            // Only an opaque reference minted from the exact live registry
+            // session/catalogue can authorize attribution. Its immutable
+            // profile, rather than mutable GTK display fields, supplies the
+            // Last.fm candidate below.
+            lastfm_source,
+            lastfm_profile,
             duration_ms,
             duration_secs,
             // Local and lifecycle-owned rows (including either kind of
@@ -1529,11 +1538,16 @@ fn capture_visible_queue(
     model: &impl IsA<gtk::gio::ListModel>,
     source_key: &str,
     selected_position: u32,
+    source_registry: &SourceRegistry,
 ) -> Option<CapturedQueue> {
     let view = queue_view(source_key)?;
     let mut selected_index = None;
     let mut items = Vec::with_capacity(model.n_items() as usize);
     let mut occurrences: HashMap<MediaKey, usize> = HashMap::new();
+    // Persisted per-remote consent is intentionally not part of this slice.
+    // The registry's closed policy therefore admits only intrinsically
+    // eligible managed sources (currently removable media for visible rows).
+    let enabled_remote_sources = HashSet::new();
 
     for model_index in 0..model.n_items() {
         let Some(track) = model.item(model_index).and_downcast::<TrackObject>() else {
@@ -1545,12 +1559,27 @@ fn capture_visible_queue(
         if model_index == selected_position {
             selected_index = Some(items.len());
         }
+        let playback_source = match regular_playlist_guard {
+            Some(guard) => source_registry.mint_regular_playlist_playback_source(
+                identity.media_key.clone(),
+                guard,
+                &enabled_remote_sources,
+            ),
+            None => track.source_session_epoch().and_then(|session_epoch| {
+                source_registry.mint_session_playback_source(
+                    identity.media_key.clone(),
+                    session_epoch,
+                    &enabled_remote_sources,
+                )
+            }),
+        };
         let occurrence = occurrences.entry(identity.media_key.clone()).or_default();
         items.push(QueueItem::from_track(
             identity,
             &track,
             *occurrence,
             regular_playlist_guard,
+            playback_source,
         ));
         *occurrence += 1;
     }
@@ -1669,7 +1698,9 @@ fn resolve_session_play_request(
 /// starts the selected item. Later view mutations do not alter that queue.
 pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     let source_key = ctx.active_source_key.borrow().clone();
-    let Some(captured) = capture_visible_queue(&ctx.model, &source_key, position) else {
+    let Some(captured) =
+        capture_visible_queue(&ctx.model, &source_key, position, &ctx.source_registry)
+    else {
         return false;
     };
     let selected = &captured.items[captured.selected_index];
@@ -2455,6 +2486,75 @@ mod tests {
         volume: f64,
     }
 
+    struct PlaybackRegistryFixture {
+        runtime: tokio::runtime::Runtime,
+        registry: SourceRegistry,
+    }
+
+    impl PlaybackRegistryFixture {
+        fn new() -> Self {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let registry = SourceRegistry::new(runtime.handle().clone());
+            Self { runtime, registry }
+        }
+
+        fn capture(
+            &self,
+            model: &impl IsA<gtk::gio::ListModel>,
+            source_key: &str,
+            selected_position: u32,
+        ) -> Option<CapturedQueue> {
+            capture_visible_queue(model, source_key, selected_position, &self.registry)
+        }
+
+        fn wait_for_catalogue(
+            &self,
+            source_id: SourceId,
+        ) -> (u64, Vec<crate::architecture::models::Track>) {
+            self.runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if let Some(snapshot) = self.registry.snapshot(source_id) {
+                            if snapshot.state == crate::source_lifecycle::SourceState::Ready {
+                                let session_epoch = snapshot
+                                    .session_epoch
+                                    .expect("ready source owns a session epoch");
+                                let tracks = snapshot
+                                    .catalogue
+                                    .expect("ready source publishes a catalogue")
+                                    .value
+                                    .tracks()
+                                    .to_vec();
+                                return (session_epoch, tracks);
+                            }
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("source catalogue becomes ready")
+            })
+        }
+
+        fn disconnect(&self, source_id: SourceId) {
+            let waiter = self
+                .registry
+                .disconnect(source_id)
+                .expect("live source begins retirement");
+            self.runtime.block_on(waiter.wait());
+        }
+    }
+
+    impl Drop for PlaybackRegistryFixture {
+        fn drop(&mut self) {
+            let barrier = self.registry.shutdown();
+            self.runtime.block_on(barrier.wait());
+        }
+    }
+
     impl RecordingOutput {
         fn new(reject_loads: usize) -> (Self, Rc<RefCell<RecordingOutputState>>) {
             let state = Rc::new(RefCell::new(RecordingOutputState::default()));
@@ -2668,6 +2768,78 @@ mod tests {
         projected_row(id, &format!("file:///music/{id}.flac"))
     }
 
+    fn write_lastfm_flac(path: &std::path::Path, title: Option<&str>, artist: Option<&str>) {
+        let mut fixture = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/audio/silence.flac"
+        ))
+        .to_vec();
+        assert_eq!(&fixture[..4], b"fLaC");
+        // Raise the shared 100 ms fixture's declared duration above Last.fm's
+        // strict 30-second boundary without adding another binary fixture.
+        let packed = u64::from_be_bytes(
+            fixture[18..26]
+                .try_into()
+                .expect("FLAC STREAMINFO sample word"),
+        );
+        let sample_rate = (packed >> 44) & 0x0f_ffff;
+        assert!(sample_rate > 0);
+        let total_samples = sample_rate * 31;
+        assert!(total_samples < (1_u64 << 36));
+        let declared = (packed & !((1_u64 << 36) - 1)) | total_samples;
+        fixture[18..26].copy_from_slice(&declared.to_be_bytes());
+        std::fs::write(path, fixture).expect("copy FLAC fixture");
+        crate::local::tag_writer::write_tags(
+            path,
+            &crate::local::tag_writer::TagEdits {
+                // Explicit empty edits prove tag absence rather than relying
+                // on the shared fixture's current metadata.
+                title: Some(title.unwrap_or_default().to_string()),
+                artist: Some(artist.unwrap_or_default().to_string()),
+                album: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .expect("write exact removable fixture tags");
+    }
+
+    fn managed_row(
+        track: &crate::architecture::models::Track,
+        source_id: SourceId,
+        session_epoch: Option<u64>,
+        display_title: &str,
+        display_artist: &str,
+    ) -> TrackObject {
+        let row = TrackObject::new(
+            track.track_number.unwrap_or(0),
+            display_title,
+            track.duration_secs.unwrap_or(0),
+            display_artist,
+            &track.album_title,
+            track.genre.as_deref().unwrap_or("Unknown"),
+            track.composer.as_deref().unwrap_or(""),
+            track.year.unwrap_or(0),
+            "",
+            track.bitrate_kbps.unwrap_or(0),
+            track.sample_rate_hz.unwrap_or(0),
+            track.play_count.unwrap_or(0),
+            track.format.as_deref().unwrap_or(""),
+            "",
+        );
+        row.set_track_id(
+            track
+                .native_track_id
+                .as_ref()
+                .expect("managed track has an exact native identity")
+                .as_str(),
+        );
+        assert!(row.set_source_id(source_id));
+        if let Some(session_epoch) = session_epoch {
+            row.set_source_session_epoch(session_epoch);
+        }
+        row
+    }
+
     fn ids(session: &PlaybackSession) -> Vec<String> {
         session
             .queue
@@ -2708,7 +2880,7 @@ mod tests {
             row.source_id().unwrap_or(view.source_id),
             TrackId::new(row.track_id()).expect("test track identity"),
         );
-        QueueItem::from_track(identity, row, occurrence, None)
+        QueueItem::from_track(identity, row, occurrence, None, None)
     }
 
     fn refreshed_metadata() -> QueueTrackRefresh {
@@ -3050,12 +3222,15 @@ mod tests {
 
     #[test]
     fn production_snapshot_survives_sort_filter_navigation_and_owns_output_events() {
+        let registry = PlaybackRegistryFixture::new();
         let source_key = "fixture-device-a";
         let store = gtk::gio::ListStore::new::<TrackObject>();
         for id in ["a", "b", "c"] {
             store.append(&playback_row(id));
         }
-        let captured = capture_visible_queue(&store, source_key, 1).expect("visible B is captured");
+        let captured = registry
+            .capture(&store, source_key, 1)
+            .expect("visible B is captured");
         assert_eq!(
             captured
                 .items
@@ -3116,8 +3291,9 @@ mod tests {
         // not install a queue until the user explicitly starts one there.
         store.remove_all();
         store.append(&playback_row("remote-x"));
-        let remote_projection =
-            capture_visible_queue(&store, "remote-server", 0).expect("remote view captures");
+        let remote_projection = registry
+            .capture(&store, "remote-server", 0)
+            .expect("remote view captures");
         assert_eq!(
             remote_projection.items[0].identity.media_key.source_id,
             SourceId::removable("remote-server").expect("replacement source ID")
@@ -3148,9 +3324,190 @@ mod tests {
     }
 
     #[test]
+    fn visible_queue_capture_freezes_only_registry_owned_removable_attribution() {
+        let registry = PlaybackRegistryFixture::new();
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let tagged_path = mount.path().join("eligible.flac");
+        let untagged_path = mount.path().join("untagged.flac");
+        write_lastfm_flac(
+            &tagged_path,
+            Some("Exact Tagged Title"),
+            Some("Exact Tagged Artist"),
+        );
+        write_lastfm_flac(&untagged_path, None, None);
+
+        let source_id =
+            SourceId::removable("playback:capture-attribution").expect("removable source identity");
+        let provenance = registry
+            .registry
+            .claim_provenance(
+                source_id,
+                crate::source_lifecycle::SourceProvenance::Removable,
+            )
+            .expect("claim removable provenance");
+        registry
+            .registry
+            .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+            .expect("removable connection admitted");
+        let (session_epoch, tracks) = registry.wait_for_catalogue(source_id);
+        assert_eq!(tracks.len(), 2);
+
+        let tagged_id =
+            TrackId::removable_relative(mount.path(), &tagged_path).expect("tagged track identity");
+        let untagged_id = TrackId::removable_relative(mount.path(), &untagged_path)
+            .expect("untagged track identity");
+        let tagged_track = tracks
+            .iter()
+            .find(|track| track.native_track_id.as_ref() == Some(&tagged_id))
+            .expect("tagged track published");
+        let untagged_track = tracks
+            .iter()
+            .find(|track| track.native_track_id.as_ref() == Some(&untagged_id))
+            .expect("untagged track published");
+
+        // The GTK projection is deliberately inconsistent with the parser's
+        // exact tags. Registry minting, not mutable display metadata, must
+        // decide the frozen Last.fm payload.
+        let tagged_row = managed_row(
+            tagged_track,
+            source_id,
+            Some(session_epoch),
+            "Changed Display Title",
+            "Changed Display Artist",
+        );
+        let untagged_row = managed_row(
+            untagged_track,
+            source_id,
+            Some(session_epoch),
+            "Convincing Display Title",
+            "Convincing Display Artist",
+        );
+        let store = gtk::gio::ListStore::new::<TrackObject>();
+        store.append(&tagged_row);
+        store.append(&untagged_row);
+
+        let captured = registry
+            .capture(&store, &source_id.to_string(), 0)
+            .expect("live removable projection captures");
+        let tagged_item = captured
+            .items
+            .iter()
+            .find(|item| item.identity.media_key.track_id == tagged_id)
+            .expect("tagged queue item");
+        assert_eq!(tagged_item.title, "Changed Display Title");
+        assert_eq!(tagged_item.artist, "Changed Display Artist");
+        let tagged_profile = tagged_item
+            .lastfm_profile
+            .as_ref()
+            .expect("registry-minted removable profile");
+        assert_eq!(tagged_profile.title(), "Exact Tagged Title");
+        assert_eq!(tagged_profile.artist(), "Exact Tagged Artist");
+        assert_eq!(tagged_profile.album(), None);
+        assert_eq!(tagged_profile.duration_secs(), Some(31));
+        let frozen_candidate = tagged_item
+            .lastfm_occurrence_candidate()
+            .expect("exact tagged profile creates one occurrence candidate");
+        assert_eq!(frozen_candidate.title, "Exact Tagged Title");
+        assert_eq!(frozen_candidate.artist, "Exact Tagged Artist");
+        assert_eq!(frozen_candidate.album, None);
+
+        let untagged_item = captured
+            .items
+            .iter()
+            .find(|item| item.identity.media_key.track_id == untagged_id)
+            .expect("untagged queue item");
+        assert!(untagged_item.lastfm_source.is_none());
+        assert!(untagged_item.lastfm_profile.is_none());
+        assert!(untagged_item.lastfm_occurrence_candidate().is_none());
+
+        // A second registry, a stale epoch, a missing epoch, and a different
+        // source identity cannot turn the same convincing display row into
+        // attribution authority.
+        let foreign_registry = PlaybackRegistryFixture::new();
+        let foreign = foreign_registry
+            .capture(&store, &source_id.to_string(), 0)
+            .expect("foreign registry still captures a playable queue");
+        assert!(foreign
+            .items
+            .iter()
+            .all(|item| item.lastfm_source.is_none() && item.lastfm_profile.is_none()));
+
+        let stale_store = gtk::gio::ListStore::new::<TrackObject>();
+        stale_store.append(&managed_row(
+            tagged_track,
+            source_id,
+            session_epoch.checked_add(1),
+            "Exact Tagged Title",
+            "Exact Tagged Artist",
+        ));
+        let stale = registry
+            .capture(&stale_store, &source_id.to_string(), 0)
+            .expect("stale row remains a captured playback item");
+        assert!(stale.items[0].lastfm_source.is_none());
+
+        let missing_store = gtk::gio::ListStore::new::<TrackObject>();
+        missing_store.append(&managed_row(
+            tagged_track,
+            source_id,
+            None,
+            "Exact Tagged Title",
+            "Exact Tagged Artist",
+        ));
+        let missing = registry
+            .capture(&missing_store, &source_id.to_string(), 0)
+            .expect("epoch-less row remains a captured playback item");
+        assert!(missing.items[0].lastfm_source.is_none());
+
+        let remote_source = SourceId::random();
+        let remote_store = gtk::gio::ListStore::new::<TrackObject>();
+        remote_store.append(&managed_row(
+            tagged_track,
+            remote_source,
+            Some(session_epoch),
+            "Exact Tagged Title",
+            "Exact Tagged Artist",
+        ));
+        let remote = registry
+            .capture(&remote_store, &remote_source.to_string(), 0)
+            .expect("remote-shaped row remains playable");
+        assert!(remote.items[0].lastfm_source.is_none());
+
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![tagged_item.clone()], 0));
+        let generation = session.begin_event_generation();
+        assert!(session.mark_load_accepted(generation));
+        let accepted = session
+            .take_accepted_lastfm_output_load(generation)
+            .expect("live exact profile creates an accepted output proof");
+        assert_eq!(
+            format!("{accepted:?}"),
+            "LastFmAcceptedOutputLoad::Eligible(<redacted>)"
+        );
+
+        registry.disconnect(source_id);
+        let retired = registry
+            .capture(&store, &source_id.to_string(), 0)
+            .expect("retired rows can still be copied as inert queue data");
+        assert!(retired
+            .items
+            .iter()
+            .all(|item| item.lastfm_source.is_none() && item.lastfm_profile.is_none()));
+        assert_eq!(
+            frozen_candidate.title, "Exact Tagged Title",
+            "the already-captured metadata snapshot remains immutable"
+        );
+        let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
+        let rejected = owner.accept_output_load(accepted, &registry.registry, &HashSet::new());
+        assert!(!rejected.admitted());
+        assert!(!rejected.stale());
+        assert!(registry.registry.release_provenance(source_id, provenance));
+    }
+
+    #[test]
     fn regular_playlist_capture_skips_unavailable_rows_without_losing_duplicate_occurrences() {
         use crate::ui::objects::{PlaylistOccurrenceBinding, PlaylistRowUnavailableReason};
 
+        let registry = PlaybackRegistryFixture::new();
         let playlist_key = "playlist:mixed";
         let stable_id = TrackId::new("same-local-track").expect("local track ID");
         let first = projected_row(stable_id.as_str(), "file:///music/same.flac");
@@ -3181,11 +3538,12 @@ mod tests {
 
         assert_eq!(playable_model_positions(&store, playlist_key), [0, 2]);
         assert!(
-            capture_visible_queue(&store, playlist_key, 1).is_none(),
+            registry.capture(&store, playlist_key, 1).is_none(),
             "activating an unavailable row must not install a replacement queue"
         );
-        let captured =
-            capture_visible_queue(&store, playlist_key, 2).expect("duplicate is playable");
+        let captured = registry
+            .capture(&store, playlist_key, 2)
+            .expect("duplicate is playable");
         assert_eq!(captured.selected_index, 1);
         assert_eq!(captured.items.len(), 2);
         assert_eq!(
@@ -3209,6 +3567,7 @@ mod tests {
         use crate::source_registry::{RegularPlaylistTrack, RegularPlaylistTrackResolution};
         use crate::ui::playlist_projection::project_playlist_rows;
 
+        let registry = PlaybackRegistryFixture::new();
         let source_id = SourceId::random();
         let track_id = TrackId::remote("remote/native-id").expect("remote track ID");
         let media_key = MediaKey::new(source_id, track_id.clone());
@@ -3291,7 +3650,8 @@ mod tests {
         for row in &rows {
             store.append(row);
         }
-        let captured = capture_visible_queue(&store, "playlist:mixed", 1)
+        let captured = registry
+            .capture(&store, "playlist:mixed", 1)
             .expect("duplicate remote occurrence is playable");
         assert_eq!(captured.selected_index, 1);
         assert_eq!(captured.items.len(), 2);
@@ -3311,6 +3671,8 @@ mod tests {
             assert_eq!(guard.catalogue_generation(), 29);
             assert!(item.uri().is_empty());
             assert!(item.cover_art_url.is_empty());
+            assert!(item.lastfm_source.is_none());
+            assert!(item.lastfm_profile.is_none());
         }
     }
 

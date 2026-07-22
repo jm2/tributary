@@ -64,18 +64,22 @@ generic secret-bearing JSON values.
 The still-open playback-qualification slice adds exact registry-minted session and catalogue
 attribution. Each opaque reference is bound to one registry instance and one exact track profile;
 source policy, profile, session epoch, and catalogue generation, authority, and membership are
-revalidated under the lifecycle lock. Structured external-file attribution comes only from real
-parsed tags, requires title and artist, and never substitutes a filename or a synthetic `Unknown`
-album. Each `QueueItem` freezes the occurrence metadata, and a GTK-free owner accepts only a
+revalidated under the lifecycle lock. Structured external-file and removable attribution comes
+only from real parsed tags, requires title and artist, and never substitutes a filename or a
+synthetic `Unknown` album. External sessions retain their registry proof, while removable queue
+capture asks the live registry to mint the exact current-session reference before each `QueueItem`
+freezes its occurrence metadata. A GTK-free owner accepts only a
 move-only eligible/ineligible output proof before producing structured handoffs. Only
 `PlaybackSession` can issue the private production mint witness after the exact output generation
 crosses acceptance. The ordering fix in this slice lock-linearizes freshness so delayed accepted
 loads and ephemeral NowPlaying/Clear handoffs become inert, while an already qualified enqueue
-remains durable. External exact-profile and proof construction is implemented, but production
-playback consumption remains unwired; local, removable, and authenticated-remote exact profiles
-remain to be implemented.
-These pieces are deliberately unwired from production application and UI lifecycle. Continue with
-one process-lifetime, non-recreatable production playback owner/coordinator; runtime event,
+remains durable. External/removable exact-profile and proof construction is implemented, but
+production playback consumption remains unwired. Local and authenticated-remote exact profiles
+remain to be implemented; production capture supplies no remote-source opt-in, so authenticated
+remotes remain closed.
+Production queue capture now freezes eligible removable proofs, but no production Last.fm
+owner/runtime consumes them yet. Continue with one process-lifetime, non-recreatable production
+playback owner/coordinator; runtime event,
 terminal, source-retirement, and shutdown wiring; localized consent and browser invocation;
 authorization-owner construction; atomic vault install and same/different-account transition
 policy; account/recovery/status UI and localization; application ownership; package-time
@@ -622,7 +626,9 @@ selecting and validating a maintained AirPlay path.
   [foundation #151](https://github.com/jm2/tributary/pull/151);
   [runtime/lifecycle slice](https://github.com/jm2/tributary/pull/153);
   [playback/now-playing slice](https://github.com/jm2/tributary/pull/154);
-  [desktop-authorization slice](https://github.com/jm2/tributary/pull/155)).
+  [desktop-authorization slice](https://github.com/jm2/tributary/pull/155);
+  [playback-ownership slice](https://github.com/jm2/tributary/pull/156);
+  [removable-attribution slice](https://github.com/jm2/tributary/pull/157)).
 
   Acceptance criteria:
 
@@ -735,13 +741,15 @@ selecting and validating a maintained AirPlay path.
     exact track profile, current epoch or catalogue generation, and catalogue authority and
     membership. Coarse capability without an exact profile fails closed, as do references from a
     different registry, track, epoch, generation, or retired source.
-  - Structured external-file profiles are derived only from parser-attested tags. Title and artist
-    are both required; optional album/album-artist, track number, and duration remain exact when
-    present, while filenames, paths, and the display-only `Unknown` album fallback never establish
-    Last.fm attribution. The profile and source proof are redacted and frozen into the exact
-    `QueueItem` occurrence. This external profile/proof construction is implemented, but its
-    production playback consumer is still unwired; local, removable, and authenticated Subsonic,
-    Jellyfin, Plex, and DAAP exact profiles remain.
+  - Structured external-file and removable profiles are derived only from parser-attested tags.
+    Title and artist are both required; optional album/album-artist, track number, and duration
+    remain exact when present, while filenames, paths, and the display-only `Unknown` album fallback
+    never establish Last.fm attribution. External sessions retain their registry-minted proof;
+    removable queue capture asks the live registry to mint an exact current-session reference and
+    freezes that redacted proof/profile into the `QueueItem` occurrence. This external/removable
+    profile and proof construction is implemented, but its production playback consumer is still
+    unwired. Local and authenticated Subsonic, Jellyfin, Plex, and DAAP exact profiles remain, and
+    production capture supplies no remote-source opt-in so authenticated remotes stay closed.
   - Added a GTK-free playback owner and typed handoff boundary. An accepted output load carries one
     move-only eligible/ineligible proof, so no later caller can reconstruct eligibility from raw
     epochs or mutable display metadata. Its constructor requires a private production witness which
@@ -800,23 +808,19 @@ selecting and validating a maintained AirPlay path.
     remains failed rather than claiming a durable commit. The process-wide panic hook omits every
     panic payload. Private metadata, credentials, provider bodies, receipt contents, exact
     durations, and panic payloads remain absent from status and diagnostics.
-  - Validation passes 245 focused Last.fm tests, including all 31 playback-owner tests and
-    deterministic regressions proving that accepted-load freshness remains locked through owner
-    mutation and ephemeral NowPlaying/Clear freshness remains locked through ingress. The locked
-    debug and release suites each pass 20 library, 1,613 application, and 14 repository-metadata
-    tests (1,647 total). Strict Clippy is green in both profiles, the Rust 1.92 locked all-target
-    check passes, formatting and diff checks are clean, and the dependency audit reports only the
-    two already documented allowed unmaintained warnings. The matrix covers registry binding;
-    exact session/catalogue policy and membership; real-tag external provenance; frozen occurrence
-    metadata; private accepted-output minting; delayed eligible/ineligible loads; committed and
-    defensive navigation/Repeat-One revocation; stale NowPlaying/Clear handoffs; durable enqueue;
-    metadata/threshold/clock/redaction boundaries; playback discontinuities and terminal paths;
-    runtime lifecycle and code-9 races; and hard-abort retirement.
+  - Validation passes the merged baseline's 245 focused Last.fm tests, including all 31
+    playback-owner tests, plus three deterministic removable real-tag scan/profile, exact
+    registry-minted queue-capture, stale-session, no-profile/fallback, remote-closed, and redaction
+    regressions. The locked debug and release suites each pass 20 library, 1,616 application, and 14
+    repository-metadata tests (1,650 total). Strict Clippy is green in both profiles, the Rust 1.92
+    locked all-target check passes, formatting and diff checks are clean, and the dependency audit
+    reports only the two documented allowed unmaintained warnings.
 
   Remaining production work: neither the internal runtime nor a process-lifetime, non-recreatable
   playback owner/coordinator is instantiated by application startup or joined by application
-  shutdown. External exact-profile and proof construction exists but production consumption is
-  unwired; local, removable, and authenticated-remote exact profiles remain. Add a production
+  shutdown. External/removable exact-profile and proof construction exists but production
+  consumption is unwired; local and authenticated-remote exact profiles plus production
+  remote-source opt-in remain. Add a production
   activation/unavailable-capability issuer and that single owner/coordinator; runtime
   playback-event, terminal, source-retirement, and shutdown wiring; localized consent and browser
   invocation around the completed latest-only authorization core; authorization-owner construction;
@@ -927,6 +931,7 @@ selecting and validating a maintained AirPlay path.
 
 | Date | Task | PR | Result |
 |---|---|---|---|
+| 2026-07-22 | P2.1 Last.fm removable attribution internals | [#157](https://github.com/jm2/tributary/pull/157) | Added exact per-track removable attribution derived only from parser-attested title and artist tags, preserving authoritative optional fields while excluding filenames, paths, and synthetic `Unknown` fallbacks. Removable queue capture now asks the live registry to mint an exact registry-instance/session/profile-bound proof before freezing it into the `QueueItem`; stale sessions, unprofiled rows, and non-removable provenance fail closed. Production Last.fm owner/runtime consumption remains unwired, local and authenticated-remote exact profiles remain absent, and production capture supplies no remote-source opt-in so authenticated remotes stay closed. Validation passes the three new focused regressions and locked debug/release suites of 1,650 tests each, with strict Clippy in both profiles, Rust 1.92 locked all-target, formatting, diff, and dependency-audit gates green apart from the two documented allowed unmaintained warnings. P2.1 remains open at 14/38 (36.8%). |
 | 2026-07-22 | P2.1 Last.fm playback qualification and handoff internals | [#156](https://github.com/jm2/tributary/pull/156) | Added exact registry-minted session/catalogue attribution with registry-instance binding and lock-linearized policy, profile, and catalogue revalidation; real external-tag provenance requiring title and artist without filename or synthetic `Unknown`-album fallbacks; frozen `QueueItem` occurrence metadata; a private production mint witness issuable only by `PlaybackSession` after exact output acceptance; a move-only accepted eligible/ineligible output proof; and a GTK-free owner with typed handoffs. The ordering fix makes delayed accepted loads and ephemeral NowPlaying/Clear handoffs inert under lock-linearized freshness while qualified enqueue remains durable. External profile/proof construction is implemented but production consumption remains unwired; local, removable, and authenticated-remote exact profiles plus one process-lifetime, non-recreatable production owner/coordinator, runtime event/terminal/source-retirement/shutdown wiring, consent/auth/vault/UI/credentials, and live end-to-end work remain. Validation passes 245 focused Last.fm tests and locked debug/release suites of 1,647 tests each, with strict Clippy in both profiles, the Rust 1.92 all-target check, formatting, diff, and the dependency audit green apart from the two documented allowed unmaintained warnings. The P2.1 checkbox stays open and the total remains 14/38 (36.8%). |
 | 2026-07-22 | P2.1 Last.fm desktop-authorization internals | [#155](https://github.com/jm2/tributary/pull/155) | Added strict borrowed zeroizing authentication-envelope parsing and zeroizing partial HTTP response collection, then added an eight-command GTK-free latest-only authorization owner with response-observed monotonic one-hour expiry, owner-private token-bearing URL storage with no production accessor or handoff, opaque one-shot Finish authority, joined ordinary retirement, deterministic closed/poison/hard-abort outcomes, content-free status, and a move-only staged username/session-key grant. It deliberately creates no account UUID, installs no vault record, opens no browser, and has no production factory, so a concrete consent-gated browser handoff, exact account transition, global ownership, UI/application integration, credentials, and acceptance work remain; [#50](https://github.com/jm2/tributary/issues/50) and the 14/38 P2.1 record stay open. |
 | 2026-07-21 | P2.1 Last.fm playback evidence and now-playing internals | [#154](https://github.com/jm2/tributary/pull/154) | Added an uncloneable frozen-metadata occurrence authority with random version-4 identity, one first-evidence UTC start, strictly observed-forward threshold credit, retry continuity, explicit terminal retirement, and redacted diagnostics. Added runtime-owned account-independent latest-only now-playing with synchronous predecessor cancellation, a fourth reserved explicit-clear control, fixed non-durable outcomes, and an atomic exact-generation/account/epoch code-9 reauthorization claim. Normal lifecycle and supervised failure cancel and join the child before authority release; hard external owner abort reports a failed drain while a child-held shared vault lease excludes successors until the request future drops. This slice remains deliberately unwired pending consent, exact source/session policy, the production playback/action owner, application/auth/UI/build-credential integration, and final acceptance validation; [#50](https://github.com/jm2/tributary/issues/50) and the 14/38 P2.1 record remain open. |
