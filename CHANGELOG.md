@@ -16,21 +16,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [playback/now-playing slice](https://github.com/jm2/tributary/pull/154),
   [desktop-authorization slice](https://github.com/jm2/tributary/pull/155),
   [playback-ownership slice](https://github.com/jm2/tributary/pull/156),
-  [removable-attribution slice](https://github.com/jm2/tributary/pull/157), and the
-  [process-coordinator slice](https://github.com/jm2/tributary/pull/158)).
-  This is an internal foundation, not yet a user-visible scrobbling feature. The standalone
-  playback observer, GTK-free playback owner/handoffs, and runtime-owned now-playing lane still have
-  no active production instance. Application startup now claims a non-recreatable Dormant playback
-  coordinator, however, and production call sites feed its epoch-bound boundary with output intent,
-  lazy accepted-load handoff, events, discontinuities, source-revalidation points, terminal causes,
-  committed output replacement, and shutdown. Exact real-tag external/removable proofs reach that boundary,
-  but Dormant mode revokes them through a metadata-free discard closure and emits no Last.fm work.
-  Authenticated remotes remain closed because exact remote profiles and a production remote-source
-  opt-in set do not exist. Active playback-owner/runtime construction and handoff dispatch, exact
-  local/authenticated-remote profiles, construction of the authorization owner, explicit consent
-  and browser launch, staged-session vault installation and account transition policy, exact
-  per-source/session policy, settings/status UI, localization and accessibility, and production
-  package credentials remain follow-on work; the
+  [removable-attribution slice](https://github.com/jm2/tributary/pull/157),
+  [process-coordinator slice](https://github.com/jm2/tributary/pull/158), and the
+  [headless runtime-bridge slice](https://github.com/jm2/tributary/pull/159)).
+  This is an internal foundation, not yet a user-visible scrobbling feature. Application startup
+  claims a non-recreatable Dormant playback coordinator, and production call sites feed its
+  epoch-bound boundary with output intent, lazy accepted-load handoff, events, discontinuities,
+  source-revalidation points, terminal causes, committed output replacement, and shutdown. A
+  sealed headless Active bridge now exists: it can consume a running runtime's one-shot
+  playback-only ingress, mint the coordinator's sole playback owner, synchronously carry accepted
+  playback through source admission into ordered NowPlaying and Clear runtime commands, and retain
+  each admitted Enqueue through its one-shot runtime completion; only `Inserted`/`AlreadyQueued`
+  proves SQLite durability. Exact real-tag external/removable proofs can reach that bridge, but
+  startup remains
+  Dormant and revokes them through a metadata-free discard closure. No production path starts the
+  Last.fm runtime, claims playback ingress, issues activation, constructs the authorization owner,
+  or supplies settings and live source policy, so the feature emits no Last.fm work and remains
+  unavailable to users. Exact local/authenticated-remote profiles, explicit consent and browser
+  launch, staged-session vault installation and account transition policy, exact per-source/session
+  policy, settings/status UI, localization and accessibility, and production package credentials
+  remain follow-on work; the
   [complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary) also tracks
   activation/unavailable-state issuance, structured source-owner conversion, account replacement
   and recovery, package verification/API registration, and the remaining acceptance matrix.
@@ -96,14 +101,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     captures the `QueueItem`; authenticated-remote capture remains denied without both an exact
     profile and a production opt-in source set. Ineligible or policy-rejected replacements
     terminally retire their predecessor and emit at most one explicit clear. Lock-linearized
-    freshness makes delayed accepted loads and stale NowPlaying/Clear handoffs inert after a
-    successor, while a qualified Enqueue is not retroactively revoked. Move-only redacted handoffs
+    freshness makes delayed accepted loads and superseded NowPlaying/Clear handoffs inert, while a
+    qualified Enqueue is not retroactively revoked. A successor NowPlaying updates latest-issued
+    freshness without prematurely invalidating the predecessor Clear: source-policy rejection or
+    any runtime-admission failure leaves that Clear claimable, and only successful successor
+    admission consumes it. Move-only redacted handoffs
     keep payloads private through exact source and runtime admission. A separate move-only output
     intent closes the predecessor generation before any output call: an exact same-occurrence retry
     preserves UUID, start, credit, metadata, and latches, while a replacement retires terminally and
     an incoherent generation fails closed. Exact local/authenticated-remote profiles remain
     unwired.
-  - **Dormant process playback coordinator and production ingress:** startup claims exactly one
+  - **Process playback coordinator, sealed activation bridge, and production ingress:** startup claims exactly one
     non-cloneable process owner before GTK activation and can transfer it only to the first window.
     Cloneable redacted bindings carry a checked window epoch; rebinding makes old callbacks inert,
     poison becomes terminal shutdown, and owner drop cannot permit recreation. Production playback
@@ -111,14 +119,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     playback session, hands accepted loads to the lazy coordinator boundary, and reports current
     events before history/UI reduction, seek/Previous/resume discontinuities, Stop, committed output replacement,
     queue and external-terminal retirement, source-authority revalidation points, and application
-    shutdown without retaining a GTK `RefCell` guard across coordinator ingress. The coordinator is
-    intentionally Dormant and contains no playback owner, runtime, transport, vault, credentials,
-    activation capability, metadata, or policy. It never invokes the metadata extractor; accepted
-    authority is instead consumed and revoked exactly once through a separate content-free discard
-    closure in Dormant, stale-window, and shutdown states. Thus external/removable metadata and
-    action handoffs still do not leave the playback session, and this boundary is not user-visible
-    activation. Review follow-up also makes OS-open dispatch use the same structural-window check
-    as activation, so files are drained immediately when a live window is temporarily unfocused.
+    shutdown without retaining a GTK `RefCell` guard across coordinator ingress. A sealed Active
+    state can now bind the exact current window to one already-claimed playback runtime ingress and
+    one immutable remote-source opt-in snapshot. A module-private mint creates the sole playback
+    owner; accepted loads, events, discontinuities, source revalidation, and typed retirement drive
+    exact source admission and ordered NowPlaying, Enqueue, and Clear dispatch. Enqueue admission
+    returns a distinct pending-durability disposition and transfers a bounded child operation lease
+    to its completion task; only SQLite `Inserted`/`AlreadyQueued` completion settles successfully,
+    while a late queue, storage, stale-account, owner-stop, or cancelled-supervisor result becomes a
+    sticky terminal failure. The accepted-load
+    extractor is lazy, runs outside the coordinator mutex but inside the activation drain barrier,
+    and has an explicit bounded, non-reentrant contract; stale activation results are revoked
+    without dispatch. Close, rebind, shutdown, and drop revoke admission, drain in-flight work and
+    every supervised enqueue receipt, and publish one shared retirement result before a successor
+    can activate. Fatal owner/gate failures, delayed Enqueue-completion failures, and failed
+    retirement fail closed terminally instead of exposing a replacement environment. The
+    production application nevertheless issues no activation: startup remains
+    Dormant with no playback owner, Last.fm runtime, transport, vault, credentials, or policy. Its
+    accepted authority is consumed and revoked exactly once through a separate content-free discard
+    closure in Dormant, stale-window, and shutdown states, so external/removable metadata and action
+    handoffs still do not leave the playback session. Review follow-up also makes OS-open dispatch
+    use the same structural-window check as activation, so files are drained immediately when a
+    live window is temporarily unfocused.
   - **Private offline FIFO and durable delivery gate:** migration 17 creates and revalidates a
     constrained queue containing
     only bounded submission metadata, opaque occurrence/order identity, one-way account binding,
@@ -151,15 +173,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     ordinary HTTP status failures, oversized bodies, malformed or cardinality-incoherent responses,
     invalid stored data, and local capability failures retain the queue and pause or quarantine
     automatic delivery instead of guessing, deleting, or looping.
-  - **Bounded serialized runtime:** during an active runtime, its lifecycle-owned actor is the sole
+  - **Bounded serialized runtime and private playback ingress:** during an active runtime, its
+    lifecycle-owned actor is the sole
     SQLite and credential-vault mutator. Explicit missing/corrupt-vault recovery is the only
     separate mutating path and holds the same process-global lease. The actor's bounded metadata
     FIFO reserves four slots for control: one delivery result, two lifecycle markers, and one
     explicit now-playing clear. This preserves delivery-result/disconnect/shutdown ordering while
     a full 64-command ordinary metadata backlog still cannot starve playback retirement. One
-    ingress gate
-    linearizes admission against every lifecycle transition. Playback-facing input is deliberately
-    unbound: only the runtime ingress gate can attach the vault-derived account binding. Startup
+    ingress gate linearizes admission against every lifecycle transition. A running runtime can
+    issue exactly one non-cloneable, redacted playback capability; concurrent claims have one
+    winner, dropping it never restores the claim, and closed, shutting-down, or poisoned state
+    fails closed. That capability exposes only bounded NowPlaying, Enqueue, and Clear submission—no
+    lifecycle, status, account, credential, vault, or recovery authority—and the general runtime
+    handle no longer exposes those playback submissions in production. Playback-facing input is
+    deliberately unbound: only the runtime ingress gate can attach the vault-derived account
+    binding. No production path claims this capability yet. Startup
     additionally requires an opaque capability intended for a future consent/build-enablement
     issuer; no production path issues it yet. Checked account epochs and delivery generations
     reject stale events; watched phase, pending count, fixed failure category, and saturating

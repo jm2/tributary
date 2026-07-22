@@ -25,8 +25,8 @@ use super::playback::{
     LastFmPlaybackOccurrence, LastFmPlaybackState, SystemLastFmPlaybackClock,
 };
 use super::runtime::{
-    LastFmNowPlaying, LastFmNowPlayingOutcome, LastFmRuntimeAdmissionError,
-    LastFmRuntimeCommandError, LastFmRuntimeHandle, LastFmRuntimeOperation,
+    LastFmNowPlaying, LastFmNowPlayingOutcome, LastFmPlaybackRuntimeIngress,
+    LastFmRuntimeAdmissionError, LastFmRuntimeCommandError, LastFmRuntimeOperation,
 };
 use super::storage::{LastFmEnqueueOutcome, UnboundLastFmScrobble};
 
@@ -166,8 +166,14 @@ impl fmt::Debug for LastFmAcceptedOutputFreshness {
 }
 
 struct LastFmEphemeralHandoffLaneState {
-    current_identity: Option<Arc<()>>,
-    unclaimed: bool,
+    /// The newest now-playing or clear handoff. Issuing a clear invalidates
+    /// every older now-playing; issuing now-playing does not itself erase a
+    /// clear which the runtime may still need.
+    latest_issued: Option<Arc<()>>,
+    /// Exact clear still owed for a predecessor now-playing publication.
+    /// Only a clear attempt or successfully admitted successor now-playing
+    /// consumes this identity.
+    pending_clear: Option<Arc<()>>,
 }
 
 type LastFmEphemeralHandoffLane = Arc<Mutex<LastFmEphemeralHandoffLaneState>>;
@@ -178,19 +184,56 @@ struct LastFmEphemeralHandoffFreshness {
 }
 
 impl LastFmEphemeralHandoffFreshness {
-    fn try_claim<T>(self, claim: impl FnOnce() -> T) -> Option<T> {
+    fn try_claim_now_playing<T>(
+        self,
+        claim: impl FnOnce() -> Option<T>,
+        admitted: impl FnOnce(&T) -> bool,
+    ) -> Option<T> {
         let mut lane = self
             .lane
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let current = lane
-            .current_identity
+        let latest = lane
+            .latest_issued
             .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &self.identity));
-        if !current || !lane.unclaimed {
+            .is_some_and(|latest| Arc::ptr_eq(latest, &self.identity));
+        if !latest {
             return None;
         }
-        lane.unclaimed = false;
+
+        // The move-only handoff gets one admission attempt. Keep the pending
+        // predecessor clear until that attempt actually crosses both source
+        // and runtime admission successfully.
+        lane.latest_issued = None;
+        let result = claim();
+        if result.as_ref().is_some_and(admitted) {
+            lane.pending_clear = None;
+        }
+        drop(lane);
+        result
+    }
+
+    fn try_claim_clear<T>(self, claim: impl FnOnce() -> T) -> Option<T> {
+        let mut lane = self
+            .lane
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pending = lane
+            .pending_clear
+            .as_ref()
+            .is_some_and(|pending| Arc::ptr_eq(pending, &self.identity));
+        if !pending {
+            return None;
+        }
+
+        lane.pending_clear = None;
+        if lane
+            .latest_issued
+            .as_ref()
+            .is_some_and(|latest| Arc::ptr_eq(latest, &self.identity))
+        {
+            lane.latest_issued = None;
+        }
         let result = claim();
         drop(lane);
         Some(result)
@@ -393,6 +436,18 @@ impl LastFmAcceptedOutputLoad {
             kind: LastFmAcceptedOutputLoadKind::Ineligible,
         }
     }
+
+    /// Consume and revoke a built accepted load without inspecting its
+    /// eligibility, source attribution, metadata, identity, or generation.
+    ///
+    /// Active coordination uses this after lazy construction if window or
+    /// activation authority changed before the load could reach its sole
+    /// playback owner. Revocation shares the exact freshness gate with owner
+    /// admission, so either this operation or owner mutation wins wholly.
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) fn revoke(self) {
+        self.freshness.revoke();
+    }
 }
 
 impl fmt::Debug for LastFmAcceptedOutputLoad {
@@ -489,7 +544,7 @@ impl LastFmPlaybackHandoff {
     /// admission failure.
     pub fn try_admit(
         self,
-        runtime: &LastFmRuntimeHandle,
+        runtime: &LastFmPlaybackRuntimeIngress,
         registry: &SourceRegistry,
         enabled_remote_sources: &HashSet<SourceId>,
     ) -> Option<Result<LastFmPlaybackRuntimeOperation, LastFmRuntimeAdmissionError>> {
@@ -511,6 +566,7 @@ impl LastFmPlaybackHandoff {
                     .try_clear_now_playing()
                     .map(LastFmPlaybackRuntimeOperation::ClearNowPlaying)
             },
+            |result| result.is_ok(),
         )
     }
 
@@ -535,6 +591,7 @@ impl LastFmPlaybackHandoff {
             admit_now_playing,
             admit_enqueue,
             admit_clear,
+            |_| true,
         )
     }
 
@@ -545,24 +602,26 @@ impl LastFmPlaybackHandoff {
         admit_now_playing: impl FnOnce(LastFmNowPlaying) -> T,
         admit_enqueue: impl FnOnce(UnboundLastFmScrobble) -> T,
         admit_clear: impl FnOnce() -> T,
+        now_playing_admitted: impl FnOnce(&T) -> bool,
     ) -> Option<T> {
         match self.0 {
             LastFmPlaybackHandoffPayload::NowPlaying {
                 freshness,
                 source,
                 now_playing,
-            } => freshness
-                .try_claim(|| {
+            } => freshness.try_claim_now_playing(
+                || {
                     source.admit(registry, enabled_remote_sources, || {
                         admit_now_playing(now_playing)
                     })
-                })
-                .flatten(),
+                },
+                now_playing_admitted,
+            ),
             LastFmPlaybackHandoffPayload::Enqueue { source, scrobble } => {
                 source.admit(registry, enabled_remote_sources, || admit_enqueue(scrobble))
             }
             LastFmPlaybackHandoffPayload::ClearNowPlaying { freshness } => {
-                freshness.try_claim(admit_clear)
+                freshness.try_claim_clear(admit_clear)
             }
         }
     }
@@ -770,8 +829,14 @@ where
 }
 
 impl LastFmPlaybackOwner<SystemLastFmPlaybackClock> {
+    pub(super) fn new_for_coordinator(
+        _mint: super::playback_coordinator::LastFmPlaybackOwnerMint,
+    ) -> Self {
+        Self::with_clock(SystemLastFmPlaybackClock)
+    }
+
     #[cfg(test)]
-    #[allow(clippy::redundant_pub_crate)] // Production ownership is application-internal.
+    #[allow(clippy::redundant_pub_crate)]
     pub(crate) fn new() -> Self {
         Self::with_clock(SystemLastFmPlaybackClock)
     }
@@ -781,14 +846,13 @@ impl<C> LastFmPlaybackOwner<C>
 where
     C: LastFmPlaybackClock,
 {
-    #[cfg(test)]
     fn with_clock(clock: C) -> Self {
         Self {
             clock,
             active: None,
             ephemeral_handoff_lane: Arc::new(Mutex::new(LastFmEphemeralHandoffLaneState {
-                current_identity: None,
-                unclaimed: false,
+                latest_issued: None,
+                pending_clear: None,
             })),
         }
     }
@@ -1096,6 +1160,33 @@ where
             .is_some_and(|active| active.occurrence.observe_discontinuity(generation))
     }
 
+    /// Revalidate the active occurrence's exact source and current policy.
+    ///
+    /// A still-authorized occurrence is preserved unchanged. If its retained
+    /// registry-bound source proof, live session/catalogue, exact metadata
+    /// profile, provenance, capability, or remote opt-in no longer matches,
+    /// the occurrence is terminally retired and produces at most one clear.
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) fn revalidate_active_source(
+        &mut self,
+        registry: &SourceRegistry,
+        enabled_remote_sources: &HashSet<SourceId>,
+    ) -> LastFmPlaybackOwnerUpdate {
+        let Some(source) = self.active.as_ref().map(|active| active.source.clone()) else {
+            return LastFmPlaybackOwnerUpdate::none();
+        };
+        if source
+            .admit(registry, enabled_remote_sources, || ())
+            .is_some()
+        {
+            return LastFmPlaybackOwnerUpdate::none();
+        }
+        self.retire().map_or_else(
+            LastFmPlaybackOwnerUpdate::none,
+            LastFmPlaybackOwnerUpdate::handoff,
+        )
+    }
+
     /// End the active occurrence for Stop, queue/source retirement, output
     /// replacement, or application shutdown. Clear is emitted at most once.
     pub fn retire(&mut self) -> Option<LastFmPlaybackHandoff> {
@@ -1155,7 +1246,7 @@ where
         now_playing: LastFmNowPlaying,
     ) -> LastFmPlaybackHandoff {
         self.with_ephemeral_handoff_lane(move |owner, lane| {
-            let freshness = owner.replace_ephemeral_handoff_freshness_with_lane(lane);
+            let freshness = owner.issue_now_playing_freshness_with_lane(lane);
             LastFmPlaybackHandoff::now_playing(freshness, source, now_playing)
         })
     }
@@ -1172,18 +1263,30 @@ where
         lane: &mut LastFmEphemeralHandoffLaneState,
     ) -> Option<LastFmPlaybackHandoff> {
         needs_clear.then(|| {
-            let freshness = self.replace_ephemeral_handoff_freshness_with_lane(lane);
+            let freshness = self.issue_clear_freshness_with_lane(lane);
             LastFmPlaybackHandoff::clear_now_playing(freshness)
         })
     }
 
-    fn replace_ephemeral_handoff_freshness_with_lane(
+    fn issue_now_playing_freshness_with_lane(
         &self,
         lane: &mut LastFmEphemeralHandoffLaneState,
     ) -> LastFmEphemeralHandoffFreshness {
         let identity = Arc::new(());
-        lane.current_identity = Some(Arc::clone(&identity));
-        lane.unclaimed = true;
+        lane.latest_issued = Some(Arc::clone(&identity));
+        LastFmEphemeralHandoffFreshness {
+            lane: Arc::clone(&self.ephemeral_handoff_lane),
+            identity,
+        }
+    }
+
+    fn issue_clear_freshness_with_lane(
+        &self,
+        lane: &mut LastFmEphemeralHandoffLaneState,
+    ) -> LastFmEphemeralHandoffFreshness {
+        let identity = Arc::new(());
+        lane.latest_issued = Some(Arc::clone(&identity));
+        lane.pending_clear = Some(Arc::clone(&identity));
         LastFmEphemeralHandoffFreshness {
             lane: Arc::clone(&self.ephemeral_handoff_lane),
             identity,
@@ -1230,8 +1333,8 @@ where
             .ephemeral_handoff_lane
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        lane.current_identity = None;
-        lane.unclaimed = false;
+        lane.latest_issued = None;
+        lane.pending_clear = None;
     }
 }
 
@@ -1357,12 +1460,23 @@ mod tests {
         LastFmAcceptedOutputFreshness::fresh()
     }
 
-    fn ephemeral_freshness() -> LastFmEphemeralHandoffFreshness {
+    fn ephemeral_now_playing_freshness() -> LastFmEphemeralHandoffFreshness {
         let identity = Arc::new(());
         LastFmEphemeralHandoffFreshness {
             lane: Arc::new(Mutex::new(LastFmEphemeralHandoffLaneState {
-                current_identity: Some(Arc::clone(&identity)),
-                unclaimed: true,
+                latest_issued: Some(Arc::clone(&identity)),
+                pending_clear: None,
+            })),
+            identity,
+        }
+    }
+
+    fn ephemeral_clear_freshness() -> LastFmEphemeralHandoffFreshness {
+        let identity = Arc::new(());
+        LastFmEphemeralHandoffFreshness {
+            lane: Arc::new(Mutex::new(LastFmEphemeralHandoffLaneState {
+                latest_issued: Some(Arc::clone(&identity)),
+                pending_clear: Some(Arc::clone(&identity)),
             })),
             identity,
         }
@@ -2032,6 +2146,71 @@ mod tests {
     }
 
     #[test]
+    fn revalidation_preserves_an_exactly_authorized_active_occurrence() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let registry = SourceRegistry::new(runtime.handle().clone());
+        let (clock, _) = TestClock::successful();
+        let mut owner = LastFmPlaybackOwner::with_clock(clock);
+        let active_generation = generation(47);
+
+        load_and_prove_playing(
+            &mut owner,
+            LastFmPlaybackOccurrenceIdentity::fresh(),
+            local_source("revalidate-authorized"),
+            active_generation,
+        );
+        assert_empty(owner.revalidate_active_source(&registry, &HashSet::new()));
+        let scrobble = qualify_after_playing(&mut owner, active_generation);
+        assert_eq!(scrobble.duration_secs(), 100);
+        assert!(owner.retire().is_some());
+    }
+
+    #[test]
+    fn revalidation_retires_lost_exact_managed_authority_and_clears_once() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let registry = SourceRegistry::new(runtime.handle().clone());
+        let source_id = SourceId::random();
+        let remote_key = MediaKey::new(
+            source_id,
+            TrackId::remote("revalidate-managed").expect("valid remote track id"),
+        );
+        let source = LastFmPlaybackSource::managed(
+            PlaybackSourceReference::session(remote_key, 11).expect("valid remote reference"),
+        );
+        let (clock, _) = TestClock::successful();
+        let mut owner = LastFmPlaybackOwner::with_clock(clock);
+        let active_generation = generation(48);
+
+        assert_empty(owner.accept_load(
+            accepted(LastFmPlaybackOccurrenceIdentity::fresh(), source),
+            active_generation,
+        ));
+        drop(expect_handoff(
+            owner.observe_event(&PlayerEvent::state(active_generation, PlayerState::Playing)),
+            LastFmPlaybackHandoffKind::NowPlaying,
+        ));
+
+        // Opt-in alone cannot rescue a reference minted outside this exact
+        // registry instance. Losing any component of the retained authority
+        // retires the occurrence terminally.
+        let enabled_remote_sources = HashSet::from([source_id]);
+        expect_clear(owner.revalidate_active_source(&registry, &enabled_remote_sources));
+        assert_empty(owner.revalidate_active_source(&registry, &enabled_remote_sources));
+        assert_empty(owner.observe_event(&PlayerEvent::position(
+            active_generation,
+            u64::MAX,
+            u64::MAX,
+        )));
+        assert!(owner.retire().is_none());
+    }
+
+    #[test]
     fn clock_failure_is_fixed_redacted_and_disables_same_identity() {
         let mut owner = LastFmPlaybackOwner::with_clock(TestClock::failing());
         let identity = LastFmPlaybackOccurrenceIdentity::fresh();
@@ -2334,6 +2513,33 @@ mod tests {
     }
 
     #[test]
+    fn built_output_load_revocation_consumes_and_closes_only_its_freshness() {
+        let eligible_freshness = output_freshness();
+        let eligible_probe = eligible_freshness.clone();
+        LastFmAcceptedOutputLoad::eligible(
+            LastFmAcceptedOutputMint::for_test(),
+            generation(49),
+            eligible_freshness,
+            accepted(
+                LastFmPlaybackOccurrenceIdentity::fresh(),
+                local_source("built-revocation-private"),
+            ),
+        )
+        .revoke();
+        assert!(eligible_probe.try_claim(|| ()).is_none());
+
+        let ineligible_freshness = output_freshness();
+        let ineligible_probe = ineligible_freshness.clone();
+        LastFmAcceptedOutputLoad::ineligible(
+            LastFmAcceptedOutputMint::for_test(),
+            generation(50),
+            ineligible_freshness,
+        )
+        .revoke();
+        assert!(ineligible_probe.try_claim(|| ()).is_none());
+    }
+
+    #[test]
     fn accepted_output_freshness_stays_locked_through_owner_mutation() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2456,7 +2662,7 @@ mod tests {
         })
         .expect("valid now-playing metadata");
         let now_playing_handoff = LastFmPlaybackHandoff::now_playing(
-            ephemeral_freshness(),
+            ephemeral_now_playing_freshness(),
             LastFmPlaybackSource::managed(reference.clone()),
             now_playing,
         );
@@ -2476,6 +2682,7 @@ mod tests {
                 now_playing_calls.set(now_playing_calls.get() + 1);
                 LastFmPlaybackHandoffKind::ClearNowPlaying
             },
+            |_| true,
         );
         assert!(result.is_none());
         assert_eq!(now_playing_calls.get(), 0);
@@ -2509,6 +2716,7 @@ mod tests {
                 enqueue_calls.set(enqueue_calls.get() + 1);
                 LastFmPlaybackHandoffKind::ClearNowPlaying
             },
+            |_| true,
         );
         assert!(result.is_none());
         assert_eq!(enqueue_calls.get(), 0);
@@ -2533,7 +2741,7 @@ mod tests {
         .expect("valid now-playing metadata");
 
         let local = LastFmPlaybackHandoff::now_playing(
-            ephemeral_freshness(),
+            ephemeral_now_playing_freshness(),
             local_source("callback-local"),
             now_playing,
         );
@@ -2553,11 +2761,12 @@ mod tests {
                 local_calls.set(local_calls.get() + 1);
                 LastFmPlaybackHandoffKind::ClearNowPlaying
             },
+            |_| true,
         );
         assert_eq!(result, Some(LastFmPlaybackHandoffKind::NowPlaying));
         assert_eq!(local_calls.get(), 1);
 
-        let clear = LastFmPlaybackHandoff::clear_now_playing(ephemeral_freshness());
+        let clear = LastFmPlaybackHandoff::clear_now_playing(ephemeral_clear_freshness());
         let clear_calls = Cell::new(0);
         let result = clear.try_admit_with(
             &registry,
@@ -2574,6 +2783,7 @@ mod tests {
                 clear_calls.set(clear_calls.get() + 1);
                 LastFmPlaybackHandoffKind::ClearNowPlaying
             },
+            |_| true,
         );
         assert_eq!(result, Some(LastFmPlaybackHandoffKind::ClearNowPlaying));
         assert_eq!(clear_calls.get(), 1);
@@ -2662,7 +2872,7 @@ mod tests {
     }
 
     #[test]
-    fn delayed_clear_is_stale_after_its_successor_now_playing_is_issued() {
+    fn delayed_clear_is_stale_after_its_successor_now_playing_is_admitted() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2699,26 +2909,6 @@ mod tests {
         );
         drop(predecessor_now_playing);
 
-        let stale_calls = Cell::new(0);
-        let stale_result = delayed_clear.try_admit_with_callbacks_for_test(
-            &registry,
-            &enabled_remote_sources,
-            |_| {
-                stale_calls.set(stale_calls.get() + 1);
-                LastFmPlaybackHandoffKind::NowPlaying
-            },
-            |_| {
-                stale_calls.set(stale_calls.get() + 1);
-                LastFmPlaybackHandoffKind::Enqueue
-            },
-            || {
-                stale_calls.set(stale_calls.get() + 1);
-                LastFmPlaybackHandoffKind::ClearNowPlaying
-            },
-        );
-        assert!(stale_result.is_none());
-        assert_eq!(stale_calls.get(), 0);
-
         let successor_calls = Cell::new(0);
         let successor_result = successor_now_playing.try_admit_with_callbacks_for_test(
             &registry,
@@ -2741,6 +2931,159 @@ mod tests {
             Some(LastFmPlaybackHandoffKind::NowPlaying)
         );
         assert_eq!(successor_calls.get(), 1);
+
+        let stale_calls = Cell::new(0);
+        let stale_result = delayed_clear.try_admit_with_callbacks_for_test(
+            &registry,
+            &enabled_remote_sources,
+            |_| {
+                stale_calls.set(stale_calls.get() + 1);
+                LastFmPlaybackHandoffKind::NowPlaying
+            },
+            |_| {
+                stale_calls.set(stale_calls.get() + 1);
+                LastFmPlaybackHandoffKind::Enqueue
+            },
+            || {
+                stale_calls.set(stale_calls.get() + 1);
+                LastFmPlaybackHandoffKind::ClearNowPlaying
+            },
+        );
+        assert!(stale_result.is_none());
+        assert_eq!(stale_calls.get(), 0);
+    }
+
+    #[test]
+    fn rejected_successor_now_playing_preserves_predecessor_clear() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let registry = SourceRegistry::new(runtime.handle().clone());
+        let source_id = SourceId::random();
+        let enabled_remote_sources = HashSet::from([source_id]);
+        let (clock, _) = TestClock::successful();
+        let mut owner = LastFmPlaybackOwner::with_clock(clock);
+
+        assert_empty(owner.accept_load(
+            accepted(
+                LastFmPlaybackOccurrenceIdentity::fresh(),
+                local_source("source-rejection-predecessor"),
+            ),
+            generation(46),
+        ));
+        let predecessor_now_playing = expect_handoff(
+            owner.observe_event(&PlayerEvent::state(generation(46), PlayerState::Playing)),
+            LastFmPlaybackHandoffKind::NowPlaying,
+        );
+        let remote_key = MediaKey::new(
+            source_id,
+            TrackId::remote("source-rejection-successor").expect("valid remote track id"),
+        );
+        let remote_source = LastFmPlaybackSource::managed(
+            PlaybackSourceReference::session(remote_key, 91).expect("valid remote reference"),
+        );
+        let delayed_clear = expect_handoff(
+            owner.accept_load(
+                accepted(LastFmPlaybackOccurrenceIdentity::fresh(), remote_source),
+                generation(47),
+            ),
+            LastFmPlaybackHandoffKind::ClearNowPlaying,
+        );
+        let rejected_now_playing = expect_handoff(
+            owner.observe_event(&PlayerEvent::state(generation(47), PlayerState::Playing)),
+            LastFmPlaybackHandoffKind::NowPlaying,
+        );
+        drop(predecessor_now_playing);
+
+        let rejected_calls = Cell::new(0);
+        let rejected = rejected_now_playing.try_admit_with_callbacks_for_test(
+            &registry,
+            &enabled_remote_sources,
+            |_| {
+                rejected_calls.set(rejected_calls.get() + 1);
+                LastFmPlaybackHandoffKind::NowPlaying
+            },
+            |_| panic!("now-playing handoff cannot reach enqueue ingress"),
+            || panic!("now-playing handoff cannot reach clear ingress"),
+        );
+        assert!(rejected.is_none());
+        assert_eq!(rejected_calls.get(), 0);
+
+        let clear = delayed_clear.try_admit_with_callbacks_for_test(
+            &registry,
+            &enabled_remote_sources,
+            |_| panic!("clear handoff cannot reach now-playing ingress"),
+            |_| panic!("clear handoff cannot reach enqueue ingress"),
+            || LastFmPlaybackHandoffKind::ClearNowPlaying,
+        );
+        assert_eq!(clear, Some(LastFmPlaybackHandoffKind::ClearNowPlaying));
+        drop(owner);
+        runtime.block_on(registry.shutdown().wait());
+    }
+
+    #[test]
+    fn runtime_busy_successor_now_playing_preserves_predecessor_clear() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let registry = SourceRegistry::new(runtime.handle().clone());
+        let enabled_remote_sources = HashSet::new();
+        let (clock, _) = TestClock::successful();
+        let mut owner = LastFmPlaybackOwner::with_clock(clock);
+
+        assert_empty(owner.accept_load(
+            accepted(
+                LastFmPlaybackOccurrenceIdentity::fresh(),
+                local_source("runtime-busy-predecessor"),
+            ),
+            generation(48),
+        ));
+        let predecessor_now_playing = expect_handoff(
+            owner.observe_event(&PlayerEvent::state(generation(48), PlayerState::Playing)),
+            LastFmPlaybackHandoffKind::NowPlaying,
+        );
+        let delayed_clear = expect_handoff(
+            owner.accept_load(
+                accepted(
+                    LastFmPlaybackOccurrenceIdentity::fresh(),
+                    local_source("runtime-busy-successor"),
+                ),
+                generation(49),
+            ),
+            LastFmPlaybackHandoffKind::ClearNowPlaying,
+        );
+        let busy_now_playing = expect_handoff(
+            owner.observe_event(&PlayerEvent::state(generation(49), PlayerState::Playing)),
+            LastFmPlaybackHandoffKind::NowPlaying,
+        );
+        drop(predecessor_now_playing);
+
+        let busy = busy_now_playing.try_admit_with(
+            &registry,
+            &enabled_remote_sources,
+            |_| {
+                Err::<LastFmPlaybackHandoffKind, LastFmRuntimeAdmissionError>(
+                    LastFmRuntimeAdmissionError::Busy,
+                )
+            },
+            |_| panic!("now-playing handoff cannot reach enqueue ingress"),
+            || panic!("now-playing handoff cannot reach clear ingress"),
+            |result| result.is_ok(),
+        );
+        assert_eq!(busy, Some(Err(LastFmRuntimeAdmissionError::Busy)));
+
+        let clear = delayed_clear.try_admit_with_callbacks_for_test(
+            &registry,
+            &enabled_remote_sources,
+            |_| panic!("clear handoff cannot reach now-playing ingress"),
+            |_| panic!("clear handoff cannot reach enqueue ingress"),
+            || LastFmPlaybackHandoffKind::ClearNowPlaying,
+        );
+        assert_eq!(clear, Some(LastFmPlaybackHandoffKind::ClearNowPlaying));
+        drop(owner);
+        runtime.block_on(registry.shutdown().wait());
     }
 
     #[test]
@@ -2859,7 +3202,8 @@ mod tests {
         let lane = lane_probe
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert!(!lane.unclaimed);
+        assert!(lane.latest_issued.is_none());
+        assert!(lane.pending_clear.is_none());
         drop(lane);
         drop(owner);
         runtime.block_on(registry.shutdown().wait());

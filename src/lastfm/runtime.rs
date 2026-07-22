@@ -80,6 +80,7 @@ enum IngressPhase {
 #[allow(clippy::struct_excessive_bools)] // Each flag is an independent serialized admission proof.
 struct IngressGate {
     phase: IngressPhase,
+    playback_ingress_claimed: bool,
     queue_admission_open: bool,
     queued_metadata: usize,
     delivery_event_queued: bool,
@@ -115,6 +116,17 @@ struct HandleInner {
 /// Cloneable, nonblocking submission side of the Last.fm queue owner.
 #[derive(Clone)]
 pub struct LastFmRuntimeHandle {
+    inner: Arc<HandleInner>,
+}
+
+/// Move-only playback submission authority claimed from one running runtime.
+///
+/// This deliberately exposes only the three playback-generated command
+/// classes. It carries no lifecycle, status, account, credential, vault, or
+/// recovery authority. Claiming is process-local to this runtime instance and
+/// remains consumed after this value is dropped.
+#[must_use = "claimed Last.fm playback ingress must be retained or explicitly discarded"]
+pub struct LastFmPlaybackRuntimeIngress {
     inner: Arc<HandleInner>,
 }
 
@@ -172,12 +184,43 @@ pub enum LastFmNowPlayingOutcome {
 }
 
 impl LastFmRuntimeHandle {
+    /// Claim this runtime's sole playback-only submission capability.
+    ///
+    /// Claim, shutdown, and closed-state observation linearize on the runtime
+    /// ingress gate. Handle clones and concurrent callers therefore share one
+    /// winner, and dropping the returned capability never restores it.
+    pub fn try_claim_playback_ingress(
+        &self,
+    ) -> Result<LastFmPlaybackRuntimeIngress, LastFmPlaybackRuntimeIngressClaimError> {
+        let mut ingress = self.inner.ingress.lock().map_err(|_| {
+            self.inner.commands.close();
+            LastFmPlaybackRuntimeIngressClaimError::Unavailable
+        })?;
+        if self.inner.commands.is_closed() {
+            ingress.phase = IngressPhase::Closed;
+            ingress.queue_admission_open = false;
+            cancel_gate_delivery(&mut ingress);
+            cancel_gate_now_playing(&mut ingress);
+        }
+        if ingress.playback_ingress_claimed
+            || ingress.shutdown_queued
+            || matches!(ingress.phase, IngressPhase::Closed)
+        {
+            return Err(LastFmPlaybackRuntimeIngressClaimError::Unavailable);
+        }
+        ingress.playback_ingress_claimed = true;
+        drop(ingress);
+        Ok(LastFmPlaybackRuntimeIngress {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+
     /// Bind and queue one exact validated occurrence for durable insertion.
     ///
     /// The playback side never receives or retains the vault-derived account
     /// binding. This gate attaches the binding owned by the current runtime
     /// account, including while that exact account's credential is renewed.
-    pub fn try_enqueue(
+    fn try_enqueue_from_playback_ingress(
         &self,
         scrobble: UnboundLastFmScrobble,
     ) -> Result<LastFmRuntimeOperation<LastFmEnqueueOutcome>, LastFmRuntimeAdmissionError> {
@@ -232,7 +275,7 @@ impl LastFmRuntimeHandle {
     /// Admission is bounded with durable metadata commands. A later admitted
     /// occurrence supersedes the previous network task; this path never
     /// retries a failed now-playing request.
-    pub fn try_update_now_playing(
+    fn try_update_now_playing_from_playback_ingress(
         &self,
         now_playing: LastFmNowPlaying,
     ) -> Result<LastFmRuntimeOperation<LastFmNowPlayingOutcome>, LastFmRuntimeAdmissionError> {
@@ -292,7 +335,7 @@ impl LastFmRuntimeHandle {
 
     /// Retire the latest now-playing occurrence when playback stops or its
     /// successor is not eligible for Last.fm metadata publication.
-    pub fn try_clear_now_playing(
+    fn try_clear_now_playing_from_playback_ingress(
         &self,
     ) -> Result<LastFmRuntimeOperation<()>, LastFmRuntimeAdmissionError> {
         let mut ingress = self.lock_ingress()?;
@@ -344,6 +387,29 @@ impl LastFmRuntimeHandle {
             }
         }
         Ok(LastFmRuntimeOperation { receiver })
+    }
+
+    #[cfg(test)]
+    pub(super) fn try_enqueue(
+        &self,
+        scrobble: UnboundLastFmScrobble,
+    ) -> Result<LastFmRuntimeOperation<LastFmEnqueueOutcome>, LastFmRuntimeAdmissionError> {
+        self.try_enqueue_from_playback_ingress(scrobble)
+    }
+
+    #[cfg(test)]
+    pub(super) fn try_update_now_playing(
+        &self,
+        now_playing: LastFmNowPlaying,
+    ) -> Result<LastFmRuntimeOperation<LastFmNowPlayingOutcome>, LastFmRuntimeAdmissionError> {
+        self.try_update_now_playing_from_playback_ingress(now_playing)
+    }
+
+    #[cfg(test)]
+    pub(super) fn try_clear_now_playing(
+        &self,
+    ) -> Result<LastFmRuntimeOperation<()>, LastFmRuntimeAdmissionError> {
+        self.try_clear_now_playing_from_playback_ingress()
     }
 
     /// Install a renewed session for the exact retained account and restart
@@ -621,6 +687,49 @@ impl LastFmRuntimeHandle {
     }
 }
 
+impl LastFmPlaybackRuntimeIngress {
+    /// Submit one validated now-playing occurrence through bounded runtime
+    /// admission.
+    pub fn try_update_now_playing(
+        &self,
+        now_playing: LastFmNowPlaying,
+    ) -> Result<LastFmRuntimeOperation<LastFmNowPlayingOutcome>, LastFmRuntimeAdmissionError> {
+        LastFmRuntimeHandle {
+            inner: Arc::clone(&self.inner),
+        }
+        .try_update_now_playing_from_playback_ingress(now_playing)
+    }
+
+    /// Submit one playback-derived scrobble through bounded durable queue
+    /// admission.
+    pub fn try_enqueue(
+        &self,
+        scrobble: UnboundLastFmScrobble,
+    ) -> Result<LastFmRuntimeOperation<LastFmEnqueueOutcome>, LastFmRuntimeAdmissionError> {
+        LastFmRuntimeHandle {
+            inner: Arc::clone(&self.inner),
+        }
+        .try_enqueue_from_playback_ingress(scrobble)
+    }
+
+    /// Retire the runtime's latest now-playing value through bounded control
+    /// admission.
+    pub fn try_clear_now_playing(
+        &self,
+    ) -> Result<LastFmRuntimeOperation<()>, LastFmRuntimeAdmissionError> {
+        LastFmRuntimeHandle {
+            inner: Arc::clone(&self.inner),
+        }
+        .try_clear_now_playing_from_playback_ingress()
+    }
+}
+
+impl fmt::Debug for LastFmPlaybackRuntimeIngress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LastFmPlaybackRuntimeIngress(<redacted>)")
+    }
+}
+
 impl fmt::Debug for LastFmRuntimeHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let phase = self
@@ -663,6 +772,13 @@ pub enum LastFmRuntimeAdmissionError {
     NotActive,
     #[error("Last.fm runtime is closed")]
     Closed,
+}
+
+/// Fixed, content-free failure to claim playback submission authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum LastFmPlaybackRuntimeIngressClaimError {
+    #[error("Last.fm playback runtime ingress is unavailable")]
+    Unavailable,
 }
 
 /// Content-free result of one command which crossed ingress admission.
@@ -3398,6 +3514,7 @@ pub async fn spawn_lastfm_runtime(
     };
     let ingress = Arc::new(Mutex::new(IngressGate {
         phase: ingress_phase,
+        playback_ingress_claimed: false,
         queue_admission_open: queue_state
             .durable_pause
             .is_none_or(storage::LastFmDurablePause::queue_admission_open),
@@ -3837,6 +3954,182 @@ mod tests {
         .unwrap()
     }
 
+    fn idle_runtime_handle() -> (LastFmRuntimeHandle, async_channel::Receiver<Command>) {
+        let binding = session("listener").account_binding();
+        let ingress = Arc::new(Mutex::new(IngressGate {
+            phase: IngressPhase::Active {
+                account_binding: binding,
+                account_epoch: LastFmAccountEpoch::INITIAL,
+            },
+            playback_ingress_claimed: false,
+            queue_admission_open: true,
+            queued_metadata: 0,
+            delivery_event_queued: false,
+            reauthorization_queued: false,
+            now_playing_clear_queued: false,
+            now_playing_clear_generation: None,
+            now_playing_generation: LastFmNowPlayingGeneration::INITIAL_PREDECESSOR,
+            now_playing_reauthorization_commit: false,
+            delivery_cancellation: None,
+            now_playing_cancellation: None,
+            shutdown_queued: false,
+            recovery_clear_gate: None,
+            now_playing_result_gate: None,
+            now_playing_reauthorization_commit_gate: None,
+        }));
+        let (commands, receiver) = async_channel::bounded(COMMAND_CAPACITY);
+        let (_status_sender, status) = watch::channel(LastFmRuntimeStatus::active(0));
+        (
+            LastFmRuntimeHandle {
+                inner: Arc::new(HandleInner {
+                    commands,
+                    ingress,
+                    status,
+                }),
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn playback_ingress_claim_has_one_concurrent_winner_and_stays_consumed_after_drop() {
+        let (handle, _commands) = idle_runtime_handle();
+        let barrier = Arc::new(ThreadBarrier::new(9));
+        let mut attempts = Vec::new();
+        for _ in 0..8 {
+            let handle = handle.clone();
+            let barrier = Arc::clone(&barrier);
+            attempts.push(std::thread::spawn(move || {
+                barrier.wait();
+                handle.try_claim_playback_ingress().is_ok()
+            }));
+        }
+
+        barrier.wait();
+        let winners = attempts
+            .into_iter()
+            .map(|attempt| usize::from(attempt.join().unwrap()))
+            .sum::<usize>();
+
+        assert_eq!(winners, 1);
+        assert_eq!(
+            handle.try_claim_playback_ingress().unwrap_err(),
+            LastFmPlaybackRuntimeIngressClaimError::Unavailable
+        );
+    }
+
+    #[test]
+    fn playback_ingress_claim_linearizes_with_shutdown_and_channel_close() {
+        let (shutdown_handle, shutdown_commands) = idle_runtime_handle();
+        assert!(shutdown_handle.close_and_flush());
+        assert_eq!(
+            shutdown_handle.try_claim_playback_ingress().unwrap_err(),
+            LastFmPlaybackRuntimeIngressClaimError::Unavailable
+        );
+        assert!(matches!(
+            shutdown_commands.try_recv().unwrap(),
+            Command::Shutdown
+        ));
+
+        let (committed_handle, committed_commands) = idle_runtime_handle();
+        {
+            let mut gate = committed_handle.inner.ingress.lock().unwrap();
+            let IngressPhase::Active {
+                account_binding,
+                account_epoch,
+            } = gate.phase
+            else {
+                panic!("test runtime was not active");
+            };
+            gate.phase = IngressPhase::Transitioning {
+                account_binding,
+                account_epoch,
+                state: TransitionState::DeliveryRestartCommitted,
+            };
+        }
+        assert!(committed_handle.close_and_flush());
+        assert!(matches!(
+            committed_handle.inner.ingress.lock().unwrap().phase,
+            IngressPhase::Transitioning {
+                state: TransitionState::DeliveryRestartCommitted,
+                ..
+            }
+        ));
+        assert_eq!(
+            committed_handle.try_claim_playback_ingress().unwrap_err(),
+            LastFmPlaybackRuntimeIngressClaimError::Unavailable
+        );
+        assert!(matches!(
+            committed_commands.try_recv().unwrap(),
+            Command::Shutdown
+        ));
+
+        let (closed_handle, closed_commands) = idle_runtime_handle();
+        drop(closed_commands);
+        assert_eq!(
+            closed_handle.try_claim_playback_ingress().unwrap_err(),
+            LastFmPlaybackRuntimeIngressClaimError::Unavailable
+        );
+        assert!(matches!(
+            closed_handle.inner.ingress.lock().unwrap().phase,
+            IngressPhase::Closed
+        ));
+
+        let (poisoned_handle, poisoned_commands) = idle_runtime_handle();
+        let poisoned_gate = Arc::clone(&poisoned_handle.inner.ingress);
+        let poisoned = std::thread::spawn(move || {
+            let _guard = poisoned_gate.lock().unwrap();
+            panic!("poison playback ingress gate");
+        });
+        assert!(poisoned.join().is_err());
+        assert_eq!(
+            poisoned_handle.try_claim_playback_ingress().unwrap_err(),
+            LastFmPlaybackRuntimeIngressClaimError::Unavailable
+        );
+        assert!(poisoned_commands.is_closed());
+    }
+
+    #[test]
+    fn playback_ingress_exposes_only_redacted_bounded_playback_dispatch() {
+        let (handle, commands) = idle_runtime_handle();
+        let ingress = handle.try_claim_playback_ingress().unwrap();
+        assert_eq!(
+            format!("{ingress:?}"),
+            "LastFmPlaybackRuntimeIngress(<redacted>)"
+        );
+
+        let now_playing = LastFmNowPlaying::try_new(LastFmTrack {
+            artist: "Artist".to_owned(),
+            title: "Now".to_owned(),
+            album: Some("Album".to_owned()),
+            album_artist: None,
+            track_number: Some(1),
+            duration_seconds: 60,
+        })
+        .unwrap();
+        let now_playing_operation = ingress.try_update_now_playing(now_playing).unwrap();
+        let enqueue_operation = ingress.try_enqueue(unbound_scrobble("Later")).unwrap();
+        let clear_operation = ingress.try_clear_now_playing().unwrap();
+
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            Command::NowPlaying { .. }
+        ));
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            Command::Enqueue { .. }
+        ));
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            Command::ClearNowPlaying { .. }
+        ));
+        assert!(commands.try_recv().is_err());
+
+        drop(now_playing_operation);
+        drop(enqueue_operation);
+        drop(clear_operation);
+    }
+
     #[test]
     fn lifecycle_gate_cancels_delivery_before_reserved_markers_cross_a_full_metadata_backlog() {
         let stored_session = session("listener");
@@ -3848,6 +4141,7 @@ mod tests {
                 account_binding: binding,
                 account_epoch: epoch,
             },
+            playback_ingress_claimed: false,
             queue_admission_open: true,
             queued_metadata: 0,
             delivery_event_queued: false,
@@ -3948,6 +4242,7 @@ mod tests {
                 account_epoch: epoch,
                 state: TransitionState::DisconnectInFlight,
             },
+            playback_ingress_claimed: false,
             queue_admission_open: false,
             queued_metadata: 0,
             delivery_event_queued: false,
@@ -4042,6 +4337,7 @@ mod tests {
                 account_binding: binding,
                 account_epoch: epoch,
             },
+            playback_ingress_claimed: false,
             queue_admission_open: true,
             queued_metadata: 0,
             delivery_event_queued: false,
@@ -4343,6 +4639,7 @@ mod tests {
                 account_binding: binding,
                 account_epoch: epoch,
             },
+            playback_ingress_claimed: false,
             queue_admission_open: true,
             queued_metadata: 0,
             delivery_event_queued: false,
@@ -4849,6 +5146,7 @@ mod tests {
                 account_epoch: epoch,
                 state: TransitionState::CredentialCleanupInFlight,
             },
+            playback_ingress_claimed: false,
             queue_admission_open: false,
             queued_metadata: 0,
             delivery_event_queued: false,

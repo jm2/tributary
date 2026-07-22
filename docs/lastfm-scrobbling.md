@@ -2,8 +2,8 @@
 
 - Status: accepted P2.1 design; internal protocol/desktop-authorization/vault/queue/playback-evidence,
   registry-bound external and removable attribution, playback-owner, delivery/lifecycle,
-  now-playing, and Dormant process-coordinator/production-ingress boundaries implemented; product
-  integration pending
+  now-playing, process-coordinator/production-ingress, and sealed headless Active runtime-bridge
+  boundaries implemented; production startup remains Dormant and product integration is pending
 - Decision date: 2026-07-20
 - Implementation status date: 2026-07-22
 - Tracking issue: [#50](https://github.com/jm2/tributary/issues/50)
@@ -42,6 +42,11 @@ The implemented internal foundation includes:
 - an explicit `LastFmRuntimeActivation` capability intended for a future issuer that has first
   established consent and build enablement. No production application path issues that capability
   yet;
+- a one-shot playback-only capability claim on each started runtime. Exactly one concurrent caller
+  can receive the move-only, non-`Clone` ingress, its claim remains consumed after drop, and
+  shutdown, closed-channel, or poisoned admission fails with a fixed content-free result. It
+  exposes only bounded NowPlaying, Enqueue, and Clear submission and carries no lifecycle, account,
+  credential, vault, recovery, or status authority;
 - runtime-only account attachment: playback-facing admission accepts a validated unbound scrobble,
   and the runtime attaches the current account's vault-derived binding at its ingress gate before
   sending the bound command to the serialized owner, including during that exact account's
@@ -75,8 +80,12 @@ The implemented internal foundation includes:
   input freezes its structured occurrence metadata and opaque queue-occurrence identity before any
   event arrives. Only `PlaybackSession` can issue the private production mint witness, and only
   after that exact generation crosses synchronous output acceptance. Lock-linearized freshness
-  makes a delayed accepted load and stale NowPlaying/Clear handoff inert after a successor wins;
-  qualified Enqueue is deliberately not retroactively revoked. An ineligible or policy-rejected
+  makes a delayed accepted load inert after a successor wins. A Clear owed for a published
+  predecessor survives a source-rejected or runtime-Busy successor NowPlaying and is cancelled only
+  once the successor crosses runtime admission successfully; older NowPlaying and consumed Clear
+  handoffs are inert, while a qualified Enqueue is deliberately not retroactively revoked and,
+  after runtime admission, remains owned until its one-shot durable result settles. An
+  ineligible or policy-rejected
   accepted replacement terminally retires its predecessor and emits at most one explicit clear.
   A separate move-only intent closes predecessor delivery before output invocation. The exact same
   queue occurrence may retry while preserving UUID, first-evidence time, credit, metadata, and
@@ -84,7 +93,8 @@ The implemented internal foundation includes:
   skipped generation fails closed.
   Typed, move-only now-playing/scrobble/clear handoffs keep payloads private until the exact registry
   and runtime admission boundary, and fixed diagnostics redact source, generation, identity, and
-  metadata. No production `LastFmPlaybackOwner` instance exists yet;
+  metadata. Only the coordinator-private mint can construct the owner used by the headless Active
+  bridge; no production caller activates such an instance yet;
 - one non-cloneable, non-recreatable process playback coordinator claimed before GTK activation and
   transferable only to the first window. Its cloneable redacted binding carries a checked window
   epoch, makes stale-window callbacks inert, converts poison into terminal shutdown, and cannot be
@@ -95,11 +105,31 @@ The implemented internal foundation includes:
   source-authority revalidation points, and application shutdown without retaining a GTK `RefCell`
   borrow across coordinator ingress. Source changes invoke that boundary before selective queue
   invalidation; Dormant mode has no active proof to revalidate, unrelated-source changes remain
-  otherwise inert, and output reselection or failed preflight likewise does not retire. The coordinator remains deliberately `Dormant` and
-  contains no playback owner, runtime, transport, vault, credentials, activation capability,
-  metadata, or policy. Dormant, stale, failed, and shutdown load settlement never invokes its lazy
-  metadata extractor and instead calls one separate metadata-free exact-discard closure after
-  releasing the coordinator lock;
+  otherwise inert, and output reselection or failed preflight likewise does not retire. Dormant,
+  stale, failed, and shutdown load settlement never invokes its lazy metadata extractor and instead
+  calls one separate metadata-free exact-discard closure after releasing the coordinator lock;
+- a sealed headless Active path inside that process coordinator. A non-cloneable lease binds one
+  exact window and checked activation epoch to the runtime's already-claimed playback ingress,
+  constructs the sole playback owner through a coordinator-private mint, and routes lazy accepted
+  loads, current events, discontinuities, source-authority revalidation, and typed retirement.
+  Accepted-load construction starts only after admission to the exact Active lifecycle operation
+  and is rechecked before owner mutation. Its builder is contractually bounded and must not
+  synchronously re-enter activation close, owner rebind/shutdown, or another API waiting for the
+  same operation drain. Owner mutation precedes registry-locked source-policy admission and bounded
+  runtime handoff while the operation remains admitted. Before an Enqueue can enter the runtime, its
+  parent operation reserves one of 64 supervisor slots and a child drain lease. Synchronous ingress
+  reports `PendingDurability`; the child remains armed until the runtime Enqueue completion settles,
+  only `Inserted`/`AlreadyQueued` proves SQLite durability, and task cancellation maps to owner-stop
+  rather than silently releasing it;
+- lifecycle retirement for that Active bridge. Close, rebind, and shutdown first revoke new
+  admission, wait for every admitted operation and supervised enqueue receipt, retire the owner and
+  dispatch any required Clear, then observe the same immutable retirement result. No successor
+  activation/window is exposed before that result. A late queue, storage, stale-account, owner-stop,
+  or supervisor-cancellation result is retained as a sticky terminal failure. Owner/operation/
+  retirement/coordinator poison and closed runtime admission likewise fail terminally rather than
+  allowing a successor after an unproven retirement. Focused tests cover exact activation scoping,
+  lazy-builder retirement, in-flight dispatch, delayed enqueue success/failure, shared concurrent
+  close/rebind/shutdown results, Clear-before-successor ordering, and poison paths;
 - a serialized actor with bounded admission for 64 ordinary metadata commands and four reserved
   control slots: one delivery result, two lifecycle markers, and one explicit now-playing clear.
   Delivery, lifecycle, and playback retirement therefore cannot be starved by the ordinary FIFO;
@@ -150,20 +180,30 @@ The implemented internal foundation includes:
   capability pause for any still-unpurged account before releasing the lease. If SQLite cannot
   establish that pause, the shutdown proof remains failed and no durable-pause claim is made.
 
-This foundation is intentionally not exposed as a partial user feature. Still remaining are active
-construction of the internal `LastFmPlaybackOwner` and delivery/runtime owner inside the existing
-process coordinator; metadata extraction and dispatch of the owner's move-only action/clear
-handoffs; exact local and authenticated-remote profile construction plus production remote-source
-opt-in; and activation/per-source policy. Also remaining are
+This foundation is intentionally not exposed as a partial user feature. Startup still leaves the
+process coordinator Dormant: no production application owner starts the delivery/runtime actor,
+claims its one-shot playback ingress, issues the exact-window activation, or connects playback to
+live feature/per-source policy. Exact local and authenticated-remote profile construction plus
+production remote-source opt-in also remain. Also remaining are
 localized consent and browser invocation around the completed authorization core; one process-wide
 authorization/runtime owner; atomic staged-session vault installation, exact same-account
 reauthorization and different-account replacement/purge policy; enablement, exact per-source/session
 policy, and a production activation issuer; settings, account/recovery/status, valid-vault
 corrupt-queue recovery, accessibility, and all localization UI; release-time production credential
 injection and package verification; and the remaining live end-to-end and platform acceptance
-matrix. The internal observer, playback owner, runtime, and now-playing lane are complete boundaries
-but remain uninstantiated or unconnected while the coordinator is Dormant; the countable P2.1
-record stays open until those product layers land.
+matrix. The internal observer, playback owner, runtime, now-playing lane, and sealed runtime bridge
+are complete headless boundaries but remain uninstantiated or unconnected by production while the
+coordinator is Dormant; the countable P2.1 record stays open at **14/38 (36.8%)** until those product
+layers land.
+
+The current headless-runtime-bridge slice includes focused capability, activation-epoch,
+lazy-builder, real-runtime durable-enqueue, supervised delayed-enqueue completion/failure,
+exact-managed-source revocation, dispatch-order, source/runtime-rejection, operation-drain,
+shared-retirement, close/rebind/shutdown, and poison regressions. Locked debug and release suites
+each pass 20 library, 1,677 application, and 14
+repository-metadata tests (1,711 total). Strict Clippy passes in debug, release, and the fuzz
+workspace; the declared Rust 1.92 locked all-target check, formatting, and diff checks are clean;
+and the dependency audit is green apart from the two documented allowed unmaintained warnings.
 
 The central rule is:
 
@@ -597,6 +637,14 @@ The implementation is complete only when all of the following are covered:
 - first authoritative playing evidence, no-credit anchors, stale/rejected generations, pause,
   buffering, seek directions, Previous restart, retry, Repeat One, output error, natural end,
   source retirement, and one-shot now-playing/scrobble latches;
+- one-winner playback-ingress claim and permanent consumption; exact window/activation scoping;
+  bounded non-reentrant lazy metadata construction; owner-before-source-before-runtime ordering;
+  operation drain; bounded enqueue-completion reservation before runtime admission; pending versus
+  durable enqueue disposition; delayed SQLite success, queue/storage/stale-account/owner-stop and
+  supervisor-cancellation results; immutable shared close/rebind/shutdown retirement success or
+  failure; terminal owner/gate/coordinator poison and closed-runtime behavior; predecessor Clear
+  retention across source rejection or runtime Busy and cancellation only after successful
+  successor admission;
 - exact half-duration ceiling and four-minute cap edges based only on accumulated forward evidence;
 - atomic admission-before-network, exact 10,000-row contention at the transaction boundary,
   fail-visible refusal without eviction, FIFO ordering, 50-item batch boundaries, and account
