@@ -16,19 +16,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [playback/now-playing slice](https://github.com/jm2/tributary/pull/154),
   [desktop-authorization slice](https://github.com/jm2/tributary/pull/155),
   [playback-ownership slice](https://github.com/jm2/tributary/pull/156),
-  [removable-attribution slice](https://github.com/jm2/tributary/pull/157)).
+  [removable-attribution slice](https://github.com/jm2/tributary/pull/157), and the
+  [process-coordinator slice](https://github.com/jm2/tributary/pull/158)).
   This is an internal foundation, not yet a user-visible scrobbling feature. The standalone
-  playback observer, GTK-free playback owner/handoffs, and runtime-owned now-playing lane are
-  deliberately not connected to production playback or application startup. Exact real-tag
-  external and removable profiles, registry-bound proofs, and registry-minted removable queue
-  capture are constructed, but their production playback consumer is still unwired.
+  playback observer, GTK-free playback owner/handoffs, and runtime-owned now-playing lane still have
+  no active production instance. Application startup now claims a non-recreatable Dormant playback
+  coordinator, however, and production call sites feed its epoch-bound boundary with output intent,
+  lazy accepted-load handoff, events, discontinuities, source-revalidation points, terminal causes,
+  committed output replacement, and shutdown. Exact real-tag external/removable proofs reach that boundary,
+  but Dormant mode revokes them through a metadata-free discard closure and emits no Last.fm work.
   Authenticated remotes remain closed because exact remote profiles and a production remote-source
-  opt-in set do not exist. One process-lifetime, non-recreatable production playback
-  owner/coordinator, exact local/authenticated-remote profiles, runtime event and
-  terminal/source-retirement/shutdown wiring, construction of the authorization owner, explicit
-  consent and browser launch, staged-session vault installation and account transition policy,
-  exact per-source/session policy, settings/status UI, localization and accessibility, and
-  production package credentials remain follow-on work; the
+  opt-in set do not exist. Active playback-owner/runtime construction and handoff dispatch, exact
+  local/authenticated-remote profiles, construction of the authorization owner, explicit consent
+  and browser launch, staged-session vault installation and account transition policy, exact
+  per-source/session policy, settings/status UI, localization and accessibility, and production
+  package credentials remain follow-on work; the
   [complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary) also tracks
   activation/unavailable-state issuance, structured source-owner conversion, account replacement
   and recovery, package verification/API registration, and the remaining acceptance matrix.
@@ -96,9 +98,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     terminally retire their predecessor and emit at most one explicit clear. Lock-linearized
     freshness makes delayed accepted loads and stale NowPlaying/Clear handoffs inert after a
     successor, while a qualified Enqueue is not retroactively revoked. Move-only redacted handoffs
-    keep payloads private through exact source and runtime admission. No process-lifetime,
-    non-recreatable production owner/coordinator exists yet to own this internal boundary; proof
-    consumption and exact local/authenticated-remote profiles remain unwired.
+    keep payloads private through exact source and runtime admission. A separate move-only output
+    intent closes the predecessor generation before any output call: an exact same-occurrence retry
+    preserves UUID, start, credit, metadata, and latches, while a replacement retires terminally and
+    an incoherent generation fails closed. Exact local/authenticated-remote profiles remain
+    unwired.
+  - **Dormant process playback coordinator and production ingress:** startup claims exactly one
+    non-cloneable process owner before GTK activation and can transfer it only to the first window.
+    Cloneable redacted bindings carry a checked window epoch; rebinding makes old callbacks inert,
+    poison becomes terminal shutdown, and owner drop cannot permit recreation. Production playback
+    now reports intent before output invocation, handles the accepted/rejected result in the
+    playback session, hands accepted loads to the lazy coordinator boundary, and reports current
+    events before history/UI reduction, seek/Previous/resume discontinuities, Stop, committed output replacement,
+    queue and external-terminal retirement, source-authority revalidation points, and application
+    shutdown without retaining a GTK `RefCell` guard across coordinator ingress. The coordinator is
+    intentionally Dormant and contains no playback owner, runtime, transport, vault, credentials,
+    activation capability, metadata, or policy. It never invokes the metadata extractor; accepted
+    authority is instead consumed and revoked exactly once through a separate content-free discard
+    closure in Dormant, stale-window, and shutdown states. Thus external/removable metadata and
+    action handoffs still do not leave the playback session, and this boundary is not user-visible
+    activation. Review follow-up also makes OS-open dispatch use the same structural-window check
+    as activation, so files are drained immediately when a live window is temporarily unfocused.
   - **Private offline FIFO and durable delivery gate:** migration 17 creates and revalidates a
     constrained queue containing
     only bounded submission metadata, opaque occurrence/order identity, one-way account binding,
