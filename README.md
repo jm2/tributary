@@ -121,7 +121,10 @@ capable build accepts one database attachment followed by one move-only request 
 and enablement, then starts the runtime, claims its one-shot playback ingress, and activates the
 exact window as one retained generation with an immutable remote-source set. Partial activation is
 shut down and joined; normal close drains the bridge before the runtime, and a failed drain is
-terminal.
+terminal. Database, Starting, and Active publication linearize with close on one gate. Once Active,
+the owner supervises the runtime's persistent barrier: an unexpected exit closes application
+ingress, retires the bridge, joins the runtime, and only then publishes a fixed terminal failure;
+an application close that wins the same gate remains an ordinary ordered drain.
 
 Production playback already reports output intent before invocation, handles the accepted/rejected
 session result, hands accepted loads to the lazy coordinator boundary, and reports current events,

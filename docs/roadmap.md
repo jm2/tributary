@@ -52,7 +52,9 @@ build capability before database, vault, queue, or network access; accepts one d
 followed by one move-only consent/enablement request; freezes one exact remote-source set; and
 starts the runtime, claims its one-shot playback ingress, and activates the exact-window bridge as
 one retained generation. Partial activation is rolled back and joined. Close drains the bridge
-before the runtime, and failed drain is terminal.
+before the runtime, and failed drain is terminal. Database, Starting, and Active status publication
+linearize with close; unexpected runtime exit is supervised through bridge retirement and runtime
+join before a fixed terminal result, while a close that wins the gate remains a normal drain.
 
 Production startup still leaves the coordinator `Dormant`: no application caller starts the
 application-owner core, attaches its database, issues an activation request, or connects live
@@ -228,10 +230,11 @@ slices.
 
   The GTK-free application-owner core now supplies one database attachment followed by one bounded
   request and the transactional runtime-start, one-shot ingress-claim, exact-window activation,
-  rollback, and bridge-before-runtime drain lifecycle. Production startup still leaves the
-  coordinator `Dormant`: no shipping caller constructs or feeds that core, attaches its database,
-  issues an activation request, or supplies live enablement/per-source policy. Dormant accepted
-  authority is consumed and revoked exactly once through a separate metadata-free discard closure.
+  rollback, bridge-before-runtime drain, close-linearized phase publication, and unexpected-runtime
+  supervision lifecycle. Production startup still leaves the coordinator `Dormant`: no shipping
+  caller constructs or feeds that core, attaches its database, issues an activation request, or
+  supplies live enablement/per-source policy. Dormant accepted authority is consumed and revoked
+  exactly once through a separate metadata-free discard closure.
   External/removable profile and proof construction reaches this
   boundary, but no production playback owner consumes it. Exact local/authenticated-remote profiles
   remain unwired; authenticated remotes also have no production opt-in source set. The runtime's
@@ -497,7 +500,9 @@ The playback-history contract makes the remaining Last.fm behavior much less amb
    A headless application-owner core now classifies build capability without vault/network work,
    accepts one database attachment followed by one opaque activation request, and retains runtime
    plus exact-window bridge as one immutable-policy generation. Partial activation is joined; normal
-   close drains the bridge before the runtime and failed drain is terminal.
+   close drains the bridge before the runtime and failed drain is terminal. Close-linearized phase
+   publication cannot regress during shutdown, and unexpected runtime exit retires and joins the
+   generation before its fixed failure is published.
 
    Production startup remains deliberately `Dormant`: no caller constructs or feeds this core,
    attaches its database, issues an activation request, or supplies live policy/UI/auth ownership,

@@ -148,9 +148,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     remote-source set, starts the runtime, claims its one-shot playback ingress, and activates the
     exact-window bridge as one transaction. Every partial start is rolled back and joined. Normal
     close drains the bridge before shutting down and joining the runtime; a failed drain is sticky
-    and cannot expose a successor generation. The core publishes only bounded content-free status
-    and remains unconstructed by the shipping application, so it cannot infer consent from build
-    credentials, vault state, queued rows, or source connectivity.
+    and cannot expose a successor generation. Database, Starting, and Active publication
+    linearize with close, and the retained runtime barrier is supervised: unexpected runtime exit
+    closes ingress, retires the bridge, joins the runtime, and only then publishes a fixed terminal
+    failure. A concurrent application close which wins the gate remains a normal ordered drain.
+    The core publishes only bounded content-free status and remains unconstructed by the shipping
+    application, so it cannot infer consent from build credentials, vault state, queued rows, or
+    source connectivity.
   - **Private offline FIFO and durable delivery gate:** migration 17 creates and revalidates a
     constrained queue containing
     only bounded submission metadata, opaque occurrence/order identity, one-way account binding,

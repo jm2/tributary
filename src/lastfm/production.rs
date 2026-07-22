@@ -29,7 +29,8 @@ use super::playback_coordinator::{
     LastFmPlaybackCoordinatorOutcome,
 };
 use super::runtime::{
-    spawn_lastfm_runtime, LastFmRuntimeActivation, LastFmRuntimeHandle, LastFmRuntimeShutdown,
+    spawn_lastfm_runtime, LastFmRuntimeActivation, LastFmRuntimeBarrier, LastFmRuntimeHandle,
+    LastFmRuntimeShutdown,
 };
 
 const APPLICATION_COMMAND_CAPACITY: usize = 2;
@@ -106,6 +107,8 @@ pub(crate) enum LastFmApplicationCommandError {
     PlaybackIngress,
     #[error("Last.fm playback coordinator could not activate")]
     CoordinatorActivation,
+    #[error("Last.fm runtime terminated unexpectedly")]
+    RuntimeTerminated,
     #[error("Last.fm application generation did not drain")]
     Drain,
 }
@@ -298,12 +301,15 @@ enum Command {
         completion: oneshot::Sender<Result<(), LastFmApplicationCommandError>>,
     },
     #[cfg(test)]
+    StopRuntimeForTest,
+    #[cfg(test)]
     PanicForTest,
 }
 
 struct ActiveGeneration {
     coordinator: LastFmPlaybackCoordinatorActivation,
-    _runtime_handle: LastFmRuntimeHandle,
+    runtime_handle: LastFmRuntimeHandle,
+    runtime_barrier: LastFmRuntimeBarrier,
     runtime_shutdown: LastFmRuntimeShutdown,
 }
 
@@ -318,6 +324,12 @@ struct ApplicationOwner {
     database: Option<DatabaseConnection>,
     generation: Option<ActiveGeneration>,
     #[cfg(test)]
+    attachment_publish_gate: Option<AttachmentPublishGate>,
+    #[cfg(test)]
+    activation_start_gate: Option<ActivationStartGate>,
+    #[cfg(test)]
+    runtime_exit_gate: Option<RuntimeExitGate>,
+    #[cfg(test)]
     panic_cleanup_gate: Option<PanicCleanupGate>,
 }
 
@@ -325,12 +337,34 @@ impl ApplicationOwner {
     async fn run(
         &mut self,
     ) -> Result<LastFmApplicationShutdownReason, LastFmApplicationShutdownError> {
-        while let Ok(command) = self.commands.recv().await {
+        loop {
+            let command = if let Some(generation) = self.generation.as_ref() {
+                let runtime_barrier = generation.runtime_barrier.clone();
+                tokio::select! {
+                    biased;
+                    command = self.commands.recv() => command,
+                    _ = runtime_barrier.wait() => {
+                        return self.fail_after_unexpected_runtime_exit().await;
+                    }
+                }
+            } else {
+                self.commands.recv().await
+            };
+            let Ok(command) = command else {
+                break;
+            };
             match command {
                 Command::AttachDatabase {
                     database,
                     completion,
-                } => self.attach_database(database, completion)?,
+                } => {
+                    #[cfg(test)]
+                    if let Some(gate) = self.attachment_publish_gate.take() {
+                        let _ = gate.reached.send(()).await;
+                        let _ = gate.release.recv().await;
+                    }
+                    self.attach_database(database, completion)?;
+                }
                 Command::Activate {
                     activation,
                     completion,
@@ -342,6 +376,12 @@ impl ApplicationOwner {
                             Some(LastFmApplicationCommandError::Drain),
                         );
                         return Err(error);
+                    }
+                }
+                #[cfg(test)]
+                Command::StopRuntimeForTest => {
+                    if let Some(generation) = self.generation.as_ref() {
+                        generation.runtime_handle.close_and_flush();
                     }
                 }
                 #[cfg(test)]
@@ -380,12 +420,63 @@ impl ApplicationOwner {
         }
     }
 
+    async fn fail_after_unexpected_runtime_exit(
+        &mut self,
+    ) -> Result<LastFmApplicationShutdownReason, LastFmApplicationShutdownError> {
+        #[cfg(test)]
+        if let Some(gate) = self.runtime_exit_gate.take() {
+            let _ = gate.reached.send(()).await;
+            let _ = gate.release.recv().await;
+        }
+
+        let unexpected = {
+            let mut ingress = self.ingress.lock().unwrap_or_else(PoisonError::into_inner);
+            if ingress.open {
+                ingress.open = false;
+                ingress.publish(LastFmApplicationPhase::ShuttingDown, None);
+                self.commands.close();
+                true
+            } else {
+                false
+            }
+        };
+        self.ingress.clear_poison();
+        self.reject_queued();
+
+        // Whichever event closes ingress owns the outcome. An application
+        // close that won the gate remains a normal ordered drain; otherwise
+        // the runtime barrier is an unexpected terminal generation failure.
+        let drained = self.close_generation().await.is_ok();
+        let mut ingress = self.ingress.lock().unwrap_or_else(PoisonError::into_inner);
+        ingress.open = false;
+        if unexpected {
+            ingress.publish(
+                LastFmApplicationPhase::Failed,
+                Some(LastFmApplicationCommandError::RuntimeTerminated),
+            );
+        } else if drained {
+            ingress.publish(LastFmApplicationPhase::Stopped, None);
+        } else {
+            ingress.publish(
+                LastFmApplicationPhase::Failed,
+                Some(LastFmApplicationCommandError::Drain),
+            );
+        }
+        drop(ingress);
+        self.ingress.clear_poison();
+        if unexpected || !drained {
+            Err(LastFmApplicationShutdownError)
+        } else {
+            Ok(LastFmApplicationShutdownReason::Drained)
+        }
+    }
+
     fn attach_database(
         &mut self,
         database: DatabaseConnection,
         completion: oneshot::Sender<Result<(), LastFmApplicationCommandError>>,
     ) -> Result<(), LastFmApplicationShutdownError> {
-        if !self.is_open()? || self.transport.is_none() {
+        if self.transport.is_none() {
             let _ = completion.send(Err(LastFmApplicationCommandError::OwnerStopped));
             return Ok(());
         }
@@ -393,8 +484,23 @@ impl ApplicationOwner {
             let _ = completion.send(Err(LastFmApplicationCommandError::OwnerStopped));
             return Ok(());
         }
+
+        // Database attachment and a concurrent close linearize on one gate,
+        // so AwaitingConsent can never overwrite ShuttingDown.
+        let attach = {
+            let mut ingress = self.lock_ingress()?;
+            if ingress.open {
+                ingress.publish(LastFmApplicationPhase::AwaitingConsent, None);
+                true
+            } else {
+                false
+            }
+        };
+        if !attach {
+            let _ = completion.send(Err(LastFmApplicationCommandError::OwnerStopped));
+            return Ok(());
+        }
         self.database = Some(database);
-        self.publish(LastFmApplicationPhase::AwaitingConsent, None)?;
         let _ = completion.send(Ok(()));
         Ok(())
     }
@@ -404,10 +510,6 @@ impl ApplicationOwner {
         activation: LastFmApplicationActivation,
         completion: oneshot::Sender<Result<(), LastFmApplicationCommandError>>,
     ) -> Result<(), LastFmApplicationShutdownError> {
-        if !self.is_open()? {
-            let _ = completion.send(Err(LastFmApplicationCommandError::OwnerStopped));
-            return Ok(());
-        }
         let Some(database) = self.database.take() else {
             let _ = completion.send(Err(LastFmApplicationCommandError::OwnerStopped));
             return Ok(());
@@ -416,7 +518,29 @@ impl ApplicationOwner {
             let _ = completion.send(Err(LastFmApplicationCommandError::OwnerStopped));
             return Ok(());
         };
-        self.publish(LastFmApplicationPhase::Starting, None)?;
+
+        #[cfg(test)]
+        if let Some(gate) = self.activation_start_gate.take() {
+            let _ = gate.reached.send(()).await;
+            let _ = gate.release.recv().await;
+        }
+
+        // Starting and a concurrent close linearize on the same gate. Close
+        // can therefore never be overwritten by a stale Starting snapshot or
+        // followed by an unnecessary vault/runtime start.
+        let start = {
+            let mut ingress = self.lock_ingress()?;
+            if ingress.open {
+                ingress.publish(LastFmApplicationPhase::Starting, None);
+                true
+            } else {
+                false
+            }
+        };
+        if !start {
+            let _ = completion.send(Err(LastFmApplicationCommandError::OwnerStopped));
+            return Ok(());
+        }
 
         let started = spawn_lastfm_runtime(
             LastFmRuntimeActivation::issue_after_consent_and_enablement(),
@@ -431,6 +555,7 @@ impl ApplicationOwner {
             self.fail_terminal(LastFmApplicationCommandError::RuntimeStart)?;
             return Ok(());
         };
+        let runtime_barrier = runtime_shutdown.barrier();
 
         if !self.is_open()? {
             let drained = runtime_shutdown.shutdown().await.is_ok();
@@ -526,7 +651,8 @@ impl ApplicationOwner {
 
         self.generation = Some(ActiveGeneration {
             coordinator,
-            _runtime_handle: runtime_handle,
+            runtime_handle,
+            runtime_barrier,
             runtime_shutdown,
         });
         let _ = completion.send(Ok(()));
@@ -539,7 +665,8 @@ impl ApplicationOwner {
         };
         let ActiveGeneration {
             coordinator,
-            _runtime_handle: runtime_handle,
+            runtime_handle,
+            runtime_barrier: _,
             runtime_shutdown,
         } = generation;
         let coordinator_drained = close_coordinator(coordinator).await;
@@ -594,6 +721,8 @@ impl ApplicationOwner {
                     let _ = completion.send(Err(LastFmApplicationCommandError::OwnerStopped));
                 }
                 #[cfg(test)]
+                Command::StopRuntimeForTest => {}
+                #[cfg(test)]
                 Command::PanicForTest => {}
             }
         }
@@ -633,6 +762,24 @@ impl ApplicationOwner {
 #[cfg(test)]
 #[derive(Clone)]
 struct PanicCleanupGate {
+    reached: async_channel::Sender<()>,
+    release: async_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+struct ActivationStartGate {
+    reached: async_channel::Sender<()>,
+    release: async_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+struct AttachmentPublishGate {
+    reached: async_channel::Sender<()>,
+    release: async_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+struct RuntimeExitGate {
     reached: async_channel::Sender<()>,
     release: async_channel::Receiver<()>,
 }
@@ -813,12 +960,24 @@ fn spawn_with_dependencies(
         clock,
         ApplicationSpawnOptions {
             #[cfg(test)]
+            attachment_publish_gate: None,
+            #[cfg(test)]
+            activation_start_gate: None,
+            #[cfg(test)]
+            runtime_exit_gate: None,
+            #[cfg(test)]
             panic_cleanup_gate: None,
         },
     )
 }
 
 struct ApplicationSpawnOptions {
+    #[cfg(test)]
+    attachment_publish_gate: Option<AttachmentPublishGate>,
+    #[cfg(test)]
+    activation_start_gate: Option<ActivationStartGate>,
+    #[cfg(test)]
+    runtime_exit_gate: Option<RuntimeExitGate>,
     #[cfg(test)]
     panic_cleanup_gate: Option<PanicCleanupGate>,
 }
@@ -859,6 +1018,12 @@ fn spawn_with_options(
         clock,
         database: None,
         generation: None,
+        #[cfg(test)]
+        attachment_publish_gate: options.attachment_publish_gate,
+        #[cfg(test)]
+        activation_start_gate: options.activation_start_gate,
+        #[cfg(test)]
+        runtime_exit_gate: options.runtime_exit_gate,
         #[cfg(test)]
         panic_cleanup_gate: options.panic_cleanup_gate,
     };
@@ -1146,6 +1311,78 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_before_database_publication_never_regresses_or_attaches() {
+        let source_registry = SourceRegistry::new(tokio::runtime::Handle::current());
+        let mut coordinator_owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
+        let coordinator = coordinator_owner
+            .bind_window(source_registry.clone())
+            .expect("window binding");
+        let (attachment_reached, attachment_observations) = async_channel::bounded(1);
+        let (attachment_release, attachment_releases) = async_channel::bounded(1);
+        let (handle, shutdown) = spawn_with_options(
+            coordinator,
+            tokio::runtime::Handle::current(),
+            Arc::new(UnusedCredentials),
+            Some(Arc::new(PendingTransport)),
+            Arc::new(FixedClock),
+            ApplicationSpawnOptions {
+                attachment_publish_gate: Some(AttachmentPublishGate {
+                    reached: attachment_reached,
+                    release: attachment_releases,
+                }),
+                activation_start_gate: None,
+                runtime_exit_gate: None,
+                panic_cleanup_gate: None,
+            },
+        );
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        let attachment = handle
+            .try_attach_database(database)
+            .expect("database command admitted");
+        tokio::time::timeout(Duration::from_secs(2), attachment_observations.recv())
+            .await
+            .expect("pre-attachment gate deadline")
+            .expect("pre-attachment gate reached");
+
+        let barrier = shutdown.barrier();
+        assert!(handle.close_and_flush());
+        assert_eq!(barrier.state(), LastFmApplicationDrainState::Pending);
+        assert_eq!(
+            handle.subscribe_status().borrow().phase,
+            LastFmApplicationPhase::ShuttingDown
+        );
+        attachment_release
+            .send(())
+            .await
+            .expect("release pre-attachment gate");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), attachment.wait())
+                .await
+                .expect("closed attachment deadline"),
+            Err(LastFmApplicationCommandError::OwnerStopped)
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), shutdown.shutdown())
+                .await
+                .expect("application drain deadline"),
+            Ok(LastFmApplicationShutdownReason::Drained)
+        );
+        assert_eq!(barrier.wait().await, Ok(()));
+        assert_eq!(barrier.state(), LastFmApplicationDrainState::Drained);
+        assert_eq!(
+            handle.subscribe_status().borrow().phase,
+            LastFmApplicationPhase::Stopped
+        );
+        assert_eq!(
+            coordinator_owner.shutdown(),
+            LastFmPlaybackCoordinatorOutcome::Applied
+        );
+        source_registry.shutdown().wait().await;
+    }
+
     #[tokio::test]
     async fn production_constructor_is_claimed_exactly_once_per_process() {
         let first_registry = SourceRegistry::new(tokio::runtime::Handle::current());
@@ -1317,6 +1554,246 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_before_start_publication_never_regresses_or_starts_runtime() {
+        let database = migrated_database().await;
+        let credentials = Arc::new(FixedCredentials::new(stored_session()));
+        let source_registry = SourceRegistry::new(tokio::runtime::Handle::current());
+        let mut coordinator_owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
+        let coordinator = coordinator_owner
+            .bind_window(source_registry.clone())
+            .expect("window binding");
+        let (start_reached, start_observations) = async_channel::bounded(1);
+        let (start_release, start_releases) = async_channel::bounded(1);
+        let (handle, shutdown) = spawn_with_options(
+            coordinator,
+            tokio::runtime::Handle::current(),
+            credentials.clone(),
+            Some(Arc::new(PendingTransport)),
+            Arc::new(FixedClock),
+            ApplicationSpawnOptions {
+                attachment_publish_gate: None,
+                activation_start_gate: Some(ActivationStartGate {
+                    reached: start_reached,
+                    release: start_releases,
+                }),
+                runtime_exit_gate: None,
+                panic_cleanup_gate: None,
+            },
+        );
+        handle
+            .try_attach_database(database)
+            .expect("database admitted")
+            .wait()
+            .await
+            .expect("database attached");
+        let activation = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            HashSet::new(),
+        )
+        .expect("local-only activation policy");
+        let activation = handle
+            .try_activate(activation)
+            .expect("activation admitted");
+        tokio::time::timeout(Duration::from_secs(2), start_observations.recv())
+            .await
+            .expect("pre-start gate deadline")
+            .expect("pre-start gate reached");
+
+        let barrier = shutdown.barrier();
+        assert!(handle.close_and_flush());
+        assert_eq!(barrier.state(), LastFmApplicationDrainState::Pending);
+        assert_eq!(
+            handle.subscribe_status().borrow().phase,
+            LastFmApplicationPhase::ShuttingDown
+        );
+        start_release
+            .send(())
+            .await
+            .expect("release pre-start gate");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), activation.wait())
+                .await
+                .expect("closed activation deadline"),
+            Err(LastFmApplicationCommandError::OwnerStopped)
+        );
+        assert_eq!(credentials.loads.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), shutdown.shutdown())
+                .await
+                .expect("application drain deadline"),
+            Ok(LastFmApplicationShutdownReason::Drained)
+        );
+        assert_eq!(barrier.wait().await, Ok(()));
+        assert_eq!(barrier.state(), LastFmApplicationDrainState::Drained);
+        assert_eq!(
+            handle.subscribe_status().borrow().phase,
+            LastFmApplicationPhase::Stopped
+        );
+        assert_eq!(
+            coordinator_owner.shutdown(),
+            LastFmPlaybackCoordinatorOutcome::Applied
+        );
+        source_registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unexpected_runtime_exit_fails_application_after_retiring_generation() {
+        let database = migrated_database().await;
+        let credentials = Arc::new(FixedCredentials::new(stored_session()));
+        let source_registry = SourceRegistry::new(tokio::runtime::Handle::current());
+        let mut coordinator_owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
+        let coordinator = coordinator_owner
+            .bind_window(source_registry.clone())
+            .expect("window binding");
+        let (handle, shutdown) = spawn_with_dependencies(
+            coordinator,
+            tokio::runtime::Handle::current(),
+            credentials,
+            Some(Arc::new(PendingTransport)),
+            Arc::new(FixedClock),
+        );
+        handle
+            .try_attach_database(database)
+            .expect("database admitted")
+            .wait()
+            .await
+            .expect("database attached");
+        let activation = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            HashSet::new(),
+        )
+        .expect("local-only activation policy");
+        handle
+            .try_activate(activation)
+            .expect("activation admitted")
+            .wait()
+            .await
+            .expect("real runtime and coordinator activated");
+        assert_eq!(
+            handle.subscribe_status().borrow().phase,
+            LastFmApplicationPhase::Active
+        );
+
+        let barrier = shutdown.barrier();
+        handle
+            .inner
+            .commands
+            .try_send(Command::StopRuntimeForTest)
+            .expect("stop retained runtime independently");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), barrier.wait())
+                .await
+                .expect("unexpected runtime cleanup deadline"),
+            Err(LastFmApplicationShutdownError)
+        );
+        assert_eq!(barrier.state(), LastFmApplicationDrainState::Failed);
+        let status = *handle.subscribe_status().borrow();
+        assert_eq!(status.phase, LastFmApplicationPhase::Failed);
+        assert_eq!(
+            status.failure,
+            Some(LastFmApplicationCommandError::RuntimeTerminated)
+        );
+        let late = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            HashSet::new(),
+        )
+        .expect("well-formed late activation");
+        assert_eq!(
+            handle.try_activate(late).unwrap_err(),
+            LastFmApplicationAdmissionError::Closed
+        );
+        assert_eq!(
+            shutdown.shutdown().await,
+            Err(LastFmApplicationShutdownError)
+        );
+        assert_eq!(
+            coordinator_owner.shutdown(),
+            LastFmPlaybackCoordinatorOutcome::Applied
+        );
+        source_registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn application_close_wins_runtime_exit_classification_and_drains_normally() {
+        let database = migrated_database().await;
+        let credentials = Arc::new(FixedCredentials::new(stored_session()));
+        let source_registry = SourceRegistry::new(tokio::runtime::Handle::current());
+        let mut coordinator_owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
+        let coordinator = coordinator_owner
+            .bind_window(source_registry.clone())
+            .expect("window binding");
+        let (exit_reached, exit_observations) = async_channel::bounded(1);
+        let (exit_release, exit_releases) = async_channel::bounded(1);
+        let (handle, shutdown) = spawn_with_options(
+            coordinator,
+            tokio::runtime::Handle::current(),
+            credentials,
+            Some(Arc::new(PendingTransport)),
+            Arc::new(FixedClock),
+            ApplicationSpawnOptions {
+                attachment_publish_gate: None,
+                activation_start_gate: None,
+                runtime_exit_gate: Some(RuntimeExitGate {
+                    reached: exit_reached,
+                    release: exit_releases,
+                }),
+                panic_cleanup_gate: None,
+            },
+        );
+        handle
+            .try_attach_database(database)
+            .expect("database admitted")
+            .wait()
+            .await
+            .expect("database attached");
+        let activation = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            HashSet::new(),
+        )
+        .expect("local-only activation policy");
+        handle
+            .try_activate(activation)
+            .expect("activation admitted")
+            .wait()
+            .await
+            .expect("real runtime and coordinator activated");
+
+        let barrier = shutdown.barrier();
+        handle
+            .inner
+            .commands
+            .try_send(Command::StopRuntimeForTest)
+            .expect("stop retained runtime independently");
+        tokio::time::timeout(Duration::from_secs(2), exit_observations.recv())
+            .await
+            .expect("runtime-exit classification deadline")
+            .expect("runtime-exit classification reached");
+        assert!(handle.close_and_flush());
+        assert_eq!(barrier.state(), LastFmApplicationDrainState::Pending);
+        assert_eq!(
+            handle.subscribe_status().borrow().phase,
+            LastFmApplicationPhase::ShuttingDown
+        );
+        exit_release
+            .send(())
+            .await
+            .expect("release runtime-exit classification");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), shutdown.shutdown())
+                .await
+                .expect("application drain deadline"),
+            Ok(LastFmApplicationShutdownReason::Drained)
+        );
+        assert_eq!(barrier.wait().await, Ok(()));
+        assert_eq!(barrier.state(), LastFmApplicationDrainState::Drained);
+        assert_eq!(
+            handle.subscribe_status().borrow().phase,
+            LastFmApplicationPhase::Stopped
+        );
+        assert_eq!(
+            coordinator_owner.shutdown(),
+            LastFmPlaybackCoordinatorOutcome::Applied
+        );
+        source_registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stale_coordinator_rolls_back_claimed_runtime_and_drains_normally() {
         let database = migrated_database().await;
         let credentials = Arc::new(FixedCredentials::new(stored_session()));
@@ -1396,6 +1873,9 @@ mod tests {
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
             ApplicationSpawnOptions {
+                attachment_publish_gate: None,
+                activation_start_gate: None,
+                runtime_exit_gate: None,
                 panic_cleanup_gate: Some(PanicCleanupGate {
                     reached: cleanup_reached,
                     release: cleanup_releases,

@@ -138,7 +138,10 @@ The implemented internal foundation includes:
   claim its one-shot playback ingress, and activate the exact coordinator window. Runtime and activation
   are retained as one generation. Every partial start is rolled back and joined; close retires the
   bridge before runtime shutdown/join, a late start cannot publish Active after close, and a failed
-  drain is terminal. Its status and diagnostics contain only fixed categories;
+  drain is terminal. Database, Starting, and Active publication linearize with close. The retained
+  runtime barrier is supervised; unexpected exit closes application ingress, retires the bridge,
+  joins the runtime, and only then publishes a fixed terminal failure, while an application close
+  that wins the gate remains a normal drain. Status and diagnostics contain only fixed categories;
 - a serialized actor with bounded admission for 64 ordinary metadata commands and four reserved
   control slots: one delivery result, two lifecycle markers, and one explicit now-playing clear.
   Delivery, lifecycle, and playback retirement therefore cannot be starved by the ordinary FIFO;
@@ -206,15 +209,17 @@ application owner are complete headless boundaries but remain uninstantiated or 
 production while the coordinator is Dormant; the countable P2.1 record stays open at **14/38
 (36.8%)** until those product layers land.
 
-The current application-owner slice adds nine focused regressions for zero-action unavailable
-builds, one-shot database/consent input, process-wide ownership, a real Active generation, late
-vault-load close, stale-coordinator rollback, panic cleanup ordering, close with queued inputs, and
-bounded/redacted policy. Existing capability, activation-epoch, durable-enqueue,
-exact-managed-source revocation, dispatch-order, retirement, close/rebind/shutdown, and poison
-coverage remains green. Locked debug and release suites each pass 20 library, 1,686 application,
-and 14 repository-metadata tests (1,720 total). Strict Clippy passes in debug, release, and the fuzz
-workspace; the declared Rust 1.92 locked all-target check, formatting, and diff checks are clean;
-and the dependency audit reports only the two documented allowed unmaintained warnings.
+The current application-owner slice adds 13 focused regressions for zero-action unavailable builds,
+one-shot database/consent input, process-wide ownership, a real Active generation, late vault-load
+close, stale-coordinator rollback, panic cleanup ordering, close with queued inputs,
+bounded/redacted policy, close-before-database and close-before-Starting publication, unexpected
+runtime exit, and close-versus-runtime-exit classification. Existing capability, activation-epoch,
+durable-enqueue, exact-managed-source revocation, dispatch-order, retirement,
+close/rebind/shutdown, and poison coverage remains green. Locked debug and release suites each pass
+20 library, 1,690 application, and 14 repository-metadata tests (1,724 total). Strict Clippy passes
+in debug, release, and the fuzz workspace; the declared Rust 1.92 locked all-target check,
+formatting, and diff checks are clean; and the dependency audit reports only the two documented
+allowed unmaintained warnings.
 
 The central rule is:
 
@@ -347,7 +352,12 @@ The owner retains the runtime handle and status, sole runtime shutdown owner, an
 activation lease as one generation. A duplicate or concurrent activation cannot produce another
 runtime or playback owner. Any failure after runtime start closes and joins that runtime before a
 retry can be considered; a failed coordinator or runtime drain is sticky and terminal. A database
-or start result that completes after close cannot publish Active or resurrect authority.
+or start result that completes after close cannot publish AwaitingConsent, Starting, or Active or
+resurrect authority. Once Active, the owner selects between application commands and the retained
+runtime's persistent barrier. Unexpected runtime settlement atomically closes application ingress,
+retires the coordinator before consuming the runtime join side, and publishes only the fixed
+`RuntimeTerminated` failure after cleanup. If application close wins that same gate first, its
+ordinary bridge-before-runtime drain and Stopped/Drain result remain authoritative.
 
 Remote policy is immutable for the lifetime of one activation. A policy replacement must first
 close coordinator admission, drain accepted operations and supervised queue-insert completions,
@@ -713,8 +723,9 @@ The implementation is complete only when all of the following are covered:
 - application-owner unavailable-build zero action; one database attachment before activation;
   duplicate and post-close request rejection; runtime-start,
   playback-ingress-claim, and bridge-activation rollback; immutable policy forwarding;
-  bridge-before-runtime drain; close racing a late start; persistent barrier sender loss or panic;
-  no successor after failed drain; and content-free status and diagnostics;
+  bridge-before-runtime drain; close racing database, Starting, Active, and runtime-exit
+  publication; unexpected active-runtime termination; persistent barrier sender loss or panic; no
+  successor after failed drain; and content-free status and diagnostics;
 - exact half-duration ceiling and four-minute cap edges based only on accumulated forward evidence;
 - atomic admission-before-network, exact 10,000-row contention at the transaction boundary,
   fail-visible refusal without eviction, FIFO ordering, 50-item batch boundaries, and account
