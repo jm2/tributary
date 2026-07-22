@@ -47,14 +47,22 @@ freshness preserves a predecessor Clear across a source-rejected or runtime-Busy
 NowPlaying, cancels it only on successful successor admission, and leaves qualified Enqueue work
 owned until durability is known.
 
+A GTK-free application-owner core now supplies the headless activation transaction. It classifies
+build capability before database, vault, queue, or network access; accepts one database attachment
+followed by one move-only consent/enablement request; freezes one exact remote-source set; and
+starts the runtime, claims its one-shot playback ingress, and activates the exact-window bridge as
+one retained generation. Partial activation is rolled back and joined. Close drains the bridge
+before the runtime, and failed drain is terminal.
+
 Production startup still leaves the coordinator `Dormant`: no application caller starts the
-Last.fm runtime, claims its playback ingress, issues activation, or connects live enablement and
-per-source policy, consent, authorization, vault recovery, or UI. Dormant accepted authority is
-consumed only through the exact metadata-free discard closure. Exact local/authenticated-remote
-profiles, production remote-source opt-in, production runtime/activation ownership, consent and
-browser invocation, authorization-owner construction plus atomic vault/account transition,
-localized account/recovery/status UI, packaged credentials, and live final acceptance testing
-remain the next slices.
+application-owner core, attaches its database, issues an activation request, or connects live
+enablement and per-source policy, consent, authorization, vault recovery, or UI. Dormant accepted
+authority is consumed only through the exact metadata-free discard closure. Exact
+local/authenticated-remote profiles, production remote-source opt-in,
+startup/database/nonblocking-shutdown composition, consent and browser invocation,
+authorization-owner construction plus atomic vault/account transition, localized
+account/recovery/status UI, packaged credentials, and live final acceptance testing remain the next
+slices.
 
 ## Current baseline
 
@@ -218,10 +226,13 @@ remain the next slices.
   closed-runtime failures terminally close the bridge rather than admitting a successor after an
   unproven retirement.
 
-  Production startup still leaves the coordinator `Dormant`: no production caller starts the
-  runtime, claims playback ingress, issues the activation, or supplies live enablement/per-source
-  policy. Dormant accepted authority is consumed and revoked exactly once through a separate
-  metadata-free discard closure. External/removable profile and proof construction reaches this
+  The GTK-free application-owner core now supplies one database attachment followed by one bounded
+  request and the transactional runtime-start, one-shot ingress-claim, exact-window activation,
+  rollback, and bridge-before-runtime drain lifecycle. Production startup still leaves the
+  coordinator `Dormant`: no shipping caller constructs or feeds that core, attaches its database,
+  issues an activation request, or supplies live enablement/per-source policy. Dormant accepted
+  authority is consumed and revoked exactly once through a separate metadata-free discard closure.
+  External/removable profile and proof construction reaches this
   boundary, but no production playback owner consumes it. Exact local/authenticated-remote profiles
   remain unwired; authenticated remotes also have no production opt-in source set. The runtime's
   uncloneable, account-independent now-playing input receives the exact current account and epoch
@@ -257,9 +268,10 @@ remain the next slices.
   Remaining work is production integration rather than a claim that this internal slice is
   available. The complete inventory lives in the
   [dated contract boundary](lastfm-scrobbling.md#dated-implementation-boundary); it includes a
-  production application owner which starts the existing runtime, claims its one-shot playback
-  ingress, activates the exact-window bridge, and connects playback to live enablement/per-source
-  policy; exact local and authenticated-remote profiles plus production remote-source opt-in;
+  composition of the completed application owner into first-window startup, migrated-database
+  attachment, and nonblocking shutdown, with one immutable policy generation shared by queue
+  capture and bridge dispatch; exact local and authenticated-remote profiles plus production
+  remote-source opt-in;
   consent/browser invocation and construction of the completed
   authorization core; atomic staged-session vault/account transitions;
   account/recovery/status UX; localization/accessibility; application lifecycle ownership;
@@ -482,11 +494,16 @@ The playback-history contract makes the remaining Last.fm behavior much less amb
    freshness preserves a predecessor Clear across rejected or Busy successor NowPlaying until a
    successor admission succeeds.
 
-   Production startup remains deliberately `Dormant`: no caller starts the Last.fm runtime, claims
-   playback ingress, issues activation, or supplies live policy/UI/auth ownership, so accepted
-   authority still follows the metadata-free discard path. Exact local/authenticated-remote profiles
-   and production remote-source opt-in also remain, along with consent/browser/vault
-   account-transition policy.
+   A headless application-owner core now classifies build capability without vault/network work,
+   accepts one database attachment followed by one opaque activation request, and retains runtime
+   plus exact-window bridge as one immutable-policy generation. Partial activation is joined; normal
+   close drains the bridge before the runtime and failed drain is terminal.
+
+   Production startup remains deliberately `Dormant`: no caller constructs or feeds this core,
+   attaches its database, issues an activation request, or supplies live policy/UI/auth ownership,
+   so accepted authority still follows the metadata-free discard path. Exact
+   local/authenticated-remote profiles and production remote-source opt-in also remain, along with
+   consent/browser/vault account-transition policy.
    The browser work must be a concrete consent-gated launch operation and must not claim that an
    unavoidable URL handoff outside the process can be synchronously revoked.
    Next complete the production-integration inventory in the
@@ -548,7 +565,7 @@ not mistaken for work already underway.
 
 | Issue | Current implementation state | Likely implementation shape |
 |---|---|---|
-| [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | Accepted [contract](lastfm-scrobbling.md), bounded client with zeroizing strict auth parsing, latest-only desktop-authorization core, native-vault authority, migrations 17/18, transactional private FIFO, durable delivery/cleanup gate, standalone playback-evidence observer, GTK-free move-only accepted-output owner/handoffs with `PlaybackSession`-private minting and corrected Clear/NowPlaying freshness, registry-bound real-tag external/removable attribution with exact removable queue capture, internal delivery/lifecycle/latest-only-now-playing runtime with request-scoped hard-abort-safe shared vault exclusion, and an exactly-once process coordinator with epoch-bound production ingress plus a sealed, operation-drained headless Active bridge using one-shot playback-only runtime authority, bounded durable-enqueue completion supervision, and immutable shared retirement. Production startup remains Dormant; no UI/auth/live-policy owner activates it. | Start the runtime, claim playback ingress, and activate the bridge from one production application owner with live feature/per-source policy; add exact local/authenticated-remote profiles and production remote-source opt-in; then wrap the completed authorization core in consent, browser launch, atomic vault/account transition and that global owner; add localized account/recovery/status UI, package credentials, and live final acceptance coverage. |
+| [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | Accepted [contract](lastfm-scrobbling.md), bounded client with zeroizing strict auth parsing, latest-only desktop-authorization core, native-vault authority, migrations 17/18, transactional private FIFO, durable delivery/cleanup gate, standalone playback-evidence observer, GTK-free move-only accepted-output owner/handoffs with `PlaybackSession`-private minting and corrected Clear/NowPlaying freshness, registry-bound real-tag external/removable attribution with exact removable queue capture, internal delivery/lifecycle/latest-only-now-playing runtime with request-scoped hard-abort-safe shared vault exclusion, an exactly-once process coordinator with epoch-bound production ingress plus a sealed operation-drained Active bridge, and a headless application-owner core for transactional runtime/bridge activation and ordered drain. Production startup remains Dormant because it does not construct or feed that core. | Compose the completed owner into the first-window/database/shutdown lifecycle; add exact local/authenticated-remote profiles and one persisted policy generation shared by queue capture and bridge dispatch; then wrap the completed authorization core in consent, browser launch, and atomic vault/account transition; add localized account/recovery/status UI, package credentials, and live final acceptance coverage. |
 | [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
 | [#46 — Drag and drop](https://github.com/jm2/tributary/issues/46) | Column-header reordering exists; track/file drag-and-drop does not. | Local playlist DnD first; file export, remote rows, and device copies as distinct policies. |
 | [#39 — Album art in browser](https://github.com/jm2/tributary/issues/39) | Artwork is shown for now-playing, not in the Genre/Artist/Album browser. | Virtualized art UI with bounded async cache, cancellation, accessibility, and authenticated art. |

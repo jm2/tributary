@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Last.fm now has a fail-closed protocol, desktop-authorization, credential-vault, durable-queue,
-  playback-evidence/owner, and delivery/lifecycle runtime foundation**
+  playback-evidence/owner, delivery/lifecycle runtime, and application-owner foundation**
   ([#50](https://github.com/jm2/tributary/issues/50),
   [#151](https://github.com/jm2/tributary/pull/151),
   [runtime/lifecycle slice](https://github.com/jm2/tributary/pull/153),
@@ -17,8 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [desktop-authorization slice](https://github.com/jm2/tributary/pull/155),
   [playback-ownership slice](https://github.com/jm2/tributary/pull/156),
   [removable-attribution slice](https://github.com/jm2/tributary/pull/157),
-  [process-coordinator slice](https://github.com/jm2/tributary/pull/158), and the
-  [headless runtime-bridge slice](https://github.com/jm2/tributary/pull/159)).
+  [process-coordinator slice](https://github.com/jm2/tributary/pull/158), the
+  [headless runtime-bridge slice](https://github.com/jm2/tributary/pull/159), and the
+  application-owner core slice (PR pending)).
   This is an internal foundation, not yet a user-visible scrobbling feature. Application startup
   claims a non-recreatable Dormant playback coordinator, and production call sites feed its
   epoch-bound boundary with output intent, lazy accepted-load handoff, events, discontinuities,
@@ -29,13 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each admitted Enqueue through its one-shot runtime completion; only `Inserted`/`AlreadyQueued`
   proves SQLite durability. Exact real-tag external/removable proofs can reach that bridge, but
   startup remains
-  Dormant and revokes them through a metadata-free discard closure. No production path starts the
-  Last.fm runtime, claims playback ingress, issues activation, constructs the authorization owner,
-  or supplies settings and live source policy, so the feature emits no Last.fm work and remains
-  unavailable to users. Exact local/authenticated-remote profiles, explicit consent and browser
-  launch, staged-session vault installation and account transition policy, exact per-source/session
-  policy, settings/status UI, localization and accessibility, and production package credentials
-  remain follow-on work; the
+  Dormant and revokes them through a metadata-free discard closure. The new application-owner core
+  is not composed into shipping startup and receives neither a database attachment nor an
+  activation request, so no Last.fm runtime starts, no Last.fm work is emitted, and the feature
+  remains unavailable to users. Exact local/authenticated-remote profiles, explicit consent and
+  browser launch, staged-session vault installation and account transition policy, exact
+  per-source/session policy, settings/status UI, localization and accessibility, and production
+  package credentials remain follow-on work; the
   [complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary) also tracks
   activation/unavailable-state issuance, structured source-owner conversion, account replacement
   and recovery, package verification/API registration, and the remaining acceptance matrix.
@@ -141,6 +142,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     handoffs still do not leave the playback session. Review follow-up also makes OS-open dispatch
     use the same structural-window check as activation, so files are drained immediately when a
     live window is temporarily unfocused.
+  - **Headless application activation owner:** one non-cloneable owner evaluates build capability
+    before touching the database, vault, queue, or network. A capable build accepts one database
+    attachment followed by one move-only consent/enablement request, freezes its exact
+    remote-source set, starts the runtime, claims its one-shot playback ingress, and activates the
+    exact-window bridge as one transaction. Every partial start is rolled back and joined. Normal
+    close drains the bridge before shutting down and joining the runtime; a failed drain is sticky
+    and cannot expose a successor generation. The core publishes only bounded content-free status
+    and remains unconstructed by the shipping application, so it cannot infer consent from build
+    credentials, vault state, queued rows, or source connectivity.
   - **Private offline FIFO and durable delivery gate:** migration 17 creates and revalidates a
     constrained queue containing
     only bounded submission metadata, opaque occurrence/order identity, one-way account binding,
@@ -187,9 +197,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     lifecycle, status, account, credential, vault, or recovery authority—and the general runtime
     handle no longer exposes those playback submissions in production. Playback-facing input is
     deliberately unbound: only the runtime ingress gate can attach the vault-derived account
-    binding. No production path claims this capability yet. Startup
-    additionally requires an opaque capability intended for a future consent/build-enablement
-    issuer; no production path issues it yet. Checked account epochs and delivery generations
+    binding. No shipping composition claims this capability yet. Startup additionally requires an
+    opaque capability issued only inside the application-owner core after it consumes a move-only
+    consent/enablement request; no production settings or composition path issues that request yet.
+    Checked account epochs and delivery generations
     reject stale events; watched phase, pending count, fixed failure category, and saturating
     non-persistent accepted/ignored/rejected counters update only after the matching durable
     mutation.
