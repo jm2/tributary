@@ -1,9 +1,9 @@
 # Last.fm scrobbling contract
 
-- Status: accepted P2.1 design; internal protocol/vault/queue/playback-evidence,
+- Status: accepted P2.1 design; internal protocol/desktop-authorization/vault/queue/playback-evidence,
   delivery/lifecycle, and now-playing runtime implemented; product integration pending
 - Decision date: 2026-07-20
-- Implementation status date: 2026-07-21
+- Implementation status date: 2026-07-22
 - Tracking issue: [#50](https://github.com/jm2/tributary/issues/50)
 - Playback evidence foundation: [`playback-history.md`](playback-history.md)
 
@@ -14,7 +14,7 @@ permission to disclose listening activity.
 
 ## Dated implementation boundary
 
-The following inventory describes the internal implementation as of 2026-07-21. The rest of this
+The following inventory describes the internal implementation as of 2026-07-22. The rest of this
 document remains the accepted normative contract for the complete feature; present-tense contract
 language does not mean that every required product layer or acceptance case has shipped.
 
@@ -22,7 +22,19 @@ The implemented internal foundation includes:
 
 - the bounded signed HTTPS client, strict response parsing, versioned native-vault record, one-way
   account binding, migration 17's atomic account-bound 10,000-row FIFO, and migration 18's exact
-  binding-only fixed-category durable delivery/credential-cleanup singleton;
+  binding-only fixed-category durable delivery/credential-cleanup singleton. Authentication
+  envelopes are borrowed from zeroizing response storage, validate the complete JSON
+  string/escape/surrogate grammar, decode tokens and returned credentials directly into zeroizing
+  allocations, and preserve fixed provider/HTTP classification without generic secret-bearing
+  JSON values or ignored-value scratch storage;
+- a bounded GTK-free latest-only desktop-authorization owner. A request token remains solely inside
+  its serialized owner, expires exactly 60 monotonic minutes after response observation, and lends
+  the token-bearing browser URL only to a callback while exact current authority is live. Begin,
+  Finish, cancel, expiry, failure, and close synchronously revoke every retained URL view; Finish
+  consumes an opaque one-shot seal and the token before exchange. Ordinary supersession and
+  shutdown cancel and join child work, abnormal owner loss closes ingress with a fixed terminal
+  status, and success returns only a move-only staged username/session-key grant. This core mints
+  no UUID, writes no vault record, opens no browser, and has no production factory;
 - an explicit `LastFmRuntimeActivation` capability intended for a future issuer that has first
   established consent and build enablement. No production application path issues that capability
   yet;
@@ -92,9 +104,11 @@ The implemented internal foundation includes:
 This foundation is intentionally not exposed as a partial user feature. Still remaining are the
 production playback owner that creates the occurrence state only after exact source/session
 eligibility, converts immutable structured `Track` metadata, dispatches its now-playing/scrobble
-actions, and issues explicit clear without crossing GTK borrow boundaries; desktop browser
-authorization and its latest-only token lifecycle; consent, enablement, exact per-source/session
-policy, account replacement, and a production activation issuer; application startup/shutdown
+actions, and issues explicit clear without crossing GTK borrow boundaries; localized consent and
+browser invocation around the completed authorization core; one process-wide production owner;
+atomic staged-session vault installation, exact same-account reauthorization and different-account
+replacement/purge policy; enablement, exact per-source/session policy, and a production activation
+issuer; application startup/shutdown
 ownership; settings, account/recovery/status, valid-vault corrupt-queue recovery, accessibility,
 and all localization UI; release-time production credential injection and package verification;
 and the remaining end-to-end and platform acceptance matrix. The internal observer and
@@ -212,6 +226,12 @@ Authorization is one cancellable latest-only desktop flow:
 4. Only a successful, structurally valid response supplies the account username and session key.
    Tributary generates a new random opaque account UUID and atomically stores the three-field
    account record in the operating-system credential vault before enabling scrobbling.
+
+As of 2026-07-22, the internal authorization core implements the bounded latest-only request flow
+through the move-only staged username/session-key result in step 4. No production path constructs
+that owner, records consent, launches the browser, creates an account UUID, installs the staged
+grant in the vault, or applies same/different-account transition policy yet; those operations must
+land as one fail-closed integration rather than exposing a partial feature.
 
 Tributary never asks for a Last.fm password. The request token, session key, username, and opaque
 account UUID have content-redacted error and debug representations. An authorization token is not

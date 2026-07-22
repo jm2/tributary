@@ -8,18 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Last.fm now has a fail-closed protocol, credential-vault, durable-queue, playback-evidence, and
-  delivery/lifecycle runtime foundation**
+- **Last.fm now has a fail-closed protocol, desktop-authorization, credential-vault, durable-queue,
+  playback-evidence, and delivery/lifecycle runtime foundation**
   ([#50](https://github.com/jm2/tributary/issues/50),
   [#151](https://github.com/jm2/tributary/pull/151),
   [runtime/lifecycle slice](https://github.com/jm2/tributary/pull/153),
-  [playback/now-playing slice](https://github.com/jm2/tributary/pull/154)).
+  [playback/now-playing slice](https://github.com/jm2/tributary/pull/154),
+  desktop-authorization slice).
   This is an internal foundation, not yet a user-visible scrobbling feature. The standalone
   playback observer and runtime-owned now-playing lane are deliberately not connected to
-  production playback or application startup. The desktop authorization flow, explicit consent
-  and exact per-source/session policy, settings/status UI, localization and accessibility,
-  application startup/shutdown wiring, and production package credentials remain follow-on work;
-  the
+  production playback or application startup. Production construction of the authorization
+  owner, explicit consent and browser launch, staged-session vault installation and account
+  transition policy, exact per-source/session policy, settings/status UI, localization and
+  accessibility, application startup/shutdown wiring, and production package credentials remain
+  follow-on work; the
   [complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary) also tracks
   activation/unavailable-state issuance, structured source-owner conversion, account replacement
   and recovery, package verification/API registration, and the remaining acceptance matrix.
@@ -32,7 +34,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     incoherent item mappings fail closed; the provider's inconsistent string-or-number corrected
     flags accept only canonical 0/1 values. Only timeouts/transport failures, HTTP 429/5xx without
     a recognized provider error envelope, transient provider codes 8/11/16, and provider rate-limit
-    code 29 are retryable, while code 9 requests reauthorization.
+    code 29 are retryable, while code 9 requests reauthorization. Authentication responses are
+    retained in zeroizing byte storage, validated as a complete JSON document—including every
+    escape and UTF-16 surrogate pair—and decoded through borrowed raw envelopes directly into
+    zeroizing token, username, and session-key allocations. Strict success fields and a borrowed
+    provider-error probe preserve HTTP/provider classification without generic secret-bearing JSON
+    values or ignored-value scratch allocations; partial response buffers wipe on every async or
+    blocking failure path.
+  - **Latest-only desktop authorization core:** a GTK-free bounded serialized owner obtains one
+    in-memory request token, measures its exact 60-minute life from response observation on a
+    monotonic clock, and exposes the token-bearing browser URL only to a callback while exact
+    current authority remains live. Begin, Finish, cancel, expiry, terminal failure, and shutdown
+    synchronously revoke every retained URL view. Finish consumes an opaque one-shot seal and the
+    request token before exchange; supersession and normal shutdown cancel and join predecessor
+    work, while abnormal owner loss closes ingress and reports a fixed terminal status. Success
+    returns only a move-only staged username/session-key grant: this internal layer deliberately
+    creates no account UUID, writes no vault record, opens no browser, and bypasses neither future
+    consent nor same/different-account transition policy.
   - **Native protected authority:** session keys, exact usernames, and random account UUIDs use
     macOS Keychain, Windows Credential Manager, or Linux Secret Service with no plaintext fallback.
     The versioned vault record requires an RFC 4122 v4 account UUID, nonblank control-free username,
@@ -153,10 +171,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     before releasing the lease. If SQLite cannot establish that pause, the shutdown proof remains
     failed rather than claiming a durable commit; successor ownership still cannot overlap the
     predecessor's request or database task.
-    Validation: 168 focused Last.fm tests pass, including 29 playback-evidence and 12
-    now-playing runtime tests. Locked debug and release suites each pass 20 library, 1,514
-    application, and 14 repository-metadata tests (1,548 total). Strict Clippy is green in both
-    profiles, the Rust 1.92 locked all-target check passes, formatting and diff checks are clean,
+    Validation: 207 focused Last.fm tests pass, including 28 desktop-authorization, 26 client,
+    29 playback-evidence, and 12 now-playing runtime tests. Locked debug and release suites each
+    pass 20 library, 1,558 application, and 14 repository-metadata tests (1,592 total). Strict
+    Clippy is green in both profiles, the Rust 1.92 locked all-target check passes, formatting and
+    diff checks are clean,
     and the dependency audit reports only the two already documented allowed unmaintained warnings.
 - **Rhythmbox profiles can now be migrated through a bounded, preview-first, transactional
   workflow** ([#57](https://github.com/jm2/tributary/issues/57),
