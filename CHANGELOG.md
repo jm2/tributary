@@ -9,19 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Last.fm now has a fail-closed protocol, desktop-authorization, credential-vault, durable-queue,
-  playback-evidence, and delivery/lifecycle runtime foundation**
+  playback-evidence/owner, and delivery/lifecycle runtime foundation**
   ([#50](https://github.com/jm2/tributary/issues/50),
   [#151](https://github.com/jm2/tributary/pull/151),
   [runtime/lifecycle slice](https://github.com/jm2/tributary/pull/153),
   [playback/now-playing slice](https://github.com/jm2/tributary/pull/154),
   [desktop-authorization slice](https://github.com/jm2/tributary/pull/155)).
   This is an internal foundation, not yet a user-visible scrobbling feature. The standalone
-  playback observer and runtime-owned now-playing lane are deliberately not connected to
-  production playback or application startup. Production construction of the authorization
-  owner, explicit consent and browser launch, staged-session vault installation and account
-  transition policy, exact per-source/session policy, settings/status UI, localization and
-  accessibility, application startup/shutdown wiring, and production package credentials remain
-  follow-on work; the
+  playback observer, GTK-free playback owner/handoffs, and runtime-owned now-playing lane are
+  deliberately not connected to production playback or application startup. Exact real-tag
+  external profiles and registry-bound proofs are constructed, but their production playback
+  consumer is still unwired. One process-lifetime, non-recreatable production playback
+  owner/coordinator, exact local/removable/authenticated-remote profiles, runtime event and
+  terminal/source-retirement/shutdown wiring, construction of the authorization owner, explicit
+  consent and browser launch, staged-session vault installation and account transition policy,
+  exact per-source/session policy, settings/status UI, localization and accessibility, and
+  production package credentials remain follow-on work; the
   [complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary) also tracks
   activation/unavailable-state issuance, structured source-owner conversion, account replacement
   and recovery, package verification/API registration, and the remaining acceptance matrix.
@@ -73,6 +76,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     replacement, and application shutdown terminate it. Now-playing and scrobble actions each
     consume one latch before handoff, and metadata, exact duration/start, occurrence identity, and
     generation remain absent from diagnostics.
+  - **Typed accepted-output owner and handoffs:** a GTK-free owner consumes a move-only proof that
+    binds one exact accepted output generation to either eligible frozen occurrence data or an
+    explicit ineligible replacement. Each `QueueItem` freezes that occurrence's structured
+    metadata, and only `PlaybackSession` can issue the private production mint witness after the
+    exact generation crosses output acceptance. Managed external input carries an opaque
+    registry-minted attribution reference bound to one registry instance, one exact session or
+    catalogue authority, and one exact source-owned profile. Minting and admission revalidate
+    capability, provenance, source opt-in, profile, epoch/generation, catalogue authority, and
+    membership under the lifecycle lock. External profiles require parser-attested title and
+    artist; filenames and the display-only `Unknown` album are never substituted. Ineligible or
+    policy-rejected replacements terminally retire their predecessor and emit at most one explicit
+    clear. Lock-linearized freshness makes delayed accepted loads and stale NowPlaying/Clear
+    handoffs inert after a successor, while a qualified Enqueue is not retroactively revoked.
+    Move-only redacted handoffs keep payloads private through exact source and runtime admission.
+    No process-lifetime, non-recreatable production owner/coordinator exists yet to own this
+    internal boundary; external proof consumption and exact local/removable/authenticated-remote
+    profiles remain unwired.
   - **Private offline FIFO and durable delivery gate:** migration 17 creates and revalidates a
     constrained queue containing
     only bounded submission metadata, opaque occurrence/order identity, one-way account binding,
@@ -172,12 +192,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     before releasing the lease. If SQLite cannot establish that pause, the shutdown proof remains
     failed rather than claiming a durable commit; successor ownership still cannot overlap the
     predecessor's request or database task.
-    Validation: 208 focused Last.fm tests pass, including 29 desktop-authorization, 26 client,
-    29 playback-evidence, and 12 now-playing runtime tests. Locked debug and release suites each
-    pass 20 library, 1,559 application, and 14 repository-metadata tests (1,593 total). Strict
-    Clippy is green in both profiles, the Rust 1.92 locked all-target check passes, formatting and
-    diff checks are clean,
-    and the dependency audit reports only the two already documented allowed unmaintained warnings.
 - **Rhythmbox profiles can now be migrated through a bounded, preview-first, transactional
   workflow** ([#57](https://github.com/jm2/tributary/issues/57),
   [#150](https://github.com/jm2/tributary/pull/150)):

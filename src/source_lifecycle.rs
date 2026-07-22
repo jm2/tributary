@@ -2044,6 +2044,17 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         state.entries.get(&source_id).map(Entry::snapshot)
     }
 
+    /// Test-only proof that another thread currently owns the lifecycle state
+    /// lock. This avoids timing-based assertions when a test callback is
+    /// deliberately holding an exact admission transaction open.
+    #[cfg(test)]
+    pub(crate) fn state_lock_is_contended_for_test(&self) -> bool {
+        matches!(
+            self.inner.state.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+
     /// Read only the current adopted session epoch without cloning catalogue
     /// or view snapshot handles.
     pub fn active_session_epoch(&self, source_id: SourceId) -> Option<u64> {
@@ -2073,6 +2084,162 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             return None;
         }
         Some((active.epoch, inspect(active.adapter.adapter.as_ref())))
+    }
+
+    /// Perform one bounded synchronous admission through an exact live
+    /// session.
+    ///
+    /// The eligibility predicate and admitted action both execute while the
+    /// lifecycle state lock is retained. Disconnect, replacement, shutdown,
+    /// and provenance changes therefore linearize entirely before or after
+    /// the action instead of slipping between a snapshot check and its use.
+    /// The action receives no adapter, lease, or permit, so no lifecycle
+    /// authority can escape into a future or network operation.
+    ///
+    /// Both callbacks must be non-blocking and must not re-enter this
+    /// lifecycle registry. The admitted action should do no more than mutate
+    /// bounded in-memory ownership or use a non-blocking `try_*` ingress.
+    pub(crate) fn admit_exact_session_if<T, Eligible, Admit>(
+        &self,
+        source_id: SourceId,
+        expected_session_epoch: u64,
+        eligible: Eligible,
+        admit: Admit,
+    ) -> Option<T>
+    where
+        Eligible: FnOnce(&A, &ProvenanceSet) -> bool,
+        Admit: FnOnce() -> T,
+    {
+        let state = lock(&self.inner.state);
+        if state.gate != RegistryGate::Running {
+            return None;
+        }
+        let entry = state.entries.get(&source_id)?;
+        let active = entry.active.as_ref()?;
+        if active.epoch != expected_session_epoch || !active.lease.is_active() {
+            return None;
+        }
+        if !eligible(active.adapter.adapter.as_ref(), &entry.provenance) {
+            return None;
+        }
+
+        // Keep `state` live through admission. Returning a value is allowed,
+        // but it cannot contain source authority because the callback never
+        // receives any.
+        Some(admit())
+    }
+
+    /// Project one bounded, non-authoritative value from an exact live
+    /// session while its adapter, provenance, epoch, lease, and registry gate
+    /// are observed under the lifecycle state lock.
+    ///
+    /// This is the minting counterpart of [`Self::admit_exact_session_if`].
+    /// The callback must be non-blocking and non-reentrant, and its result
+    /// must not retain the adapter, lease, locator, credential, or permit.
+    pub(crate) fn project_exact_session<T, Project>(
+        &self,
+        source_id: SourceId,
+        expected_session_epoch: u64,
+        project: Project,
+    ) -> Option<T>
+    where
+        Project: FnOnce(&A, &ProvenanceSet) -> Option<T>,
+    {
+        let state = lock(&self.inner.state);
+        if state.gate != RegistryGate::Running {
+            return None;
+        }
+        let entry = state.entries.get(&source_id)?;
+        let active = entry.active.as_ref()?;
+        if active.epoch != expected_session_epoch || !active.lease.is_active() {
+            return None;
+        }
+        project(active.adapter.adapter.as_ref(), &entry.provenance)
+    }
+
+    /// Perform one bounded synchronous admission through an exact live
+    /// session and accepted catalogue.
+    ///
+    /// This is the catalogue-scoped counterpart of
+    /// [`Self::admit_exact_session_if`]. Exact epoch/generation validation,
+    /// eligibility and catalogue membership inspection, and the admitted
+    /// action form one state-lock transaction. No session or catalogue permit
+    /// is returned or exposed.
+    pub(crate) fn admit_exact_catalogue_if<T, Eligible, Admit>(
+        &self,
+        source_id: SourceId,
+        expected_session_epoch: u64,
+        expected_catalogue_generation: u64,
+        eligible: Eligible,
+        admit: Admit,
+    ) -> Option<T>
+    where
+        Eligible: FnOnce(&A, &ProvenanceSet, &S) -> bool,
+        Admit: FnOnce() -> T,
+    {
+        let state = lock(&self.inner.state);
+        if state.gate != RegistryGate::Running {
+            return None;
+        }
+        let entry = state.entries.get(&source_id)?;
+        let active = entry.active.as_ref()?;
+        let catalogue = entry.catalogue.as_ref()?;
+        if active.epoch != expected_session_epoch
+            || catalogue.session_epoch != expected_session_epoch
+            || catalogue.generation != expected_catalogue_generation
+            || !active.lease.is_active()
+            || !catalogue.authority.is_active()
+        {
+            return None;
+        }
+        if !eligible(
+            active.adapter.adapter.as_ref(),
+            &entry.provenance,
+            catalogue.value.as_ref(),
+        ) {
+            return None;
+        }
+
+        Some(admit())
+    }
+
+    /// Project one bounded, non-authoritative value from an exact live
+    /// session and accepted catalogue under the lifecycle state lock.
+    ///
+    /// Exact epoch/generation checks, adapter/profile inspection, provenance,
+    /// and catalogue membership selection therefore form one atomic minting
+    /// observation. The callback follows the same non-blocking,
+    /// non-reentrant contract as [`Self::project_exact_session`].
+    pub(crate) fn project_exact_catalogue<T, Project>(
+        &self,
+        source_id: SourceId,
+        expected_session_epoch: u64,
+        expected_catalogue_generation: u64,
+        project: Project,
+    ) -> Option<T>
+    where
+        Project: FnOnce(&A, &ProvenanceSet, &S) -> Option<T>,
+    {
+        let state = lock(&self.inner.state);
+        if state.gate != RegistryGate::Running {
+            return None;
+        }
+        let entry = state.entries.get(&source_id)?;
+        let active = entry.active.as_ref()?;
+        let catalogue = entry.catalogue.as_ref()?;
+        if active.epoch != expected_session_epoch
+            || catalogue.session_epoch != expected_session_epoch
+            || catalogue.generation != expected_catalogue_generation
+            || !active.lease.is_active()
+            || !catalogue.authority.is_active()
+        {
+            return None;
+        }
+        project(
+            active.adapter.adapter.as_ref(),
+            &entry.provenance,
+            catalogue.value.as_ref(),
+        )
     }
 
     /// Select a contribution from the greatest-generation accepted view.
@@ -6878,5 +7045,130 @@ mod tests {
         active.allow_close();
         retiring.probe.wait_for_completions(1).await;
         active.probe.wait_for_completions(1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exact_session_admission_orders_disconnect_without_returning_a_permit() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        claim(&registry, source_id, SourceProvenance::Saved);
+        let mut adapter = AdapterFixture::immediate();
+        let (session_epoch, _) = adopt(&registry, source_id, &mut adapter, vec!["catalogue"]);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let admitting = registry.clone();
+        let admission = std::thread::spawn(move || {
+            admitting.admit_exact_session_if(
+                source_id,
+                session_epoch,
+                |_adapter, provenance| provenance.contains(SourceProvenance::Saved),
+                || {
+                    entered_tx.send(()).expect("admission observer alive");
+                    release_rx.recv().expect("release synchronous admission");
+                    Arc::new(())
+                },
+            )
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("synchronous admission entered");
+
+        assert!(
+            registry.state_lock_is_contended_for_test(),
+            "the admitted callback must retain the lifecycle lock"
+        );
+
+        let (waiter_tx, waiter_rx) = std::sync::mpsc::sync_channel(1);
+        let disconnecting = registry.clone();
+        let disconnect = std::thread::spawn(move || {
+            let waiter = disconnecting
+                .disconnect(source_id)
+                .expect("disconnect admitted");
+            waiter_tx.send(waiter).expect("disconnect observer alive");
+        });
+
+        release_tx.send(()).expect("admission remains alive");
+        let returned_without_authority = admission
+            .join()
+            .expect("admission thread")
+            .expect("exact session admitted");
+        let waiter = waiter_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("disconnect resumes after synchronous callback");
+        disconnect.join().expect("disconnect thread");
+        waiter.wait().await;
+
+        // Retaining the callback result cannot retain lifecycle authority.
+        assert_eq!(Arc::strong_count(&returned_without_authority), 1);
+        let called = AtomicBool::new(false);
+        assert!(registry
+            .admit_exact_session_if(
+                source_id,
+                session_epoch,
+                |_adapter, _provenance| true,
+                || called.store(true, Ordering::Release),
+            )
+            .is_none());
+        assert!(!called.load(Ordering::Acquire));
+        shutdown_immediate(&registry).await;
+    }
+
+    #[tokio::test]
+    async fn exact_catalogue_admission_requires_current_epoch_generation_and_predicate() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        claim(&registry, source_id, SourceProvenance::Saved);
+        let mut adapter = AdapterFixture::immediate();
+        let (session_epoch, _) = adopt(&registry, source_id, &mut adapter, vec!["catalogue"]);
+        let generation = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .expect("accepted catalogue")
+            .generation;
+
+        assert_eq!(
+            registry.admit_exact_catalogue_if(
+                source_id,
+                session_epoch,
+                generation,
+                |_adapter, provenance, catalogue| {
+                    provenance.contains(SourceProvenance::Saved)
+                        && catalogue.as_slice() == ["catalogue"]
+                },
+                || 17,
+            ),
+            Some(17)
+        );
+
+        for (epoch, catalogue_generation) in [
+            (session_epoch.wrapping_add(1), generation),
+            (session_epoch, generation.wrapping_add(1)),
+        ] {
+            let called = AtomicBool::new(false);
+            assert!(registry
+                .admit_exact_catalogue_if(
+                    source_id,
+                    epoch,
+                    catalogue_generation,
+                    |_adapter, _provenance, _catalogue| true,
+                    || called.store(true, Ordering::Release),
+                )
+                .is_none());
+            assert!(!called.load(Ordering::Acquire));
+        }
+
+        let called = AtomicBool::new(false);
+        assert!(registry
+            .admit_exact_catalogue_if(
+                source_id,
+                session_epoch,
+                generation,
+                |_adapter, _provenance, _catalogue| false,
+                || called.store(true, Ordering::Release),
+            )
+            .is_none());
+        assert!(!called.load(Ordering::Acquire));
+        shutdown_immediate(&registry).await;
     }
 }

@@ -93,6 +93,143 @@ pub enum ServerPlaylistCapability {
     PullSnapshots,
 }
 
+/// Whether one exact managed adapter can contribute structured playback
+/// attribution to an explicitly enabled listening-history integration.
+///
+/// This capability is intentionally independent from playlist support and
+/// defaults to denied. Source identity alone cannot recover the distinction:
+/// saved remotes and external files can both use random [`SourceId`] values.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PlaybackAttributionCapability {
+    #[default]
+    Unsupported,
+    AuthenticatedRemote,
+    Removable,
+    External,
+}
+
+/// Exact bounded structured metadata which one live adapter authorizes for a
+/// single track's listening-history attribution.
+///
+/// The value carries no source identity, adapter, locator, credential, lease,
+/// or permit. It is useful only inside an opaque registry-minted
+/// [`PlaybackSourceReference`], where later action admission compares it with
+/// the exact current adapter profile. Debug output is always redacted.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PlaybackAttributionProfile {
+    title: String,
+    artist: String,
+    album: Option<String>,
+    album_artist: Option<String>,
+    track_number: Option<u32>,
+    duration_secs: Option<u64>,
+}
+
+impl PlaybackAttributionProfile {
+    /// Build the only shipping profile from exact external-file tag
+    /// provenance. A presentation fallback can never enter the profile.
+    pub(crate) fn from_external_track(
+        track: &Track,
+        title_from_tag: bool,
+        artist_from_tag: bool,
+        album_from_tag: bool,
+    ) -> Option<Self> {
+        if !title_from_tag || !artist_from_tag {
+            return None;
+        }
+        Self::bounded(
+            track.title.clone(),
+            track.artist_name.clone(),
+            album_from_tag.then(|| track.album_title.clone()),
+            track.album_artist_name.clone(),
+            track.track_number,
+            track.duration_secs,
+        )
+    }
+
+    fn bounded(
+        title: String,
+        artist: String,
+        album: Option<String>,
+        album_artist: Option<String>,
+        track_number: Option<u32>,
+        duration_secs: Option<u64>,
+    ) -> Option<Self> {
+        const MAX_TEXT_BYTES: usize = 64 * 1024;
+        if title.is_empty()
+            || artist.is_empty()
+            || title.len() > MAX_TEXT_BYTES
+            || artist.len() > MAX_TEXT_BYTES
+            || album
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_TEXT_BYTES)
+            || album_artist
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_TEXT_BYTES)
+        {
+            return None;
+        }
+        Some(Self {
+            title,
+            artist,
+            album: album.filter(|value| !value.is_empty()),
+            album_artist: album_artist.filter(|value| !value.is_empty()),
+            track_number,
+            duration_secs,
+        })
+    }
+
+    pub(crate) fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub(crate) fn artist(&self) -> &str {
+        &self.artist
+    }
+
+    pub(crate) fn album(&self) -> Option<&str> {
+        self.album.as_deref()
+    }
+
+    pub(crate) fn album_artist(&self) -> Option<&str> {
+        self.album_artist.as_deref()
+    }
+
+    pub(crate) const fn track_number(&self) -> Option<u32> {
+        self.track_number
+    }
+
+    pub(crate) const fn duration_secs(&self) -> Option<u64> {
+        self.duration_secs
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        title: impl Into<String>,
+        artist: impl Into<String>,
+        album: Option<&str>,
+        album_artist: Option<&str>,
+        track_number: Option<u32>,
+        duration_secs: Option<u64>,
+    ) -> Self {
+        Self::bounded(
+            title.into(),
+            artist.into(),
+            album.map(str::to_string),
+            album_artist.map(str::to_string),
+            track_number,
+            duration_secs,
+        )
+        .expect("test playback attribution profile is bounded")
+    }
+}
+
+impl std::fmt::Debug for PlaybackAttributionProfile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PlaybackAttributionProfile(<redacted>)")
+    }
+}
+
 /// One complete server-playlist listing bound to its exact successful source
 /// session.
 ///
@@ -276,6 +413,102 @@ impl RegularPlaylistCatalogueGuard {
 
     pub const fn catalogue_generation(self) -> u64 {
         self.catalogue_generation
+    }
+}
+
+/// Non-authoritative identity and exact attribution snapshot retained by one
+/// playback occurrence for later synchronous source-policy revalidation.
+///
+/// Its private kind and registry-instance binding make it impossible to
+/// construct from UI epochs, guards, or source shape. It contains no adapter,
+/// locator, credential, lease, or permit; cloning it cannot keep a source or
+/// catalogue alive.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PlaybackSourceReference {
+    binding: PlaybackReferenceBinding,
+    kind: PlaybackSourceReferenceKind,
+    profile: PlaybackAttributionProfile,
+}
+
+#[derive(Clone)]
+struct PlaybackReferenceBinding(Arc<()>);
+
+impl PartialEq for PlaybackReferenceBinding {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for PlaybackReferenceBinding {}
+
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum PlaybackSourceReferenceKind {
+    Session {
+        media_key: MediaKey,
+        session_epoch: u64,
+    },
+    RegularPlaylist {
+        media_key: MediaKey,
+        guard: RegularPlaylistCatalogueGuard,
+    },
+}
+
+impl PlaybackSourceReference {
+    /// Construct a deliberately unbound managed reference for owner unit
+    /// tests. Its fresh registry binding can never pass production admission.
+    #[cfg(test)]
+    pub(crate) fn session(media_key: MediaKey, session_epoch: u64) -> Option<Self> {
+        (session_epoch != 0).then(|| Self {
+            binding: PlaybackReferenceBinding(Arc::new(())),
+            kind: PlaybackSourceReferenceKind::Session {
+                media_key,
+                session_epoch,
+            },
+            profile: PlaybackAttributionProfile::for_test(
+                "title-private",
+                "artist-private",
+                Some("album-private"),
+                Some("album-artist-private"),
+                Some(7),
+                Some(100),
+            ),
+        })
+    }
+
+    pub(crate) fn profile(&self) -> &PlaybackAttributionProfile {
+        &self.profile
+    }
+
+    pub(crate) fn matches_attribution(
+        &self,
+        title: &str,
+        artist: &str,
+        album: Option<&str>,
+        album_artist: Option<&str>,
+        track_number: Option<u32>,
+        duration_secs: Option<u64>,
+    ) -> bool {
+        self.profile.title == title
+            && self.profile.artist == artist
+            && self.profile.album.as_deref() == album
+            && self.profile.album_artist.as_deref() == album_artist
+            && self.profile.track_number == track_number
+            && self.profile.duration_secs == duration_secs
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn source_id(&self) -> SourceId {
+        match &self.kind {
+            PlaybackSourceReferenceKind::Session { media_key, .. }
+            | PlaybackSourceReferenceKind::RegularPlaylist { media_key, .. } => media_key.source_id,
+        }
+    }
+}
+
+impl std::fmt::Debug for PlaybackSourceReference {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PlaybackSourceReference(<redacted>)")
     }
 }
 
@@ -694,6 +927,28 @@ impl AcceptedSourcePayload {
 
 /// Heterogeneous operational contract stored by one lifecycle registry.
 pub trait ManagedSourceAdapter: LifecycleAdapter + Send + Sync {
+    /// Explicit, reviewed opt-in for structured playback attribution.
+    ///
+    /// Future managed adapters remain ineligible until their source kind,
+    /// structured metadata, and lifecycle provenance have been reviewed.
+    fn playback_attribution_capability(&self) -> PlaybackAttributionCapability {
+        PlaybackAttributionCapability::Unsupported
+    }
+
+    /// Return the exact bounded structured attribution authorized for one
+    /// track by this live adapter.
+    ///
+    /// Coarse source capability is deliberately insufficient. Every adapter,
+    /// including all currently shipped remote and removable backends,
+    /// defaults to no per-track profile and therefore fails closed. The
+    /// external-file adapter is the only production override today.
+    fn playback_attribution_profile(
+        &self,
+        _track_id: &TrackId,
+    ) -> Option<PlaybackAttributionProfile> {
+        None
+    }
+
     /// Explicit opt-in for Tributary-owned source-scoped regular playlists.
     /// Future adapters remain denied until their accepted catalogue and media
     /// resolver satisfy the same exact-ID authority contract.
@@ -788,6 +1043,10 @@ macro_rules! standard_remote_adapter {
         }
 
         impl ManagedSourceAdapter for $adapter {
+            fn playback_attribution_capability(&self) -> PlaybackAttributionCapability {
+                PlaybackAttributionCapability::AuthenticatedRemote
+            }
+
             fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
                 $regular_playlist_capability
             }
@@ -828,6 +1087,10 @@ impl LifecycleAdapter for crate::subsonic::SubsonicBackend {
 }
 
 impl ManagedSourceAdapter for crate::subsonic::SubsonicBackend {
+    fn playback_attribution_capability(&self) -> PlaybackAttributionCapability {
+        PlaybackAttributionCapability::AuthenticatedRemote
+    }
+
     fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
         source_scoped_playlist_capability::<Self>()
     }
@@ -886,6 +1149,10 @@ impl LifecycleAdapter for crate::jellyfin::JellyfinBackend {
 }
 
 impl ManagedSourceAdapter for crate::jellyfin::JellyfinBackend {
+    fn playback_attribution_capability(&self) -> PlaybackAttributionCapability {
+        PlaybackAttributionCapability::AuthenticatedRemote
+    }
+
     fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
         source_scoped_playlist_capability::<Self>()
     }
@@ -945,6 +1212,10 @@ fn validate_daap_initial_catalogue(
 }
 
 impl ManagedSourceAdapter for crate::daap::DaapBackend {
+    fn playback_attribution_capability(&self) -> PlaybackAttributionCapability {
+        PlaybackAttributionCapability::AuthenticatedRemote
+    }
+
     fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
         source_scoped_playlist_capability::<Self>()
     }
@@ -981,6 +1252,7 @@ struct BuiltInInstallation {
 struct SourceRegistryInner {
     lifecycle: SourceLifecycleRegistry<dyn ManagedSourceAdapter, AcceptedSourcePayload>,
     runtime: tokio::runtime::Handle,
+    playback_reference_binding: PlaybackReferenceBinding,
     built_ins: Mutex<HashMap<SourceId, BuiltInInstallation>>,
     external_sessions: Mutex<HashMap<SourceId, ProvenanceClaimId>>,
 }
@@ -1067,6 +1339,7 @@ pub struct ExternalFileSession {
     track_id: TrackId,
     session_epoch: u64,
     track: Track,
+    playback_source: Option<PlaybackSourceReference>,
     #[cfg(test)]
     close_probe: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -1086,6 +1359,13 @@ impl ExternalFileSession {
 
     pub fn track(&self) -> &Track {
         &self.track
+    }
+
+    /// Opaque exact-session attribution reference minted by the registry.
+    /// Missing means the parsed file failed closed for listening-history
+    /// attribution while remaining playable.
+    pub(crate) fn playback_source(&self) -> Option<&PlaybackSourceReference> {
+        self.playback_source.as_ref()
     }
 
     #[cfg(test)]
@@ -1124,6 +1404,7 @@ impl SourceRegistry {
             inner: Arc::new(SourceRegistryInner {
                 lifecycle,
                 runtime,
+                playback_reference_binding: PlaybackReferenceBinding(Arc::new(())),
                 built_ins: Mutex::new(built_ins),
                 external_sessions: Mutex::new(HashMap::new()),
             }),
@@ -1212,6 +1493,11 @@ impl SourceRegistry {
                 .schedule_prune_after_current_retirement(source_id);
             return Err(closed_external_admission_error());
         };
+        let playback_source = self.mint_session_playback_source(
+            MediaKey::new(source_id, track_id.clone()),
+            session_epoch,
+            &HashSet::new(),
+        );
 
         let replaced = external_sessions.insert(source_id, claim_id);
         debug_assert!(
@@ -1223,6 +1509,7 @@ impl SourceRegistry {
             track_id,
             session_epoch,
             track,
+            playback_source,
             #[cfg(test)]
             close_probe,
         })
@@ -1296,6 +1583,161 @@ impl SourceRegistry {
             .lifecycle
             .snapshot(source_id)
             .map(public_snapshot)
+    }
+
+    /// Mint one opaque attribution reference from an exact live session.
+    ///
+    /// The full per-track profile, coarse capability, provenance, remote
+    /// opt-in, expected epoch, and registry-instance binding are captured in
+    /// one lifecycle-lock observation. Raw UI epochs cannot construct this
+    /// value.
+    pub(crate) fn mint_session_playback_source(
+        &self,
+        media_key: MediaKey,
+        expected_session_epoch: u64,
+        enabled_remote_sources: &HashSet<SourceId>,
+    ) -> Option<PlaybackSourceReference> {
+        if expected_session_epoch == 0 {
+            return None;
+        }
+        let binding = self.inner.playback_reference_binding.clone();
+        self.inner.lifecycle.project_exact_session(
+            media_key.source_id,
+            expected_session_epoch,
+            move |adapter, provenance| {
+                if !playback_attribution_is_eligible(
+                    adapter.playback_attribution_capability(),
+                    media_key.source_id,
+                    provenance,
+                    enabled_remote_sources,
+                ) {
+                    return None;
+                }
+                let profile = adapter.playback_attribution_profile(&media_key.track_id)?;
+                Some(PlaybackSourceReference {
+                    binding,
+                    kind: PlaybackSourceReferenceKind::Session {
+                        media_key,
+                        session_epoch: expected_session_epoch,
+                    },
+                    profile,
+                })
+            },
+        )
+    }
+
+    /// Mint one opaque attribution reference from an exact accepted
+    /// source-wide catalogue and its live session.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn mint_regular_playlist_playback_source(
+        &self,
+        media_key: MediaKey,
+        guard: RegularPlaylistCatalogueGuard,
+        enabled_remote_sources: &HashSet<SourceId>,
+    ) -> Option<PlaybackSourceReference> {
+        if guard.source_id != media_key.source_id
+            || guard.session_epoch == 0
+            || guard.catalogue_generation == 0
+        {
+            return None;
+        }
+        let binding = self.inner.playback_reference_binding.clone();
+        self.inner.lifecycle.project_exact_catalogue(
+            media_key.source_id,
+            guard.session_epoch,
+            guard.catalogue_generation,
+            move |adapter, provenance, payload| {
+                if payload
+                    .regular_playlist_track(&media_key.track_id)
+                    .is_none()
+                    || !playback_attribution_is_eligible(
+                        adapter.playback_attribution_capability(),
+                        media_key.source_id,
+                        provenance,
+                        enabled_remote_sources,
+                    )
+                {
+                    return None;
+                }
+                let profile = adapter.playback_attribution_profile(&media_key.track_id)?;
+                Some(PlaybackSourceReference {
+                    binding,
+                    kind: PlaybackSourceReferenceKind::RegularPlaylist { media_key, guard },
+                    profile,
+                })
+            },
+        )
+    }
+
+    /// Atomically revalidate one managed playback occurrence and perform a
+    /// bounded non-blocking action through its exact source authority.
+    ///
+    /// Source/session or source/catalogue validation, intrinsic adapter
+    /// capability, live provenance, exact remote opt-in, and `admit` all
+    /// execute under the lifecycle state lock. A disconnect, replacement,
+    /// shutdown, Saved-provenance demotion, or catalogue refresh therefore
+    /// wins wholly before or after this ingress. The callback receives no
+    /// adapter, locator, lease, or permit and must neither block nor re-enter
+    /// this registry.
+    ///
+    /// The returned value is not source authority and may safely represent a
+    /// pending database or network operation after this method returns.
+    pub(crate) fn try_admit_playback_action<T>(
+        &self,
+        source: &PlaybackSourceReference,
+        enabled_remote_sources: &HashSet<SourceId>,
+        admit: impl FnOnce() -> T,
+    ) -> Option<T> {
+        if source.binding != self.inner.playback_reference_binding {
+            return None;
+        }
+        match &source.kind {
+            PlaybackSourceReferenceKind::Session {
+                media_key,
+                session_epoch,
+            } => self.inner.lifecycle.admit_exact_session_if(
+                media_key.source_id,
+                *session_epoch,
+                |adapter, provenance| {
+                    playback_attribution_is_eligible(
+                        adapter.playback_attribution_capability(),
+                        media_key.source_id,
+                        provenance,
+                        enabled_remote_sources,
+                    ) && adapter
+                        .playback_attribution_profile(&media_key.track_id)
+                        .as_ref()
+                        == Some(&source.profile)
+                },
+                admit,
+            ),
+            PlaybackSourceReferenceKind::RegularPlaylist { media_key, guard } => {
+                if guard.source_id != media_key.source_id {
+                    return None;
+                }
+                self.inner.lifecycle.admit_exact_catalogue_if(
+                    media_key.source_id,
+                    guard.session_epoch,
+                    guard.catalogue_generation,
+                    |adapter, provenance, payload| {
+                        payload
+                            .regular_playlist_track(&media_key.track_id)
+                            .is_some()
+                            && playback_attribution_is_eligible(
+                                adapter.playback_attribution_capability(),
+                                media_key.source_id,
+                                provenance,
+                                enabled_remote_sources,
+                            )
+                            && adapter
+                                .playback_attribution_profile(&media_key.track_id)
+                                .as_ref()
+                                == Some(&source.profile)
+                    },
+                    admit,
+                )
+            }
+        }
     }
 
     /// Spawn one standard remote constructor under the only permitted
@@ -2089,6 +2531,47 @@ impl SourceRegistry {
     }
 }
 
+/// Closed source-kind/provenance policy for structured playback attribution.
+///
+/// Future provenance kinds are denied automatically because every admitted
+/// capability compares the complete set with its explicit allowed kinds.
+fn playback_attribution_is_eligible(
+    capability: PlaybackAttributionCapability,
+    source_id: SourceId,
+    provenance: &crate::source_lifecycle::ProvenanceSet,
+    enabled_remote_sources: &HashSet<SourceId>,
+) -> bool {
+    if source_id.as_uuid().is_nil()
+        || source_id == SourceId::local()
+        || source_id == SourceId::radio_browser()
+    {
+        return false;
+    }
+
+    match capability {
+        PlaybackAttributionCapability::Unsupported => false,
+        PlaybackAttributionCapability::AuthenticatedRemote => {
+            let allowed_kinds = [
+                SourceProvenance::Saved,
+                SourceProvenance::Environment,
+                SourceProvenance::Discovery,
+            ]
+            .into_iter()
+            .filter(|kind| provenance.contains(*kind))
+            .count();
+            provenance.contains(SourceProvenance::Saved)
+                && provenance.len() == allowed_kinds
+                && enabled_remote_sources.contains(&source_id)
+        }
+        PlaybackAttributionCapability::Removable => {
+            provenance.len() == 1 && provenance.contains(SourceProvenance::Removable)
+        }
+        PlaybackAttributionCapability::External => {
+            provenance.len() == 1 && provenance.claim_count(SourceProvenance::External) == 1
+        }
+    }
+}
+
 fn regular_playlist_authority_eq(
     observed: &RegularPlaylistTrackResolution,
     current: &RegularPlaylistTrackResolution,
@@ -2372,6 +2855,8 @@ mod tests {
                 probe: Arc::clone(self),
                 close_release: self.close_release.subscribe(),
                 catalogue: Vec::new(),
+                playback_attribution_capability: PlaybackAttributionCapability::Unsupported,
+                playback_attribution_profiles: Arc::new(Mutex::new(HashMap::new())),
                 regular_playlist_capability: RegularPlaylistCapability::Unsupported,
                 server_playlist_capability: ServerPlaylistCapability::Unsupported,
                 server_playlists: Vec::new(),
@@ -2394,6 +2879,8 @@ mod tests {
                 probe: Arc::clone(self),
                 close_release: self.close_release.subscribe(),
                 catalogue,
+                playback_attribution_capability: PlaybackAttributionCapability::Unsupported,
+                playback_attribution_profiles: Arc::new(Mutex::new(HashMap::new())),
                 regular_playlist_capability: RegularPlaylistCapability::SourceScopedEntries,
                 server_playlist_capability: ServerPlaylistCapability::Unsupported,
                 server_playlists: Vec::new(),
@@ -2429,6 +2916,8 @@ mod tests {
                 probe: Arc::clone(self),
                 close_release: self.close_release.subscribe(),
                 catalogue: Vec::new(),
+                playback_attribution_capability: PlaybackAttributionCapability::Unsupported,
+                playback_attribution_profiles: Arc::new(Mutex::new(HashMap::new())),
                 regular_playlist_capability: RegularPlaylistCapability::SourceScopedEntries,
                 server_playlist_capability: ServerPlaylistCapability::PullSnapshots,
                 server_playlists: vec![summary],
@@ -2491,6 +2980,8 @@ mod tests {
         probe: Arc<FakeProbe>,
         close_release: watch::Receiver<bool>,
         catalogue: Vec<Track>,
+        playback_attribution_capability: PlaybackAttributionCapability,
+        playback_attribution_profiles: Arc<Mutex<HashMap<TrackId, PlaybackAttributionProfile>>>,
         regular_playlist_capability: RegularPlaylistCapability,
         server_playlist_capability: ServerPlaylistCapability,
         server_playlists: Vec<ServerPlaylistSummary>,
@@ -2500,6 +2991,28 @@ mod tests {
         server_playlist_snapshot_failure: Option<String>,
         stream_failure: Option<String>,
         artwork_available: bool,
+    }
+
+    impl FakeAdapter {
+        fn with_playback_attribution(
+            mut self,
+            capability: PlaybackAttributionCapability,
+            track_id: TrackId,
+        ) -> Self {
+            self.playback_attribution_capability = capability;
+            lock(&self.playback_attribution_profiles).insert(
+                track_id,
+                PlaybackAttributionProfile::for_test(
+                    "Fixture Title",
+                    "Fixture Artist",
+                    Some("Fixture Album"),
+                    Some("Fixture Album Artist"),
+                    Some(7),
+                    Some(181),
+                ),
+            );
+            self
+        }
     }
 
     #[async_trait]
@@ -2612,6 +3125,19 @@ mod tests {
     }
 
     impl ManagedSourceAdapter for FakeAdapter {
+        fn playback_attribution_capability(&self) -> PlaybackAttributionCapability {
+            self.playback_attribution_capability
+        }
+
+        fn playback_attribution_profile(
+            &self,
+            track_id: &TrackId,
+        ) -> Option<PlaybackAttributionProfile> {
+            lock(&self.playback_attribution_profiles)
+                .get(track_id)
+                .cloned()
+        }
+
         fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
             self.regular_playlist_capability
         }
@@ -2787,6 +3313,36 @@ mod tests {
         )
     }
 
+    fn tagged_external_fixture(
+        directory: &tempfile::TempDir,
+        file_name: &str,
+        album: Option<&str>,
+    ) -> (File, ExternalFileHint) {
+        let path = directory.path().join(file_name);
+        std::fs::write(
+            &path,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        )
+        .expect("copy external FLAC fixture");
+        crate::local::tag_writer::write_tags(
+            &path,
+            &crate::local::tag_writer::TagEdits {
+                title: Some("Tagged Title".to_string()),
+                artist: Some("Tagged Artist".to_string()),
+                album: Some(album.unwrap_or_default().to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("write external fixture tags");
+        (
+            File::open(path).expect("open tagged external FLAC"),
+            ExternalFileHint::new(file_name, Some("flac")).expect("safe external hint"),
+        )
+    }
+
     fn read_file_stream(stream: &ResolvedSourceStream) -> Vec<u8> {
         let ResolvedSourceStream::File(media) = stream else {
             panic!("fixture expected retained file media");
@@ -2879,6 +3435,80 @@ mod tests {
         assert_server_playlist_pull::<crate::subsonic::SubsonicBackend>();
     }
 
+    #[tokio::test]
+    async fn playback_source_references_are_registry_minted_bound_and_redacted() {
+        let source_registry = registry();
+        let source_id = SourceId::random();
+        let track_id = TrackId::remote("SENTINEL_NATIVE_TRACK_9271").expect("track identity");
+        let media_key = MediaKey::new(source_id, track_id.clone());
+        let probe = FakeProbe::new(true);
+        let session_epoch = connect_playback_attribution_fixture(
+            &source_registry,
+            source_id,
+            &[SourceProvenance::Saved],
+            probe.adapter("minted-reference").with_playback_attribution(
+                PlaybackAttributionCapability::AuthenticatedRemote,
+                track_id.clone(),
+            ),
+        )
+        .await;
+        let enabled = HashSet::from([source_id]);
+
+        assert!(source_registry
+            .mint_session_playback_source(media_key.clone(), 0, &enabled)
+            .is_none());
+        assert!(source_registry
+            .mint_session_playback_source(
+                media_key.clone(),
+                session_epoch.wrapping_add(1),
+                &enabled,
+            )
+            .is_none());
+        let session = source_registry
+            .mint_session_playback_source(media_key.clone(), session_epoch, &enabled)
+            .expect("exact live registry mints the reference");
+        assert_eq!(session.source_id(), source_id);
+
+        let other_registry = registry();
+        let other_probe = FakeProbe::new(true);
+        let other_session_epoch = connect_playback_attribution_fixture(
+            &other_registry,
+            source_id,
+            &[SourceProvenance::Saved],
+            other_probe
+                .adapter("same-source-other-registry")
+                .with_playback_attribution(
+                    PlaybackAttributionCapability::AuthenticatedRemote,
+                    track_id,
+                ),
+        )
+        .await;
+        assert_eq!(
+            other_session_epoch, session_epoch,
+            "the fixture must isolate registry-instance binding from epoch mismatch"
+        );
+        let other_session = other_registry
+            .mint_session_playback_source(media_key, other_session_epoch, &enabled)
+            .expect("the second registry mints its own otherwise-equivalent reference");
+        assert_eq!(
+            other_registry.try_admit_playback_action(&other_session, &enabled, || "admitted"),
+            Some("admitted")
+        );
+        assert!(other_registry
+            .try_admit_playback_action(&session, &enabled, || ())
+            .is_none());
+
+        let debug = format!("{session:?} {:?}", session.profile());
+        assert!(!debug.contains(&source_id.to_string()));
+        assert!(!debug.contains("SENTINEL_NATIVE_TRACK_9271"));
+        assert!(!debug.contains("Fixture Title"));
+        assert!(!debug.contains(&session_epoch.to_string()));
+        assert_eq!(session.clone(), session);
+
+        source_registry.shutdown().wait().await;
+        other_registry.shutdown().wait().await;
+    }
+
     async fn wait_for_catalogue(registry: &SourceRegistry, source_id: SourceId) -> (u64, u64) {
         timeout(Duration::from_secs(2), async {
             loop {
@@ -2955,6 +3585,27 @@ mod tests {
         wait_for_catalogue(registry, source_id).await
     }
 
+    async fn connect_playback_attribution_fixture(
+        registry: &SourceRegistry,
+        source_id: SourceId,
+        provenances: &[SourceProvenance],
+        adapter: FakeAdapter,
+    ) -> u64 {
+        for provenance in provenances {
+            registry
+                .claim_provenance(source_id, *provenance)
+                .expect("playback fixture provenance");
+        }
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(adapter) },
+            )
+            .expect("playback fixture connection admitted");
+        wait_for_catalogue(registry, source_id).await.1
+    }
+
     fn browser_playlist_snapshot(
         native_id: &str,
         name: &str,
@@ -3028,6 +3679,421 @@ mod tests {
         .await
         .expect("catalogue refresh accepted");
         generation
+    }
+
+    #[tokio::test]
+    async fn playback_attribution_policy_is_closed_over_capability_provenance_and_opt_in() {
+        struct Case {
+            name: &'static str,
+            capability: PlaybackAttributionCapability,
+            provenances: &'static [SourceProvenance],
+            enable_exact_remote: bool,
+            expected: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "unknown adapter defaults denied",
+                capability: PlaybackAttributionCapability::Unsupported,
+                provenances: &[SourceProvenance::Saved],
+                enable_exact_remote: true,
+                expected: false,
+            },
+            Case {
+                name: "saved authenticated remote explicitly enabled",
+                capability: PlaybackAttributionCapability::AuthenticatedRemote,
+                provenances: &[SourceProvenance::Saved],
+                enable_exact_remote: true,
+                expected: true,
+            },
+            Case {
+                name: "saved authenticated remote not enabled",
+                capability: PlaybackAttributionCapability::AuthenticatedRemote,
+                provenances: &[SourceProvenance::Saved],
+                enable_exact_remote: false,
+                expected: false,
+            },
+            Case {
+                name: "environment-only authenticated remote",
+                capability: PlaybackAttributionCapability::AuthenticatedRemote,
+                provenances: &[SourceProvenance::Environment],
+                enable_exact_remote: true,
+                expected: false,
+            },
+            Case {
+                name: "saved discovered authenticated remote",
+                capability: PlaybackAttributionCapability::AuthenticatedRemote,
+                provenances: &[SourceProvenance::Saved, SourceProvenance::Discovery],
+                enable_exact_remote: true,
+                expected: true,
+            },
+            Case {
+                name: "authenticated remote with foreign provenance",
+                capability: PlaybackAttributionCapability::AuthenticatedRemote,
+                provenances: &[SourceProvenance::Saved, SourceProvenance::External],
+                enable_exact_remote: true,
+                expected: false,
+            },
+            Case {
+                name: "exact removable provenance",
+                capability: PlaybackAttributionCapability::Removable,
+                provenances: &[SourceProvenance::Removable],
+                enable_exact_remote: false,
+                expected: true,
+            },
+            Case {
+                name: "removable with discovery provenance",
+                capability: PlaybackAttributionCapability::Removable,
+                provenances: &[SourceProvenance::Removable, SourceProvenance::Discovery],
+                enable_exact_remote: false,
+                expected: false,
+            },
+            Case {
+                name: "one exact external claim",
+                capability: PlaybackAttributionCapability::External,
+                provenances: &[SourceProvenance::External],
+                enable_exact_remote: false,
+                expected: true,
+            },
+            Case {
+                name: "duplicate external claim",
+                capability: PlaybackAttributionCapability::External,
+                provenances: &[SourceProvenance::External, SourceProvenance::External],
+                enable_exact_remote: false,
+                expected: false,
+            },
+        ];
+
+        let registry = registry();
+        for case in cases {
+            let source_id = SourceId::random();
+            let track_id = TrackId::remote(format!("{}-track", case.name.replace(' ', "-")))
+                .expect("bounded fixture track ID");
+            let probe = FakeProbe::new(true);
+            let adapter = probe
+                .adapter(case.name)
+                .with_playback_attribution(case.capability, track_id.clone());
+            let session_epoch = connect_playback_attribution_fixture(
+                &registry,
+                source_id,
+                case.provenances,
+                adapter,
+            )
+            .await;
+            let enabled_remote_sources = if case.enable_exact_remote {
+                HashSet::from([source_id])
+            } else {
+                HashSet::from([SourceId::random()])
+            };
+            let source = registry.mint_session_playback_source(
+                MediaKey::new(source_id, track_id),
+                session_epoch,
+                &enabled_remote_sources,
+            );
+            let calls = AtomicUsize::new(0);
+            let admitted = source.as_ref().and_then(|source| {
+                registry.try_admit_playback_action(source, &enabled_remote_sources, || {
+                    calls.fetch_add(1, Ordering::AcqRel)
+                })
+            });
+            assert_eq!(admitted.is_some(), case.expected, "{}", case.name);
+            assert_eq!(
+                calls.load(Ordering::Acquire),
+                usize::from(case.expected),
+                "{} callback execution",
+                case.name
+            );
+        }
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn coarse_attribution_capability_without_an_exact_track_profile_fails_closed() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let track_id = TrackId::remote("coarse-only-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        let mut adapter = probe.adapter("coarse-only");
+        adapter.playback_attribution_capability =
+            PlaybackAttributionCapability::AuthenticatedRemote;
+        let session_epoch = connect_playback_attribution_fixture(
+            &registry,
+            source_id,
+            &[SourceProvenance::Saved],
+            adapter,
+        )
+        .await;
+        let enabled = HashSet::from([source_id]);
+
+        assert!(registry
+            .mint_session_playback_source(
+                MediaKey::new(source_id, track_id),
+                session_epoch,
+                &enabled,
+            )
+            .is_none());
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::used_underscore_binding)]
+    async fn reserved_radio_identity_is_denied_even_when_remote_policy_otherwise_matches() {
+        let registry = registry();
+        let source_id = SourceId::radio_browser();
+        let built_in_claim = lock(&registry.inner.built_ins)
+            .get(&source_id)
+            .expect("radio installation")
+            ._claim_id;
+        registry
+            .claim_provenance(source_id, SourceProvenance::Saved)
+            .expect("saved fixture provenance");
+        let track_id = TrackId::remote("radio-attribution-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        let session_epoch = registry
+            .install_builtin_candidate(
+                source_id,
+                Ok(Box::new(
+                    probe
+                        .adapter("radio-attribution")
+                        .with_playback_attribution(
+                            PlaybackAttributionCapability::AuthenticatedRemote,
+                            track_id.clone(),
+                        ),
+                ) as Box<dyn ManagedSourceAdapter>),
+            )
+            .expect("radio fixture adopted");
+        assert!(registry.release_provenance(source_id, built_in_claim));
+        let snapshot = registry
+            .snapshot(source_id)
+            .expect("radio fixture retained");
+        assert_eq!(snapshot.provenance.len(), 1);
+        assert!(snapshot.provenance.contains(SourceProvenance::Saved));
+
+        let source = registry.mint_session_playback_source(
+            MediaKey::new(source_id, track_id),
+            session_epoch,
+            &HashSet::from([source_id]),
+        );
+        assert!(source.is_none());
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn saved_demotion_linearizes_after_in_flight_playback_admission() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let saved_claim = registry
+            .claim_provenance(source_id, SourceProvenance::Saved)
+            .expect("saved claim");
+        registry
+            .claim_provenance(source_id, SourceProvenance::Discovery)
+            .expect("discovery claim");
+        let track_id = TrackId::remote("saved-demotion-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        let adapter_track_id = track_id.clone();
+        registry
+            .connect_standard::<FakeAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move {
+                    Ok(probe.adapter("saved-demotion").with_playback_attribution(
+                        PlaybackAttributionCapability::AuthenticatedRemote,
+                        adapter_track_id,
+                    ))
+                },
+            )
+            .expect("fixture connection admitted");
+        let session_epoch = wait_for_catalogue(&registry, source_id).await.1;
+        let enabled_remote_sources = HashSet::from([source_id]);
+        let source = registry
+            .mint_session_playback_source(
+                MediaKey::new(source_id, track_id),
+                session_epoch,
+                &enabled_remote_sources,
+            )
+            .expect("exact session attribution reference");
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (finish_tx, finish_rx) = mpsc::sync_channel(1);
+        let admitting_registry = registry.clone();
+        let admitting_source = source.clone();
+        let admission = std::thread::spawn(move || {
+            admitting_registry.try_admit_playback_action(
+                &admitting_source,
+                &enabled_remote_sources,
+                || {
+                    entered_tx.send(()).expect("admission observer alive");
+                    finish_rx.recv().expect("release synchronous admission");
+                    "admitted"
+                },
+            )
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("playback admission entered");
+
+        assert!(
+            registry.inner.lifecycle.state_lock_is_contended_for_test(),
+            "the admitted callback must retain the lifecycle lock through ingress"
+        );
+
+        let (released_tx, released_rx) = mpsc::sync_channel(1);
+        let demoting_registry = registry.clone();
+        let demotion = std::thread::spawn(move || {
+            released_tx
+                .send(demoting_registry.release_provenance(source_id, saved_claim))
+                .expect("demotion result observer alive");
+        });
+
+        finish_tx.send(()).expect("admission remains alive");
+        assert_eq!(
+            admission.join().expect("admission thread"),
+            Some("admitted")
+        );
+        assert!(released_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("demotion resumed after admission"));
+        demotion.join().expect("demotion thread");
+
+        let snapshot = registry
+            .snapshot(source_id)
+            .expect("discovered source remains");
+        assert_eq!(snapshot.session_epoch, Some(session_epoch));
+        assert!(!snapshot.provenance.contains(SourceProvenance::Saved));
+        assert!(snapshot.provenance.contains(SourceProvenance::Discovery));
+        let called = AtomicBool::new(false);
+        assert!(registry
+            .try_admit_playback_action(&source, &HashSet::from([source_id]), || {
+                called.store(true, Ordering::Release);
+            })
+            .is_none());
+        assert!(!called.load(Ordering::Acquire));
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn playlist_playback_admission_requires_exact_current_catalogue_membership() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let track_id = TrackId::remote("guarded-playback-track").expect("track ID");
+        let missing_track_id = TrackId::remote("missing-guarded-track").expect("missing track ID");
+        let probe = FakeProbe::new(true);
+        let adapter = probe
+            .playlist_adapter("guarded-playback", vec![fixture_track(track_id.clone())])
+            .with_playback_attribution(
+                PlaybackAttributionCapability::AuthenticatedRemote,
+                track_id.clone(),
+            )
+            .with_playback_attribution(
+                PlaybackAttributionCapability::AuthenticatedRemote,
+                missing_track_id.clone(),
+            );
+        let (catalogue_generation, session_epoch) =
+            connect_playlist_fixture(&registry, source_id, adapter).await;
+        let media_key = MediaKey::new(source_id, track_id.clone());
+        let resolved = registry.resolve_regular_playlist_tracks(std::slice::from_ref(&media_key));
+        let guard = available(&resolved[0]).guard();
+        assert_eq!(guard.catalogue_generation(), catalogue_generation);
+        assert_eq!(guard.session_epoch(), session_epoch);
+        let enabled_remote_sources = HashSet::from([source_id]);
+        let exact = registry
+            .mint_regular_playlist_playback_source(
+                media_key.clone(),
+                guard,
+                &enabled_remote_sources,
+            )
+            .expect("exact guarded playlist occurrence");
+        assert_eq!(
+            registry.try_admit_playback_action(&exact, &enabled_remote_sources, || 1),
+            Some(1)
+        );
+        assert!(registry
+            .try_admit_playback_action(&exact, &HashSet::new(), || 2)
+            .is_none());
+
+        let missing_media_key = MediaKey::new(source_id, missing_track_id);
+        assert!(registry
+            .mint_session_playback_source(
+                missing_media_key.clone(),
+                session_epoch,
+                &enabled_remote_sources,
+            )
+            .is_some());
+        let missing = registry.mint_regular_playlist_playback_source(
+            missing_media_key,
+            guard,
+            &enabled_remote_sources,
+        );
+        assert!(missing.is_none());
+        for stale_guard in [
+            RegularPlaylistCatalogueGuard {
+                source_id,
+                session_epoch: session_epoch.wrapping_add(1),
+                catalogue_generation,
+            },
+            RegularPlaylistCatalogueGuard {
+                source_id,
+                session_epoch,
+                catalogue_generation: catalogue_generation.wrapping_add(1),
+            },
+        ] {
+            assert!(registry
+                .mint_regular_playlist_playback_source(
+                    media_key.clone(),
+                    stale_guard,
+                    &enabled_remote_sources,
+                )
+                .is_none());
+        }
+
+        let refreshed_generation = refresh_playlist_catalogue(
+            &registry,
+            source_id,
+            vec![fixture_track(track_id.clone())],
+            RegularPlaylistCapability::SourceScopedEntries,
+        )
+        .await;
+        assert_ne!(refreshed_generation, catalogue_generation);
+        assert_eq!(
+            registry
+                .snapshot(source_id)
+                .expect("source remains active")
+                .session_epoch,
+            Some(session_epoch)
+        );
+        assert!(registry
+            .try_admit_playback_action(&exact, &enabled_remote_sources, || 5)
+            .is_none());
+
+        let session = registry
+            .mint_session_playback_source(media_key.clone(), session_epoch, &enabled_remote_sources)
+            .expect("same source session remains current");
+        assert_eq!(
+            registry.try_admit_playback_action(&session, &enabled_remote_sources, || 6),
+            Some(6)
+        );
+        let current_guard = available(
+            &registry.resolve_regular_playlist_tracks(std::slice::from_ref(&media_key))[0],
+        )
+        .guard();
+        assert_eq!(current_guard.catalogue_generation(), refreshed_generation);
+        let current = registry
+            .mint_regular_playlist_playback_source(
+                media_key,
+                current_guard,
+                &enabled_remote_sources,
+            )
+            .expect("refreshed guarded occurrence");
+        assert_eq!(
+            registry.try_admit_playback_action(&current, &enabled_remote_sources, || 7),
+            Some(7)
+        );
+
+        registry.shutdown().wait().await;
     }
 
     #[tokio::test]
@@ -6421,6 +7487,10 @@ mod tests {
         let session = registry
             .adopt_external_file(file, hint)
             .expect("admit external file");
+        assert!(
+            session.playback_source().is_none(),
+            "an untagged WAV must not mint attribution from filename/Unknown metadata fallbacks"
+        );
 
         let snapshot = registry
             .snapshot(session.source_id())
@@ -6477,6 +7547,98 @@ mod tests {
         registry
             .retire_external(session.source_id())
             .expect("retire external session")
+            .wait()
+            .await;
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn tagged_external_profiles_are_exact_redacted_and_revalidated_at_admission() {
+        let registry = registry();
+        let directory = tempfile::tempdir().expect("external fixture directory");
+
+        let (required_file, required_hint) =
+            tagged_external_fixture(&directory, "required-only.flac", None);
+        let required = registry
+            .adopt_external_file(required_file, required_hint)
+            .expect("admit required-tag external file");
+        let reference = required
+            .playback_source()
+            .cloned()
+            .expect("tagged title and artist mint an exact reference");
+        let profile = reference.profile();
+        assert_eq!(profile.title(), "Tagged Title");
+        assert_eq!(profile.artist(), "Tagged Artist");
+        assert_eq!(profile.album(), None, "Unknown Album is never authorized");
+        assert!(reference.matches_attribution(
+            "Tagged Title",
+            "Tagged Artist",
+            None,
+            profile.album_artist(),
+            profile.track_number(),
+            profile.duration_secs(),
+        ));
+        assert!(!reference.matches_attribution(
+            "Altered Title",
+            "Tagged Artist",
+            None,
+            profile.album_artist(),
+            profile.track_number(),
+            profile.duration_secs(),
+        ));
+        assert_eq!(
+            registry.try_admit_playback_action(&reference, &HashSet::new(), || 1),
+            Some(1)
+        );
+        assert!(registry
+            .mint_session_playback_source(
+                MediaKey::new(required.source_id(), TrackId::external()),
+                required.session_epoch(),
+                &HashSet::new(),
+            )
+            .is_none());
+        assert!(registry
+            .mint_session_playback_source(
+                MediaKey::new(required.source_id(), required.track_id().clone()),
+                required.session_epoch().wrapping_add(1),
+                &HashSet::new(),
+            )
+            .is_none());
+
+        let mut altered_profile = reference.clone();
+        altered_profile.profile.title = "Altered Title".to_string();
+        assert!(registry
+            .try_admit_playback_action(&altered_profile, &HashSet::new(), || 2)
+            .is_none());
+        let debug = format!("{reference:?} {:?}", reference.profile());
+        assert!(!debug.contains("Tagged Title"));
+        assert!(!debug.contains("Tagged Artist"));
+
+        let (album_file, album_hint) =
+            tagged_external_fixture(&directory, "tagged-album.flac", Some("Tagged Album"));
+        let tagged_album = registry
+            .adopt_external_file(album_file, album_hint)
+            .expect("admit album-tagged external file");
+        let album_reference = tagged_album
+            .playback_source()
+            .expect("album-tagged file remains eligible");
+        assert_eq!(album_reference.profile().album(), Some("Tagged Album"));
+        assert_eq!(
+            registry.try_admit_playback_action(album_reference, &HashSet::new(), || 3),
+            Some(3)
+        );
+
+        registry
+            .retire_external(required.source_id())
+            .expect("retire required-only source")
+            .wait()
+            .await;
+        assert!(registry
+            .try_admit_playback_action(&reference, &HashSet::new(), || 4)
+            .is_none());
+        registry
+            .retire_external(tagged_album.source_id())
+            .expect("retire album-tagged source")
             .wait()
             .await;
         registry.shutdown().wait().await;
