@@ -24,15 +24,18 @@ bounded signed transport, native protected-session boundary, strict queue schema
 offline FIFO, a serialized durable-delivery/lifecycle runtime, a standalone generation-owned
 playback-evidence state machine, a GTK-free owner with move-only accepted-output proofs and redacted
 action/clear handoffs, a `PlaybackSession`-private accepted-output mint witness, exact
-registry-instance-bound session/catalogue attribution with real-tag external profiles/proofs, a
-runtime-owned latest-only now-playing lane with joined normal retirement and shared-vault exclusion
+registry-instance-bound session/catalogue attribution with real-tag external and removable
+profiles/proofs plus registry-minted removable queue capture, a runtime-owned latest-only
+now-playing lane with joined normal retirement and shared-vault exclusion
 across hard owner abort, and a GTK-free latest-only desktop authorization owner with one-shot
 exchange and exact monotonic token expiry. Lock-linearized freshness makes delayed accepted loads
 and stale NowPlaying/Clear handoffs inert after a successor while leaving qualified Enqueue work
-durable. Those internal pieces remain intentionally unwired from the production application. One
-process-lifetime, non-recreatable production playback owner/coordinator, production consumption of
-the external proofs, exact local/removable/authenticated-remote profiles, runtime event and
-terminal/source-retirement/shutdown wiring, consent and browser invocation, authorization-owner
+durable. Production queue capture now freezes eligible removable proofs, but no production Last.fm
+owner/runtime consumes them yet. One process-lifetime, non-recreatable production playback
+owner/coordinator, production consumption of
+the external/removable proofs, exact local/authenticated-remote profiles, production remote-source
+opt-in, runtime event and terminal/source-retirement/shutdown wiring, consent and browser
+invocation, authorization-owner
 construction plus atomic vault/account transition, localized account/recovery/status UI,
 application ownership, packaged credentials, and live final acceptance testing remain the next
 slices.
@@ -160,17 +163,20 @@ slices.
   accepted output generation inside a move-only typed proof of eligible frozen occurrence data or
   an explicit ineligible replacement. Only `PlaybackSession` can issue the private production mint
   witness after that exact generation crosses output acceptance, and the occurrence's `QueueItem`
-  metadata remains frozen. Managed external occurrences carry an opaque attribution reference bound
-  to one registry instance, exact session or catalogue authority, and exact track profile. The
-  registry revalidates policy, profile, epoch/generation, catalogue authority, and membership under
-  the lifecycle lock. External profiles require parser-attested title and artist and never use a
-  filename or display-only `Unknown` album fallback. Ineligible or rejected replacements
+  metadata remains frozen. Managed external and removable occurrences carry an opaque attribution
+  reference bound to one registry instance, exact session or catalogue authority, and exact track
+  profile. The registry revalidates policy, profile, epoch/generation, catalogue authority, and
+  membership under the lifecycle lock. External and removable profiles require parser-attested
+  title and artist and never use a filename or display-only `Unknown` album fallback. Removable
+  queue capture asks the live registry to mint its exact current-session reference. Ineligible or
+  rejected replacements
   terminally retire their predecessor and issue at most one clear. Lock-linearized freshness makes
   delayed accepted loads and stale NowPlaying/Clear handoffs inert after a successor, while a
   qualified Enqueue is not retroactively revoked. Move-only redacted handoffs keep their payload
-  private through exact source and runtime admission. External profile/proof construction exists,
-  but its production consumer and exact local/removable/authenticated-remote profiles remain
-  unwired. This remains an internal boundary with no process-lifetime, non-recreatable production
+  private through exact source and runtime admission. External/removable profile and proof
+  construction exists, but its production consumer and exact local/authenticated-remote profiles
+  remain unwired; authenticated remotes also have no production opt-in source set. This remains an
+  internal boundary with no process-lifetime, non-recreatable production
   owner/coordinator. The runtime's uncloneable, account-independent now-playing input receives the
   exact current account and epoch internally.
   A monotonic latest-only generation synchronously cancels its predecessor before admission;
@@ -205,9 +211,10 @@ slices.
   available. The complete inventory lives in the
   [dated contract boundary](lastfm-scrobbling.md#dated-implementation-boundary); it includes
   one process-lifetime, non-recreatable production playback owner/coordinator; production
-  consumption of the implemented external-file profiles/proofs; exact local, removable, and
-  authenticated-remote profiles; runtime event, terminal, source-retirement, and shutdown wiring;
-  activation and source policy; consent/browser invocation and construction of the completed
+  consumption of the implemented external-file and removable profiles/proofs; exact local and
+  authenticated-remote profiles plus production remote-source opt-in; runtime event, terminal,
+  source-retirement, and shutdown wiring; activation and source policy; consent/browser invocation
+  and construction of the completed
   authorization core; atomic staged-session vault/account transitions;
   account/recovery/status UX; localization/accessibility; application lifecycle ownership;
   production credential injection and verification/API registration; and live end-to-end
@@ -398,11 +405,12 @@ The playback-history contract makes the remaining Last.fm behavior much less amb
    diagnostics. Its GTK-free owner consumes a move-only proof binding the exact accepted output
    generation to eligible frozen metadata or an explicit ineligible replacement. Only
    `PlaybackSession` can issue the private production mint witness after exact output acceptance.
-   Its frozen `QueueItem` snapshot and opaque external attribution bind the exact registry instance,
-   session or catalogue authority, and real-tag profile; policy, profile, epoch/generation,
+   Its frozen `QueueItem` snapshot and opaque external/removable attribution bind the exact registry
+   instance, session or catalogue authority, and real-tag profile; policy, profile, epoch/generation,
    catalogue authority, and membership are revalidated under the lifecycle lock before move-only
-   redacted handoffs cross source/runtime admission. External title and artist must be
-   parser-attested, with no filename or display-only `Unknown` album fallback. Lock-linearized
+   redacted handoffs cross source/runtime admission. External and removable title and artist must
+   be parser-attested, with no filename or display-only `Unknown` album fallback; removable queue
+   capture asks the registry to mint its exact current-session proof. Lock-linearized
    freshness makes delayed accepted loads and stale NowPlaying/Clear handoffs inert after a
    successor while qualified Enqueue remains durable; ineligible or rejected replacements retire
    and clear their predecessor at most once. The runtime now owns latest-only, synchronously
@@ -416,8 +424,9 @@ The playback-history contract makes the remaining Last.fm behavior much less amb
    accessor or handoff, joined cancellation/supersession/shutdown, fixed terminal status, and a
    move-only staged username/session-key grant without minting durable account authority.
    This code has no process-lifetime, non-recreatable production playback owner/coordinator. The
-   implemented external profiles/proofs have no production consumer, exact
-   local/removable/authenticated-remote profiles remain, and the owner is not yet connected to
+   implemented external/removable profiles and proofs have no production consumer, exact
+   local/authenticated-remote profiles and production remote-source opt-in remain, and the owner is
+   not yet connected to
    runtime playback events, terminal or source-retirement paths, production shutdown, or
    consent/browser/vault account-transition policy.
    The browser work must be a concrete consent-gated launch operation and must not claim that an
@@ -481,7 +490,7 @@ not mistaken for work already underway.
 
 | Issue | Current implementation state | Likely implementation shape |
 |---|---|---|
-| [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | Accepted [contract](lastfm-scrobbling.md), bounded client with zeroizing strict auth parsing, latest-only desktop-authorization core, native-vault authority, migrations 17/18, transactional private FIFO, durable delivery/cleanup gate, standalone playback-evidence observer, GTK-free move-only accepted-output owner/handoffs with `PlaybackSession`-private minting and freshness ordering, registry-bound real-tag external attribution, and internal delivery/lifecycle/latest-only-now-playing runtime with request-scoped hard-abort-safe shared vault exclusion; not production-wired and no settings UI yet. | Add one process-lifetime, non-recreatable production playback owner/coordinator; consume the implemented external proofs; add exact local/removable/authenticated-remote profiles; wire runtime events, terminal/source-retirement/shutdown paths, and per-source policy; then wrap the completed authorization core in consent, browser launch, atomic vault/account transition and one global application owner; add localized account/recovery/status UI, package credentials, and live final acceptance coverage. |
+| [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | Accepted [contract](lastfm-scrobbling.md), bounded client with zeroizing strict auth parsing, latest-only desktop-authorization core, native-vault authority, migrations 17/18, transactional private FIFO, durable delivery/cleanup gate, standalone playback-evidence observer, GTK-free move-only accepted-output owner/handoffs with `PlaybackSession`-private minting and freshness ordering, registry-bound real-tag external/removable attribution with exact removable queue capture, and internal delivery/lifecycle/latest-only-now-playing runtime with request-scoped hard-abort-safe shared vault exclusion; not production-wired and no settings UI yet. | Add one process-lifetime, non-recreatable production playback owner/coordinator; consume the implemented external/removable proofs; add exact local/authenticated-remote profiles and production remote-source opt-in; wire runtime events, terminal/source-retirement/shutdown paths, and per-source policy; then wrap the completed authorization core in consent, browser launch, atomic vault/account transition and one global application owner; add localized account/recovery/status UI, package credentials, and live final acceptance coverage. |
 | [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
 | [#46 — Drag and drop](https://github.com/jm2/tributary/issues/46) | Column-header reordering exists; track/file drag-and-drop does not. | Local playlist DnD first; file export, remote rows, and device copies as distinct policies. |
 | [#39 — Album art in browser](https://github.com/jm2/tributary/issues/39) | Artwork is shown for now-playing, not in the Genre/Artist/Album browser. | Virtualized art UI with bounded async cache, cancellation, accessibility, and authenticated art. |

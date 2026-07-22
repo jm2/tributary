@@ -164,7 +164,7 @@ impl ExternalFileCandidate {
             rating: crate::architecture::models::TrackRating::unsupported(),
             last_played: None,
         };
-        let playback_attribution_profile = PlaybackAttributionProfile::from_external_track(
+        let playback_attribution_profile = PlaybackAttributionProfile::from_tagged_track(
             &track,
             title_from_tag,
             artist_from_tag,

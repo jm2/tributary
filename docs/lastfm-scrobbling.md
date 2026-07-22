@@ -1,8 +1,8 @@
 # Last.fm scrobbling contract
 
 - Status: accepted P2.1 design; internal protocol/desktop-authorization/vault/queue/playback-evidence,
-  registry-bound external attribution, playback-owner, delivery/lifecycle, and now-playing
-  boundaries implemented; product integration pending
+  registry-bound external and removable attribution, playback-owner, delivery/lifecycle, and
+  now-playing boundaries implemented; product integration pending
 - Decision date: 2026-07-20
 - Implementation status date: 2026-07-22
 - Tracking issue: [#50](https://github.com/jm2/tributary/issues/50)
@@ -58,12 +58,15 @@ The implemented internal foundation includes:
   either the current session epoch or current catalogue guard and membership. Minting and action
   admission hold the lifecycle lock while revalidating capability, provenance, per-source opt-in,
   exact track profile, current epoch or catalogue generation, and catalogue authority and
-  membership. Structured external-file profiles come only from parser-attested tags: title and
-  artist are required, optional authoritative fields remain exact, and neither a filename nor the
-  display-only `Unknown` album can establish attribution. The redacted profile and proof are frozen
-  into the exact `QueueItem` occurrence. This external profile/proof construction is implemented,
-  but production playback does not consume it yet; exact local, removable, and authenticated-remote
-  profiles remain;
+  membership. Structured external-file and removable profiles come only from parser-attested tags:
+  title and artist are required, optional authoritative fields remain exact, and neither a
+  filename nor the display-only `Unknown` album can establish attribution. External sessions
+  already carry their registry-minted proof; removable queue capture asks the live registry to mint
+  an exact current-session proof before freezing the redacted profile and source reference into the
+  `QueueItem` occurrence. Authenticated remotes remain closed because neither their exact profiles
+  nor a production remote-source opt-in set exists. External/removable profile and proof
+  construction is implemented, but production playback does not consume it yet; exact local and
+  authenticated-remote profiles remain;
 - a GTK-free playback owner around that state machine. One move-only accepted-output proof binds an
   exact output generation to either validated eligible playback or an explicit ineligible accepted
   replacement, so a caller cannot attach one metadata decision to another generation. Eligible
@@ -128,9 +131,10 @@ The implemented internal foundation includes:
 
 This foundation is intentionally not exposed as a partial user feature. Still remaining are one
 process-lifetime, non-recreatable production owner/coordinator for the internal playback owner;
-production consumption of the implemented external-file profiles/proofs; exact local, removable,
-and authenticated-remote profile construction; and production wiring for accepted/rejected load
-results, runtime playback events, every terminal path, source retirement, and application shutdown.
+production consumption of the implemented external-file and removable profiles/proofs; exact local
+and authenticated-remote profile construction plus production remote-source opt-in; and production
+wiring for accepted/rejected load results, runtime playback events, every terminal path, source
+retirement, and application shutdown.
 The coordinator must dispatch the owner's move-only action/clear handoffs without crossing GTK
 borrow boundaries. Also remaining are
 localized consent and browser invocation around the completed authorization core; one process-wide

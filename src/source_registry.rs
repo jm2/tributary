@@ -126,9 +126,13 @@ pub struct PlaybackAttributionProfile {
 }
 
 impl PlaybackAttributionProfile {
-    /// Build the only shipping profile from exact external-file tag
-    /// provenance. A presentation fallback can never enter the profile.
-    pub(crate) fn from_external_track(
+    /// Build a profile from exact real audio-tag provenance.
+    ///
+    /// External files and retained removable media share this boundary. A
+    /// filename or synthetic presentation fallback can never enter the
+    /// profile, and an absent album tag remains absent rather than becoming
+    /// an `Unknown Album` attribution.
+    pub(crate) fn from_tagged_track(
         track: &Track,
         title_from_tag: bool,
         artist_from_tag: bool,
@@ -938,10 +942,11 @@ pub trait ManagedSourceAdapter: LifecycleAdapter + Send + Sync {
     /// Return the exact bounded structured attribution authorized for one
     /// track by this live adapter.
     ///
-    /// Coarse source capability is deliberately insufficient. Every adapter,
-    /// including all currently shipped remote and removable backends,
-    /// defaults to no per-track profile and therefore fails closed. The
-    /// external-file adapter is the only production override today.
+    /// Coarse source capability is deliberately insufficient. The default and
+    /// all currently shipped authenticated-remote adapters return no
+    /// per-track profile and therefore fail closed. External-file and retained
+    /// removable-media adapters are the current production overrides, both
+    /// deriving profiles only from exact real-tag provenance.
     fn playback_attribution_profile(
         &self,
         _track_id: &TrackId,
@@ -3341,6 +3346,34 @@ mod tests {
             File::open(path).expect("open tagged external FLAC"),
             ExternalFileHint::new(file_name, Some("flac")).expect("safe external hint"),
         )
+    }
+
+    fn write_tagged_removable_fixture(
+        path: &std::path::Path,
+        title: &str,
+        artist: &str,
+        album: Option<&str>,
+    ) {
+        std::fs::write(
+            path,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        )
+        .expect("copy removable FLAC fixture");
+        crate::local::tag_writer::write_tags(
+            path,
+            &crate::local::tag_writer::TagEdits {
+                title: Some(title.to_string()),
+                artist: Some(artist.to_string()),
+                // Clear the fixture's album when this exact scan should have
+                // no authoritative album rather than relying on fixture data.
+                album: Some(album.unwrap_or_default().to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("write removable fixture tags");
     }
 
     fn read_file_stream(stream: &ResolvedSourceStream) -> Vec<u8> {
@@ -7295,6 +7328,134 @@ mod tests {
         assert!(registry.release_provenance(source_id, claim));
         wait_until_pruned(&registry, source_id).await;
         assert!(!resolved.is_active());
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn removable_attribution_is_exact_redacted_and_revoked_across_session_lifecycle() {
+        let registry = registry();
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let path = mount.path().join("tagged.flac");
+        write_tagged_removable_fixture(
+            &path,
+            "Private Predecessor Title",
+            "Private Predecessor Artist",
+            None,
+        );
+        let source_id = SourceId::removable("registry:test:attribution-lifecycle")
+            .expect("removable source identity");
+        let removable_claim = registry
+            .claim_provenance(source_id, SourceProvenance::Removable)
+            .expect("claim removable source");
+
+        registry
+            .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+            .expect("initial removable connection admitted");
+        let (_, predecessor_epoch) = wait_for_catalogue(&registry, source_id).await;
+        let track_id = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .and_then(|catalogue| catalogue.value.tracks().first().cloned())
+            .and_then(|track| track.native_track_id)
+            .expect("predecessor track identity");
+        let media_key = MediaKey::new(source_id, track_id.clone());
+        let predecessor = registry
+            .mint_session_playback_source(media_key.clone(), predecessor_epoch, &HashSet::new())
+            .expect("exact removable profile reference");
+        assert_eq!(predecessor.profile().title(), "Private Predecessor Title");
+        assert_eq!(predecessor.profile().artist(), "Private Predecessor Artist");
+        assert_eq!(
+            predecessor.profile().album(),
+            None,
+            "an absent album tag must not authorize Unknown Album"
+        );
+        assert_eq!(
+            registry.try_admit_playback_action(&predecessor, &HashSet::new(), || 1),
+            Some(1)
+        );
+        assert!(registry
+            .mint_session_playback_source(
+                media_key.clone(),
+                predecessor_epoch.wrapping_add(1),
+                &HashSet::new(),
+            )
+            .is_none());
+        let wrong_track = TrackId::removable_relative(
+            mount.path(),
+            &mount.path().join("not-in-the-accepted-scan.flac"),
+        )
+        .expect("wrong lexical track identity");
+        assert!(registry
+            .mint_session_playback_source(
+                MediaKey::new(source_id, wrong_track),
+                predecessor_epoch,
+                &HashSet::new(),
+            )
+            .is_none());
+
+        let foreign_claim = registry
+            .claim_provenance(source_id, SourceProvenance::Saved)
+            .expect("add foreign provenance");
+        assert!(registry
+            .try_admit_playback_action(&predecessor, &HashSet::new(), || 2)
+            .is_none());
+        assert!(registry
+            .mint_session_playback_source(media_key.clone(), predecessor_epoch, &HashSet::new(),)
+            .is_none());
+        assert!(registry.release_provenance(source_id, foreign_claim));
+        assert_eq!(
+            registry.try_admit_playback_action(&predecessor, &HashSet::new(), || 3),
+            Some(3)
+        );
+
+        let debug = format!("{predecessor:?} {:?}", predecessor.profile());
+        assert!(!debug.contains("Private Predecessor Title"));
+        assert!(!debug.contains("Private Predecessor Artist"));
+
+        registry
+            .disconnect(source_id)
+            .expect("disconnect predecessor")
+            .wait()
+            .await;
+        assert!(registry
+            .try_admit_playback_action(&predecessor, &HashSet::new(), || 4)
+            .is_none());
+
+        write_tagged_removable_fixture(
+            &path,
+            "Private Successor Title",
+            "Private Successor Artist",
+            Some("Private Successor Album"),
+        );
+        registry
+            .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+            .expect("successor removable connection admitted");
+        let (_, successor_epoch) = wait_for_catalogue(&registry, source_id).await;
+        assert_ne!(successor_epoch, predecessor_epoch);
+        let successor = registry
+            .mint_session_playback_source(media_key, successor_epoch, &HashSet::new())
+            .expect("successor exact removable profile reference");
+        assert_eq!(successor.profile().title(), "Private Successor Title");
+        assert_eq!(successor.profile().artist(), "Private Successor Artist");
+        assert_eq!(successor.profile().album(), Some("Private Successor Album"));
+        assert_eq!(
+            predecessor.profile().title(),
+            "Private Predecessor Title",
+            "the stale reference retains only its frozen predecessor snapshot"
+        );
+        assert!(registry
+            .try_admit_playback_action(&predecessor, &HashSet::new(), || 5)
+            .is_none());
+        assert_eq!(
+            registry.try_admit_playback_action(&successor, &HashSet::new(), || 6),
+            Some(6)
+        );
+
+        assert!(registry.release_provenance(source_id, removable_claim));
+        wait_until_pruned(&registry, source_id).await;
+        assert!(registry
+            .try_admit_playback_action(&successor, &HashSet::new(), || 7)
+            .is_none());
         registry.shutdown().wait().await;
     }
 
