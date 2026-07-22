@@ -1,7 +1,8 @@
 # Last.fm scrobbling contract
 
 - Status: accepted P2.1 design; internal protocol/desktop-authorization/vault/queue/playback-evidence,
-  delivery/lifecycle, and now-playing runtime implemented; product integration pending
+  registry-bound external attribution, playback-owner, delivery/lifecycle, and now-playing
+  boundaries implemented; product integration pending
 - Decision date: 2026-07-20
 - Implementation status date: 2026-07-22
 - Tracking issue: [#50](https://github.com/jm2/tributary/issues/50)
@@ -53,6 +54,28 @@ The implemented internal foundation includes:
   Retry retains occurrence identity, credit, timestamp, and one-shot latches while re-anchoring the
   new generation; terminal retirement is explicit. The authority is deliberately uncloneable and
   its diagnostics redact metadata, duration, timestamp, UUID, and generation;
+- opaque `SourceRegistry`-minted playback attribution bound to the exact registry instance and
+  either the current session epoch or current catalogue guard and membership. Minting and action
+  admission hold the lifecycle lock while revalidating capability, provenance, per-source opt-in,
+  exact track profile, current epoch or catalogue generation, and catalogue authority and
+  membership. Structured external-file profiles come only from parser-attested tags: title and
+  artist are required, optional authoritative fields remain exact, and neither a filename nor the
+  display-only `Unknown` album can establish attribution. The redacted profile and proof are frozen
+  into the exact `QueueItem` occurrence. This external profile/proof construction is implemented,
+  but production playback does not consume it yet; exact local, removable, and authenticated-remote
+  profiles remain;
+- a GTK-free playback owner around that state machine. One move-only accepted-output proof binds an
+  exact output generation to either validated eligible playback or an explicit ineligible accepted
+  replacement, so a caller cannot attach one metadata decision to another generation. Eligible
+  input freezes its structured occurrence metadata and opaque queue-occurrence identity before any
+  event arrives. Only `PlaybackSession` can issue the private production mint witness, and only
+  after that exact generation crosses synchronous output acceptance. Lock-linearized freshness
+  makes a delayed accepted load and stale NowPlaying/Clear handoff inert after a successor wins;
+  qualified Enqueue is deliberately not retroactively revoked. An ineligible or policy-rejected
+  accepted replacement terminally retires its predecessor and emits at most one explicit clear.
+  Typed, move-only now-playing/scrobble/clear handoffs keep payloads private until the exact registry
+  and runtime admission boundary, and fixed diagnostics redact source, generation, identity, and
+  metadata. This owner deliberately has no production constructor or coordinator yet;
 - a serialized actor with bounded admission for 64 ordinary metadata commands and four reserved
   control slots: one delivery result, two lifecycle markers, and one explicit now-playing clear.
   Delivery, lifecycle, and playback retirement therefore cannot be starved by the ordinary FIFO;
@@ -103,19 +126,21 @@ The implemented internal foundation includes:
   capability pause for any still-unpurged account before releasing the lease. If SQLite cannot
   establish that pause, the shutdown proof remains failed and no durable-pause claim is made.
 
-This foundation is intentionally not exposed as a partial user feature. Still remaining are the
-production playback owner that creates the occurrence state only after exact source/session
-eligibility, converts immutable structured `Track` metadata, dispatches its now-playing/scrobble
-actions, and issues explicit clear without crossing GTK borrow boundaries; localized consent and
-browser invocation around the completed authorization core; one process-wide production owner;
-atomic staged-session vault installation, exact same-account reauthorization and different-account
-replacement/purge policy; enablement, exact per-source/session policy, and a production activation
-issuer; application startup/shutdown
-ownership; settings, account/recovery/status, valid-vault corrupt-queue recovery, accessibility,
-and all localization UI; release-time production credential injection and package verification;
-and the remaining end-to-end and platform acceptance matrix. The internal observer and
-now-playing lane are complete but deliberately unwired; the countable P2.1 record stays open until
-the product layers land.
+This foundation is intentionally not exposed as a partial user feature. Still remaining are one
+process-lifetime, non-recreatable production owner/coordinator for the internal playback owner;
+production consumption of the implemented external-file profiles/proofs; exact local, removable,
+and authenticated-remote profile construction; and production wiring for accepted/rejected load
+results, runtime playback events, every terminal path, source retirement, and application shutdown.
+The coordinator must dispatch the owner's move-only action/clear handoffs without crossing GTK
+borrow boundaries. Also remaining are
+localized consent and browser invocation around the completed authorization core; one process-wide
+authorization/runtime owner; atomic staged-session vault installation, exact same-account
+reauthorization and different-account replacement/purge policy; enablement, exact per-source/session
+policy, and a production activation issuer; settings, account/recovery/status, valid-vault
+corrupt-queue recovery, accessibility, and all localization UI; release-time production credential
+injection and package verification; and the remaining live end-to-end and platform acceptance
+matrix. The internal observer, playback owner, and now-playing lane are complete boundaries but
+deliberately unwired; the countable P2.1 record stays open until those product layers land.
 
 The central rule is:
 

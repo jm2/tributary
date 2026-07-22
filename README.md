@@ -65,7 +65,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Durable local playback history | ✅ Exact accepted local occurrences persist a saturating play count and monotonic last-played timestamp, with live Plays refresh ([contract](docs/playback-history.md)) |
 | Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ Recently Played and Top 25 use deterministic authoritative history, safe untouched-default migration, and live projection refresh ([P1.3](docs/task.md#p13--record-trustworthy-local-playback-history)) |
 | Track ratings | ✅ Exact 1–100 local editing, read-only/unsupported source states, deterministic sorting, live refresh, and smart-playlist rules ([contract](docs/ratings.md)) |
-| Last.fm scrobbling | 🚧 Internal foundation only — bounded protocol/vault storage, a private durable FIFO, a latest-only desktop-authorization owner, a standalone generation-owned playback-evidence state machine, and runtime-owned one-shot now-playing are implemented. They remain deliberately unwired from production playback and application/UI lifecycle. Production consent/browser launch, vault installation and account-transition policy, exact source/session policy, activation and source-owner conversion, account/recovery/status UX, localization/accessibility, production credentials/verification, and final acceptance testing remain ([complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary)) |
+| Last.fm scrobbling | 🚧 Internal foundation only — bounded protocol/vault storage, a private durable FIFO, a latest-only desktop-authorization owner, frozen generation-owned playback evidence, a GTK-free move-only playback-owner/handoff boundary, registry-instance-bound session/catalogue attribution plumbing with real-tag external profiles/proofs, and runtime-owned one-shot now-playing are implemented. They remain deliberately unwired from production playback and application/UI lifecycle. One process-lifetime, non-recreatable production playback owner/coordinator, production consumption of the external proofs, exact local/removable/authenticated-remote profiles, runtime event and terminal/source-retirement/shutdown wiring, consent/browser launch, vault installation and account-transition policy, activation, account/recovery/status UX, localization/accessibility, production credentials/verification, and live final acceptance testing remain ([complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary)) |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
 | Linux and macOS file associations | ✅ |
@@ -79,6 +79,20 @@ an explicit consent-gated handoff remains product-integration work. Normal lifec
 supervised-failure paths cancel and join network work before releasing authority. An external
 playback-runtime owner abort marks the drain barrier failed, while the child request keeps a shared
 vault lease until its future is actually dropped so a successor cannot overlap it.
+
+The internal playback owner consumes one move-only proof that binds an accepted output generation
+to either frozen eligible metadata or an explicit ineligible replacement. In production code, only
+`PlaybackSession` can issue the private mint witness after that exact generation crosses output
+acceptance, and each `QueueItem` keeps its occurrence metadata frozen. Managed external proofs are
+bound to one registry instance, exact session or catalogue authority, and exact real-tag profile;
+policy, profile, epoch/generation, authority, and membership are revalidated under the lifecycle
+lock. External title and artist must both come from parsed tags—filenames and a display-only
+`Unknown` album never substitute. Lock-linearized freshness leaves delayed accepted loads and stale
+NowPlaying/Clear handoffs inert after a successor wins, while a qualified Enqueue is not
+retroactively revoked. No process-lifetime, non-recreatable production owner/coordinator exists yet
+to own this boundary or feed it loads, playback events, terminal events, source retirement, or
+shutdown; external proof consumption and exact local/removable/authenticated-remote profiles remain
+unwired.
 
 See the [implementation roadmap](docs/roadmap.md) for the audited open-issue backlog, proposed
 ordering, and explicit current limitations. The countable working list is

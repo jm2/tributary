@@ -34,9 +34,19 @@ pub fn is_audio_file(path: &Path) -> bool {
 pub struct ParsedTrack {
     pub file_path: String,
     pub title: String,
+    /// Whether `title` came from an explicit audio tag. When false, `title` is
+    /// only the parser's filename/display fallback and is not authoritative
+    /// attribution metadata.
+    pub title_from_tag: bool,
     pub artist_name: String,
+    /// Whether `artist_name` came from an explicit audio tag. When false, the
+    /// value is the presentation-only `Unknown Artist` fallback.
+    pub artist_from_tag: bool,
     pub album_artist_name: Option<String>,
     pub album_title: String,
+    /// Whether `album_title` came from an explicit audio tag. When false, the
+    /// value is the presentation-only `Unknown Album` fallback.
+    pub album_from_tag: bool,
     pub genre: Option<String>,
     pub year: Option<i32>,
     pub track_number: Option<u32>,
@@ -84,18 +94,18 @@ pub fn parse_audio_file_from_file(mut file: File, path: &Path) -> Result<ParsedT
     let props = tagged_file.properties();
 
     // Extract tag fields
-    let title = tag
-        .and_then(|t| t.title().map(|s| s.to_string()))
-        .unwrap_or_else(|| {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Unknown")
-                .to_string()
-        });
+    let tagged_title = tag.and_then(|t| t.title().map(|s| s.to_string()));
+    let title_from_tag = tagged_title.is_some();
+    let title = tagged_title.unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Unknown")
+            .to_string()
+    });
 
-    let artist_name = tag
-        .and_then(|t| t.artist().map(|s| s.to_string()))
-        .unwrap_or_else(|| "Unknown Artist".to_string());
+    let tagged_artist = tag.and_then(|t| t.artist().map(|s| s.to_string()));
+    let artist_from_tag = tagged_artist.is_some();
+    let artist_name = tagged_artist.unwrap_or_else(|| "Unknown Artist".to_string());
 
     let album_artist_name = tag.and_then(|t| {
         use lofty::tag::ItemKey;
@@ -107,9 +117,9 @@ pub fn parse_audio_file_from_file(mut file: File, path: &Path) -> Result<ParsedT
         t.get_string(ItemKey::Composer).map(str::to_string)
     });
 
-    let album_title = tag
-        .and_then(|t| t.album().map(|s| s.to_string()))
-        .unwrap_or_else(|| "Unknown Album".to_string());
+    let tagged_album = tag.and_then(|t| t.album().map(|s| s.to_string()));
+    let album_from_tag = tagged_album.is_some();
+    let album_title = tagged_album.unwrap_or_else(|| "Unknown Album".to_string());
 
     let genre = tag.and_then(|t| t.genre().map(|s| s.to_string()));
     let year = tag.and_then(|t| {
@@ -145,9 +155,12 @@ pub fn parse_audio_file_from_file(mut file: File, path: &Path) -> Result<ParsedT
     Ok(ParsedTrack {
         file_path: path.to_string_lossy().to_string(),
         title,
+        title_from_tag,
         artist_name,
+        artist_from_tag,
         album_artist_name,
         album_title,
+        album_from_tag,
         genre,
         composer,
         year,
@@ -200,6 +213,12 @@ mod tests {
         assert_eq!(parsed.file_path, path.to_string_lossy());
         assert_eq!(parsed.format, "WAV");
         assert_eq!(parsed.file_size_bytes, Some(45));
+        assert_eq!(parsed.title, path.file_stem().unwrap().to_string_lossy());
+        assert!(!parsed.title_from_tag);
+        assert_eq!(parsed.artist_name, "Unknown Artist");
+        assert!(!parsed.artist_from_tag);
+        assert_eq!(parsed.album_title, "Unknown Album");
+        assert!(!parsed.album_from_tag);
         std::fs::remove_file(path).expect("remove WAV fixture");
     }
 

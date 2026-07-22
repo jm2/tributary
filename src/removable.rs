@@ -21,7 +21,9 @@ use crate::local::resolver::{MountedRootAuthority, ResolvedFileMedia};
 use crate::source_lifecycle::{
     AdapterCloseFuture, AdapterStream, CancellationObserver, CloseAuthority, LifecycleAdapter,
 };
-use crate::source_registry::{CatalogueFuture, ManagedSourceAdapter, StreamFuture};
+use crate::source_registry::{
+    CatalogueFuture, ManagedSourceAdapter, PlaybackAttributionCapability, StreamFuture,
+};
 
 const MAX_TAG_TEXT_BYTES: usize = 64 * 1024;
 
@@ -163,6 +165,10 @@ impl LifecycleAdapter for RemovableMediaAdapter {
 }
 
 impl ManagedSourceAdapter for RemovableMediaAdapter {
+    fn playback_attribution_capability(&self) -> PlaybackAttributionCapability {
+        PlaybackAttributionCapability::Removable
+    }
+
     fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
         Box::pin(async move { Ok(self.tracks.clone()) })
     }
