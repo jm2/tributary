@@ -130,10 +130,11 @@ testing remain the next slices.
   response policy. Authentication responses use borrowed strict envelopes over zeroizing storage,
   validate the complete JSON string/escape/surrogate grammar, and decode secrets directly into
   zeroizing allocations. A bounded GTK-free latest-only authorization owner enforces the exact
-  response-observed monotonic 60-minute token life at URL inspection and Finish admission,
-  synchronously revokes every callback-only URL view, consumes one-shot finish authority before
-  exchange, joins normal retirement, and returns a move-only staged session without minting account
-  identity or touching the vault. The foundation also includes exact versioned native-vault
+  response-observed monotonic 60-minute token life automatically and at Finish admission, retains
+  the token-bearing URL solely inside exact current owner authority with no production accessor or
+  browser handoff, consumes one-shot finish authority before exchange, joins normal retirement, and
+  returns a move-only staged session without minting account identity or touching the vault. The
+  foundation also includes exact versioned native-vault
   credentials with only a one-way SQLite account
   binding; migration 17's validated private queue; migration 18's binding-only fixed-category
   delivery-pause and credential-cleanup singleton; atomic capped admission; oldest-prefix receipts
@@ -376,11 +377,13 @@ The playback-history contract makes the remaining Last.fm behavior much less amb
    cancel and join before authority release; a hard owner abort fails the drain barrier while a
    child-held shared vault lease continues to exclude successors until the request future drops.
    A separate bounded GTK-free authorization owner now provides latest-only request/exchange,
-   response-observed exact one-hour expiry, synchronously revocable callback-only browser URLs,
-   joined cancellation/supersession/shutdown, fixed terminal status, and a move-only staged
-   username/session-key grant without minting durable account authority.
+   response-observed exact one-hour expiry, an owner-private token-bearing URL with no production
+   accessor or handoff, joined cancellation/supersession/shutdown, fixed terminal status, and a
+   move-only staged username/session-key grant without minting durable account authority.
    This code is not yet instantiated by production startup, connected to authoritative playback,
    joined by production shutdown, or wrapped in consent/browser/vault account-transition policy.
+   The browser work must be a concrete consent-gated launch operation and must not claim that an
+   unavoidable URL handoff outside the process can be synchronously revoked.
    Next complete the production-integration inventory in the
    [dated contract boundary](lastfm-scrobbling.md#dated-implementation-boundary). The complete
    target still keeps the session

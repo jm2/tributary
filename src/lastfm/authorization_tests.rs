@@ -320,7 +320,7 @@ fn session() -> DesktopAuthorizedSession {
 fn authorization_url(
     challenge: &LastFmAuthorizationChallenge,
 ) -> Result<String, LastFmAuthorizationAdmissionError> {
-    challenge.with_authorization_url(str::to_owned)
+    challenge.authorization_url_for_test()
 }
 
 fn assert_url_revoked(challenge: &LastFmAuthorizationChallenge) {
@@ -1208,19 +1208,17 @@ async fn terminal_exchange_failure_keeps_every_challenge_clone_revoked() {
 }
 
 #[tokio::test]
-async fn panicking_url_inspection_poison_fails_the_entire_ingress_closed() {
+async fn poisoned_internal_ingress_fails_the_entire_owner_closed() {
     let harness = harness(Duration::ZERO);
     let mut status = harness.handle.subscribe_status();
     let barrier = harness.shutdown.barrier();
     let (_flow, challenge) = ready_challenge(&harness).await;
-    let inspection = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = challenge.with_authorization_url::<()>(|_| panic!("inspection panic"));
+    let ingress = Arc::clone(&harness.handle.inner.ingress);
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _guard = ingress.lock().expect("test ingress initially available");
+        panic!("poison internal ingress");
     }));
-    assert!(inspection.is_err());
-    assert_eq!(
-        challenge.with_authorization_url(str::to_owned).unwrap_err(),
-        LastFmAuthorizationAdmissionError::Closed
-    );
+    assert!(poisoned.is_err());
     assert_eq!(
         harness.handle.try_begin().unwrap_err(),
         LastFmAuthorizationAdmissionError::Closed
@@ -1242,6 +1240,28 @@ async fn panicking_url_inspection_poison_fails_the_entire_ingress_closed() {
     );
 }
 
+#[test]
+fn production_challenge_source_surface_exposes_only_flow() {
+    let source = include_str!("authorization.rs");
+    let implementation = source
+        .split_once("impl LastFmAuthorizationChallenge {")
+        .expect("challenge implementation remains present")
+        .1
+        .split_once("\n}\n\nimpl fmt::Debug for LastFmAuthorizationChallenge")
+        .expect("challenge implementation remains bounded")
+        .0;
+    let public_items = implementation
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("pub"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        public_items,
+        ["pub fn flow(&self) -> LastFmAuthorizationFlow {"]
+    );
+    assert!(implementation.contains("#[cfg(test)]\n    fn authorization_url_for_test"));
+}
+
 #[tokio::test]
 async fn retained_challenge_cannot_keep_handle_or_url_authority_alive_after_shutdown() {
     let harness = harness(Duration::ZERO);
@@ -1250,7 +1270,7 @@ async fn retained_challenge_cannot_keep_handle_or_url_authority_alive_after_shut
     shutdown(harness).await;
     assert!(challenge.0.handle.upgrade().is_none());
     assert_eq!(
-        challenge.with_authorization_url(str::to_owned).unwrap_err(),
+        authorization_url(&challenge).unwrap_err(),
         LastFmAuthorizationAdmissionError::Closed
     );
 }

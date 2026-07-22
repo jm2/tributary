@@ -43,14 +43,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     blocking failure path.
   - **Latest-only desktop authorization core:** a GTK-free bounded serialized owner obtains one
     in-memory request token, measures its exact 60-minute life from response observation on a
-    monotonic clock, and exposes the token-bearing browser URL only to a callback while exact
-    current authority remains live. Begin, Finish, cancel, expiry, terminal failure, and shutdown
-    synchronously revoke every retained URL view. Finish consumes an opaque one-shot seal and the
-    request token before exchange; supersession and normal shutdown cancel and join predecessor
-    work, while abnormal owner loss closes ingress and reports a fixed terminal status. Success
-    returns only a move-only staged username/session-key grant: this internal layer deliberately
-    creates no account UUID, writes no vault record, opens no browser, and bypasses neither future
-    consent nor same/different-account transition policy.
+    monotonic clock, and retains the token-bearing browser URL entirely inside exact current owner
+    authority. The opaque challenge has no production URL accessor or browser handoff. Begin,
+    Finish, cancel, expiry, terminal failure, and shutdown revoke the internal URL allocation;
+    Finish consumes an opaque one-shot seal and the request token before exchange. Supersession and
+    normal shutdown cancel and join predecessor work, while abnormal owner loss closes ingress and
+    reports a fixed terminal status. Success returns only a move-only staged username/session-key
+    grant: this internal layer deliberately creates no account UUID, writes no vault record, opens
+    no browser, and bypasses neither a future explicit consent-gated browser handoff nor
+    same/different-account transition policy.
   - **Native protected authority:** session keys, exact usernames, and random account UUIDs use
     macOS Keychain, Windows Credential Manager, or Linux Secret Service with no plaintext fallback.
     The versioned vault record requires an RFC 4122 v4 account UUID, nonblank control-free username,
@@ -171,9 +172,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     before releasing the lease. If SQLite cannot establish that pause, the shutdown proof remains
     failed rather than claiming a durable commit; successor ownership still cannot overlap the
     predecessor's request or database task.
-    Validation: 207 focused Last.fm tests pass, including 28 desktop-authorization, 26 client,
+    Validation: 208 focused Last.fm tests pass, including 29 desktop-authorization, 26 client,
     29 playback-evidence, and 12 now-playing runtime tests. Locked debug and release suites each
-    pass 20 library, 1,558 application, and 14 repository-metadata tests (1,592 total). Strict
+    pass 20 library, 1,559 application, and 14 repository-metadata tests (1,593 total). Strict
     Clippy is green in both profiles, the Rust 1.92 locked all-target check passes, formatting and
     diff checks are clean,
     and the dependency audit reports only the two already documented allowed unmaintained warnings.

@@ -28,13 +28,15 @@ The implemented internal foundation includes:
   allocations, and preserve fixed provider/HTTP classification without generic secret-bearing
   JSON values or ignored-value scratch storage;
 - a bounded GTK-free latest-only desktop-authorization owner. A request token remains solely inside
-  its serialized owner, expires exactly 60 monotonic minutes after response observation, and lends
-  the token-bearing browser URL only to a callback while exact current authority is live. Begin,
-  Finish, cancel, expiry, failure, and close synchronously revoke every retained URL view; Finish
-  consumes an opaque one-shot seal and the token before exchange. Ordinary supersession and
-  shutdown cancel and join child work, abnormal owner loss closes ingress with a fixed terminal
-  status, and success returns only a move-only staged username/session-key grant. This core mints
-  no UUID, writes no vault record, opens no browser, and has no production factory;
+  its serialized owner, expires exactly 60 monotonic minutes after response observation, and keeps
+  the token-bearing browser URL inside exact current owner authority. The opaque challenge exposes
+  no production URL accessor or browser handoff. Begin, Finish, cancel, expiry, failure, and close
+  revoke the internal URL allocation; Finish consumes an opaque one-shot seal and the token before
+  exchange. Ordinary supersession and shutdown cancel and join child work, abnormal owner loss
+  closes ingress with a fixed terminal status, and success returns only a move-only staged
+  username/session-key grant. This core mints no UUID, writes no vault record, opens no browser, and
+  has no production factory. Product integration must add a concrete consent-gated browser-launch
+  operation and must not describe its unavoidable external URL handoff as synchronously revocable;
 - an explicit `LastFmRuntimeActivation` capability intended for a future issuer that has first
   established consent and build enablement. No production application path issues that capability
   yet;

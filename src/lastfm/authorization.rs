@@ -2,17 +2,20 @@
 //!
 //! The owner retains the request token and staged session behind a bounded,
 //! serialized command lane. Presentation receives only a redacted challenge:
-//! its browser URL is available through a synchronously revocable, short-lived
-//! view, while its opaque finish authority is consumed atomically before
-//! `auth.getSession` is first awaited.
+//! the token-bearing browser URL remains entirely owner-private, while opaque
+//! finish authority is consumed atomically before `auth.getSession` is first
+//! awaited.
 //!
 //! This module is intentionally an injected internal core. Production consent,
-//! global single-owner coordination, and vault installation remain deferred;
-//! no build-credential factory wires this owner into the application.
+//! a concrete browser handoff, global single-owner coordination, and vault
+//! installation remain deferred; no build-credential factory wires this owner
+//! into the application.
 
 use std::fmt;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+#[cfg(test)]
+use std::sync::Weak;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use futures::FutureExt;
@@ -171,27 +174,22 @@ struct ChallengeInner {
     generation: u64,
     flow: LastFmAuthorizationFlow,
     finish: LastFmAuthorizationFinish,
+    #[cfg(test)]
     handle: Weak<HandleInner>,
 }
 
-/// Browser challenge for one exact in-memory request token.
+/// Opaque challenge for one exact in-memory request token.
 ///
-/// Clones share one protected URL allocation. A caller may inspect it
-/// repeatedly while the challenge remains current. Successful finish, cancel,
-/// supersession, expiry, terminal failure, or shutdown synchronously revokes
-/// every clone before the corresponding admission call returns.
+/// The token-bearing browser URL remains solely inside the owner and has no
+/// production accessor or handoff. Successful finish, cancel, supersession,
+/// expiry, terminal failure, or shutdown revokes that internal allocation and
+/// every clone's finish authority.
 #[derive(Clone)]
 pub struct LastFmAuthorizationChallenge(Arc<ChallengeInner>);
 
 impl LastFmAuthorizationChallenge {
-    /// Inspect the current browser URL without copying it into durable state.
-    ///
-    /// The callback must be short-lived and must not re-enter an authorization
-    /// handle. Revocation waits for an in-progress inspection to finish.
-    pub fn with_authorization_url<T>(
-        &self,
-        inspect: impl FnOnce(&str) -> T,
-    ) -> Result<T, LastFmAuthorizationAdmissionError> {
+    #[cfg(test)]
+    fn authorization_url_for_test(&self) -> Result<String, LastFmAuthorizationAdmissionError> {
         let handle = self
             .0
             .handle
@@ -227,7 +225,7 @@ impl LastFmAuthorizationChallenge {
         current
             .authorization_url
             .as_ref()
-            .map(|url| inspect(url.as_str()))
+            .map(|url| url.as_str().to_owned())
             .ok_or(LastFmAuthorizationAdmissionError::FinishUnavailable)
     }
 
@@ -839,6 +837,7 @@ enum OwnerEvent {
 struct AuthorizationOwner {
     commands: async_channel::Receiver<Command>,
     ingress: Arc<Mutex<IngressGate>>,
+    #[cfg(test)]
     handle: Weak<HandleInner>,
     transport: Arc<dyn LastFmAuthorizationTransport>,
     clock: Arc<dyn LastFmAuthorizationClock>,
@@ -1190,6 +1189,7 @@ impl AuthorizationOwner {
             generation,
             flow: flow.clone(),
             finish: finish.clone(),
+            #[cfg(test)]
             handle: self.handle.clone(),
         }));
         let ingress = Arc::clone(&self.ingress);
@@ -1831,6 +1831,7 @@ fn spawn_lastfm_authorization_with_options(
     let mut owner = AuthorizationOwner {
         commands: receiver,
         ingress,
+        #[cfg(test)]
         handle: Arc::downgrade(&inner),
         transport,
         clock,

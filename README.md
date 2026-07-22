@@ -73,11 +73,12 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Light & dark mode | ✅ Automatic (libadwaita) |
 
 The internal Last.fm authorization and playback runtimes distinguish joined lifecycle retirement
-from a hard task abort. Authorization keeps its one-hour request token and callback-inspected URL
-behind synchronously revocable latest-only authority; normal lifecycle and supervised-failure paths
-cancel and join network work before releasing authority. An external playback-runtime owner abort
-marks the drain barrier failed, while the child request keeps a shared vault lease until its future
-is actually dropped so a successor cannot overlap it.
+from a hard task abort. Authorization keeps its one-hour request token and token-bearing browser URL
+entirely behind latest-only owner authority, with no production URL accessor or browser handoff yet;
+an explicit consent-gated handoff remains product-integration work. Normal lifecycle and
+supervised-failure paths cancel and join network work before releasing authority. An external
+playback-runtime owner abort marks the drain barrier failed, while the child request keeps a shared
+vault lease until its future is actually dropped so a successor cannot overlap it.
 
 See the [implementation roadmap](docs/roadmap.md) for the audited open-issue backlog, proposed
 ordering, and explicit current limitations. The countable working list is

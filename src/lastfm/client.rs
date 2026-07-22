@@ -103,6 +103,7 @@ impl fmt::Debug for DesktopAuthToken {
 pub(super) struct DesktopAuthorizationUrl(ProtectedString);
 
 impl DesktopAuthorizationUrl {
+    #[cfg(test)]
     pub(super) fn as_str(&self) -> &str {
         self.0.expose()
     }
