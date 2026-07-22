@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [#151](https://github.com/jm2/tributary/pull/151),
   [runtime/lifecycle slice](https://github.com/jm2/tributary/pull/153),
   [playback/now-playing slice](https://github.com/jm2/tributary/pull/154),
-  [desktop-authorization slice](https://github.com/jm2/tributary/pull/155)).
+  [desktop-authorization slice](https://github.com/jm2/tributary/pull/155),
+  [playback-ownership slice](https://github.com/jm2/tributary/pull/156)).
   This is an internal foundation, not yet a user-visible scrobbling feature. The standalone
   playback observer, GTK-free playback owner/handoffs, and runtime-owned now-playing lane are
   deliberately not connected to production playback or application startup. Exact real-tag
