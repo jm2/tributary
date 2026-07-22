@@ -439,14 +439,14 @@ async fn fifty_one_rows_settle_as_exact_fifty_then_one_with_one_request_in_fligh
 }
 
 #[tokio::test]
-async fn terminal_outcomes_update_only_bounded_aggregate_status() {
+async fn terminal_outcomes_update_only_bounded_aggregate_status_and_rate_limit_retries() {
     let database = database().await;
     let session = session();
     let binding = session.account_binding();
     enqueue_rows(&database, binding, 2).await;
     let (transport, calls, responses, _retired, active) = GatedTransport::new(session.clone());
     let store = Arc::new(TestCredentialStore::new(session, active));
-    let (clock, _waits) = ManualClock::new(0);
+    let (clock, waits) = ManualClock::new(0);
     let (handle, shutdown) = spawn_activated_runtime(database.clone(), store, transport, clock)
         .await
         .unwrap();
@@ -477,18 +477,19 @@ async fn terminal_outcomes_update_only_bounded_aggregate_status() {
         .unwrap();
     assert_eq!(receive(&calls).await.batch_size, 1);
     responses
-        .send(Err(LastFmClientError::ServiceRejected { code: 29 }))
+        .send(Err(LastFmClientError::RateLimited))
         .await
         .unwrap();
     let second = wait_for_status(&mut status, |snapshot| {
-        snapshot.pending_scrobbles == 0 && snapshot.rejected_scrobbles == 1
+        snapshot.phase == LastFmRuntimePhase::BackingOff
     })
     .await;
     assert_eq!(second.accepted_scrobbles, 1);
     assert_eq!(second.ignored_scrobbles, 1);
-    assert_eq!(second.rejected_scrobbles, 1);
-    assert_eq!(second.phase, LastFmRuntimePhase::Active);
-    assert_eq!(second.failure, None);
+    assert_eq!(second.rejected_scrobbles, 0);
+    assert_eq!(second.pending_scrobbles, 1);
+    assert_eq!(second.failure, Some(LastFmRuntimeCommandError::Delivery));
+    assert_eq!(receive(&waits).await, 30_000);
     shutdown.shutdown().await.unwrap();
 }
 
@@ -550,6 +551,11 @@ async fn transient_retry_persists_exact_thirty_seconds_across_restart_and_deadli
     .await
     .unwrap();
     let mut second_status = second_handle.subscribe_status();
+    assert_eq!(second_status.borrow().phase, LastFmRuntimePhase::BackingOff);
+    assert_eq!(
+        second_status.borrow().failure,
+        Some(LastFmRuntimeCommandError::Delivery)
+    );
     assert_eq!(receive(&second_waits).await, 31_000);
     assert!(second_calls.try_recv().is_err());
     assert_eq!(ready_row(&database, binding, 31_000).await, rescheduled);
@@ -791,18 +797,21 @@ async fn disconnect_cancels_and_joins_delivery_before_queue_purge_and_vault_dele
 
 #[tokio::test]
 async fn reauthentication_and_cardinality_pauses_retain_the_exact_private_row() {
-    let database = database().await;
-    let session = session();
-    let binding = session.account_binding();
-    enqueue_rows(&database, binding, 1).await;
-    let before = ready_row(&database, binding, 0).await;
+    let reauth_database = database().await;
+    let reauth_session = session();
+    let reauth_binding = reauth_session.account_binding();
+    enqueue_rows(&reauth_database, reauth_binding, 1).await;
+    let reauth_before = ready_row(&reauth_database, reauth_binding, 0).await;
 
     let (reauth_transport, reauth_calls, reauth_responses, _retired, reauth_active) =
-        GatedTransport::new(session.clone());
-    let store = Arc::new(TestCredentialStore::new(session.clone(), reauth_active));
+        GatedTransport::new(reauth_session.clone());
+    let store = Arc::new(TestCredentialStore::new(
+        reauth_session.clone(),
+        reauth_active,
+    ));
     let (reauth_clock, _waits) = ManualClock::new(0);
     let (reauth_handle, reauth_shutdown) = spawn_activated_runtime(
-        database.clone(),
+        reauth_database.clone(),
         store.clone(),
         reauth_transport,
         reauth_clock,
@@ -824,11 +833,20 @@ async fn reauthentication_and_cardinality_pauses_retain_the_exact_private_row() 
         Some(LastFmRuntimeCommandError::ReauthenticationRequired)
     );
     assert_eq!(paused.pending_scrobbles, 1);
-    assert_eq!(ready_row(&database, binding, 0).await, before);
+    assert_eq!(
+        ready_row(&reauth_database, reauth_binding, 0).await,
+        reauth_before
+    );
     reauth_shutdown.shutdown().await.unwrap();
 
+    let database = database().await;
+    let session = session();
+    let binding = session.account_binding();
+    enqueue_rows(&database, binding, 1).await;
+    let before = ready_row(&database, binding, 0).await;
     let (cardinality_transport, cardinality_calls, cardinality_responses, _retired, active) =
-        GatedTransport::new(session);
+        GatedTransport::new(session.clone());
+    let store = Arc::new(TestCredentialStore::new(session, Arc::clone(&active)));
     assert_eq!(active.load(Ordering::SeqCst), 0);
     let (cardinality_clock, _waits) = ManualClock::new(0);
     let (cardinality_handle, cardinality_shutdown) = spawn_activated_runtime(
@@ -943,6 +961,331 @@ async fn code_nine_keeps_queue_admission_open_and_exact_reauthorization_restarts
     assert_eq!(delivered.rejected_scrobbles, 0);
     assert_eq!(storage::queue_len(&database).await.unwrap(), 0);
     shutdown.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn durable_code_nine_restart_stays_paused_until_exact_reauthorization_clears_it() {
+    let database = database().await;
+    let original = session();
+    let binding = original.account_binding();
+    enqueue_rows(&database, binding, 1).await;
+    let (first_transport, first_calls, first_responses, _retired, first_active) =
+        GatedTransport::new(original.clone());
+    let store = Arc::new(TestCredentialStore::new(original.clone(), first_active));
+    let (first_clock, _waits) = ManualClock::new(0);
+    let (first_handle, first_shutdown) = spawn_activated_runtime(
+        database.clone(),
+        store.clone(),
+        first_transport,
+        first_clock,
+    )
+    .await
+    .unwrap();
+    let mut first_status = first_handle.subscribe_status();
+    assert_eq!(receive(&first_calls).await.batch_size, 1);
+    first_responses
+        .send(Err(LastFmClientError::ReauthenticationRequired))
+        .await
+        .unwrap();
+    wait_for_status(&mut first_status, |snapshot| {
+        snapshot.phase == LastFmRuntimePhase::ReauthenticationRequired
+    })
+    .await;
+    assert_eq!(
+        storage::validate_account_queue_state(&database, binding)
+            .await
+            .unwrap()
+            .durable_pause,
+        Some(storage::LastFmDurablePause::ReauthenticationRequired)
+    );
+    first_shutdown.shutdown().await.unwrap();
+
+    let renewed = original
+        .reauthorized("listener", ProtectedString::new(SESSION_KEY_B))
+        .unwrap();
+    let (second_transport, second_calls, second_responses, _retired, _active) =
+        GatedTransport::new(renewed.clone());
+    let (second_clock, _waits) = ManualClock::new(0);
+    let (second_handle, second_shutdown) = spawn_activated_runtime(
+        database.clone(),
+        store.clone(),
+        second_transport,
+        second_clock,
+    )
+    .await
+    .unwrap();
+    let mut second_status = second_handle.subscribe_status();
+    let startup = *second_status.borrow_and_update();
+    assert_eq!(startup.phase, LastFmRuntimePhase::ReauthenticationRequired);
+    assert_eq!(
+        startup.failure,
+        Some(LastFmRuntimeCommandError::ReauthenticationRequired)
+    );
+    assert!(second_calls.try_recv().is_err());
+
+    second_handle
+        .reauthorize_same_account("listener".to_owned(), ProtectedString::new(SESSION_KEY_B))
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(store.stored_session(), Some(renewed));
+    assert_eq!(receive(&second_calls).await.batch_size, 1);
+    second_responses.send(Ok(accepted(1))).await.unwrap();
+    wait_for_status(&mut second_status, |snapshot| {
+        snapshot.pending_scrobbles == 0
+    })
+    .await;
+    assert_eq!(
+        storage::validate_account_queue_state(&database, binding)
+            .await
+            .unwrap()
+            .durable_pause,
+        None
+    );
+    second_shutdown.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn same_process_compatibility_pause_resumes_with_current_manual_authority() {
+    let database = database().await;
+    let session = session();
+    let binding = session.account_binding();
+    enqueue_rows(&database, binding, 1).await;
+    let (transport, calls, responses, _retired, active) = GatedTransport::new(session.clone());
+    let store = Arc::new(TestCredentialStore::new(session, active));
+    let (clock, _waits) = ManualClock::new(0);
+    let (handle, shutdown) = spawn_activated_runtime(database.clone(), store, transport, clock)
+        .await
+        .unwrap();
+    let mut status = handle.subscribe_status();
+    assert_eq!(receive(&calls).await.batch_size, 1);
+    responses.send(Ok(accepted(0))).await.unwrap();
+    wait_for_status(&mut status, |snapshot| {
+        snapshot.phase == LastFmRuntimePhase::CompatibilityPaused
+    })
+    .await;
+    let recovery = handle
+        .issue_manual_pause_recovery_after_explicit_user_action()
+        .unwrap();
+    let stale_repeated_pause = handle
+        .issue_manual_pause_recovery_after_explicit_user_action()
+        .unwrap();
+    handle
+        .resume_after_manual_recovery(recovery)
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(receive(&calls).await.batch_size, 1);
+    let first_pause_revision = status.borrow().revision;
+    responses.send(Ok(accepted(0))).await.unwrap();
+    wait_for_status(&mut status, |snapshot| {
+        snapshot.phase == LastFmRuntimePhase::CompatibilityPaused
+            && snapshot.revision > first_pause_revision
+    })
+    .await;
+    assert_eq!(
+        handle
+            .resume_after_manual_recovery(stale_repeated_pause)
+            .unwrap_err(),
+        LastFmRuntimeAdmissionError::NotReadyForManualRecovery
+    );
+
+    let stale_revision = handle
+        .issue_manual_pause_recovery_after_explicit_user_action()
+        .unwrap();
+    handle
+        .try_enqueue(unbound_pending(99))
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(
+        handle
+            .resume_after_manual_recovery(stale_revision)
+            .unwrap_err(),
+        LastFmRuntimeAdmissionError::NotReadyForManualRecovery
+    );
+    let current = handle
+        .issue_manual_pause_recovery_after_explicit_user_action()
+        .unwrap();
+    handle
+        .resume_after_manual_recovery(current)
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(receive(&calls).await.batch_size, 2);
+    responses.send(Ok(accepted(2))).await.unwrap();
+    wait_for_status(&mut status, |snapshot| snapshot.pending_scrobbles == 0).await;
+    assert_eq!(
+        storage::validate_account_queue_state(&database, binding)
+            .await
+            .unwrap()
+            .durable_pause,
+        None
+    );
+    shutdown.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn manual_recovery_preserves_a_delayed_head_before_network_delivery() {
+    let database = database().await;
+    let session = session();
+    let binding = session.account_binding();
+    enqueue_rows(&database, binding, 1).await;
+    let (transport, calls, responses, _retired, active) = GatedTransport::new(session.clone());
+    let store = Arc::new(TestCredentialStore::new(session, active));
+    let (clock, waits) = ManualClock::new(30_999);
+    let (handle, shutdown) =
+        spawn_activated_runtime(database.clone(), store, transport, clock.clone())
+            .await
+            .unwrap();
+    let mut status = handle.subscribe_status();
+
+    assert_eq!(receive(&calls).await.batch_size, 1);
+    responses.send(Ok(accepted(0))).await.unwrap();
+    wait_for_status(&mut status, |snapshot| {
+        snapshot.phase == LastFmRuntimePhase::CompatibilityPaused
+    })
+    .await;
+    let receipt = storage::due_batch(&database, binding, 30_999, 50)
+        .await
+        .unwrap()
+        .unwrap();
+    storage::reschedule_batch(&database, &receipt, 31_000)
+        .await
+        .unwrap();
+
+    let recovery = handle
+        .issue_manual_pause_recovery_after_explicit_user_action()
+        .unwrap();
+    handle
+        .resume_after_manual_recovery(recovery)
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    let backing_off = *handle.subscribe_status().borrow();
+    assert_eq!(backing_off.phase, LastFmRuntimePhase::BackingOff);
+    assert_eq!(
+        backing_off.failure,
+        Some(LastFmRuntimeCommandError::Delivery)
+    );
+    assert!(calls.try_recv().is_err());
+    assert_eq!(receive(&waits).await, 31_000);
+
+    clock.advance_to(31_000);
+    assert_eq!(receive(&calls).await.batch_size, 1);
+    responses.send(Ok(accepted(1))).await.unwrap();
+    wait_for_status(&mut status, |snapshot| snapshot.pending_scrobbles == 0).await;
+    shutdown.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_during_committed_manual_recovery_clears_authority_without_starting_network() {
+    let database = database().await;
+    let session = session();
+    let binding = session.account_binding();
+    enqueue_rows(&database, binding, 1).await;
+    let (transport, calls, responses, _retired, active) = GatedTransport::new(session.clone());
+    let store = Arc::new(TestCredentialStore::new(session, active));
+    let (clock, _waits) = ManualClock::new(0);
+    let (handle, shutdown) = spawn_activated_runtime(database.clone(), store, transport, clock)
+        .await
+        .unwrap();
+    let mut status = handle.subscribe_status();
+    assert_eq!(receive(&calls).await.batch_size, 1);
+    responses.send(Ok(accepted(0))).await.unwrap();
+    wait_for_status(&mut status, |snapshot| {
+        snapshot.phase == LastFmRuntimePhase::CompatibilityPaused
+    })
+    .await;
+
+    let (reached, reached_events) = async_channel::bounded(1);
+    let (release, release_events) = async_channel::bounded(1);
+    handle.inner.ingress.lock().unwrap().recovery_clear_gate = Some(RecoveryClearGate {
+        reached,
+        release: release_events,
+    });
+    let recovery = handle
+        .issue_manual_pause_recovery_after_explicit_user_action()
+        .unwrap();
+    let operation = handle.resume_after_manual_recovery(recovery).unwrap();
+    receive(&reached_events).await;
+    assert!(handle.close_and_flush());
+    release.send(()).await.unwrap();
+    assert_eq!(
+        operation.wait().await,
+        Err(LastFmRuntimeCommandError::OwnerStopped)
+    );
+    assert!(calls.try_recv().is_err());
+    assert_eq!(
+        storage::validate_account_queue_state(&database, binding)
+            .await
+            .unwrap()
+            .durable_pause,
+        None
+    );
+    assert_eq!(
+        shutdown.shutdown().await.unwrap(),
+        LastFmRuntimeShutdownReason::Drained
+    );
+}
+
+#[tokio::test]
+async fn compatibility_pause_survives_restart_without_an_automatic_request() {
+    let database = database().await;
+    let session = session();
+    let binding = session.account_binding();
+    enqueue_rows(&database, binding, 1).await;
+    let (first_transport, first_calls, first_responses, _retired, first_active) =
+        GatedTransport::new(session.clone());
+    let store = Arc::new(TestCredentialStore::new(session.clone(), first_active));
+    let (first_clock, _waits) = ManualClock::new(0);
+    let (first_handle, first_shutdown) = spawn_activated_runtime(
+        database.clone(),
+        store.clone(),
+        first_transport,
+        first_clock,
+    )
+    .await
+    .unwrap();
+    let mut first_status = first_handle.subscribe_status();
+    assert_eq!(receive(&first_calls).await.batch_size, 1);
+    first_responses.send(Ok(accepted(0))).await.unwrap();
+    wait_for_status(&mut first_status, |snapshot| {
+        snapshot.phase == LastFmRuntimePhase::CompatibilityPaused
+    })
+    .await;
+    let stale_predecessor = first_handle
+        .issue_manual_pause_recovery_after_explicit_user_action()
+        .unwrap();
+    first_shutdown.shutdown().await.unwrap();
+
+    let (second_transport, second_calls, _responses, _retired, _active) =
+        GatedTransport::new(session);
+    let (second_clock, _waits) = ManualClock::new(0);
+    let (second_handle, second_shutdown) =
+        spawn_activated_runtime(database.clone(), store, second_transport, second_clock)
+            .await
+            .unwrap();
+    let startup = *second_handle.subscribe_status().borrow();
+    assert_eq!(startup.phase, LastFmRuntimePhase::CompatibilityPaused);
+    assert_eq!(
+        startup.failure,
+        Some(LastFmRuntimeCommandError::Compatibility)
+    );
+    assert_eq!(startup.pending_scrobbles, 1);
+    assert!(second_calls.try_recv().is_err());
+    assert_eq!(
+        second_handle
+            .resume_after_manual_recovery(stale_predecessor)
+            .unwrap_err(),
+        LastFmRuntimeAdmissionError::NotReadyForManualRecovery
+    );
+    second_shutdown.shutdown().await.unwrap();
 }
 
 #[tokio::test]

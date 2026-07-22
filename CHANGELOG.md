@@ -8,11 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Last.fm now has a fail-closed protocol, credential-vault, and durable-queue foundation**
+- **Last.fm now has a fail-closed protocol, credential-vault, durable-queue, and delivery/lifecycle
+  runtime foundation**
   ([#50](https://github.com/jm2/tributary/issues/50),
-  [#151](https://github.com/jm2/tributary/pull/151)). This is an internal foundation, not yet a
-  user-visible scrobbling feature: playback observation, delivery-worker lifecycle, consent and
-  per-source settings, status UI, and localization remain follow-on work.
+  [#151](https://github.com/jm2/tributary/pull/151),
+  [runtime/lifecycle slice](https://github.com/jm2/tributary/tree/agent/p2.1-lastfm-runtime)). This
+  is an internal foundation, not yet a user-visible scrobbling feature, and the runtime is
+  deliberately not connected to application startup. Playback evidence and now-playing, the
+  desktop authorization flow, explicit consent and per-source policy, settings/status UI,
+  localization and accessibility, application startup/shutdown wiring, and production package
+  credentials remain follow-on work; the
+  [complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary) also tracks
+  activation/unavailable-state issuance, structured source-owner conversion, account replacement
+  and recovery, package verification/API registration, and the remaining acceptance matrix.
 
   - **Bounded protocol client:** an HTTPS-only, redirect-safe Last.fm 2.0 client validates
     build-injected 32-hex application credentials, signs desktop-auth, now-playing, and ordered
@@ -20,8 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     operation, 1 MiB encoded-request, and 2 MiB response limits cover the provable maximum valid
     percent-encoded and JSON-escaped batches. Unknown future provider errors and structurally
     incoherent item mappings fail closed; the provider's inconsistent string-or-number corrected
-    flags accept only canonical 0/1 values. Only network failures and service codes 11/16 are
-    retryable, while code 9 requests reauthorization.
+    flags accept only canonical 0/1 values. Only timeouts/transport failures, HTTP 429/5xx without
+    a recognized provider error envelope, transient provider codes 8/11/16, and provider rate-limit
+    code 29 are retryable, while code 9 requests reauthorization.
   - **Native protected authority:** session keys, exact usernames, and random account UUIDs use
     macOS Keychain, Windows Credential Manager, or Linux Secret Service with no plaintext fallback.
     The versioned vault record requires an RFC 4122 v4 account UUID, nonblank control-free username,
@@ -29,25 +38,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     construction is retryable per operation rather than process-poisoning after a transient vault
     failure, and the Flatpak permission policy narrowly allows only
     `org.freedesktop.secrets` in addition to its existing reviewed grants.
-  - **Private offline FIFO:** migration 17 creates and revalidates a constrained queue containing
+  - **Private offline FIFO and durable delivery gate:** migration 17 creates and revalidates a
+    constrained queue containing
     only bounded submission metadata, opaque occurrence/order identity, one-way account binding,
     and saturated retry state. Atomic admission enforces a 10,000-row global cap, exact occurrence
     idempotency, and one-account quarantine. An idempotent hit revalidates the complete stored row
-    before reporting durable success, so a malformed identity or retry state is retained for
-    explicit recovery and fails closed instead of returning a corrupt row ID. Opaque receipts freeze
+    before reporting durable success, so a malformed identity or retry state is retained and fails
+    closed instead of returning a corrupt row ID. Destructive recovery for a corrupt queue while
+    its vault account is still valid remains follow-on product/UI work. Opaque receipts freeze
     the exact oldest prefix; terminal settlement and retry rescheduling compare-and-swap the entire
-    batch transactionally so stale or partial receipts change nothing. Downgrade is refused while
-    private rows remain.
-  - **Recovery and redaction:** normal account purge cannot erase a successor binding. A separate
-    missing/corrupt-vault recovery requires an opaque close-and-FIFO-drain capability and deletes
-    only the closed row-ID snapshot, including malformed non-positive identities, before a successor
-    can be created. Queue models, generated SeaORM `ActiveModel` values, client/vault values, errors,
-    and diagnostics redact credentials, account bindings, listening metadata, and start evidence.
-    Validation includes 40 focused Last.fm tests; locked debug and release suites each pass 20
-    library, 1,385 application, and 10 repository-metadata tests (1,415 total), alongside strict
-    debug/release Clippy, Rust 1.92 all-target compilation, Flatpak positive/negative permission
-    tests, locked fuzz-workspace formatting/Clippy with the same target-scoped vault dependency
-    graph, and dependency auditing without public Last.fm network access.
+    batch transactionally so stale or partial receipts change nothing. Migration 18 adds one exact
+    singleton containing only that one-way binding and a fixed reauthentication, compatibility,
+    capability, or credential-cleanup category. A result pause is receipt-checked and committed
+    before the worker's Stop acknowledgement; a worker failure is account-checked before its Stop
+    acknowledgement. If either pause write fails, ingress closes and the worker stops with a fixed
+    capability/storage failure, but the uncommitted state is not claimed to survive restart.
+    Startup restores an exact committed phase without spawning a worker. Code 9
+    clears only after exact same-account reauthorization, while compatibility/capability pauses
+    require an opaque exact-runtime/account/revision/category recovery command. Disconnect
+    atomically replaces the emptied queue and any delivery pause with a cleanup tombstone, then
+    clears it only after exact vault deletion; missing/corrupt-vault recovery separately purges both
+    tables transactionally. Downgrade is refused while either private rows or a pause marker remain.
+  - **Single-flight durable delivery:** one cancellable worker reads the exact oldest due FIFO prefix
+    of at most 50 rows, defensively converts it to one ordered protocol batch, performs one bounded
+    request, and then waits for the serialized owner to acknowledge the exact durable mutation
+    before it can inspect another row. Only timeouts, transport failures, service-unavailable, and
+    rate-limit outcomes—including provider codes 8/11/16/29—reschedule the complete receipt, with
+    deterministic exponential delays from 30 seconds through a one-hour cap. Valid
+    accepted/ignored results and recognized terminal service rejections settle the exact receipt;
+    ordinary HTTP status failures, oversized bodies, malformed or cardinality-incoherent responses,
+    invalid stored data, and local capability failures retain the queue and pause or quarantine
+    automatic delivery instead of guessing, deleting, or looping.
+  - **Bounded serialized runtime:** during an active runtime, its lifecycle-owned actor is the sole
+    SQLite and credential-vault mutator. Explicit missing/corrupt-vault recovery is the only
+    separate mutating path and holds the same process-global lease. The actor's bounded metadata
+    FIFO reserves three slots for delivery and lifecycle control,
+    including a delivery result followed by disconnect and shutdown, while one ingress gate
+    linearizes admission against every lifecycle transition. Playback-facing input is deliberately
+    unbound: only the runtime ingress gate can attach the vault-derived account binding. Startup
+    additionally requires an opaque capability intended for a future consent/build-enablement
+    issuer; no production path issues it yet. Checked account epochs and delivery generations
+    reject stale events; watched phase, pending count, fixed failure category, and saturating
+    non-persistent accepted/ignored/rejected counters update only after the matching durable
+    mutation.
+  - **Exhaustive reauthorization and replay policy:** Last.fm code 9 cancels network delivery but
+    keeps FIFO admission available and retains every queued row. Exactly one live reauthorization
+    may be pending; it must name the same account, replace that exact account's vault session while
+    retaining the lifecycle lease, retire the old worker generation, and restart delivery.
+    Supplying a different username is an explicit account-replacement refusal, never authority to
+    retag or purge the queue. If a remote submission
+    may have succeeded but shutdown or task loss wins before actor settlement, the unchanged receipt
+    remains for at-least-once replay on the successor runtime rather than being falsely deleted.
+    Unexpected worker panics likewise become one content-free paused status and retain the exact
+    receipt.
+  - **Disconnect, shutdown, and explicit recovery:** one process-global vault lifecycle lease spans
+    startup inspection, the active runtime, same-account credential replacement, disconnect cleanup,
+    and exceptional recovery; blocking vault operations own that same lease through cancellation or
+    failure so a successor cannot observe a gap. Disconnect closes admission, cancels and joins
+    delivery, drains work already admitted ahead of it, purges only the exact account queue, drops
+    the in-memory session, installs a durable cleanup tombstone, and then deletes only the matching
+    vault record before clearing that exact marker. Vault-delete and marker-clear failures remain
+    cleanup-only across restart; an already-absent vault may close only the matching tombstone, and
+    a different stored account is never deletion authority. Normal shutdown closes admission,
+    cancels delivery, drains the serialized owner, and deliberately leaves durable queue and vault
+    state for a later run. Separate cancellation-safe recovery acts only when the vault is missing or
+    structurally corrupt, deletes the closed queue snapshot before a corrupt record, and refuses to
+    mutate anything for a valid or merely unavailable vault.
+  - **Process-wide panic privacy:** queue models, generated SeaORM `ActiveModel` values,
+    client/vault values, errors, status, and diagnostics redact credentials, account bindings,
+    listening metadata (including exact duration), and start evidence. Because Rust invokes its
+    global hook even for a panic a worker later catches, Tributary now installs a payload-ignoring
+    hook as the first operation in `main`; it emits only fixed text plus an opt-in code-location
+    backtrace. A subprocess regression panics with a sentinel private value and proves that value is
+    absent from captured output. An
+    actor unwind retains its complete owner and vault lease while it closes ingress, cancels and
+    joins delivery, then attempts to commit or validate a capability pause for unpurged state
+    before releasing the lease. If SQLite cannot establish that pause, the shutdown proof remains
+    failed rather than claiming a durable commit; successor ownership still cannot overlap the
+    predecessor's request or database task.
+    Validation: 127 focused Last.fm tests; locked debug and release suites each pass 20 library,
+    1,473 application, and 14 repository-metadata tests (1,507 total), alongside strict debug and
+    release Clippy, the Rust 1.92 locked all-target check, formatting and diff checks, and the
+    dependency audit.
 - **Rhythmbox profiles can now be migrated through a bounded, preview-first, transactional
   workflow** ([#57](https://github.com/jm2/tributary/issues/57),
   [#150](https://github.com/jm2/tributary/pull/150)):

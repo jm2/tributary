@@ -35,14 +35,20 @@ impl LastFmClock for FixedClock {
 }
 
 struct ObservedTransport {
-    calls: async_channel::Sender<bool>,
+    calls: async_channel::Sender<TransportCall>,
     responses: async_channel::Receiver<Result<ScrobbleBatchResult, LastFmClientError>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TransportCall {
+    renewed_session: bool,
+    batch_size: usize,
 }
 
 impl ObservedTransport {
     fn new() -> (
         Arc<Self>,
-        async_channel::Receiver<bool>,
+        async_channel::Receiver<TransportCall>,
         async_channel::Sender<Result<ScrobbleBatchResult, LastFmClientError>>,
     ) {
         let (calls, call_events) = async_channel::unbounded();
@@ -68,9 +74,15 @@ impl LastFmTransport for ObservedTransport {
     async fn submit_scrobbles(
         &self,
         session: &StoredSession,
-        _scrobbles: &[Scrobble],
+        scrobbles: &[Scrobble],
     ) -> Result<ScrobbleBatchResult, LastFmClientError> {
-        let _ = self.calls.send(session.key().expose() == RENEWED_KEY).await;
+        let _ = self
+            .calls
+            .send(TransportCall {
+                renewed_session: session.key().expose() == RENEWED_KEY,
+                batch_size: scrobbles.len(),
+            })
+            .await;
         self.responses
             .recv()
             .await
@@ -81,12 +93,18 @@ impl LastFmTransport for ObservedTransport {
 struct GatedCredentialStore {
     session: Mutex<Option<StoredSession>>,
     save_started: async_channel::Sender<()>,
-    save_release: Mutex<mpsc::Receiver<()>>,
+    save_release: Mutex<mpsc::Receiver<Result<(), CredentialError>>>,
     deletes: AtomicUsize,
 }
 
 impl GatedCredentialStore {
-    fn new(session: StoredSession) -> (Arc<Self>, async_channel::Receiver<()>, mpsc::Sender<()>) {
+    fn new(
+        session: StoredSession,
+    ) -> (
+        Arc<Self>,
+        async_channel::Receiver<()>,
+        mpsc::Sender<Result<(), CredentialError>>,
+    ) {
         let (save_started, save_events) = async_channel::bounded(1);
         let (release, save_release) = mpsc::channel();
         (
@@ -126,7 +144,7 @@ impl SessionCredentialStore for GatedCredentialStore {
             .lock()
             .map_err(|_| CredentialError::Unavailable)?
             .recv_timeout(WATCHDOG)
-            .map_err(|_| CredentialError::Unavailable)?;
+            .map_err(|_| CredentialError::Unavailable)??;
         *self
             .session
             .lock()
@@ -151,9 +169,10 @@ struct PausedRuntime {
     shutdown: LastFmRuntimeShutdown,
     status: watch::Receiver<LastFmRuntimeStatus>,
     store: Arc<GatedCredentialStore>,
-    calls: async_channel::Receiver<bool>,
+    calls: async_channel::Receiver<TransportCall>,
+    responses: async_channel::Sender<Result<ScrobbleBatchResult, LastFmClientError>>,
     save_events: async_channel::Receiver<()>,
-    save_release: mpsc::Sender<()>,
+    save_release: mpsc::Sender<Result<(), CredentialError>>,
 }
 
 async fn paused_runtime() -> PausedRuntime {
@@ -191,7 +210,7 @@ async fn paused_runtime() -> PausedRuntime {
     .unwrap();
     let mut status = handle.subscribe_status();
     assert!(
-        !receive(&calls).await,
+        !receive(&calls).await.renewed_session,
         "initial delivery uses the original key"
     );
     responses
@@ -208,6 +227,7 @@ async fn paused_runtime() -> PausedRuntime {
         status,
         store,
         calls,
+        responses,
         save_events,
         save_release,
     }
@@ -233,6 +253,12 @@ async fn wait_for_status(
             .await
             .expect("runtime status changed before watchdog")
             .expect("runtime owner remained active");
+    }
+}
+
+fn accepted(count: usize) -> ScrobbleBatchResult {
+    ScrobbleBatchResult {
+        items: vec![SubmissionResult::Accepted { corrected: false }; count],
     }
 }
 
@@ -276,10 +302,10 @@ async fn reauthorization_claim_serializes_disconnect_and_retains_single_flight_u
     assert_eq!(storage::queue_len(&runtime.database).await.unwrap(), 1);
     assert_eq!(runtime.store.deletes.load(Ordering::SeqCst), 0);
 
-    runtime.save_release.send(()).unwrap();
+    runtime.save_release.send(Ok(())).unwrap();
     operation.wait().await.unwrap();
     assert!(
-        receive(&runtime.calls).await,
+        receive(&runtime.calls).await.renewed_session,
         "renewed delivery uses the saved key"
     );
     assert!(runtime.store.has_renewed_session());
@@ -296,6 +322,187 @@ async fn reauthorization_claim_serializes_disconnect_and_retains_single_flight_u
     );
     assert_eq!(storage::queue_len(&runtime.database).await.unwrap(), 0);
     assert_eq!(runtime.store.deletes.load(Ordering::SeqCst), 1);
+    runtime.shutdown.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enqueue_during_same_account_vault_save_is_bound_persisted_and_drained_after_reauthorization(
+) {
+    let mut runtime = paused_runtime().await;
+    let reauthorization = runtime
+        .handle
+        .reauthorize_same_account("listener".to_owned(), ProtectedString::new(RENEWED_KEY))
+        .unwrap();
+    receive(&runtime.save_events).await;
+
+    let occurrence_id = Uuid::new_v4();
+    let enqueue = runtime
+        .handle
+        .try_enqueue(
+            UnboundLastFmScrobble::try_new(
+                occurrence_id,
+                "Concurrent Artist".to_owned(),
+                "Concurrent Track".to_owned(),
+                Some("Concurrent Album".to_owned()),
+                None,
+                Some(2),
+                240,
+                1_700_000_001,
+            )
+            .unwrap(),
+        )
+        .expect("queue admission remains open during same-account reauthorization");
+    assert_eq!(
+        storage::queue_len(&runtime.database).await.unwrap(),
+        1,
+        "the serialized actor remains blocked behind the vault save"
+    );
+
+    runtime.save_release.send(Ok(())).unwrap();
+    reauthorization.wait().await.unwrap();
+    assert!(matches!(
+        enqueue.wait().await.unwrap(),
+        LastFmEnqueueOutcome::Inserted { .. }
+    ));
+
+    let storage::LastFmBatchAvailability::Ready(receipt) =
+        storage::batch_availability(&runtime.database, runtime.binding, 0, 50)
+            .await
+            .unwrap()
+    else {
+        panic!("both retained occurrences remain ready after reauthorization");
+    };
+    assert_eq!(receipt.len(), 2);
+    assert!(receipt
+        .rows()
+        .iter()
+        .any(|row| row.occurrence_id == occurrence_id));
+    assert!(receipt
+        .rows()
+        .iter()
+        .all(|row| &row.account_binding == runtime.binding.as_bytes()));
+
+    let mut delivered = 0;
+    while delivered < 2 {
+        let call = receive(&runtime.calls).await;
+        assert!(call.renewed_session, "delivery uses the renewed vault key");
+        assert!(call.batch_size > 0 && call.batch_size <= 2 - delivered);
+        runtime
+            .responses
+            .send(Ok(accepted(call.batch_size)))
+            .await
+            .unwrap();
+        delivered += call.batch_size;
+    }
+    let settled = wait_for_status(&mut runtime.status, LastFmRuntimePhase::Active).await;
+    if settled.pending_scrobbles != 0 {
+        loop {
+            let snapshot = *runtime.status.borrow_and_update();
+            if snapshot.pending_scrobbles == 0 {
+                break;
+            }
+            tokio::time::timeout(WATCHDOG, runtime.status.changed())
+                .await
+                .expect("delivery settlement arrived before watchdog")
+                .expect("runtime owner remained active");
+        }
+    }
+    assert_eq!(runtime.status.borrow().accepted_scrobbles, 2);
+    assert_eq!(storage::queue_len(&runtime.database).await.unwrap(), 0);
+    runtime.shutdown.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_vault_save_retains_code_nine_admission_and_a_later_reauthorization_succeeds() {
+    let mut runtime = paused_runtime().await;
+    let first = runtime
+        .handle
+        .reauthorize_same_account("listener".to_owned(), ProtectedString::new(RENEWED_KEY))
+        .unwrap();
+    receive(&runtime.save_events).await;
+    runtime
+        .save_release
+        .send(Err(CredentialError::Unavailable))
+        .unwrap();
+    assert_eq!(
+        first.wait().await,
+        Err(LastFmRuntimeCommandError::CredentialStore)
+    );
+    let failed = wait_for_status(
+        &mut runtime.status,
+        LastFmRuntimePhase::ReauthenticationRequired,
+    )
+    .await;
+    assert_eq!(
+        failed.failure,
+        Some(LastFmRuntimeCommandError::CredentialStore)
+    );
+    assert_eq!(
+        storage::validate_account_queue_state(&runtime.database, runtime.binding)
+            .await
+            .unwrap()
+            .durable_pause,
+        Some(storage::LastFmDurablePause::ReauthenticationRequired)
+    );
+
+    runtime
+        .handle
+        .try_enqueue(
+            UnboundLastFmScrobble::try_new(
+                Uuid::new_v4(),
+                "Offline Artist".to_owned(),
+                "Offline Track".to_owned(),
+                None,
+                None,
+                None,
+                180,
+                1_700_000_002,
+            )
+            .unwrap(),
+        )
+        .expect("typed vault failure keeps code-nine queue admission open")
+        .wait()
+        .await
+        .unwrap();
+
+    let second = runtime
+        .handle
+        .reauthorize_same_account("listener".to_owned(), ProtectedString::new(RENEWED_KEY))
+        .unwrap();
+    receive(&runtime.save_events).await;
+    runtime.save_release.send(Ok(())).unwrap();
+    second.wait().await.unwrap();
+    assert!(runtime.store.has_renewed_session());
+
+    let mut delivered = 0;
+    while delivered < 2 {
+        let call = receive(&runtime.calls).await;
+        assert!(call.renewed_session);
+        runtime
+            .responses
+            .send(Ok(accepted(call.batch_size)))
+            .await
+            .unwrap();
+        delivered += call.batch_size;
+    }
+    loop {
+        let snapshot = *runtime.status.borrow_and_update();
+        if snapshot.pending_scrobbles == 0 {
+            break;
+        }
+        tokio::time::timeout(WATCHDOG, runtime.status.changed())
+            .await
+            .expect("delivery settlement arrived before watchdog")
+            .expect("runtime owner remained active");
+    }
+    assert_eq!(storage::queue_len(&runtime.database).await.unwrap(), 0);
+    assert_eq!(
+        storage::validate_account_queue_state(&runtime.database, runtime.binding)
+            .await
+            .unwrap()
+            .durable_pause,
+        None
+    );
     runtime.shutdown.shutdown().await.unwrap();
 }
 
@@ -322,7 +529,7 @@ async fn shutdown_during_reauthorization_save_never_restarts_or_publishes_active
         LastFmRuntimeAdmissionError::Closed
     );
 
-    runtime.save_release.send(()).unwrap();
+    runtime.save_release.send(Ok(())).unwrap();
     assert_eq!(
         operation.wait().await,
         Err(LastFmRuntimeCommandError::OwnerStopped)

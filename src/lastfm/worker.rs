@@ -84,6 +84,17 @@ impl LastFmDeliveryAcknowledgement {
             .take()
             .is_some_and(|sender| sender.send(directive).is_ok())
     }
+
+    #[cfg(test)]
+    pub(super) fn testing_pair() -> (Self, oneshot::Receiver<LastFmDeliveryDirective>) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            Self {
+                sender: Some(sender),
+            },
+            receiver,
+        )
+    }
 }
 
 impl fmt::Debug for LastFmDeliveryAcknowledgement {
@@ -152,6 +163,7 @@ pub enum LastFmDeliveryEvent {
     Failed {
         generation: LastFmDeliveryGeneration,
         failure: LastFmDeliveryWorkerFailure,
+        acknowledgement: LastFmDeliveryAcknowledgement,
     },
 }
 
@@ -162,6 +174,7 @@ impl fmt::Debug for LastFmDeliveryEvent {
             Self::Failed {
                 generation,
                 failure,
+                acknowledgement: _,
             } => formatter
                 .debug_struct("LastFmDeliveryFailureEvent")
                 .field("generation", generation)
@@ -194,6 +207,21 @@ pub struct LastFmDeliveryWorker {
     task: Option<JoinHandle<LastFmDeliveryWorkerExit>>,
 }
 
+/// One-shot activation for a fully staged recovery worker. The runtime keeps
+/// the worker suspended until the exact durable pause has been cleared.
+pub(super) struct LastFmDeliveryStart {
+    sender: Option<oneshot::Sender<()>>,
+}
+
+impl LastFmDeliveryStart {
+    #[must_use]
+    pub(super) fn activate(mut self) -> bool {
+        self.sender
+            .take()
+            .is_some_and(|sender| sender.send(()).is_ok())
+    }
+}
+
 impl LastFmDeliveryWorker {
     /// Notify an empty or delayed worker that durable queue state may have
     /// changed. Revisions coalesce without losing the fact of a change.
@@ -217,7 +245,7 @@ impl LastFmDeliveryWorker {
     /// ingress mutex, so an in-flight request cannot remain live while already
     /// queued metadata delays the actor's lifecycle marker.
     #[must_use]
-    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+    pub(super) fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
     }
 
@@ -266,6 +294,7 @@ struct DeliveryTask {
     cancellation: CancellationToken,
     wake: watch::Receiver<u64>,
     events: async_channel::Sender<LastFmDeliveryEvent>,
+    activation: Option<oneshot::Receiver<()>>,
 }
 
 /// Spawn the sole reader/network task for one authorized account generation.
@@ -280,6 +309,48 @@ pub fn spawn_lastfm_delivery_worker(
     transport: Arc<dyn LastFmTransport>,
     clock: Arc<dyn LastFmClock>,
     events: async_channel::Sender<LastFmDeliveryEvent>,
+) -> LastFmDeliveryWorker {
+    spawn_lastfm_delivery_worker_inner(
+        database, session, generation, transport, clock, events, None,
+    )
+}
+
+/// Stage a delivery generation which cannot inspect or submit queue data
+/// until its one-shot activation capability is consumed.
+pub(super) fn spawn_lastfm_delivery_worker_suspended(
+    database: DatabaseConnection,
+    session: StoredSession,
+    generation: LastFmDeliveryGeneration,
+    transport: Arc<dyn LastFmTransport>,
+    clock: Arc<dyn LastFmClock>,
+    events: async_channel::Sender<LastFmDeliveryEvent>,
+) -> (LastFmDeliveryWorker, LastFmDeliveryStart) {
+    let (sender, receiver) = oneshot::channel();
+    let worker = spawn_lastfm_delivery_worker_inner(
+        database,
+        session,
+        generation,
+        transport,
+        clock,
+        events,
+        Some(receiver),
+    );
+    (
+        worker,
+        LastFmDeliveryStart {
+            sender: Some(sender),
+        },
+    )
+}
+
+fn spawn_lastfm_delivery_worker_inner(
+    database: DatabaseConnection,
+    session: StoredSession,
+    generation: LastFmDeliveryGeneration,
+    transport: Arc<dyn LastFmTransport>,
+    clock: Arc<dyn LastFmClock>,
+    events: async_channel::Sender<LastFmDeliveryEvent>,
+    activation: Option<oneshot::Receiver<()>>,
 ) -> LastFmDeliveryWorker {
     let account_binding = session.account_binding();
     let cancellation = CancellationToken::new();
@@ -297,6 +368,7 @@ pub fn spawn_lastfm_delivery_worker(
         cancellation: task_cancellation,
         wake,
         events,
+        activation,
     }
     .run();
     let task = tokio::spawn(async move {
@@ -323,6 +395,16 @@ pub fn spawn_lastfm_delivery_worker(
 
 impl DeliveryTask {
     async fn run(mut self) -> LastFmDeliveryWorkerExit {
+        if let Some(activation) = self.activation.take() {
+            let activated = tokio::select! {
+                biased;
+                () = self.cancellation.cancelled() => return LastFmDeliveryWorkerExit::Cancelled,
+                activated = activation => activated,
+            };
+            if activated.is_err() {
+                return LastFmDeliveryWorkerExit::DirectedStop;
+            }
+        }
         loop {
             // Treat the current revision as represented by the following
             // authoritative database read. A racing later revision remains
@@ -471,9 +553,13 @@ async fn send_failure_event(
     events: &async_channel::Sender<LastFmDeliveryEvent>,
     cancellation: &CancellationToken,
 ) -> LastFmDeliveryWorkerExit {
+    let (acknowledgement, directive) = oneshot::channel();
     let event = LastFmDeliveryEvent::Failed {
         generation,
         failure,
+        acknowledgement: LastFmDeliveryAcknowledgement {
+            sender: Some(acknowledgement),
+        },
     };
     let sent = tokio::select! {
         biased;
@@ -482,10 +568,20 @@ async fn send_failure_event(
             return LastFmDeliveryWorkerExit::Cancelled;
         }
     };
-    if sent.is_ok() {
-        LastFmDeliveryWorkerExit::Failed(failure)
-    } else {
-        LastFmDeliveryWorkerExit::ActorChannelClosed
+    if sent.is_err() {
+        return LastFmDeliveryWorkerExit::ActorChannelClosed;
+    }
+    let directive = tokio::select! {
+        biased;
+        directive = directive => Some(directive),
+        () = cancellation.cancelled() => None,
+    };
+    match directive {
+        Some(Ok(LastFmDeliveryDirective::Stop)) | None => LastFmDeliveryWorkerExit::Failed(failure),
+        Some(Ok(LastFmDeliveryDirective::Continue)) => {
+            LastFmDeliveryWorkerExit::ActorAcknowledgementDropped
+        }
+        Some(Err(_)) => LastFmDeliveryWorkerExit::ActorAcknowledgementDropped,
     }
 }
 
@@ -916,13 +1012,18 @@ mod tests {
         );
 
         let failure = LastFmDeliveryWorkerFailure::UnexpectedTaskExit;
-        assert!(matches!(
-            receive(&event_receiver).await,
-            LastFmDeliveryEvent::Failed {
-                generation,
-                failure: observed,
-            } if generation == LastFmDeliveryGeneration::new(7) && observed == failure
-        ));
+        let LastFmDeliveryEvent::Failed {
+            generation,
+            failure: observed,
+            acknowledgement,
+        } = receive(&event_receiver).await
+        else {
+            panic!("expected worker failure event");
+        };
+        assert_eq!(generation, LastFmDeliveryGeneration::new(7));
+        assert_eq!(observed, failure);
+        assert!(!worker.task.as_ref().unwrap().is_finished());
+        assert!(acknowledgement.acknowledge(LastFmDeliveryDirective::Stop));
         assert_eq!(
             worker.join().await.unwrap(),
             LastFmDeliveryWorkerExit::Failed(failure)
@@ -956,13 +1057,18 @@ mod tests {
         let (worker, events) = spawn_fixture(database.clone(), session, transport, clock);
 
         let failure = LastFmDeliveryWorkerFailure::Storage(LastFmQueueError::CorruptStorage);
-        assert!(matches!(
-            receive(&events).await,
-            LastFmDeliveryEvent::Failed {
-                generation,
-                failure: observed,
-            } if generation == LastFmDeliveryGeneration::new(7) && observed == failure
-        ));
+        let LastFmDeliveryEvent::Failed {
+            generation,
+            failure: observed,
+            acknowledgement,
+        } = receive(&events).await
+        else {
+            panic!("expected worker failure event");
+        };
+        assert_eq!(generation, LastFmDeliveryGeneration::new(7));
+        assert_eq!(observed, failure);
+        assert!(!worker.task.as_ref().unwrap().is_finished());
+        assert!(acknowledgement.acknowledge(LastFmDeliveryDirective::Stop));
         assert_eq!(
             worker.join().await.unwrap(),
             LastFmDeliveryWorkerExit::Failed(failure)

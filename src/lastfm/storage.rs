@@ -18,11 +18,13 @@ use sea_orm::{
 use uuid::{Uuid, Variant, Version};
 
 use crate::db::entities::lastfm_scrobble::{
-    self, StoredLastFmScrobble, StoredMetadataText, MAX_LASTFM_ATTEMPT_COUNT,
+    self, StoredLastFmScrobble, StoredMetadataText, StoredTrackNumber, MAX_LASTFM_ATTEMPT_COUNT,
     MAX_LASTFM_METADATA_BYTES, MAX_LASTFM_RETRY_AT_MS, MAX_LASTFM_STARTED_AT_SECS,
 };
 
 use super::credentials::LastFmAccountBinding;
+
+const LASTFM_DELIVERY_PAUSE_TABLE: &str = "lastfm_delivery_pause";
 
 /// Hard global bound on pending listening records.
 pub const MAX_LASTFM_QUEUE_ROWS: u64 = 10_000;
@@ -192,7 +194,6 @@ impl ValidatedLastFmScrobble {
             .field("has_album", &self.album.is_some())
             .field("has_album_artist", &self.album_artist.is_some())
             .field("has_track_number", &self.track_number.is_some())
-            .field("duration_secs", &self.duration_secs)
             .finish_non_exhaustive()
     }
 }
@@ -357,6 +358,44 @@ pub enum LastFmBatchAvailability {
     Ready(LastFmBatchReceipt),
 }
 
+/// Durable closed-retry category for the one active Last.fm account.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LastFmDurablePause {
+    ReauthenticationRequired,
+    Compatibility,
+    Capability,
+    CredentialCleanupRequired,
+}
+
+impl LastFmDurablePause {
+    const fn code(self) -> i64 {
+        match self {
+            Self::ReauthenticationRequired => 1,
+            Self::Compatibility => 2,
+            Self::Capability => 3,
+            Self::CredentialCleanupRequired => 4,
+        }
+    }
+
+    fn from_code(code: i64) -> Result<Self, LastFmQueueError> {
+        match code {
+            1 => Ok(Self::ReauthenticationRequired),
+            2 => Ok(Self::Compatibility),
+            3 => Ok(Self::Capability),
+            4 => Ok(Self::CredentialCleanupRequired),
+            _ => Err(LastFmQueueError::CorruptStorage),
+        }
+    }
+}
+
+/// One coherent startup snapshot of the private queue and delivery gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct LastFmValidatedQueueState {
+    pub pending_scrobbles: u64,
+    pub oldest_next_attempt_at_ms: Option<i64>,
+    pub durable_pause: Option<LastFmDurablePause>,
+}
+
 /// Content-free queue failure category.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LastFmQueueError {
@@ -461,6 +500,9 @@ where
              WHERE NOT EXISTS (
                  SELECT 1 FROM lastfm_scrobble_queue WHERE account_binding <> ?
              )
+             AND NOT EXISTS (
+                 SELECT 1 FROM lastfm_delivery_pause WHERE account_binding <> ?
+             )
              AND (SELECT COUNT(*) FROM lastfm_scrobble_queue) < ?
              ON CONFLICT(occurrence_id) DO NOTHING",
             [
@@ -473,6 +515,7 @@ where
                 input.payload.track_number.into(),
                 input.payload.duration_secs.into(),
                 input.payload.started_at_unix_secs.into(),
+                input.account_binding.as_bytes().to_vec().into(),
                 input.account_binding.as_bytes().to_vec().into(),
                 i64::try_from(cap)
                     .map_err(|_| LastFmQueueError::InvalidInput)?
@@ -494,7 +537,7 @@ where
     // Any mixed-account state is quarantined before interpreting even an
     // otherwise idempotent occurrence. This keeps corrupted or externally
     // modified storage from being mistaken for a healthy single-account queue.
-    if queue_has_other_binding(db, input.account_binding).await? {
+    if account_state_has_other_binding(db, input.account_binding).await? {
         return Err(LastFmQueueError::AccountMismatch);
     }
 
@@ -550,7 +593,7 @@ pub async fn batch_availability(
         return Err(LastFmQueueError::InvalidBatch);
     }
 
-    if queue_has_other_binding(db, account_binding).await? {
+    if account_state_has_other_binding(db, account_binding).await? {
         return Err(LastFmQueueError::AccountMismatch);
     }
     let rows = load_prefix(db, account_binding, limit).await?;
@@ -674,6 +717,137 @@ pub async fn reschedule_batch(
         .map_err(|_| LastFmQueueError::Storage)
 }
 
+/// Persist a closed delivery category only while the exact in-flight receipt
+/// remains the current FIFO prefix.
+pub(super) async fn persist_pause_for_receipt(
+    db: &DatabaseConnection,
+    receipt: &LastFmBatchReceipt,
+    pause: LastFmDurablePause,
+) -> Result<(), LastFmQueueError> {
+    if pause == LastFmDurablePause::CredentialCleanupRequired {
+        return Err(LastFmQueueError::InvalidInput);
+    }
+    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let result = async {
+        validate_receipt(&transaction, receipt).await?;
+        persist_pause_in_transaction(&transaction, receipt.account_binding, pause).await
+    }
+    .await;
+    finish_transaction(transaction, result).await
+}
+
+/// Persist a local worker/capability pause for the exact current account.
+pub(super) async fn persist_pause_for_account(
+    db: &DatabaseConnection,
+    account_binding: LastFmAccountBinding,
+    pause: LastFmDurablePause,
+) -> Result<(), LastFmQueueError> {
+    if pause == LastFmDurablePause::CredentialCleanupRequired {
+        return Err(LastFmQueueError::InvalidInput);
+    }
+    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let result = async {
+        if account_state_has_other_binding(&transaction, account_binding).await? {
+            return Err(LastFmQueueError::AccountMismatch);
+        }
+        persist_pause_in_transaction(&transaction, account_binding, pause).await
+    }
+    .await;
+    finish_transaction(transaction, result).await
+}
+
+/// Atomically replace one exact delivery pause without ever opening the
+/// durable gate between categories. Cleanup tombstones are owned exclusively
+/// by the purge/credential-cleanup protocol and cannot be forged here.
+pub(super) async fn replace_exact_pause(
+    db: &DatabaseConnection,
+    account_binding: LastFmAccountBinding,
+    expected: LastFmDurablePause,
+    replacement: LastFmDurablePause,
+) -> Result<(), LastFmQueueError> {
+    if expected == LastFmDurablePause::CredentialCleanupRequired
+        || replacement == LastFmDurablePause::CredentialCleanupRequired
+    {
+        return Err(LastFmQueueError::InvalidInput);
+    }
+    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let result = async {
+        if account_state_has_other_binding(&transaction, account_binding).await? {
+            return Err(LastFmQueueError::AccountMismatch);
+        }
+        match load_pause(&transaction).await? {
+            Some((binding, retained))
+                if binding == *account_binding.as_bytes() && retained == expected => {}
+            Some((binding, _)) if binding != *account_binding.as_bytes() => {
+                return Err(LastFmQueueError::AccountMismatch);
+            }
+            Some(_) | None => return Err(LastFmQueueError::StaleBatch),
+        }
+        if expected == replacement {
+            return Ok(());
+        }
+        let replaced = transaction
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                format!(
+                    "UPDATE {LASTFM_DELIVERY_PAUSE_TABLE}
+                     SET pause_category = ?
+                     WHERE slot = 1 AND account_binding = ? AND pause_category = ?"
+                ),
+                [
+                    replacement.code().into(),
+                    account_binding.as_bytes().to_vec().into(),
+                    expected.code().into(),
+                ],
+            ))
+            .await
+            .map_err(|_| LastFmQueueError::Storage)?;
+        if replaced.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(LastFmQueueError::StaleBatch)
+        }
+    }
+    .await;
+    finish_transaction(transaction, result).await
+}
+
+/// Compare-and-delete one exact durable category. A missing or different
+/// category is stale authority and changes nothing.
+pub(super) async fn clear_exact_pause(
+    db: &DatabaseConnection,
+    account_binding: LastFmAccountBinding,
+    expected: LastFmDurablePause,
+) -> Result<(), LastFmQueueError> {
+    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let result = async {
+        if account_state_has_other_binding(&transaction, account_binding).await? {
+            return Err(LastFmQueueError::AccountMismatch);
+        }
+        let deleted = transaction
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                format!(
+                    "DELETE FROM {LASTFM_DELIVERY_PAUSE_TABLE}
+                     WHERE slot = 1 AND account_binding = ? AND pause_category = ?"
+                ),
+                [
+                    account_binding.as_bytes().to_vec().into(),
+                    expected.code().into(),
+                ],
+            ))
+            .await
+            .map_err(|_| LastFmQueueError::Storage)?;
+        if deleted.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(LastFmQueueError::StaleBatch)
+        }
+    }
+    .await;
+    finish_transaction(transaction, result).await
+}
+
 /// Purge private queued metadata only for the expected current account.
 ///
 /// A stale disconnect cannot erase a successor account's rows. The lifecycle
@@ -683,7 +857,7 @@ pub async fn purge_account(
     account_binding: LastFmAccountBinding,
 ) -> Result<u64, LastFmQueueError> {
     let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
-    match queue_has_other_binding(&transaction, account_binding).await {
+    match account_state_has_other_binding(&transaction, account_binding).await {
         Ok(false) => {}
         Ok(true) => {
             let _ = transaction.rollback().await;
@@ -702,6 +876,25 @@ pub async fn purge_account(
         let _ = transaction.rollback().await;
         return Err(LastFmQueueError::Storage);
     };
+    let pause_marked = transaction
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            format!(
+                "INSERT INTO {LASTFM_DELIVERY_PAUSE_TABLE}
+                 (slot, account_binding, pause_category) VALUES (1, ?, ?)
+                 ON CONFLICT(slot) DO UPDATE SET pause_category = excluded.pause_category
+                 WHERE account_binding = excluded.account_binding"
+            ),
+            [
+                account_binding.as_bytes().to_vec().into(),
+                LastFmDurablePause::CredentialCleanupRequired.code().into(),
+            ],
+        ))
+        .await;
+    if !matches!(pause_marked, Ok(result) if result.rows_affected() == 1) {
+        let _ = transaction.rollback().await;
+        return Err(LastFmQueueError::Storage);
+    }
     transaction
         .commit()
         .await
@@ -732,27 +925,34 @@ pub async fn purge_quarantined_after_admission_closed(
         .await
         .map_err(|_| LastFmQueueError::Storage);
     let cutoff = match cutoff {
-        Ok(Some(cutoff)) => cutoff,
-        Ok(None) => {
-            transaction
-                .commit()
-                .await
-                .map_err(|_| LastFmQueueError::Storage)?;
-            return Ok(0);
-        }
+        Ok(cutoff) => cutoff,
         Err(error) => {
             let _ = transaction.rollback().await;
             return Err(error);
         }
     };
 
-    let deleted = match purge_through_cutoff(&transaction, cutoff).await {
-        Ok(deleted) => deleted,
-        Err(error) => {
-            let _ = transaction.rollback().await;
-            return Err(error);
-        }
+    let deleted = match cutoff {
+        Some(cutoff) => match purge_through_cutoff(&transaction, cutoff).await {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        },
+        None => 0,
     };
+    let pause_deleted = transaction
+        .execute(Statement::from_string(
+            DbBackend::Sqlite,
+            format!("DELETE FROM {LASTFM_DELIVERY_PAUSE_TABLE}"),
+        ))
+        .await;
+    if let Err(error) = pause_deleted {
+        let _ = transaction.rollback().await;
+        let _ = error;
+        return Err(LastFmQueueError::Storage);
+    }
     transaction
         .commit()
         .await
@@ -778,9 +978,19 @@ pub async fn validate_account_queue(
     db: &DatabaseConnection,
     account_binding: LastFmAccountBinding,
 ) -> Result<u64, LastFmQueueError> {
+    validate_account_queue_state(db, account_binding)
+        .await
+        .map(|state| state.pending_scrobbles)
+}
+
+/// Validate and load the complete retained account state in one transaction.
+pub(super) async fn validate_account_queue_state(
+    db: &DatabaseConnection,
+    account_binding: LastFmAccountBinding,
+) -> Result<LastFmValidatedQueueState, LastFmQueueError> {
     let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
     let result = async {
-        if queue_has_other_binding(&transaction, account_binding).await? {
+        if account_state_has_other_binding(&transaction, account_binding).await? {
             return Err(LastFmQueueError::AccountMismatch);
         }
 
@@ -801,22 +1011,41 @@ pub async fn validate_account_queue(
             u64::try_from(rows.len()).map_err(|_| LastFmQueueError::CorruptStorage)?;
         if loaded_count != count
             || rows
-                .into_iter()
+                .iter()
+                .cloned()
                 .any(|row| StoredLastFmScrobble::try_from(row).is_err())
         {
             return Err(LastFmQueueError::CorruptStorage);
         }
-        Ok(count)
+        let oldest_next_attempt_at_ms = rows.first().map(|row| row.next_attempt_at_ms);
+        let durable_pause = load_pause(&transaction)
+            .await?
+            .map(|(binding, pause)| {
+                if binding == *account_binding.as_bytes() {
+                    Ok(pause)
+                } else {
+                    Err(LastFmQueueError::AccountMismatch)
+                }
+            })
+            .transpose()?;
+        if durable_pause == Some(LastFmDurablePause::CredentialCleanupRequired) && count != 0 {
+            return Err(LastFmQueueError::CorruptStorage);
+        }
+        Ok(LastFmValidatedQueueState {
+            pending_scrobbles: count,
+            oldest_next_attempt_at_ms,
+            durable_pause,
+        })
     }
     .await;
 
     match result {
-        Ok(count) => {
+        Ok(state) => {
             transaction
                 .commit()
                 .await
                 .map_err(|_| LastFmQueueError::Storage)?;
-            Ok(count)
+            Ok(state)
         }
         Err(error) => {
             let _ = transaction.rollback().await;
@@ -825,11 +1054,76 @@ pub async fn validate_account_queue(
     }
 }
 
+/// Inspect the only vault-independent startup state which can be recovered
+/// safely without account credentials.
+pub(super) async fn has_empty_cleanup_tombstone(
+    db: &DatabaseConnection,
+) -> Result<Option<[u8; 32]>, LastFmQueueError> {
+    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let result = async {
+        let count = lastfm_scrobble::Entity::find()
+            .count(&transaction)
+            .await
+            .map_err(|_| LastFmQueueError::Storage)?;
+        match load_pause(&transaction).await? {
+            Some((binding, LastFmDurablePause::CredentialCleanupRequired)) if count == 0 => {
+                Ok(Some(binding))
+            }
+            Some((_, LastFmDurablePause::CredentialCleanupRequired)) => {
+                Err(LastFmQueueError::CorruptStorage)
+            }
+            Some(_) | None => Ok(None),
+        }
+    }
+    .await;
+    finish_transaction(transaction, result).await
+}
+
+/// Clear only the empty cleanup tombstone after the lifecycle owner proved the
+/// vault record is already absent. No other pause category is recoverable here.
+pub(super) async fn clear_empty_cleanup_after_missing_vault(
+    db: &DatabaseConnection,
+    expected_binding: [u8; 32],
+    _authority: &LastFmClosedAndDrainedQueue,
+) -> Result<(), LastFmQueueError> {
+    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let result = async {
+        let count = lastfm_scrobble::Entity::find()
+            .count(&transaction)
+            .await
+            .map_err(|_| LastFmQueueError::Storage)?;
+        if count != 0 {
+            return Err(LastFmQueueError::CorruptStorage);
+        }
+        let deleted = transaction
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                format!(
+                    "DELETE FROM {LASTFM_DELIVERY_PAUSE_TABLE}
+                     WHERE slot = 1 AND account_binding = ? AND pause_category = ?"
+                ),
+                [
+                    expected_binding.to_vec().into(),
+                    LastFmDurablePause::CredentialCleanupRequired.code().into(),
+                ],
+            ))
+            .await
+            .map_err(|_| LastFmQueueError::Storage)?;
+        if deleted.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(LastFmQueueError::StaleBatch)
+        }
+    }
+    .await;
+    finish_transaction(transaction, result).await
+}
+
 async fn validate_receipt<C>(db: &C, receipt: &LastFmBatchReceipt) -> Result<(), LastFmQueueError>
 where
     C: ConnectionTrait,
 {
-    if queue_has_other_binding(db, receipt.account_binding).await? {
+    if account_state_has_other_binding(db, receipt.account_binding).await? {
         return Err(LastFmQueueError::AccountMismatch);
     }
     let current = load_prefix(db, receipt.account_binding, receipt.rows.len()).await?;
@@ -867,8 +1161,8 @@ fn same_payload(model: &lastfm_scrobble::Model, input: &PendingLastFmScrobble) -
         && model.album.as_ref().map(StoredMetadataText::as_str) == input.payload.album.as_deref()
         && model.album_artist.as_ref().map(StoredMetadataText::as_str)
             == input.payload.album_artist.as_deref()
-        && model.track_number == input.payload.track_number
-        && model.duration_secs == input.payload.duration_secs
+        && model.track_number.map(StoredTrackNumber::get) == input.payload.track_number
+        && model.duration_secs.get() == input.payload.duration_secs
         && model.started_at_unix_secs.get() == input.payload.started_at_unix_secs
 }
 
@@ -885,6 +1179,129 @@ where
         .await
         .map(|count| count != 0)
         .map_err(|_| LastFmQueueError::Storage)
+}
+
+async fn pause_has_other_binding<C>(
+    db: &C,
+    account_binding: LastFmAccountBinding,
+) -> Result<bool, LastFmQueueError>
+where
+    C: ConnectionTrait,
+{
+    db.query_one(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        format!(
+            "SELECT 1 AS present FROM {LASTFM_DELIVERY_PAUSE_TABLE}
+             WHERE account_binding <> ? LIMIT 1"
+        ),
+        [account_binding.as_bytes().to_vec().into()],
+    ))
+    .await
+    .map(|row| row.is_some())
+    .map_err(|_| LastFmQueueError::Storage)
+}
+
+async fn account_state_has_other_binding<C>(
+    db: &C,
+    account_binding: LastFmAccountBinding,
+) -> Result<bool, LastFmQueueError>
+where
+    C: ConnectionTrait,
+{
+    if queue_has_other_binding(db, account_binding).await? {
+        return Ok(true);
+    }
+    pause_has_other_binding(db, account_binding).await
+}
+
+async fn load_pause<C>(db: &C) -> Result<Option<([u8; 32], LastFmDurablePause)>, LastFmQueueError>
+where
+    C: ConnectionTrait,
+{
+    let rows = db
+        .query_all(Statement::from_string(
+            DbBackend::Sqlite,
+            format!(
+                "SELECT slot, account_binding, pause_category
+                 FROM {LASTFM_DELIVERY_PAUSE_TABLE} ORDER BY slot"
+            ),
+        ))
+        .await
+        .map_err(|_| LastFmQueueError::Storage)?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    if rows.len() != 1 || row.try_get::<i64>("", "slot").ok() != Some(1) {
+        return Err(LastFmQueueError::CorruptStorage);
+    }
+    let binding = row
+        .try_get::<Vec<u8>>("", "account_binding")
+        .map_err(|_| LastFmQueueError::CorruptStorage)?;
+    let binding: [u8; 32] = binding
+        .try_into()
+        .map_err(|_| LastFmQueueError::CorruptStorage)?;
+    let category = row
+        .try_get::<i64>("", "pause_category")
+        .map_err(|_| LastFmQueueError::CorruptStorage)?;
+    Ok(Some((binding, LastFmDurablePause::from_code(category)?)))
+}
+
+async fn persist_pause_in_transaction<C>(
+    db: &C,
+    account_binding: LastFmAccountBinding,
+    pause: LastFmDurablePause,
+) -> Result<(), LastFmQueueError>
+where
+    C: ConnectionTrait,
+{
+    let inserted = db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            format!(
+                "INSERT INTO {LASTFM_DELIVERY_PAUSE_TABLE}
+                 (slot, account_binding, pause_category) VALUES (1, ?, ?)
+                 ON CONFLICT(slot) DO NOTHING"
+            ),
+            [
+                account_binding.as_bytes().to_vec().into(),
+                pause.code().into(),
+            ],
+        ))
+        .await
+        .map_err(|_| LastFmQueueError::Storage)?;
+    if inserted.rows_affected() == 1 {
+        return Ok(());
+    }
+    match load_pause(db).await? {
+        Some((binding, retained))
+            if binding == *account_binding.as_bytes() && retained == pause =>
+        {
+            Ok(())
+        }
+        Some((binding, _)) if binding != *account_binding.as_bytes() => {
+            Err(LastFmQueueError::AccountMismatch)
+        }
+        Some(_) | None => Err(LastFmQueueError::StaleBatch),
+    }
+}
+
+async fn finish_transaction<T>(
+    transaction: sea_orm::DatabaseTransaction,
+    result: Result<T, LastFmQueueError>,
+) -> Result<T, LastFmQueueError> {
+    match result {
+        Ok(value) => {
+            transaction
+                .commit()
+                .await
+                .map_err(|_| LastFmQueueError::Storage)?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
+    }
 }
 
 async fn purge_through_cutoff<C>(db: &C, cutoff: i64) -> Result<u64, LastFmQueueError>
@@ -924,7 +1341,15 @@ fn canonical_optional_text(value: Option<String>) -> Result<Option<String>, Last
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::{Database, EntityTrait};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use sea_orm::{
+        ActiveValue::{NotSet, Set},
+        Database, EntityTrait, SqlxSqliteConnector,
+    };
 
     use super::*;
     use sea_orm_migration::MigratorTrait;
@@ -938,6 +1363,70 @@ mod tests {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         db
+    }
+
+    async fn pooled_file_database() -> (tempfile::TempDir, DatabaseConnection) {
+        let directory = tempfile::tempdir().expect("create Last.fm queue database directory");
+        let pool = SqlitePoolOptions::new()
+            .min_connections(2)
+            .max_connections(4)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(directory.path().join("lastfm-queue.db"))
+                    .create_if_missing(true)
+                    .foreign_keys(true)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .busy_timeout(Duration::from_secs(5)),
+            )
+            .await
+            .expect("open pooled Last.fm queue database");
+        assert!(pool.size() >= 2, "fixture requires distinct SQLite writers");
+        let db = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
+        Migrator::up(&db, None)
+            .await
+            .expect("run Last.fm queue migrations");
+        crate::db::migration::revalidate_critical_objects(&db)
+            .await
+            .expect("revalidate canonical Last.fm queue schema");
+        (directory, db)
+    }
+
+    async fn seed_canonical_rows(
+        db: &DatabaseConnection,
+        account_binding: LastFmAccountBinding,
+        count: usize,
+    ) -> Vec<Uuid> {
+        const SEED_CHUNK_ROWS: usize = 500;
+
+        let occurrence_ids = (0..count).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        let transaction = db.begin().await.expect("begin bulk seed transaction");
+        for chunk in occurrence_ids.chunks(SEED_CHUNK_ROWS) {
+            let rows = chunk
+                .iter()
+                .map(|occurrence_id| lastfm_scrobble::ActiveModel {
+                    id: NotSet,
+                    occurrence_id: Set(occurrence_id.as_bytes().to_vec().into()),
+                    account_binding: Set(account_binding.as_bytes().to_vec().into()),
+                    artist: Set("Seed Artist".to_owned().into()),
+                    track_title: Set("Seed Track".to_owned().into()),
+                    album: Set(Some("Seed Album".to_owned().into())),
+                    album_artist: Set(None),
+                    track_number: Set(Some(1.into())),
+                    duration_secs: Set(60.into()),
+                    started_at_unix_secs: Set(1_700_000_000_i64.into()),
+                    attempt_count: Set(0),
+                    next_attempt_at_ms: Set(0),
+                });
+            lastfm_scrobble::Entity::insert_many(rows)
+                .exec(&transaction)
+                .await
+                .expect("insert canonical Last.fm seed chunk");
+        }
+        transaction
+            .commit()
+            .await
+            .expect("commit canonical Last.fm seed rows");
+        occurrence_ids
     }
 
     fn binding(username: &str) -> LastFmAccountBinding {
@@ -991,6 +1480,224 @@ mod tests {
             enqueue(&db, &input(account, title)).await.unwrap();
         }
         assert_eq!(validate_account_queue(&db, account).await.unwrap(), 3);
+        assert_eq!(
+            validate_account_queue_state(&db, account).await.unwrap(),
+            LastFmValidatedQueueState {
+                pending_scrobbles: 3,
+                oldest_next_attempt_at_ms: Some(0),
+                durable_pause: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_pause_is_account_bound_receipt_checked_and_category_cas_cleared() {
+        let db = database().await;
+        let account = binding("listener");
+        enqueue(&db, &input(account, "Retained")).await.unwrap();
+        let receipt = batch(&db, account, 0, 50).await;
+
+        persist_pause_for_receipt(&db, &receipt, LastFmDurablePause::Compatibility)
+            .await
+            .unwrap();
+        assert_eq!(
+            validate_account_queue_state(&db, account).await.unwrap(),
+            LastFmValidatedQueueState {
+                pending_scrobbles: 1,
+                oldest_next_attempt_at_ms: Some(0),
+                durable_pause: Some(LastFmDurablePause::Compatibility),
+            }
+        );
+        enqueue(&db, &input(account, "Admitted while compatible"))
+            .await
+            .unwrap();
+        assert_eq!(
+            enqueue(&db, &input(binding("other"), "Wrong account"))
+                .await
+                .unwrap_err(),
+            LastFmQueueError::AccountMismatch
+        );
+        assert_eq!(
+            clear_exact_pause(&db, account, LastFmDurablePause::Capability)
+                .await
+                .unwrap_err(),
+            LastFmQueueError::StaleBatch
+        );
+        assert_eq!(
+            validate_account_queue_state(&db, account)
+                .await
+                .unwrap()
+                .durable_pause,
+            Some(LastFmDurablePause::Compatibility)
+        );
+        replace_exact_pause(
+            &db,
+            account,
+            LastFmDurablePause::Compatibility,
+            LastFmDurablePause::Capability,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replace_exact_pause(
+                &db,
+                account,
+                LastFmDurablePause::Compatibility,
+                LastFmDurablePause::Capability,
+            )
+            .await
+            .unwrap_err(),
+            LastFmQueueError::StaleBatch
+        );
+        assert_eq!(
+            persist_pause_for_account(&db, account, LastFmDurablePause::CredentialCleanupRequired,)
+                .await
+                .unwrap_err(),
+            LastFmQueueError::InvalidInput
+        );
+        clear_exact_pause(&db, account, LastFmDurablePause::Capability)
+            .await
+            .unwrap();
+        assert_eq!(
+            validate_account_queue_state(&db, account)
+                .await
+                .unwrap()
+                .durable_pause,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_receipt_cannot_install_a_pause_and_invalid_category_is_corrupt() {
+        let db = database().await;
+        let account = binding("listener");
+        enqueue(&db, &input(account, "Retained")).await.unwrap();
+        let receipt = batch(&db, account, 0, 50).await;
+        db.execute_unprepared(
+            "UPDATE lastfm_scrobble_queue
+             SET attempt_count = 1, next_attempt_at_ms = 30_000",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            persist_pause_for_receipt(&db, &receipt, LastFmDurablePause::ReauthenticationRequired,)
+                .await
+                .unwrap_err(),
+            LastFmQueueError::StaleBatch
+        );
+        assert_eq!(
+            validate_account_queue_state(&db, account)
+                .await
+                .unwrap()
+                .durable_pause,
+            None
+        );
+
+        db.execute_unprepared("PRAGMA ignore_check_constraints = ON")
+            .await
+            .unwrap();
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO lastfm_delivery_pause (slot, account_binding, pause_category)
+             VALUES (1, ?, 5)",
+            [account.as_bytes().to_vec().into()],
+        ))
+        .await
+        .unwrap();
+        db.execute_unprepared("PRAGMA ignore_check_constraints = OFF")
+            .await
+            .unwrap();
+        assert_eq!(
+            validate_account_queue_state(&db, account)
+                .await
+                .unwrap_err(),
+            LastFmQueueError::CorruptStorage
+        );
+    }
+
+    #[tokio::test]
+    async fn account_purge_marks_cleanup_and_recovery_removes_state_with_an_empty_queue() {
+        let db = database().await;
+        let account = binding("listener");
+        persist_pause_for_account(&db, account, LastFmDurablePause::Capability)
+            .await
+            .unwrap();
+        assert_eq!(purge_account(&db, account).await.unwrap(), 0);
+        assert_eq!(purge_account(&db, account).await.unwrap(), 0);
+        assert_eq!(
+            validate_account_queue_state(&db, account)
+                .await
+                .unwrap()
+                .durable_pause,
+            Some(LastFmDurablePause::CredentialCleanupRequired)
+        );
+        assert_eq!(
+            has_empty_cleanup_tombstone(&db).await.unwrap(),
+            Some(*account.as_bytes())
+        );
+
+        let authority = LastFmClosedAndDrainedQueue::issue_after_barrier();
+        assert_eq!(
+            purge_quarantined_after_admission_closed(&db, &authority)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            validate_account_queue_state(&db, account)
+                .await
+                .unwrap()
+                .durable_pause,
+            None
+        );
+
+        persist_pause_for_account(&db, account, LastFmDurablePause::Compatibility)
+            .await
+            .unwrap();
+        assert_eq!(
+            purge_quarantined_after_admission_closed(&db, &authority)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            validate_account_queue_state(&db, account)
+                .await
+                .unwrap()
+                .durable_pause,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_vault_cleanup_clear_is_bound_to_the_inspected_tombstone() {
+        let db = database().await;
+        let predecessor = binding("predecessor");
+        let successor = binding("successor");
+        purge_account(&db, predecessor).await.unwrap();
+        let inspected = has_empty_cleanup_tombstone(&db).await.unwrap().unwrap();
+
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE lastfm_delivery_pause SET account_binding = ? WHERE slot = 1",
+            [successor.as_bytes().to_vec().into()],
+        ))
+        .await
+        .unwrap();
+        let authority = LastFmClosedAndDrainedQueue::issue_after_barrier();
+        assert_eq!(
+            clear_empty_cleanup_after_missing_vault(&db, inspected, &authority)
+                .await
+                .unwrap_err(),
+            LastFmQueueError::StaleBatch
+        );
+        assert_eq!(
+            validate_account_queue_state(&db, successor)
+                .await
+                .unwrap()
+                .durable_pause,
+            Some(LastFmDurablePause::CredentialCleanupRequired)
+        );
     }
 
     #[tokio::test]
@@ -1079,6 +1786,108 @@ mod tests {
             LastFmQueueError::Full
         );
         assert_eq!(queue_len(&db).await.unwrap(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_cap_linearizes_two_concurrent_file_database_writers() {
+        let (_directory, db) = pooled_file_database().await;
+        let account = binding("listener");
+        let seed_count = usize::try_from(MAX_LASTFM_QUEUE_ROWS - 1).unwrap();
+        let seeded_occurrences = seed_canonical_rows(&db, account, seed_count).await;
+        assert_eq!(
+            validate_account_queue(&db, account).await.unwrap(),
+            MAX_LASTFM_QUEUE_ROWS - 1
+        );
+
+        let first = input(account, "First boundary contender");
+        let second = input(account, "Second boundary contender");
+        assert_ne!(first.occurrence_id(), second.occurrence_id());
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+        let first_task = {
+            let db = db.clone();
+            let input = first.clone();
+            let start = Arc::clone(&start);
+            tokio::spawn(async move {
+                start.wait().await;
+                enqueue(&db, &input).await
+            })
+        };
+        let second_task = {
+            let db = db.clone();
+            let input = second.clone();
+            let start = Arc::clone(&start);
+            tokio::spawn(async move {
+                start.wait().await;
+                enqueue(&db, &input).await
+            })
+        };
+        start.wait().await;
+        let (first_result, second_result) = tokio::join!(first_task, second_task);
+        let first_result = first_result.expect("first writer task completed");
+        let second_result = second_result.expect("second writer task completed");
+        let (winner, loser, winner_row_id) = match (&first_result, &second_result) {
+            (Ok(LastFmEnqueueOutcome::Inserted { row_id }), Err(LastFmQueueError::Full)) => {
+                (&first, &second, *row_id)
+            }
+            (Err(LastFmQueueError::Full), Ok(LastFmEnqueueOutcome::Inserted { row_id })) => {
+                (&second, &first, *row_id)
+            }
+            outcomes => panic!("expected one inserted writer and one full writer: {outcomes:?}"),
+        };
+
+        assert_eq!(queue_len(&db).await.unwrap(), MAX_LASTFM_QUEUE_ROWS);
+        assert_eq!(
+            validate_account_queue(&db, account).await.unwrap(),
+            MAX_LASTFM_QUEUE_ROWS
+        );
+        let stored = models(&db)
+            .await
+            .into_iter()
+            .map(StoredLastFmScrobble::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("every retained row remains canonical");
+        assert_eq!(
+            stored.len(),
+            usize::try_from(MAX_LASTFM_QUEUE_ROWS).unwrap()
+        );
+        assert!(stored
+            .iter()
+            .all(|row| row.account_binding == *account.as_bytes()));
+
+        let retained_occurrences = stored
+            .iter()
+            .map(|row| row.occurrence_id)
+            .collect::<HashSet<_>>();
+        assert!(seeded_occurrences
+            .iter()
+            .all(|occurrence_id| retained_occurrences.contains(occurrence_id)));
+        assert!(retained_occurrences.contains(&winner.occurrence_id()));
+        assert!(!retained_occurrences.contains(&loser.occurrence_id()));
+
+        let retained_winner = stored
+            .iter()
+            .find(|row| row.occurrence_id == winner.occurrence_id())
+            .expect("inserted boundary winner remains queued");
+        assert_eq!(retained_winner.id, winner_row_id);
+        assert_eq!(
+            retained_winner.account_binding,
+            *winner.account_binding().as_bytes()
+        );
+        assert_eq!(retained_winner.artist, winner.artist());
+        assert_eq!(retained_winner.track_title, winner.track_title());
+        assert_eq!(retained_winner.album.as_deref(), winner.album());
+        assert_eq!(
+            retained_winner.album_artist.as_deref(),
+            winner.album_artist()
+        );
+        assert_eq!(retained_winner.track_number, winner.track_number());
+        assert_eq!(retained_winner.duration_secs, winner.duration_secs());
+        assert_eq!(
+            retained_winner.started_at_unix_secs,
+            winner.started_at_unix_secs()
+        );
+        assert_eq!(retained_winner.attempt_count, 0);
+        assert_eq!(retained_winner.next_attempt_at_ms, 0);
     }
 
     #[tokio::test]
@@ -1239,6 +2048,13 @@ mod tests {
         );
         assert_eq!(queue_len(&db).await.unwrap(), 1);
         assert_eq!(purge_account(&db, first_account).await.unwrap(), 1);
+        clear_exact_pause(
+            &db,
+            first_account,
+            LastFmDurablePause::CredentialCleanupRequired,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             lastfm_scrobble::Entity::find()
                 .all(&db)
@@ -1288,6 +2104,13 @@ mod tests {
         );
 
         assert_eq!(purge_account(&db, successor_account).await.unwrap(), 1);
+        clear_exact_pause(
+            &db,
+            successor_account,
+            LastFmDurablePause::CredentialCleanupRequired,
+        )
+        .await
+        .unwrap();
         enqueue(&db, &input(retired_account, "Unrecoverable private row"))
             .await
             .unwrap();
@@ -1539,7 +2362,8 @@ mod tests {
             assert!(!diagnostics.contains(&occurrence_id.to_string()));
             assert!(!diagnostics.contains("1700987654"));
             assert!(!diagnostics.contains("LastFmAccountBinding"));
-            assert!(diagnostics.contains("duration_secs: 321"));
+            assert!(!diagnostics.contains("duration_secs"));
+            assert!(!diagnostics.contains("321"));
         }
     }
 

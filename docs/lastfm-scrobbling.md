@@ -1,7 +1,8 @@
 # Last.fm scrobbling contract
 
-- Status: accepted P2.1 design; protocol/vault/queue foundation implemented; playback/runtime/UI pending
+- Status: accepted P2.1 design; internal protocol/vault/queue/delivery/lifecycle runtime implemented; product integration pending
 - Decision date: 2026-07-20
+- Implementation status date: 2026-07-21
 - Tracking issue: [#50](https://github.com/jm2/tributary/issues/50)
 - Playback evidence foundation: [`playback-history.md`](playback-history.md)
 
@@ -10,13 +11,66 @@ is retained, and how qualified scrobbles survive offline operation. The feature 
 opt-in and fail-closed: loading a URI, selecting a row, or receiving unowned output progress is not
 permission to disclose listening activity.
 
-The implemented foundation includes the bounded signed HTTPS client, strict versioned native-vault
-record and one-way account binding, migration 17, atomic capped FIFO admission, exact batch
-settlement/rescheduling, binding-safe disconnect purge, and closed-and-drained missing-vault
-recovery. It is intentionally not exposed as a partial feature: playback evidence wiring, delivery
-and lifecycle ownership, consent/per-source policy, account and status UI, localization, and
-release-time production credentials remain. The countable P2.1 record stays open until those layers
-and their full acceptance matrix land.
+## Dated implementation boundary
+
+The following inventory describes the internal implementation as of 2026-07-21. The rest of this
+document remains the accepted normative contract for the complete feature; present-tense contract
+language does not mean that every required product layer or acceptance case has shipped.
+
+The implemented internal foundation includes:
+
+- the bounded signed HTTPS client, strict response parsing, versioned native-vault record, one-way
+  account binding, migration 17's atomic account-bound 10,000-row FIFO, and migration 18's exact
+  binding-only fixed-category durable delivery/credential-cleanup singleton;
+- an explicit `LastFmRuntimeActivation` capability intended for a future issuer that has first
+  established consent and build enablement. No production application path issues that capability
+  yet;
+- runtime-only account attachment: playback-facing admission accepts a validated unbound scrobble,
+  and the runtime attaches the current account's vault-derived binding at its ingress gate before
+  sending the bound command to the serialized owner, including during that exact account's
+  reauthorization;
+- a serialized actor with bounded admission for 64 ordinary metadata commands and three reserved
+  control slots, so delivery and lifecycle work cannot be starved by the ordinary FIFO;
+- one oldest-first delivery worker, batches of at most 50 rows, and at most one request in flight.
+  The worker prepares and submits data but cannot mutate SQLite; the actor owns exact-receipt
+  terminal settlement, durable rescheduling, and bounded accepted/ignored/rejected counters;
+- a closed delivery classification: only timeout, transport, provider codes 8/11/16/29, and HTTP
+  temporary-service/rate-limit failures retry, using durable 30-second exponential backoff capped
+  at one hour. Accepted,
+  ignored, and recognized terminal service results settle; incompatible HTTP/body/response results
+  retain and quarantine the exact batch; and code 9 retains the queue for reauthorization. When
+  SQLite accepts a pause, its commit precedes worker stop, survives restart without spawning a
+  worker, and clears only through exact reauthorization or an opaque category- and runtime-bound
+  explicit recovery command. If persistence fails, the actor closes admission, reports a fixed
+  storage/capability failure, and stops the worker without claiming a restart-stable pause;
+- a same-account live-reauthorization handoff that preserves the opaque account binding, admits one
+  secret-bearing transition through completion, atomically excludes disconnect while it owns the
+  transition, keeps queue admission open for that same binding while network delivery is stopped,
+  and cannot restart delivery or publish `Active` after shutdown closes admission;
+- checked delivery generations and stale-result retirement, including retention and replay when a
+  request may have been accepted remotely before local terminal deletion. This is deliberately
+  at-least-once delivery, not an exactly-once claim;
+- lifecycle-owned disconnect, shutdown, and vault recovery: disconnect retires delivery,
+  atomically replaces the purged queue with a cleanup tombstone, and clears that marker only after
+  exact credential deletion; failed vault or marker cleanup is restart-stable and retryable, shutdown
+  closes admission and drains admitted durable work while cancelling and joining network work, and
+  runtime startup plus explicit missing/corrupt-vault recovery share a process-wide vault lease so
+  successor ownership cannot overlap blocking vault operations or destructive recovery; and
+- process-wide panic reporting that emits fixed diagnostics and never renders a panic payload,
+  including payloads from caught worker, actor, or blocking-operation panics. Actor unwind is
+  caught while its complete owner state and vault lease remain retained; ingress closes, the
+  worker/relay are cancelled and joined, then the owner attempts to commit or validate a durable
+  capability pause for any still-unpurged account before releasing the lease. If SQLite cannot
+  establish that pause, the shutdown proof remains failed and no durable-pause claim is made.
+
+This foundation is intentionally not exposed as a partial user feature. Still remaining are the
+generation-owned playback observer, exact threshold and one-shot now-playing wiring; desktop
+browser authorization and its latest-only token lifecycle; consent, enablement, per-source policy,
+account replacement, and a production activation issuer; application startup/shutdown integration;
+settings, status, valid-vault corrupt-queue recovery, accessibility, and all localization UI;
+release-time production credential injection and package verification; and the remaining
+end-to-end and platform acceptance matrix. The countable P2.1 record stays open until those layers
+land.
 
 The central rule is:
 
@@ -48,7 +102,7 @@ response at runtime.
 
 ## Delivery boundary and non-goals
 
-The initial implementation includes one active Last.fm account, browser authorization, secure
+The accepted initial P2.1 scope requires one active Last.fm account, browser authorization, secure
 session retention, now-playing notification, durable scrobbling, explicit source policy, localized
 status and recovery, and bounded fake-service coverage. It does not include:
 
@@ -149,12 +203,14 @@ platform's operating-system credential vault (Secret Service/libsecret, macOS Ke
 Credential Manager through the selected maintained abstraction). There is no plaintext database,
 configuration-file, environment-variable, command-line, log, or home-directory fallback.
 
-Vault creation, lookup, update, or deletion failure disables request and queue admission
+Vault creation, startup lookup, or deletion failure disables request and queue admission
 immediately and presents a fixed localized **secure storage unavailable** state. A transient vault
 read failure does not silently purge a queue or create another account; delivery remains paused
 until the exact record can be recovered. A missing record while preferences claim the feature is
-enabled is the same fail-closed state. Corrupt or oversized fields are rejected without including
-their contents in diagnostics.
+enabled is the same fail-closed state. During exact same-account code-9 reauthorization, a failed
+vault update retains the already-valid prior record and durable reauthentication marker: network
+delivery stays stopped, but offline queue admission may remain open for that same binding. Corrupt
+or oversized fields are rejected without including their contents in diagnostics.
 
 When a missing or corrupt vault record cannot be recovered, the settings surface may offer an
 explicit **Discard quarantined scrobbles** recovery action. It first closes occurrence and queue
@@ -247,7 +303,7 @@ credit, but each occurrence has a one-shot scrobble-admission latch.
 For an eligible occurrence, Tributary attempts `track.updateNowPlaying` once, immediately after the
 first authoritative playing evidence. The request uses the exact frozen metadata and current vault
 session. It is cancellable, generation-owned, and bounded, but it is never persisted or retried.
-Offline state, a timeout, network failure, service code 11/16, malformed response, shutdown, or
+Offline state, a timeout, network failure, service code 8/11/16/29, malformed response, shutdown, or
 supersession simply ends that occurrence's now-playing attempt.
 
 Error code 9 still pauses subsequent Last.fm work and exposes **reauthorization required**, but the
@@ -269,10 +325,12 @@ at 240,000 milliseconds. Unknown-duration and at-most-30-second occurrences neve
 natural end or after four minutes. Natural end by itself grants no missing credit.
 
 When the threshold is crossed, the occurrence closes its admission latch before synchronously
-submitting one queue-insert command. The database transaction rechecks the active account binding
-and global queue cap, then commits before any scrobble network request may include that row. A
-failed insert or full queue cannot be reconstructed from later events because the occurrence latch
-stays closed; it produces a visible fixed-category failure rather than risking duplicate admission.
+submitting one queue-insert command. Runtime ingress attaches the active account binding under its
+gate, the serialized actor rechecks the exact active account and epoch, and the database transaction
+enforces the single queue binding and global cap before committing. No scrobble network request may
+include that row before the commit. A failed insert or full queue cannot be reconstructed from later
+events because the occurrence latch stays closed; it produces a visible fixed-category failure
+rather than risking duplicate admission.
 
 The queue is capped at exactly 10,000 rows globally for the one active account. At the cap,
 Tributary refuses every new qualified row all-or-none and never silently evicts an older scrobble.
@@ -281,7 +339,7 @@ scrobbles are not being saved until pending rows are delivered or purged.
 
 ## Durable queue and privacy boundary
 
-The SQLite migration adds a strictly recognized, account-bound FIFO. Each row persists only:
+SQLite migration 17 adds a strictly recognized, account-bound FIFO. Each row persists only:
 
 - an opaque row identity and monotonic FIFO ordering state;
 - the one-way account-binding digest;
@@ -296,9 +354,29 @@ timestamps, and fixed categories through `Debug`.
 
 FIFO order is admission order, not playback-start order: a long track can qualify after a shorter
 track that started later. The oldest pending rows always block newer rows from being sent ahead.
-The migration is transactional and idempotent, validates an already-present table and indexes, and
-refuses a downgrade while any queue row exists. An empty queue may be downgraded without leaving
-account or listening metadata behind.
+Migration 18 upgrades an already-applied migration-17 database with one exact singleton delivery
+gate. Its only fields are the singleton slot, the same one-way account-binding digest, and one fixed
+numeric category: reauthentication, compatibility, capability, or credential cleanup required. It
+contains no username, credential, listening metadata, response, endpoint, or diagnostic text.
+Result-driven pause writes validate the exact receipt; worker-failure pauses validate the current
+account. A successful transaction commits before a Stop acknowledgement or durable paused status
+is published. If that write fails, the actor closes admission and stops delivery with a fixed
+capability/storage failure, but does not describe the uncommitted state as restart-stable. Startup
+reads the queue and marker coherently and restores a committed fixed phase without spawning a
+delivery worker. The cleanup
+category additionally requires an empty queue and opens only the cleanup-retry path: it never
+retains a session in the actor, admits metadata, or starts network work. Code 9 can clear only after
+exact same-account vault reauthorization; compatibility and capability markers require an opaque
+explicit-recovery capability bound to that exact runtime, account epoch, watched pause revision,
+and category. The cleanup marker is not manual-recovery authority. Stale receipts, generations,
+accounts, revisions, recovery categories, or cleanup states change nothing.
+
+Both migrations are transactional and idempotent and validate their already-present tables and
+indexes/constraints. Closed missing/corrupt-vault recovery purges the queue and marker in one
+transaction. Normal disconnect instead atomically purges the queue while replacing any delivery
+pause with the cleanup marker; exact vault deletion and exact cleanup-marker deletion form a second,
+retryable cross-store stage. Downgrade refuses while either a queue row or marker exists; an empty
+state may be downgraded without leaving account or listening metadata behind.
 
 The queue itself is private listening history. It uses the existing application data-file
 permissions, is included in the consent disclosure, and is purged on explicit Last.fm disconnect.
@@ -306,10 +384,16 @@ It is not displayed as a browsable track-history feature or exported through pla
 
 ## Submission, retry, and response handling
 
-One worker owns queue delivery. It acquires the current vault record, verifies the queue binding,
-and sends the oldest eligible rows to `track.scrobble` as an HTTPS form POST. One request contains
-at most 50 rows, preserving FIFO order and Last.fm's indexed parameter/signature rules. At most one
-batch is in flight, so a retrying head cannot be bypassed by new work.
+Runtime startup coherently loads the durable account state and vault authority. An active or
+delivery-paused account requires and retains the exactly matching session. A cleanup marker with a
+still-present matching vault record instead creates a sessionless cleanup-only actor; if the vault
+record is already absent, startup compare-and-deletes only the exact inspected cleanup marker and
+reports typed cleanup completion without exposing an active handle. The runtime otherwise restores
+a durable paused phase without a worker or gives one generation-owned worker the matching session.
+The worker sends the oldest eligible rows to `track.scrobble` as an
+HTTPS form POST. One request contains at most 50 rows, preserving FIFO order and Last.fm's indexed
+parameter/signature rules. At most one batch is in flight, so a retrying head cannot be bypassed by
+new work.
 
 Every request has independent connection and operation deadlines plus a bounded response body.
 HTTP status alone is never treated as success; the worker parses the complete Last.fm envelope and
@@ -320,9 +404,13 @@ The result policy is closed and exhaustive:
 - an explicitly accepted item is terminal-success and is deleted transactionally;
 - an item carrying any nonzero `ignoredMessage` code, including an unknown future ignored code, is
   terminal-ignored and is deleted without automatic modification or resubmission;
-- top-level service codes 11 and 16 are transient and retain the complete batch for retry;
-- DNS, connect, TLS, timeout, response-body interruption, and other failures that leave no complete
-  trustworthy response retain the complete batch for retry;
+- HTTP 429 or 5xx without a recognized provider error envelope is transient and retains the
+  complete batch for retry; a recognized provider envelope retains its own closed classification;
+- top-level service codes 8, 11, and 16 and rate-limit code 29 are transient and retain the complete
+  batch for retry;
+- DNS, connect, TLS, timeout, and response-body stream interruption retain the complete batch for
+  retry; policy failures and a response exceeding the fixed body limit remain compatibility
+  failures rather than transient transport outcomes;
 - top-level code 9 retains the complete queue, closes network admission, and pauses delivery until
   the same account is successfully reauthorized;
 - every other recognized top-level Last.fm error is terminal for that submitted batch and is not
@@ -331,10 +419,20 @@ The result policy is closed and exhaustive:
   were accepted. It retains and quarantines the batch, pauses automatic delivery with a visible
   compatibility failure, and never guesses from aggregate accepted/ignored counts.
 
-Accepted and ignored items may be removed independently from one otherwise valid batch response.
-The durable mutation is committed before another batch starts. Terminal errors and ignored items
-update only bounded aggregate status; raw response text and metadata are not copied into logs or a
-failure ledger.
+Accepted and ignored items are classified independently for bounded aggregate counters, but one
+complete structurally valid terminal response settles its complete exact receipt atomically. The
+durable mutation is committed before another batch starts. Terminal errors and ignored items update
+only bounded aggregate status; raw response text and metadata are not copied into logs or a failure
+ledger.
+
+Reauthentication, compatibility, and capability pauses are durable delivery state, not retry
+timers. Restart never clears them or starts a worker. An ordinary failed same-account vault save
+retains the reauthentication marker and keeps same-binding queue admission open. Compatibility or
+capability delivery resumes only after an explicit runtime/account/revision/category-bound recovery
+request retires the old generation and atomically clears the matching marker; a failed transition
+keeps or atomically replaces a durable closed category rather than exposing an unmarked restart
+window. The credential-cleanup category is separately closed to all delivery and queue admission.
+These internal authorities are not production-wired to UI yet.
 
 Transient retries have no attempt limit. After each transient result, the saturated attempt count
 and a clock-based not-before value are committed using a deterministic exponential schedule that
@@ -359,13 +457,20 @@ there is no automatic correction request.
    now-playing work;
 2. retires the delivery generation so a late response cannot mutate successor state;
 3. drains earlier admitted queue writes, then transactionally purges all Last.fm queue rows and
-   account-scoped retry state; and
-4. deletes the vault account record before reporting completion.
+   account-scoped retry state while installing the exact binding-only credential-cleanup marker;
+4. wipes the retained in-memory session and deletes only the exact matching vault account record;
+   and
+5. compare-and-deletes the cleanup marker before reporting completion.
 
-If the vault deletion fails, the queue remains purged and all Last.fm work remains disabled; the UI
-reports an incomplete secure-store cleanup and offers a retry. Replacing an account uses this same
-path. Tributary cannot retract a request Last.fm accepted before cancellation, so the confirmation
-explains that already-submitted history remains on Last.fm.
+If vault deletion or cleanup-marker deletion fails, the queue remains purged, the durable cleanup
+marker remains authoritative, and all Last.fm work remains disabled; the UI reports an incomplete
+secure-store cleanup and offers a retry. Restart with a matching record restores only a sessionless
+cleanup state and creates no delivery worker. If vault deletion committed immediately before a
+crash, the exact inspected marker plus an absent vault record authorizes idempotent marker cleanup
+and a typed completed outcome without an active handle; a different stored account never does.
+Replacing an account uses this same path. Tributary cannot retract a
+request Last.fm accepted before cancellation, so the confirmation explains that already-submitted
+history remains on Last.fm.
 
 Normal application shutdown first closes the shared playback/Last.fm admission gate. It drains all
 queue INSERT, accepted/terminal DELETE, retry-state, and purge commands admitted before the FIFO
@@ -397,7 +502,7 @@ The implementation is complete only when all of the following are covered:
 - atomic admission-before-network, exact 10,000-row contention at the transaction boundary,
   fail-visible refusal without eviction, FIFO ordering, 50-item batch boundaries, and account
   isolation;
-- accepted, independently ignored, 11, 16, 9, every other known error, unknown ignored code,
+- accepted, independently ignored, 8, 11, 16, 29, 9, every other known error, unknown ignored code,
   non-200 success/failure envelopes, malformed complete responses, interrupted responses, timeout,
   offline/restart backoff, ambiguous accepted-before-delete replay, and correction neutrality;
 - disconnect races, in-flight response retirement, purge-before-vault-delete failure, normal
@@ -406,6 +511,6 @@ The implementation is complete only when all of the following are covered:
 - accessible settings states and exact key/placeholder parity across all 13 shipped locale
   catalogs, with no substantive English fallback.
 
-No CI test calls the public Last.fm service. Protocol tests use a bounded local fake HTTPS/service
-boundary or a transport abstraction, while the release checklist separately verifies that a
+No CI test calls the public Last.fm service. Protocol tests use a bounded local loopback fake
+service or a transport abstraction, while the release checklist separately verifies that a
 production API account is registered, injected, and permitted under Last.fm's current terms.

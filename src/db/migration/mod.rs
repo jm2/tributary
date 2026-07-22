@@ -19,6 +19,7 @@ mod m20260719_000014_server_playlist_links;
 mod m20260720_000015_playlist_sidebar_revision;
 mod m20260720_000016_rhythmbox_import_receipts;
 mod m20260720_000017_lastfm_scrobble_queue;
+mod m20260721_000018_lastfm_delivery_pause;
 
 pub struct Migrator;
 
@@ -43,6 +44,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260720_000015_playlist_sidebar_revision::Migration),
             Box::new(m20260720_000016_rhythmbox_import_receipts::Migration),
             Box::new(m20260720_000017_lastfm_scrobble_queue::Migration),
+            Box::new(m20260721_000018_lastfm_delivery_pause::Migration),
         ]
     }
 }
@@ -54,5 +56,6 @@ pub async fn revalidate_critical_objects(
 ) -> Result<(), DbErr> {
     m20260720_000015_playlist_sidebar_revision::revalidate(db).await?;
     m20260720_000016_rhythmbox_import_receipts::revalidate(db).await?;
-    m20260720_000017_lastfm_scrobble_queue::revalidate(db).await
+    m20260720_000017_lastfm_scrobble_queue::revalidate(db).await?;
+    m20260721_000018_lastfm_delivery_pause::revalidate(db).await
 }

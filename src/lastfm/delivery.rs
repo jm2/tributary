@@ -526,7 +526,7 @@ mod tests {
             LastFmDeliveryDisposition::PauseForReauthentication
         );
         assert_eq!(
-            disposition_for_client_error(LastFmClientError::ServiceRejected { code: 29 }),
+            disposition_for_client_error(LastFmClientError::ServiceRejected { code: 13 }),
             LastFmDeliveryDisposition::SettleTerminal
         );
         for error in [
@@ -560,7 +560,7 @@ mod tests {
             LastFmClientError::ServiceUnavailable,
             LastFmClientError::RateLimited,
             LastFmClientError::ReauthenticationRequired,
-            LastFmClientError::ServiceRejected { code: 29 },
+            LastFmClientError::ServiceRejected { code: 13 },
             LastFmClientError::BodyLimit,
             LastFmClientError::InvalidResponse,
         ] {

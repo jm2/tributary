@@ -9,8 +9,9 @@
 
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
+use futures::FutureExt;
 use sea_orm::DatabaseConnection;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
@@ -28,9 +29,9 @@ use super::storage::{
     self, LastFmEnqueueOutcome, LastFmQueueError, PendingLastFmScrobble, UnboundLastFmScrobble,
 };
 use super::worker::{
-    spawn_lastfm_delivery_worker, LastFmDeliveryAcknowledgement, LastFmDeliveryDirective,
-    LastFmDeliveryEvent, LastFmDeliveryGeneration, LastFmDeliveryWorker,
-    LastFmDeliveryWorkerFailure,
+    spawn_lastfm_delivery_worker, spawn_lastfm_delivery_worker_suspended,
+    LastFmDeliveryAcknowledgement, LastFmDeliveryDirective, LastFmDeliveryEvent,
+    LastFmDeliveryGeneration, LastFmDeliveryWorker, LastFmDeliveryWorkerFailure,
 };
 
 const METADATA_INGRESS_CAPACITY: usize = 64;
@@ -48,6 +49,8 @@ impl LastFmAccountEpoch {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransitionState {
     ReauthorizationInFlight,
+    ManualRecoveryInFlight,
+    DeliveryRestartCommitted,
     DisconnectInFlight,
     PurgeRetry,
     CredentialCleanupInFlight,
@@ -69,6 +72,7 @@ enum IngressPhase {
     Closed,
 }
 
+#[allow(clippy::struct_excessive_bools)] // Each flag is an independent serialized admission proof.
 struct IngressGate {
     phase: IngressPhase,
     queue_admission_open: bool,
@@ -76,6 +80,16 @@ struct IngressGate {
     delivery_event_queued: bool,
     reauthorization_queued: bool,
     delivery_cancellation: Option<CancellationToken>,
+    shutdown_queued: bool,
+    #[cfg(test)]
+    recovery_clear_gate: Option<RecoveryClearGate>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct RecoveryClearGate {
+    reached: async_channel::Sender<()>,
+    release: async_channel::Receiver<()>,
 }
 
 struct HandleInner {
@@ -94,7 +108,8 @@ impl LastFmRuntimeHandle {
     /// Bind and queue one exact validated occurrence for durable insertion.
     ///
     /// The playback side never receives or retains the vault-derived account
-    /// binding. This gate attaches the binding owned by the active runtime.
+    /// binding. This gate attaches the binding owned by the current runtime
+    /// account, including while that exact account's credential is renewed.
     pub fn try_enqueue(
         &self,
         scrobble: UnboundLastFmScrobble,
@@ -105,6 +120,12 @@ impl LastFmRuntimeHandle {
                 account_binding,
                 account_epoch,
             } => (account_binding, account_epoch),
+            IngressPhase::Transitioning {
+                account_binding,
+                account_epoch,
+                state:
+                    TransitionState::ReauthorizationInFlight | TransitionState::ManualRecoveryInFlight,
+            } if ingress.queue_admission_open => (account_binding, account_epoch),
             IngressPhase::Transitioning { .. } => {
                 return Err(LastFmRuntimeAdmissionError::Transitioning);
             }
@@ -202,6 +223,63 @@ impl LastFmRuntimeHandle {
         Ok(LastFmRuntimeOperation { receiver })
     }
 
+    /// Restart one exact compatibility/capability quarantine only after an
+    /// explicit caller has issued the matching manual-recovery capability.
+    pub fn resume_after_manual_recovery(
+        &self,
+        recovery: LastFmManualPauseRecovery,
+    ) -> Result<LastFmRuntimeOperation<()>, LastFmRuntimeAdmissionError> {
+        let mut ingress = self.lock_ingress()?;
+        let (account_binding, account_epoch, previous_phase) = match ingress.phase {
+            phase @ IngressPhase::Active {
+                account_binding,
+                account_epoch,
+            } => (account_binding, account_epoch, phase),
+            IngressPhase::Transitioning { .. } => {
+                return Err(LastFmRuntimeAdmissionError::Transitioning);
+            }
+            IngressPhase::Closed => return Err(LastFmRuntimeAdmissionError::Closed),
+        };
+        let status = *self.inner.status.borrow();
+        let same_runtime = recovery
+            .runtime
+            .upgrade()
+            .is_some_and(|runtime| Arc::ptr_eq(&runtime, &self.inner));
+        if !same_runtime
+            || recovery.account_binding != account_binding
+            || recovery.account_epoch != account_epoch
+            || recovery.status_revision != status.revision
+            || recovery.pause.runtime_phase() != status.phase
+        {
+            return Err(LastFmRuntimeAdmissionError::NotReadyForManualRecovery);
+        }
+        ingress.phase = IngressPhase::Transitioning {
+            account_binding,
+            account_epoch,
+            state: TransitionState::ManualRecoveryInFlight,
+        };
+        let (completion, receiver) = oneshot::channel();
+        let command = Command::ResumeAfterManualRecovery {
+            account_binding,
+            account_epoch,
+            pause: recovery.pause,
+            status_revision: recovery.status_revision,
+            completion,
+        };
+        match self.inner.commands.try_send(command) {
+            Ok(()) => Ok(LastFmRuntimeOperation { receiver }),
+            Err(async_channel::TrySendError::Full(_)) => {
+                ingress.phase = previous_phase;
+                Err(LastFmRuntimeAdmissionError::Busy)
+            }
+            Err(async_channel::TrySendError::Closed(_)) => {
+                ingress.phase = IngressPhase::Closed;
+                ingress.queue_admission_open = false;
+                Err(LastFmRuntimeAdmissionError::Closed)
+            }
+        }
+    }
+
     /// Close enqueue admission and append (or retry) the destructive marker.
     pub fn disconnect_and_purge(
         &self,
@@ -254,6 +332,37 @@ impl LastFmRuntimeHandle {
                 Err(LastFmRuntimeAdmissionError::Closed)
             }
         }
+    }
+
+    /// Capture one single-use recovery authority from this exact paused
+    /// runtime after an explicit user action.
+    pub fn issue_manual_pause_recovery_after_explicit_user_action(
+        &self,
+    ) -> Result<LastFmManualPauseRecovery, LastFmRuntimeAdmissionError> {
+        let ingress = self.lock_ingress()?;
+        let (account_binding, account_epoch) = match ingress.phase {
+            IngressPhase::Active {
+                account_binding,
+                account_epoch,
+            } => (account_binding, account_epoch),
+            IngressPhase::Transitioning { .. } => {
+                return Err(LastFmRuntimeAdmissionError::Transitioning);
+            }
+            IngressPhase::Closed => return Err(LastFmRuntimeAdmissionError::Closed),
+        };
+        let status = *self.inner.status.borrow();
+        let pause = match status.phase {
+            LastFmRuntimePhase::CompatibilityPaused => storage::LastFmDurablePause::Compatibility,
+            LastFmRuntimePhase::CapabilityPaused => storage::LastFmDurablePause::Capability,
+            _ => return Err(LastFmRuntimeAdmissionError::NotReadyForManualRecovery),
+        };
+        Ok(LastFmManualPauseRecovery {
+            runtime: Arc::downgrade(&self.inner),
+            account_binding,
+            account_epoch,
+            status_revision: status.revision,
+            pause,
+        })
     }
 
     /// Retry only the vault deletion after queue purge already committed.
@@ -353,6 +462,8 @@ pub enum LastFmRuntimeAdmissionError {
     NotReadyForReauthorization,
     #[error("Last.fm reauthorization is already pending")]
     ReauthorizationPending,
+    #[error("Last.fm durable pause is not ready for this manual recovery")]
+    NotReadyForManualRecovery,
     #[error("Last.fm credential cleanup must be retried")]
     CredentialCleanupRequired,
     #[error("Last.fm credential cleanup is not ready")]
@@ -464,6 +575,46 @@ impl LastFmRuntimeStatus {
             failure: None,
         }
     }
+
+    fn startup(queue: storage::LastFmValidatedQueueState, now_unix_ms: Option<i64>) -> Self {
+        let mut status = Self::active(queue.pending_scrobbles);
+        if let Some(pause) = queue.durable_pause {
+            status.phase = pause.runtime_phase();
+            status.failure = Some(pause.runtime_failure());
+        } else if queue
+            .oldest_next_attempt_at_ms
+            .zip(now_unix_ms)
+            .is_some_and(|(deadline, now)| deadline > now)
+        {
+            status.phase = LastFmRuntimePhase::BackingOff;
+            status.failure = Some(LastFmRuntimeCommandError::Delivery);
+        }
+        status
+    }
+}
+
+impl storage::LastFmDurablePause {
+    const fn runtime_phase(self) -> LastFmRuntimePhase {
+        match self {
+            Self::ReauthenticationRequired => LastFmRuntimePhase::ReauthenticationRequired,
+            Self::Compatibility => LastFmRuntimePhase::CompatibilityPaused,
+            Self::Capability => LastFmRuntimePhase::CapabilityPaused,
+            Self::CredentialCleanupRequired => LastFmRuntimePhase::CredentialCleanup,
+        }
+    }
+
+    const fn runtime_failure(self) -> LastFmRuntimeCommandError {
+        match self {
+            Self::ReauthenticationRequired => LastFmRuntimeCommandError::ReauthenticationRequired,
+            Self::Compatibility => LastFmRuntimeCommandError::Compatibility,
+            Self::Capability => LastFmRuntimeCommandError::DeliveryCapability,
+            Self::CredentialCleanupRequired => LastFmRuntimeCommandError::CredentialStore,
+        }
+    }
+
+    const fn queue_admission_open(self) -> bool {
+        matches!(self, Self::ReauthenticationRequired | Self::Compatibility)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -520,6 +671,13 @@ enum Command {
         key: ProtectedString,
         completion: oneshot::Sender<Result<(), LastFmRuntimeCommandError>>,
     },
+    ResumeAfterManualRecovery {
+        account_binding: LastFmAccountBinding,
+        account_epoch: LastFmAccountEpoch,
+        pause: storage::LastFmDurablePause,
+        status_revision: u64,
+        completion: oneshot::Sender<Result<(), LastFmRuntimeCommandError>>,
+    },
     DisconnectAndPurge {
         account_binding: LastFmAccountBinding,
         account_epoch: LastFmAccountEpoch,
@@ -536,6 +694,8 @@ enum Command {
         event: LastFmDeliveryEvent,
     },
     Shutdown,
+    #[cfg(test)]
+    PanicForQuiescenceTest,
 }
 
 struct DeliveryRuntime {
@@ -545,17 +705,37 @@ struct DeliveryRuntime {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReauthorizationStart {
+struct DeliveryRetirement {
+    joined: bool,
+    failure: Option<LastFmDeliveryWorkerFailure>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransitionDeliveryStart {
     Started,
     Closed,
     Unavailable,
 }
 
+struct TransitionDeliveryPlan {
+    transition: TransitionState,
+    require_reauthorization_marker: bool,
+    restart_status: (LastFmRuntimePhase, Option<LastFmRuntimeCommandError>),
+    expected_pause: storage::LastFmDurablePause,
+}
+
 impl DeliveryRuntime {
-    async fn cancel_and_join(self) -> bool {
+    async fn cancel_and_join(self) -> DeliveryRetirement {
         let worker = self.worker.cancel_and_join().await;
         let relay = self.relay.await;
-        worker.is_ok() && relay.is_ok()
+        let failure = match &worker {
+            Ok(super::worker::LastFmDeliveryWorkerExit::Failed(failure)) => Some(*failure),
+            Ok(_) | Err(_) => None,
+        };
+        DeliveryRetirement {
+            joined: worker.is_ok() && relay.is_ok(),
+            failure,
+        }
     }
 }
 
@@ -584,7 +764,7 @@ struct RuntimeOwner {
 }
 
 impl RuntimeOwner {
-    async fn run(mut self) -> Result<LastFmRuntimeShutdownReason, LastFmRuntimeShutdownError> {
+    async fn run(&mut self) -> Result<LastFmRuntimeShutdownReason, LastFmRuntimeShutdownError> {
         loop {
             let Ok(command) = self.commands.recv().await else {
                 return self.fail_and_retire().await;
@@ -617,6 +797,26 @@ impl RuntimeOwner {
                     self.reauthorize(account_binding, account_epoch, username, key, completion)
                         .await;
                 }
+                Command::ResumeAfterManualRecovery {
+                    account_binding,
+                    account_epoch,
+                    pause,
+                    status_revision,
+                    completion,
+                } => {
+                    if !self.manual_recovery_received(account_binding, account_epoch) {
+                        let _ = completion.send(Err(LastFmRuntimeCommandError::OwnerStopped));
+                        return self.fail_and_retire().await;
+                    }
+                    self.resume_after_manual_recovery(
+                        account_binding,
+                        account_epoch,
+                        pause,
+                        status_revision,
+                        completion,
+                    )
+                    .await;
+                }
                 Command::DisconnectAndPurge {
                     account_binding,
                     account_epoch,
@@ -647,9 +847,21 @@ impl RuntimeOwner {
                 }
                 Command::Shutdown => {
                     self.publish(LastFmRuntimePhase::ShuttingDown, None);
-                    let retired = self.retire_delivery().await;
+                    let binding = self
+                        .account
+                        .as_ref()
+                        .filter(|account| !account.queue_purged)
+                        .map(|account| account.binding);
+                    let retirement = self.retire_delivery().await;
+                    let failure_paused = if let Some(binding) =
+                        binding.filter(|_| !retirement.joined || retirement.failure.is_some())
+                    {
+                        self.ensure_worker_failure_pause(binding).await
+                    } else {
+                        true
+                    };
                     self.account = None;
-                    if retired {
+                    if retirement.joined && failure_paused {
                         self.publish(LastFmRuntimePhase::Stopped, None);
                         return Ok(LastFmRuntimeShutdownReason::Drained);
                     }
@@ -658,6 +870,10 @@ impl RuntimeOwner {
                         Some(LastFmRuntimeCommandError::OwnerStopped),
                     );
                     return Err(LastFmRuntimeShutdownError);
+                }
+                #[cfg(test)]
+                Command::PanicForQuiescenceTest => {
+                    panic!("redacted Last.fm actor panic test");
                 }
             }
         }
@@ -670,9 +886,37 @@ impl RuntimeOwner {
             LastFmRuntimePhase::Failed,
             Some(LastFmRuntimeCommandError::OwnerStopped),
         );
-        let _ = self.retire_delivery().await;
+        let binding = self
+            .account
+            .as_ref()
+            .filter(|account| !account.queue_purged)
+            .map(|account| account.binding);
+        let _retirement = self.retire_delivery().await;
+        if let Some(binding) = binding {
+            let _ = self.ensure_worker_failure_pause(binding).await;
+        }
         self.account = None;
         Err(LastFmRuntimeShutdownError)
+    }
+
+    async fn quiesce_after_actor_panic(&mut self) {
+        let unpurged_binding = self
+            .account
+            .as_ref()
+            .filter(|account| !account.queue_purged)
+            .map(|account| account.binding);
+        if let Ok(mut ingress) = self.ingress.lock() {
+            ingress.phase = IngressPhase::Closed;
+            ingress.queue_admission_open = false;
+            ingress.shutdown_queued = true;
+            cancel_gate_delivery(&mut ingress);
+        }
+        self.commands.close();
+        let _ = self.retire_delivery().await;
+        if let Some(binding) = unpurged_binding {
+            let _ = self.ensure_worker_failure_pause(binding).await;
+        }
+        self.account = None;
     }
 
     async fn enqueue(
@@ -784,12 +1028,12 @@ impl RuntimeOwner {
             }
         };
 
-        if !self.retire_delivery().await {
+        if !self.retire_delivery().await.joined {
             self.finish_reauthorization_without_delivery(
                 binding,
                 epoch,
-                false,
-                LastFmRuntimePhase::CapabilityPaused,
+                true,
+                LastFmRuntimePhase::ReauthenticationRequired,
                 Some(LastFmRuntimeCommandError::DeliveryCapability),
             );
             let _ = completion.send(Err(LastFmRuntimeCommandError::DeliveryCapability));
@@ -799,29 +1043,196 @@ impl RuntimeOwner {
             self.finish_reauthorization_without_delivery(
                 binding,
                 epoch,
-                false,
+                true,
                 LastFmRuntimePhase::ReauthenticationRequired,
                 Some(error),
             );
             let _ = completion.send(Err(error));
             return;
         }
-        match self.start_reauthorized_delivery(binding, epoch, renewed) {
-            ReauthorizationStart::Started => {
-                let _ = completion.send(Ok(()));
-            }
-            ReauthorizationStart::Closed => {
-                let _ = completion.send(Err(LastFmRuntimeCommandError::OwnerStopped));
-            }
-            ReauthorizationStart::Unavailable => {
+        if !self.transition_still_owned(binding, epoch, TransitionState::ReauthorizationInFlight) {
+            let _ = completion.send(Err(LastFmRuntimeCommandError::OwnerStopped));
+            return;
+        }
+        if storage::replace_exact_pause(
+            &self.database,
+            binding,
+            storage::LastFmDurablePause::ReauthenticationRequired,
+            storage::LastFmDurablePause::Capability,
+        )
+        .await
+        .is_err()
+        {
+            self.finish_reauthorization_without_delivery(
+                binding,
+                epoch,
+                true,
+                LastFmRuntimePhase::ReauthenticationRequired,
+                Some(LastFmRuntimeCommandError::Queue),
+            );
+            let _ = completion.send(Err(LastFmRuntimeCommandError::Queue));
+            return;
+        }
+        let restart_status = match self
+            .delivery_restart_status(binding, storage::LastFmDurablePause::Capability)
+            .await
+        {
+            Ok(status) => status,
+            Err(error) => {
                 self.finish_reauthorization_without_delivery(
                     binding,
                     epoch,
                     false,
                     LastFmRuntimePhase::CapabilityPaused,
-                    Some(LastFmRuntimeCommandError::DeliveryCapability),
+                    Some(error),
                 );
-                let _ = completion.send(Err(LastFmRuntimeCommandError::DeliveryCapability));
+                let _ = completion.send(Err(error));
+                return;
+            }
+        };
+        match self
+            .start_transitioned_delivery(
+                binding,
+                epoch,
+                renewed,
+                TransitionDeliveryPlan {
+                    transition: TransitionState::ReauthorizationInFlight,
+                    require_reauthorization_marker: true,
+                    restart_status,
+                    expected_pause: storage::LastFmDurablePause::Capability,
+                },
+            )
+            .await
+        {
+            TransitionDeliveryStart::Started => {
+                let _ = completion.send(Ok(()));
+            }
+            TransitionDeliveryStart::Closed => {
+                let _ = completion.send(Err(LastFmRuntimeCommandError::OwnerStopped));
+            }
+            TransitionDeliveryStart::Unavailable => {
+                let restored = self.ensure_worker_failure_pause(binding).await;
+                self.finish_reauthorization_without_delivery(
+                    binding,
+                    epoch,
+                    false,
+                    LastFmRuntimePhase::CapabilityPaused,
+                    Some(if restored {
+                        LastFmRuntimeCommandError::DeliveryCapability
+                    } else {
+                        LastFmRuntimeCommandError::Queue
+                    }),
+                );
+                let _ = completion.send(Err(if restored {
+                    LastFmRuntimeCommandError::DeliveryCapability
+                } else {
+                    LastFmRuntimeCommandError::Queue
+                }));
+            }
+        }
+    }
+
+    async fn resume_after_manual_recovery(
+        &mut self,
+        binding: LastFmAccountBinding,
+        epoch: LastFmAccountEpoch,
+        pause: storage::LastFmDurablePause,
+        status_revision: u64,
+        completion: oneshot::Sender<Result<(), LastFmRuntimeCommandError>>,
+    ) {
+        let ready = matches!(
+            pause,
+            storage::LastFmDurablePause::Compatibility | storage::LastFmDurablePause::Capability
+        ) && self.account_matches(binding, epoch)
+            && self.status.phase == pause.runtime_phase()
+            && self.status.revision == status_revision;
+        if !ready {
+            self.finish_manual_recovery_without_delivery(binding, epoch, pause);
+            let _ = completion.send(Err(LastFmRuntimeCommandError::StaleAccount));
+            return;
+        }
+        if !self.retire_delivery().await.joined {
+            self.finish_manual_recovery_without_delivery(binding, epoch, pause);
+            let _ = completion.send(Err(LastFmRuntimeCommandError::DeliveryCapability));
+            return;
+        }
+        if !self.transition_still_owned(binding, epoch, TransitionState::ManualRecoveryInFlight) {
+            let _ = completion.send(Err(LastFmRuntimeCommandError::OwnerStopped));
+            return;
+        }
+        if storage::replace_exact_pause(
+            &self.database,
+            binding,
+            pause,
+            storage::LastFmDurablePause::Capability,
+        )
+        .await
+        .is_err()
+        {
+            self.finish_manual_recovery_without_delivery(binding, epoch, pause);
+            let _ = completion.send(Err(LastFmRuntimeCommandError::Queue));
+            return;
+        }
+        let restart_status = match self
+            .delivery_restart_status(binding, storage::LastFmDurablePause::Capability)
+            .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                self.finish_manual_recovery_without_delivery(
+                    binding,
+                    epoch,
+                    storage::LastFmDurablePause::Capability,
+                );
+                let _ = completion.send(Err(error));
+                return;
+            }
+        };
+        let Some(session) = self
+            .account
+            .as_ref()
+            .and_then(|account| account.session.clone())
+        else {
+            self.finish_manual_recovery_without_delivery(
+                binding,
+                epoch,
+                storage::LastFmDurablePause::Capability,
+            );
+            let _ = completion.send(Err(LastFmRuntimeCommandError::StaleAccount));
+            return;
+        };
+        match self
+            .start_transitioned_delivery(
+                binding,
+                epoch,
+                session,
+                TransitionDeliveryPlan {
+                    transition: TransitionState::ManualRecoveryInFlight,
+                    require_reauthorization_marker: false,
+                    restart_status,
+                    expected_pause: storage::LastFmDurablePause::Capability,
+                },
+            )
+            .await
+        {
+            TransitionDeliveryStart::Started => {
+                let _ = completion.send(Ok(()));
+            }
+            TransitionDeliveryStart::Closed => {
+                let _ = completion.send(Err(LastFmRuntimeCommandError::OwnerStopped));
+            }
+            TransitionDeliveryStart::Unavailable => {
+                let restored = self.ensure_worker_failure_pause(binding).await;
+                self.finish_manual_recovery_without_delivery(
+                    binding,
+                    epoch,
+                    storage::LastFmDurablePause::Capability,
+                );
+                let _ = completion.send(Err(if restored {
+                    LastFmRuntimeCommandError::DeliveryCapability
+                } else {
+                    LastFmRuntimeCommandError::Queue
+                }));
             }
         }
     }
@@ -848,7 +1259,7 @@ impl RuntimeOwner {
             return;
         }
 
-        let delivery_retired = self.retire_delivery().await;
+        let delivery_retired = self.retire_delivery().await.joined;
 
         let deleted = match storage::purge_account(&self.database, binding).await {
             Ok(deleted) => deleted,
@@ -881,7 +1292,7 @@ impl RuntimeOwner {
         );
         self.publish(LastFmRuntimePhase::CredentialCleanup, None);
 
-        match self.delete_exact_credential(binding).await {
+        match self.delete_credential_and_clear_cleanup(binding).await {
             Ok(()) => {
                 self.finish_disconnect(binding, epoch);
                 let result = if delivery_retired {
@@ -923,8 +1334,12 @@ impl RuntimeOwner {
             let _ = completion.send(Err(LastFmRuntimeCommandError::StaleAccount));
             return;
         }
-        match storage::validate_account_queue(&self.database, binding).await {
-            Ok(0) => {}
+        match storage::validate_account_queue_state(&self.database, binding).await {
+            Ok(storage::LastFmValidatedQueueState {
+                pending_scrobbles: 0,
+                durable_pause: Some(storage::LastFmDurablePause::CredentialCleanupRequired),
+                ..
+            }) => {}
             Ok(_) | Err(_) => {
                 self.set_transition_from(
                     binding,
@@ -942,7 +1357,7 @@ impl RuntimeOwner {
         }
 
         self.publish(LastFmRuntimePhase::CredentialCleanup, None);
-        match self.delete_exact_credential(binding).await {
+        match self.delete_credential_and_clear_cleanup(binding).await {
             Ok(()) => {
                 self.finish_disconnect(binding, epoch);
                 let _ = completion.send(Ok(()));
@@ -976,27 +1391,27 @@ impl RuntimeOwner {
                 match delivery_disposition(&receipt, &result) {
                     LastFmDeliveryDisposition::SettleTerminal => {
                         let Ok(row_count) = u64::try_from(receipt.len()) else {
-                            self.pause_delivery(
+                            self.pause_delivery_for_receipt(
                                 binding,
                                 epoch,
-                                LastFmRuntimePhase::CapabilityPaused,
-                                LastFmRuntimeCommandError::DeliveryCapability,
-                                true,
+                                &receipt,
+                                storage::LastFmDurablePause::Capability,
                                 acknowledgement,
-                            );
+                            )
+                            .await;
                             return;
                         };
                         let Ok(outcome_counts) =
                             TerminalOutcomeCounts::from_result(&result, row_count)
                         else {
-                            self.pause_delivery(
+                            self.pause_delivery_for_receipt(
                                 binding,
                                 epoch,
-                                LastFmRuntimePhase::CapabilityPaused,
-                                LastFmRuntimeCommandError::DeliveryCapability,
-                                true,
+                                &receipt,
+                                storage::LastFmDurablePause::Capability,
                                 acknowledgement,
-                            );
+                            )
+                            .await;
                             return;
                         };
                         match storage::settle_terminal(&self.database, &receipt).await {
@@ -1004,14 +1419,14 @@ impl RuntimeOwner {
                                 let Some(pending_scrobbles) =
                                     self.status.pending_scrobbles.checked_sub(row_count)
                                 else {
-                                    self.pause_delivery(
+                                    self.pause_delivery_for_account(
                                         binding,
                                         epoch,
-                                        LastFmRuntimePhase::CapabilityPaused,
-                                        LastFmRuntimeCommandError::DeliveryCapability,
-                                        true,
-                                        acknowledgement,
-                                    );
+                                        storage::LastFmDurablePause::Capability,
+                                    )
+                                    .await;
+                                    let _ =
+                                        acknowledgement.acknowledge(LastFmDeliveryDirective::Stop);
                                     return;
                                 };
                                 self.status.pending_scrobbles = pending_scrobbles;
@@ -1037,14 +1452,15 @@ impl RuntimeOwner {
                                 let _ = acknowledgement.acknowledge(directive);
                             }
                             Err(error) => {
-                                self.pause_delivery(
+                                self.pause_delivery_for_receipt(
                                     binding,
                                     epoch,
-                                    LastFmRuntimePhase::Paused,
-                                    LastFmRuntimeCommandError::from(error),
-                                    true,
+                                    &receipt,
+                                    storage::LastFmDurablePause::Capability,
                                     acknowledgement,
-                                );
+                                )
+                                .await;
+                                let _ = error;
                             }
                         }
                     }
@@ -1079,81 +1495,121 @@ impl RuntimeOwner {
                                     };
                                 let _ = acknowledgement.acknowledge(directive);
                             }
-                            Err(error) => self.pause_delivery(
-                                binding,
-                                epoch,
-                                LastFmRuntimePhase::CapabilityPaused,
-                                error,
-                                true,
-                                acknowledgement,
-                            ),
+                            Err(error) => {
+                                self.pause_delivery_for_receipt(
+                                    binding,
+                                    epoch,
+                                    &receipt,
+                                    storage::LastFmDurablePause::Capability,
+                                    acknowledgement,
+                                )
+                                .await;
+                                let _ = error;
+                            }
                         }
                     }
-                    LastFmDeliveryDisposition::PauseForReauthentication => self.pause_delivery(
-                        binding,
-                        epoch,
-                        LastFmRuntimePhase::ReauthenticationRequired,
-                        LastFmRuntimeCommandError::ReauthenticationRequired,
-                        false,
-                        acknowledgement,
-                    ),
-                    LastFmDeliveryDisposition::QuarantineCompatibility => self.pause_delivery(
-                        binding,
-                        epoch,
-                        LastFmRuntimePhase::CompatibilityPaused,
-                        LastFmRuntimeCommandError::Compatibility,
-                        false,
-                        acknowledgement,
-                    ),
-                    LastFmDeliveryDisposition::PauseCapabilityOrInternal => self.pause_delivery(
-                        binding,
-                        epoch,
-                        LastFmRuntimePhase::CapabilityPaused,
-                        LastFmRuntimeCommandError::DeliveryCapability,
-                        true,
-                        acknowledgement,
-                    ),
+                    LastFmDeliveryDisposition::PauseForReauthentication => {
+                        self.pause_delivery_for_receipt(
+                            binding,
+                            epoch,
+                            &receipt,
+                            storage::LastFmDurablePause::ReauthenticationRequired,
+                            acknowledgement,
+                        )
+                        .await;
+                    }
+                    LastFmDeliveryDisposition::QuarantineCompatibility => {
+                        self.pause_delivery_for_receipt(
+                            binding,
+                            epoch,
+                            &receipt,
+                            storage::LastFmDurablePause::Compatibility,
+                            acknowledgement,
+                        )
+                        .await;
+                    }
+                    LastFmDeliveryDisposition::PauseCapabilityOrInternal => {
+                        self.pause_delivery_for_receipt(
+                            binding,
+                            epoch,
+                            &receipt,
+                            storage::LastFmDurablePause::Capability,
+                            acknowledgement,
+                        )
+                        .await;
+                    }
                 }
             }
             LastFmDeliveryEvent::Failed {
                 generation,
                 failure,
+                acknowledgement,
             } => {
                 if !self.delivery_matches(binding, epoch, generation) {
+                    let _ = acknowledgement.acknowledge(LastFmDeliveryDirective::Stop);
                     return;
                 }
-                let (phase, error) = match failure {
-                    LastFmDeliveryWorkerFailure::Storage(error) => (
-                        LastFmRuntimePhase::Paused,
-                        LastFmRuntimeCommandError::from(error),
-                    ),
+                let pause = match failure {
+                    LastFmDeliveryWorkerFailure::Storage(_) => {
+                        storage::LastFmDurablePause::Capability
+                    }
                     LastFmDeliveryWorkerFailure::Clock(_)
                     | LastFmDeliveryWorkerFailure::Preparation(_)
-                    | LastFmDeliveryWorkerFailure::UnexpectedTaskExit => (
-                        LastFmRuntimePhase::CapabilityPaused,
-                        LastFmRuntimeCommandError::DeliveryCapability,
-                    ),
+                    | LastFmDeliveryWorkerFailure::UnexpectedTaskExit => {
+                        storage::LastFmDurablePause::Capability
+                    }
                 };
-                if self.pause_delivery_ingress(binding, epoch, true) {
-                    self.publish(phase, Some(error));
-                }
+                self.pause_delivery_for_account(binding, epoch, pause).await;
+                let _ = acknowledgement.acknowledge(LastFmDeliveryDirective::Stop);
             }
         }
     }
 
-    fn pause_delivery(
+    async fn pause_delivery_for_receipt(
         &mut self,
         binding: LastFmAccountBinding,
         epoch: LastFmAccountEpoch,
-        phase: LastFmRuntimePhase,
-        error: LastFmRuntimeCommandError,
-        close_queue_admission: bool,
+        receipt: &storage::LastFmBatchReceipt,
+        pause: storage::LastFmDurablePause,
         acknowledgement: LastFmDeliveryAcknowledgement,
     ) {
-        if self.pause_delivery_ingress(binding, epoch, close_queue_admission) {
-            self.publish(phase, Some(error));
-        }
+        let persisted = storage::persist_pause_for_receipt(&self.database, receipt, pause)
+            .await
+            .is_ok();
+        self.finish_persisted_pause(binding, epoch, pause, persisted);
         let _ = acknowledgement.acknowledge(LastFmDeliveryDirective::Stop);
+    }
+
+    async fn pause_delivery_for_account(
+        &mut self,
+        binding: LastFmAccountBinding,
+        epoch: LastFmAccountEpoch,
+        pause: storage::LastFmDurablePause,
+    ) {
+        let persisted = storage::persist_pause_for_account(&self.database, binding, pause)
+            .await
+            .is_ok();
+        self.finish_persisted_pause(binding, epoch, pause, persisted);
+    }
+
+    fn finish_persisted_pause(
+        &mut self,
+        binding: LastFmAccountBinding,
+        epoch: LastFmAccountEpoch,
+        pause: storage::LastFmDurablePause,
+        persisted: bool,
+    ) {
+        let queue_admission_open = persisted && pause.queue_admission_open();
+        if self.pause_delivery_ingress(binding, epoch, !queue_admission_open) {
+            if persisted {
+                self.publish(pause.runtime_phase(), Some(pause.runtime_failure()));
+            } else {
+                self.publish(
+                    LastFmRuntimePhase::CapabilityPaused,
+                    Some(LastFmRuntimeCommandError::Queue),
+                );
+            }
+        }
     }
 
     fn pause_delivery_ingress(
@@ -1226,75 +1682,61 @@ impl RuntimeOwner {
         ) && ingress.delivery_cancellation.is_some()
     }
 
-    async fn retire_delivery(&mut self) -> bool {
+    async fn retire_delivery(&mut self) -> DeliveryRetirement {
         let delivery = self
             .account
             .as_mut()
             .and_then(|account| account.delivery.take());
         match delivery {
             Some(delivery) => delivery.cancel_and_join().await,
-            None => true,
+            None => DeliveryRetirement {
+                joined: true,
+                failure: None,
+            },
         }
     }
 
-    fn start_reauthorized_delivery(
+    async fn ensure_worker_failure_pause(&self, binding: LastFmAccountBinding) -> bool {
+        if storage::persist_pause_for_account(
+            &self.database,
+            binding,
+            storage::LastFmDurablePause::Capability,
+        )
+        .await
+        .is_ok()
+        {
+            return true;
+        }
+        storage::validate_account_queue_state(&self.database, binding)
+            .await
+            .is_ok_and(|state| state.durable_pause.is_some())
+    }
+
+    async fn start_transitioned_delivery(
         &mut self,
         binding: LastFmAccountBinding,
         epoch: LastFmAccountEpoch,
         session: StoredSession,
-    ) -> ReauthorizationStart {
+        plan: TransitionDeliveryPlan,
+    ) -> TransitionDeliveryStart {
+        let TransitionDeliveryPlan {
+            transition,
+            require_reauthorization_marker,
+            restart_status,
+            expected_pause,
+        } = plan;
         let Some(generation) = self
             .account
             .as_ref()
             .filter(|account| account.binding == binding && account.epoch == epoch)
             .and_then(|account| account.last_delivery_generation.checked_next())
         else {
-            return ReauthorizationStart::Unavailable;
+            return TransitionDeliveryStart::Unavailable;
         };
 
-        // Hold the same mutex used by shutdown from the final ownership check
-        // through worker installation and status publication. If shutdown
-        // already replaced the transition with Closed, no renewed worker is
-        // spawned and Active cannot be published. If this block wins, the
-        // complete restart linearizes before shutdown, which will immediately
-        // cancel the installed generation when it claims Closed afterward.
         let ingress_owner = Arc::clone(&self.ingress);
-        let Ok(mut ingress) = ingress_owner.lock() else {
-            self.commands.close();
-            return ReauthorizationStart::Unavailable;
-        };
-        match ingress.phase {
-            IngressPhase::Transitioning {
-                account_binding,
-                account_epoch,
-                state: TransitionState::ReauthorizationInFlight,
-            } if account_binding == binding
-                && account_epoch == epoch
-                && ingress.reauthorization_queued => {}
-            IngressPhase::Closed => {
-                ingress.reauthorization_queued = false;
-                return ReauthorizationStart::Closed;
-            }
-            IngressPhase::Active { .. } | IngressPhase::Transitioning { .. } => {
-                ingress.phase = IngressPhase::Closed;
-                ingress.queue_admission_open = false;
-                ingress.reauthorization_queued = false;
-                cancel_gate_delivery(&mut ingress);
-                self.commands.close();
-                return ReauthorizationStart::Unavailable;
-            }
-        }
-        if !self.account_matches(binding, epoch) {
-            ingress.phase = IngressPhase::Closed;
-            ingress.queue_admission_open = false;
-            ingress.reauthorization_queued = false;
-            cancel_gate_delivery(&mut ingress);
-            self.commands.close();
-            return ReauthorizationStart::Unavailable;
-        }
-
         let (delivery_sender, delivery_events) = async_channel::bounded(1);
-        let worker = spawn_lastfm_delivery_worker(
+        let (worker, activation) = spawn_lastfm_delivery_worker_suspended(
             self.database.clone(),
             session.clone(),
             generation,
@@ -1315,26 +1757,183 @@ impl RuntimeOwner {
             worker,
             relay,
         };
-        // `account_matches` above and serialized actor ownership prove this
-        // account cannot change before the following mutation.
-        let account = self
-            .account
-            .as_mut()
-            .expect("validated Last.fm account remains actor-owned");
-        account.session = Some(session);
-        account.last_delivery_generation = generation;
-        account.delivery = Some(delivery);
+        {
+            let Ok(mut ingress) = ingress_owner.lock() else {
+                self.commands.close();
+                return TransitionDeliveryStart::Unavailable;
+            };
+            match ingress.phase {
+                IngressPhase::Transitioning {
+                    account_binding,
+                    account_epoch,
+                    state,
+                } if account_binding == binding
+                    && account_epoch == epoch
+                    && state == transition
+                    && (!require_reauthorization_marker || ingress.reauthorization_queued) => {}
+                IngressPhase::Closed => {
+                    ingress.reauthorization_queued = false;
+                    return TransitionDeliveryStart::Closed;
+                }
+                IngressPhase::Active { .. } | IngressPhase::Transitioning { .. } => {
+                    ingress.phase = IngressPhase::Closed;
+                    ingress.queue_admission_open = false;
+                    ingress.reauthorization_queued = false;
+                    cancel_gate_delivery(&mut ingress);
+                    self.commands.close();
+                    return TransitionDeliveryStart::Unavailable;
+                }
+            }
+            if !self.account_matches(binding, epoch) {
+                ingress.phase = IngressPhase::Closed;
+                ingress.queue_admission_open = false;
+                ingress.reauthorization_queued = false;
+                cancel_gate_delivery(&mut ingress);
+                self.commands.close();
+                return TransitionDeliveryStart::Unavailable;
+            }
+            let account = self
+                .account
+                .as_mut()
+                .expect("validated Last.fm account remains actor-owned");
+            account.session = Some(session);
+            account.last_delivery_generation = generation;
+            account.delivery = Some(delivery);
+            cancel_gate_delivery(&mut ingress);
+            ingress.delivery_cancellation = Some(cancellation);
+            ingress.phase = IngressPhase::Transitioning {
+                account_binding: binding,
+                account_epoch: epoch,
+                state: TransitionState::DeliveryRestartCommitted,
+            };
+        }
 
-        cancel_gate_delivery(&mut ingress);
-        ingress.delivery_cancellation = Some(cancellation);
+        // The staged worker cannot inspect the queue. Clearing is therefore
+        // the last fallible durable step before activation; on failure the
+        // exact marker remains and the suspended generation is retired.
+        #[cfg(test)]
+        {
+            let gate = ingress_owner
+                .lock()
+                .ok()
+                .and_then(|ingress| ingress.recovery_clear_gate.clone());
+            if let Some(gate) = gate {
+                let _ = gate.reached.send(()).await;
+                let _ = gate.release.recv().await;
+            }
+        }
+        if storage::clear_exact_pause(&self.database, binding, expected_pause)
+            .await
+            .is_err()
+        {
+            let mut shutdown_won = false;
+            if let Ok(mut ingress) = ingress_owner.lock() {
+                if matches!(
+                    ingress.phase,
+                    IngressPhase::Transitioning {
+                        account_binding,
+                        account_epoch,
+                        state: TransitionState::DeliveryRestartCommitted,
+                    } if account_binding == binding && account_epoch == epoch
+                ) {
+                    shutdown_won = ingress.shutdown_queued;
+                    ingress.phase = if shutdown_won {
+                        IngressPhase::Closed
+                    } else {
+                        IngressPhase::Transitioning {
+                            account_binding: binding,
+                            account_epoch: epoch,
+                            state: transition,
+                        }
+                    };
+                    cancel_gate_delivery(&mut ingress);
+                }
+            } else {
+                self.commands.close();
+            }
+            let _ = self.retire_delivery().await;
+            return if shutdown_won {
+                TransitionDeliveryStart::Closed
+            } else {
+                TransitionDeliveryStart::Unavailable
+            };
+        }
+
+        let Ok(mut ingress) = ingress_owner.lock() else {
+            self.commands.close();
+            return TransitionDeliveryStart::Unavailable;
+        };
+        match ingress.phase {
+            IngressPhase::Transitioning {
+                account_binding,
+                account_epoch,
+                state: TransitionState::DeliveryRestartCommitted,
+            } if account_binding == binding && account_epoch == epoch => {}
+            IngressPhase::Closed => {
+                ingress.reauthorization_queued = false;
+                return TransitionDeliveryStart::Closed;
+            }
+            IngressPhase::Active { .. } | IngressPhase::Transitioning { .. } => {
+                ingress.phase = IngressPhase::Closed;
+                ingress.queue_admission_open = false;
+                ingress.reauthorization_queued = false;
+                cancel_gate_delivery(&mut ingress);
+                self.commands.close();
+                return TransitionDeliveryStart::Unavailable;
+            }
+        }
+        if ingress.shutdown_queued {
+            ingress.phase = IngressPhase::Closed;
+            cancel_gate_delivery(&mut ingress);
+            return TransitionDeliveryStart::Closed;
+        }
+        if !activation.activate() {
+            ingress.phase = IngressPhase::Closed;
+            ingress.queue_admission_open = false;
+            ingress.reauthorization_queued = false;
+            cancel_gate_delivery(&mut ingress);
+            self.commands.close();
+            return TransitionDeliveryStart::Unavailable;
+        }
         ingress.queue_admission_open = true;
         ingress.reauthorization_queued = false;
         ingress.phase = IngressPhase::Active {
             account_binding: binding,
             account_epoch: epoch,
         };
-        self.publish(LastFmRuntimePhase::Active, None);
-        ReauthorizationStart::Started
+        self.publish(restart_status.0, restart_status.1);
+        TransitionDeliveryStart::Started
+    }
+
+    async fn delivery_restart_status(
+        &self,
+        binding: LastFmAccountBinding,
+        expected_pause: storage::LastFmDurablePause,
+    ) -> Result<(LastFmRuntimePhase, Option<LastFmRuntimeCommandError>), LastFmRuntimeCommandError>
+    {
+        let queue = storage::validate_account_queue_state(&self.database, binding)
+            .await
+            .map_err(LastFmRuntimeCommandError::from)?;
+        if queue.durable_pause != Some(expected_pause)
+            || queue.pending_scrobbles != self.status.pending_scrobbles
+        {
+            return Err(LastFmRuntimeCommandError::Queue);
+        }
+        let now = self
+            .clock
+            .now_unix_ms()
+            .map_err(|_| LastFmRuntimeCommandError::DeliveryCapability)?;
+        if queue
+            .oldest_next_attempt_at_ms
+            .is_some_and(|deadline| deadline > now)
+        {
+            Ok((
+                LastFmRuntimePhase::BackingOff,
+                Some(LastFmRuntimeCommandError::Delivery),
+            ))
+        } else {
+            Ok((LastFmRuntimePhase::Active, None))
+        }
     }
 
     /// Release a failed reauthorization only if it still owns the exact
@@ -1389,6 +1988,62 @@ impl RuntimeOwner {
                 false
             }
         }
+    }
+
+    fn finish_manual_recovery_without_delivery(
+        &mut self,
+        binding: LastFmAccountBinding,
+        epoch: LastFmAccountEpoch,
+        pause: storage::LastFmDurablePause,
+    ) -> bool {
+        let ingress_owner = Arc::clone(&self.ingress);
+        let Ok(mut ingress) = ingress_owner.lock() else {
+            self.commands.close();
+            return false;
+        };
+        match ingress.phase {
+            IngressPhase::Transitioning {
+                account_binding,
+                account_epoch,
+                state: TransitionState::ManualRecoveryInFlight,
+            } if account_binding == binding && account_epoch == epoch => {
+                ingress.queue_admission_open = pause.queue_admission_open();
+                ingress.phase = IngressPhase::Active {
+                    account_binding: binding,
+                    account_epoch: epoch,
+                };
+                self.publish(pause.runtime_phase(), Some(pause.runtime_failure()));
+                true
+            }
+            IngressPhase::Closed => false,
+            IngressPhase::Active { .. } | IngressPhase::Transitioning { .. } => {
+                ingress.phase = IngressPhase::Closed;
+                ingress.queue_admission_open = false;
+                cancel_gate_delivery(&mut ingress);
+                self.commands.close();
+                false
+            }
+        }
+    }
+
+    fn transition_still_owned(
+        &self,
+        binding: LastFmAccountBinding,
+        epoch: LastFmAccountEpoch,
+        expected: TransitionState,
+    ) -> bool {
+        let Ok(ingress) = self.ingress.lock() else {
+            self.commands.close();
+            return false;
+        };
+        matches!(
+            ingress.phase,
+            IngressPhase::Transitioning {
+                account_binding,
+                account_epoch,
+                state,
+            } if account_binding == binding && account_epoch == epoch && state == expected
+        )
     }
 
     fn finish_disconnect(&mut self, binding: LastFmAccountBinding, epoch: LastFmAccountEpoch) {
@@ -1456,6 +2111,20 @@ impl RuntimeOwner {
         };
         self.restore_vault_lease(binding, lease)?;
         result
+    }
+
+    async fn delete_credential_and_clear_cleanup(
+        &mut self,
+        binding: LastFmAccountBinding,
+    ) -> Result<(), LastFmRuntimeCommandError> {
+        self.delete_exact_credential(binding).await?;
+        storage::clear_exact_pause(
+            &self.database,
+            binding,
+            storage::LastFmDurablePause::CredentialCleanupRequired,
+        )
+        .await
+        .map_err(LastFmRuntimeCommandError::from)
     }
 
     fn take_vault_lease(
@@ -1540,6 +2209,32 @@ impl RuntimeOwner {
             // Shutdown may close after admission but before actor receipt. The
             // earlier admitted vault operation still drains; its completion
             // path is forbidden from restarting delivery or publishing Active.
+            IngressPhase::Closed => true,
+            IngressPhase::Active { .. } | IngressPhase::Transitioning { .. } => {
+                self.commands.close();
+                false
+            }
+        }
+    }
+
+    fn manual_recovery_received(
+        &self,
+        binding: LastFmAccountBinding,
+        epoch: LastFmAccountEpoch,
+    ) -> bool {
+        let Ok(ingress) = self.ingress.lock() else {
+            self.commands.close();
+            return false;
+        };
+        match ingress.phase {
+            IngressPhase::Transitioning {
+                account_binding,
+                account_epoch,
+                state: TransitionState::ManualRecoveryInFlight,
+            } => account_binding == binding && account_epoch == epoch,
+            // Shutdown may close after admission but before actor receipt. The
+            // admitted command drains without clearing state or restarting a
+            // worker, then the queued shutdown marker remains authoritative.
             IngressPhase::Closed => true,
             IngressPhase::Active { .. } | IngressPhase::Transitioning { .. } => {
                 self.commands.close();
@@ -1673,9 +2368,16 @@ fn stop_delivery_command(command: Command) {
 }
 
 fn stop_delivery_event(event: LastFmDeliveryEvent) {
-    if let LastFmDeliveryEvent::Result(event) = event {
-        let (_, _, _, acknowledgement) = event.into_parts();
-        let _ = acknowledgement.acknowledge(LastFmDeliveryDirective::Stop);
+    match event {
+        LastFmDeliveryEvent::Result(event) => {
+            let (_, _, _, acknowledgement) = event.into_parts();
+            let _ = acknowledgement.acknowledge(LastFmDeliveryDirective::Stop);
+        }
+        LastFmDeliveryEvent::Failed {
+            acknowledgement, ..
+        } => {
+            let _ = acknowledgement.acknowledge(LastFmDeliveryDirective::Stop);
+        }
     }
 }
 
@@ -1686,6 +2388,8 @@ pub enum LastFmRuntimeStartError {
     CredentialStore,
     #[error("Last.fm protected credential store has no matching account")]
     CredentialMismatch,
+    #[error("Last.fm credential cleanup was already complete")]
+    CredentialCleanupCompleted,
     #[error("Last.fm queue belongs to another account")]
     AccountMismatch,
     #[error("Last.fm queue storage is not canonical")]
@@ -1854,6 +2558,22 @@ impl fmt::Debug for LastFmRuntimeActivation {
     }
 }
 
+/// Opaque authority for one explicit, category-bound manual retry of a durable
+/// compatibility or local-capability quarantine.
+pub struct LastFmManualPauseRecovery {
+    runtime: Weak<HandleInner>,
+    account_binding: LastFmAccountBinding,
+    account_epoch: LastFmAccountEpoch,
+    status_revision: u64,
+    pause: storage::LastFmDurablePause,
+}
+
+impl fmt::Debug for LastFmManualPauseRecovery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LastFmManualPauseRecovery")
+    }
+}
+
 /// Load the exact vault authority and validate every retained row before
 /// exposing an active handle.
 pub async fn spawn_lastfm_runtime(
@@ -1864,6 +2584,9 @@ pub async fn spawn_lastfm_runtime(
     clock: Arc<dyn LastFmClock>,
 ) -> Result<(LastFmRuntimeHandle, LastFmRuntimeShutdown), LastFmRuntimeStartError> {
     let vault_lease = acquire_vault_lifecycle().await;
+    let empty_cleanup_tombstone = storage::has_empty_cleanup_tombstone(&database)
+        .await
+        .map_err(LastFmRuntimeStartError::from)?;
     let credentials_for_load = Arc::clone(&credentials);
     // Move the lease into the blocking operation. If startup itself is
     // cancelled, the detached blocking load still retains this vault
@@ -1872,52 +2595,91 @@ pub async fn spawn_lastfm_runtime(
         tokio::task::spawn_blocking(move || (vault_lease, credentials_for_load.load()))
             .await
             .map_err(|_| LastFmRuntimeStartError::CredentialStore)?;
-    let stored_session = stored_session
-        .map_err(|_| LastFmRuntimeStartError::CredentialStore)?
-        .ok_or(LastFmRuntimeStartError::CredentialMismatch)?;
+    let stored_session = stored_session.map_err(|_| LastFmRuntimeStartError::CredentialStore)?;
+    let Some(stored_session) = stored_session else {
+        let Some(cleanup_binding) = empty_cleanup_tombstone else {
+            return Err(LastFmRuntimeStartError::CredentialMismatch);
+        };
+        let authority = storage::LastFmClosedAndDrainedQueue::issue_after_barrier();
+        storage::clear_empty_cleanup_after_missing_vault(&database, cleanup_binding, &authority)
+            .await
+            .map_err(LastFmRuntimeStartError::from)?;
+        drop(vault_lease);
+        return Err(LastFmRuntimeStartError::CredentialCleanupCompleted);
+    };
     let binding = stored_session.account_binding();
-    let pending_scrobbles = storage::validate_account_queue(&database, binding)
+    let queue_state = storage::validate_account_queue_state(&database, binding)
         .await
         .map_err(LastFmRuntimeStartError::from)?;
+    let cleanup_only =
+        queue_state.durable_pause == Some(storage::LastFmDurablePause::CredentialCleanupRequired);
     let epoch = LastFmAccountEpoch::INITIAL;
     let (command_sender, command_receiver) = async_channel::bounded(COMMAND_CAPACITY);
-    let initial_status = LastFmRuntimeStatus::active(pending_scrobbles);
+    let initial_status = LastFmRuntimeStatus::startup(queue_state, clock.now_unix_ms().ok());
     let (status_sender, status) = watch::channel(initial_status);
-    let (delivery_sender, delivery_events) = async_channel::bounded(1);
     let generation = LastFmDeliveryGeneration::new(1);
-    let worker = spawn_lastfm_delivery_worker(
-        database.clone(),
-        stored_session.clone(),
-        generation,
-        Arc::clone(&transport),
-        Arc::clone(&clock),
-        delivery_sender,
-    );
-    let delivery_cancellation = worker.cancellation_token();
-    let ingress = Arc::new(Mutex::new(IngressGate {
-        phase: IngressPhase::Active {
+    let pending_delivery = if queue_state.durable_pause.is_none() {
+        let (delivery_sender, delivery_events) = async_channel::bounded(1);
+        let worker = spawn_lastfm_delivery_worker(
+            database.clone(),
+            stored_session.clone(),
+            generation,
+            Arc::clone(&transport),
+            Arc::clone(&clock),
+            delivery_sender,
+        );
+        Some((worker, delivery_events))
+    } else {
+        None
+    };
+    let delivery_cancellation = pending_delivery
+        .as_ref()
+        .map(|(worker, _)| worker.cancellation_token());
+    let ingress_phase = if cleanup_only {
+        IngressPhase::Transitioning {
             account_binding: binding,
             account_epoch: epoch,
-        },
-        queue_admission_open: true,
+            state: TransitionState::CredentialCleanupRetry,
+        }
+    } else {
+        IngressPhase::Active {
+            account_binding: binding,
+            account_epoch: epoch,
+        }
+    };
+    let ingress = Arc::new(Mutex::new(IngressGate {
+        phase: ingress_phase,
+        queue_admission_open: queue_state
+            .durable_pause
+            .is_none_or(storage::LastFmDurablePause::queue_admission_open),
         queued_metadata: 0,
         delivery_event_queued: false,
         reauthorization_queued: false,
-        delivery_cancellation: Some(delivery_cancellation),
+        delivery_cancellation,
+        shutdown_queued: false,
+        #[cfg(test)]
+        recovery_clear_gate: None,
     }));
     let inner = Arc::new(HandleInner {
         commands: command_sender.clone(),
         ingress: Arc::clone(&ingress),
         status,
     });
-    let relay = spawn_delivery_relay(
-        delivery_events,
-        command_sender.clone(),
-        Arc::clone(&ingress),
-        binding,
-        epoch,
-    );
-    let owner = RuntimeOwner {
+    let delivery = pending_delivery.map(|(worker, delivery_events)| {
+        let relay = spawn_delivery_relay(
+            delivery_events,
+            command_sender.clone(),
+            Arc::clone(&ingress),
+            binding,
+            epoch,
+        );
+        DeliveryRuntime {
+            generation,
+            worker,
+            relay,
+        }
+    });
+    let mut owner = RuntimeOwner {
         database,
         credentials,
         command_sender: command_sender.clone(),
@@ -1930,14 +2692,14 @@ pub async fn spawn_lastfm_runtime(
         account: Some(ActiveAccount {
             binding,
             epoch,
-            session: Some(stored_session),
-            queue_purged: false,
+            session: if cleanup_only {
+                None
+            } else {
+                Some(stored_session)
+            },
+            queue_purged: cleanup_only,
             last_delivery_generation: generation,
-            delivery: Some(DeliveryRuntime {
-                generation,
-                worker,
-                relay,
-            }),
+            delivery,
             vault_lease: Some(vault_lease),
         }),
     };
@@ -1947,7 +2709,13 @@ pub async fn spawn_lastfm_runtime(
             sender: completion_sender,
             drained: false,
         };
-        let result = owner.run().await;
+        let result = match AssertUnwindSafe(owner.run()).catch_unwind().await {
+            Ok(result) => result,
+            Err(_) => {
+                owner.quiesce_after_actor_panic().await;
+                Err(LastFmRuntimeShutdownError)
+            }
+        };
         if result.is_ok() {
             completion.mark_drained();
         }
@@ -1970,17 +2738,28 @@ fn request_shutdown(inner: &Arc<HandleInner>) -> bool {
         inner.commands.close();
         return false;
     };
-    if matches!(ingress.phase, IngressPhase::Closed) {
+    if ingress.shutdown_queued || matches!(ingress.phase, IngressPhase::Closed) {
         return false;
     }
-    ingress.phase = IngressPhase::Closed;
+    let restart_committed = matches!(
+        ingress.phase,
+        IngressPhase::Transitioning {
+            state: TransitionState::DeliveryRestartCommitted,
+            ..
+        }
+    );
     ingress.queue_admission_open = false;
     match inner.commands.try_send(Command::Shutdown) {
         Ok(()) => {
-            cancel_gate_delivery(&mut ingress);
+            ingress.shutdown_queued = true;
+            if !restart_committed {
+                ingress.phase = IngressPhase::Closed;
+                cancel_gate_delivery(&mut ingress);
+            }
             true
         }
         Err(_) => {
+            ingress.phase = IngressPhase::Closed;
             cancel_gate_delivery(&mut ingress);
             inner.commands.close();
             false
@@ -2005,7 +2784,7 @@ mod runtime_reauthorization_tests;
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Barrier as ThreadBarrier, Mutex};
+    use std::sync::{Barrier as ThreadBarrier, Condvar, Mutex};
 
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
     use sea_orm_migration::MigratorTrait;
@@ -2025,6 +2804,28 @@ mod tests {
     struct PendingTransport;
 
     struct AcceptedTransport;
+
+    struct BlockingDropTransport {
+        started: async_channel::Sender<()>,
+        dropping: async_channel::Sender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    struct BlockingDropGuard {
+        dropping: async_channel::Sender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Drop for BlockingDropGuard {
+        fn drop(&mut self) {
+            let _ = self.dropping.try_send(());
+            let (released, changed) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = changed.wait(released).unwrap();
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl LastFmTransport for PendingTransport {
@@ -2063,6 +2864,30 @@ mod tests {
             Ok(ScrobbleBatchResult {
                 items: vec![SubmissionResult::Accepted { corrected: false }; scrobbles.len()],
             })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LastFmTransport for BlockingDropTransport {
+        async fn update_now_playing(
+            &self,
+            _session: &StoredSession,
+            _track: &LastFmTrack,
+        ) -> Result<SubmissionResult, LastFmClientError> {
+            Err(LastFmClientError::InvalidInput)
+        }
+
+        async fn submit_scrobbles(
+            &self,
+            _session: &StoredSession,
+            _scrobbles: &[Scrobble],
+        ) -> Result<ScrobbleBatchResult, LastFmClientError> {
+            let _guard = BlockingDropGuard {
+                dropping: self.dropping.clone(),
+                release: Arc::clone(&self.release),
+            };
+            let _ = self.started.send(()).await;
+            std::future::pending().await
         }
     }
 
@@ -2111,6 +2936,10 @@ mod tests {
 
         fn delete_attempts(&self) -> usize {
             self.delete_attempts.load(Ordering::SeqCst)
+        }
+
+        fn has_session(&self) -> bool {
+            self.session.lock().unwrap().is_some()
         }
     }
 
@@ -2222,6 +3051,9 @@ mod tests {
             delivery_event_queued: false,
             reauthorization_queued: false,
             delivery_cancellation: Some(cancellation.clone()),
+            shutdown_queued: false,
+            #[cfg(test)]
+            recovery_clear_gate: None,
         }));
         let (command_sender, commands) = async_channel::bounded(COMMAND_CAPACITY);
         let (_status_sender, status) = watch::channel(LastFmRuntimeStatus::active(0));
@@ -2241,6 +3073,8 @@ mod tests {
                     .unwrap(),
             );
         }
+        let (failure_acknowledgement, _failure_directive) =
+            LastFmDeliveryAcknowledgement::testing_pair();
         {
             let mut gate = handle.inner.ingress.lock().unwrap();
             assert!(handle
@@ -2252,6 +3086,7 @@ mod tests {
                     event: LastFmDeliveryEvent::Failed {
                         generation: LastFmDeliveryGeneration::new(1),
                         failure: LastFmDeliveryWorkerFailure::UnexpectedTaskExit,
+                        acknowledgement: failure_acknowledgement,
                     },
                 })
                 .is_ok());
@@ -2309,6 +3144,9 @@ mod tests {
             delivery_event_queued: false,
             reauthorization_queued: false,
             delivery_cancellation: None,
+            shutdown_queued: false,
+            #[cfg(test)]
+            recovery_clear_gate: None,
         }));
         let (command_sender, commands) = async_channel::bounded(COMMAND_CAPACITY);
         let initial_status = LastFmRuntimeStatus::active(0);
@@ -2391,6 +3229,9 @@ mod tests {
             delivery_event_queued: false,
             reauthorization_queued: false,
             delivery_cancellation: Some(cancellation),
+            shutdown_queued: false,
+            #[cfg(test)]
+            recovery_clear_gate: None,
         }));
         let (command_sender, commands) = async_channel::bounded(COMMAND_CAPACITY);
         let initial_status = LastFmRuntimeStatus::active(1);
@@ -2422,6 +3263,9 @@ mod tests {
             clock: fixed_clock(),
         };
 
+        let (failure_acknowledgement, failure_directive) =
+            LastFmDeliveryAcknowledgement::testing_pair();
+
         owner
             .handle_delivery(
                 binding,
@@ -2431,11 +3275,24 @@ mod tests {
                     failure: LastFmDeliveryWorkerFailure::Clock(
                         LastFmDeliveryPrimitiveError::ClockOutOfRange,
                     ),
+                    acknowledgement: failure_acknowledgement,
                 },
             )
             .await;
 
+        assert_eq!(
+            failure_directive.await.unwrap(),
+            LastFmDeliveryDirective::Stop
+        );
+
         assert_eq!(storage::queue_len(&database).await.unwrap(), 1);
+        assert_eq!(
+            storage::validate_account_queue_state(&database, binding)
+                .await
+                .unwrap()
+                .durable_pause,
+            None
+        );
         assert_eq!(*status.borrow(), initial_status);
         assert!(matches!(
             ingress.lock().unwrap().phase,
@@ -2444,7 +3301,167 @@ mod tests {
                 account_epoch,
             } if account_binding == binding && account_epoch == epoch
         ));
-        assert!(owner.retire_delivery().await);
+        assert!(owner.retire_delivery().await.joined);
+    }
+
+    #[tokio::test]
+    async fn admitted_manual_resume_closed_before_actor_receipt_drains_without_clearing_or_restart()
+    {
+        let database = database().await;
+        let stored_session = session("listener");
+        let binding = stored_session.account_binding();
+        storage::persist_pause_for_account(
+            &database,
+            binding,
+            storage::LastFmDurablePause::Compatibility,
+        )
+        .await
+        .unwrap();
+        let store = Arc::new(TestCredentialStore::new(stored_session));
+        let (handle, shutdown) = spawn_lastfm_runtime(
+            LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+            database.clone(),
+            store,
+            pending_transport(),
+            fixed_clock(),
+        )
+        .await
+        .unwrap();
+        let (completion, receiver) = oneshot::channel();
+        {
+            let mut ingress = handle.inner.ingress.lock().unwrap();
+            let IngressPhase::Active {
+                account_binding,
+                account_epoch,
+            } = ingress.phase
+            else {
+                panic!("durably paused runtime retains active account authority");
+            };
+            ingress.phase = IngressPhase::Transitioning {
+                account_binding,
+                account_epoch,
+                state: TransitionState::ManualRecoveryInFlight,
+            };
+            handle
+                .inner
+                .commands
+                .try_send(Command::ResumeAfterManualRecovery {
+                    account_binding,
+                    account_epoch,
+                    pause: storage::LastFmDurablePause::Compatibility,
+                    status_revision: handle.inner.status.borrow().revision,
+                    completion,
+                })
+                .unwrap();
+            ingress.phase = IngressPhase::Closed;
+            ingress.queue_admission_open = false;
+            handle.inner.commands.try_send(Command::Shutdown).unwrap();
+        }
+
+        assert_eq!(
+            LastFmRuntimeOperation { receiver }.wait().await,
+            Err(LastFmRuntimeCommandError::OwnerStopped)
+        );
+        assert_eq!(
+            shutdown.shutdown().await.unwrap(),
+            LastFmRuntimeShutdownReason::Drained
+        );
+        assert_eq!(
+            storage::validate_account_queue_state(&database, binding)
+                .await
+                .unwrap()
+                .durable_pause,
+            Some(storage::LastFmDurablePause::Compatibility)
+        );
+    }
+
+    #[tokio::test]
+    async fn compatibility_resume_orders_an_admitted_enqueue_behind_pause_clear() {
+        let database = database().await;
+        let stored_session = session("listener");
+        let binding = stored_session.account_binding();
+        storage::persist_pause_for_account(
+            &database,
+            binding,
+            storage::LastFmDurablePause::Compatibility,
+        )
+        .await
+        .unwrap();
+        let store = Arc::new(TestCredentialStore::new(stored_session));
+        let (handle, shutdown) = spawn_lastfm_runtime(
+            LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+            database.clone(),
+            store,
+            pending_transport(),
+            fixed_clock(),
+        )
+        .await
+        .unwrap();
+        let (resume_completion, resume_receiver) = oneshot::channel();
+        let (enqueue_completion, enqueue_receiver) = oneshot::channel();
+        {
+            let mut ingress = handle.inner.ingress.lock().unwrap();
+            let IngressPhase::Active {
+                account_binding,
+                account_epoch,
+            } = ingress.phase
+            else {
+                panic!("durably paused runtime retains active account authority");
+            };
+            assert!(ingress.queue_admission_open);
+            ingress.phase = IngressPhase::Transitioning {
+                account_binding,
+                account_epoch,
+                state: TransitionState::ManualRecoveryInFlight,
+            };
+            handle
+                .inner
+                .commands
+                .try_send(Command::ResumeAfterManualRecovery {
+                    account_binding,
+                    account_epoch,
+                    pause: storage::LastFmDurablePause::Compatibility,
+                    status_revision: handle.inner.status.borrow().revision,
+                    completion: resume_completion,
+                })
+                .unwrap();
+            handle
+                .inner
+                .commands
+                .try_send(Command::Enqueue {
+                    account_binding,
+                    account_epoch,
+                    scrobble: scrobble(binding, "Behind manual resume"),
+                    completion: enqueue_completion,
+                })
+                .unwrap();
+            ingress.queued_metadata += 1;
+        }
+
+        LastFmRuntimeOperation {
+            receiver: resume_receiver,
+        }
+        .wait()
+        .await
+        .unwrap();
+        assert!(matches!(
+            LastFmRuntimeOperation {
+                receiver: enqueue_receiver,
+            }
+            .wait()
+            .await
+            .unwrap(),
+            LastFmEnqueueOutcome::Inserted { .. }
+        ));
+        assert_eq!(storage::queue_len(&database).await.unwrap(), 1);
+        assert_eq!(
+            storage::validate_account_queue_state(&database, binding)
+                .await
+                .unwrap()
+                .durable_pause,
+            None
+        );
+        shutdown.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2504,6 +3521,9 @@ mod tests {
             delivery_event_queued: false,
             reauthorization_queued: false,
             delivery_cancellation: Some(cancellation),
+            shutdown_queued: false,
+            #[cfg(test)]
+            recovery_clear_gate: None,
         }));
         let (command_sender, commands) = async_channel::bounded(COMMAND_CAPACITY);
         let initial_status = LastFmRuntimeStatus::active(1);
@@ -2557,14 +3577,14 @@ mod tests {
                 account_epoch,
             } if account_binding == binding && account_epoch == epoch
         ));
-        assert!(owner.retire_delivery().await);
+        assert!(owner.retire_delivery().await.joined);
     }
 
     #[tokio::test]
     async fn enqueue_before_disconnect_commits_then_purges_before_vault_delete() {
         let database = database().await;
         let initial_session = session("listener");
-        let _binding = initial_session.account_binding();
+        let binding = initial_session.account_binding();
         let store = Arc::new(TestCredentialStore::new(initial_session.clone()));
         let (handle, shutdown) = runtime(database.clone(), initial_session, store.clone()).await;
 
@@ -2578,6 +3598,13 @@ mod tests {
         assert_eq!(disconnected.wait().await.unwrap(), 1);
         assert_eq!(storage::queue_len(&database).await.unwrap(), 0);
         assert_eq!(store.delete_attempts(), 1);
+        assert_eq!(
+            storage::validate_account_queue_state(&database, binding)
+                .await
+                .unwrap()
+                .durable_pause,
+            None
+        );
         assert_eq!(
             shutdown.shutdown().await.unwrap(),
             LastFmRuntimeShutdownReason::Drained
@@ -2728,6 +3755,77 @@ mod tests {
         assert_eq!(barrier.wait().await, Err(LastFmRuntimeShutdownError));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn actor_panic_joins_predecessor_delivery_before_releasing_vault_generation() {
+        let database = database().await;
+        let initial_session = session("listener");
+        let binding = initial_session.account_binding();
+        storage::enqueue(&database, &scrobble(binding, "Retained"))
+            .await
+            .unwrap();
+        let store = Arc::new(TestCredentialStore::new(initial_session));
+        let (started, started_events) = async_channel::bounded(1);
+        let (dropping, dropping_events) = async_channel::bounded(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let transport: Arc<dyn LastFmTransport> = Arc::new(BlockingDropTransport {
+            started,
+            dropping,
+            release: Arc::clone(&release),
+        });
+        let (handle, shutdown) = spawn_lastfm_runtime(
+            LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+            database.clone(),
+            store.clone(),
+            transport,
+            fixed_clock(),
+        )
+        .await
+        .unwrap();
+        let barrier = shutdown.barrier();
+        started_events.recv().await.unwrap();
+        handle
+            .inner
+            .commands
+            .try_send(Command::PanicForQuiescenceTest)
+            .unwrap();
+        dropping_events.recv().await.unwrap();
+
+        let successor_database = database.clone();
+        let successor_store = store.clone();
+        let successor = tokio::spawn(async move {
+            spawn_lastfm_runtime(
+                LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+                successor_database,
+                successor_store,
+                pending_transport(),
+                fixed_clock(),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!successor.is_finished());
+        {
+            let (released, changed) = &*release;
+            *released.lock().unwrap() = true;
+            changed.notify_all();
+        }
+        assert_eq!(barrier.wait().await, Err(LastFmRuntimeShutdownError));
+        let (successor_handle, successor_shutdown) = successor.await.unwrap().unwrap();
+        assert_eq!(
+            successor_handle.subscribe_status().borrow().phase,
+            LastFmRuntimePhase::CapabilityPaused
+        );
+        assert_eq!(
+            storage::validate_account_queue_state(&database, binding)
+                .await
+                .unwrap()
+                .durable_pause,
+            Some(storage::LastFmDurablePause::Capability)
+        );
+        successor_shutdown.shutdown().await.unwrap();
+        assert_eq!(shutdown.shutdown().await, Err(LastFmRuntimeShutdownError));
+    }
+
     #[tokio::test]
     async fn purge_failure_never_deletes_vault_and_disconnect_can_retry() {
         let database = database().await;
@@ -2757,6 +3855,13 @@ mod tests {
                 .unwrap(),
             1
         );
+        storage::clear_exact_pause(
+            &database,
+            rogue_binding,
+            storage::LastFmDurablePause::CredentialCleanupRequired,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             handle.disconnect_and_purge().unwrap().wait().await.unwrap(),
             0
@@ -2771,7 +3876,7 @@ mod tests {
     async fn delete_failure_reports_zero_pending_and_cleanup_retry_succeeds() {
         let database = database().await;
         let initial_session = session("listener");
-        let _binding = initial_session.account_binding();
+        let binding = initial_session.account_binding();
         let store = Arc::new(TestCredentialStore::new(initial_session.clone()));
         store.fail_next_deletes(1);
         let (handle, shutdown) = runtime(database.clone(), initial_session, store.clone()).await;
@@ -2804,10 +3909,184 @@ mod tests {
         );
         assert_eq!(store.delete_attempts(), 2);
         assert_eq!(
+            storage::validate_account_queue_state(&database, binding)
+                .await
+                .unwrap()
+                .durable_pause,
+            None
+        );
+        assert_eq!(
             handle.retry_credential_cleanup().unwrap_err(),
             LastFmRuntimeAdmissionError::NotActive
         );
         shutdown.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_tombstone_survives_restart_and_missing_vault_finishes_exact_cleanup() {
+        let database = database().await;
+        let initial_session = session("listener");
+        let binding = initial_session.account_binding();
+        let store = Arc::new(TestCredentialStore::new(initial_session.clone()));
+        store.fail_next_deletes(1);
+        let (handle, shutdown) = runtime(database.clone(), initial_session, store.clone()).await;
+        assert_eq!(
+            handle.disconnect_and_purge().unwrap().wait().await,
+            Err(LastFmRuntimeCommandError::CredentialStore)
+        );
+        shutdown.shutdown().await.unwrap();
+
+        let (successor, successor_shutdown) = spawn_lastfm_runtime(
+            LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+            database.clone(),
+            store.clone(),
+            pending_transport(),
+            fixed_clock(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            successor.subscribe_status().borrow().phase,
+            LastFmRuntimePhase::CredentialCleanup
+        );
+        assert_eq!(
+            successor
+                .try_enqueue(unbound_scrobble("refused"))
+                .unwrap_err(),
+            LastFmRuntimeAdmissionError::Transitioning
+        );
+        successor
+            .retry_credential_cleanup()
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert!(!store.has_session());
+        assert_eq!(
+            storage::validate_account_queue_state(&database, binding)
+                .await
+                .unwrap()
+                .durable_pause,
+            None
+        );
+        successor_shutdown.shutdown().await.unwrap();
+
+        storage::purge_account(&database, binding).await.unwrap();
+        assert_eq!(
+            spawn_lastfm_runtime(
+                LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+                database.clone(),
+                store,
+                pending_transport(),
+                fixed_clock(),
+            )
+            .await
+            .unwrap_err(),
+            LastFmRuntimeStartError::CredentialCleanupCompleted
+        );
+        assert_eq!(
+            storage::has_empty_cleanup_tombstone(&database)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_retry_refuses_a_wrong_same_account_pause_before_vault_delete() {
+        let database = database().await;
+        let stored_session = session("listener");
+        let binding = stored_session.account_binding();
+        storage::persist_pause_for_account(
+            &database,
+            binding,
+            storage::LastFmDurablePause::Compatibility,
+        )
+        .await
+        .unwrap();
+        let store = Arc::new(TestCredentialStore::new(stored_session));
+        let vault_lease = acquire_vault_lifecycle().await;
+        let epoch = LastFmAccountEpoch::INITIAL;
+        let ingress = Arc::new(Mutex::new(IngressGate {
+            phase: IngressPhase::Transitioning {
+                account_binding: binding,
+                account_epoch: epoch,
+                state: TransitionState::CredentialCleanupInFlight,
+            },
+            queue_admission_open: false,
+            queued_metadata: 0,
+            delivery_event_queued: false,
+            reauthorization_queued: false,
+            delivery_cancellation: None,
+            shutdown_queued: false,
+            recovery_clear_gate: None,
+        }));
+        let (command_sender, commands) = async_channel::bounded(COMMAND_CAPACITY);
+        let mut initial_status = LastFmRuntimeStatus::active(0);
+        initial_status.phase = LastFmRuntimePhase::CredentialCleanup;
+        let (status_sender, _status) = watch::channel(initial_status);
+        let mut owner = RuntimeOwner {
+            database: database.clone(),
+            credentials: store.clone(),
+            command_sender,
+            commands,
+            ingress,
+            status_sender,
+            status: initial_status,
+            account: Some(ActiveAccount {
+                binding,
+                epoch,
+                session: None,
+                queue_purged: true,
+                last_delivery_generation: LastFmDeliveryGeneration::new(1),
+                delivery: None,
+                vault_lease: Some(vault_lease),
+            }),
+            transport: pending_transport(),
+            clock: fixed_clock(),
+        };
+        let (completion, result) = oneshot::channel();
+        owner.retry_cleanup(binding, epoch, completion).await;
+        assert_eq!(result.await.unwrap(), Err(LastFmRuntimeCommandError::Queue));
+        assert_eq!(store.delete_attempts(), 0);
+        assert_eq!(
+            storage::validate_account_queue_state(&database, binding)
+                .await
+                .unwrap()
+                .durable_pause,
+            Some(storage::LastFmDurablePause::Compatibility)
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_tombstone_refuses_a_different_vault_account_without_mutation() {
+        let database = database().await;
+        let retired = session("retired");
+        let retired_binding = retired.account_binding();
+        storage::purge_account(&database, retired_binding)
+            .await
+            .unwrap();
+        let store = Arc::new(TestCredentialStore::new(session("successor")));
+        assert_eq!(
+            spawn_lastfm_runtime(
+                LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+                database.clone(),
+                store.clone(),
+                pending_transport(),
+                fixed_clock(),
+            )
+            .await
+            .unwrap_err(),
+            LastFmRuntimeStartError::AccountMismatch
+        );
+        assert_eq!(store.delete_attempts(), 0);
+        assert_eq!(
+            storage::validate_account_queue_state(&database, retired_binding)
+                .await
+                .unwrap()
+                .durable_pause,
+            Some(storage::LastFmDurablePause::CredentialCleanupRequired)
+        );
     }
 
     #[tokio::test]
