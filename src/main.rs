@@ -141,6 +141,17 @@ fn select_existing_window<W>(active: Option<W>, windows: impl IntoIterator<Item 
     active.or_else(|| windows.into_iter().next())
 }
 
+/// Pending OS-open files need application activation only when no structural
+/// window exists. A temporarily unfocused window can drain through its
+/// already-registered application action without entering the activation
+/// path that deliberately refuses to build a second window.
+fn pending_files_need_application_activation<W>(
+    active: Option<W>,
+    windows: impl IntoIterator<Item = W>,
+) -> bool {
+    select_existing_window(active, windows).is_none()
+}
+
 const I18N_INITIALIZER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 fn initialize_i18n_backend() -> Result<(), String> {
@@ -448,7 +459,7 @@ fn main() {
         info!(count = paths.len(), "Files received via OS handler");
         ui::open_files::enqueue(paths);
 
-        if app.active_window().is_none() {
+        if pending_files_need_application_activation(app.active_window(), app.windows()) {
             app.activate();
         } else if let Some(action) = app.lookup_action("play-pending-files") {
             action.activate(None);
@@ -501,5 +512,21 @@ mod tests {
         assert_eq!(super::select_existing_window(Some(7), [8, 9]), Some(7));
         assert_eq!(super::select_existing_window(None, [8, 9]), Some(8));
         assert_eq!(super::select_existing_window(None::<i32>, []), None);
+    }
+
+    #[test]
+    fn pending_files_activate_only_when_no_structural_window_exists() {
+        assert!(!super::pending_files_need_application_activation(
+            Some(7),
+            [8, 9]
+        ));
+        assert!(!super::pending_files_need_application_activation(
+            None,
+            [8, 9]
+        ));
+        assert!(super::pending_files_need_application_activation(
+            None::<i32>,
+            []
+        ));
     }
 }

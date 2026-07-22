@@ -117,7 +117,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     authority is instead consumed and revoked exactly once through a separate content-free discard
     closure in Dormant, stale-window, and shutdown states. Thus external/removable metadata and
     action handoffs still do not leave the playback session, and this boundary is not user-visible
-    activation.
+    activation. Review follow-up also makes OS-open dispatch use the same structural-window check
+    as activation, so files are drained immediately when a live window is temporarily unfocused.
   - **Private offline FIFO and durable delivery gate:** migration 17 creates and revalidates a
     constrained queue containing
     only bounded submission metadata, opaque occurrence/order identity, one-way account binding,
