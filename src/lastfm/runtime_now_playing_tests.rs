@@ -315,6 +315,14 @@ fn validated_payload_and_all_public_debug_are_content_free() {
             ..track("valid")
         },
         LastFmTrack {
+            album: Some(" ".repeat(MAX_NOW_PLAYING_METADATA_BYTES + 1)),
+            ..track("valid")
+        },
+        LastFmTrack {
+            album_artist: Some("line\nbreak".to_owned()),
+            ..track("valid")
+        },
+        LastFmTrack {
             track_number: Some(0),
             ..track("valid")
         },
@@ -328,6 +336,15 @@ fn validated_payload_and_all_public_debug_are_content_free() {
             LastFmNowPlayingInputError
         );
     }
+
+    let canonical = LastFmNowPlaying::try_new(LastFmTrack {
+        album: Some(" ".repeat(MAX_NOW_PLAYING_METADATA_BYTES)),
+        album_artist: Some("   ".to_owned()),
+        ..track("valid")
+    })
+    .unwrap();
+    assert_eq!(canonical.0.album, None);
+    assert_eq!(canonical.0.album_artist, None);
     assert_eq!(
         format!("{:?}", LastFmRuntimeCommandError::Superseded),
         "Superseded"

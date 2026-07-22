@@ -127,11 +127,11 @@ pub struct LastFmNowPlaying(LastFmTrack);
 
 impl LastFmNowPlaying {
     /// Validate one protocol track without attaching runtime account state.
-    pub fn try_new(track: LastFmTrack) -> Result<Self, LastFmNowPlayingInputError> {
+    pub fn try_new(mut track: LastFmTrack) -> Result<Self, LastFmNowPlayingInputError> {
         if !valid_now_playing_required_text(&track.artist)
             || !valid_now_playing_required_text(&track.title)
-            || !valid_now_playing_optional_text(track.album.as_deref())
-            || !valid_now_playing_optional_text(track.album_artist.as_deref())
+            || !canonicalize_now_playing_optional_text(&mut track.album)
+            || !canonicalize_now_playing_optional_text(&mut track.album_artist)
             || matches!(track.track_number, Some(0))
             || track.duration_seconds <= 30
         {
@@ -3545,8 +3545,23 @@ fn valid_now_playing_required_text(value: &str) -> bool {
     !value.trim().is_empty() && valid_now_playing_text(value)
 }
 
-fn valid_now_playing_optional_text(value: Option<&str>) -> bool {
-    value.is_none_or(|value| value.trim().is_empty() || valid_now_playing_text(value))
+fn canonicalize_now_playing_optional_text(value: &mut Option<String>) -> bool {
+    let omit = {
+        let Some(value) = value.as_deref() else {
+            return true;
+        };
+        if value.len() > MAX_NOW_PLAYING_METADATA_BYTES
+            || value.contains('\0')
+            || value.chars().any(char::is_control)
+        {
+            return false;
+        }
+        value.trim().is_empty()
+    };
+    if omit {
+        *value = None;
+    }
+    true
 }
 
 fn valid_now_playing_text(value: &str) -> bool {
