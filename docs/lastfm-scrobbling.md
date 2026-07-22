@@ -1,6 +1,7 @@
 # Last.fm scrobbling contract
 
-- Status: accepted P2.1 design; internal protocol/vault/queue/delivery/lifecycle runtime implemented; product integration pending
+- Status: accepted P2.1 design; internal protocol/vault/queue/playback-evidence,
+  delivery/lifecycle, and now-playing runtime implemented; product integration pending
 - Decision date: 2026-07-20
 - Implementation status date: 2026-07-21
 - Tracking issue: [#50](https://github.com/jm2/tributary/issues/50)
@@ -29,8 +30,32 @@ The implemented internal foundation includes:
   and the runtime attaches the current account's vault-derived binding at its ingress gate before
   sending the bound command to the serialized owner, including during that exact account's
   reauthorization;
-- a serialized actor with bounded admission for 64 ordinary metadata commands and three reserved
-  control slots, so delivery and lifecycle work cannot be starved by the ordinary FIFO;
+- a standalone, policy- and network-free playback-occurrence state machine that freezes validated
+  structured metadata, owns a random RFC 4122 version-4 occurrence UUID, and captures exactly one
+  whole-second UTC start time from the first current-generation `Playing` or accepted-position
+  proof. The first position anchors without earning credit; only strictly observed forward deltas
+  qualify once at `min(ceil(duration / 2), 240 seconds)`. Pause, buffering, seeks, restarts,
+  retries, duplicate/regressed/stale events, wall time, and natural end cannot fabricate credit.
+  Retry retains occurrence identity, credit, timestamp, and one-shot latches while re-anchoring the
+  new generation; terminal retirement is explicit. The authority is deliberately uncloneable and
+  its diagnostics redact metadata, duration, timestamp, UUID, and generation;
+- a serialized actor with bounded admission for 64 ordinary metadata commands and four reserved
+  control slots: one delivery result, two lifecycle markers, and one explicit now-playing clear.
+  Delivery, lifecycle, and playback retirement therefore cannot be starved by the ordinary FIFO;
+- a runtime-owned, validated, uncloneable, account-independent `LastFmNowPlaying` ingress. The
+  ingress gate attaches the exact current account and epoch, allocates a monotonic latest-only
+  generation, and synchronously cancels its predecessor before the successor enters the bounded
+  FIFO. Explicit clear uses its reserved slot, advances ingress ownership, cancels synchronously,
+  and makes the actor join the predecessor before acknowledging the clear. Now-playing is never
+  persisted or retried and has fixed accepted, ignored, rejected, unavailable, incompatible, and
+  capability-unavailable outcomes. Those outcomes cannot mutate durable delivery; only provider
+  code 9 may atomically claim the exact current account, epoch, and now-playing generation, commit
+  the durable reauthorization pause, and then retire delivery. Normal lifecycle paths and
+  supervised owner failure or caught panic cancel and join the task before releasing authority. A
+  hard external owner abort instead marks the drain barrier `Failed`; owner drop cancels the child
+  before its primary lease share is released, and the request future's child-held shared vault
+  lease excludes any successor until that future is actually dropped. This request-scoped proof
+  does not turn hard abort into a joined drain for an independently active durable-delivery worker;
 - one oldest-first delivery worker, batches of at most 50 rows, and at most one request in flight.
   The worker prepares and submits data but cannot mutate SQLite; the actor owns exact-receipt
   terminal settlement, durable rescheduling, and bounded accepted/ignored/rejected counters;
@@ -52,10 +77,11 @@ The implemented internal foundation includes:
   at-least-once delivery, not an exactly-once claim;
 - lifecycle-owned disconnect, shutdown, and vault recovery: disconnect retires delivery,
   atomically replaces the purged queue with a cleanup tombstone, and clears that marker only after
-  exact credential deletion; failed vault or marker cleanup is restart-stable and retryable, shutdown
-  closes admission and drains admitted durable work while cancelling and joining network work, and
-  runtime startup plus explicit missing/corrupt-vault recovery share a process-wide vault lease so
-  successor ownership cannot overlap blocking vault operations or destructive recovery; and
+  exact credential deletion; failed vault or marker cleanup is restart-stable and retryable,
+  shutdown closes admission and drains admitted durable work while cancelling and joining network
+  work, and runtime startup plus explicit missing/corrupt-vault recovery share a process-wide vault
+  lease so successor ownership cannot overlap blocking vault operations or destructive recovery;
+  and
 - process-wide panic reporting that emits fixed diagnostics and never renders a panic payload,
   including payloads from caught worker, actor, or blocking-operation panics. Actor unwind is
   caught while its complete owner state and vault lease remain retained; ingress closes, the
@@ -64,13 +90,16 @@ The implemented internal foundation includes:
   establish that pause, the shutdown proof remains failed and no durable-pause claim is made.
 
 This foundation is intentionally not exposed as a partial user feature. Still remaining are the
-generation-owned playback observer, exact threshold and one-shot now-playing wiring; desktop
-browser authorization and its latest-only token lifecycle; consent, enablement, per-source policy,
-account replacement, and a production activation issuer; application startup/shutdown integration;
-settings, status, valid-vault corrupt-queue recovery, accessibility, and all localization UI;
-release-time production credential injection and package verification; and the remaining
-end-to-end and platform acceptance matrix. The countable P2.1 record stays open until those layers
-land.
+production playback owner that creates the occurrence state only after exact source/session
+eligibility, converts immutable structured `Track` metadata, dispatches its now-playing/scrobble
+actions, and issues explicit clear without crossing GTK borrow boundaries; desktop browser
+authorization and its latest-only token lifecycle; consent, enablement, exact per-source/session
+policy, account replacement, and a production activation issuer; application startup/shutdown
+ownership; settings, account/recovery/status, valid-vault corrupt-queue recovery, accessibility,
+and all localization UI; release-time production credential injection and package verification;
+and the remaining end-to-end and platform acceptance matrix. The internal observer and
+now-playing lane are complete but deliberately unwired; the countable P2.1 record stays open until
+the product layers land.
 
 The central rule is:
 
