@@ -939,7 +939,7 @@ pub fn popover_from_menu_model(
     popover.set_parent(parent);
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
-    for i in 0..menu.n_items() as i32 {
+    for i in 0..menu.n_items() {
         let Some(action_ref) = menu
             .item_attribute_value(i, "action", Some(glib::VariantTy::STRING))
             .and_then(|v| v.str().map(|s| s.to_string()))
@@ -953,7 +953,11 @@ pub fn popover_from_menu_model(
             continue;
         };
 
-        let bare_name = action_ref.rsplit('.').next().unwrap_or(&action_ref).to_string();
+        let bare_name = action_ref
+            .rsplit('.')
+            .next()
+            .unwrap_or(&action_ref)
+            .to_string();
 
         if let Some(action) = action_group.lookup_action(&bare_name) {
             if action.is_enabled() {

@@ -372,24 +372,20 @@ pub fn build_sidebar(
 
             let tx_for_menu = tx_for_setup.clone();
             let button_for_menu = action_btn.downgrade();
-            let row_action = sidebar_row_action(
-                &disconnect_tx_for_setup,
-                &delete_tx_for_setup,
-                {
-                    let tx_source = tx_for_menu.clone();
-                    move || {
-                        let Some(button) = button_for_menu.upgrade() else {
-                            return;
-                        };
-                        let popover = context_menu::popover_from_menu_model(
-                            &button,
-                            &playlist_creation_menu(),
-                            &playlist_creation_action_group(&tx_source),
-                        );
-                        popover.popup();
-                    }
-                },
-            );
+            let row_action = sidebar_row_action(&disconnect_tx_for_setup, &delete_tx_for_setup, {
+                let tx_source = tx_for_menu.clone();
+                move || {
+                    let Some(button) = button_for_menu.upgrade() else {
+                        return;
+                    };
+                    let popover = context_menu::popover_from_menu_model(
+                        &button,
+                        &playlist_creation_menu(),
+                        &playlist_creation_action_group(&tx_source),
+                    );
+                    popover.popup();
+                }
+            });
             let row_actions = gio::SimpleActionGroup::new();
             row_actions.add_action(&row_action);
             row_box.insert_action_group("sidebar-row", Some(&row_actions));
@@ -475,10 +471,7 @@ pub fn build_sidebar(
                         let _ = tx_c.try_send(PlaylistAction::Rename(pid_c.clone()));
                     });
                     action_group.add_action(&a);
-                    menu.append(
-                        Some(&rust_i18n::t!("sidebar.rename")),
-                        Some("rename"),
-                    );
+                    menu.append(Some(&rust_i18n::t!("sidebar.rename")), Some("rename"));
 
                     let a = gio::SimpleAction::new("export", None);
                     let tx_c = tx.clone();
@@ -499,10 +492,7 @@ pub fn build_sidebar(
                         let _ = tx_c.try_send(PlaylistAction::Delete(pid_c.clone()));
                     });
                     action_group.add_action(&a);
-                    menu.append(
-                        Some(&rust_i18n::t!("sidebar.delete")),
-                        Some("delete"),
-                    );
+                    menu.append(Some(&rust_i18n::t!("sidebar.delete")), Some("delete"));
 
                     if playlist_kind == Some(PlaylistSidebarKind::EditableSmart) {
                         let a = gio::SimpleAction::new("edit-smart", None);
