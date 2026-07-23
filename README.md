@@ -65,7 +65,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Durable local playback history | ✅ Exact accepted local occurrences persist a saturating play count and monotonic last-played timestamp, with live Plays refresh ([contract](docs/playback-history.md)) |
 | Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ Recently Played and Top 25 use deterministic authoritative history, safe untouched-default migration, and live projection refresh ([P1.3](docs/task.md#p13--record-trustworthy-local-playback-history)) |
 | Track ratings | ✅ Exact 1–100 local editing, read-only/unsupported source states, deterministic sorting, live refresh, and smart-playlist rules ([contract](docs/ratings.md)) |
-| Last.fm scrobbling | 🚧 Internal foundation only — bounded protocol/vault storage, a private durable FIFO, a latest-only desktop-authorization owner, frozen generation-owned playback evidence, a GTK-free move-only playback-owner/handoff boundary, registry-instance-bound real-tag external/removable attribution, runtime-owned one-shot now-playing, and a non-recreatable process playback coordinator with production event/terminal/source/output/shutdown ingress are implemented. A sealed headless Active bridge can bind one exact window to one private playback-only runtime capability, create the sole coordinator-minted playback owner, revalidate source policy, order ephemeral NowPlaying/Clear work, and supervise admitted Enqueue work through its runtime completion before retirement; only `Inserted`/`AlreadyQueued` proves SQLite durability. A headless application owner accepts one database attachment followed by one move-only consent/enablement request, transactionally starts the runtime and bridge as one immutable-policy generation, rolls back partial activation, and drains the bridge before the runtime. The core is not composed into application startup and receives no database attachment or activation request, so the coordinator remains Dormant, no runtime starts, no Last.fm work is emitted, and the feature remains unavailable to users. Exact local/authenticated-remote profiles, production remote opt-in, consent/browser launch, vault installation and account-transition policy, account/recovery/status UX, localization/accessibility, production credentials/verification, and live final acceptance testing remain ([complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary)) |
+| Last.fm scrobbling | 🚧 Internal foundation only — bounded protocol/vault storage, a private durable FIFO, a latest-only desktop-authorization owner, frozen generation-owned playback evidence, a GTK-free move-only playback-owner/handoff boundary, registry-instance-bound real-tag external/removable attribution, runtime-owned one-shot now-playing, and a non-recreatable process playback coordinator with production event/terminal/source/output/shutdown ingress are implemented. A sealed headless Active bridge can bind one exact window to one private playback-only runtime capability, create the sole coordinator-minted playback owner, revalidate source policy, order ephemeral NowPlaying/Clear work, and supervise admitted Enqueue work through its runtime completion before retirement; only `Inserted`/`AlreadyQueued` proves SQLite durability. A headless application owner accepts one database attachment followed by one move-only consent/enablement request, transactionally starts the runtime and bridge as one immutable-policy generation, rolls back partial activation, and drains the bridge before the runtime. Application startup now constructs exactly one owner after the first-window coordinator bind; after successful database initialization and before shutdown, capable builds attach the migrated database once, while unavailable builds skip the database handoff. Close joins the owner before coordinator/output/source teardown. Shipping issues no activation request, so the coordinator remains Dormant, no runtime, network, or scrobbling work starts, and the feature remains unavailable to users. Replacement-generation controls, exact local/authenticated-remote profiles, production remote opt-in, consent/browser launch, vault installation and account-transition policy, account/recovery/status UX, localization/accessibility, production credentials/verification, and live final acceptance testing remain ([complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary)) |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
 | Linux and macOS file associations | ✅ |
@@ -125,15 +125,20 @@ terminal. Database, Starting, and Active publication linearize with close on one
 the owner supervises the runtime's persistent barrier: an unexpected exit closes application
 ingress, retires the bridge, joins the runtime, and only then publishes a fixed terminal failure;
 an application close that wins the same gate remains an ordinary ordered drain.
+The composed handle is still one-shot and phase-only: typed runtime status, disconnect,
+reauthorization, recovery, and fully drained successor-policy controls remain part of the settings
+integration rather than usable product actions today.
 
 Production playback already reports output intent before invocation, handles the accepted/rejected
 session result, hands accepted loads to the lazy coordinator boundary, and reports current events,
 seek/Previous/resume discontinuities, Stop, committed output replacement, queue/terminal
 retirement, source-authority revalidation points, and shutdown without carrying GTK borrows across
-coordinator ingress. This is still not feature activation: application startup does not construct
-or feed the application-owner core, attach its database, issue an activation request, construct
-authorization/settings UI, or supply live source policy. The coordinator therefore remains
-Dormant and no Last.fm runtime starts. Dormant, stale, and
+coordinator ingress. Application startup now constructs the application owner after the first-window
+coordinator bind, conditionally attaches the migrated database after successful initialization,
+and joins the owner before
+coordinator/output/source teardown. This is still not feature activation: it does not issue an
+activation request, construct authorization/settings UI, or supply live source policy. The
+coordinator therefore remains Dormant and no Last.fm runtime starts. Dormant, stale, and
 shutdown loads consume and revoke their exact authority through a metadata-free discard closure,
 so no external/removable metadata or action handoff leaves the playback session. Exact
 local/authenticated-remote profiles and the production activation path remain follow-on work.
@@ -213,8 +218,10 @@ exact-window coordinator activation`. Once active, playback dispatch follows `co
 coordinator-minted playback owner → playback runtime ingress → serialized runtime actor`. The
 activation owns a registry and remote-opt-in snapshot for synchronous source admission, and its
 operation/retirement barriers prevent a successor environment from overtaking accepted playback
-work or the predecessor's final Clear. Application startup does not construct or feed the
-application-owner core and currently stops at the coordinator's Dormant state.
+work or the predecessor's final Clear. Startup now constructs the application owner and, after
+successful initialization before shutdown, attaches the migrated database on capable builds; it
+then stops at the owner's `AwaitingConsent` and the
+coordinator's Dormant state because no production activation authority exists.
 
 The local backend's aggregate contract and complete-catalogue integration seam are now stable.
 Local artist and album IDs use a private, versioned UUIDv5 namespace with separate artist/album

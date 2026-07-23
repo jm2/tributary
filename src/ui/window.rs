@@ -4,6 +4,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -100,17 +101,86 @@ fn apply_current_seek_intent(
     true
 }
 
-/// Close the process-scoped playback ingress before revoking registry
-/// authority.  Returning the source barrier keeps the existing async close
-/// drain unchanged while making the ordering deterministic.
-fn shutdown_playback_before_sources<T>(
-    shutdown_playback: impl FnOnce(),
-    retire_local_playback: impl FnOnce(),
-    shutdown_sources: impl FnOnce() -> T,
-) -> T {
-    shutdown_playback();
-    retire_local_playback();
-    shutdown_sources()
+/// Join the application-owned bridge/runtime generation before terminating
+/// the process coordinator or revoking source authority.
+///
+/// The GTK close callback starts the application drain synchronously, then
+/// hands its unique join side to this asynchronous phase. Keeping the
+/// downstream callbacks behind the awaited future makes the ordering
+/// independently testable without a GTK main loop.
+async fn drain_lastfm_application_before_sources<ApplicationDrain, Coordinator, Sources>(
+    application_drain: ApplicationDrain,
+    shutdown_coordinator: impl FnOnce() -> Coordinator,
+    shutdown_sources: impl FnOnce() -> Sources,
+) -> (ApplicationDrain::Output, Coordinator, Sources)
+where
+    ApplicationDrain: Future,
+{
+    let application_result = application_drain.await;
+    let coordinator_result = shutdown_coordinator();
+    let source_barrier = shutdown_sources();
+    (application_result, coordinator_result, source_barrier)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LastFmDatabaseCompositionOutcome {
+    UnavailableBuild,
+    Attached,
+    AlreadyAttached,
+    Retired,
+    Rejected(crate::lastfm::production::LastFmApplicationAdmissionError),
+    Failed(crate::lastfm::production::LastFmApplicationCommandError),
+}
+
+/// Attach the migrated application database only while the production owner
+/// is waiting for its first attachment.
+///
+/// Passing attachment through a callback is deliberate: a phase already known
+/// to be unavailable, attached, or retired avoids even cloning the database.
+/// A concurrent close can still reject the callback's short-lived clone. The
+/// returned fixed category keeps local-library startup independent from this
+/// optional integration while making the shipping decision directly testable.
+async fn compose_lastfm_database<Attach, Completion>(
+    phase: crate::lastfm::production::LastFmApplicationPhase,
+    attach: Attach,
+) -> LastFmDatabaseCompositionOutcome
+where
+    Attach:
+        FnOnce() -> Result<Completion, crate::lastfm::production::LastFmApplicationAdmissionError>,
+    Completion:
+        Future<Output = Result<(), crate::lastfm::production::LastFmApplicationCommandError>>,
+{
+    use crate::lastfm::production::{
+        LastFmApplicationAdmissionError, LastFmApplicationCommandError, LastFmApplicationPhase,
+    };
+
+    match phase {
+        LastFmApplicationPhase::UnavailableBuild => {
+            LastFmDatabaseCompositionOutcome::UnavailableBuild
+        }
+        LastFmApplicationPhase::AwaitingDatabase => match attach() {
+            Ok(completion) => match completion.await {
+                Ok(()) => LastFmDatabaseCompositionOutcome::Attached,
+                Err(LastFmApplicationCommandError::OwnerStopped) => {
+                    LastFmDatabaseCompositionOutcome::Retired
+                }
+                Err(error) => LastFmDatabaseCompositionOutcome::Failed(error),
+            },
+            Err(LastFmApplicationAdmissionError::Closed) => {
+                LastFmDatabaseCompositionOutcome::Retired
+            }
+            Err(LastFmApplicationAdmissionError::DatabaseAlreadyAttached) => {
+                LastFmDatabaseCompositionOutcome::AlreadyAttached
+            }
+            Err(error) => LastFmDatabaseCompositionOutcome::Rejected(error),
+        },
+        LastFmApplicationPhase::AwaitingConsent
+        | LastFmApplicationPhase::Starting
+        | LastFmApplicationPhase::Active => LastFmDatabaseCompositionOutcome::AlreadyAttached,
+        LastFmApplicationPhase::ShuttingDown
+        | LastFmApplicationPhase::Stopped
+        | LastFmApplicationPhase::Failed => LastFmDatabaseCompositionOutcome::Retired,
+    }
 }
 
 /// Registry transitions re-check the active proof rather than globally
@@ -1349,6 +1419,26 @@ pub(crate) fn build_window(
     let lastfm_playback = lastfm_playback_owner
         .bind_window(source_registry.clone())
         .expect("the unique process playback coordinator binds one window epoch");
+    // Compose the process application owner before asynchronous database
+    // initialization. It remains Dormant until a future consent/policy layer
+    // issues the move-only activation authority; ordinary builds without
+    // injected credentials perform no Last.fm database, vault, or network
+    // work.
+    let (lastfm_application, lastfm_application_shutdown) =
+        match crate::lastfm::production::spawn_lastfm_application_owner(
+            lastfm_playback.clone(),
+            rt_handle.clone(),
+        ) {
+            Ok(owner) => owner,
+            Err(error) => {
+                tracing::error!(category = %error, "Last.fm application owner unavailable");
+                let _ = lastfm_playback_owner.shutdown();
+                let _ = source_registry.shutdown();
+                app.quit();
+                return;
+            }
+        };
+    let lastfm_application_shutdown = Rc::new(RefCell::new(Some(lastfm_application_shutdown)));
     // The owner is deliberately non-cloneable. Keep the unique value alive
     // for the native window and mutate it only at the close barrier; all
     // ordinary playback callbacks receive the epoch-scoped binding instead.
@@ -1805,6 +1895,8 @@ pub(crate) fn build_window(
     let shutdown_server_playlists = server_playlist_coordinator.clone();
     let shutdown_server_playlist_barrier = server_playlist_coordinator_barrier.clone();
     let shutdown_server_playlist_browser = server_playlist_browser.clone();
+    let shutdown_lastfm_application = lastfm_application.clone();
+    let shutdown_lastfm_application_owner = lastfm_application_shutdown.clone();
     let shutdown_lastfm_playback_owner = lastfm_playback_owner.clone();
     let shutdown_started = Rc::new(Cell::new(false));
     let shutdown_started_for_close = shutdown_started.clone();
@@ -1817,6 +1909,11 @@ pub(crate) fn build_window(
 
         if !shutdown_started_for_close.replace(true) {
             super::rhythmbox_migration::cancel_pending();
+            // Close product activation and database ingress synchronously.
+            // The unique join side is awaited below without blocking GTK;
+            // an Active generation retires its bridge before its runtime.
+            let _ = shutdown_lastfm_application.close_and_flush();
+            let application_shutdown = shutdown_lastfm_application_owner.borrow_mut().take();
             // End the two window-scoped receiver loops even though their
             // application-side senders can outlive this native window. This
             // releases the controllers and window captures deterministically.
@@ -1840,35 +1937,61 @@ pub(crate) fn build_window(
             // actions also consult the shared command-admission gate below.
             w.set_sensitive(false);
             super::open_files::invalidate_admission();
-            let barrier = shutdown_playback_before_sources(
-                || {
-                    let _ = shutdown_lastfm_playback_owner.borrow_mut().shutdown();
-                },
-                || {
-                    let external_source = shutdown_playback.borrow().current_external_source_id();
-                    // Revoke the event generation before stopping the output
-                    // so no terminal callback can enqueue behind the FIFO
-                    // flush marker. Coordinator ingress is already closed,
-                    // and no owner borrow crosses either output call.
-                    shutdown_playback.borrow_mut().clear();
-                    let shutdown_output = shutdown_output_slot.borrow().as_ref().cloned();
-                    if let Some(shutdown_output) = shutdown_output {
-                        shutdown_output.borrow().stop();
-                    }
-                    if let Some(source_id) = external_source {
-                        let _ = shutdown_sources.retire_external(source_id);
-                    }
-                },
-                || shutdown_sources.shutdown(),
-            );
             let window = w.clone();
             let shutdown_complete = shutdown_complete.clone();
             let server_playlist_barrier = shutdown_server_playlist_barrier.clone();
+            let shutdown_lastfm_playback_owner = shutdown_lastfm_playback_owner.clone();
+            let shutdown_playback = shutdown_playback.clone();
+            let shutdown_output_slot = shutdown_output_slot.clone();
+            let shutdown_sources = shutdown_sources.clone();
             glib::MainContext::default().spawn_local(async move {
+                let application_drain = async move {
+                    match application_shutdown {
+                        Some(shutdown) => shutdown.shutdown().await,
+                        None => Err(
+                            crate::lastfm::production::LastFmApplicationShutdownError,
+                        ),
+                    }
+                };
+                let (application_result, coordinator_result, source_barrier) =
+                    drain_lastfm_application_before_sources(
+                        application_drain,
+                        || shutdown_lastfm_playback_owner.borrow_mut().shutdown(),
+                        || {
+                            let external_source =
+                                shutdown_playback.borrow().current_external_source_id();
+                            // The application owner has retired the Active
+                            // bridge and joined its runtime. Revoke the event
+                            // generation before the first output call, then
+                            // release source authority last.
+                            shutdown_playback.borrow_mut().clear();
+                            let shutdown_output =
+                                shutdown_output_slot.borrow().as_ref().cloned();
+                            if let Some(shutdown_output) = shutdown_output {
+                                shutdown_output.borrow().stop();
+                            }
+                            if let Some(source_id) = external_source {
+                                let _ = shutdown_sources.retire_external(source_id);
+                            }
+                            shutdown_sources.shutdown()
+                        },
+                    )
+                    .await;
+                if let Err(error) = application_result {
+                    warn!(%error, "Last.fm application owner failed to drain");
+                }
+                if coordinator_result
+                    != crate::lastfm::playback_coordinator::LastFmPlaybackCoordinatorOutcome::Applied
+                {
+                    warn!(
+                        outcome = ?coordinator_result,
+                        "Last.fm playback coordinator failed to shut down cleanly"
+                    );
+                }
                 if flush_queued && flush_rx.recv().await.is_err() {
                     warn!("Library mutation shutdown flush was not acknowledged");
                 }
-                barrier.wait().await;
+                source_barrier.wait().await;
                 server_playlist_barrier.wait().await;
                 shutdown_complete.set(true);
                 window.close();
@@ -1915,9 +2038,43 @@ pub(crate) fn build_window(
     let engine_playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
     let engine_server_playlist_coordinator = server_playlist_coordinator.clone();
     let engine_source_registry = source_registry.clone();
+    let engine_lastfm_application = lastfm_application.clone();
     rt_handle.spawn(async move {
         match crate::db::connection::init_db().await {
             Ok(db) => {
+                let lastfm_phase = engine_lastfm_application.subscribe_status().borrow().phase;
+                let lastfm_database_outcome = compose_lastfm_database(lastfm_phase, || {
+                    engine_lastfm_application
+                        .try_attach_database(db.clone())
+                        .map(|operation| async move { operation.wait().await })
+                })
+                .await;
+                match lastfm_database_outcome {
+                    LastFmDatabaseCompositionOutcome::UnavailableBuild => {
+                        info!("Last.fm unavailable in this build");
+                    }
+                    LastFmDatabaseCompositionOutcome::Attached => {
+                        info!("Last.fm application database attached");
+                    }
+                    LastFmDatabaseCompositionOutcome::AlreadyAttached => {
+                        warn!(
+                            category = "database-already-attached",
+                            "Last.fm database attachment skipped"
+                        );
+                    }
+                    LastFmDatabaseCompositionOutcome::Retired => {
+                        info!("Last.fm database attachment retired during shutdown");
+                    }
+                    LastFmDatabaseCompositionOutcome::Rejected(error) => {
+                        warn!(
+                            category = %error,
+                            "Last.fm database attachment was not admitted"
+                        );
+                    }
+                    LastFmDatabaseCompositionOutcome::Failed(error) => {
+                        warn!(category = %error, "Last.fm database attachment failed");
+                    }
+                }
                 let services = crate::local::engine::LibraryEngineServices::new(
                     engine_playlist_sidebar_refresh,
                     playlist_sidebar_refresh_rx,
@@ -2878,6 +3035,7 @@ pub(crate) fn build_window(
         let playback_source_registry = source_registry.clone();
         let playback_lastfm = lastfm_playback.clone();
         let playback_history_commands = library_commands.clone();
+        let playback_shutdown_started = shutdown_started.clone();
 
         // Pre-build a spinner widget for the buffering state.
         let buffering_spinner = gtk::Spinner::builder()
@@ -2892,6 +3050,9 @@ pub(crate) fn build_window(
         const BUFFERING_DELAY_MS: u32 = 300;
         glib::MainContext::default().spawn_local(async move {
             while let Ok(event) = player_rx.recv().await {
+                if playback_shutdown_started.get() {
+                    break;
+                }
                 let event_generation = event.generation();
                 if !playback_session
                     .borrow()
@@ -4628,6 +4789,9 @@ mod identity_tests {
         models::{Rating, Track, TrackRating},
         SourceId,
     };
+    use crate::lastfm::production::{
+        LastFmApplicationAdmissionError, LastFmApplicationCommandError, LastFmApplicationPhase,
+    };
     use crate::local::playlist_sidebar::{PlaylistSidebarEntry, PlaylistSidebarKind};
 
     #[test]
@@ -4693,32 +4857,190 @@ mod identity_tests {
         assert_eq!(callbacks.get(), 0);
     }
 
-    #[test]
-    fn source_changes_revalidate_and_shutdown_precedes_registry_revocation() {
-        let order = RefCell::new(Vec::new());
+    #[tokio::test]
+    async fn source_changes_revalidate_and_application_drain_precedes_teardown() {
+        let order = Rc::new(RefCell::new(Vec::new()));
         revalidate_before_source_reconciliation(
             || order.borrow_mut().push("revalidate"),
             || order.borrow_mut().push("source-specific invalidation"),
         );
-        let barrier = shutdown_playback_before_sources(
-            || order.borrow_mut().push("coordinator shutdown"),
-            || order.borrow_mut().push("local playback retirement"),
-            || {
-                order.borrow_mut().push("registry shutdown");
-                "barrier"
-            },
-        );
+        let application_order = order.clone();
+        let coordinator_order = order.clone();
+        let source_order = order.clone();
+        let (application_result, coordinator_result, barrier) =
+            drain_lastfm_application_before_sources(
+                async move {
+                    application_order.borrow_mut().push("application drain");
+                    Ok::<_, ()>("application")
+                },
+                || {
+                    coordinator_order.borrow_mut().push("coordinator shutdown");
+                    "coordinator"
+                },
+                || {
+                    source_order.borrow_mut().push("local playback retirement");
+                    source_order.borrow_mut().push("registry shutdown");
+                    "barrier"
+                },
+            )
+            .await;
+        assert_eq!(application_result, Ok("application"));
+        assert_eq!(coordinator_result, "coordinator");
         assert_eq!(barrier, "barrier");
         assert_eq!(
             *order.borrow(),
             [
                 "revalidate",
                 "source-specific invalidation",
+                "application drain",
                 "coordinator shutdown",
                 "local playback retirement",
                 "registry shutdown"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn failed_application_drain_remains_visible_and_teardown_continues() {
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let application_order = order.clone();
+        let coordinator_order = order.clone();
+        let source_order = order.clone();
+        let (application_result, coordinator_result, source_result) =
+            drain_lastfm_application_before_sources(
+                async move {
+                    application_order.borrow_mut().push("application failed");
+                    Err::<(), _>("drain failed")
+                },
+                || {
+                    coordinator_order.borrow_mut().push("coordinator shutdown");
+                    "coordinator"
+                },
+                || {
+                    source_order.borrow_mut().push("registry shutdown");
+                    "sources"
+                },
+            )
+            .await;
+        assert_eq!(application_result, Err("drain failed"));
+        assert_eq!(coordinator_result, "coordinator");
+        assert_eq!(source_result, "sources");
+        assert_eq!(
+            *order.borrow(),
+            [
+                "application failed",
+                "coordinator shutdown",
+                "registry shutdown"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_application_drain_blocks_downstream_teardown() {
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let (release, wait) = async_channel::bounded::<()>(1);
+        let application_order = order.clone();
+        let coordinator_order = order.clone();
+        let source_order = order.clone();
+        let drain = drain_lastfm_application_before_sources(
+            async move {
+                wait.recv().await.unwrap();
+                application_order.borrow_mut().push("application drain");
+            },
+            || coordinator_order.borrow_mut().push("coordinator shutdown"),
+            || {
+                source_order.borrow_mut().push("registry shutdown");
+            },
+        );
+        tokio::pin!(drain);
+        tokio::select! {
+            biased;
+            _ = &mut drain => panic!("drain completed before release"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert!(order.borrow().is_empty());
+        release.send(()).await.unwrap();
+        drain.await;
+        assert_eq!(
+            *order.borrow(),
+            [
+                "application drain",
+                "coordinator shutdown",
+                "registry shutdown"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn available_lastfm_database_is_attached_exactly_once() {
+        let calls = Cell::new(0);
+        let outcome = compose_lastfm_database(LastFmApplicationPhase::AwaitingDatabase, || {
+            calls.set(calls.get() + 1);
+            Ok::<_, LastFmApplicationAdmissionError>(std::future::ready(Ok::<
+                (),
+                LastFmApplicationCommandError,
+            >(())))
+        })
+        .await;
+
+        assert_eq!(outcome, LastFmDatabaseCompositionOutcome::Attached);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn unavailable_lastfm_build_never_receives_database_handle() {
+        let calls = Cell::new(0);
+        let outcome = compose_lastfm_database(LastFmApplicationPhase::UnavailableBuild, || {
+            calls.set(calls.get() + 1);
+            Ok::<_, LastFmApplicationAdmissionError>(std::future::ready(Ok::<
+                (),
+                LastFmApplicationCommandError,
+            >(())))
+        })
+        .await;
+
+        assert_eq!(outcome, LastFmDatabaseCompositionOutcome::UnavailableBuild);
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn retired_lastfm_owner_never_receives_database_handle() {
+        let calls = Cell::new(0);
+        let outcome = compose_lastfm_database(LastFmApplicationPhase::ShuttingDown, || {
+            calls.set(calls.get() + 1);
+            Ok::<_, LastFmApplicationAdmissionError>(std::future::ready(Ok::<
+                (),
+                LastFmApplicationCommandError,
+            >(())))
+        })
+        .await;
+
+        assert_eq!(outcome, LastFmDatabaseCompositionOutcome::Retired);
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn closed_lastfm_database_admission_is_benign_retirement() {
+        let outcome = compose_lastfm_database(LastFmApplicationPhase::AwaitingDatabase, || {
+            Err::<std::future::Ready<Result<(), LastFmApplicationCommandError>>, _>(
+                LastFmApplicationAdmissionError::Closed,
+            )
+        })
+        .await;
+
+        assert_eq!(outcome, LastFmDatabaseCompositionOutcome::Retired);
+    }
+
+    #[tokio::test]
+    async fn stopped_lastfm_database_completion_is_benign_retirement() {
+        let outcome = compose_lastfm_database(LastFmApplicationPhase::AwaitingDatabase, || {
+            Ok::<_, LastFmApplicationAdmissionError>(std::future::ready(Err(
+                LastFmApplicationCommandError::OwnerStopped,
+            )))
+        })
+        .await;
+
+        assert_eq!(outcome, LastFmDatabaseCompositionOutcome::Retired);
     }
 
     #[test]

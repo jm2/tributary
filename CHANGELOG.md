@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [removable-attribution slice](https://github.com/jm2/tributary/pull/157),
   [process-coordinator slice](https://github.com/jm2/tributary/pull/158), the
   [headless runtime-bridge slice](https://github.com/jm2/tributary/pull/159), and the
-  [application-owner core slice](https://github.com/jm2/tributary/pull/160)).
+  [application-owner core slice](https://github.com/jm2/tributary/pull/160), plus the
+  [production-composition slice](https://github.com/jm2/tributary/pull/165)).
   This is an internal foundation, not yet a user-visible scrobbling feature. Application startup
   claims a non-recreatable Dormant playback coordinator, and production call sites feed its
   epoch-bound boundary with output intent, lazy accepted-load handoff, events, discontinuities,
@@ -29,14 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   playback through source admission into ordered NowPlaying and Clear runtime commands, and retain
   each admitted Enqueue through its one-shot runtime completion; only `Inserted`/`AlreadyQueued`
   proves SQLite durability. Exact real-tag external/removable proofs can reach that bridge, but
-  startup remains
-  Dormant and revokes them through a metadata-free discard closure. The new application-owner core
-  is not composed into shipping startup and receives neither a database attachment nor an
-  activation request, so no Last.fm runtime starts, no Last.fm work is emitted, and the feature
-  remains unavailable to users. Exact local/authenticated-remote profiles, explicit consent and
-  browser launch, staged-session vault installation and account transition policy, exact
-  per-source/session policy, settings/status UI, localization and accessibility, and production
-  package credentials remain follow-on work; the
+  startup remains Dormant and revokes them through a metadata-free discard closure. Shipping now
+  constructs exactly one application owner after the first-window coordinator bind and before
+  asynchronous database initialization. After successful database initialization and before
+  shutdown, capable builds attach the migrated database once; unavailable builds skip that
+  handoff. Window close joins the application owner's
+  bridge-before-runtime generation before coordinator/output/source teardown. It still receives no
+  activation request, so no Last.fm runtime, network, or scrobbling work starts and the feature
+  remains unavailable to users. Successor-policy and typed runtime lifecycle/status controls,
+  exact local/authenticated-remote profiles, explicit consent and browser launch, staged-session
+  vault installation and account transition policy, exact per-source/session policy,
+  settings/status UI, localization and accessibility, and production package credentials remain
+  follow-on work; the
   [complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary) also tracks
   activation/unavailable-state issuance, structured source-owner conversion, account replacement
   and recovery, package verification/API registration, and the remaining acceptance matrix.
@@ -152,9 +157,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     linearize with close, and the retained runtime barrier is supervised: unexpected runtime exit
     closes ingress, retires the bridge, joins the runtime, and only then publishes a fixed terminal
     failure. A concurrent application close which wins the gate remains a normal ordered drain.
-    The core publishes only bounded content-free status and remains unconstructed by the shipping
-    application, so it cannot infer consent from build credentials, vault state, queued rows, or
-    source connectivity.
+    The core publishes only bounded content-free status and cannot infer consent from build
+    credentials, vault state, queued rows, or source connectivity. Shipping constructs exactly one
+    instance after binding the first-window coordinator and before asynchronous database setup.
+    After successful database initialization and before shutdown, a capable build attaches the
+    migrated database once and stops at `AwaitingConsent`; an unavailable build never invokes the
+    lazy database handoff. Close revokes application ingress synchronously,
+    then asynchronously joins the application's bridge-before-runtime drain before terminating the
+    coordinator, clearing/stopping playback, and revoking source authority. A failed application
+    drain stays visible without skipping downstream teardown, post-close player events are ignored,
+    and application Quit uses a structural live-window fallback so an unfocused window cannot
+    bypass the close barrier. No shipping path issues the activation request.
   - **Private offline FIFO and durable delivery gate:** migration 17 creates and revalidates a
     constrained queue containing
     only bounded submission metadata, opaque occurrence/order identity, one-way account binding,
@@ -203,7 +216,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     deliberately unbound: only the runtime ingress gate can attach the vault-derived account
     binding. No shipping composition claims this capability yet. Startup additionally requires an
     opaque capability issued only inside the application-owner core after it consumes a move-only
-    consent/enablement request; no production settings or composition path issues that request yet.
+    consent/enablement request; no production path issues that request yet.
     Checked account epochs and delivery generations
     reject stale events; watched phase, pending count, fixed failure category, and saturating
     non-persistent accepted/ignored/rejected counters update only after the matching durable

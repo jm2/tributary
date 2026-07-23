@@ -132,7 +132,11 @@ fn dispatch_application_quit<W, CloseWindow, QuitApplication>(
 }
 
 fn request_application_quit(app: &adw::Application) {
-    dispatch_application_quit(app.active_window(), |window| window.close(), || app.quit());
+    dispatch_application_quit(
+        select_existing_window(app.active_window(), app.windows()),
+        |window| window.close(),
+        || app.quit(),
+    );
 }
 
 /// Prefer GTK's active window, but retain a structural fallback while a live
@@ -505,6 +509,21 @@ mod tests {
 
         assert!(!window_closed.get());
         assert!(application_quit.get());
+    }
+
+    #[test]
+    fn application_quit_uses_structural_window_when_none_is_active() {
+        let closed_window = Cell::new(None);
+        let application_quit = Cell::new(false);
+
+        dispatch_application_quit(
+            super::select_existing_window(None, [7, 8]),
+            |window| closed_window.set(Some(window)),
+            || application_quit.set(true),
+        );
+
+        assert_eq!(closed_window.get(), Some(7));
+        assert!(!application_quit.get());
     }
 
     #[test]
