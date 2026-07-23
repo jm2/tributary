@@ -3,7 +3,8 @@
 - Status: accepted P2.1 design; internal protocol/desktop-authorization/vault/queue/playback-evidence,
   registry-bound external and removable attribution, playback-owner, delivery/lifecycle,
   now-playing, process-coordinator/production-ingress, sealed headless Active runtime-bridge, and
-  headless application-owner boundaries implemented; production startup remains Dormant and
+  headless application-owner boundaries plus first-window/database/ordered-shutdown composition
+  implemented; production startup remains Dormant because no activation authority is issued, and
   product integration is pending
 - Decision date: 2026-07-20
 - Implementation status date: 2026-07-22
@@ -142,6 +143,17 @@ The implemented internal foundation includes:
   runtime barrier is supervised; unexpected exit closes application ingress, retires the bridge,
   joins the runtime, and only then publishes a fixed terminal failure, while an application close
   that wins the gate remains a normal drain. Status and diagnostics contain only fixed categories;
+- shipping first-window composition for exactly one application owner. It is constructed after the
+  exact process-coordinator window bind and before asynchronous database initialization. When
+  database initialization succeeds before shutdown, a capable build attaches the migrated database
+  exactly once and remains `AwaitingConsent`; an unavailable build never invokes the lazy
+  attachment callback and performs no database, vault, queue, runtime, or network work. Window close
+  synchronously revokes database and activation ingress, then awaits
+  application bridge-before-runtime shutdown before process-coordinator termination, playback
+  session/output teardown, external playback retirement, and source-registry shutdown. Failed
+  application drain is reported without skipping downstream teardown, post-close player events are
+  ignored, and application Quit selects a structural live window when none is active so the window
+  close barrier cannot be bypassed. No shipping path issues an activation authority;
 - a serialized actor with bounded admission for 64 ordinary metadata commands and four reserved
   control slots: one delivery result, two lifecycle markers, and one explicit now-playing clear.
   Delivery, lifecycle, and playback retirement therefore cannot be starved by the ordinary FIFO;
@@ -192,31 +204,38 @@ The implemented internal foundation includes:
   capability pause for any still-unpurged account before releasing the lease. If SQLite cannot
   establish that pause, the shutdown proof remains failed and no durable-pause claim is made.
 
-This foundation is intentionally not exposed as a partial user feature. The headless application
-owner is implemented, but production startup does not construct or feed it, attach the migrated
-database, issue an activation request, or connect queue capture and dispatch to one live policy
-generation. The process coordinator therefore remains Dormant and no delivery/runtime actor
-starts. Exact local and authenticated-remote profile construction plus production remote-source
-opt-in also remain. Also remaining are
+This foundation is intentionally not exposed as a partial user feature. Production startup now
+constructs the headless application owner and owns its ordered shutdown. When database
+initialization succeeds before shutdown, a capable build attaches the migrated database once; it
+still does not issue an activation request or connect queue capture and dispatch to one live policy
+generation. The process coordinator therefore remains Dormant and no
+delivery/runtime actor starts. Exact local and authenticated-remote profile construction plus
+production remote-source opt-in also remain. Also remaining are
 localized consent and browser invocation around the completed authorization core; one process-wide
 authorization owner; atomic staged-session vault installation, exact same-account
 reauthorization and different-account replacement/purge policy; enablement, exact per-source/session
-policy, and a production activation issuer; settings, account/recovery/status, valid-vault
-corrupt-queue recovery, accessibility, and all localization UI; release-time production credential
-injection and package verification; and the remaining live end-to-end and platform acceptance
-matrix. The internal observer, playback owner, runtime, now-playing lane, sealed runtime bridge, and
-application owner are complete headless boundaries but remain uninstantiated or unconnected by
-production while the coordinator is Dormant; the countable P2.1 record stays open at **14/38
-(36.8%)** until those product layers land.
+policy, and a production activation issuer; typed runtime status, disconnect, reauthorization,
+recovery, and successor-policy-generation controls around the currently one-shot phase-only
+application handle; settings, account/recovery/status, valid-vault corrupt-queue recovery,
+accessibility, and all localization UI; release-time production credential injection and package
+verification; and the remaining live end-to-end and platform acceptance matrix. The internal
+observer, playback owner, runtime, now-playing lane, sealed runtime bridge, and
+application owner are complete headless boundaries; the application owner is now instantiated and
+database-attached, while activation/policy/auth/UI layers remain unconnected and the coordinator
+stays Dormant. The countable P2.1 record stays open at **14/38 (36.8%)** until those product layers
+land.
 
-The current application-owner slice adds 13 focused regressions for zero-action unavailable builds,
+The application-owner core adds 13 focused regressions for zero-action unavailable builds,
 one-shot database/consent input, process-wide ownership, a real Active generation, late vault-load
 close, stale-coordinator rollback, panic cleanup ordering, close with queued inputs,
 bounded/redacted policy, close-before-database and close-before-Starting publication, unexpected
 runtime exit, and close-versus-runtime-exit classification. Existing capability, activation-epoch,
 durable-enqueue, exact-managed-source revocation, dispatch-order, retirement,
-close/rebind/shutdown, and poison coverage remains green. Locked debug and release suites each pass
-20 library, 1,690 application, and 14 repository-metadata tests (1,724 total). Strict Clippy passes
+close/rebind/shutdown, and poison coverage remains green. Shipping-composition regressions add
+capable one-shot attachment, unavailable/retired zero-handoff paths, close and owner-stop race
+classification, successful/failed/pending drain ordering, and structural-window application Quit.
+Locked debug and release suites each pass 20 library, 1,698 application, and 14 repository-metadata
+tests (1,732 total). Strict Clippy passes
 in debug, release, and the fuzz workspace; the declared Rust 1.92 locked all-target check,
 formatting, and diff checks are clean; and the dependency audit reports only the two documented
 allowed unmaintained warnings.
@@ -323,8 +342,9 @@ HTTP, XML/JSON, database, and credential-store details remain in sanitized diagn
 One non-cloneable, process-lifetime Last.fm application owner is the sole bridge from already-issued
 product enablement authority to the lower-level vault, runtime, and playback-coordinator owners.
 Authorization remains a separate owner and must produce the durable account authority before
-activation. The production composition must create the application owner before asynchronous
-database initialization; it exposes only a bounded, content-free control/status surface. Missing or
+activation. Shipping composition creates the application owner after the exact first-window
+coordinator bind and before asynchronous database initialization; it exposes only a bounded,
+content-free control/status surface. Missing or
 malformed build credentials produce the fixed `UnavailableBuild` classification until shutdown,
 without reading the vault, touching the Last.fm queue, or contacting a network service.
 Otherwise it remains dormant until one migrated database has been attached and then a move-only
@@ -336,7 +356,11 @@ one bounded set of exact remote `SourceId` choices. The application owner never 
 enablement from a build credential, a vault record, queued rows, source connectivity, or a manually
 discoverable account. The preference representation, consent-version migration, disable versus
 disconnect behavior, and stale source-choice cleanup must be specified with the settings slice
-before any persisted policy can issue this request.
+before any persisted policy can issue this request. The currently composed handle intentionally
+offers only one database attachment, one activation, close, and content-free phase/failure status.
+That settings slice must also resolve one-shot activation versus a fully drained successor policy
+generation and compose typed runtime status, disconnect, reauthorization, and recovery controls;
+the present handle cannot support those product actions by itself.
 
 Each admitted activation is one fail-closed transaction:
 
@@ -370,12 +394,13 @@ authority design and is not part of this contract.
 Normal application shutdown closes the activation before the runtime: coordinator retirement may
 still owe a final now-playing clear and must settle every admitted SQLite enqueue receipt while the
 runtime is available. Only after that retirement completes may runtime admission close and its FIFO
-drain be joined. The later GTK composition must initiate this sequence asynchronously and never
-wait on the only executor worker or carry a GTK borrow across a drain.
+drain be joined. The GTK composition now initiates this sequence asynchronously, waits for the
+application join before downstream coordinator/output/source teardown, and carries no GTK or
+`RefCell` borrow across the drain.
 
-The headless core supplies these authorities and barriers without composing itself into `main` or
-a window, persisting policy, constructing authorization UI, or issuing a production activation
-request.
+The headless core is composed into the first window and receives the migrated database on capable
+builds. Shipping still does not persist live policy, construct authorization UI, or issue a
+production activation request.
 
 ## Desktop authorization and account identity
 
