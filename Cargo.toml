@@ -82,7 +82,7 @@ urlencoding = "2"
 # JSON value type (Jellyfin ImageTags parsing)
 serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }
 md-5 = "0.11"
-sha2 = "0.10"
+sha2 = "0.11"
 zeroize = "1"
 
 # Last.fm sessions are stored only in native protected credential stores:
