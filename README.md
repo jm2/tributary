@@ -65,15 +65,87 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Durable local playback history | ✅ Exact accepted local occurrences persist a saturating play count and monotonic last-played timestamp, with live Plays refresh ([contract](docs/playback-history.md)) |
 | Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ Recently Played and Top 25 use deterministic authoritative history, safe untouched-default migration, and live projection refresh ([P1.3](docs/task.md#p13--record-trustworthy-local-playback-history)) |
 | Track ratings | ✅ Exact 1–100 local editing, read-only/unsupported source states, deterministic sorting, live refresh, and smart-playlist rules ([contract](docs/ratings.md)) |
-| Last.fm scrobbling | 🚧 Foundation only — bounded HTTPS/auth client, native-vault credentials, and private durable FIFO are implemented; playback/runtime and settings UI are not yet available ([contract](docs/lastfm-scrobbling.md)) |
+| Last.fm scrobbling | 🚧 Internal foundation only — bounded protocol/vault storage, a private durable FIFO, a latest-only desktop-authorization owner, frozen generation-owned playback evidence, a GTK-free move-only playback-owner/handoff boundary, registry-instance-bound real-tag external/removable attribution, runtime-owned one-shot now-playing, and a non-recreatable process playback coordinator with production event/terminal/source/output/shutdown ingress are implemented. A sealed headless Active bridge can bind one exact window to one private playback-only runtime capability, create the sole coordinator-minted playback owner, revalidate source policy, order ephemeral NowPlaying/Clear work, and supervise admitted Enqueue work through its runtime completion before retirement; only `Inserted`/`AlreadyQueued` proves SQLite durability. A headless application owner accepts one database attachment followed by one move-only consent/enablement request, transactionally starts the runtime and bridge as one immutable-policy generation, rolls back partial activation, and drains the bridge before the runtime. Application startup now constructs exactly one owner after the first-window coordinator bind; after successful database initialization and before shutdown, capable builds attach the migrated database once, while unavailable builds skip the database handoff. Close joins the owner before coordinator/output/source teardown. Shipping issues no activation request, so the coordinator remains Dormant, no runtime, network, or scrobbling work starts, and the feature remains unavailable to users. Replacement-generation controls, exact local/authenticated-remote profiles, production remote opt-in, consent/browser launch, vault installation and account-transition policy, account/recovery/status UX, localization/accessibility, production credentials/verification, and live final acceptance testing remain ([complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary)) |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
 | Linux and macOS file associations | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 
+The internal Last.fm authorization and playback runtimes distinguish joined lifecycle retirement
+from a hard task abort. Authorization keeps its one-hour request token and token-bearing browser URL
+entirely behind latest-only owner authority, with no production URL accessor or browser handoff yet;
+an explicit consent-gated handoff remains product-integration work. Normal lifecycle and
+supervised-failure paths cancel and join network work before releasing authority. An external
+playback-runtime owner abort marks the drain barrier failed, while the child request keeps a shared
+vault lease until its future is actually dropped so a successor cannot overlap it.
+
+The internal playback owner consumes one move-only proof that binds an accepted output generation
+to either frozen eligible metadata or an explicit ineligible replacement. In production code, only
+`PlaybackSession` can issue the private mint witness after that exact generation crosses output
+acceptance, and each `QueueItem` keeps its occurrence metadata frozen. Managed external and
+removable proofs are bound to one registry instance, exact session or catalogue authority, and an
+exact real-tag profile; policy, profile, epoch/generation, authority, and membership are
+revalidated under the lifecycle lock. External and removable title and artist must both come from
+parsed tags—filenames and a display-only `Unknown` album never substitute. Removable queue capture
+asks the live registry to mint the exact current session reference before freezing the occurrence.
+Authenticated remotes remain closed because their exact profiles and production opt-in source set
+do not exist yet. Lock-linearized freshness leaves delayed accepted loads and superseded
+NowPlaying/Clear handoffs inert, while a qualified Enqueue is not retroactively revoked and, once
+runtime-admitted, remains owned through its one-shot durable completion. Issuing a
+successor NowPlaying does not discard a predecessor Clear prematurely: source rejection or failed
+runtime admission preserves that Clear, and only successful successor admission retires it.
+
+Startup claims one non-cloneable, non-recreatable process coordinator before GTK activation and
+transfers it only to the first window. Its cloneable ingress is exact-window and epoch-bound, so
+stale-window callbacks are inert. The sealed headless Active bridge can consume one non-cloneable,
+one-shot playback capability already claimed from a running runtime, use a module-private mint to
+construct its sole playback owner, and snapshot the enabled authenticated-remote source set.
+Accepted loads, playback events and discontinuities, source revalidation, and typed retirement then
+produce ordered NowPlaying, Enqueue, and Clear admissions through that restricted runtime
+capability. Enqueue admission reports asynchronous durability supervision and transfers a bounded
+child drain lease to the one-shot runtime completion task; only `Inserted`/`AlreadyQueued` proves
+SQLite durability, while a late queue, storage, stale-account, or owner-stop result is retained as
+a terminal fixed failure.
+Activation close, window rebind, owner shutdown, and owner drop first revoke admission, drain
+in-flight operations and supervised enqueue completions, retire the occurrence, and share the exact
+retirement result before a successor can become Dormant or Active; owner, gate, closed-runtime,
+late Enqueue-completion, and retirement failures close the environment terminally rather than
+admitting a replacement. The lazy accepted-load metadata extractor runs only inside that drain
+barrier, outside the coordinator mutex, and must remain bounded and non-reentrant; a race-losing
+result is revoked without dispatch.
+
+The GTK-free application-owner core adds the next headless layer. An unavailable build publishes
+`UnavailableBuild` until shutdown without touching the database, vault, queue, or network. A
+capable build accepts one database attachment followed by one move-only request issued after consent
+and enablement, then starts the runtime, claims its one-shot playback ingress, and activates the
+exact window as one retained generation with an immutable remote-source set. Partial activation is
+shut down and joined; normal close drains the bridge before the runtime, and a failed drain is
+terminal. Database, Starting, and Active publication linearize with close on one gate. Once Active,
+the owner supervises the runtime's persistent barrier: an unexpected exit closes application
+ingress, retires the bridge, joins the runtime, and only then publishes a fixed terminal failure;
+an application close that wins the same gate remains an ordinary ordered drain.
+The composed handle is still one-shot and phase-only: typed runtime status, disconnect,
+reauthorization, recovery, and fully drained successor-policy controls remain part of the settings
+integration rather than usable product actions today.
+
+Production playback already reports output intent before invocation, handles the accepted/rejected
+session result, hands accepted loads to the lazy coordinator boundary, and reports current events,
+seek/Previous/resume discontinuities, Stop, committed output replacement, queue/terminal
+retirement, source-authority revalidation points, and shutdown without carrying GTK borrows across
+coordinator ingress. Application startup now constructs the application owner after the first-window
+coordinator bind, conditionally attaches the migrated database after successful initialization,
+and joins the owner before
+coordinator/output/source teardown. This is still not feature activation: it does not issue an
+activation request, construct authorization/settings UI, or supply live source policy. The
+coordinator therefore remains Dormant and no Last.fm runtime starts. Dormant, stale, and
+shutdown loads consume and revoke their exact authority through a metadata-free discard closure,
+so no external/removable metadata or action handoff leaves the playback session. Exact
+local/authenticated-remote profiles and the production activation path remain follow-on work.
+
 See the [implementation roadmap](docs/roadmap.md) for the audited open-issue backlog, proposed
-ordering, and explicit current limitations. The countable working list is [`docs/task.md`](docs/task.md).
+ordering, and explicit current limitations. The countable working list is
+[`docs/task.md`](docs/task.md).
 
 ### Migrating from Rhythmbox
 
@@ -139,6 +211,17 @@ playback-authority owner for authenticated remotes, Radio-Browser views, removab
 ephemeral operating-system-opened files. Generic GTK rows and playback queues retain stable
 `SourceId`, exact backend-native `TrackId`, and a non-secret publishing epoch rather than a server
 address, credential-bearing URL, mount path, or local file locator.
+
+Last.fm is intentionally absent from the shipping diagram because it is not user-visible. Its
+construction path is `application owner → runtime start → one-shot playback-ingress claim →
+exact-window coordinator activation`. Once active, playback dispatch follows `coordinator →
+coordinator-minted playback owner → playback runtime ingress → serialized runtime actor`. The
+activation owns a registry and remote-opt-in snapshot for synchronous source admission, and its
+operation/retirement barriers prevent a successor environment from overtaking accepted playback
+work or the predecessor's final Clear. Startup now constructs the application owner and, after
+successful initialization before shutdown, attaches the migrated database on capable builds; it
+then stops at the owner's `AwaitingConsent` and the
+coordinator's Dormant state because no production activation authority exists.
 
 The local backend's aggregate contract and complete-catalogue integration seam are now stable.
 Local artist and album IDs use a private, versioned UUIDv5 namespace with separate artist/album
@@ -480,6 +563,7 @@ CI automatically runs on every push/PR:
 ```
 src/
 ├── main.rs                 # Application entry point (GTK + tokio bootstrap)
+├── panic_reporting.rs      # Process-wide content-free panic diagnostics
 ├── discovery.rs            # mDNS + UDP zero-config server discovery
 ├── architecture/
 │   ├── mod.rs              # Module root & re-exports
@@ -541,6 +625,20 @@ src/
 │   ├── dmap.rs             # DMAP binary TLV parser (nom-based, 24 tag types)
 │   ├── client.rs           # HTTP client (5-step session handshake)
 │   └── backend.rs          # MediaBackend impl (in-memory cache)
+├── lastfm/
+│   ├── mod.rs              # Private Last.fm integration boundary
+│   ├── authorization.rs    # Latest-only desktop authorization owner
+│   ├── client.rs           # Bounded signed Last.fm 2.0 protocol client
+│   ├── credentials.rs      # Native-vault session and account binding
+│   ├── storage.rs          # Private durable FIFO and opaque receipts
+│   ├── playback.rs         # Frozen generation-owned occurrence evidence
+│   ├── playback_owner.rs   # Coordinator-minted accepted-output owner + ordered handoffs
+│   ├── playback_coordinator.rs # Process owner + sealed exact-window runtime bridge
+│   ├── production.rs       # Headless application activation owner and drain barrier
+│   ├── delivery.rs         # Exhaustive outcome and retry policy
+│   ├── worker.rs           # Single-flight FIFO delivery worker
+│   ├── lifecycle.rs        # Shared vault lease and explicit recovery
+│   └── runtime.rs          # Serialized actor + one-shot playback-only ingress
 ├── device/
 │   ├── mod.rs              # DeviceInfo model for mounted browsable media
 │   └── usb.rs              # GIO mount filtering + logical removable-source identity

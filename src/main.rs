@@ -85,6 +85,7 @@ mod jellyfin;
 pub(crate) mod lastfm;
 #[allow(dead_code)]
 mod local;
+mod panic_reporting;
 mod platform_runtime;
 #[allow(dead_code)]
 mod plex;
@@ -99,6 +100,8 @@ mod source_registry;
 mod subsonic;
 mod ui;
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
 
@@ -129,7 +132,28 @@ fn dispatch_application_quit<W, CloseWindow, QuitApplication>(
 }
 
 fn request_application_quit(app: &adw::Application) {
-    dispatch_application_quit(app.active_window(), |window| window.close(), || app.quit());
+    dispatch_application_quit(
+        select_existing_window(app.active_window(), app.windows()),
+        |window| window.close(),
+        || app.quit(),
+    );
+}
+
+/// Prefer GTK's active window, but retain a structural fallback while a live
+/// application window temporarily lacks active focus.
+fn select_existing_window<W>(active: Option<W>, windows: impl IntoIterator<Item = W>) -> Option<W> {
+    active.or_else(|| windows.into_iter().next())
+}
+
+/// Pending OS-open files need application activation only when no structural
+/// window exists. A temporarily unfocused window can drain through its
+/// already-registered application action without entering the activation
+/// path that deliberately refuses to build a second window.
+fn pending_files_need_application_activation<W>(
+    active: Option<W>,
+    windows: impl IntoIterator<Item = W>,
+) -> bool {
+    select_existing_window(active, windows).is_none()
 }
 
 const I18N_INITIALIZER_STACK_BYTES: usize = 8 * 1024 * 1024;
@@ -149,6 +173,11 @@ fn initialize_i18n_backend() -> Result<(), String> {
 }
 
 fn main() {
+    // Rust invokes the global panic hook even for failures caught by a task
+    // supervisor. Install a content-free hook before any application work so
+    // panic payloads can never escape through the default formatter.
+    panic_reporting::install_privacy_preserving_panic_hook();
+
     // ── Windows: attach to parent console ────────────────────────────
     // The `windows_subsystem = "windows"` attribute prevents a console
     // window from popping up when double-clicking the exe.  However,
@@ -311,6 +340,19 @@ fn main() {
     // <primary> = Cmd on macOS, Ctrl on Linux/Windows.
     app.set_accels_for_action("app.quit", &["<primary>q"]);
 
+    // Claim the process-lifetime Last.fm playback coordinator before GTK can
+    // deliver the first activation. The claim is never reusable, including
+    // if the first window build drops its owner after a failure.
+    let lastfm_playback_owner =
+        match lastfm::playback_coordinator::LastFmPlaybackCoordinatorOwner::claim_process() {
+            Ok(owner) => owner,
+            Err(error) => {
+                error!(category = %error, "Last.fm playback coordinator unavailable");
+                std::process::exit(1);
+            }
+        };
+    let lastfm_playback_owner = Rc::new(RefCell::new(Some(lastfm_playback_owner)));
+
     app.connect_activate(move |app| {
         // Single-instance guard: re-activating an already-running instance
         // (re-launching the binary, clicking the launcher/dock icon, or any
@@ -318,10 +360,21 @@ fn main() {
         // Present the existing window instead of building a second one,
         // which would also register a duplicate OS media controller /
         // MPRIS service and double-fire media keys.
-        if let Some(win) = app.active_window() {
+        if let Some(win) = select_existing_window(app.active_window(), app.windows()) {
             win.present();
             return;
         }
+
+        // The process owner crosses into exactly the first window build. If
+        // GTK activates again after that window disappeared or its build
+        // failed, fail closed instead of constructing another coordinator.
+        let Some(lastfm_playback_owner) = lastfm_playback_owner.borrow_mut().take() else {
+            error!(
+                category = "owner-consumed",
+                "Last.fm playback coordinator unavailable during application activation"
+            );
+            return;
+        };
 
         // Register the app icon search path now that GTK has a display.
         if let Some(ref exe) = exe_path {
@@ -377,7 +430,13 @@ fn main() {
             }
         }
 
-        ui::window::build_window(app, rt_handle.clone(), engine_tx.clone(), engine_rx.clone());
+        ui::window::build_window(
+            app,
+            rt_handle.clone(),
+            engine_tx.clone(),
+            engine_rx.clone(),
+            lastfm_playback_owner,
+        );
     });
 
     // ── File open handler (macOS "Open With" / Linux xdg-open) ────────
@@ -404,7 +463,7 @@ fn main() {
         info!(count = paths.len(), "Files received via OS handler");
         ui::open_files::enqueue(paths);
 
-        if app.active_window().is_none() {
+        if pending_files_need_application_activation(app.active_window(), app.windows()) {
             app.activate();
         } else if let Some(action) = app.lookup_action("play-pending-files") {
             action.activate(None);
@@ -450,5 +509,43 @@ mod tests {
 
         assert!(!window_closed.get());
         assert!(application_quit.get());
+    }
+
+    #[test]
+    fn application_quit_uses_structural_window_when_none_is_active() {
+        let closed_window = Cell::new(None);
+        let application_quit = Cell::new(false);
+
+        dispatch_application_quit(
+            super::select_existing_window(None, [7, 8]),
+            |window| closed_window.set(Some(window)),
+            || application_quit.set(true),
+        );
+
+        assert_eq!(closed_window.get(), Some(7));
+        assert!(!application_quit.get());
+    }
+
+    #[test]
+    fn existing_window_selection_prefers_active_then_falls_back_structurally() {
+        assert_eq!(super::select_existing_window(Some(7), [8, 9]), Some(7));
+        assert_eq!(super::select_existing_window(None, [8, 9]), Some(8));
+        assert_eq!(super::select_existing_window(None::<i32>, []), None);
+    }
+
+    #[test]
+    fn pending_files_activate_only_when_no_structural_window_exists() {
+        assert!(!super::pending_files_need_application_activation(
+            Some(7),
+            [8, 9]
+        ));
+        assert!(!super::pending_files_need_application_activation(
+            None,
+            [8, 9]
+        ));
+        assert!(super::pending_files_need_application_activation(
+            None::<i32>,
+            []
+        ));
     }
 }

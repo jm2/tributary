@@ -19,7 +19,10 @@ use crate::local::resolver::ResolvedFileMedia;
 use crate::source_lifecycle::{
     AdapterCloseFuture, AdapterStream, CloseAuthority, LifecycleAdapter,
 };
-use crate::source_registry::{CatalogueFuture, ManagedSourceAdapter, StreamFuture};
+use crate::source_registry::{
+    CatalogueFuture, ManagedSourceAdapter, PlaybackAttributionCapability,
+    PlaybackAttributionProfile, StreamFuture,
+};
 
 const MAX_DISPLAY_HINT_BYTES: usize = 4 * 1024;
 const MAX_EXTENSION_HINT_BYTES: usize = 16;
@@ -90,6 +93,7 @@ pub struct ExternalFileAdapter {
     source_id: SourceId,
     track_id: TrackId,
     track: Track,
+    playback_attribution_profile: Option<PlaybackAttributionProfile>,
     media: ResolvedFileMedia,
     close_calls: Arc<AtomicUsize>,
 }
@@ -130,6 +134,9 @@ impl ExternalFileCandidate {
         let compatibility_id = Uuid::parse_str(track_id.as_str())
             .expect("external track identity is minted from UUIDv4");
         let parsed = self.parsed;
+        let title_from_tag = parsed.title_from_tag;
+        let artist_from_tag = parsed.artist_from_tag;
+        let album_from_tag = parsed.album_from_tag;
         let track = Track {
             id: compatibility_id,
             native_track_id: Some(track_id.clone()),
@@ -157,11 +164,18 @@ impl ExternalFileCandidate {
             rating: crate::architecture::models::TrackRating::unsupported(),
             last_played: None,
         };
+        let playback_attribution_profile = PlaybackAttributionProfile::from_tagged_track(
+            &track,
+            title_from_tag,
+            artist_from_tag,
+            album_from_tag,
+        );
 
         ExternalFileAdapter {
             source_id,
             track_id,
             track,
+            playback_attribution_profile,
             media: self.media,
             close_calls: Arc::new(AtomicUsize::new(0)),
         }
@@ -195,6 +209,19 @@ impl LifecycleAdapter for ExternalFileAdapter {
 }
 
 impl ManagedSourceAdapter for ExternalFileAdapter {
+    fn playback_attribution_capability(&self) -> PlaybackAttributionCapability {
+        PlaybackAttributionCapability::External
+    }
+
+    fn playback_attribution_profile(
+        &self,
+        track_id: &TrackId,
+    ) -> Option<PlaybackAttributionProfile> {
+        (track_id == &self.track_id)
+            .then(|| self.playback_attribution_profile.clone())
+            .flatten()
+    }
+
     fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
         Box::pin(async move { Ok(vec![self.track.clone()]) })
     }
@@ -297,8 +324,11 @@ mod tests {
             ExternalFileHint::new("song.wav", Some("wav")).expect("safe hint"),
         )
         .expect("validate original WAV");
+        assert!(!candidate.parsed.title_from_tag);
         assert_eq!(candidate.parsed.artist_name, "Unknown Artist");
+        assert!(!candidate.parsed.artist_from_tag);
         assert_eq!(candidate.parsed.album_title, "Unknown Album");
+        assert!(!candidate.parsed.album_from_tag);
 
         let replaced = match std::fs::rename(&path, &displaced) {
             Ok(()) => {
@@ -321,6 +351,9 @@ mod tests {
             assert_ne!(read_media(&candidate.media), replacement);
         }
         let adapter = candidate.into_adapter();
+        assert!(adapter
+            .playback_attribution_profile(adapter.track_id())
+            .is_none());
         assert!(adapter.track.file_path.is_none());
         assert!(adapter.track.stream_url.is_none());
         assert!(adapter.track.cover_art_url.is_none());

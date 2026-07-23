@@ -6,8 +6,9 @@ use std::time::Duration;
 use md5::{Digest, Md5};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{StatusCode, Url};
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, MapAccess, Visitor};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::http_body::{read_limited, ResponseBodyError};
@@ -46,7 +47,7 @@ impl AppCredentials {
     ///
     /// CI and developer builds intentionally compile without these variables;
     /// attempting to enable Last.fm in such a build fails closed at runtime.
-    pub fn from_build() -> Result<Self, LastFmClientError> {
+    pub(super) fn from_build() -> Result<Self, LastFmClientError> {
         let api_key = option_env!("TRIBUTARY_LASTFM_API_KEY")
             .ok_or(LastFmClientError::AppCredentialsUnavailable)?;
         let shared_secret = option_env!("TRIBUTARY_LASTFM_SHARED_SECRET")
@@ -77,12 +78,18 @@ impl fmt::Debug for AppCredentials {
 }
 
 /// Unauthorized, one-use desktop authentication token.
-pub struct DesktopAuthToken(ProtectedString);
+pub(super) struct DesktopAuthToken(ProtectedString);
 
 impl DesktopAuthToken {
-    fn from_response(value: String) -> Result<Self, LastFmClientError> {
-        validate_hex_credential(&value).map_err(|_| LastFmClientError::InvalidResponse)?;
-        Ok(Self(ProtectedString::new(value)))
+    fn from_response(mut value: SecretResponseString) -> Result<Self, LastFmClientError> {
+        let value = ProtectedString::new(value.take());
+        validate_hex_credential(value.expose()).map_err(|_| LastFmClientError::InvalidResponse)?;
+        Ok(Self(value))
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(value: &str) -> Result<Self, LastFmClientError> {
+        Self::from_response(SecretResponseString::for_test(value))
     }
 }
 
@@ -93,17 +100,105 @@ impl fmt::Debug for DesktopAuthToken {
 }
 
 /// Browser URL that carries an ephemeral desktop auth token.
-pub struct DesktopAuthorizationUrl(Url);
+pub(super) struct DesktopAuthorizationUrl(ProtectedString);
 
 impl DesktopAuthorizationUrl {
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
+    #[cfg(test)]
+    pub(super) fn as_str(&self) -> &str {
+        self.0.expose()
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(value: &str) -> Result<Self, LastFmClientError> {
+        let url = Url::parse(value).map_err(|_| LastFmClientError::InvalidInput)?;
+        if url.scheme() != "https"
+            || url.host_str() != Some("www.last.fm")
+            || url.port_or_known_default() != Some(443)
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/api/auth/"
+            || url.fragment().is_some()
+        {
+            return Err(LastFmClientError::InvalidInput);
+        }
+        let mut api_key = None;
+        let mut token = None;
+        for (name, value) in url.query_pairs() {
+            let slot = match name.as_ref() {
+                "api_key" => &mut api_key,
+                "token" => &mut token,
+                _ => return Err(LastFmClientError::InvalidInput),
+            };
+            if slot.replace(value.into_owned()).is_some() {
+                return Err(LastFmClientError::InvalidInput);
+            }
+        }
+        let api_key = api_key.ok_or(LastFmClientError::InvalidInput)?;
+        let token = token.ok_or(LastFmClientError::InvalidInput)?;
+        validate_hex_credential(&api_key)?;
+        validate_hex_credential(&token)?;
+        Ok(Self(ProtectedString::new(String::from(url))))
     }
 }
 
 impl fmt::Debug for DesktopAuthorizationUrl {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("DesktopAuthorizationUrl([REDACTED])")
+    }
+}
+
+/// Validated result of a one-shot desktop token exchange.
+///
+/// This deliberately is not a [`StoredSession`]: deciding whether to mint a
+/// fresh opaque account identity or preserve an exact existing identity is a
+/// lifecycle decision made only after account/replacement policy runs. Both
+/// fields remain content-redacted, and the username is wiped if this staged
+/// result is cancelled or rejected before installation.
+pub(super) struct DesktopAuthorizedSession {
+    username: Zeroizing<String>,
+    key: Zeroizing<String>,
+}
+
+impl DesktopAuthorizedSession {
+    fn from_response(response: RawSession) -> Result<Self, LastFmClientError> {
+        // Protect both values before validation so malformed provider output
+        // is wiped on every error path as well as after successful staging.
+        let staged = Self {
+            username: response.name.into_zeroizing(),
+            key: response.key.into_zeroizing(),
+        };
+        validate_required_text(&staged.username, MAX_USERNAME_BYTES)
+            .map_err(|_| LastFmClientError::InvalidResponse)?;
+        validate_hex_credential(&staged.key).map_err(|_| LastFmClientError::InvalidResponse)?;
+        Ok(staged)
+    }
+
+    pub(super) fn username(&self) -> &str {
+        &self.username
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(username: &str, key: &str) -> Result<Self, LastFmClientError> {
+        Self::from_response(RawSession {
+            name: SecretResponseString::for_test(username),
+            key: SecretResponseString::for_test(key),
+        })
+    }
+
+    /// Move the validated identity and key to the serialized vault installer.
+    ///
+    /// The caller must either create a new [`StoredSession`] or use
+    /// [`StoredSession::reauthorized`] after exact-byte account comparison.
+    pub(super) fn into_parts(self) -> (Zeroizing<String>, ProtectedString) {
+        let Self { username, mut key } = self;
+        let key = ProtectedString::new(std::mem::take(&mut *key));
+        (username, key)
+    }
+}
+
+impl fmt::Debug for DesktopAuthorizedSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DesktopAuthorizedSession([REDACTED])")
     }
 }
 
@@ -291,15 +386,15 @@ impl LastFmClient {
     }
 
     /// Begin the documented desktop authorization flow.
-    pub async fn request_auth_token(&self) -> Result<DesktopAuthToken, LastFmClientError> {
+    pub(super) async fn request_auth_token(&self) -> Result<DesktopAuthToken, LastFmClientError> {
         let response: TokenResponse = self
-            .signed_post(vec![("method".to_string(), "auth.getToken".to_string())])
+            .signed_auth_post(vec![("method".to_string(), "auth.getToken".to_string())])
             .await?;
         DesktopAuthToken::from_response(response.token)
     }
 
     /// Build the exact HTTPS Last.fm browser-authorization URL.
-    pub fn authorization_url(
+    pub(super) fn authorization_url(
         &self,
         token: &DesktopAuthToken,
     ) -> Result<DesktopAuthorizationUrl, LastFmClientError> {
@@ -315,29 +410,30 @@ impl LastFmClient {
         url.query_pairs_mut()
             .append_pair("api_key", self.credentials.api_key.expose())
             .append_pair("token", token.0.expose());
-        Ok(DesktopAuthorizationUrl(url))
+        // `From<Url> for String` moves Url's serialization allocation instead
+        // of formatting a second token-bearing copy. ProtectedString wipes the
+        // resulting URL, including its API key and request token, on drop.
+        Ok(DesktopAuthorizationUrl(ProtectedString::new(String::from(
+            url,
+        ))))
     }
 
-    /// Exchange a user-authorized desktop token for a durable session.
-    pub async fn exchange_auth_token(
+    /// Exchange a user-authorized desktop token for a staged session.
+    ///
+    /// Taking the non-cloneable token by value is the low-level one-shot
+    /// boundary. The returned identity remains unbound until the serialized
+    /// authorization owner applies exact account/replacement policy.
+    pub(super) async fn exchange_auth_token(
         &self,
-        token: &DesktopAuthToken,
-    ) -> Result<StoredSession, LastFmClientError> {
+        token: DesktopAuthToken,
+    ) -> Result<DesktopAuthorizedSession, LastFmClientError> {
         let response: SessionEnvelope = self
-            .signed_post(vec![
+            .signed_auth_post(vec![
                 ("method".to_string(), "auth.getSession".to_string()),
                 ("token".to_string(), token.0.expose().to_string()),
             ])
             .await?;
-        validate_text(&response.session.name, MAX_USERNAME_BYTES, true)
-            .map_err(|_| LastFmClientError::InvalidResponse)?;
-        validate_hex_credential(&response.session.key)
-            .map_err(|_| LastFmClientError::InvalidResponse)?;
-        StoredSession::new(
-            response.session.name,
-            ProtectedString::new(response.session.key),
-        )
-        .map_err(|_| LastFmClientError::InvalidResponse)
+        DesktopAuthorizedSession::from_response(response.session)
     }
 
     /// Publish metadata for the track currently playing.
@@ -405,39 +501,7 @@ impl LastFmClient {
         &self,
         parameters: Vec<(String, String)>,
     ) -> Result<T, LastFmClientError> {
-        let mut parameters = SensitiveParameters(parameters);
-        parameters.0.push((
-            "api_key".to_string(),
-            self.credentials.api_key.expose().to_string(),
-        ));
-        let signature = sign_parameters(&parameters.0, self.credentials.shared_secret.expose())?;
-        parameters.0.push(("api_sig".to_string(), signature));
-        parameters
-            .0
-            .push(("format".to_string(), "json".to_string()));
-
-        let encoded = encode_form(&parameters.0);
-        if encoded.len() > self.policy.maximum_form_bytes {
-            return Err(LastFmClientError::InvalidInput);
-        }
-
-        let response = self
-            .http
-            .post(self.endpoint.clone())
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .timeout(self.policy.timeout)
-            .body(encoded.as_bytes().to_vec())
-            .send()
-            .await;
-        let response = response.map_err(map_reqwest_error)?;
-        let status = response.status();
-        let body = read_limited(
-            response,
-            self.policy.maximum_response_bytes,
-            self.policy.timeout,
-        )
-        .await
-        .map_err(map_body_error)?;
+        let (status, body) = self.signed_response(parameters).await?;
 
         let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
             if status.is_success() {
@@ -454,14 +518,287 @@ impl LastFmClient {
         }
         serde_json::from_value(value).map_err(|_| LastFmClientError::InvalidResponse)
     }
+
+    /// Parse an authentication response without first materializing a generic
+    /// JSON value whose ordinary strings could retain a token, username, key,
+    /// or provider message. The first pass borrows only the provider error
+    /// code; the typed success pass owns sensitive fields directly inside
+    /// zeroizing wrappers.
+    async fn signed_auth_post<T: AuthResponse>(
+        &self,
+        parameters: Vec<(String, String)>,
+    ) -> Result<T, LastFmClientError> {
+        let (status, body) = self.signed_response(parameters).await?;
+        parse_auth_response(status, &body)
+    }
+
+    async fn signed_response(
+        &self,
+        parameters: Vec<(String, String)>,
+    ) -> Result<(StatusCode, Zeroizing<Vec<u8>>), LastFmClientError> {
+        let mut parameters = SensitiveParameters(parameters);
+        parameters.0.push((
+            "api_key".to_string(),
+            self.credentials.api_key.expose().to_string(),
+        ));
+        let signature = sign_parameters(&parameters.0, self.credentials.shared_secret.expose())?;
+        parameters.0.push(("api_sig".to_string(), signature));
+        parameters
+            .0
+            .push(("format".to_string(), "json".to_string()));
+
+        let encoded = encode_form(&parameters.0, self.policy.maximum_form_bytes)?;
+
+        let response = self
+            .http
+            .post(self.endpoint.clone())
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .timeout(self.policy.timeout)
+            .body(encoded.as_bytes().to_vec())
+            .send()
+            .await;
+        let response = response.map_err(map_reqwest_error)?;
+        let status = response.status();
+        let body = Zeroizing::new(
+            read_limited(
+                response,
+                self.policy.maximum_response_bytes,
+                self.policy.timeout,
+            )
+            .await
+            .map_err(map_body_error)?,
+        );
+        Ok((status, body))
+    }
 }
 
-fn encode_form(parameters: &[(String, String)]) -> Zeroizing<String> {
-    Zeroizing::new({
-        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+trait AuthResponse: Sized {
+    fn from_auth_raw(raw: &RawValue) -> Result<Self, LastFmClientError>;
+}
+
+fn auth_object(raw: &RawValue) -> Result<&str, LastFmClientError> {
+    let representation = raw.get();
+    if representation.as_bytes().first() == Some(&b'{') {
+        Ok(representation)
+    } else {
+        Err(LastFmClientError::InvalidResponse)
+    }
+}
+
+fn parse_auth_response<T: AuthResponse>(
+    status: StatusCode,
+    body: &[u8],
+) -> Result<T, LastFmClientError> {
+    // RawValue validates one complete JSON value while borrowing the original
+    // zeroizing response body. Its scanner intentionally does not validate
+    // Unicode surrogate pairing, so perform that allocation-free pass before
+    // interpreting either provider errors or success fields.
+    let Some(raw) = validated_auth_raw(body) else {
+        return Err(if status.is_success() {
+            LastFmClientError::InvalidResponse
+        } else {
+            status_error(status)
+        });
+    };
+
+    if raw.get().starts_with('{') {
+        let probe: AuthProviderErrorProbe =
+            serde_json::from_str(raw.get()).map_err(|_| LastFmClientError::InvalidResponse)?;
+        if let Some(code) = probe.error {
+            return Err(provider_error_for_code(parse_auth_provider_code(code)?)?);
+        }
+    }
+    if !status.is_success() {
+        return Err(status_error(status));
+    }
+    T::from_auth_raw(raw)
+}
+
+fn validated_auth_raw(body: &[u8]) -> Option<&RawValue> {
+    let raw: &RawValue = serde_json::from_slice(body).ok()?;
+    validate_json_string_literals(raw.get()).ok()?;
+    Some(raw)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InvalidAuthJsonString;
+
+fn validate_json_string_literals(raw: &str) -> Result<(), InvalidAuthJsonString> {
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'"' {
+            let end = json_string_literal_end(bytes, index).ok_or(InvalidAuthJsonString)?;
+            visit_json_string_literal(&raw[index..end], |_| {})?;
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+fn json_string_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut index = start.checked_add(1)?;
+    while let Some(byte) = bytes.get(index) {
+        match byte {
+            b'"' => return index.checked_add(1),
+            b'\\' => {
+                let escape = *bytes.get(index.checked_add(1)?)?;
+                index = index.checked_add(if escape == b'u' { 6 } else { 2 })?;
+                if index > bytes.len() {
+                    return None;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn visit_json_string_literal(
+    literal: &str,
+    mut visit: impl FnMut(char),
+) -> Result<(), InvalidAuthJsonString> {
+    let inner = literal
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or(InvalidAuthJsonString)?;
+    let mut characters = inner.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            if character == '"' || character <= '\u{001f}' {
+                return Err(InvalidAuthJsonString);
+            }
+            visit(character);
+            continue;
+        }
+
+        let escaped = match characters.next().ok_or(InvalidAuthJsonString)? {
+            '"' => '"',
+            '\\' => '\\',
+            '/' => '/',
+            'b' => '\u{0008}',
+            'f' => '\u{000c}',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'u' => decode_json_unicode_escape(&mut characters)?,
+            _ => return Err(InvalidAuthJsonString),
+        };
+        visit(escaped);
+    }
+    Ok(())
+}
+
+fn decode_json_unicode_escape(
+    characters: &mut std::str::Chars<'_>,
+) -> Result<char, InvalidAuthJsonString> {
+    let leading = decode_json_hex_quad(characters)?;
+    let scalar = match leading {
+        0xd800..=0xdbff => {
+            if characters.next() != Some('\\') || characters.next() != Some('u') {
+                return Err(InvalidAuthJsonString);
+            }
+            let trailing = decode_json_hex_quad(characters)?;
+            if !(0xdc00..=0xdfff).contains(&trailing) {
+                return Err(InvalidAuthJsonString);
+            }
+            0x1_0000 + ((u32::from(leading) - 0xd800) << 10) + (u32::from(trailing) - 0xdc00)
+        }
+        0xdc00..=0xdfff => return Err(InvalidAuthJsonString),
+        _ => u32::from(leading),
+    };
+    char::from_u32(scalar).ok_or(InvalidAuthJsonString)
+}
+
+fn decode_json_hex_quad(
+    characters: &mut std::str::Chars<'_>,
+) -> Result<u16, InvalidAuthJsonString> {
+    let mut value = 0_u16;
+    for _ in 0..4 {
+        let character = characters.next().ok_or(InvalidAuthJsonString)?;
+        if !character.is_ascii_hexdigit() {
+            return Err(InvalidAuthJsonString);
+        }
+        value = (value << 4)
+            | u16::try_from(character.to_digit(16).ok_or(InvalidAuthJsonString)?)
+                .map_err(|_| InvalidAuthJsonString)?;
+    }
+    Ok(value)
+}
+
+fn encode_form(
+    parameters: &[(String, String)],
+    maximum_bytes: usize,
+) -> Result<Zeroizing<String>, LastFmClientError> {
+    encode_form_with_observer(parameters, maximum_bytes, |_| {})
+}
+
+fn encode_form_with_observer(
+    parameters: &[(String, String)],
+    maximum_bytes: usize,
+    mut observe: impl FnMut(&String),
+) -> Result<Zeroizing<String>, LastFmClientError> {
+    let encoded_length = encoded_form_length(parameters, maximum_bytes)?;
+    let mut encoded = Zeroizing::new(String::new());
+    encoded
+        .try_reserve_exact(encoded_length)
+        .map_err(|_| LastFmClientError::InvalidInput)?;
+    observe(&encoded);
+
+    {
+        let mut serializer = url::form_urlencoded::Serializer::new(&mut *encoded);
         serializer.extend_pairs(parameters.iter().map(|(key, value)| (&**key, &**value)));
-        serializer.finish()
-    })
+    }
+    observe(&encoded);
+    debug_assert_eq!(encoded.len(), encoded_length);
+    Ok(encoded)
+}
+
+fn encoded_form_length(
+    parameters: &[(String, String)],
+    maximum_bytes: usize,
+) -> Result<usize, LastFmClientError> {
+    let maximum_bytes = maximum_bytes.min(MAX_FORM_BODY_BYTES);
+    let mut length = 0;
+    for (index, (key, value)) in parameters.iter().enumerate() {
+        if index != 0 {
+            length = checked_form_length(length, 1, maximum_bytes)?;
+        }
+        length = checked_encoded_component_length(length, key, maximum_bytes)?;
+        length = checked_form_length(length, 1, maximum_bytes)?;
+        length = checked_encoded_component_length(length, value, maximum_bytes)?;
+    }
+    Ok(length)
+}
+
+fn checked_encoded_component_length(
+    mut length: usize,
+    component: &str,
+    maximum_bytes: usize,
+) -> Result<usize, LastFmClientError> {
+    for encoded in url::form_urlencoded::byte_serialize(component.as_bytes()) {
+        length = checked_form_length(length, encoded.len(), maximum_bytes)?;
+    }
+    Ok(length)
+}
+
+fn checked_form_length(
+    length: usize,
+    additional: usize,
+    maximum_bytes: usize,
+) -> Result<usize, LastFmClientError> {
+    let length = length
+        .checked_add(additional)
+        .ok_or(LastFmClientError::InvalidInput)?;
+    if length > maximum_bytes {
+        return Err(LastFmClientError::InvalidInput);
+    }
+    Ok(length)
 }
 
 fn authenticated_parameters(method: &str, session: &StoredSession) -> Vec<(String, String)> {
@@ -645,15 +982,22 @@ fn provider_error(
         .and_then(|value| u16::try_from(value).ok())
         .or_else(|| code.as_str().and_then(|value| value.parse::<u16>().ok()))
         .ok_or(LastFmClientError::InvalidResponse)?;
-    Ok(Some(match code {
+    Ok(Some(provider_error_for_code(code)?))
+}
+
+fn provider_error_for_code(code: u16) -> Result<LastFmClientError, LastFmClientError> {
+    Ok(match code {
         9 => LastFmClientError::ReauthenticationRequired,
-        11 | 16 => LastFmClientError::ServiceUnavailable,
+        // Last.fm's published registry explicitly asks clients to retry the
+        // generic backend failure (8) and temporary outages (11/16).
+        8 | 11 | 16 => LastFmClientError::ServiceUnavailable,
+        29 => LastFmClientError::RateLimited,
         // Exhaustive recognized set from Last.fm's published error-code
         // registry. Unknown future values are compatibility failures rather
         // than guessed terminal results.
-        1..=8 | 10 | 12..=15 | 17..=27 | 29 => LastFmClientError::ServiceRejected { code },
+        1..=7 | 10 | 12..=15 | 17..=27 => LastFmClientError::ServiceRejected { code },
         _ => return Err(LastFmClientError::InvalidResponse),
-    }))
+    })
 }
 
 fn submission_result(item: &RawSubmission) -> Result<SubmissionResult, LastFmClientError> {
@@ -721,20 +1065,226 @@ fn parse_u16(value: &StringOrNumber) -> Result<u16, LastFmClientError> {
     }
 }
 
-#[derive(Deserialize)]
-struct TokenResponse {
-    token: String,
+/// Borrowing provider-error probe for secret-bearing auth responses.
+///
+/// The custom map visitor rejects a duplicate `error` member and borrows every
+/// value as raw JSON. Consequently neither success secrets nor ignored provider
+/// text pass through serde_json's ordinary string scratch during this pass.
+struct AuthProviderErrorProbe<'a> {
+    error: Option<&'a RawValue>,
 }
 
-#[derive(Deserialize)]
+impl<'de> Deserialize<'de> for AuthProviderErrorProbe<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(AuthProviderErrorProbeVisitor)
+    }
+}
+
+struct AuthProviderErrorProbeVisitor;
+
+impl<'de> Visitor<'de> for AuthProviderErrorProbeVisitor {
+    type Value = AuthProviderErrorProbe<'de>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a Last.fm authentication response object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut error = None;
+        while let Some(field) = map.next_key::<AuthProviderField>()? {
+            let value: &'de RawValue = map.next_value()?;
+            if field == AuthProviderField::Error && error.replace(value).is_some() {
+                return Err(serde::de::Error::duplicate_field("error"));
+            }
+        }
+        Ok(AuthProviderErrorProbe { error })
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AuthProviderField {
+    Error,
+    Other,
+}
+
+impl<'de> Deserialize<'de> for AuthProviderField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_identifier(AuthProviderFieldVisitor)
+    }
+}
+
+struct AuthProviderFieldVisitor;
+
+impl Visitor<'_> for AuthProviderFieldVisitor {
+    type Value = AuthProviderField;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a Last.fm authentication response field")
+    }
+
+    fn visit_borrowed_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(auth_provider_field(value))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(auth_provider_field(value))
+    }
+}
+
+fn auth_provider_field(value: &str) -> AuthProviderField {
+    if value == "error" {
+        AuthProviderField::Error
+    } else {
+        AuthProviderField::Other
+    }
+}
+
+fn parse_auth_provider_code(raw: &RawValue) -> Result<u16, LastFmClientError> {
+    let representation = raw.get();
+    if !representation.starts_with('"') {
+        return representation
+            .parse::<u16>()
+            .map_err(|_| LastFmClientError::InvalidResponse);
+    }
+
+    let mut parsed = Some(0_u16);
+    let mut digits = 0_usize;
+    let mut position = 0_usize;
+    visit_json_string_literal(representation, |character| {
+        if position == 0 && character == '+' {
+            // Match `u16::from_str`, which permits one leading plus sign.
+        } else if character.is_ascii_digit() {
+            digits += 1;
+            let digit = u16::from(character as u8 - b'0');
+            parsed = parsed
+                .and_then(|value| value.checked_mul(10))
+                .and_then(|value| value.checked_add(digit));
+        } else {
+            parsed = None;
+        }
+        position += 1;
+    })
+    .map_err(|_| LastFmClientError::InvalidResponse)?;
+    parsed
+        .filter(|_| digits > 0)
+        .ok_or(LastFmClientError::InvalidResponse)
+}
+
+/// A JSON response string protected from its first owned allocation.
+struct SecretResponseString(Zeroizing<String>);
+
+impl SecretResponseString {
+    fn from_json_literal(raw: &RawValue) -> Result<Self, LastFmClientError> {
+        let representation = raw.get();
+        let inner = representation
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .ok_or(LastFmClientError::InvalidResponse)?;
+        let mut value = Zeroizing::new(String::with_capacity(inner.len()));
+        visit_json_string_literal(representation, |character| value.push(character))
+            .map_err(|_| LastFmClientError::InvalidResponse)?;
+        Ok(Self(value))
+    }
+
+    fn into_zeroizing(self) -> Zeroizing<String> {
+        self.0
+    }
+
+    fn take(&mut self) -> String {
+        std::mem::take(&mut *self.0)
+    }
+
+    #[cfg(test)]
+    fn for_test(value: &str) -> Self {
+        Self(Zeroizing::new(value.to_owned()))
+    }
+}
+
+impl fmt::Debug for SecretResponseString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretResponseString([REDACTED])")
+    }
+}
+
+struct TokenResponse {
+    token: SecretResponseString,
+}
+
 struct SessionEnvelope {
     session: RawSession,
 }
 
-#[derive(Deserialize)]
 struct RawSession {
-    name: String,
-    key: String,
+    name: SecretResponseString,
+    key: SecretResponseString,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BorrowedTokenResponse<'a> {
+    #[serde(borrow)]
+    token: &'a RawValue,
+}
+
+impl AuthResponse for TokenResponse {
+    fn from_auth_raw(raw: &RawValue) -> Result<Self, LastFmClientError> {
+        // Serde-derived structs also accept positional sequences. Inspect the
+        // borrowed raw shape before deserialization so a scalar or sequence
+        // cannot enter serde_json's ordinary string scratch.
+        let response: BorrowedTokenResponse = serde_json::from_str(auth_object(raw)?)
+            .map_err(|_| LastFmClientError::InvalidResponse)?;
+        Ok(Self {
+            token: SecretResponseString::from_json_literal(response.token)?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BorrowedSessionEnvelope<'a> {
+    #[serde(borrow)]
+    session: &'a RawValue,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BorrowedRawSession<'a> {
+    #[serde(borrow)]
+    name: &'a RawValue,
+    #[serde(borrow)]
+    key: &'a RawValue,
+    #[serde(borrow, default, rename = "subscriber")]
+    _subscriber: Option<&'a RawValue>,
+}
+
+impl AuthResponse for SessionEnvelope {
+    fn from_auth_raw(raw: &RawValue) -> Result<Self, LastFmClientError> {
+        let envelope: BorrowedSessionEnvelope = serde_json::from_str(auth_object(raw)?)
+            .map_err(|_| LastFmClientError::InvalidResponse)?;
+        let session: BorrowedRawSession = serde_json::from_str(auth_object(envelope.session)?)
+            .map_err(|_| LastFmClientError::InvalidResponse)?;
+        Ok(Self {
+            session: RawSession {
+                name: SecretResponseString::from_json_literal(session.name)?,
+                key: SecretResponseString::from_json_literal(session.key)?,
+            },
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -816,13 +1366,15 @@ mod tests {
     use axum::http::header::{CONTENT_TYPE, LOCATION, REFERER};
     use axum::http::{HeaderValue, Method, StatusCode};
     use serde_json::json;
+    use zeroize::Zeroizing;
 
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
 
     use super::{
-        append_track_parameters, encode_form, sign_parameters, AppCredentials, IgnoredReason,
-        LastFmClient, LastFmClientError, LastFmTrack, RequestPolicy, Scrobble, ScrobblesEnvelope,
-        SubmissionResult, MAX_FORM_BODY_BYTES, MAX_RESPONSE_BODY_BYTES, MAX_SCROBBLES_PER_BATCH,
+        append_track_parameters, encode_form_with_observer, provider_error, sign_parameters,
+        AppCredentials, IgnoredReason, LastFmClient, LastFmClientError, LastFmTrack, RequestPolicy,
+        Scrobble, ScrobblesEnvelope, SubmissionResult, MAX_FORM_BODY_BYTES,
+        MAX_RESPONSE_BODY_BYTES, MAX_SCROBBLES_PER_BATCH,
     };
 
     const API_KEY: &str = "0123456789abcdef0123456789abcdef";
@@ -942,16 +1494,69 @@ mod tests {
         parameters.push(("api_sig".to_string(), signature));
         parameters.push(("format".to_string(), "json".to_string()));
 
-        let encoded = encode_form(&parameters);
+        let mut allocation_states = Vec::with_capacity(2);
+        let encoded =
+            encode_form_with_observer(&parameters, MAX_FORM_BODY_BYTES, |partially_encoded| {
+                allocation_states.push((partially_encoded.as_ptr(), partially_encoded.capacity()));
+            })
+            .expect("maximum form encodes");
         assert!(
             encoded.len() > 512 * 1024,
             "fixture must regress the old undersized cap"
         );
         assert!(encoded.len() <= MAX_FORM_BODY_BYTES);
+        assert_eq!(allocation_states.len(), 2);
+        assert!(allocation_states[0].1 >= encoded.len());
+        assert!(
+            allocation_states
+                .iter()
+                .all(|state| *state == allocation_states[0]),
+            "the protected form allocation must remain stable during secret-bearing serialization"
+        );
         assert_eq!(
             form(encoded.as_bytes()).get("artist[49]").map(String::len),
             Some(super::MAX_METADATA_BYTES)
         );
+    }
+
+    #[test]
+    fn auth_form_reserves_before_appending_the_complete_token() {
+        let parameters = vec![
+            ("method".to_string(), "auth.getSession".to_string()),
+            ("token".to_string(), TOKEN.to_string()),
+            ("api_key".to_string(), API_KEY.to_string()),
+            ("api_sig".to_string(), SHARED_SECRET.to_string()),
+            ("format".to_string(), "json".to_string()),
+        ];
+        let mut allocation_states = Vec::with_capacity(2);
+        let encoded =
+            encode_form_with_observer(&parameters, MAX_FORM_BODY_BYTES, |partially_encoded| {
+                allocation_states.push((partially_encoded.as_ptr(), partially_encoded.capacity()));
+            })
+            .expect("auth form encodes");
+
+        assert_eq!(allocation_states.len(), 2);
+        assert!(allocation_states[0].1 >= encoded.len());
+        assert!(
+            allocation_states
+                .iter()
+                .all(|state| *state == allocation_states[0]),
+            "the protected form allocation must remain stable after the token is serialized"
+        );
+        assert_eq!(
+            form(encoded.as_bytes()).get("token").map(String::as_str),
+            Some(TOKEN)
+        );
+    }
+
+    #[test]
+    fn form_cap_failure_precedes_protected_serialization() {
+        let parameters = vec![("token".to_string(), TOKEN.to_string())];
+        let mut observations = 0;
+        let result = encode_form_with_observer(&parameters, 1, |_| observations += 1);
+
+        assert!(matches!(result, Err(LastFmClientError::InvalidInput)));
+        assert_eq!(observations, 0);
     }
 
     #[tokio::test]
@@ -983,10 +1588,11 @@ mod tests {
             .body(body)
             .expect("bounded response fixture")
             .into();
-        let collected =
+        let collected = Zeroizing::new(
             super::read_limited(response, MAX_RESPONSE_BODY_BYTES, Duration::from_secs(1))
                 .await
-                .expect("maximum valid response fits cap");
+                .expect("maximum valid response fits cap"),
+        );
         let parsed: ScrobblesEnvelope =
             serde_json::from_slice(&collected).expect("maximum response parses");
         assert_eq!(
@@ -1016,8 +1622,366 @@ mod tests {
         }
     }
 
+    #[test]
+    fn authorization_test_fixtures_are_strict_and_redacted() {
+        let token = super::DesktopAuthToken::for_test(TOKEN).expect("valid fixture token");
+        assert_eq!(format!("{token:?}"), "DesktopAuthToken([REDACTED])");
+        assert_eq!(
+            super::DesktopAuthToken::for_test("not-a-token").err(),
+            Some(LastFmClientError::InvalidResponse)
+        );
+
+        let value = format!("https://www.last.fm/api/auth/?api_key={API_KEY}&token={TOKEN}");
+        let authorization = super::DesktopAuthorizationUrl::for_test(&value)
+            .expect("valid fixture authorization URL");
+        assert_eq!(authorization.as_str(), value);
+        assert_eq!(
+            format!("{authorization:?}"),
+            "DesktopAuthorizationUrl([REDACTED])"
+        );
+        for invalid in [
+            format!("http://www.last.fm/api/auth/?api_key={API_KEY}&token={TOKEN}"),
+            format!("https://example.test/api/auth/?api_key={API_KEY}&token={TOKEN}"),
+            format!("https://www.last.fm/api/auth/?api_key={API_KEY}"),
+            format!("https://www.last.fm/api/auth/?api_key={API_KEY}&token={TOKEN}&token={TOKEN}"),
+            format!("https://www.last.fm/api/auth/?api_key={API_KEY}&token=invalid"),
+        ] {
+            assert_eq!(
+                super::DesktopAuthorizationUrl::for_test(&invalid).err(),
+                Some(LastFmClientError::InvalidInput)
+            );
+        }
+
+        let staged = super::DesktopAuthorizedSession::for_test("private-listener", SESSION_KEY)
+            .expect("valid staged fixture");
+        let rendered = format!("{staged:?}");
+        assert!(!rendered.contains("private-listener"));
+        assert!(!rendered.contains(SESSION_KEY));
+        assert_eq!(
+            super::DesktopAuthorizedSession::for_test("line\nbreak", SESSION_KEY).err(),
+            Some(LastFmClientError::InvalidResponse)
+        );
+        assert_eq!(
+            super::DesktopAuthorizedSession::for_test("   ", SESSION_KEY).err(),
+            Some(LastFmClientError::InvalidResponse)
+        );
+        assert_eq!(
+            super::DesktopAuthorizedSession::for_test("private-listener", "invalid").err(),
+            Some(LastFmClientError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn auth_success_fields_are_owned_only_by_zeroizing_response_types() {
+        let token_body = format!(r#"{{"token":"{TOKEN}"}}"#);
+        let response: super::TokenResponse =
+            super::parse_auth_response(StatusCode::OK, token_body.as_bytes())
+                .expect("valid token envelope");
+        assert_eq!(
+            format!("{:?}", response.token),
+            "SecretResponseString([REDACTED])"
+        );
+        let token = super::DesktopAuthToken::from_response(response.token)
+            .expect("valid token enters protected ownership");
+        assert_eq!(format!("{token:?}"), "DesktopAuthToken([REDACTED])");
+
+        let session_body =
+            format!(r#"{{"session":{{"name":"private-listener","key":"{SESSION_KEY}"}}}}"#);
+        let response: super::SessionEnvelope =
+            super::parse_auth_response(StatusCode::OK, session_body.as_bytes())
+                .expect("valid session envelope");
+        assert_eq!(
+            format!("{:?} {:?}", response.session.name, response.session.key),
+            "SecretResponseString([REDACTED]) SecretResponseString([REDACTED])"
+        );
+        let staged = super::DesktopAuthorizedSession::from_response(response.session)
+            .expect("valid session remains staged");
+        let rendered = format!("{staged:?}");
+        assert!(!rendered.contains("private-listener"));
+        assert!(!rendered.contains(SESSION_KEY));
+    }
+
+    #[test]
+    fn escaped_auth_secrets_decode_exactly_into_protected_owners() {
+        let escaped_token = TOKEN.replace('0', r"\u0030").replace('f', r"\u0066");
+        let token_body = format!(r#"{{"token":"{escaped_token}"}}"#);
+        let response: super::TokenResponse =
+            super::parse_auth_response(StatusCode::OK, token_body.as_bytes())
+                .expect("escaped token envelope");
+        let token = super::DesktopAuthToken::from_response(response.token)
+            .expect("escaped token validates after direct decoding");
+        assert_eq!(token.0.expose(), TOKEN);
+
+        let escaped_key = SESSION_KEY.replace('1', r"\u0031");
+        let session_body = format!(
+            r#"{{"session":{{"name":"private-\uD83D\uDE80-listener","key":"{escaped_key}"}}}}"#
+        );
+        let response: super::SessionEnvelope =
+            super::parse_auth_response(StatusCode::OK, session_body.as_bytes())
+                .expect("escaped session envelope");
+        let staged = super::DesktopAuthorizedSession::from_response(response.session)
+            .expect("escaped session validates after direct decoding");
+        assert_eq!(staged.username(), "private-🚀-listener");
+
+        let (username, key) = staged.into_parts();
+        let _: &Zeroizing<String> = &username;
+        assert_eq!(username.as_str(), "private-🚀-listener");
+        assert_eq!(key.expose(), SESSION_KEY);
+    }
+
+    #[test]
+    fn partial_escapes_and_unpaired_surrogates_fail_before_auth_interpretation() {
+        let invalid_bodies: &[&[u8]] = &[
+            br#"{"token":"partial\"#,
+            br#"{"token":"\u12"}"#,
+            br#"{"token":"\uD800"}"#,
+            br#"{"token":"\uDC00"}"#,
+            br#"{"token":"\uD800\u0041"}"#,
+            br#"{"token":"0123456789abcdef0123456789abcdef","message":"\uD800"}"#,
+            br#"{"token":"0123456789abcdef0123456789abcdef","mess\uD800age":"ignored"}"#,
+        ];
+
+        for body in invalid_bodies {
+            assert_eq!(
+                super::parse_auth_response::<super::TokenResponse>(StatusCode::OK, body).err(),
+                Some(LastFmClientError::InvalidResponse)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_http_5xx_and_complete_bad_error_members_remain_distinct() {
+        let cases: &[(&[u8], LastFmClientError)] = &[
+            (br#"{"error":"9""#, LastFmClientError::ServiceUnavailable),
+            (
+                br#"{"error":"\u12"}"#,
+                LastFmClientError::ServiceUnavailable,
+            ),
+            (
+                br#"{"message":"\uD800"}"#,
+                LastFmClientError::ServiceUnavailable,
+            ),
+            (
+                br#"{"error":"not-a-code"}"#,
+                LastFmClientError::InvalidResponse,
+            ),
+            (br#"{"error":null}"#, LastFmClientError::InvalidResponse),
+            (br#"{"error":[]}"#, LastFmClientError::InvalidResponse),
+        ];
+
+        for (body, expected) in cases {
+            assert_eq!(
+                super::parse_auth_response::<super::TokenResponse>(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    body
+                )
+                .err(),
+                Some(*expected)
+            );
+        }
+    }
+
+    #[test]
+    fn whitespace_only_decoded_session_username_is_rejected() {
+        let body = format!(r#"{{"session":{{"name":"\u0020 \u0020","key":"{SESSION_KEY}"}}}}"#);
+        let response: super::SessionEnvelope =
+            super::parse_auth_response(StatusCode::OK, body.as_bytes())
+                .expect("structurally valid session envelope");
+        assert_eq!(
+            super::DesktopAuthorizedSession::from_response(response.session).err(),
+            Some(LastFmClientError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn auth_success_envelopes_require_objects_before_borrowed_deserialization() {
+        // Each body is valid JSON. The raw object guard must reject it before
+        // serde's derived struct visitor can treat a sequence position or a
+        // scalar string as one of the borrowed response fields.
+        for body in [format!(r#"["{TOKEN}"]"#), format!(r#""{TOKEN}""#)] {
+            let error =
+                super::parse_auth_response::<super::TokenResponse>(StatusCode::OK, body.as_bytes())
+                    .err()
+                    .expect("non-object token envelope must fail");
+            assert_eq!(error, LastFmClientError::InvalidResponse);
+            assert!(!format!("{error:?} {error}").contains(TOKEN));
+        }
+
+        let session_bodies = [
+            format!(r#"[{{"name":"private-listener","key":"{SESSION_KEY}"}}]"#),
+            r#"{"session":["name","key"]}"#.to_owned(),
+            r#""private-session-scalar""#.to_owned(),
+            r#"{"session":"private-session-scalar"}"#.to_owned(),
+        ];
+        for body in session_bodies {
+            let error = super::parse_auth_response::<super::SessionEnvelope>(
+                StatusCode::OK,
+                body.as_bytes(),
+            )
+            .err()
+            .expect("non-object session envelope must fail");
+            assert_eq!(error, LastFmClientError::InvalidResponse);
+            let rendered = format!("{error:?} {error}");
+            assert!(!rendered.contains("private-listener"));
+            assert!(!rendered.contains("private-session-scalar"));
+            assert!(!rendered.contains(SESSION_KEY));
+        }
+    }
+
+    #[test]
+    fn malformed_partial_and_duplicate_auth_envelopes_fail_closed() {
+        let token_envelopes = [
+            format!(r#"{{"token":"{TOKEN}","token":"{TOKEN}"}}"#),
+            "{}".to_owned(),
+            r#"{"token":7}"#.to_owned(),
+            format!(r#"{{"token":"{TOKEN}""#),
+            format!(r#"{{"token":"{TOKEN}"}} trailing"#),
+            format!(r#"[{{"token":"{TOKEN}"}}]"#),
+            format!(r#"{{"token":"{TOKEN}","unexpected":"\u0061"}}"#),
+        ];
+        for body in token_envelopes {
+            assert!(matches!(
+                super::parse_auth_response::<super::TokenResponse>(StatusCode::OK, body.as_bytes()),
+                Err(LastFmClientError::InvalidResponse)
+            ));
+        }
+
+        let session_envelopes = [
+            format!(
+                r#"{{"session":{{"name":"first","key":"{SESSION_KEY}"}},"session":{{"name":"second","key":"{SESSION_KEY}"}}}}"#
+            ),
+            format!(r#"{{"session":{{"name":"first","name":"second","key":"{SESSION_KEY}"}}}}"#),
+            format!(
+                r#"{{"session":{{"name":"private-listener","key":"{SESSION_KEY}","key":"{SESSION_KEY}"}}}}"#
+            ),
+            r#"{"session":{"name":"private-listener"}}"#.to_owned(),
+            format!(r#"{{"session":{{"key":"{SESSION_KEY}"}}}}"#),
+            format!(r#"{{"session":{{"name":7,"key":"{SESSION_KEY}"}}}}"#),
+            format!(r#"{{"session":{{"name":"private-listener","key":"{SESSION_KEY}"}}"#),
+            format!(
+                r#"{{"session":{{"name":"private-listener","key":"{SESSION_KEY}","unexpected":"\u0061"}}}}"#
+            ),
+            format!(
+                r#"{{"session":{{"name":"private-listener","key":"{SESSION_KEY}"}},"unexpected":"\u0061"}}"#
+            ),
+        ];
+        for body in session_envelopes {
+            assert!(matches!(
+                super::parse_auth_response::<super::SessionEnvelope>(
+                    StatusCode::OK,
+                    body.as_bytes()
+                ),
+                Err(LastFmClientError::InvalidResponse)
+            ));
+        }
+
+        let invalid_token_body = br#"{"token":"not-a-token"}"#;
+        let response: super::TokenResponse =
+            super::parse_auth_response(StatusCode::OK, invalid_token_body)
+                .expect("structurally valid token envelope");
+        assert_eq!(
+            super::DesktopAuthToken::from_response(response.token).err(),
+            Some(LastFmClientError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn auth_provider_and_http_classification_matches_generic_policy() {
+        let cases: &[(StatusCode, &[u8], LastFmClientError)] = &[
+            (
+                StatusCode::OK,
+                br#"{"error":9,"message":"private-session-text"}"#,
+                LastFmClientError::ReauthenticationRequired,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                br#"{"error":"13","message":"private-signature-text"}"#,
+                LastFmClientError::ServiceRejected { code: 13 },
+            ),
+            (
+                StatusCode::OK,
+                br#"{"error":"\u0038","message":"private-backend-text"}"#,
+                LastFmClientError::ServiceUnavailable,
+            ),
+            (
+                StatusCode::OK,
+                br#"{"error":29,"message":"private-rate-text"}"#,
+                LastFmClientError::RateLimited,
+            ),
+            (
+                StatusCode::OK,
+                br#"{"error":28,"message":"future-private-text"}"#,
+                LastFmClientError::InvalidResponse,
+            ),
+            (
+                StatusCode::OK,
+                br#"{"error":null,"message":"private-null-text"}"#,
+                LastFmClientError::InvalidResponse,
+            ),
+            (
+                StatusCode::OK,
+                br#"{"error":9,"error":13,"message":"private-duplicate-text"}"#,
+                LastFmClientError::InvalidResponse,
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                br#"{"message":"private-rate-status"}"#,
+                LastFmClientError::RateLimited,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                br#"{"message":"private-service-status"}"#,
+                LastFmClientError::ServiceUnavailable,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                br#"{"message":"private-http-status"}"#,
+                LastFmClientError::HttpStatus,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                br#"{"message":"private-malformed""#,
+                LastFmClientError::ServiceUnavailable,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                br#""private-scalar""#,
+                LastFmClientError::HttpStatus,
+            ),
+            (
+                StatusCode::OK,
+                br#""private-scalar""#,
+                LastFmClientError::InvalidResponse,
+            ),
+        ];
+
+        for (status, body, expected) in cases {
+            let error = super::parse_auth_response::<super::TokenResponse>(*status, body)
+                .err()
+                .expect("fixture must fail");
+            assert_eq!(&error, expected);
+            let rendered = format!("{error:?} {error}");
+            for private in [
+                "private-session-text",
+                "private-signature-text",
+                "private-backend-text",
+                "private-rate-text",
+                "future-private-text",
+                "private-null-text",
+                "private-duplicate-text",
+                "private-rate-status",
+                "private-service-status",
+                "private-http-status",
+                "private-malformed",
+                "private-scalar",
+            ] {
+                assert!(!rendered.contains(private));
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn desktop_auth_flow_uses_signed_form_posts_and_redacted_values() {
+    async fn desktop_auth_flow_consumes_token_and_stages_redacted_session() {
         let service =
             MockHttpService::start(vec![MockRoute::new(Method::POST, "/2.0/").replies([
                 MockResponse::json(json!({"token": TOKEN})),
@@ -1037,13 +2001,23 @@ mod tests {
         assert!(authorization.as_str().contains(API_KEY));
         assert!(authorization.as_str().contains(TOKEN));
         assert!(!format!("{token:?} {authorization:?}").contains(TOKEN));
+        let _: &super::ProtectedString = &authorization.0;
 
-        let session = client
-            .exchange_auth_token(&token)
+        // Moving the non-Clone token into this call is the compile-time
+        // one-shot boundary; a second exchange cannot be expressed with it.
+        let staged = client
+            .exchange_auth_token(token)
             .await
             .expect("session exchange");
-        assert_eq!(session.username(), "listener");
-        assert_eq!(session.key().expose(), SESSION_KEY);
+        assert_eq!(staged.username(), "listener");
+        let rendered = format!("{staged:?}");
+        assert_eq!(rendered, "DesktopAuthorizedSession([REDACTED])");
+        assert!(!rendered.contains("listener"));
+        assert!(!rendered.contains(SESSION_KEY));
+        let (username, key) = staged.into_parts();
+        let _: &Zeroizing<String> = &username;
+        assert_eq!(username.as_str(), "listener");
+        assert_eq!(key.expose(), SESSION_KEY);
 
         let requests = service.requests();
         assert_eq!(requests.len(), 2);
@@ -1191,6 +2165,7 @@ mod tests {
         let service =
             MockHttpService::start(vec![MockRoute::new(Method::POST, "/2.0/").replies([
                 MockResponse::json(json!({"error": 9, "message": "session-secret-from-provider"})),
+                MockResponse::json(json!({"error": "8", "message": "backend private text"})),
                 MockResponse::json(json!({"error": "29", "message": "private metadata"})),
                 MockResponse::json(json!({"error": 13, "message": "signature secret"})),
                 MockResponse::json(json!({"error": 28, "message": "future provider code"})),
@@ -1205,7 +2180,11 @@ mod tests {
             client
                 .request_auth_token()
                 .await
-                .expect_err("code 29 fails"),
+                .expect_err("code 8 fails transiently"),
+            client
+                .request_auth_token()
+                .await
+                .expect_err("code 29 fails transiently"),
             client
                 .request_auth_token()
                 .await
@@ -1221,16 +2200,35 @@ mod tests {
         ];
         assert_eq!(errors[0], LastFmClientError::ReauthenticationRequired);
         assert!(errors[0].requires_reauthentication());
-        assert_eq!(errors[1], LastFmClientError::ServiceRejected { code: 29 });
-        assert!(!errors[1].is_retryable());
-        assert_eq!(errors[2], LastFmClientError::ServiceRejected { code: 13 });
-        assert_eq!(errors[3], LastFmClientError::InvalidResponse);
+        assert_eq!(errors[1], LastFmClientError::ServiceUnavailable);
+        assert!(errors[1].is_retryable());
+        assert_eq!(errors[2], LastFmClientError::RateLimited);
+        assert!(errors[2].is_retryable());
+        assert_eq!(errors[3], LastFmClientError::ServiceRejected { code: 13 });
         assert_eq!(errors[4], LastFmClientError::InvalidResponse);
+        assert_eq!(errors[5], LastFmClientError::InvalidResponse);
         let rendered = format!("{errors:?}");
         assert!(!rendered.contains("provider"));
         assert!(!rendered.contains("private metadata"));
         assert!(!rendered.contains("signature secret"));
         service.finish().await;
+    }
+
+    #[test]
+    fn published_transient_provider_codes_are_exhaustively_retryable() {
+        for (code, expected) in [
+            (8, LastFmClientError::ServiceUnavailable),
+            (11, LastFmClientError::ServiceUnavailable),
+            (16, LastFmClientError::ServiceUnavailable),
+            (29, LastFmClientError::RateLimited),
+        ] {
+            assert_eq!(
+                provider_error(&json!({"error": code})).unwrap(),
+                Some(expected),
+                "published provider code {code} changed retry class"
+            );
+            assert!(expected.is_retryable());
+        }
     }
 
     #[tokio::test]
@@ -1319,15 +2317,23 @@ mod tests {
                     "session": {"name": "line\nbreak", "key": SESSION_KEY}
                 })),
                 MockResponse::json(json!({
+                    "session": {"name": "private-listener", "key": "not-a-session-key"}
+                })),
+                MockResponse::json(json!({
                     "nowplaying": {"ignoredMessage": {"code": "0", "#text": ""}}
                 })),
             ])])
             .await;
         let endpoint = format!("{}/2.0/", service.base_url());
         let client = LastFmClient::for_test(&endpoint, credentials());
-        let token = super::DesktopAuthToken::from_response(TOKEN.to_owned()).unwrap();
+        let token = super::DesktopAuthToken::for_test(TOKEN).unwrap();
         assert_eq!(
-            client.exchange_auth_token(&token).await.err(),
+            client.exchange_auth_token(token).await.err(),
+            Some(LastFmClientError::InvalidResponse)
+        );
+        let token = super::DesktopAuthToken::for_test(TOKEN).unwrap();
+        assert_eq!(
+            client.exchange_auth_token(token).await.err(),
             Some(LastFmClientError::InvalidResponse)
         );
         let session =

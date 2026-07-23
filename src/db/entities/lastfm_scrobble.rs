@@ -99,6 +99,50 @@ impl fmt::Debug for StoredMetadataText {
     }
 }
 
+/// Opaque database representation of an optional private track number.
+#[derive(Clone, Copy, PartialEq, Eq, DeriveValueType)]
+pub struct StoredTrackNumber(i32);
+
+impl StoredTrackNumber {
+    pub(crate) const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+impl From<i32> for StoredTrackNumber {
+    fn from(value: i32) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Debug for StoredTrackNumber {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StoredTrackNumber(<redacted>)")
+    }
+}
+
+/// Opaque database representation of a private exact playback duration.
+#[derive(Clone, Copy, PartialEq, Eq, DeriveValueType)]
+pub struct StoredDuration(i32);
+
+impl StoredDuration {
+    pub(crate) const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+impl From<i32> for StoredDuration {
+    fn from(value: i32) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Debug for StoredDuration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StoredDuration(<redacted>)")
+    }
+}
+
 /// Opaque database representation of a private playback-start timestamp.
 #[derive(Clone, Copy, PartialEq, Eq, DeriveValueType)]
 pub struct StoredStartedAt(i64);
@@ -133,8 +177,8 @@ pub struct Model {
     pub track_title: StoredMetadataText,
     pub album: Option<StoredMetadataText>,
     pub album_artist: Option<StoredMetadataText>,
-    pub track_number: Option<i32>,
-    pub duration_secs: i32,
+    pub track_number: Option<StoredTrackNumber>,
+    pub duration_secs: StoredDuration,
     pub started_at_unix_secs: StoredStartedAt,
     pub attempt_count: i32,
     pub next_attempt_at_ms: i64,
@@ -158,7 +202,6 @@ impl fmt::Debug for Model {
             .field("has_album", &self.album.is_some())
             .field("has_album_artist", &self.album_artist.is_some())
             .field("has_track_number", &self.track_number.is_some())
-            .field("duration_secs", &self.duration_secs)
             .field("attempt_count", &self.attempt_count)
             .finish_non_exhaustive()
     }
@@ -196,7 +239,6 @@ impl fmt::Debug for StoredLastFmScrobble {
             .field("has_album", &self.album.is_some())
             .field("has_album_artist", &self.album_artist.is_some())
             .field("has_track_number", &self.track_number.is_some())
-            .field("duration_secs", &self.duration_secs)
             .field("attempt_count", &self.attempt_count)
             .finish_non_exhaustive()
     }
@@ -237,8 +279,10 @@ impl TryFrom<Model> for StoredLastFmScrobble {
             .map_err(|()| LastFmScrobbleDataError::Album)?;
         validate_optional_text(album_artist.as_ref().map(StoredMetadataText::as_str))
             .map_err(|()| LastFmScrobbleDataError::AlbumArtist)?;
+        let track_number = track_number.map(StoredTrackNumber::get);
         validate_optional_positive(track_number)
             .map_err(|()| LastFmScrobbleDataError::TrackNumber)?;
+        let duration_secs = duration_secs.get();
         if duration_secs <= 30 {
             return Err(LastFmScrobbleDataError::Duration);
         }
@@ -338,8 +382,8 @@ mod tests {
             track_title: "Track".to_owned().into(),
             album: Some("Album".to_owned().into()),
             album_artist: None,
-            track_number: Some(1),
-            duration_secs: 31,
+            track_number: Some(1.into()),
+            duration_secs: 31.into(),
             started_at_unix_secs: 1.into(),
             attempt_count: 0,
             next_attempt_at_ms: 0,
@@ -376,10 +420,10 @@ mod tests {
         invalid.album_artist = Some("\t".to_owned().into());
         cases.push((invalid, LastFmScrobbleDataError::AlbumArtist));
         let mut invalid = model();
-        invalid.track_number = Some(0);
+        invalid.track_number = Some(0.into());
         cases.push((invalid, LastFmScrobbleDataError::TrackNumber));
         let mut invalid = model();
-        invalid.duration_secs = 30;
+        invalid.duration_secs = 30.into();
         cases.push((invalid, LastFmScrobbleDataError::Duration));
         let mut invalid = model();
         invalid.started_at_unix_secs = 0.into();
@@ -421,11 +465,15 @@ mod tests {
         raw.track_title = "PRIVATE_TRACK_SENTINEL".to_owned().into();
         raw.album = Some("PRIVATE_ALBUM_SENTINEL".to_owned().into());
         raw.album_artist = Some("PRIVATE_ALBUM_ARTIST_SENTINEL".to_owned().into());
+        raw.track_number = Some(31_337.into());
+        raw.duration_secs = 32_147.into();
         raw.started_at_unix_secs = 1_700_123_456.into();
 
         // Conversion validation needs a canonical occurrence UUID, so retain a
         // separate valid row for the worker-facing type.
-        let stored = StoredLastFmScrobble::try_from(model()).unwrap();
+        let mut stored_model = model();
+        stored_model.duration_secs = 42_789.into();
+        let stored = StoredLastFmScrobble::try_from(stored_model).unwrap();
         let active = ActiveModel::from(raw.clone());
         let private_occurrence = format!("{:?}", raw.occurrence_id.as_slice());
         let private_binding = format!("{:?}", raw.account_binding.as_slice());
@@ -434,15 +482,19 @@ mod tests {
             "StoredOccurrenceId(<redacted>)",
             "StoredAccountBinding(<redacted>)",
             "StoredMetadataText(<redacted>)",
+            "StoredTrackNumber(<redacted>)",
+            "StoredDuration(<redacted>)",
             "StoredStartedAt(<redacted>)",
         ] {
             assert!(active_diagnostics.contains(redaction));
         }
-        let diagnostics = [
-            format!("{raw:?}"),
-            format!("{stored:?}"),
-            active_diagnostics,
-        ];
+        let raw_diagnostics = format!("{raw:?}");
+        let stored_diagnostics = format!("{stored:?}");
+        assert!(!raw_diagnostics.contains("32147"));
+        assert!(!active_diagnostics.contains("31337"));
+        assert!(!active_diagnostics.contains("32147"));
+        assert!(!stored_diagnostics.contains("42789"));
+        let diagnostics = [raw_diagnostics, stored_diagnostics, active_diagnostics];
 
         for diagnostics in diagnostics {
             for sentinel in [

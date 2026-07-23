@@ -9,7 +9,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const SERVICE: &str = "io.github.tributary.Tributary.lastfm";
 const ACCOUNT: &str = "session";
@@ -159,23 +159,17 @@ impl SessionCredentialStore for OsSessionCredentialStore {
     fn load(&self) -> Result<Option<StoredSession>, CredentialError> {
         let entry = native_entry()?;
         match entry.get_secret() {
-            Ok(mut bytes) => {
-                let result = decode_session(&bytes);
-                bytes.zeroize();
-                result.map(Some)
-            }
+            Ok(bytes) => decode_session(&Zeroizing::new(bytes)).map(Some),
             Err(keyring_core::Error::NoEntry) => Ok(None),
             Err(_) => Err(CredentialError::Unavailable),
         }
     }
 
     fn save(&self, session: &StoredSession) -> Result<(), CredentialError> {
-        let mut encoded = encode_session(session)?;
-        let result = native_entry()?
+        let encoded = encode_session(session)?;
+        native_entry()?
             .set_secret(&encoded)
-            .map_err(|_| CredentialError::Unavailable);
-        encoded.zeroize();
-        result
+            .map_err(|_| CredentialError::Unavailable)
     }
 
     fn delete(&self) -> Result<(), CredentialError> {
@@ -223,14 +217,18 @@ fn native_store() -> Result<Arc<keyring_core::CredentialStore>, CredentialError>
     Err(CredentialError::Unavailable)
 }
 
-fn encode_session(session: &StoredSession) -> Result<Vec<u8>, CredentialError> {
+fn encode_session(session: &StoredSession) -> Result<Zeroizing<Vec<u8>>, CredentialError> {
     let username = session.username.as_bytes();
     let key = session.key.expose().as_bytes();
     validate_username(&session.username)?;
     validate_session_key(session.key.expose())?;
     let username_length =
         u16::try_from(username.len()).map_err(|_| CredentialError::InvalidData)?;
-    let mut encoded = Vec::new();
+    // Keep the complete plaintext vault payload behind an RAII wipe from its
+    // first allocation. In particular, `save` may return early when native
+    // entry construction fails, and panics or future error branches must not
+    // be able to bypass the cleanup.
+    let mut encoded = Zeroizing::new(Vec::new());
     encoded
         .try_reserve(19 + username.len() + key.len())
         .map_err(|_| CredentialError::InvalidData)?;
@@ -352,13 +350,21 @@ mod tests {
     #[test]
     fn versioned_encoding_round_trips_without_plaintext_fallback() {
         let original = session();
-        let mut encoded = encode_session(&original).expect("session encodes");
+        let encoded = encode_session(&original).expect("session encodes");
         assert_eq!(encoded[0], ENCODING_VERSION);
         let decoded = decode_session(&encoded).expect("session decodes");
         assert_eq!(decoded.username(), "listener");
         assert_eq!(decoded.key().expose(), SESSION_KEY);
         assert_eq!(decoded.account_binding(), original.account_binding());
-        encoded.fill(0);
+    }
+
+    #[test]
+    fn encoded_vault_payload_guarantees_drop_zeroization() {
+        fn require_drop_zeroization<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+
+        let encoded = encode_session(&session()).expect("session encodes");
+        require_drop_zeroization(&encoded);
+        assert!(encoded.ends_with(SESSION_KEY.as_bytes()));
     }
 
     #[test]

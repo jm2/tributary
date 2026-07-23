@@ -8707,9 +8707,12 @@ mod tests {
         ParsedTrack {
             file_path: path.to_string(),
             title: title.to_string(),
+            title_from_tag: true,
             artist_name: "Updated Artist".to_string(),
+            artist_from_tag: true,
             album_artist_name: Some("Updated Album Artist".to_string()),
             album_title: "Updated Album".to_string(),
+            album_from_tag: true,
             genre: Some("Updated Genre".to_string()),
             composer: None,
             year: Some(2026),

@@ -17,7 +17,7 @@ use crate::audio::output::{AudioOutput, OutputType};
 use crate::audio::PlayerEvent;
 
 use super::output_dialogs::load_saved_outputs;
-use super::playback::{stop_owned_playback, PlaybackSession};
+use super::playback::PlaybackSession;
 
 /// Stable identity for a selectable output endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,23 +71,17 @@ fn output_type_for_target(target: &OutputTarget) -> OutputType {
     }
 }
 
-/// Atomically apply the non-widget portion of an output selection.
-///
-/// A reselect returns before touching the session or either output slot. A
-/// real change first validates both the replacement and the local-output
-/// parking invariant, then clears the queue generation before stopping the
-/// old output. Consequently, even a synchronously delivered terminal event
-/// from that Stop is stale. Switching away from Local parks the exact output;
-/// switching between remote endpoints retains it; switching back restores it.
-fn apply_output_selection(
-    active_target: &mut OutputTarget,
-    requested: OutputTarget,
-    session: &mut PlaybackSession,
-    active_output: &mut Box<dyn AudioOutput>,
-    parked_local: &mut Option<Box<dyn AudioOutput>>,
-    activation: OutputActivation,
+/// Validate a requested endpoint without touching the playback session or
+/// invoking either output. The activation stays owned by the caller until the
+/// coordinator has retired the predecessor occurrence.
+fn preflight_output_selection(
+    active_target: &OutputTarget,
+    requested: &OutputTarget,
+    active_output: &dyn AudioOutput,
+    parked_local: &Option<Box<dyn AudioOutput>>,
+    activation: &OutputActivation,
 ) -> OutputSelectionOutcome {
-    if !output_change_required(active_target, &requested) {
+    if !output_change_required(active_target, requested) {
         return OutputSelectionOutcome::Reselected;
     }
 
@@ -102,7 +96,7 @@ fn apply_output_selection(
         return OutputSelectionOutcome::Unavailable;
     }
 
-    let activation_is_valid = match (&requested, &activation) {
+    let activation_is_valid = match (requested, activation) {
         (OutputTarget::Local, OutputActivation::Local) => parked_local
             .as_ref()
             .is_some_and(|output| output.output_type() == OutputType::Local),
@@ -115,7 +109,31 @@ fn apply_output_selection(
         return OutputSelectionOutcome::Unavailable;
     }
 
-    stop_owned_playback(session, active_output.as_ref());
+    OutputSelectionOutcome::Changed
+}
+
+/// Stop and replace a previously validated output. The caller must clear the
+/// session and retire coordinator ownership before entering this function.
+fn commit_preflighted_output_selection(
+    active_target: &mut OutputTarget,
+    requested: OutputTarget,
+    active_output: &mut Box<dyn AudioOutput>,
+    parked_local: &mut Option<Box<dyn AudioOutput>>,
+    activation: OutputActivation,
+) {
+    debug_assert_eq!(
+        preflight_output_selection(
+            active_target,
+            &requested,
+            active_output.as_ref(),
+            parked_local,
+            &activation,
+        ),
+        OutputSelectionOutcome::Changed,
+        "a preflighted output transaction remains stable on the GTK thread"
+    );
+
+    active_output.stop();
 
     match activation {
         OutputActivation::Local => {
@@ -133,7 +151,93 @@ fn apply_output_selection(
     }
 
     *active_target = requested;
+}
+
+/// Apply a selection to directly owned test state. Production uses the shared
+/// two-phase helper below so coordinator ingress occurs between session proof
+/// revocation and the first output call.
+#[cfg(test)]
+fn apply_output_selection(
+    active_target: &mut OutputTarget,
+    requested: OutputTarget,
+    session: &mut PlaybackSession,
+    active_output: &mut Box<dyn AudioOutput>,
+    parked_local: &mut Option<Box<dyn AudioOutput>>,
+    activation: OutputActivation,
+) -> OutputSelectionOutcome {
+    let outcome = preflight_output_selection(
+        active_target,
+        &requested,
+        active_output.as_ref(),
+        parked_local,
+        &activation,
+    );
+    if outcome != OutputSelectionOutcome::Changed {
+        return outcome;
+    }
+
+    session.clear();
+    commit_preflighted_output_selection(
+        active_target,
+        requested,
+        active_output,
+        parked_local,
+        activation,
+    );
     OutputSelectionOutcome::Changed
+}
+
+/// Preflight the complete output-selection state, clear the session proof,
+/// release every guard, then retire process-scoped coordinator ownership
+/// before stopping, dropping, or swapping the predecessor output. Failed
+/// construction and same-target reselection never run the callback.
+fn apply_shared_output_selection(
+    active_target: &Rc<RefCell<OutputTarget>>,
+    requested: OutputTarget,
+    playback_session: &Rc<RefCell<PlaybackSession>>,
+    active_output: &Rc<RefCell<Box<dyn AudioOutput>>>,
+    parked_local: &Rc<RefCell<Option<Box<dyn AudioOutput>>>>,
+    activation: OutputActivation,
+    retire_predecessor: impl FnOnce(),
+) -> (
+    OutputSelectionOutcome,
+    Option<crate::architecture::SourceId>,
+) {
+    let outcome = {
+        let target = active_target.borrow();
+        let output = active_output.borrow();
+        let parked = parked_local.borrow();
+        preflight_output_selection(&target, &requested, output.as_ref(), &parked, &activation)
+    };
+    if outcome != OutputSelectionOutcome::Changed {
+        return (outcome, None);
+    }
+
+    let external_source = {
+        let mut session = playback_session.borrow_mut();
+        let external_source = session.current_external_source_id();
+        session.clear();
+        external_source
+    };
+
+    // No target/session/output/parking guard crosses coordinator ingress.
+    // The old output remains untouched until the predecessor proof is gone.
+    retire_predecessor();
+
+    {
+        let mut target = active_target.borrow_mut();
+        let mut output = active_output.borrow_mut();
+        let mut parked = parked_local.borrow_mut();
+        commit_preflighted_output_selection(
+            &mut target,
+            requested,
+            &mut output,
+            &mut parked,
+            activation,
+        );
+    }
+
+    (OutputSelectionOutcome::Changed, external_source)
 }
 
 /// Wire the output selector popover: switching between local, MPD,
@@ -154,6 +258,7 @@ pub fn setup_output_selector(
     volume_scale: &gtk::Scale,
     rt_handle: &tokio::runtime::Handle,
     source_registry: &crate::source_registry::SourceRegistry,
+    lastfm_playback: &crate::lastfm::playback_coordinator::LastFmPlaybackCoordinatorBinding,
 ) {
     let active_output = active_output.clone();
     let parked_local = parked_local.clone();
@@ -163,6 +268,7 @@ pub fn setup_output_selector(
     let volume_scale = volume_scale.clone();
     let output_button = output_button.clone();
     let source_registry = source_registry.clone();
+    let lastfm_playback = lastfm_playback.clone();
     // Real runtime handle for embedded media servers used by remote outputs.
     let rt_handle = rt_handle.clone();
 
@@ -235,22 +341,19 @@ pub fn setup_output_selector(
             }
         };
 
-        let (outcome, external_source) = {
-            let mut target = active_target.borrow_mut();
-            let mut session = playback_session.borrow_mut();
-            let external_source = session.current_external_source_id();
-            let mut output = active_output.borrow_mut();
-            let mut parked = parked_local.borrow_mut();
-            let outcome = apply_output_selection(
-                &mut target,
-                requested_target,
-                &mut session,
-                &mut output,
-                &mut parked,
-                activation,
-            );
-            (outcome, external_source)
-        };
+        let (outcome, external_source) = apply_shared_output_selection(
+            &active_target,
+            requested_target,
+            &playback_session,
+            &active_output,
+            &parked_local,
+            activation,
+            || {
+                let _ = lastfm_playback.retire(
+                    crate::lastfm::playback_coordinator::LastFmPlaybackRetirement::OutputReplacement,
+                );
+            },
+        );
         if outcome != OutputSelectionOutcome::Changed {
             warn!(?outcome, "Output selection could not be committed");
             return;
@@ -415,6 +518,7 @@ mod tests {
         name: String,
         output_type: OutputType,
         state: Rc<RefCell<FakeOutputState>>,
+        order: Option<Rc<RefCell<Vec<&'static str>>>>,
         reject_loads: Cell<usize>,
         volume: f64,
     }
@@ -425,12 +529,22 @@ mod tests {
             output_type: OutputType,
             reject_loads: usize,
         ) -> (Box<dyn AudioOutput>, Rc<RefCell<FakeOutputState>>) {
+            Self::boxed_with_order(name, output_type, reject_loads, None)
+        }
+
+        fn boxed_with_order(
+            name: &str,
+            output_type: OutputType,
+            reject_loads: usize,
+            order: Option<Rc<RefCell<Vec<&'static str>>>>,
+        ) -> (Box<dyn AudioOutput>, Rc<RefCell<FakeOutputState>>) {
             let state = Rc::new(RefCell::new(FakeOutputState::default()));
             (
                 Box::new(Self {
                     name: name.to_string(),
                     output_type,
                     state: Rc::clone(&state),
+                    order,
                     reject_loads: Cell::new(reject_loads),
                     volume: 0.5,
                 }),
@@ -441,6 +555,9 @@ mod tests {
 
     impl Drop for FakeOutput {
         fn drop(&mut self) {
+            if let Some(order) = &self.order {
+                order.borrow_mut().push("output-drop");
+            }
             self.state.borrow_mut().drops += 1;
         }
     }
@@ -486,6 +603,9 @@ mod tests {
         fn pause(&self) {}
 
         fn stop(&self) {
+            if let Some(order) = &self.order {
+                order.borrow_mut().push("output-stop");
+            }
             self.state.borrow_mut().stops += 1;
         }
 
@@ -570,6 +690,106 @@ mod tests {
                 Some(source_id)
             ),
             None
+        );
+    }
+
+    #[test]
+    fn coordinator_ingress_runs_only_after_committed_change_releases_all_borrows() {
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let (local, local_state) =
+            FakeOutput::boxed_with_order("local", OutputType::Local, 0, Some(order.clone()));
+        let (remote, _) = FakeOutput::boxed("mpd", OutputType::Mpd, 0);
+        let active_output = Rc::new(RefCell::new(local));
+        let parked_local = Rc::new(RefCell::new(None));
+        let active_target = Rc::new(RefCell::new(OutputTarget::Local));
+        let playback_session = Rc::new(RefCell::new(PlaybackSession::default()));
+        assert!(playback_session.borrow_mut().replace_queue(
+            vec![super::super::playback::QueueItem::direct_for_test(
+                "file:///tmp/owned.flac".to_string(),
+                "Owned".to_string(),
+                "Artist".to_string(),
+                "Album".to_string(),
+            )],
+            0,
+        ));
+        assert!(playback_session.borrow().has_current());
+        let callbacks = Cell::new(0);
+
+        let (outcome, external_source) = apply_shared_output_selection(
+            &active_target,
+            OutputTarget::Mpd {
+                host: "music.local".to_string(),
+                port: 6600,
+                exclusive_control: true,
+            },
+            &playback_session,
+            &active_output,
+            &parked_local,
+            OutputActivation::Remote(remote),
+            || {
+                order.borrow_mut().push("coordinator-retire");
+                assert!(active_target.try_borrow_mut().is_ok());
+                assert!(playback_session.try_borrow_mut().is_ok());
+                assert!(active_output.try_borrow_mut().is_ok());
+                assert!(parked_local.try_borrow_mut().is_ok());
+                assert!(!playback_session.borrow().has_current());
+                assert_eq!(*active_target.borrow(), OutputTarget::Local);
+                assert_eq!(active_output.borrow().name(), "local");
+                assert_eq!(local_state.borrow().stops, 0);
+                callbacks.set(callbacks.get() + 1);
+            },
+        );
+        assert_eq!(outcome, OutputSelectionOutcome::Changed);
+        assert_eq!(external_source, None);
+        assert_eq!(callbacks.get(), 1);
+        assert_eq!(local_state.borrow().stops, 1);
+        assert_eq!(*order.borrow(), ["coordinator-retire", "output-stop"]);
+        assert!(matches!(*active_target.borrow(), OutputTarget::Mpd { .. }));
+        assert_eq!(active_output.borrow().name(), "mpd");
+        assert_eq!(parked_local.borrow().as_ref().unwrap().name(), "local");
+
+        let reselected = active_target.borrow().clone();
+        let (outcome, _) = apply_shared_output_selection(
+            &active_target,
+            reselected,
+            &playback_session,
+            &active_output,
+            &parked_local,
+            // Identity rejection occurs before this mismatched activation is
+            // inspected, and coordinator ingress must remain silent.
+            OutputActivation::Local,
+            || callbacks.set(callbacks.get() + 1),
+        );
+        assert_eq!(outcome, OutputSelectionOutcome::Reselected);
+        assert_eq!(callbacks.get(), 1);
+
+        assert!(playback_session.borrow_mut().replace_queue(
+            vec![super::super::playback::QueueItem::direct_for_test(
+                "https://radio.invalid/live".to_string(),
+                "Retry".to_string(),
+                "Remote".to_string(),
+                "Live".to_string(),
+            )],
+            0,
+        ));
+        let preserved_identity = playback_session.borrow().current_identity().cloned();
+        let (wrong, _) = FakeOutput::boxed("wrong", OutputType::AirPlay, 0);
+        let (outcome, _) = apply_shared_output_selection(
+            &active_target,
+            OutputTarget::Chromecast {
+                address: "192.0.2.10:8009".parse().unwrap(),
+            },
+            &playback_session,
+            &active_output,
+            &parked_local,
+            OutputActivation::Remote(wrong),
+            || callbacks.set(callbacks.get() + 1),
+        );
+        assert_eq!(outcome, OutputSelectionOutcome::Unavailable);
+        assert_eq!(callbacks.get(), 1);
+        assert_eq!(
+            playback_session.borrow().current_identity(),
+            preserved_identity.as_ref()
         );
     }
 

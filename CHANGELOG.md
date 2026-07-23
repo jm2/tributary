@@ -8,11 +8,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Last.fm now has a fail-closed protocol, credential-vault, and durable-queue foundation**
+- **Last.fm now has a fail-closed protocol, desktop-authorization, credential-vault, durable-queue,
+  playback-evidence/owner, delivery/lifecycle runtime, and application-owner foundation**
   ([#50](https://github.com/jm2/tributary/issues/50),
-  [#151](https://github.com/jm2/tributary/pull/151)). This is an internal foundation, not yet a
-  user-visible scrobbling feature: playback observation, delivery-worker lifecycle, consent and
-  per-source settings, status UI, and localization remain follow-on work.
+  [#151](https://github.com/jm2/tributary/pull/151),
+  [runtime/lifecycle slice](https://github.com/jm2/tributary/pull/153),
+  [playback/now-playing slice](https://github.com/jm2/tributary/pull/154),
+  [desktop-authorization slice](https://github.com/jm2/tributary/pull/155),
+  [playback-ownership slice](https://github.com/jm2/tributary/pull/156),
+  [removable-attribution slice](https://github.com/jm2/tributary/pull/157),
+  [process-coordinator slice](https://github.com/jm2/tributary/pull/158), the
+  [headless runtime-bridge slice](https://github.com/jm2/tributary/pull/159), and the
+  [application-owner core slice](https://github.com/jm2/tributary/pull/160), plus the
+  [production-composition slice](https://github.com/jm2/tributary/pull/165)).
+  This is an internal foundation, not yet a user-visible scrobbling feature. Application startup
+  claims a non-recreatable Dormant playback coordinator, and production call sites feed its
+  epoch-bound boundary with output intent, lazy accepted-load handoff, events, discontinuities,
+  source-revalidation points, terminal causes, committed output replacement, and shutdown. A
+  sealed headless Active bridge now exists: it can consume a running runtime's one-shot
+  playback-only ingress, mint the coordinator's sole playback owner, synchronously carry accepted
+  playback through source admission into ordered NowPlaying and Clear runtime commands, and retain
+  each admitted Enqueue through its one-shot runtime completion; only `Inserted`/`AlreadyQueued`
+  proves SQLite durability. Exact real-tag external/removable proofs can reach that bridge, but
+  startup remains Dormant and revokes them through a metadata-free discard closure. Shipping now
+  constructs exactly one application owner after the first-window coordinator bind and before
+  asynchronous database initialization. After successful database initialization and before
+  shutdown, capable builds attach the migrated database once; unavailable builds skip that
+  handoff. Window close joins the application owner's
+  bridge-before-runtime generation before coordinator/output/source teardown. It still receives no
+  activation request, so no Last.fm runtime, network, or scrobbling work starts and the feature
+  remains unavailable to users. Successor-policy and typed runtime lifecycle/status controls,
+  exact local/authenticated-remote profiles, explicit consent and browser launch, staged-session
+  vault installation and account transition policy, exact per-source/session policy,
+  settings/status UI, localization and accessibility, and production package credentials remain
+  follow-on work; the
+  [complete inventory](docs/lastfm-scrobbling.md#dated-implementation-boundary) also tracks
+  activation/unavailable-state issuance, structured source-owner conversion, account replacement
+  and recovery, package verification/API registration, and the remaining acceptance matrix.
 
   - **Bounded protocol client:** an HTTPS-only, redirect-safe Last.fm 2.0 client validates
     build-injected 32-hex application credentials, signs desktop-auth, now-playing, and ordered
@@ -20,8 +52,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     operation, 1 MiB encoded-request, and 2 MiB response limits cover the provable maximum valid
     percent-encoded and JSON-escaped batches. Unknown future provider errors and structurally
     incoherent item mappings fail closed; the provider's inconsistent string-or-number corrected
-    flags accept only canonical 0/1 values. Only network failures and service codes 11/16 are
-    retryable, while code 9 requests reauthorization.
+    flags accept only canonical 0/1 values. Only timeouts/transport failures, HTTP 429/5xx without
+    a recognized provider error envelope, transient provider codes 8/11/16, and provider rate-limit
+    code 29 are retryable, while code 9 requests reauthorization. Authentication responses are
+    retained in zeroizing byte storage, validated as a complete JSON document—including every
+    escape and UTF-16 surrogate pair—and decoded through borrowed raw envelopes directly into
+    zeroizing token, username, and session-key allocations. Strict success fields and a borrowed
+    provider-error probe preserve HTTP/provider classification without generic secret-bearing JSON
+    values or ignored-value scratch allocations; partial response buffers wipe on every async or
+    blocking failure path.
+  - **Latest-only desktop authorization core:** a GTK-free bounded serialized owner obtains one
+    in-memory request token, measures its exact 60-minute life from response observation on a
+    monotonic clock, and retains the token-bearing browser URL entirely inside exact current owner
+    authority. The opaque challenge has no production URL accessor or browser handoff. Begin,
+    Finish, cancel, expiry, terminal failure, and shutdown revoke the internal URL allocation;
+    Finish consumes an opaque one-shot seal and the request token before exchange. Supersession and
+    normal shutdown cancel and join predecessor work, while abnormal owner loss closes ingress and
+    reports a fixed terminal status. Success returns only a move-only staged username/session-key
+    grant: this internal layer deliberately creates no account UUID, writes no vault record, opens
+    no browser, and bypasses neither a future explicit consent-gated browser handoff nor
+    same/different-account transition policy.
   - **Native protected authority:** session keys, exact usernames, and random account UUIDs use
     macOS Keychain, Windows Credential Manager, or Linux Secret Service with no plaintext fallback.
     The versioned vault record requires an RFC 4122 v4 account UUID, nonblank control-free username,
@@ -29,25 +79,201 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     construction is retryable per operation rather than process-poisoning after a transient vault
     failure, and the Flatpak permission policy narrowly allows only
     `org.freedesktop.secrets` in addition to its existing reviewed grants.
-  - **Private offline FIFO:** migration 17 creates and revalidates a constrained queue containing
+  - **Frozen generation-owned playback evidence:** a GTK-, policy-, credential-, and network-free
+    state machine validates and freezes only structured artist/title, optional album/album artist,
+    optional positive track number, and known duration greater than 30 seconds. Each eligible
+    occurrence mints a distinct opaque RFC 4122 v4 UUID, is deliberately uncloneable, attaches only
+    an accepted output generation, and captures one bounded UTC whole-second start exactly when the
+    first current-generation `Playing` state or accepted no-credit position proof establishes
+    playback. Initial and post-discontinuity samples only anchor; strictly observed forward deltas
+    alone count toward `min(ceil(duration_ms / 2), 240,000 ms)`. Pause, buffering, seek, Previous
+    restart, retry, duplicate/regressed/stale events, wall time, and natural end cannot manufacture
+    credit. A retry retains the same occurrence, credit, timestamp, and closed latches while
+    re-anchoring its new accepted generation; Stop, EOS, queue/source retirement, output-target
+    replacement, and application shutdown terminate it. Now-playing and scrobble actions each
+    consume one latch before handoff, and metadata, exact duration/start, occurrence identity, and
+    generation remain absent from diagnostics.
+  - **Typed accepted-output owner and handoffs:** a GTK-free owner consumes a move-only proof that
+    binds one exact accepted output generation to either eligible frozen occurrence data or an
+    explicit ineligible replacement. Each `QueueItem` freezes that occurrence's structured
+    metadata, and only `PlaybackSession` can issue the private production mint witness after the
+    exact generation crosses output acceptance. Managed external and removable input carries an
+    opaque registry-minted attribution reference bound to one registry instance, one exact session
+    or catalogue authority, and one exact source-owned profile. Minting and admission revalidate
+    capability, provenance, source opt-in, profile, epoch/generation, catalogue authority, and
+    membership under the lifecycle lock. External and removable profiles require parser-attested
+    title and artist; filenames and the display-only `Unknown` album are never substituted. The
+    removable queue path asks the live registry to mint that exact session-bound proof while it
+    captures the `QueueItem`; authenticated-remote capture remains denied without both an exact
+    profile and a production opt-in source set. Ineligible or policy-rejected replacements
+    terminally retire their predecessor and emit at most one explicit clear. Lock-linearized
+    freshness makes delayed accepted loads and superseded NowPlaying/Clear handoffs inert, while a
+    qualified Enqueue is not retroactively revoked. A successor NowPlaying updates latest-issued
+    freshness without prematurely invalidating the predecessor Clear: source-policy rejection or
+    any runtime-admission failure leaves that Clear claimable, and only successful successor
+    admission consumes it. Move-only redacted handoffs
+    keep payloads private through exact source and runtime admission. A separate move-only output
+    intent closes the predecessor generation before any output call: an exact same-occurrence retry
+    preserves UUID, start, credit, metadata, and latches, while a replacement retires terminally and
+    an incoherent generation fails closed. Exact local/authenticated-remote profiles remain
+    unwired.
+  - **Process playback coordinator, sealed activation bridge, and production ingress:** startup claims exactly one
+    non-cloneable process owner before GTK activation and can transfer it only to the first window.
+    Cloneable redacted bindings carry a checked window epoch; rebinding makes old callbacks inert,
+    poison becomes terminal shutdown, and owner drop cannot permit recreation. Production playback
+    now reports intent before output invocation, handles the accepted/rejected result in the
+    playback session, hands accepted loads to the lazy coordinator boundary, and reports current
+    events before history/UI reduction, seek/Previous/resume discontinuities, Stop, committed output replacement,
+    queue and external-terminal retirement, source-authority revalidation points, and application
+    shutdown without retaining a GTK `RefCell` guard across coordinator ingress. A sealed Active
+    state can now bind the exact current window to one already-claimed playback runtime ingress and
+    one immutable remote-source opt-in snapshot. A module-private mint creates the sole playback
+    owner; accepted loads, events, discontinuities, source revalidation, and typed retirement drive
+    exact source admission and ordered NowPlaying, Enqueue, and Clear dispatch. Enqueue admission
+    returns a distinct pending-durability disposition and transfers a bounded child operation lease
+    to its completion task; only SQLite `Inserted`/`AlreadyQueued` completion settles successfully,
+    while a late queue, storage, stale-account, owner-stop, or cancelled-supervisor result becomes a
+    sticky terminal failure. The accepted-load
+    extractor is lazy, runs outside the coordinator mutex but inside the activation drain barrier,
+    and has an explicit bounded, non-reentrant contract; stale activation results are revoked
+    without dispatch. Close, rebind, shutdown, and drop revoke admission, drain in-flight work and
+    every supervised enqueue receipt, and publish one shared retirement result before a successor
+    can activate. Fatal owner/gate failures, delayed Enqueue-completion failures, and failed
+    retirement fail closed terminally instead of exposing a replacement environment. The
+    production application nevertheless issues no activation: startup remains
+    Dormant with no playback owner, Last.fm runtime, transport, vault, credentials, or policy. Its
+    accepted authority is consumed and revoked exactly once through a separate content-free discard
+    closure in Dormant, stale-window, and shutdown states, so external/removable metadata and action
+    handoffs still do not leave the playback session. Review follow-up also makes OS-open dispatch
+    use the same structural-window check as activation, so files are drained immediately when a
+    live window is temporarily unfocused.
+  - **Headless application activation owner:** one non-cloneable owner evaluates build capability
+    before touching the database, vault, queue, or network. A capable build accepts one database
+    attachment followed by one move-only consent/enablement request, freezes its exact
+    remote-source set, starts the runtime, claims its one-shot playback ingress, and activates the
+    exact-window bridge as one transaction. Every partial start is rolled back and joined. Normal
+    close drains the bridge before shutting down and joining the runtime; a failed drain is sticky
+    and cannot expose a successor generation. Database, Starting, and Active publication
+    linearize with close, and the retained runtime barrier is supervised: unexpected runtime exit
+    closes ingress, retires the bridge, joins the runtime, and only then publishes a fixed terminal
+    failure. A concurrent application close which wins the gate remains a normal ordered drain.
+    The core publishes only bounded content-free status and cannot infer consent from build
+    credentials, vault state, queued rows, or source connectivity. Shipping constructs exactly one
+    instance after binding the first-window coordinator and before asynchronous database setup.
+    After successful database initialization and before shutdown, a capable build attaches the
+    migrated database once and stops at `AwaitingConsent`; an unavailable build never invokes the
+    lazy database handoff. Close revokes application ingress synchronously,
+    then asynchronously joins the application's bridge-before-runtime drain before terminating the
+    coordinator, clearing/stopping playback, and revoking source authority. A failed application
+    drain stays visible without skipping downstream teardown, post-close player events are ignored,
+    and application Quit uses a structural live-window fallback so an unfocused window cannot
+    bypass the close barrier. No shipping path issues the activation request.
+  - **Private offline FIFO and durable delivery gate:** migration 17 creates and revalidates a
+    constrained queue containing
     only bounded submission metadata, opaque occurrence/order identity, one-way account binding,
     and saturated retry state. Atomic admission enforces a 10,000-row global cap, exact occurrence
     idempotency, and one-account quarantine. An idempotent hit revalidates the complete stored row
-    before reporting durable success, so a malformed identity or retry state is retained for
-    explicit recovery and fails closed instead of returning a corrupt row ID. Opaque receipts freeze
+    before reporting durable success, so a malformed identity or retry state is retained and fails
+    closed instead of returning a corrupt row ID. Destructive recovery for a corrupt queue while
+    its vault account is still valid remains follow-on product/UI work. Opaque receipts freeze
     the exact oldest prefix; terminal settlement and retry rescheduling compare-and-swap the entire
-    batch transactionally so stale or partial receipts change nothing. Downgrade is refused while
-    private rows remain.
-  - **Recovery and redaction:** normal account purge cannot erase a successor binding. A separate
-    missing/corrupt-vault recovery requires an opaque close-and-FIFO-drain capability and deletes
-    only the closed row-ID snapshot, including malformed non-positive identities, before a successor
-    can be created. Queue models, generated SeaORM `ActiveModel` values, client/vault values, errors,
-    and diagnostics redact credentials, account bindings, listening metadata, and start evidence.
-    Validation includes 40 focused Last.fm tests; locked debug and release suites each pass 20
-    library, 1,385 application, and 10 repository-metadata tests (1,415 total), alongside strict
-    debug/release Clippy, Rust 1.92 all-target compilation, Flatpak positive/negative permission
-    tests, locked fuzz-workspace formatting/Clippy with the same target-scoped vault dependency
-    graph, and dependency auditing without public Last.fm network access.
+    batch transactionally so stale or partial receipts change nothing. Migration 18 adds one exact
+    singleton containing only that one-way binding and a fixed reauthentication, compatibility,
+    capability, or credential-cleanup category. A result pause is receipt-checked and committed
+    before the worker's Stop acknowledgement; a worker failure is account-checked before its Stop
+    acknowledgement. If either pause write fails, ingress closes and the worker stops with a fixed
+    capability/storage failure, but the uncommitted state is not claimed to survive restart.
+    Startup restores an exact committed phase without spawning a worker. Code 9
+    clears only after exact same-account reauthorization, while compatibility/capability pauses
+    require an opaque exact-runtime/account/revision/category recovery command. Disconnect
+    atomically replaces the emptied queue and any delivery pause with a cleanup tombstone, then
+    clears it only after exact vault deletion; missing/corrupt-vault recovery separately purges both
+    tables transactionally. Downgrade is refused while either private rows or a pause marker remain.
+  - **Single-flight durable delivery:** one cancellable worker reads the exact oldest due FIFO
+    prefix of at most 50 rows, defensively converts it to one ordered protocol batch, performs one
+    bounded request, and then waits for the serialized owner to acknowledge the exact durable
+    mutation before it can inspect another row. Only timeouts, transport failures,
+    service-unavailable, and rate-limit outcomes—including provider codes 8/11/16/29—reschedule
+    the complete receipt, with deterministic exponential delays from 30 seconds through a one-hour
+    cap. Valid
+    accepted/ignored results and recognized terminal service rejections settle the exact receipt;
+    ordinary HTTP status failures, oversized bodies, malformed or cardinality-incoherent responses,
+    invalid stored data, and local capability failures retain the queue and pause or quarantine
+    automatic delivery instead of guessing, deleting, or looping.
+  - **Bounded serialized runtime and private playback ingress:** during an active runtime, its
+    lifecycle-owned actor is the sole
+    SQLite and credential-vault mutator. Explicit missing/corrupt-vault recovery is the only
+    separate mutating path and holds the same process-global lease. The actor's bounded metadata
+    FIFO reserves four slots for control: one delivery result, two lifecycle markers, and one
+    explicit now-playing clear. This preserves delivery-result/disconnect/shutdown ordering while
+    a full 64-command ordinary metadata backlog still cannot starve playback retirement. One
+    ingress gate linearizes admission against every lifecycle transition. A running runtime can
+    issue exactly one non-cloneable, redacted playback capability; concurrent claims have one
+    winner, dropping it never restores the claim, and closed, shutting-down, or poisoned state
+    fails closed. That capability exposes only bounded NowPlaying, Enqueue, and Clear submission—no
+    lifecycle, status, account, credential, vault, or recovery authority—and the general runtime
+    handle no longer exposes those playback submissions in production. Playback-facing input is
+    deliberately unbound: only the runtime ingress gate can attach the vault-derived account
+    binding. No shipping composition claims this capability yet. Startup additionally requires an
+    opaque capability issued only inside the application-owner core after it consumes a move-only
+    consent/enablement request; no production path issues that request yet.
+    Checked account epochs and delivery generations
+    reject stale events; watched phase, pending count, fixed failure category, and saturating
+    non-persistent accepted/ignored/rejected counters update only after the matching durable
+    mutation.
+  - **Runtime-owned one-shot now-playing:** playback submits one validated, uncloneable,
+    account-independent `LastFmNowPlaying`; the ingress gate attaches the exact current account and
+    epoch without exposing the vault session. A monotonic latest-only generation synchronously
+    cancels its predecessor before the successor crosses the bounded FIFO. Stop or an ineligible
+    successor uses the separately reserved clear command, which advances ingress ownership and
+    cancels under the ingress lock, then makes the actor join the predecessor before acknowledging
+    the clear in FIFO order. Now-playing is
+    never persisted or retried. Accepted, ignored, rejected, transient-unavailable, incompatible,
+    and capability-unavailable results are fixed content-free outcomes and do not settle, pause,
+    or otherwise disturb durable scrobble delivery. Only provider code 9 may claim the exact
+    current now-playing generation/account/epoch, atomically commit the durable reauthorization
+    pause, and then retire delivery; a stale result or failed claim mutates nothing. Normal
+    supersession, clear, disconnect, reauthorization, and shutdown paths, plus supervised owner
+    failure and caught actor panic, cancel and join the task before releasing account or vault
+    authority. A hard external abort of the owner cannot claim joined quiescence: its drain barrier
+    becomes `Failed`. Owner drop still cancels the child before releasing the primary lease share,
+    while the request future retains its own shared vault-lifecycle lease until transport state is
+    actually dropped; a successor therefore cannot overlap the abandoned request.
+  - **Exhaustive reauthorization and replay policy:** Last.fm code 9 cancels network delivery but
+    keeps FIFO admission available and retains every queued row. Exactly one live reauthorization
+    may be pending; it must name the same account, replace that exact account's vault session while
+    retaining the lifecycle lease, retire the old worker generation, and restart delivery.
+    Supplying a different username is an explicit account-replacement refusal, never authority to
+    retag or purge the queue. If a remote submission
+    may have succeeded but shutdown or task loss wins before actor settlement, the unchanged receipt
+    remains for at-least-once replay on the successor runtime rather than being falsely deleted.
+    Unexpected worker panics likewise become one content-free paused status and retain the exact
+    receipt.
+  - **Disconnect, shutdown, and explicit recovery:** one process-global vault lifecycle lease spans
+    startup inspection, the active runtime, same-account credential replacement, disconnect cleanup,
+    and exceptional recovery; blocking vault operations own that same lease through cancellation or
+    failure so a successor cannot observe a gap. Disconnect closes admission, cancels and joins
+    delivery, drains work already admitted ahead of it, purges only the exact account queue, drops
+    the in-memory session, installs a durable cleanup tombstone, and then deletes only the matching
+    vault record before clearing that exact marker. Vault-delete and marker-clear failures remain
+    cleanup-only across restart; an already-absent vault may close only the matching tombstone, and
+    a different stored account is never deletion authority. Normal shutdown closes admission,
+    cancels delivery, drains the serialized owner, and deliberately leaves durable queue and vault
+    state for a later run. Separate cancellation-safe recovery acts only when the vault is missing
+    or structurally corrupt, deletes the closed queue snapshot before a corrupt record, and refuses
+    to mutate anything for a valid or merely unavailable vault.
+  - **Process-wide panic privacy:** queue models, generated SeaORM `ActiveModel` values,
+    client/vault values, errors, status, and diagnostics redact credentials, account bindings,
+    listening metadata (including exact duration), and start evidence. Because Rust invokes its
+    global hook even for a panic a worker later catches, Tributary now installs a payload-ignoring
+    hook as the first operation in `main`; it emits only fixed text plus an opt-in code-location
+    backtrace. A subprocess regression panics with a sentinel private value and proves that value is
+    absent from captured output. An
+    actor unwind retains its complete owner and vault lease while it closes ingress, cancels and
+    joins delivery, then attempts to commit or validate a capability pause for unpurged state
+    before releasing the lease. If SQLite cannot establish that pause, the shutdown proof remains
+    failed rather than claiming a durable commit; successor ownership still cannot overlap the
+    predecessor's request or database task.
 - **Rhythmbox profiles can now be migrated through a bounded, preview-first, transactional
   workflow** ([#57](https://github.com/jm2/tributary/issues/57),
   [#150](https://github.com/jm2/tributary/pull/150)):

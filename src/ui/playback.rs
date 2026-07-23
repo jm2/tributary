@@ -17,8 +17,19 @@ use tracing::warn;
 use crate::architecture::{MediaKey, SourceId, TrackId, ViewOrigin};
 use crate::audio::output::AudioOutput;
 use crate::audio::{PlayerEvent, PlayerEventGeneration, PlayerState};
+use crate::lastfm::playback::LastFmPlaybackEvidenceError;
+use crate::lastfm::playback_coordinator::{
+    LastFmPlaybackCoordinatorBinding, LastFmPlaybackRetirement,
+};
+use crate::lastfm::playback_owner::{
+    LastFmAcceptedOutputFreshness, LastFmAcceptedOutputLoad, LastFmAcceptedPlayback,
+    LastFmOutputIntent, LastFmPlaybackOccurrenceIdentity, LastFmPlaybackSource,
+};
 use crate::local::playback_history::PlaybackHistoryProgress;
-use crate::source_registry::RegularPlaylistCatalogueGuard;
+use crate::source_registry::{
+    PlaybackAttributionProfile, PlaybackSourceReference, RegularPlaylistCatalogueGuard,
+    SourceRegistry,
+};
 use crate::ui::header_bar::RepeatMode;
 use crate::ui::objects::{PlaylistOccurrenceState, TrackObject};
 
@@ -199,15 +210,24 @@ pub struct QueueTrackRefresh {
     pub title: String,
     pub artist: String,
     pub album: String,
+    pub album_artist: Option<String>,
+    pub track_number: Option<u32>,
+    pub duration_secs: Option<u64>,
     pub cover_art_url: String,
 }
 
 impl QueueTrackRefresh {
     pub fn from_track(track: &TrackObject) -> Self {
+        let album_artist = track.album_artist();
+        let track_number = track.track_number();
+        let duration_secs = track.duration_secs();
         Self {
             title: track.title(),
             artist: track.artist(),
             album: track.album(),
+            album_artist: (!album_artist.is_empty()).then_some(album_artist),
+            track_number: (track_number != 0).then_some(track_number),
+            duration_secs: (duration_secs != 0).then_some(duration_secs),
             cover_art_url: track.cover_art_url(),
         }
     }
@@ -241,13 +261,25 @@ pub struct QueueItem {
     /// Random SourceIds are also valid persisted remote identities, so source
     /// shape alone cannot safely recover this lifecycle distinction later.
     external_session: bool,
+    /// Exact attribution authority captured before this queue occurrence was
+    /// created. Eligible managed rows receive it only through a registry-minted
+    /// session/catalogue reference; external files carry their session proof.
+    lastfm_source: Option<LastFmPlaybackSource>,
+    /// Exact structured payload bound into `lastfm_source`. Candidate fields
+    /// are derived from this profile, never from mutable/display metadata.
+    lastfm_profile: Option<PlaybackAttributionProfile>,
     /// Positive metadata duration captured with this queue occurrence.
     /// Zero remains unknown so an output may supply its first real duration.
     duration_ms: Option<u64>,
+    /// Exact positive structured duration retained for Last.fm metadata.
+    /// Unlike output duration events, this is frozen from source metadata.
+    duration_secs: Option<u64>,
     uri: String,
     title: String,
     artist: String,
     album: String,
+    album_artist: Option<String>,
+    track_number: Option<u32>,
     cover_art_url: String,
 }
 
@@ -257,12 +289,18 @@ impl QueueItem {
         track: &TrackObject,
         occurrence: usize,
         regular_playlist_guard: Option<RegularPlaylistCatalogueGuard>,
+        playback_source: Option<PlaybackSourceReference>,
     ) -> Self {
         let is_library = is_library_source(identity.media_key.source_id);
-        let duration_ms = match track.duration_secs() {
-            0 => None,
-            duration_secs => Some(duration_secs.saturating_mul(1_000)),
-        };
+        let raw_duration_secs = track.duration_secs();
+        let duration_secs = (raw_duration_secs != 0).then_some(raw_duration_secs);
+        let duration_ms = duration_secs.map(|duration_secs| duration_secs.saturating_mul(1_000));
+        let album_artist = track.album_artist();
+        let track_number = track.track_number();
+        let lastfm_profile = playback_source
+            .as_ref()
+            .map(|reference| reference.profile().clone());
+        let lastfm_source = playback_source.map(LastFmPlaybackSource::managed);
         Self {
             identity,
             occurrence,
@@ -272,7 +310,14 @@ impl QueueItem {
                 .or_else(|| track.source_session_epoch()),
             regular_playlist_guard,
             external_session: false,
+            // Only an opaque reference minted from the exact live registry
+            // session/catalogue can authorize attribution. Its immutable
+            // profile, rather than mutable GTK display fields, supplies the
+            // Last.fm candidate below.
+            lastfm_source,
+            lastfm_profile,
             duration_ms,
+            duration_secs,
             // Local and lifecycle-owned rows (including either kind of
             // regular-playlist occurrence) retain identity, ordering, and
             // metadata but never a locator. Every output load resolves the
@@ -285,12 +330,23 @@ impl QueueItem {
             title: track.title(),
             artist: track.artist(),
             album: track.album(),
+            album_artist: (!album_artist.is_empty()).then_some(album_artist),
+            track_number: (track_number != 0).then_some(track_number),
             cover_art_url: track.cover_art_url(),
         }
     }
 
     pub(crate) fn external(session: &crate::source_registry::ExternalFileSession) -> Self {
         let track = session.track();
+        let attribution = session.playback_source().map(|reference| {
+            (
+                LastFmPlaybackSource::managed(reference.clone()),
+                reference.profile().clone(),
+            )
+        });
+        let (lastfm_source, lastfm_profile) = attribution
+            .map(|(source, profile)| (Some(source), Some(profile)))
+            .unwrap_or((None, None));
         Self {
             identity: PlaybackIdentity {
                 media_key: MediaKey::new(session.source_id(), session.track_id().clone()),
@@ -301,16 +357,41 @@ impl QueueItem {
             source_session_epoch: Some(session.session_epoch()),
             regular_playlist_guard: None,
             external_session: true,
+            lastfm_source,
+            lastfm_profile,
             duration_ms: track
                 .duration_secs
                 .filter(|duration_secs| *duration_secs > 0)
                 .map(|duration_secs| duration_secs.saturating_mul(1_000)),
+            duration_secs: track
+                .duration_secs
+                .filter(|duration_secs| *duration_secs > 0),
             uri: String::new(),
             title: track.title.clone(),
             artist: track.artist_name.clone(),
             album: track.album_title.clone(),
+            album_artist: track
+                .album_artist_name
+                .clone()
+                .filter(|album_artist| !album_artist.is_empty()),
+            track_number: track.track_number.filter(|track_number| *track_number != 0),
             cover_art_url: String::new(),
         }
+    }
+
+    fn lastfm_occurrence_candidate(&self) -> Option<LastFmOccurrenceCandidate> {
+        let source = self.lastfm_source.clone()?;
+        let profile = self.lastfm_profile.as_ref()?;
+        Some(LastFmOccurrenceCandidate {
+            identity: LastFmPlaybackOccurrenceIdentity::fresh(),
+            source,
+            artist: profile.artist().to_string(),
+            title: profile.title().to_string(),
+            album: profile.album().map(str::to_string),
+            album_artist: profile.album_artist().map(str::to_string),
+            track_number: profile.track_number(),
+            duration_secs: profile.duration_secs(),
+        })
     }
 
     #[cfg(test)]
@@ -330,11 +411,16 @@ impl QueueItem {
             source_session_epoch: None,
             regular_playlist_guard: None,
             external_session: false,
+            lastfm_source: None,
+            lastfm_profile: None,
             duration_ms: None,
+            duration_secs: None,
             uri,
             title,
             artist,
             album,
+            album_artist: None,
+            track_number: None,
             cover_art_url: String::new(),
         }
     }
@@ -351,11 +437,16 @@ impl QueueItem {
             source_session_epoch: Some(session_epoch),
             regular_playlist_guard: None,
             external_session: true,
+            lastfm_source: None,
+            lastfm_profile: None,
             duration_ms: None,
+            duration_secs: None,
             uri: String::new(),
             title: "External".to_string(),
             artist: "Artist".to_string(),
             album: "Album".to_string(),
+            album_artist: None,
+            track_number: None,
             cover_art_url: String::new(),
         }
     }
@@ -368,6 +459,222 @@ impl QueueItem {
     #[cfg(test)]
     pub(crate) const fn source_session_epoch(&self) -> Option<u64> {
         self.source_session_epoch
+    }
+}
+
+/// Immutable Last.fm input owned by one genuine queue occurrence.
+///
+/// This private candidate is created with the occurrence, before any output
+/// retry. It intentionally keeps the original structured values even if a
+/// later library refresh rewrites the queue item's display metadata. Each
+/// accepted retry consumes a newly constructed move-only accepted value while
+/// retaining this candidate's exact occurrence identity and frozen payload.
+#[derive(Clone)]
+struct LastFmOccurrenceCandidate {
+    identity: LastFmPlaybackOccurrenceIdentity,
+    source: LastFmPlaybackSource,
+    artist: String,
+    title: String,
+    album: Option<String>,
+    album_artist: Option<String>,
+    track_number: Option<u32>,
+    duration_secs: Option<u64>,
+}
+
+impl LastFmOccurrenceCandidate {
+    fn accepted(&self) -> Result<LastFmAcceptedPlayback, LastFmPlaybackEvidenceError> {
+        LastFmAcceptedPlayback::try_new(
+            self.identity.clone(),
+            self.source.clone(),
+            self.artist.clone(),
+            self.title.clone(),
+            self.album.clone(),
+            self.album_artist.clone(),
+            self.track_number,
+            self.duration_secs,
+        )
+    }
+}
+
+impl std::fmt::Debug for LastFmOccurrenceCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LastFmOccurrenceCandidate(<redacted>)")
+    }
+}
+
+/// Non-cloneable witness that only `PlaybackSession` can issue after its
+/// exact current generation crosses synchronous output acceptance.
+///
+/// The type is crate-visible solely so the GTK-free owner can require it;
+/// the production constructor remains private to this module. Test-only
+/// owner fixtures may mint an isolated witness without creating a GTK session.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) struct LastFmAcceptedOutputMint(());
+
+impl LastFmAcceptedOutputMint {
+    const fn issue() -> Self {
+        Self(())
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) const fn for_test() -> Self {
+        Self(())
+    }
+}
+
+/// Non-cloneable witness that only `PlaybackSession` can issue after it has
+/// committed the complete predecessor-to-successor output transition.
+///
+/// The GTK-free owner requires this witness to construct an output intent, so
+/// no production caller can suspend or retire occurrence evidence from raw
+/// generation values.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) struct LastFmOutputIntentMint(());
+
+impl LastFmOutputIntentMint {
+    const fn issue() -> Self {
+        Self(())
+    }
+}
+
+impl std::fmt::Debug for LastFmOutputIntentMint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LastFmOutputIntentMint(<opaque>)")
+    }
+}
+
+/// Rollback-safe clone of only the predecessor's accepted-load freshness.
+///
+/// Tentative navigation stores this clone in the successor session. Dropping
+/// it during rollback changes nothing; committing an output attempt revokes it
+/// before either the Last.fm coordinator or the output can observe the
+/// transition. It contains no metadata, identity, or source authority.
+struct AcceptedLastFmLoadSuspension(LastFmAcceptedOutputFreshness);
+
+impl AcceptedLastFmLoadSuspension {
+    fn commit(self) {
+        self.0.revoke();
+    }
+}
+
+impl std::fmt::Debug for AcceptedLastFmLoadSuspension {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AcceptedLastFmLoadSuspension(<redacted>)")
+    }
+}
+
+impl std::fmt::Debug for LastFmAcceptedOutputMint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LastFmAcceptedOutputMint(<opaque>)")
+    }
+}
+
+/// Move-only, one-shot authority for handing one accepted output load to the
+/// Last.fm playback owner.
+///
+/// `PlaybackSession` is intentionally not cloneable. Transactional UI paths
+/// move this state into their rollback snapshots, so rollback cannot duplicate
+/// an accepted load. A retry becomes available only after a genuinely new
+/// generation crosses output acceptance. Its shared freshness gate is revoked
+/// by every successor or terminal path, making delayed extracted loads inert.
+#[derive(Default)]
+enum AcceptedLastFmLoad {
+    #[default]
+    Unavailable,
+    Available {
+        generation: PlayerEventGeneration,
+        freshness: LastFmAcceptedOutputFreshness,
+    },
+    Consumed {
+        generation: PlayerEventGeneration,
+        freshness: LastFmAcceptedOutputFreshness,
+    },
+}
+
+impl AcceptedLastFmLoad {
+    fn install(&mut self, generation: PlayerEventGeneration) {
+        if self.generation() == Some(generation) {
+            return;
+        }
+        self.revoke();
+        *self = Self::Available {
+            generation,
+            freshness: LastFmAcceptedOutputFreshness::fresh(),
+        };
+    }
+
+    fn take(&mut self, generation: PlayerEventGeneration) -> Option<LastFmAcceptedOutputFreshness> {
+        let Self::Available {
+            generation: current,
+            freshness,
+        } = self
+        else {
+            return None;
+        };
+        if *current != generation {
+            return None;
+        }
+        let retained = freshness.clone();
+        let output = freshness.clone();
+        *self = Self::Consumed {
+            generation,
+            freshness: retained,
+        };
+        Some(output)
+    }
+
+    fn revoke(&mut self) {
+        *self = match std::mem::take(self) {
+            Self::Available {
+                generation,
+                freshness,
+            }
+            | Self::Consumed {
+                generation,
+                freshness,
+            } => {
+                freshness.revoke();
+                Self::Consumed {
+                    generation,
+                    freshness,
+                }
+            }
+            Self::Unavailable => Self::Unavailable,
+        };
+    }
+
+    fn suspension(&self) -> Option<AcceptedLastFmLoadSuspension> {
+        match self {
+            Self::Available { freshness, .. } | Self::Consumed { freshness, .. } => {
+                Some(AcceptedLastFmLoadSuspension(freshness.clone()))
+            }
+            Self::Unavailable => None,
+        }
+    }
+
+    const fn generation(&self) -> Option<PlayerEventGeneration> {
+        match self {
+            Self::Unavailable => None,
+            Self::Available { generation, .. } | Self::Consumed { generation, .. } => {
+                Some(*generation)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    const fn is_consumed(&self) -> bool {
+        matches!(self, Self::Consumed { .. })
+    }
+}
+
+impl std::fmt::Debug for AcceptedLastFmLoad {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "AcceptedLastFmLoad::Unavailable",
+            Self::Available { .. } => "AcceptedLastFmLoad::Available(<redacted>)",
+            Self::Consumed { .. } => "AcceptedLastFmLoad::Consumed(<redacted>)",
+        })
     }
 }
 
@@ -467,7 +774,7 @@ impl ShuffleState {
 /// forward history after Previous before drawing again. Reaching the retained
 /// boundary never invents a predecessor. Repeat-one is an EOS policy
 /// implemented by [`replay_current`], so manual Next still moves.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct PlaybackSession {
     queue: Vec<QueueItem>,
     current_index: Option<usize>,
@@ -482,10 +789,31 @@ pub struct PlaybackSession {
     /// resolution when applicable) instead of issuing `play()` to an output
     /// that has no loaded media.
     resolution_failed: bool,
+    /// Move-only one-shot proof for the exact current generation whose media
+    /// load the output accepted. Resolution completion alone never sets this
+    /// proof.
+    accepted_lastfm_load: AcceptedLastFmLoad,
+    /// Freshness-only predecessor suspension installed by tentative queue
+    /// navigation or Repeat One. Rollback drops it inert; the first committed
+    /// output attempt consumes it before advancing generation ownership.
+    pending_lastfm_output_suspension: Option<AcceptedLastFmLoadSuspension>,
     /// Durable-history accounting for the current local queue occurrence.
     /// Remote, removable, radio, and external items deliberately leave this
     /// empty even when their backend-native track ID resembles a local ID.
     history_occurrence: Option<PlaybackHistoryOccurrence>,
+    /// Frozen candidate shared by accepted retries of the current genuine
+    /// queue occurrence. Queue navigation and Repeat One replace it even when
+    /// the stable media key and metadata are unchanged.
+    lastfm_occurrence_candidate: Option<LastFmOccurrenceCandidate>,
+}
+
+impl Drop for PlaybackSession {
+    fn drop(&mut self) {
+        // An accepted load may already have been extracted into a delayed
+        // coordinator task. Closing the owning playback session must revoke
+        // that shared freshness gate even when teardown bypasses `clear`.
+        self.accepted_lastfm_load.revoke();
+    }
 }
 
 impl PlaybackSession {
@@ -503,6 +831,11 @@ impl PlaybackSession {
     }
 
     pub fn clear(&mut self) {
+        // Close every extracted accepted-load clone before mutating terminal
+        // session ownership. A concurrent coordinator claim can therefore
+        // never attach the predecessor after Stop/source/output retirement.
+        self.revoke_accepted_lastfm_load();
+        self.pending_lastfm_output_suspension = None;
         self.queue.clear();
         self.current_index = None;
         self.shuffle = None;
@@ -510,6 +843,7 @@ impl PlaybackSession {
         self.pending_resolution = None;
         self.resolution_failed = false;
         self.history_occurrence = None;
+        self.lastfm_occurrence_candidate = None;
     }
 
     /// Start a fresh shuffle traversal without changing the queue or current
@@ -593,6 +927,9 @@ impl PlaybackSession {
             if item.title == update.title
                 && item.artist == update.artist
                 && item.album == update.album
+                && item.album_artist == update.album_artist
+                && item.track_number == update.track_number
+                && item.duration_secs == update.duration_secs
                 && item.cover_art_url == update.cover_art_url
             {
                 continue;
@@ -601,6 +938,9 @@ impl PlaybackSession {
             item.title = update.title.clone();
             item.artist = update.artist.clone();
             item.album = update.album.clone();
+            item.album_artist = update.album_artist.clone();
+            item.track_number = update.track_number;
+            item.duration_secs = update.duration_secs;
             item.cover_art_url = update.cover_art_url.clone();
             refreshed += 1;
         }
@@ -642,6 +982,12 @@ impl PlaybackSession {
         let generation = event.generation();
         if !self.accepts_event_generation(generation) {
             return None;
+        }
+        if matches!(
+            event,
+            PlayerEvent::Error { .. } | PlayerEvent::TrackEnded { .. }
+        ) {
+            self.revoke_accepted_lastfm_load();
         }
 
         let current_track_id = self.current().and_then(|item| {
@@ -756,13 +1102,71 @@ impl PlaybackSession {
     }
 
     fn begin_history_occurrence_for_current(&mut self) {
+        self.install_history_occurrence_for_current();
+    }
+
+    fn install_history_occurrence_for_current(&mut self) {
+        self.lastfm_occurrence_candidate = self
+            .current()
+            .and_then(QueueItem::lastfm_occurrence_candidate);
         self.history_occurrence = self
             .current()
             .and_then(PlaybackHistoryOccurrence::from_item);
     }
 
     fn begin_repeat_one_occurrence(&mut self) {
-        self.begin_history_occurrence_for_current();
+        // Repeat One is installed tentatively: a failure before handoff must
+        // restore the predecessor's move-only accepted-load proof. The caller
+        // owns that proof until the new occurrence either commits or rolls
+        // back.
+        debug_assert!(matches!(
+            &self.accepted_lastfm_load,
+            AcceptedLastFmLoad::Unavailable
+        ));
+        self.install_history_occurrence_for_current();
+    }
+
+    fn revoke_accepted_lastfm_load(&mut self) {
+        self.accepted_lastfm_load.revoke();
+    }
+
+    /// Consume the one-shot Last.fm handoff proof only after its exact current
+    /// output generation crossed [`Self::mark_load_accepted`]. Resolution
+    /// completion alone is insufficient. The proof is consumed before source
+    /// eligibility or metadata validation, so an ineligible or invalid load
+    /// cannot be retrieved again. This method never consults mutable GTK rows,
+    /// output duration, a filename, URI, or backend lookup.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn take_accepted_lastfm_output_load(
+        &mut self,
+        generation: PlayerEventGeneration,
+    ) -> Option<LastFmAcceptedOutputLoad> {
+        if self.pending_resolution.is_some()
+            || self.resolution_failed
+            || !self.accepts_event_generation(generation)
+        {
+            return None;
+        }
+        let freshness = self.accepted_lastfm_load.take(generation)?;
+        Some(
+            match self
+                .lastfm_occurrence_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.accepted().ok())
+            {
+                Some(accepted) => LastFmAcceptedOutputLoad::eligible(
+                    LastFmAcceptedOutputMint::issue(),
+                    generation,
+                    freshness,
+                    accepted,
+                ),
+                None => LastFmAcceptedOutputLoad::ineligible(
+                    LastFmAcceptedOutputMint::issue(),
+                    generation,
+                    freshness,
+                ),
+            },
+        )
     }
 
     fn mark_history_load_accepted(&mut self, generation: PlayerEventGeneration) -> bool {
@@ -792,6 +1196,47 @@ impl PlaybackSession {
         true
     }
 
+    /// Record the synchronous output-acceptance boundary for every source.
+    /// Local history attaches to the same generation when applicable.
+    fn mark_load_accepted(&mut self, generation: PlayerEventGeneration) -> bool {
+        if self.pending_resolution.is_some()
+            || self.resolution_failed
+            || !self.accepts_event_generation(generation)
+        {
+            return false;
+        }
+        // Re-observing acceptance for one generation must not reopen a proof
+        // that was already consumed.
+        self.accepted_lastfm_load.install(generation);
+        let _ = self.mark_history_load_accepted(generation);
+        true
+    }
+
+    fn finish_output_load(&mut self, generation: PlayerEventGeneration, accepted: bool) -> bool {
+        if accepted {
+            self.mark_load_accepted(generation)
+        } else {
+            self.mark_load_rejected(generation)
+        }
+    }
+
+    /// Consume and revoke one exact accepted proof without constructing or
+    /// validating occurrence metadata. Dormant and closed coordinators use
+    /// this path so disabled Last.fm support does no attribution work.
+    fn discard_accepted_lastfm_output_load(&mut self, generation: PlayerEventGeneration) -> bool {
+        if self.pending_resolution.is_some()
+            || self.resolution_failed
+            || !self.accepts_event_generation(generation)
+        {
+            return false;
+        }
+        let Some(freshness) = self.accepted_lastfm_load.take(generation) else {
+            return false;
+        };
+        freshness.revoke();
+        true
+    }
+
     /// Exact hidden external-file source currently owned by playback.
     ///
     /// This must be read before `clear`: baseline visibility is not terminal
@@ -817,14 +1262,39 @@ impl PlaybackSession {
             .flatten()
     }
 
-    fn begin_event_generation(&mut self) -> PlayerEventGeneration {
-        self.event_generation = self.event_generation.next();
+    fn begin_output_attempt(&mut self) -> OutputAttempt {
+        let previous_generation = self.event_generation;
+
+        // A tentative predecessor snapshot is revoked only at this commit
+        // point. This must happen before the current proof, coordinator, or
+        // output can observe the successor attempt.
+        if let Some(suspension) = self.pending_lastfm_output_suspension.take() {
+            suspension.commit();
+        }
+        self.revoke_accepted_lastfm_load();
+        self.event_generation = previous_generation.next();
         self.pending_resolution = None;
         self.resolution_failed = false;
         if let Some(occurrence) = self.history_occurrence.as_mut() {
             occurrence.retire_delivery();
         }
-        self.event_generation
+        let intent = LastFmOutputIntent::new(
+            LastFmOutputIntentMint::issue(),
+            previous_generation,
+            self.event_generation,
+            self.lastfm_occurrence_candidate
+                .as_ref()
+                .map(|candidate| candidate.identity.clone()),
+        );
+        OutputAttempt {
+            generation: self.event_generation,
+            intent,
+        }
+    }
+
+    #[cfg(test)]
+    fn begin_event_generation(&mut self) -> PlayerEventGeneration {
+        self.begin_output_attempt().generation
     }
 
     /// Hand the current direct item to an output under a fresh event owner.
@@ -835,35 +1305,49 @@ impl PlaybackSession {
     /// from the mutable GTK projection instead. A rejected load retains that
     /// exact item and generation as retryable, while a later attempt advances
     /// ownership before it calls the output again.
-    pub(super) fn load_current_direct(
-        &mut self,
-        output: &dyn AudioOutput,
-    ) -> Option<DirectLoadAttempt> {
+    fn prepare_current_direct_load(&mut self) -> Option<PreparedDirectLoad> {
         let uri = self.current()?.uri.clone();
         if uri.is_empty() || self.current()?.source_session_epoch.is_some() {
             return None;
         }
+        let attempt = self.begin_output_attempt();
+        Some(PreparedDirectLoad {
+            uri,
+            generation: attempt.generation,
+            intent: attempt.intent,
+        })
+    }
 
-        let generation = self.begin_event_generation();
+    #[cfg(test)]
+    pub(super) fn load_current_direct(
+        &mut self,
+        output: &dyn AudioOutput,
+    ) -> Option<DirectLoadAttempt> {
+        let PreparedDirectLoad {
+            uri,
+            generation,
+            intent: _,
+        } = self.prepare_current_direct_load()?;
         output.set_event_generation(generation);
         let accepted = output.load_uri(&uri);
-        if accepted {
-            let _ = self.mark_history_load_accepted(generation);
-        } else {
-            let marked = self.mark_load_rejected(generation);
-            debug_assert!(marked, "current direct load remains retryable");
-        }
+        let marked = self.finish_output_load(generation, accepted);
+        debug_assert!(marked, "current direct load owns playback delivery state");
         Some(DirectLoadAttempt {
             generation,
             accepted,
         })
     }
 
-    fn begin_pending_resolution(&mut self) -> PlayerEventGeneration {
-        let generation = self.begin_event_generation();
-        self.pending_resolution = Some(generation);
+    fn begin_pending_resolution_attempt(&mut self) -> OutputAttempt {
+        let attempt = self.begin_output_attempt();
+        self.pending_resolution = Some(attempt.generation);
         self.resolution_failed = false;
-        generation
+        attempt
+    }
+
+    #[cfg(test)]
+    fn begin_pending_resolution(&mut self) -> PlayerEventGeneration {
+        self.begin_pending_resolution_attempt().generation
     }
 
     /// Claim a completed resolution only while its queue item/generation still
@@ -886,6 +1370,7 @@ impl PlaybackSession {
         }
         self.pending_resolution = None;
         self.resolution_failed = true;
+        self.revoke_accepted_lastfm_load();
         if let Some(occurrence) = self.history_occurrence.as_mut() {
             occurrence.retire_delivery();
         }
@@ -906,6 +1391,7 @@ impl PlaybackSession {
         }
         self.pending_resolution = None;
         self.resolution_failed = true;
+        self.revoke_accepted_lastfm_load();
         if let Some(occurrence) = self.history_occurrence.as_mut() {
             occurrence.retire_delivery();
         }
@@ -922,6 +1408,7 @@ impl PlaybackSession {
             return false;
         }
         self.resolution_failed = true;
+        self.revoke_accepted_lastfm_load();
         if let Some(occurrence) = self.history_occurrence.as_mut() {
             occurrence.retire_delivery();
         }
@@ -955,6 +1442,7 @@ impl PlaybackSession {
 
         self.event_generation = self.event_generation.next();
         self.resolution_failed = true;
+        self.revoke_accepted_lastfm_load();
         if let Some(occurrence) = self.history_occurrence.as_mut() {
             occurrence.retire_delivery();
         }
@@ -1109,6 +1597,18 @@ impl PlaybackSession {
     }
 }
 
+struct OutputAttempt {
+    generation: PlayerEventGeneration,
+    intent: LastFmOutputIntent,
+}
+
+struct PreparedDirectLoad {
+    uri: String,
+    generation: PlayerEventGeneration,
+    intent: LastFmOutputIntent,
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DirectLoadAttempt {
     pub(super) generation: PlayerEventGeneration,
@@ -1172,11 +1672,16 @@ fn capture_visible_queue(
     model: &impl IsA<gtk::gio::ListModel>,
     source_key: &str,
     selected_position: u32,
+    source_registry: &SourceRegistry,
 ) -> Option<CapturedQueue> {
     let view = queue_view(source_key)?;
     let mut selected_index = None;
     let mut items = Vec::with_capacity(model.n_items() as usize);
     let mut occurrences: HashMap<MediaKey, usize> = HashMap::new();
+    // Persisted per-remote consent is intentionally not part of this slice.
+    // The registry's closed policy therefore admits only intrinsically
+    // eligible managed sources (currently removable media for visible rows).
+    let enabled_remote_sources = HashSet::new();
 
     for model_index in 0..model.n_items() {
         let Some(track) = model.item(model_index).and_downcast::<TrackObject>() else {
@@ -1188,12 +1693,27 @@ fn capture_visible_queue(
         if model_index == selected_position {
             selected_index = Some(items.len());
         }
+        let playback_source = match regular_playlist_guard {
+            Some(guard) => source_registry.mint_regular_playlist_playback_source(
+                identity.media_key.clone(),
+                guard,
+                &enabled_remote_sources,
+            ),
+            None => track.source_session_epoch().and_then(|session_epoch| {
+                source_registry.mint_session_playback_source(
+                    identity.media_key.clone(),
+                    session_epoch,
+                    &enabled_remote_sources,
+                )
+            }),
+        };
         let occurrence = occurrences.entry(identity.media_key.clone()).or_default();
         items.push(QueueItem::from_track(
             identity,
             &track,
             *occurrence,
             regular_playlist_guard,
+            playback_source,
         ));
         *occurrence += 1;
     }
@@ -1209,6 +1729,7 @@ fn capture_visible_queue(
 /// Both the explicit Stop control and output replacement use this ordering, so
 /// a backend that publishes `Stopped` synchronously cannot mutate the cleared
 /// or replacement session.
+#[cfg(test)]
 pub(super) fn stop_owned_playback(session: &mut PlaybackSession, output: &dyn AudioOutput) {
     session.clear();
     output.stop();
@@ -1269,6 +1790,9 @@ pub struct PlaybackContext {
     pub rt_handle: tokio::runtime::Handle,
     /// Sole at-use resolver and lifecycle authority for source-owned media.
     pub source_registry: crate::source_registry::SourceRegistry,
+    /// Cloneable window binding to the single process-lifetime Last.fm
+    /// playback coordinator. It remains inert while the feature is dormant.
+    pub lastfm_playback: LastFmPlaybackCoordinatorBinding,
     /// The tracklist `ColumnView` — used to scroll the currently
     /// playing row into view on track change so the user doesn't lose
     /// their place when sequential / shuffled playback advances.
@@ -1306,13 +1830,50 @@ fn resolve_session_play_request(
     resolve_play_request(session.borrow().has_current(), item_count, shuffle)
 }
 
+/// Apply one Play/Toggle command only while its captured generation still
+/// owns playback, re-anchoring Last.fm evidence before touching the output.
+///
+/// The callbacks are deliberately sequential: neither the session gate nor
+/// coordinator ingress can retain a `RefCell` borrow across an output method,
+/// including an output that publishes a synchronous callback.
+fn apply_current_output_control(
+    generation: PlayerEventGeneration,
+    accepts: impl FnOnce(PlayerEventGeneration) -> bool,
+    observe_discontinuity: impl FnOnce(PlayerEventGeneration),
+    control_output: impl FnOnce(),
+) -> bool {
+    if !accepts(generation) {
+        return false;
+    }
+    observe_discontinuity(generation);
+    control_output();
+    true
+}
+
+fn control_current_output(ctx: &PlaybackContext, control: impl FnOnce(&dyn AudioOutput)) -> bool {
+    let generation = ctx.session.borrow().current_event_generation();
+    apply_current_output_control(
+        generation,
+        |generation| ctx.session.borrow().accepts_event_generation(generation),
+        |generation| {
+            let _ = ctx.lastfm_playback.observe_discontinuity(generation);
+        },
+        || {
+            let output = ctx.active_output.borrow();
+            control(output.as_ref());
+        },
+    )
+}
+
 /// Try to play the track at `position` in the given model.
 ///
 /// Captures the visible sorted model as an immutable playback queue, then
 /// starts the selected item. Later view mutations do not alter that queue.
 pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     let source_key = ctx.active_source_key.borrow().clone();
-    let Some(captured) = capture_visible_queue(&ctx.model, &source_key, position) else {
+    let Some(captured) =
+        capture_visible_queue(&ctx.model, &source_key, position, &ctx.source_registry)
+    else {
         return false;
     };
     let selected = &captured.items[captured.selected_index];
@@ -1327,26 +1888,45 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     // A visible-track selection is a newer playback intent than any
     // OS-open admission still parsing in the background.
     super::open_files::invalidate_admission();
-    let previous = ctx.session.borrow().clone();
+    let previous = std::mem::take(&mut *ctx.session.borrow_mut());
     let previous_external = previous.current_external_source_id();
+    let predecessor_suspension = previous.accepted_lastfm_load.suspension();
+    // The replacement is fresh except for the monotonic event generation.
+    // Reusing `Default`'s zero here could let a delayed event from an old
+    // output collide after enough whole-session replacements.
+    {
+        let mut replacement = ctx.session.borrow_mut();
+        replacement.event_generation = previous.event_generation;
+        replacement.pending_lastfm_output_suspension = predecessor_suspension;
+    }
     if !ctx
         .session
         .borrow_mut()
         .replace_queue(captured.items, captured.selected_index)
     {
+        *ctx.session.borrow_mut() = previous;
         return false;
     }
 
-    if let Some(source_id) = previous_external {
-        let _ = ctx.source_registry.retire_external(source_id);
-    }
-
     if play_current(ctx) {
+        // `play_current` has already committed and published the replacement
+        // output intent, so registry retirement cannot race ahead of Last.fm
+        // predecessor retirement.
+        if let Some(source_id) = previous_external {
+            let _ = ctx.source_registry.retire_external(source_id);
+        }
         true
-    } else if previous_external.is_some() {
-        // The previous external capability was explicitly retired above and
-        // must never be restored as a retry target.
-        ctx.session.borrow_mut().clear();
+    } else if let Some(source_id) = previous_external {
+        // A previous external capability is never restored as a retry target.
+        // No replacement intent was emitted, so abandon playback explicitly
+        // before revoking its registry authority.
+        abandon_external_playback(
+            &ctx.session,
+            &ctx.lastfm_playback,
+            &ctx.active_output,
+            &ctx.source_registry,
+            source_id,
+        );
         false
     } else {
         *ctx.session.borrow_mut() = previous;
@@ -1370,10 +1950,7 @@ pub fn play_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
     // temporaries live through the selected arm, and StartAt mutably borrows
     // the same session while installing the newly captured queue.
     match resolve_session_play_request(&ctx.session, ctx.model.n_items(), shuffle) {
-        PlayRequest::Resume => {
-            ctx.active_output.borrow().play();
-            true
-        }
+        PlayRequest::Resume => control_current_output(ctx, |output| output.play()),
         PlayRequest::StartAt(_) => {
             let source_key = ctx.active_source_key.borrow().clone();
             let playable = playable_model_positions(&ctx.model, &source_key);
@@ -1399,8 +1976,11 @@ pub fn toggle_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
     } else if ctx.session.borrow().resolution_failed {
         play_current(ctx)
     } else if ctx.session.borrow().has_current() {
-        ctx.active_output.borrow().toggle_play_pause();
-        true
+        // The output abstraction does not expose a race-free prediction of
+        // which direction Toggle will take. Conservatively re-anchor both
+        // Pause and Resume before issuing the exact current-generation
+        // command.
+        control_current_output(ctx, |output| output.toggle_play_pause())
     } else {
         play_or_start(ctx, shuffle)
     }
@@ -1411,11 +1991,93 @@ pub fn toggle_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
 pub fn stop_playback(ctx: &PlaybackContext) {
     super::open_files::invalidate_admission();
     let external_source = ctx.session.borrow().current_external_source_id();
-    let output = ctx.active_output.borrow();
-    stop_owned_playback(&mut ctx.session.borrow_mut(), output.as_ref());
+    ctx.session.borrow_mut().clear();
+    let _ = ctx.lastfm_playback.retire(LastFmPlaybackRetirement::Stop);
+    ctx.active_output.borrow().stop();
     if let Some(source_id) = external_source {
         let _ = ctx.source_registry.retire_external(source_id);
     }
+}
+
+/// Terminally abandon an external occurrence in one fixed authority order.
+/// Each callback finishes before the next begins, keeping session and output
+/// borrows outside coordinator and registry ingress.
+fn apply_external_abandonment(
+    clear_session: impl FnOnce(),
+    retire_lastfm: impl FnOnce(),
+    stop_output: impl FnOnce(),
+    retire_source: impl FnOnce(),
+) {
+    clear_session();
+    retire_lastfm();
+    stop_output();
+    retire_source();
+}
+
+fn abandon_external_playback(
+    session: &Rc<RefCell<PlaybackSession>>,
+    lastfm_playback: &LastFmPlaybackCoordinatorBinding,
+    active_output: &Rc<RefCell<Box<dyn AudioOutput>>>,
+    source_registry: &SourceRegistry,
+    source_id: SourceId,
+) {
+    apply_external_abandonment(
+        || session.borrow_mut().clear(),
+        || {
+            let _ = lastfm_playback.retire(LastFmPlaybackRetirement::QueueAbandoned);
+        },
+        || active_output.borrow().stop(),
+        || {
+            let _ = source_registry.retire_external(source_id);
+        },
+    );
+}
+
+/// Commit one output attempt, release playback-session ownership, and only
+/// then notify the GTK-free coordinator. The caller may invoke an output after
+/// this returns without carrying a `RefCell` borrow into coordinator ingress.
+fn begin_pending_output(ctx: &PlaybackContext) -> PlayerEventGeneration {
+    let attempt = ctx.session.borrow_mut().begin_pending_resolution_attempt();
+    let generation = attempt.generation;
+    let _ = ctx.lastfm_playback.observe_output_intent(attempt.intent);
+    generation
+}
+
+/// Record one synchronous output result before asking the coordinator to
+/// consume it. Active coordination lazily freezes metadata; dormant or closed
+/// coordination consumes and revokes the exact proof without constructing it.
+fn finish_coordinated_output_load(
+    session: &Rc<RefCell<PlaybackSession>>,
+    lastfm_playback: &LastFmPlaybackCoordinatorBinding,
+    generation: PlayerEventGeneration,
+    accepted: bool,
+) -> bool {
+    if !session
+        .borrow_mut()
+        .finish_output_load(generation, accepted)
+    {
+        return false;
+    }
+    if !accepted {
+        return true;
+    }
+
+    let build_session = Rc::clone(session);
+    let discard_session = Rc::clone(session);
+    let _ = lastfm_playback.accept_output_load_lazy(
+        generation,
+        move || {
+            build_session
+                .borrow_mut()
+                .take_accepted_lastfm_output_load(generation)
+        },
+        move || {
+            let _ = discard_session
+                .borrow_mut()
+                .discard_accepted_lastfm_output_load(generation);
+        },
+    );
+    true
 }
 
 /// Load the current immutable queue item and refresh now-playing UI.
@@ -1433,8 +2095,8 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         // Stop and supersede the prior output before beginning the async DB
         // lookup. Stop, Next, Previous, and replay all advance the generation,
         // so a late result can never reach a receiver after ownership moves.
+        let generation = begin_pending_output(ctx);
         ctx.active_output.borrow().stop();
-        let generation = ctx.session.borrow_mut().begin_pending_resolution();
         ctx.active_output.borrow().set_event_generation(generation);
         update_now_playing_ui(ctx, &item, identity.as_ref(), None);
 
@@ -1461,6 +2123,7 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         let active_output = Rc::clone(&ctx.active_output);
         let media_ctrl = Rc::clone(&ctx.media_ctrl);
         let app_config = Rc::clone(&ctx.app_config);
+        let lastfm_playback = ctx.lastfm_playback.clone();
         let album_art = ctx.album_art.clone();
         glib::MainContext::default().spawn_local(async move {
             match resolved_rx.recv().await {
@@ -1471,14 +2134,22 @@ fn play_current(ctx: &PlaybackContext) -> bool {
                         let artwork_media = media.clone();
                         let accepted = active_output.borrow().load_local(media);
                         if !accepted {
-                            let marked = session.borrow_mut().mark_load_rejected(generation);
+                            let marked = finish_coordinated_output_load(
+                                &session,
+                                &lastfm_playback,
+                                generation,
+                                false,
+                            );
                             debug_assert!(marked, "current local load remains retryable");
                             album_art::invalidate();
                         } else {
-                            let marked = session
-                                .borrow_mut()
-                                .mark_history_load_accepted(generation);
-                            debug_assert!(marked, "accepted local load owns history delivery");
+                            let marked = finish_coordinated_output_load(
+                                &session,
+                                &lastfm_playback,
+                                generation,
+                                true,
+                            );
+                            debug_assert!(marked, "accepted local load owns playback delivery");
                             album_art::update_resolved_file_album_art(
                                 &album_art,
                                 artwork_media,
@@ -1522,8 +2193,8 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         // Retire the prior output/ticket before awaiting the source resolver.
         // The Stop captures the old event generation; the new generation below
         // therefore rejects any delayed terminal event it produces.
+        let generation = begin_pending_output(ctx);
         ctx.active_output.borrow().stop();
-        let generation = ctx.session.borrow_mut().begin_pending_resolution();
         ctx.active_output.borrow().set_event_generation(generation);
         update_now_playing_ui(ctx, &item, identity.as_ref(), None);
 
@@ -1536,6 +2207,7 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         let session = Rc::clone(&ctx.session);
         let active_output = Rc::clone(&ctx.active_output);
         let media_ctrl = Rc::clone(&ctx.media_ctrl);
+        let lastfm_playback = ctx.lastfm_playback.clone();
         let album_art = ctx.album_art.clone();
         let external_session = item.external_session;
         let regular_playlist_guard = item.regular_playlist_guard;
@@ -1567,9 +2239,12 @@ fn play_current(ctx: &PlaybackContext) -> bool {
                                         Ok(url) => active_output.borrow().load_uri(url.as_str()),
                                         Err(error) => {
                                             warn!(error = %error, "Public stream authority expired before output handoff");
-                                            let marked = session
-                                                .borrow_mut()
-                                                .mark_load_rejected(generation);
+                                            let marked = finish_coordinated_output_load(
+                                                &session,
+                                                &lastfm_playback,
+                                                generation,
+                                                false,
+                                            );
                                             debug_assert!(
                                                 marked,
                                                 "expired public load remains retryable"
@@ -1600,21 +2275,34 @@ fn play_current(ctx: &PlaybackContext) -> bool {
                         }
                     };
                     if accepted {
-                        let _ = session
-                            .borrow_mut()
-                            .mark_history_load_accepted(generation);
+                        let marked = finish_coordinated_output_load(
+                            &session,
+                            &lastfm_playback,
+                            generation,
+                            true,
+                        );
+                        debug_assert!(marked, "accepted resolved load owns playback delivery");
                     } else {
                         if external_session
                             && session.borrow().accepts_event_generation(generation)
                             && session.borrow().current_external_source_id() == Some(source_id)
                         {
                             super::open_files::invalidate_admission();
-                            session.borrow_mut().clear();
-                            let _ = source_registry.retire_external(source_id);
-                            active_output.borrow().stop();
+                            abandon_external_playback(
+                                &session,
+                                &lastfm_playback,
+                                &active_output,
+                                &source_registry,
+                                source_id,
+                            );
                             album_art::invalidate();
                         } else {
-                            let marked = session.borrow_mut().mark_load_rejected(generation);
+                            let marked = finish_coordinated_output_load(
+                                &session,
+                                &lastfm_playback,
+                                generation,
+                                false,
+                            );
                             debug_assert!(marked, "current resolved load remains retryable");
                         }
                         if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
@@ -1628,10 +2316,14 @@ fn play_current(ctx: &PlaybackContext) -> bool {
                         && session.borrow().current_external_source_id() == Some(source_id);
                     if owns_external {
                         super::open_files::invalidate_admission();
-                        session.borrow_mut().clear();
-                        let _ = source_registry.retire_external(source_id);
                         warn!(error = %error, "Could not resolve external media through its live source session");
-                        active_output.borrow().stop();
+                        abandon_external_playback(
+                            &session,
+                            &lastfm_playback,
+                            &active_output,
+                            &source_registry,
+                            source_id,
+                        );
                         album_art::invalidate();
                         if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
                             ctrl.update_playback(false);
@@ -1664,19 +2356,28 @@ fn play_current(ctx: &PlaybackContext) -> bool {
 
     tracing::debug!("Playing track");
 
-    let load = {
-        let output = ctx.active_output.borrow();
-        ctx.session
-            .borrow_mut()
-            .load_current_direct(output.as_ref())
-    };
-    let Some(load) = load else {
+    let prepared = { ctx.session.borrow_mut().prepare_current_direct_load() };
+    let Some(prepared) = prepared else {
         debug_assert!(false, "current direct queue item is loadable");
         return false;
     };
+    let PreparedDirectLoad {
+        uri,
+        generation,
+        intent,
+    } = prepared;
+    let _ = ctx.lastfm_playback.observe_output_intent(intent);
+    let accepted = {
+        let output = ctx.active_output.borrow();
+        output.set_event_generation(generation);
+        output.load_uri(&uri)
+    };
+    let marked =
+        finish_coordinated_output_load(&ctx.session, &ctx.lastfm_playback, generation, accepted);
+    debug_assert!(marked, "current direct load owns playback delivery state");
     tracing::debug!(
-        generation = ?load.generation,
-        accepted = load.accepted,
+        generation = ?generation,
+        accepted,
         "Direct queue item handed to output"
     );
     update_now_playing_ui(ctx, &item, identity.as_ref(), Some(&playback_uri));
@@ -1847,18 +2548,80 @@ fn navigate_and_play(
     navigate: impl FnOnce(&mut PlaybackSession) -> Option<usize>,
     play: impl FnOnce() -> bool,
 ) -> bool {
-    let previous = session.borrow().clone();
-    let selected = {
+    // Queue and shuffle data remain available to navigation. Only the
+    // authority-bearing occurrence state is moved out, while inexpensive
+    // positional state is copied/cloned for a possible pre-handoff rollback.
+    let (
+        previous_index,
+        previous_shuffle,
+        previous_pending_resolution,
+        previous_resolution_failed,
+        previous_history_occurrence,
+        previous_lastfm_candidate,
+        mut previous_accepted_lastfm_load,
+        previous_generation,
+        selected,
+    ) = {
         let mut session = session.borrow_mut();
-        navigate(&mut session)
+        let previous_index = session.current_index;
+        let previous_shuffle = session.shuffle.clone();
+        let previous_pending_resolution = session.pending_resolution;
+        let previous_resolution_failed = session.resolution_failed;
+        let previous_history_occurrence = session.history_occurrence.take();
+        let previous_lastfm_candidate = session.lastfm_occurrence_candidate.take();
+        let predecessor_suspension = session.accepted_lastfm_load.suspension();
+        let previous_accepted_lastfm_load = std::mem::take(&mut session.accepted_lastfm_load);
+        session.pending_lastfm_output_suspension = predecessor_suspension;
+        let previous_generation = session.event_generation;
+        let selected = navigate(&mut session);
+        (
+            previous_index,
+            previous_shuffle,
+            previous_pending_resolution,
+            previous_resolution_failed,
+            previous_history_occurrence,
+            previous_lastfm_candidate,
+            previous_accepted_lastfm_load,
+            previous_generation,
+            selected,
+        )
     };
     if selected.is_none() {
+        let mut session = session.borrow_mut();
+        session.pending_lastfm_output_suspension = None;
+        session.history_occurrence = previous_history_occurrence;
+        session.lastfm_occurrence_candidate = previous_lastfm_candidate;
+        session.accepted_lastfm_load = previous_accepted_lastfm_load;
         return false;
     }
     if play() {
+        // The new output handoff committed, so an already-extracted proof for
+        // the predecessor must become inert before this retained clone is
+        // dropped. Pre-handoff rollback deliberately restores it unchanged.
+        session.borrow_mut().pending_lastfm_output_suspension = None;
+        previous_accepted_lastfm_load.revoke();
         true
     } else {
-        *session.borrow_mut() = previous;
+        let mut session = session.borrow_mut();
+        if session.event_generation != previous_generation {
+            // A callback that advanced output ownership cannot roll the old
+            // occurrence back, even if it incorrectly reports failure. Revoke
+            // its delayed proof before the debug assertion can unwind.
+            previous_accepted_lastfm_load.revoke();
+            debug_assert!(
+                false,
+                "a failed navigation handoff must not advance output ownership"
+            );
+            return false;
+        }
+        session.current_index = previous_index;
+        session.shuffle = previous_shuffle;
+        session.pending_resolution = previous_pending_resolution;
+        session.resolution_failed = previous_resolution_failed;
+        session.history_occurrence = previous_history_occurrence;
+        session.lastfm_occurrence_candidate = previous_lastfm_candidate;
+        session.pending_lastfm_output_suspension = None;
+        session.accepted_lastfm_load = previous_accepted_lastfm_load;
         false
     }
 }
@@ -1911,6 +2674,7 @@ pub fn previous_or_restart_from_user(
                 .session
                 .borrow_mut()
                 .observe_history_seek(event_generation, position_ms, 0);
+            let _ = ctx.lastfm_playback.observe_discontinuity(event_generation);
             ctx.active_output.borrow().seek_to(0);
         },
     );
@@ -1929,20 +2693,46 @@ fn replay_current_occurrence(
     // generation. Snapshot just the tentative occurrence so a pre-handoff
     // failure can restore its predecessor without cloning or rolling back the
     // queue, shuffle traversal, resolution state, or event ownership.
-    let (previous_occurrence, previous_generation) = {
+    let (
+        previous_history_occurrence,
+        previous_lastfm_candidate,
+        mut previous_accepted_lastfm_load,
+        previous_generation,
+    ) = {
         let mut session = session.borrow_mut();
-        let previous = session.history_occurrence.clone();
+        let history_occurrence = session.history_occurrence.take();
+        let lastfm_candidate = session.lastfm_occurrence_candidate.take();
+        let predecessor_suspension = session.accepted_lastfm_load.suspension();
+        let accepted_lastfm_load = std::mem::take(&mut session.accepted_lastfm_load);
+        session.pending_lastfm_output_suspension = predecessor_suspension;
         let generation = session.event_generation;
         session.begin_repeat_one_occurrence();
-        (previous, generation)
+        (
+            history_occurrence,
+            lastfm_candidate,
+            accepted_lastfm_load,
+            generation,
+        )
     };
     if play() {
+        // Repeat One is a new genuine occurrence even when the media identity
+        // is unchanged. Revoke any delayed accepted-load proof belonging to
+        // the predecessor once the replay handoff commits.
+        session.borrow_mut().pending_lastfm_output_suspension = None;
+        previous_accepted_lastfm_load.revoke();
         true
     } else {
         let mut session = session.borrow_mut();
         if session.event_generation == previous_generation {
-            session.history_occurrence = previous_occurrence;
+            session.pending_lastfm_output_suspension = None;
+            session.history_occurrence = previous_history_occurrence;
+            session.lastfm_occurrence_candidate = previous_lastfm_candidate;
+            session.accepted_lastfm_load = previous_accepted_lastfm_load;
         } else {
+            // Generation advancement committed output ownership even though
+            // the callback reported failure. The predecessor cannot safely be
+            // restored, so make every extracted clone inert before asserting.
+            previous_accepted_lastfm_load.revoke();
             debug_assert!(
                 false,
                 "a failed repeat-one handoff must not advance output ownership"
@@ -1970,13 +2760,23 @@ pub fn play_external_session(
     if !ctx.session.borrow_mut().replace_queue(vec![item], 0) {
         return false;
     }
+    if !play_current(ctx) {
+        abandon_external_playback(
+            &ctx.session,
+            &ctx.lastfm_playback,
+            &ctx.active_output,
+            &ctx.source_registry,
+            external.source_id(),
+        );
+        if previous_external != Some(external.source_id()) {
+            if let Some(source_id) = previous_external {
+                let _ = ctx.source_registry.retire_external(source_id);
+            }
+        }
+        return false;
+    }
     if let Some(source_id) = previous_external {
         let _ = ctx.source_registry.retire_external(source_id);
-    }
-    if !play_current(ctx) {
-        ctx.session.borrow_mut().clear();
-        let _ = ctx.source_registry.retire_external(external.source_id());
-        return false;
     }
     tracing::info!("OS-opened external playback started");
     true
@@ -2012,7 +2812,77 @@ mod tests {
     struct RecordingOutput {
         state: Rc<RefCell<RecordingOutputState>>,
         reject_loads: Cell<usize>,
+        session_borrow_probe: Option<std::rc::Weak<RefCell<PlaybackSession>>>,
         volume: f64,
+    }
+
+    struct PlaybackRegistryFixture {
+        runtime: tokio::runtime::Runtime,
+        registry: SourceRegistry,
+    }
+
+    impl PlaybackRegistryFixture {
+        fn new() -> Self {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let registry = SourceRegistry::new(runtime.handle().clone());
+            Self { runtime, registry }
+        }
+
+        fn capture(
+            &self,
+            model: &impl IsA<gtk::gio::ListModel>,
+            source_key: &str,
+            selected_position: u32,
+        ) -> Option<CapturedQueue> {
+            capture_visible_queue(model, source_key, selected_position, &self.registry)
+        }
+
+        fn wait_for_catalogue(
+            &self,
+            source_id: SourceId,
+        ) -> (u64, Vec<crate::architecture::models::Track>) {
+            self.runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if let Some(snapshot) = self.registry.snapshot(source_id) {
+                            if snapshot.state == crate::source_lifecycle::SourceState::Ready {
+                                let session_epoch = snapshot
+                                    .session_epoch
+                                    .expect("ready source owns a session epoch");
+                                let tracks = snapshot
+                                    .catalogue
+                                    .expect("ready source publishes a catalogue")
+                                    .value
+                                    .tracks()
+                                    .to_vec();
+                                return (session_epoch, tracks);
+                            }
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("source catalogue becomes ready")
+            })
+        }
+
+        fn disconnect(&self, source_id: SourceId) {
+            let waiter = self
+                .registry
+                .disconnect(source_id)
+                .expect("live source begins retirement");
+            self.runtime.block_on(waiter.wait());
+        }
+    }
+
+    impl Drop for PlaybackRegistryFixture {
+        fn drop(&mut self) {
+            let barrier = self.registry.shutdown();
+            self.runtime.block_on(barrier.wait());
+        }
     }
 
     impl RecordingOutput {
@@ -2022,6 +2892,7 @@ mod tests {
                 Self {
                     state: Rc::clone(&state),
                     reject_loads: Cell::new(reject_loads),
+                    session_borrow_probe: None,
                     volume: 0.5,
                 },
                 state,
@@ -2043,6 +2914,16 @@ mod tests {
         }
 
         fn load_uri(&self, uri: &str) -> bool {
+            if let Some(session) = self
+                .session_borrow_probe
+                .as_ref()
+                .and_then(std::rc::Weak::upgrade)
+            {
+                assert!(
+                    session.try_borrow_mut().is_ok(),
+                    "output callbacks must run after the playback-session borrow is released"
+                );
+            }
             self.state.borrow_mut().loads.push(uri.to_string());
             let remaining = self.reject_loads.get();
             if remaining == 0 {
@@ -2108,7 +2989,10 @@ mod tests {
             source_session_epoch: None,
             regular_playlist_guard: None,
             external_session: false,
+            lastfm_source: None,
+            lastfm_profile: None,
             duration_ms: None,
+            duration_secs: None,
             uri: if is_library_source(view.source_id) {
                 String::new()
             } else {
@@ -2117,6 +3001,8 @@ mod tests {
             title: id.to_string(),
             artist: "Artist".to_string(),
             album: "Album".to_string(),
+            album_artist: None,
+            track_number: None,
             cover_art_url: String::new(),
         }
     }
@@ -2125,6 +3011,61 @@ mod tests {
         let mut item = item(source, id);
         item.duration_ms = duration_ms.filter(|duration_ms| *duration_ms > 0);
         item
+    }
+
+    fn authoritative_lastfm_item(source: &str, id: &str) -> QueueItem {
+        let mut item = item(source, id);
+        item.lastfm_source = LastFmPlaybackSource::local(item.identity.media_key.clone());
+        sync_test_lastfm_profile(&mut item);
+        item
+    }
+
+    fn sync_test_lastfm_profile(item: &mut QueueItem) {
+        item.lastfm_profile = Some(PlaybackAttributionProfile::for_test(
+            item.title.clone(),
+            item.artist.clone(),
+            (!item.album.is_empty()).then_some(item.album.as_str()),
+            item.album_artist.as_deref(),
+            item.track_number,
+            item.duration_secs,
+        ));
+    }
+
+    fn assert_newer_lastfm_load_survives_stale_predecessor(
+        newer: LastFmAcceptedOutputLoad,
+        newer_generation: PlayerEventGeneration,
+        delayed_predecessor: LastFmAcceptedOutputLoad,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let registry = crate::source_registry::SourceRegistry::new(runtime.handle().clone());
+        let enabled_remote_sources = HashSet::new();
+        let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
+
+        assert!(owner
+            .accept_output_load(newer, &registry, &enabled_remote_sources)
+            .admitted());
+        let stale =
+            owner.accept_output_load(delayed_predecessor, &registry, &enabled_remote_sources);
+        assert!(stale.stale());
+        let (handoff, error) = stale.into_update().into_parts();
+        assert!(handoff.is_none());
+        assert!(error.is_none());
+
+        let (handoff, error) = owner
+            .observe_event(&PlayerEvent::state(newer_generation, PlayerState::Playing))
+            .into_parts();
+        assert!(error.is_none());
+        assert_eq!(
+            handoff.as_ref().map(|handoff| handoff.kind()),
+            Some(crate::lastfm::playback_owner::LastFmPlaybackHandoffKind::NowPlaying),
+            "the delayed predecessor cannot retire the committed successor"
+        );
+
+        drop(owner);
+        runtime.block_on(registry.shutdown().wait());
     }
 
     fn accept_history_load(session: &mut PlaybackSession) -> PlayerEventGeneration {
@@ -2168,6 +3109,78 @@ mod tests {
         projected_row(id, &format!("file:///music/{id}.flac"))
     }
 
+    fn write_lastfm_flac(path: &std::path::Path, title: Option<&str>, artist: Option<&str>) {
+        let mut fixture = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/audio/silence.flac"
+        ))
+        .to_vec();
+        assert_eq!(&fixture[..4], b"fLaC");
+        // Raise the shared 100 ms fixture's declared duration above Last.fm's
+        // strict 30-second boundary without adding another binary fixture.
+        let packed = u64::from_be_bytes(
+            fixture[18..26]
+                .try_into()
+                .expect("FLAC STREAMINFO sample word"),
+        );
+        let sample_rate = (packed >> 44) & 0x0f_ffff;
+        assert!(sample_rate > 0);
+        let total_samples = sample_rate * 31;
+        assert!(total_samples < (1_u64 << 36));
+        let declared = (packed & !((1_u64 << 36) - 1)) | total_samples;
+        fixture[18..26].copy_from_slice(&declared.to_be_bytes());
+        std::fs::write(path, fixture).expect("copy FLAC fixture");
+        crate::local::tag_writer::write_tags(
+            path,
+            &crate::local::tag_writer::TagEdits {
+                // Explicit empty edits prove tag absence rather than relying
+                // on the shared fixture's current metadata.
+                title: Some(title.unwrap_or_default().to_string()),
+                artist: Some(artist.unwrap_or_default().to_string()),
+                album: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .expect("write exact removable fixture tags");
+    }
+
+    fn managed_row(
+        track: &crate::architecture::models::Track,
+        source_id: SourceId,
+        session_epoch: Option<u64>,
+        display_title: &str,
+        display_artist: &str,
+    ) -> TrackObject {
+        let row = TrackObject::new(
+            track.track_number.unwrap_or(0),
+            display_title,
+            track.duration_secs.unwrap_or(0),
+            display_artist,
+            &track.album_title,
+            track.genre.as_deref().unwrap_or("Unknown"),
+            track.composer.as_deref().unwrap_or(""),
+            track.year.unwrap_or(0),
+            "",
+            track.bitrate_kbps.unwrap_or(0),
+            track.sample_rate_hz.unwrap_or(0),
+            track.play_count.unwrap_or(0),
+            track.format.as_deref().unwrap_or(""),
+            "",
+        );
+        row.set_track_id(
+            track
+                .native_track_id
+                .as_ref()
+                .expect("managed track has an exact native identity")
+                .as_str(),
+        );
+        assert!(row.set_source_id(source_id));
+        if let Some(session_epoch) = session_epoch {
+            row.set_source_session_epoch(session_epoch);
+        }
+        row
+    }
+
     fn ids(session: &PlaybackSession) -> Vec<String> {
         session
             .queue
@@ -2208,7 +3221,7 @@ mod tests {
             row.source_id().unwrap_or(view.source_id),
             TrackId::new(row.track_id()).expect("test track identity"),
         );
-        QueueItem::from_track(identity, row, occurrence, None)
+        QueueItem::from_track(identity, row, occurrence, None, None)
     }
 
     fn refreshed_metadata() -> QueueTrackRefresh {
@@ -2216,6 +3229,9 @@ mod tests {
             title: "Title".to_string(),
             artist: "Artist".to_string(),
             album: "Album".to_string(),
+            album_artist: Some("Album Artist".to_string()),
+            track_number: Some(7),
+            duration_secs: Some(181),
             cover_art_url: String::new(),
         }
     }
@@ -2243,6 +3259,12 @@ mod tests {
 
         assert!(session.queue.iter().all(|item| item.uri.is_empty()));
         assert_eq!(session.queue[1].title, "Title");
+        assert_eq!(
+            session.queue[1].album_artist.as_deref(),
+            Some("Album Artist")
+        );
+        assert_eq!(session.queue[1].track_number, Some(7));
+        assert_eq!(session.queue[1].duration_secs, Some(181));
         assert_eq!(
             ids(&session),
             ["a", "b", "c"],
@@ -2321,6 +3343,7 @@ mod tests {
     #[test]
     fn local_and_playlist_queue_capture_discards_the_row_locator() {
         let local = projected_row("legacy:local-id", "file:///music/captured.flac");
+        local.set_album_artist("Exact Album Artist");
         let playlist = projected_row("legacy:local-id", "file:///music/captured.flac");
         let remote = projected_row("remote-id", "https://media.invalid/stream");
 
@@ -2345,8 +3368,52 @@ mod tests {
             Some(ViewOrigin::Playlist("favourites".to_string()))
         );
         assert!(local_item.uri.is_empty());
+        assert_eq!(
+            local_item.album_artist.as_deref(),
+            Some("Exact Album Artist")
+        );
+        assert_eq!(local_item.track_number, Some(1));
+        assert_eq!(local_item.duration_secs, Some(60));
         assert!(playlist_item.uri.is_empty());
         assert_eq!(remote_item.uri, "https://media.invalid/stream");
+    }
+
+    #[test]
+    fn production_track_object_keeps_display_metadata_but_has_no_lastfm_candidate_without_provenance(
+    ) {
+        let row = projected_row(
+            "structured-looking",
+            "file:///music/structured-looking.flac",
+        );
+        row.set_album_artist("Displayed Album Artist");
+        let captured = item_from_row("local", &row, 0);
+        assert_eq!(captured.title, "Title");
+        assert_eq!(captured.artist, "Artist");
+        assert_eq!(captured.album, "Album");
+        assert_eq!(
+            captured.album_artist.as_deref(),
+            Some("Displayed Album Artist")
+        );
+        assert_eq!(captured.duration_secs, Some(60));
+        assert!(captured.lastfm_source.is_none());
+        assert!(captured.lastfm_profile.is_none());
+
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![captured], 0));
+        assert!(session.lastfm_occurrence_candidate.is_none());
+        let generation = session.begin_event_generation();
+        assert!(session.mark_load_accepted(generation));
+        let ineligible = session
+            .take_accepted_lastfm_output_load(generation)
+            .expect("every exact accepted output load reaches the owner boundary");
+        assert_eq!(
+            format!("{ineligible:?}"),
+            "LastFmAcceptedOutputLoad::Ineligible"
+        );
+        assert!(session.accepted_lastfm_load.is_consumed());
+        assert!(session
+            .take_accepted_lastfm_output_load(generation)
+            .is_none());
     }
 
     #[test]
@@ -2496,12 +3563,15 @@ mod tests {
 
     #[test]
     fn production_snapshot_survives_sort_filter_navigation_and_owns_output_events() {
+        let registry = PlaybackRegistryFixture::new();
         let source_key = "fixture-device-a";
         let store = gtk::gio::ListStore::new::<TrackObject>();
         for id in ["a", "b", "c"] {
             store.append(&playback_row(id));
         }
-        let captured = capture_visible_queue(&store, source_key, 1).expect("visible B is captured");
+        let captured = registry
+            .capture(&store, source_key, 1)
+            .expect("visible B is captured");
         assert_eq!(
             captured
                 .items
@@ -2562,8 +3632,9 @@ mod tests {
         // not install a queue until the user explicitly starts one there.
         store.remove_all();
         store.append(&playback_row("remote-x"));
-        let remote_projection =
-            capture_visible_queue(&store, "remote-server", 0).expect("remote view captures");
+        let remote_projection = registry
+            .capture(&store, "remote-server", 0)
+            .expect("remote view captures");
         assert_eq!(
             remote_projection.items[0].identity.media_key.source_id,
             SourceId::removable("remote-server").expect("replacement source ID")
@@ -2594,9 +3665,190 @@ mod tests {
     }
 
     #[test]
+    fn visible_queue_capture_freezes_only_registry_owned_removable_attribution() {
+        let registry = PlaybackRegistryFixture::new();
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let tagged_path = mount.path().join("eligible.flac");
+        let untagged_path = mount.path().join("untagged.flac");
+        write_lastfm_flac(
+            &tagged_path,
+            Some("Exact Tagged Title"),
+            Some("Exact Tagged Artist"),
+        );
+        write_lastfm_flac(&untagged_path, None, None);
+
+        let source_id =
+            SourceId::removable("playback:capture-attribution").expect("removable source identity");
+        let provenance = registry
+            .registry
+            .claim_provenance(
+                source_id,
+                crate::source_lifecycle::SourceProvenance::Removable,
+            )
+            .expect("claim removable provenance");
+        registry
+            .registry
+            .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+            .expect("removable connection admitted");
+        let (session_epoch, tracks) = registry.wait_for_catalogue(source_id);
+        assert_eq!(tracks.len(), 2);
+
+        let tagged_id =
+            TrackId::removable_relative(mount.path(), &tagged_path).expect("tagged track identity");
+        let untagged_id = TrackId::removable_relative(mount.path(), &untagged_path)
+            .expect("untagged track identity");
+        let tagged_track = tracks
+            .iter()
+            .find(|track| track.native_track_id.as_ref() == Some(&tagged_id))
+            .expect("tagged track published");
+        let untagged_track = tracks
+            .iter()
+            .find(|track| track.native_track_id.as_ref() == Some(&untagged_id))
+            .expect("untagged track published");
+
+        // The GTK projection is deliberately inconsistent with the parser's
+        // exact tags. Registry minting, not mutable display metadata, must
+        // decide the frozen Last.fm payload.
+        let tagged_row = managed_row(
+            tagged_track,
+            source_id,
+            Some(session_epoch),
+            "Changed Display Title",
+            "Changed Display Artist",
+        );
+        let untagged_row = managed_row(
+            untagged_track,
+            source_id,
+            Some(session_epoch),
+            "Convincing Display Title",
+            "Convincing Display Artist",
+        );
+        let store = gtk::gio::ListStore::new::<TrackObject>();
+        store.append(&tagged_row);
+        store.append(&untagged_row);
+
+        let captured = registry
+            .capture(&store, &source_id.to_string(), 0)
+            .expect("live removable projection captures");
+        let tagged_item = captured
+            .items
+            .iter()
+            .find(|item| item.identity.media_key.track_id == tagged_id)
+            .expect("tagged queue item");
+        assert_eq!(tagged_item.title, "Changed Display Title");
+        assert_eq!(tagged_item.artist, "Changed Display Artist");
+        let tagged_profile = tagged_item
+            .lastfm_profile
+            .as_ref()
+            .expect("registry-minted removable profile");
+        assert_eq!(tagged_profile.title(), "Exact Tagged Title");
+        assert_eq!(tagged_profile.artist(), "Exact Tagged Artist");
+        assert_eq!(tagged_profile.album(), None);
+        assert_eq!(tagged_profile.duration_secs(), Some(31));
+        let frozen_candidate = tagged_item
+            .lastfm_occurrence_candidate()
+            .expect("exact tagged profile creates one occurrence candidate");
+        assert_eq!(frozen_candidate.title, "Exact Tagged Title");
+        assert_eq!(frozen_candidate.artist, "Exact Tagged Artist");
+        assert_eq!(frozen_candidate.album, None);
+
+        let untagged_item = captured
+            .items
+            .iter()
+            .find(|item| item.identity.media_key.track_id == untagged_id)
+            .expect("untagged queue item");
+        assert!(untagged_item.lastfm_source.is_none());
+        assert!(untagged_item.lastfm_profile.is_none());
+        assert!(untagged_item.lastfm_occurrence_candidate().is_none());
+
+        // A second registry, a stale epoch, a missing epoch, and a different
+        // source identity cannot turn the same convincing display row into
+        // attribution authority.
+        let foreign_registry = PlaybackRegistryFixture::new();
+        let foreign = foreign_registry
+            .capture(&store, &source_id.to_string(), 0)
+            .expect("foreign registry still captures a playable queue");
+        assert!(foreign
+            .items
+            .iter()
+            .all(|item| item.lastfm_source.is_none() && item.lastfm_profile.is_none()));
+
+        let stale_store = gtk::gio::ListStore::new::<TrackObject>();
+        stale_store.append(&managed_row(
+            tagged_track,
+            source_id,
+            session_epoch.checked_add(1),
+            "Exact Tagged Title",
+            "Exact Tagged Artist",
+        ));
+        let stale = registry
+            .capture(&stale_store, &source_id.to_string(), 0)
+            .expect("stale row remains a captured playback item");
+        assert!(stale.items[0].lastfm_source.is_none());
+
+        let missing_store = gtk::gio::ListStore::new::<TrackObject>();
+        missing_store.append(&managed_row(
+            tagged_track,
+            source_id,
+            None,
+            "Exact Tagged Title",
+            "Exact Tagged Artist",
+        ));
+        let missing = registry
+            .capture(&missing_store, &source_id.to_string(), 0)
+            .expect("epoch-less row remains a captured playback item");
+        assert!(missing.items[0].lastfm_source.is_none());
+
+        let remote_source = SourceId::random();
+        let remote_store = gtk::gio::ListStore::new::<TrackObject>();
+        remote_store.append(&managed_row(
+            tagged_track,
+            remote_source,
+            Some(session_epoch),
+            "Exact Tagged Title",
+            "Exact Tagged Artist",
+        ));
+        let remote = registry
+            .capture(&remote_store, &remote_source.to_string(), 0)
+            .expect("remote-shaped row remains playable");
+        assert!(remote.items[0].lastfm_source.is_none());
+
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![tagged_item.clone()], 0));
+        let generation = session.begin_event_generation();
+        assert!(session.mark_load_accepted(generation));
+        let accepted = session
+            .take_accepted_lastfm_output_load(generation)
+            .expect("live exact profile creates an accepted output proof");
+        assert_eq!(
+            format!("{accepted:?}"),
+            "LastFmAcceptedOutputLoad::Eligible(<redacted>)"
+        );
+
+        registry.disconnect(source_id);
+        let retired = registry
+            .capture(&store, &source_id.to_string(), 0)
+            .expect("retired rows can still be copied as inert queue data");
+        assert!(retired
+            .items
+            .iter()
+            .all(|item| item.lastfm_source.is_none() && item.lastfm_profile.is_none()));
+        assert_eq!(
+            frozen_candidate.title, "Exact Tagged Title",
+            "the already-captured metadata snapshot remains immutable"
+        );
+        let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
+        let rejected = owner.accept_output_load(accepted, &registry.registry, &HashSet::new());
+        assert!(!rejected.admitted());
+        assert!(!rejected.stale());
+        assert!(registry.registry.release_provenance(source_id, provenance));
+    }
+
+    #[test]
     fn regular_playlist_capture_skips_unavailable_rows_without_losing_duplicate_occurrences() {
         use crate::ui::objects::{PlaylistOccurrenceBinding, PlaylistRowUnavailableReason};
 
+        let registry = PlaybackRegistryFixture::new();
         let playlist_key = "playlist:mixed";
         let stable_id = TrackId::new("same-local-track").expect("local track ID");
         let first = projected_row(stable_id.as_str(), "file:///music/same.flac");
@@ -2627,11 +3879,12 @@ mod tests {
 
         assert_eq!(playable_model_positions(&store, playlist_key), [0, 2]);
         assert!(
-            capture_visible_queue(&store, playlist_key, 1).is_none(),
+            registry.capture(&store, playlist_key, 1).is_none(),
             "activating an unavailable row must not install a replacement queue"
         );
-        let captured =
-            capture_visible_queue(&store, playlist_key, 2).expect("duplicate is playable");
+        let captured = registry
+            .capture(&store, playlist_key, 2)
+            .expect("duplicate is playable");
         assert_eq!(captured.selected_index, 1);
         assert_eq!(captured.items.len(), 2);
         assert_eq!(
@@ -2655,6 +3908,7 @@ mod tests {
         use crate::source_registry::{RegularPlaylistTrack, RegularPlaylistTrackResolution};
         use crate::ui::playlist_projection::project_playlist_rows;
 
+        let registry = PlaybackRegistryFixture::new();
         let source_id = SourceId::random();
         let track_id = TrackId::remote("remote/native-id").expect("remote track ID");
         let media_key = MediaKey::new(source_id, track_id.clone());
@@ -2737,7 +3991,8 @@ mod tests {
         for row in &rows {
             store.append(row);
         }
-        let captured = capture_visible_queue(&store, "playlist:mixed", 1)
+        let captured = registry
+            .capture(&store, "playlist:mixed", 1)
             .expect("duplicate remote occurrence is playable");
         assert_eq!(captured.selected_index, 1);
         assert_eq!(captured.items.len(), 2);
@@ -2757,6 +4012,8 @@ mod tests {
             assert_eq!(guard.catalogue_generation(), 29);
             assert!(item.uri().is_empty());
             assert!(item.cover_art_url.is_empty());
+            assert!(item.lastfm_source.is_none());
+            assert!(item.lastfm_profile.is_none());
         }
     }
 
@@ -3067,15 +4324,21 @@ mod tests {
         let mut original = PlaybackSession::default();
         assert!(original.replace_queue(
             vec![
-                item("source", "a"),
-                item("source", "b"),
-                item("source", "c"),
-                item("source", "d"),
+                authoritative_lastfm_item("local", "a"),
+                authoritative_lastfm_item("local", "b"),
+                authoritative_lastfm_item("local", "c"),
+                authoritative_lastfm_item("local", "d"),
             ],
             0,
         ));
         assert!(original.advance(RepeatMode::Off, true).is_some());
         assert!(original.advance(RepeatMode::Off, true).is_some());
+        let current = original.current_index.expect("current shuffled item");
+        original.queue[current].duration_secs = Some(181);
+        sync_test_lastfm_profile(&mut original.queue[current]);
+        original.begin_history_occurrence_for_current();
+        let accepted_generation = original.begin_event_generation();
+        assert!(original.mark_load_accepted(accepted_generation));
         let expected_index = original.current_index;
         let expected_shuffle = original.shuffle.clone();
         let session = RefCell::new(original);
@@ -3095,6 +4358,10 @@ mod tests {
         ));
         assert_eq!(session.borrow().current_index, expected_index);
         assert_eq!(session.borrow().shuffle, expected_shuffle);
+        assert!(session
+            .borrow_mut()
+            .take_accepted_lastfm_output_load(accepted_generation)
+            .is_some());
 
         // Once an output handoff is initiated, the selected occurrence is a
         // committed retry target; synchronous output rejection is handled by
@@ -3105,6 +4372,179 @@ mod tests {
             || true,
         ));
         assert_ne!(session.borrow().current_index, expected_index);
+    }
+
+    #[test]
+    fn unavailable_navigation_restores_the_move_only_accepted_handoff() {
+        let mut item = authoritative_lastfm_item("local", "boundary");
+        item.duration_secs = Some(181);
+        sync_test_lastfm_profile(&mut item);
+        let mut playback = PlaybackSession::default();
+        assert!(playback.replace_queue(vec![item], 0));
+        let generation = playback.begin_event_generation();
+        assert!(playback.mark_load_accepted(generation));
+        let session = RefCell::new(playback);
+
+        assert!(!navigate_and_play(
+            &session,
+            |session| session.previous(RepeatMode::Off, false),
+            || panic!("an unavailable selection cannot reach playback"),
+        ));
+        assert!(session
+            .borrow_mut()
+            .take_accepted_lastfm_output_load(generation)
+            .is_some());
+    }
+
+    #[test]
+    fn committed_navigation_revokes_an_extracted_predecessor_load() {
+        let mut predecessor = authoritative_lastfm_item("local", "navigation-predecessor");
+        predecessor.duration_secs = Some(181);
+        sync_test_lastfm_profile(&mut predecessor);
+        let mut successor = authoritative_lastfm_item("local", "navigation-successor");
+        successor.duration_secs = Some(181);
+        sync_test_lastfm_profile(&mut successor);
+
+        let mut playback = PlaybackSession::default();
+        assert!(playback.replace_queue(vec![predecessor, successor], 0));
+        let predecessor_generation = playback.begin_event_generation();
+        assert!(playback.mark_load_accepted(predecessor_generation));
+        let delayed_predecessor = playback
+            .take_accepted_lastfm_output_load(predecessor_generation)
+            .expect("predecessor proof extracted before navigation");
+        let session = RefCell::new(playback);
+
+        assert!(navigate_and_play(
+            &session,
+            |session| session.advance(RepeatMode::Off, false),
+            || {
+                let mut session = session.borrow_mut();
+                let generation = session.begin_event_generation();
+                assert!(session.mark_load_accepted(generation));
+                true
+            },
+        ));
+        let successor_generation = session.borrow().current_event_generation();
+        let newer = session
+            .borrow_mut()
+            .take_accepted_lastfm_output_load(successor_generation)
+            .expect("committed navigation owns the successor proof");
+
+        assert_newer_lastfm_load_survives_stale_predecessor(
+            newer,
+            successor_generation,
+            delayed_predecessor,
+        );
+    }
+
+    #[test]
+    fn committed_repeat_one_replay_revokes_an_extracted_predecessor_load() {
+        let mut item = authoritative_lastfm_item("local", "repeat-one-predecessor");
+        item.duration_secs = Some(181);
+        sync_test_lastfm_profile(&mut item);
+
+        let mut playback = PlaybackSession::default();
+        assert!(playback.replace_queue(vec![item], 0));
+        let predecessor_generation = playback.begin_event_generation();
+        assert!(playback.mark_load_accepted(predecessor_generation));
+        let delayed_predecessor = playback
+            .take_accepted_lastfm_output_load(predecessor_generation)
+            .expect("predecessor proof extracted before repeat-one replay");
+        let session = RefCell::new(playback);
+
+        assert!(replay_current_occurrence(&session, || {
+            let mut session = session.borrow_mut();
+            let generation = session.begin_event_generation();
+            assert!(session.mark_load_accepted(generation));
+            true
+        }));
+        let successor_generation = session.borrow().current_event_generation();
+        let newer = session
+            .borrow_mut()
+            .take_accepted_lastfm_output_load(successor_generation)
+            .expect("committed repeat-one replay owns the successor proof");
+
+        assert_newer_lastfm_load_survives_stale_predecessor(
+            newer,
+            successor_generation,
+            delayed_predecessor,
+        );
+    }
+
+    #[test]
+    fn generation_changed_failed_navigation_and_replay_revoke_extracted_predecessors() {
+        let mut navigation_predecessor =
+            authoritative_lastfm_item("local", "failed-navigation-predecessor");
+        navigation_predecessor.duration_secs = Some(181);
+        sync_test_lastfm_profile(&mut navigation_predecessor);
+        let mut navigation_successor =
+            authoritative_lastfm_item("local", "failed-navigation-successor");
+        navigation_successor.duration_secs = Some(181);
+        sync_test_lastfm_profile(&mut navigation_successor);
+        let mut navigation = PlaybackSession::default();
+        assert!(navigation.replace_queue(vec![navigation_predecessor, navigation_successor], 0,));
+        let navigation_generation = navigation.begin_event_generation();
+        assert!(navigation.mark_load_accepted(navigation_generation));
+        let delayed_navigation = navigation
+            .take_accepted_lastfm_output_load(navigation_generation)
+            .expect("navigation predecessor proof");
+        let navigation = RefCell::new(navigation);
+
+        let navigation_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            navigate_and_play(
+                &navigation,
+                |session| session.advance(RepeatMode::Off, false),
+                || {
+                    navigation.borrow_mut().begin_event_generation();
+                    false
+                },
+            )
+        }));
+        if cfg!(debug_assertions) {
+            assert!(navigation_result.is_err());
+        } else {
+            assert!(matches!(navigation_result, Ok(false)));
+        }
+
+        let mut replay_item = authoritative_lastfm_item("local", "failed-repeat-one-predecessor");
+        replay_item.duration_secs = Some(181);
+        sync_test_lastfm_profile(&mut replay_item);
+        let mut replay = PlaybackSession::default();
+        assert!(replay.replace_queue(vec![replay_item], 0));
+        let replay_generation = replay.begin_event_generation();
+        assert!(replay.mark_load_accepted(replay_generation));
+        let delayed_replay = replay
+            .take_accepted_lastfm_output_load(replay_generation)
+            .expect("repeat-one predecessor proof");
+        let replay = RefCell::new(replay);
+
+        let replay_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            replay_current_occurrence(&replay, || {
+                replay.borrow_mut().begin_event_generation();
+                false
+            })
+        }));
+        if cfg!(debug_assertions) {
+            assert!(replay_result.is_err());
+        } else {
+            assert!(matches!(replay_result, Ok(false)));
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let registry = crate::source_registry::SourceRegistry::new(runtime.handle().clone());
+        let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
+        for delayed in [delayed_navigation, delayed_replay] {
+            let admission = owner.accept_output_load(delayed, &registry, &HashSet::new());
+            assert!(admission.stale());
+            let (handoff, error) = admission.into_update().into_parts();
+            assert!(handoff.is_none());
+            assert!(error.is_none());
+        }
+        drop(owner);
+        runtime.block_on(registry.shutdown().wait());
     }
 
     #[test]
@@ -3146,6 +4586,72 @@ mod tests {
         stop_owned_playback(&mut session, &output);
         assert!(session.shuffle.is_none(), "Stop resets history");
         assert_eq!(output_state.borrow().stops, 1);
+    }
+
+    #[test]
+    fn current_output_control_is_generation_gated_and_ordered_before_output() {
+        let mut playback = PlaybackSession::default();
+        assert!(playback.replace_queue(vec![item("source", "controlled")], 0));
+        let generation = playback.begin_event_generation();
+        let session = RefCell::new(playback);
+        let order = RefCell::new(Vec::new());
+
+        assert!(apply_current_output_control(
+            generation,
+            |candidate| {
+                order.borrow_mut().push("gate");
+                session.borrow().accepts_event_generation(candidate)
+            },
+            |candidate| {
+                assert_eq!(candidate, generation);
+                assert!(session.try_borrow_mut().is_ok());
+                order.borrow_mut().push("discontinuity");
+            },
+            || {
+                assert!(session.try_borrow_mut().is_ok());
+                order.borrow_mut().push("output");
+            },
+        ));
+        assert_eq!(*order.borrow(), ["gate", "discontinuity", "output"]);
+
+        order.borrow_mut().clear();
+        session.borrow_mut().clear();
+        assert!(!apply_current_output_control(
+            generation,
+            |candidate| {
+                order.borrow_mut().push("gate");
+                session.borrow().accepts_event_generation(candidate)
+            },
+            |_| order.borrow_mut().push("discontinuity"),
+            || order.borrow_mut().push("output"),
+        ));
+        assert_eq!(*order.borrow(), ["gate"]);
+    }
+
+    #[test]
+    fn toggle_directions_share_the_conservative_discontinuity_boundary() {
+        for direction in ["pause", "resume"] {
+            let order = RefCell::new(Vec::new());
+            assert!(apply_current_output_control(
+                PlayerEventGeneration::from_raw(51),
+                |_| true,
+                |_| order.borrow_mut().push("discontinuity"),
+                || order.borrow_mut().push(direction),
+            ));
+            assert_eq!(*order.borrow(), ["discontinuity", direction]);
+        }
+    }
+
+    #[test]
+    fn external_abandonment_retires_coordinator_and_output_before_source() {
+        let order = RefCell::new(Vec::new());
+        apply_external_abandonment(
+            || order.borrow_mut().push("session"),
+            || order.borrow_mut().push("lastfm"),
+            || order.borrow_mut().push("output"),
+            || order.borrow_mut().push("source"),
+        );
+        assert_eq!(*order.borrow(), ["session", "lastfm", "output", "source"]);
     }
 
     #[test]
@@ -3593,6 +5099,686 @@ mod tests {
     }
 
     #[test]
+    fn lastfm_snapshot_requires_output_acceptance_and_structured_eligible_source_metadata() {
+        let mut local_item = authoritative_lastfm_item("local", "structured-track");
+        local_item.album_artist = Some("Exact Album Artist".to_string());
+        local_item.track_number = Some(7);
+        local_item.duration_secs = Some(181);
+        sync_test_lastfm_profile(&mut local_item);
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![local_item], 0));
+
+        let generation = session.begin_event_generation();
+        assert!(session
+            .take_accepted_lastfm_output_load(generation)
+            .is_none());
+        assert!(session.mark_load_accepted(generation));
+        let accepted = session
+            .take_accepted_lastfm_output_load(generation)
+            .expect("accepted local source");
+        assert_eq!(
+            format!("{accepted:?}"),
+            "LastFmAcceptedOutputLoad::Eligible(<redacted>)"
+        );
+
+        let _ = session.observe_history_event(&PlayerEvent::error(generation, "private error"));
+        assert!(session
+            .take_accepted_lastfm_output_load(generation)
+            .is_none());
+
+        let (output, _) = RecordingOutput::new(0);
+        let mut radio = PlaybackSession::default();
+        assert!(radio.replace_queue(vec![item("radio-topvote", "station")], 0));
+        let direct = radio
+            .load_current_direct(&output)
+            .expect("direct radio load attempted");
+        assert!(direct.accepted);
+        let ineligible = radio
+            .take_accepted_lastfm_output_load(direct.generation)
+            .expect("an accepted radio load explicitly retires eligible predecessors");
+        assert_eq!(
+            format!("{ineligible:?}"),
+            "LastFmAcceptedOutputLoad::Ineligible"
+        );
+    }
+
+    #[test]
+    fn accepted_lastfm_handoff_is_exact_one_shot_and_retry_generation_reopens_it() {
+        let mut item = authoritative_lastfm_item("local", "one-shot");
+        item.duration_secs = Some(181);
+        sync_test_lastfm_profile(&mut item);
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![item], 0));
+
+        let generation = session.begin_event_generation();
+        assert!(session.mark_load_accepted(generation));
+        assert!(session
+            .take_accepted_lastfm_output_load(generation.next())
+            .is_none());
+        assert_eq!(
+            session.accepted_lastfm_load.generation(),
+            Some(generation),
+            "a mismatched generation cannot consume current acceptance proof"
+        );
+        assert!(session
+            .take_accepted_lastfm_output_load(generation)
+            .is_some());
+        assert!(session.accepted_lastfm_load.is_consumed());
+        assert!(session
+            .take_accepted_lastfm_output_load(generation)
+            .is_none());
+
+        let retry_generation = session.begin_event_generation();
+        assert!(session.mark_load_accepted(retry_generation));
+        assert!(session
+            .take_accepted_lastfm_output_load(generation)
+            .is_none());
+        assert_eq!(
+            session.accepted_lastfm_load.generation(),
+            Some(retry_generation)
+        );
+        assert!(session
+            .take_accepted_lastfm_output_load(retry_generation)
+            .is_some());
+        assert!(session
+            .take_accepted_lastfm_output_load(retry_generation)
+            .is_none());
+    }
+
+    #[test]
+    fn metadata_free_discard_consumes_and_revokes_the_exact_accepted_proof() {
+        let mut item = authoritative_lastfm_item("local", "dormant-discard");
+        item.duration_secs = Some(181);
+        sync_test_lastfm_profile(&mut item);
+        let session = Rc::new(RefCell::new(PlaybackSession::default()));
+        assert!(session.borrow_mut().replace_queue(vec![item], 0));
+
+        let generation = session.borrow_mut().begin_event_generation();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let registry = SourceRegistry::new(runtime.handle().clone());
+        let mut coordinator =
+            crate::lastfm::playback_coordinator::LastFmPlaybackCoordinatorOwner::isolated_for_test(
+            );
+        let binding = coordinator
+            .bind_window(registry.clone())
+            .expect("bind dormant coordinator");
+
+        assert!(finish_coordinated_output_load(
+            &session, &binding, generation, true,
+        ));
+        assert!(session.borrow().accepted_lastfm_load.is_consumed());
+        assert!(session
+            .borrow_mut()
+            .take_accepted_lastfm_output_load(generation)
+            .is_none());
+        assert!(session.borrow_mut().mark_load_accepted(generation));
+        assert!(
+            session
+                .borrow_mut()
+                .take_accepted_lastfm_output_load(generation)
+                .is_none(),
+            "re-observing acceptance cannot reopen a discarded proof"
+        );
+        drop(binding);
+        drop(coordinator);
+        runtime.block_on(registry.shutdown().wait());
+    }
+
+    #[test]
+    fn direct_attempt_revokes_predecessor_before_reentrant_output_callback() {
+        let mut item = authoritative_lastfm_item("local", "ordered-direct-retry");
+        item.duration_secs = Some(181);
+        item.uri = "https://media.invalid/ordered-direct-retry".to_string();
+        sync_test_lastfm_profile(&mut item);
+        let session = Rc::new(RefCell::new(PlaybackSession::default()));
+        assert!(session.borrow_mut().replace_queue(vec![item], 0));
+        let predecessor_generation = session.borrow_mut().begin_event_generation();
+        assert!(session
+            .borrow_mut()
+            .mark_load_accepted(predecessor_generation));
+        let delayed_predecessor = session
+            .borrow_mut()
+            .take_accepted_lastfm_output_load(predecessor_generation)
+            .expect("extract predecessor before retry");
+
+        let prepared = session
+            .borrow_mut()
+            .prepare_current_direct_load()
+            .expect("prepare direct retry");
+        let PreparedDirectLoad {
+            uri,
+            generation,
+            intent,
+        } = prepared;
+        assert_eq!(format!("{intent:?}"), "LastFmOutputIntent(<redacted>)");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let registry = SourceRegistry::new(runtime.handle().clone());
+        let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
+        assert!(owner
+            .accept_output_load(delayed_predecessor, &registry, &HashSet::new())
+            .stale());
+
+        let (mut output, _) = RecordingOutput::new(1);
+        output.session_borrow_probe = Some(Rc::downgrade(&session));
+        output.set_event_generation(generation);
+        assert!(!output.load_uri(&uri));
+        assert!(session.borrow_mut().finish_output_load(generation, false));
+        assert!(session.borrow().resolution_failed);
+
+        runtime.block_on(registry.shutdown().wait());
+    }
+
+    #[test]
+    fn delayed_eligible_and_ineligible_loads_cannot_replace_newer_owner_state() {
+        fn eligible_item(track_id: &str) -> QueueItem {
+            let mut item = authoritative_lastfm_item("local", track_id);
+            item.duration_secs = Some(181);
+            sync_test_lastfm_profile(&mut item);
+            item
+        }
+
+        fn assert_newer_remains_active(
+            owner: &mut crate::lastfm::playback_owner::LastFmPlaybackOwner,
+            generation: PlayerEventGeneration,
+        ) {
+            let update = owner.observe_event(&PlayerEvent::state(generation, PlayerState::Playing));
+            let (handoff, error) = update.into_parts();
+            assert!(error.is_none());
+            assert_eq!(
+                handoff.as_ref().map(|handoff| handoff.kind()),
+                Some(crate::lastfm::playback_owner::LastFmPlaybackHandoffKind::NowPlaying),
+                "a stale accepted-load proof cannot retire or replace the newer occurrence"
+            );
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let registry = crate::source_registry::SourceRegistry::new(runtime.handle().clone());
+        let enabled_remote_sources = HashSet::new();
+
+        let mut eligible_session = PlaybackSession::default();
+        assert!(eligible_session.replace_queue(vec![eligible_item("older-eligible")], 0));
+        let older_generation = eligible_session.begin_event_generation();
+        assert!(eligible_session.mark_load_accepted(older_generation));
+        let older = eligible_session
+            .take_accepted_lastfm_output_load(older_generation)
+            .expect("older eligible accepted load");
+        assert!(eligible_session.replace_queue(vec![eligible_item("newer-eligible")], 0));
+        let newer_generation = eligible_session.begin_event_generation();
+        assert!(eligible_session.mark_load_accepted(newer_generation));
+        let newer = eligible_session
+            .take_accepted_lastfm_output_load(newer_generation)
+            .expect("newer eligible accepted load");
+
+        let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
+        assert!(owner
+            .accept_output_load(newer, &registry, &enabled_remote_sources)
+            .admitted());
+        let stale = owner.accept_output_load(older, &registry, &enabled_remote_sources);
+        assert!(matches!(
+            &stale,
+            crate::lastfm::playback_owner::LastFmPlaybackLoadAdmission::Stale(_)
+        ));
+        let (handoff, error) = stale.into_update().into_parts();
+        assert!(handoff.is_none());
+        assert!(error.is_none());
+        assert_newer_remains_active(&mut owner, newer_generation);
+
+        let mut ineligible_session = PlaybackSession::default();
+        assert!(ineligible_session.replace_queue(vec![item("radio-topvote", "station")], 0));
+        let older_generation = ineligible_session.begin_event_generation();
+        assert!(ineligible_session.mark_load_accepted(older_generation));
+        let older = ineligible_session
+            .take_accepted_lastfm_output_load(older_generation)
+            .expect("older ineligible accepted load");
+        assert!(ineligible_session.replace_queue(vec![eligible_item("newer-after-radio")], 0));
+        let newer_generation = ineligible_session.begin_event_generation();
+        assert!(ineligible_session.mark_load_accepted(newer_generation));
+        let newer = ineligible_session
+            .take_accepted_lastfm_output_load(newer_generation)
+            .expect("newer eligible accepted load");
+
+        let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
+        assert!(owner
+            .accept_output_load(newer, &registry, &enabled_remote_sources)
+            .admitted());
+        let stale = owner.accept_output_load(older, &registry, &enabled_remote_sources);
+        assert!(matches!(
+            &stale,
+            crate::lastfm::playback_owner::LastFmPlaybackLoadAdmission::Stale(_)
+        ));
+        let (handoff, error) = stale.into_update().into_parts();
+        assert!(handoff.is_none());
+        assert!(error.is_none());
+        assert_newer_remains_active(&mut owner, newer_generation);
+    }
+
+    #[test]
+    fn dropping_playback_session_revokes_an_extracted_accepted_load() {
+        let mut item = authoritative_lastfm_item("local", "dropped-session");
+        item.duration_secs = Some(181);
+        sync_test_lastfm_profile(&mut item);
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![item], 0));
+        let generation = session.begin_event_generation();
+        assert!(session.mark_load_accepted(generation));
+        let delayed = session
+            .take_accepted_lastfm_output_load(generation)
+            .expect("accepted load extracted before abnormal teardown");
+        drop(session);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let registry = crate::source_registry::SourceRegistry::new(runtime.handle().clone());
+        let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
+        let admission = owner.accept_output_load(delayed, &registry, &HashSet::new());
+        assert!(admission.stale());
+        let (handoff, error) = admission.into_update().into_parts();
+        assert!(handoff.is_none());
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn move_only_handoff_stays_one_shot_across_repeated_acceptance_and_retry() {
+        let mut item = authoritative_lastfm_item("local", "move-only-one-shot");
+        item.duration_secs = Some(181);
+        sync_test_lastfm_profile(&mut item);
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![item], 0));
+
+        let generation = session.begin_event_generation();
+        assert!(session.mark_load_accepted(generation));
+        let accepted = session
+            .take_accepted_lastfm_output_load(generation)
+            .expect("the session owns one accepted handoff");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let registry = crate::source_registry::SourceRegistry::new(runtime.handle().clone());
+        let enabled_remote_sources = HashSet::new();
+        let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
+        assert!(owner
+            .accept_output_load(accepted, &registry, &enabled_remote_sources)
+            .into_update()
+            .into_parts()
+            .1
+            .is_none());
+
+        assert!(session
+            .take_accepted_lastfm_output_load(generation)
+            .is_none());
+        assert!(session.mark_load_accepted(generation));
+        assert!(session
+            .take_accepted_lastfm_output_load(generation)
+            .is_none());
+
+        let retry_attempt = session.begin_output_attempt();
+        let retry_generation = retry_attempt.generation;
+        let (handoff, error) = owner
+            .observe_output_intent(retry_attempt.intent)
+            .into_parts();
+        assert!(handoff.is_none());
+        assert!(error.is_none());
+        assert!(session.mark_load_accepted(retry_generation));
+        let retry = session
+            .take_accepted_lastfm_output_load(retry_generation)
+            .expect("a genuinely new accepted generation receives one fresh handoff");
+        assert!(owner
+            .accept_output_load(retry, &registry, &enabled_remote_sources)
+            .into_update()
+            .into_parts()
+            .1
+            .is_none());
+        assert!(session
+            .take_accepted_lastfm_output_load(retry_generation)
+            .is_none());
+    }
+
+    #[test]
+    fn invalid_lastfm_candidate_becomes_one_shot_ineligible_output_load() {
+        let invalid = authoritative_lastfm_item("local", "missing-duration");
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![invalid], 0));
+        let generation = session.begin_event_generation();
+        assert!(session.mark_load_accepted(generation));
+
+        let ineligible = session
+            .take_accepted_lastfm_output_load(generation)
+            .expect("an invalid candidate still replaces the owner's output occurrence");
+        assert_eq!(
+            format!("{ineligible:?}"),
+            "LastFmAcceptedOutputLoad::Ineligible"
+        );
+        assert!(session.accepted_lastfm_load.is_consumed());
+        assert!(session
+            .take_accepted_lastfm_output_load(generation)
+            .is_none());
+    }
+
+    #[test]
+    fn accepted_retry_uses_occurrence_frozen_metadata_after_queue_refresh() {
+        let mut local_item = authoritative_lastfm_item("local", "frozen-track");
+        local_item.title = "Original Title".to_string();
+        local_item.artist = "Original Artist".to_string();
+        local_item.album = "Original Album".to_string();
+        local_item.album_artist = Some("Original Album Artist".to_string());
+        local_item.track_number = Some(3);
+        local_item.duration_secs = Some(181);
+        sync_test_lastfm_profile(&mut local_item);
+
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![local_item], 0));
+        let first_generation = session.begin_event_generation();
+        assert!(session.mark_load_accepted(first_generation));
+        let first = session
+            .take_accepted_lastfm_output_load(first_generation)
+            .expect("local occurrence is eligible");
+
+        let retry_generation = session.begin_event_generation();
+        assert!(session.mark_load_accepted(retry_generation));
+        assert_eq!(
+            refresh(
+                &mut session,
+                "frozen-track",
+                QueueTrackRefresh {
+                    title: "Refreshed Title".to_string(),
+                    artist: "Refreshed Artist".to_string(),
+                    album: "Refreshed Album".to_string(),
+                    album_artist: Some("Refreshed Album Artist".to_string()),
+                    track_number: Some(9),
+                    duration_secs: Some(301),
+                    cover_art_url: "refreshed-art".to_string(),
+                },
+            ),
+            1
+        );
+        assert_eq!(
+            session.current().expect("current item").title,
+            "Refreshed Title"
+        );
+        let retry = session
+            .take_accepted_lastfm_output_load(retry_generation)
+            .expect("local retry remains eligible");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let registry = crate::source_registry::SourceRegistry::new(runtime.handle().clone());
+        let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
+        let enabled_remote_sources = HashSet::new();
+        let first_update = owner
+            .accept_output_load(first, &registry, &enabled_remote_sources)
+            .into_update();
+        assert!(first_update.into_parts().1.is_none());
+        let retry_update = owner
+            .accept_output_load(retry, &registry, &enabled_remote_sources)
+            .into_update();
+        assert!(
+            retry_update.into_parts().1.is_none(),
+            "a queue refresh cannot drift one accepted occurrence's metadata"
+        );
+    }
+
+    #[test]
+    fn tagged_external_file_provenance_reaches_the_frozen_lastfm_candidate() {
+        fn adopt_tagged_fixture(
+            registry: &crate::source_registry::SourceRegistry,
+            directory: &std::path::Path,
+            file_name: &str,
+            album: Option<&str>,
+        ) -> crate::source_registry::ExternalFileSession {
+            let path = directory.join(file_name);
+            let mut fixture = include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            ))
+            .to_vec();
+            assert_eq!(&fixture[..4], b"fLaC");
+            // The shared audio fixture is intentionally only 100 ms. Rewrite
+            // its STREAMINFO declaration to 31 seconds so this provenance
+            // test crosses the real Last.fm duration boundary without adding
+            // a large binary fixture. Lofty derives duration from this exact
+            // source metadata; playback/decoder behavior is not under test.
+            let packed = u64::from_be_bytes(
+                fixture[18..26]
+                    .try_into()
+                    .expect("FLAC STREAMINFO sample word"),
+            );
+            let sample_rate = (packed >> 44) & 0x0f_ffff;
+            assert!(sample_rate > 0);
+            let total_samples = sample_rate * 31;
+            assert!(total_samples < (1_u64 << 36));
+            let declared = (packed & !((1_u64 << 36) - 1)) | total_samples;
+            fixture[18..26].copy_from_slice(&declared.to_be_bytes());
+            std::fs::write(&path, fixture).expect("copy FLAC fixture");
+            crate::local::tag_writer::write_tags(
+                &path,
+                &crate::local::tag_writer::TagEdits {
+                    title: Some("Tagged Title".to_string()),
+                    artist: Some("Tagged Artist".to_string()),
+                    // Explicitly clear the fixture album in the missing case,
+                    // so parser provenance rather than fixture state decides
+                    // whether the optional Last.fm field survives.
+                    album: Some(album.unwrap_or_default().to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("write fixture tags");
+
+            registry
+                .adopt_external_file_if_current(
+                    std::fs::File::open(&path).expect("open tagged FLAC"),
+                    crate::external_file::ExternalFileHint::new(file_name, Some("flac"))
+                        .expect("safe external-file hint"),
+                    || true,
+                )
+                .expect("parse and adopt tagged external file")
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let registry = crate::source_registry::SourceRegistry::new(runtime.handle().clone());
+        let directory = tempfile::tempdir().expect("external FLAC fixture directory");
+
+        let missing_album =
+            adopt_tagged_fixture(&registry, directory.path(), "missing-album.flac", None);
+        assert_eq!(missing_album.track().title, "Tagged Title");
+        assert_eq!(missing_album.track().artist_name, "Tagged Artist");
+        assert_eq!(missing_album.track().album_title, "Unknown Album");
+        assert_eq!(missing_album.track().duration_secs, Some(31));
+        assert!(missing_album.playback_source().is_some());
+        assert_eq!(
+            missing_album
+                .playback_source()
+                .and_then(|source| source.profile().album()),
+            None
+        );
+
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(vec![QueueItem::external(&missing_album)], 0));
+        let candidate = session
+            .lastfm_occurrence_candidate
+            .as_ref()
+            .expect("tagged title and artist make the external occurrence eligible");
+        assert_eq!(candidate.title, "Tagged Title");
+        assert_eq!(candidate.artist, "Tagged Artist");
+        assert_eq!(candidate.album, None, "display fallback album is omitted");
+
+        let tagged_album = adopt_tagged_fixture(
+            &registry,
+            directory.path(),
+            "tagged-album.flac",
+            Some("Tagged Album"),
+        );
+        assert_eq!(
+            tagged_album
+                .playback_source()
+                .and_then(|source| source.profile().album()),
+            Some("Tagged Album")
+        );
+        assert_eq!(tagged_album.track().album_title, "Tagged Album");
+        assert!(session.replace_queue(vec![QueueItem::external(&tagged_album)], 0));
+        assert_eq!(
+            session
+                .lastfm_occurrence_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.album.as_deref()),
+            Some("Tagged Album"),
+            "an explicit album tag remains authoritative optional metadata"
+        );
+
+        let generation = session.begin_event_generation();
+        assert!(session.mark_load_accepted(generation));
+        let matching = session
+            .take_accepted_lastfm_output_load(generation)
+            .expect("matching structured tags produce one accepted output proof");
+        assert_eq!(
+            format!("{matching:?}"),
+            "LastFmAcceptedOutputLoad::Eligible(<redacted>)"
+        );
+        let enabled_remote_sources = HashSet::new();
+        let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
+        let admission = owner.accept_output_load(matching, &registry, &enabled_remote_sources);
+        assert!(admission.admitted());
+        let (handoff, error) = admission.into_update().into_parts();
+        assert!(handoff.is_none());
+        assert!(error.is_none());
+
+        let (handoff, error) = owner
+            .observe_event(&PlayerEvent::state(generation, PlayerState::Playing))
+            .into_parts();
+        assert!(error.is_none());
+        let now_playing = handoff.expect("matching managed occurrence emits now-playing");
+        assert_eq!(
+            now_playing.kind(),
+            crate::lastfm::playback_owner::LastFmPlaybackHandoffKind::NowPlaying
+        );
+        let callback_calls = Cell::new(0);
+        let admitted = now_playing.try_admit_with_callbacks_for_test(
+            &registry,
+            &enabled_remote_sources,
+            |_| {
+                callback_calls.set(callback_calls.get() + 1);
+                crate::lastfm::playback_owner::LastFmPlaybackHandoffKind::NowPlaying
+            },
+            |_| {
+                callback_calls.set(callback_calls.get() + 1);
+                crate::lastfm::playback_owner::LastFmPlaybackHandoffKind::Enqueue
+            },
+            || {
+                callback_calls.set(callback_calls.get() + 1);
+                crate::lastfm::playback_owner::LastFmPlaybackHandoffKind::ClearNowPlaying
+            },
+        );
+        assert_eq!(
+            admitted,
+            Some(crate::lastfm::playback_owner::LastFmPlaybackHandoffKind::NowPlaying)
+        );
+        assert_eq!(callback_calls.get(), 1);
+
+        let mut mismatched = QueueItem::external(&tagged_album);
+        mismatched.lastfm_profile = Some(PlaybackAttributionProfile::for_test(
+            "Different Title",
+            "Tagged Artist",
+            Some("Tagged Album"),
+            None,
+            tagged_album.track().track_number,
+            tagged_album.track().duration_secs,
+        ));
+        assert!(session.replace_queue(vec![mismatched], 0));
+        let generation = session.begin_event_generation();
+        assert!(session.mark_load_accepted(generation));
+        let ineligible = session
+            .take_accepted_lastfm_output_load(generation)
+            .expect("the accepted output replacement must still reach ownership");
+        assert_eq!(
+            format!("{ineligible:?}"),
+            "LastFmAcceptedOutputLoad::Ineligible",
+            "a profile cannot be paired with metadata different from its registry-minted reference"
+        );
+        let rejected = owner.accept_output_load(ineligible, &registry, &enabled_remote_sources);
+        assert!(!rejected.admitted());
+        assert!(!rejected.stale());
+        let (handoff, error) = rejected.into_update().into_parts();
+        assert!(error.is_none());
+        assert_eq!(
+            handoff.as_ref().map(|handoff| handoff.kind()),
+            Some(crate::lastfm::playback_owner::LastFmPlaybackHandoffKind::ClearNowPlaying),
+            "an accepted metadata mismatch terminally clears its eligible predecessor"
+        );
+
+        let missing_waiter = registry
+            .retire_external(missing_album.source_id())
+            .expect("retire missing-album session");
+        let album_waiter = registry
+            .retire_external(tagged_album.source_id())
+            .expect("retire tagged-album session");
+        runtime.block_on(async {
+            missing_waiter.wait().await;
+            album_waiter.wait().await;
+            registry.shutdown().wait().await;
+        });
+    }
+
+    #[test]
+    fn retries_keep_but_new_queue_occurrences_replace_lastfm_candidate_identity() {
+        let mut session = PlaybackSession::default();
+        assert!(session.replace_queue(
+            vec![
+                authoritative_lastfm_item("local", "a"),
+                authoritative_lastfm_item("local", "b"),
+            ],
+            0,
+        ));
+        let first = session
+            .lastfm_occurrence_candidate
+            .as_ref()
+            .map(|candidate| candidate.identity.clone())
+            .expect("first occurrence identity");
+
+        let _retry_generation = session.begin_event_generation();
+        assert_eq!(
+            session
+                .lastfm_occurrence_candidate
+                .as_ref()
+                .map(|candidate| &candidate.identity),
+            Some(&first)
+        );
+
+        assert_eq!(session.advance(RepeatMode::Off, false), Some(1));
+        let second = session
+            .lastfm_occurrence_candidate
+            .as_ref()
+            .map(|candidate| candidate.identity.clone())
+            .expect("second occurrence identity");
+        assert_ne!(first, second);
+
+        session.begin_repeat_one_occurrence();
+        let repeated = session
+            .lastfm_occurrence_candidate
+            .as_ref()
+            .map(|candidate| &candidate.identity)
+            .expect("repeat-one occurrence identity");
+        assert_ne!(repeated, &second);
+    }
+
+    #[test]
     fn history_requires_a_current_successfully_accepted_delivery() {
         let mut session = PlaybackSession::default();
         assert!(session.replace_queue(vec![history_item("local", "pending", Some(20_000))], 0,));
@@ -3862,11 +6048,13 @@ mod tests {
     #[test]
     fn repeat_one_failure_rolls_back_only_its_tentative_history_occurrence() {
         let mut playback = PlaybackSession::default();
-        assert!(playback.replace_queue(
-            vec![history_item("local", "repeat-rollback", Some(20_000))],
-            0,
-        ));
-        let generation = accept_history_load(&mut playback);
+        let mut item = authoritative_lastfm_item("local", "repeat-rollback");
+        item.duration_ms = Some(20_000);
+        item.duration_secs = Some(181);
+        sync_test_lastfm_profile(&mut item);
+        assert!(playback.replace_queue(vec![item], 0));
+        let generation = playback.begin_event_generation();
+        assert!(playback.mark_load_accepted(generation));
         observe_playing(&mut playback, generation);
         assert_eq!(observe_position(&mut playback, generation, 0, 20_000), None);
         assert_eq!(
@@ -3890,18 +6078,23 @@ mod tests {
             false
         }));
 
-        let session = session.borrow();
-        assert_eq!(session.event_generation, generation);
+        let restored = session.borrow();
+        assert_eq!(restored.event_generation, generation);
         assert_eq!(
-            session
+            restored
                 .current()
                 .map(|item| item.identity.media_key.track_id.as_str()),
             Some("repeat-rollback")
         );
         assert_eq!(
-            session.history_occurrence.as_ref(),
+            restored.history_occurrence.as_ref(),
             Some(&previous_occurrence)
         );
+        drop(restored);
+        assert!(session
+            .borrow_mut()
+            .take_accepted_lastfm_output_load(generation)
+            .is_some());
     }
 
     #[test]
