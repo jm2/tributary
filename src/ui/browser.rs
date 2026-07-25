@@ -148,6 +148,7 @@ pub fn build_browser(
         &album_store,
         album_art_controller.clone(),
         album_pane_artwork.clone(),
+        album_pane_artwork_size.clone(),
     );
     let folder_pane = build_pane("Folder", &folder_store);
 
@@ -489,7 +490,33 @@ pub fn set_album_pane_artwork(browser_box: &gtk::Box, state: &BrowserState, enab
         return;
     }
     state.album_pane_artwork.set(enabled);
+    rebuild_album_pane(browser_box, state);
+}
 
+/// Update the album-pane thumbnail size. The bind factory reads the
+/// size knob on every bind, so the change applies to the next set of
+/// rows that scroll into view. We rebuild the album pane here so the
+/// cached textures (keyed by `(album_key, pixel_size)`) are dropped
+/// alongside the old bind factory — a stale entry from the previous
+/// size would never be queried again, and leaving it in the cache
+/// would still consume the bounded-memory budget.
+pub fn set_album_pane_artwork_size(browser_box: &gtk::Box, state: &BrowserState, pixel_size: i32) {
+    if state.album_pane_artwork_size.get() == pixel_size {
+        return;
+    }
+    state.album_pane_artwork_size.set(pixel_size);
+    rebuild_album_pane(browser_box, state);
+}
+
+/// Replace the album pane in place with a freshly-built one wired to
+/// the current `(album_pane_artwork, album_pane_artwork_size)` knobs.
+/// The existing `gio::ListStore` is preserved across the swap so the
+/// album rows survive; the album store is then repopulated from the
+/// shared track snapshot so the artwork candidates match the latest
+/// library state. The cache is cleared because every entry was decoded
+/// at the previous size and would never match a new `(album_key,
+/// pixel_size)` lookup under the recompiled bind factory.
+fn rebuild_album_pane(browser_box: &gtk::Box, state: &BrowserState) {
     let panes_box = browser_box
         .last_child()
         .and_then(|w| w.downcast::<gtk::Box>().ok());
@@ -525,12 +552,24 @@ pub fn set_album_pane_artwork(browser_box: &gtk::Box, state: &BrowserState, enab
         &album_store,
         state.album_art_controller.clone(),
         state.album_pane_artwork.clone(),
+        state.album_pane_artwork_size.clone(),
     );
     panes_box.remove(&old_pane);
     panes_box.append(&new_pane);
 
-    // Repopulate the store so the artwork candidates survive the swap.
-    rebuild_browser_data(browser_box, state, &[]);
+    // The new album pane keeps the same `gio::ListStore` as the old one,
+    // so the album rows survive the swap. Repopulate the store from the
+    // current snapshot so the BrowserItem's artwork candidates are
+    // refreshed against the latest library state — but do NOT call
+    // `rebuild_browser_data` here: that helper would replace
+    // `state.tracks` with whatever slice it is handed, and the call site
+    // would have to pass the live master track list to avoid blanking
+    // the genre and artist panes. Toggling the artwork checkbox or
+    // changing the size is a layout event, not a library sync, so the
+    // snapshot must stay put.
+    let borrowed = state.tracks.borrow();
+    let use_aa = state.use_album_artist.get();
+    populate_albums(&album_store, &borrowed, &None, &None, use_aa);
 }
 
 /// Pull the underlying `gio::ListStore<BrowserItem>` out of an album
@@ -542,14 +581,6 @@ fn album_store_from_pane(pane: &gtk::Box) -> Option<gio::ListStore> {
     selection
         .model()
         .and_then(|m| m.downcast::<gio::ListStore>().ok())
-}
-
-/// Update the album-pane thumbnail size. Changes apply to future binds
-/// only — visible rows keep their existing texture until scrolled out
-/// of view (the bind factory's cache probe re-reads the size knob when
-/// a row scrolls back into view).
-pub fn set_album_pane_artwork_size(state: &BrowserState, pixel_size: i32) {
-    state.album_pane_artwork_size.set(pixel_size);
 }
 
 /// Attach the live source registry to the album-art coordinator. Must
@@ -693,6 +724,7 @@ fn build_album_pane(
     store: &gio::ListStore,
     album_art_controller: Rc<AlbumArtController>,
     album_pane_artwork_visible: Rc<Cell<bool>>,
+    album_pane_artwork_size: Rc<Cell<i32>>,
 ) -> gtk::Box {
     let header = gtk::Label::builder()
         .label(rust_i18n::t!("browser.album").as_ref())
@@ -709,7 +741,8 @@ fn build_album_pane(
     let factory = gtk::SignalListItemFactory::new();
 
     if album_pane_artwork_visible.get() {
-        let (setup, bind, unbind, _binder) = album_art_controller.build_binder();
+        let (setup, bind, unbind, _binder) =
+            album_art_controller.build_binder_with_size(album_pane_artwork_size.clone());
         factory.connect_setup(setup);
         factory.connect_bind(bind);
         factory.connect_unbind(unbind);

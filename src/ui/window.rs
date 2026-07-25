@@ -3594,10 +3594,15 @@ pub(crate) fn build_window(
                     // size.
                     browser::set_album_pane_artwork(&bw_for_art, &bs_for_art, enabled);
                 });
+            let bw_for_size = bw.clone();
             let bs_for_size = bs.clone();
             let on_art_size_change: std::rc::Rc<dyn Fn(preferences::AlbumArtSize)> =
                 std::rc::Rc::new(move |size: preferences::AlbumArtSize| {
-                    browser::set_album_pane_artwork_size(&bs_for_size, size.pixel_size());
+                    browser::set_album_pane_artwork_size(
+                        &bw_for_size,
+                        &bs_for_size,
+                        size.pixel_size(),
+                    );
                 });
             preferences::show_preferences(
                 &win,
