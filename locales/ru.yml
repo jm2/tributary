@@ -193,6 +193,8 @@ context:
   remove_from_playlist: "Удалить из плейлиста"
   playlist_add_unsupported_heading: "Композиции не добавлены"
   playlist_add_unsupported_body: "По крайней мере одна выбранная композиция недоступна или не поддерживается в обычных плейлистах. Ничего не добавлено."
+  playlist_drag_description: "Перетащите выбранные композиции в обычный плейлист. Escape отменяет; Shift+F10 — клавиатурный эквивалент."
+  playlist_add_success: "Добавлено композиций: %{count} в %{playlist}."
 
 # ── Обычные плейлисты ───────────────────────────────────────────
 regular_playlist:

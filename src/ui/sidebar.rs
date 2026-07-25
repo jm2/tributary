@@ -274,17 +274,18 @@ fn playlist_creation_action_group(
 ///   the user clicks its trash button.
 /// * `add_button` is the `+` button for adding manual servers (wired in `window.rs`).
 /// * `playlist_action_rx` emits playlist CRUD actions from the context menu.
-pub fn build_sidebar(
-    initial_sources: &[SourceObject],
-) -> (
+type SidebarBuildOutput = (
     gtk::Box,
     gio::ListStore,
     gtk::SingleSelection,
+    gtk::ListView,
     async_channel::Receiver<String>,
     async_channel::Receiver<String>,
     gtk::Button,
     async_channel::Receiver<PlaylistAction>,
-) {
+);
+
+pub fn build_sidebar(initial_sources: &[SourceObject]) -> SidebarBuildOutput {
     let store = gio::ListStore::new::<SourceObject>();
     for src in initial_sources {
         store.append(src);
@@ -792,6 +793,7 @@ pub fn build_sidebar(
         sidebar_box,
         store,
         selection,
+        list_view,
         disconnect_rx,
         delete_rx,
         add_button,

@@ -84,6 +84,24 @@ struct PlaylistAddPlan {
     authority: Vec<RegularPlaylistTrackResolution>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, glib::Boxed)]
+#[boxed_type(name = "TributaryPlaylistDragPayload")]
+struct PlaylistDragPayload {
+    candidates: Vec<PlaylistAddCandidate>,
+}
+
+impl PlaylistDragPayload {
+    fn from_selection(sm: &gtk::SortListModel, selection: &gtk::MultiSelection) -> Option<Self> {
+        let selected = selection.selection();
+        let snapshot = SelectionSnapshot::from_positions(
+            (0..sm.n_items()).filter(|position| selected.contains(*position)),
+        )?;
+        Some(Self {
+            candidates: collect_selected_add_candidates(sm, &snapshot)?,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlaylistMutationOutcome {
     Committed,
@@ -94,6 +112,7 @@ enum PlaylistMutationOutcome {
 #[derive(Clone)]
 struct PlaylistMutationContext {
     window: gtk::glib::WeakRef<adw::ApplicationWindow>,
+    toast_overlay: adw::ToastOverlay,
     rt_handle: tokio::runtime::Handle,
     source_registry: SourceRegistry,
     sidebar_store: gtk::gio::ListStore,
@@ -113,6 +132,7 @@ impl PlaylistMutationContext {
     fn from_window(state: &WindowState) -> Self {
         Self {
             window: state.window.downgrade(),
+            toast_overlay: state.toast_overlay.clone(),
             rt_handle: state.rt_handle.clone(),
             source_registry: state.source_registry.clone(),
             sidebar_store: state.sidebar_store.clone(),
@@ -155,6 +175,74 @@ impl PlaylistMutationContext {
         if let Some(window) = self.window.upgrade() {
             show_playlist_mutation_failed_dialog(&window);
         }
+    }
+
+    fn show_added(&self, count: usize, playlist_name: &str) {
+        let message = rust_i18n::t!(
+            "context.playlist_add_success",
+            count = count,
+            playlist = playlist_name
+        );
+        self.toast_overlay
+            .add_toast(adw::Toast::new(message.as_ref()));
+    }
+
+    fn add_candidates_to_playlist(
+        &self,
+        playlist_id: String,
+        playlist_name: String,
+        candidates: Vec<PlaylistAddCandidate>,
+    ) {
+        if !playlist_is_editable_regular(&self.sidebar_store, &playlist_id) {
+            self.show_unsupported();
+            return;
+        }
+        let Ok(plan) = prepare_playlist_add_plan(&self.source_registry, &candidates) else {
+            self.show_unsupported();
+            return;
+        };
+
+        let worker_pid = playlist_id.clone();
+        let registry = self.source_registry.clone();
+        let (result_tx, result_rx) = async_channel::bounded(1);
+        self.rt_handle.spawn(async move {
+            let outcome = match crate::db::connection::init_db().await {
+                Ok(db) => {
+                    let manager = crate::local::playlist_manager::PlaylistManager::new(db);
+                    match manager
+                        .add_entries_if_authorized(&worker_pid, &plan.inputs, || {
+                            registry.acquire_regular_playlist_commit_authority(&plan.authority)
+                        })
+                        .await
+                    {
+                        Ok(PlaylistEntryAddOutcome::Committed(_)) => PlaylistMutationOutcome::Committed,
+                        Ok(PlaylistEntryAddOutcome::Rejected) => PlaylistMutationOutcome::Rejected,
+                        Err(error) => {
+                            tracing::error!(%error, playlist = %worker_pid, "Failed to add exact playlist occurrences");
+                            PlaylistMutationOutcome::Failed
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "Failed to open DB for playlist add");
+                    PlaylistMutationOutcome::Failed
+                }
+            };
+            let _ = result_tx.send(outcome).await;
+        });
+
+        let context = self.clone();
+        let count = candidates.len();
+        gtk::glib::MainContext::default().spawn_local(async move {
+            match result_rx.recv().await {
+                Ok(PlaylistMutationOutcome::Committed) => {
+                    context.show_added(count, &playlist_name);
+                    context.refresh_playlist_after_commit(&playlist_id);
+                }
+                Ok(PlaylistMutationOutcome::Rejected) => context.show_unsupported(),
+                Ok(PlaylistMutationOutcome::Failed) | Err(_) => context.show_mutation_failed(),
+            }
+        });
     }
 
     fn refresh_playlist_after_commit(&self, playlist_id: &str) {
@@ -306,6 +394,7 @@ fn expose_context_menu_accessibility(column_view: &gtk::ColumnView) {
 /// open the same selection-snapshotted action model relative to the focused
 /// tracklist, and are consumed only when a non-empty menu was opened.
 pub fn setup_context_menu(state: &WindowState) {
+    setup_playlist_transfer(state);
     let sm = state.sort_model.clone();
     let sidebar_store = state.sidebar_store.clone();
     let active_source_key = state.active_source_key.clone();
@@ -422,6 +511,68 @@ pub fn setup_context_menu(state: &WindowState) {
     });
     state.column_view.add_controller(key_controller);
     expose_context_menu_accessibility(&state.column_view);
+}
+
+fn setup_playlist_transfer(state: &WindowState) {
+    use gtk::glib::prelude::ToValue;
+
+    let drag_source = gtk::DragSource::builder()
+        .actions(gtk::gdk::DragAction::COPY)
+        .build();
+    let sort_model = state.sort_model.clone();
+    let column_view = state.column_view.clone();
+    drag_source.connect_prepare(move |_, _, _| {
+        let selection = column_view
+            .model()?
+            .downcast::<gtk::MultiSelection>()
+            .ok()?;
+        let payload = PlaylistDragPayload::from_selection(&sort_model, &selection)?;
+        Some(gtk::gdk::ContentProvider::for_value(&payload.to_value()))
+    });
+    state.column_view.add_controller(drag_source);
+    state.column_view.update_property(&[
+        gtk::accessible::Property::Description(
+            rust_i18n::t!("context.playlist_drag_description").as_ref(),
+        ),
+        gtk::accessible::Property::KeyShortcuts("Shift+F10 ContextMenu"),
+    ]);
+
+    let context = PlaylistMutationContext::from_window(state);
+    let sidebar_selection = state.sidebar_selection.clone();
+    let drop_target = gtk::DropTarget::new(
+        PlaylistDragPayload::static_type(),
+        gtk::gdk::DragAction::COPY,
+    );
+    let selection_for_accept = sidebar_selection.clone();
+    drop_target.connect_accept(move |_, _| {
+        selection_for_accept
+            .selected_item()
+            .and_downcast::<SourceObject>()
+            .is_some_and(|source| source.is_editable_regular_playlist())
+    });
+    let context_for_drop = context.clone();
+    let selection_for_drop = sidebar_selection.clone();
+    drop_target.connect_drop(move |_, value, _, _| {
+        let Ok(payload) = value.get::<PlaylistDragPayload>() else {
+            return false;
+        };
+        let Some(source) = selection_for_drop
+            .selected_item()
+            .and_downcast::<SourceObject>()
+        else {
+            return false;
+        };
+        if !source.is_editable_regular_playlist() {
+            return false;
+        }
+        context_for_drop.add_candidates_to_playlist(
+            source.playlist_id(),
+            source.name(),
+            payload.candidates,
+        );
+        true
+    });
+    state.sidebar_view.add_controller(drop_target);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -551,6 +702,7 @@ fn build_add_to_playlist_actions(
                 let action_name = format!("add-to-{}", pl_id.replace('-', "_"));
                 let add_action = gtk::gio::SimpleAction::new(&action_name, None);
                 let pid = pl_id.clone();
+                let action_playlist_name = pl_name.clone();
                 let interaction_request = interaction_request.cloned();
                 let candidates = candidates.clone();
                 let context = context.clone();
@@ -573,75 +725,11 @@ fn build_add_to_playlist_actions(
                         context.show_unsupported();
                         return;
                     };
-                    let Ok(plan) =
-                        prepare_playlist_add_plan(&context.source_registry, &candidates)
-                    else {
-                        context.show_unsupported();
-                        return;
-                    };
-
-                    let pid = pid.clone();
-                    let worker_pid = pid.clone();
-                    let registry = context.source_registry.clone();
-                    let (result_tx, result_rx) = async_channel::bounded(1);
-                    context.rt_handle.spawn(async move {
-                        let outcome = match crate::db::connection::init_db().await {
-                            Ok(db) => {
-                                let manager =
-                                    crate::local::playlist_manager::PlaylistManager::new(db);
-                                // Stage the complete ordered mutation first,
-                                // then acquire exact live authority at the
-                                // transaction's final commit boundary. The
-                                // manager retains it through commit; stale
-                                // acquisition rejects and rolls back every
-                                // staged insert.
-                                match manager
-                                    .add_entries_if_authorized(
-                                        &worker_pid,
-                                        &plan.inputs,
-                                        || {
-                                            registry.acquire_regular_playlist_commit_authority(
-                                                &plan.authority,
-                                            )
-                                        },
-                                    )
-                                    .await
-                                {
-                                    Ok(PlaylistEntryAddOutcome::Committed(_)) => {
-                                        PlaylistMutationOutcome::Committed
-                                    }
-                                    Ok(PlaylistEntryAddOutcome::Rejected) => {
-                                        PlaylistMutationOutcome::Rejected
-                                    }
-                                    Err(error) => {
-                                        tracing::error!(%error, playlist = %worker_pid, "Failed to add exact playlist occurrences");
-                                        PlaylistMutationOutcome::Failed
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                tracing::error!(%error, "Failed to open DB for playlist add");
-                                PlaylistMutationOutcome::Failed
-                            }
-                        };
-                        let _ = result_tx.send(outcome).await;
-                    });
-
-                    let context = context.clone();
-                    let playlist_id = pid.clone();
-                    let count = candidates.len();
-                    gtk::glib::MainContext::default().spawn_local(async move {
-                        match result_rx.recv().await {
-                            Ok(PlaylistMutationOutcome::Committed) => {
-                                tracing::info!(playlist = %playlist_id, count, "Tracks added to playlist");
-                                context.refresh_playlist_after_commit(&playlist_id);
-                            }
-                            Ok(PlaylistMutationOutcome::Rejected) => context.show_unsupported(),
-                            Ok(PlaylistMutationOutcome::Failed) | Err(_) => {
-                                context.show_mutation_failed();
-                            }
-                        }
-                    });
+                    context.add_candidates_to_playlist(
+                        pid.clone(),
+                        action_playlist_name.clone(),
+                        candidates,
+                    );
                 });
                 action_group.add_action(&add_action);
                 menu.append(

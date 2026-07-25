@@ -193,6 +193,8 @@ context:
   remove_from_playlist: "從播放清單移除"
   playlist_add_unsupported_heading: "曲目未加入"
   playlist_add_unsupported_body: "至少有一個所選曲目無法使用，或不支援加入一般播放清單。未加入任何曲目。"
+  playlist_drag_description: "將所選曲目拖到一般播放清單。按 Escape 取消；按 Shift+F10 使用鍵盤等效操作。"
+  playlist_add_success: "已將 %{count} 首曲目加入 %{playlist}。"
 
 # ── 一般播放清單 ──────────────────────────────────────────────
 regular_playlist:
