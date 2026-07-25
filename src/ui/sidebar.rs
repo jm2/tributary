@@ -339,8 +339,8 @@ pub fn build_sidebar(
             let row_actions = gio::SimpleActionGroup::new();
             row_actions.add_action(&row_action);
             row_box.insert_action_group("sidebar-row", Some(&row_actions));
-            action_btn.set_action_name(Some("sidebar-row.invoke"));
             action_btn.set_action_target_value(Some(&sidebar_button_action_target(None)));
+            action_btn.set_action_name(Some("sidebar-row.invoke"));
 
             // Per-row right-click gesture.
             //
