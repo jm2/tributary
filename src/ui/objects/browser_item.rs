@@ -42,6 +42,11 @@ impl BrowserItem {
         self.imp().count.get()
     }
 
+    /// Render label + parenthesized count in the legacy single-string form.
+    ///
+    /// Prefer [`Self::label`] + [`Self::count`] from the UI layer so the
+    /// count can be styled independently (dimmed secondary text per
+    /// GNOME HIG). Kept for any callers that still want a single string.
     pub fn display(&self) -> String {
         format!("{} ({})", self.label(), self.count())
     }

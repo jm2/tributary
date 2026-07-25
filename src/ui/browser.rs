@@ -508,13 +508,27 @@ fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
         let label = gtk::Label::builder()
             .halign(gtk::Align::Start)
+            .valign(gtk::Align::Center)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .hexpand(true)
+            .single_line_mode(true)
+            .build();
+        let count = gtk::Label::builder()
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::Center)
+            .css_classes(["dim-label", "caption", "numeric"])
+            .build();
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
             .margin_start(8)
             .margin_end(8)
             .margin_top(2)
             .margin_bottom(2)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
-        list_item.set_child(Some(&label));
+        row.append(&label);
+        row.append(&count);
+        list_item.set_child(Some(&row));
     });
 
     factory.connect_bind(|_, list_item| {
@@ -523,11 +537,20 @@ fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
             .item()
             .and_downcast::<BrowserItem>()
             .expect("BrowserItem");
-        let label = list_item
+        let row = list_item
             .child()
+            .and_downcast::<gtk::Box>()
+            .expect("Box");
+        let first = row
+            .first_child()
             .and_downcast::<gtk::Label>()
             .expect("Label");
-        label.set_text(&item.display());
+        let second = row
+            .last_child()
+            .and_downcast::<gtk::Label>()
+            .expect("Label");
+        first.set_text(&item.label());
+        second.set_text(&format!("({})", item.count()));
     });
 
     let list_view = gtk::ListView::builder()
