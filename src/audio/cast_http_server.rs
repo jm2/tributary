@@ -385,9 +385,36 @@ fn pick_lan_bind_address(candidates: &[(String, std::net::IpAddr)]) -> Option<st
 /// unique-local (fc00::/7, RFC 4193) is reachable on a private IPv6 LAN. The
 /// other unicast scopes — link-local, loopback, and unspecified — cannot be
 /// carried in a portable receiver URL and are handled by the caller.
-fn is_reachable_ipv6(v6: &std::net::Ipv6Addr) -> bool {
+pub fn is_reachable_ipv6(v6: &std::net::Ipv6Addr) -> bool {
     let first = v6.segments()[0];
     (first & 0xe000) == 0x2000 || (first & 0xfe00) == 0xfc00
+}
+
+/// Process-global latch recording whether the cast HTTP server ever bound an
+/// IPv6 socket on this host. Discovery consults this latch so it can refuse
+/// IPv6 control endpoints (and avoid advertising a Chromecast that the
+/// receiver-facility listener would never hear) without ever diverging from
+/// the bound listener's address family.
+///
+/// The latch is `Relaxed`: it only gates a single user-visible control
+/// decision per service event, and a stale-on-mismatch read is
+/// self-correcting on the next publish (the listener's bind latches it for
+/// the lifetime of the process).
+static CAST_LISTENER_BINDS_IPV6: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Returns whether the cast HTTP server has bound an IPv6 socket on this
+/// host. Used by `discovery` to gate V6 control-endpoint acceptance on the
+/// listener having actually bound V6 — the bead's symmetric-publish
+/// guarantee that the listener and the discovered receiver share an address
+/// family.
+pub fn cast_listener_binds_ipv6() -> bool {
+    CAST_LISTENER_BINDS_IPV6.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub fn set_cast_listener_binds_ipv6_for_test_and_swap(value: bool) -> bool {
+    CAST_LISTENER_BINDS_IPV6.swap(value, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A running cast HTTP server instance.
@@ -472,6 +499,9 @@ impl CastHttpServer {
 
         let listener = TcpListener::bind(bind_addr).await?;
         let addr = listener.local_addr()?;
+        if addr.is_ipv6() {
+            CAST_LISTENER_BINDS_IPV6.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
 
         info!(addr = %addr, "Cast HTTP server listening");
 
