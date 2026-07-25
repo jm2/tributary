@@ -1431,9 +1431,11 @@ mod tests {
     /// Headless CI (cargo test on fedora:41 with no X/Wayland socket)
     /// cannot initialize GTK, so the test gates on `gtk::init()`'s
     /// non-panicking result and skips with a printed reason when GTK
-    /// cannot acquire a display. The contract still holds on any machine
-    /// with a display — the test is therefore meaningful on a developer
-    /// box and harmless in CI.
+    /// cannot acquire a display. macOS is excluded because GTK's Quartz
+    /// backend panics when initialized from the test harness worker thread.
+    /// The contract still holds on any machine with a display — the test is
+    /// therefore meaningful on a developer box and harmless in CI.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn popover_from_menu_model_attaches_a_visible_child_widget() {
         if let Err(e) = gtk::init() {
