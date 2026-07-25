@@ -69,8 +69,8 @@ authenticated HTTP endpoint whose URL, query string, or response header carries
 the user's token — and under Subsonic's plaintext auth mode, the user's actual
 *password*. Publishing that data through GTK, through the file system, or
 through a downstream process without a boundary is the failure mode the existing
-P1.4 work closed for live playback, and offline extends the same boundary
-rather than reinventing it.
+`task-remediation-2026-07.md` P1.4 work closed for live playback, and offline
+extends the same boundary rather than reinventing it.
 
 The non-negotiable rules are:
 
@@ -81,7 +81,7 @@ The non-negotiable rules are:
    signed requests are minted only by the exact-origin proxy and consumed only
    through its revocable opaque ticket.
 2. **The redirect policy is the one recorded 2026-07-13.** Authenticated
-   download clients share the P1.4 exact-origin + HTTPS-only redirect policy:
+   download clients share the `task-remediation-2026-07.md` P1.4 exact-origin + HTTPS-only redirect policy:
    they must follow the redirect matrix that the existing redirect tests
    enforce, must refuse HTTPS→HTTP downgrades, must not forward `Referer`, and
    must never let a redirect re-route a request onto a third-party host. The
@@ -98,8 +98,8 @@ The non-negotiable rules are:
 
 The credential-boundary section is normative and may not be weakened by an
 implementation slice. Any slice that would persist a credential to make a
-download work is a bug. This matches P1.4's "no token in MPD/Chromecast/AirPlay
-ticket" rule verbatim.
+download work is a bug. This matches `task-remediation-2026-07.md` P1.4's
+"no token in MPD/Chromecast/AirPlay ticket" rule verbatim.
 
 ## Source-scoped identity and lifecycle
 
@@ -167,8 +167,9 @@ The rules:
 1. **A job is owned by one and only one supervisor.** Local cancellation,
    source retirement, replacement, and shutdown must drain or cancel the same
    job deterministically. The supervisor can be the source registry's offline
-   worker or a headless application owner modelled on `mol-polecat-work`'s
-   application-owner; it is never a GTK thread.
+   worker or a headless application owner on the same model as the Last.fm
+   application owner composed in [#165](https://github.com/jm2/tributary/pull/165);
+   it is never a GTK thread.
 2. **Resumption is exact and bounded.** A retried range request uses the
    `Range` bytes the previous job last committed. Out-of-order or duplicate
    ranges are rejected; ranges past `Content-Length` are rejected; the previous
@@ -245,7 +246,7 @@ Adapters opt in by returning `Some(OfflineSnapshot)` from
 
 | Backend | Download path | Snapshot cap | Restrictions |
 |---|---|---|---|
-| Subsonic | `GET .../download?view=...&id=<trackId>` authenticated through the exact-origin proxy. | Per-source byte total bounded at the source-adapter-declared cap; offline rows are still capped by the per-track quota. | Bearer URL handling per P1.6 — only the proxy ticket ever reaches GTK. |
+| Subsonic | `GET .../download?view=...&id=<trackId>` authenticated through the exact-origin proxy. | Per-source byte total bounded at the source-adapter-declared cap; offline rows are still capped by the per-track quota. | Bearer URL handling per `task-remediation-2026-07.md` P1.6 — only the proxy ticket ever reaches GTK. |
 | Jellyfin | `GET /Items/<id>/Download` authenticated through the exact-origin proxy. | Identical. | Same. |
 | Plex | `GET /library/parts/<partId>` authenticated through the exact-origin proxy; uses `X-Plex-Token` only inside the proxy boundary. | Identical. | Same. |
 | DAAP | `DAAP.song` request, authenticated through the DAAP protocol-specific lane already retired to the source lifecycle. | Identical. | DAAP connection still has exactly-once logout; cache rows must retire on disconnect. |
@@ -260,8 +261,8 @@ credential-isolation argument holds for that path.
 
 ## Credential handling
 
-This section is normative. It repeats P1.4's rules, restated for offline
-storage:
+This section is normative. It repeats `task-remediation-2026-07.md` P1.4's rules,
+restated for offline storage:
 
 1. **Persistence is forbidden.** No `tracks` row carries a credential, URL,
    signed parameter, header, or token in any column. No file name or directory
@@ -282,7 +283,7 @@ storage:
    revocation retires only the in-flight lease, not the cache row.
 5. **Loaded credentials stay loaded.** Offline downloads do not load built or
    shipped credentials. A source whose authorization requires a credential that
-   the source cannot provide without `GC_*` build-time setup remains
+   the source cannot provide without `TRIBUTARY_*` build-time setup remains
    disabled at runtime (see `roadmap.md:289`); the cache engine does not invent
    a way around that gate.
 
@@ -323,7 +324,7 @@ does not mutate; it siblings. The rules:
    remains until the new snapshot is committed.
 2. **Sibling retention is bounded.** When a new snapshot is committed, the
    predecessor is queued for unlink. The unlink path goes through the same
-   `tracks` integrity-as-unlink authority that Path 2.3 closes.
+   `tracks` integrity-as-unlink authority that `task-remediation-2026-07.md` P2.3 closes.
 3. **Refresh is monotonic.** A successful refresh only retires a row when
    either the new snapshot is committed or the user explicitly chooses
    "Delete cache entry". Refreshing to detect stale content is not a delete
@@ -412,8 +413,8 @@ Each slice lands with its own focused regression suite. The slices are:
 | Capability | Default-deny behaviour for adapters that opt out; Subsonic/Jellyfin/Plex/DAAP opt in. |
 | Resumable job | Bounded range requests; out-of-order rejection; cap-bytes mismatch; checksum guard. |
 | Atomic storage | `fsync` + rename; Windows transactional move; cross-filesystem fallback. |
-| Credential boundary | No credential in metadata, file name, sidecar, log, or GTK row. Same regex-style coverage as P1.4. |
-| Redirect policy | Per P1.4 matrix; HTTPS-only, no `Referer`, no HTTPS→HTTP downgrade. |
+| Credential boundary | No credential in metadata, file name, sidecar, log, or GTK row. Same regex-style coverage as `task-remediation-2026-07.md` P1.4. |
+| Redirect policy | Per `task-remediation-2026-07.md` P1.4 matrix; HTTPS-only, no `Referer`, no HTTPS→HTTP downgrade. |
 | Licensing | Default-deny; revocation retires rows but preserves files. |
 | Reconciliation | Refresh creates a sibling; no in-place mutation; unlink is content-aware. |
 | Cancellation | Lifecycle supersession cancels in-flight jobs. |
@@ -439,7 +440,8 @@ own:
    separate ADR — see [P3.2](task.md#p32--android-and-device-synchronization).
 4. **Distributed quota.** Cross-process quota enforcement is out of scope.
 5. **DAAP-only authorization refresh.** DAAP's particular reauthorization flow
-   remains under P1.5; offline extends it without changing it.
+   remains under `task-remediation-2026-07.md` P1.5; offline extends it without
+   changing it.
 
 The contract exists to make those deferred areas explicit, so an implementer
 does not have to invent them mid-slice.
@@ -460,6 +462,10 @@ machinery existing.
 ## See also
 
 - [`task.md`](task.md) — P3.1 implementation record and overall backlog.
+- [`task-remediation-2026-07.md`](task-remediation-2026-07.md) — P1.4
+  exact-origin redirects, P1.5 response limits, P1.6 receiver credentials,
+  P2.3 tag-write hardening. The credential-handling, redirect-policy,
+  and unlink-authority rules in this document all cite items from that file.
 - [`source-scoped-playlists.md`](source-scoped-playlists.md) — identity
   boundary for regular playlist entries; offline cache rows share the same
   identity shape.
@@ -468,4 +474,6 @@ machinery existing.
 - [`architecture/source-lifecycle.md`](architecture/source-lifecycle.md) —
   source identity, retirement, and redaction policy.
 - [`lastfm-scrobbling.md`](lastfm-scrobbling.md) — credential-free delivery
-  and redaction policy precedent.
+  and redaction policy precedent; the headless application owner composed
+  in [#165](https://github.com/jm2/tributary/pull/165) is the reference
+  shape for the offline-job supervisor.
