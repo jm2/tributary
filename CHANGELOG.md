@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Root-relative folder browsing with multi-root disambiguation, lazy navigation, and an explicit
+  omission policy for pathless sources**
+  ([#14](https://github.com/jm2/tributary/issues/14)). The new folder pane lives alongside the
+  genre / artist / album panes and is hidden-by-preference by default. Roots are sourced from the
+  configured `library_paths`; the data layer assigns each track to its most-specific configured
+  ancestor so overlapping roots never share a subtree, surfaces missing or persisted-unavailable
+  roots as explicit placeholder rows, and omits pathless tracks (remote backends, external files,
+  removable scan-only rows) by design. Expanding a node reads only its immediate children, and the
+  index refuses to escape the root via `..` components or symlinks. The pane composes with the
+  existing genre / artist / album / search filters so a folder selection narrows the tracklist
+  without resetting the others.
 - **Last.fm now has a fail-closed protocol, desktop-authorization, credential-vault, durable-queue,
   playback-evidence/owner, delivery/lifecycle runtime, and application-owner foundation**
   ([#50](https://github.com/jm2/tributary/issues/50),

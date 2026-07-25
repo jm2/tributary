@@ -478,6 +478,8 @@ pub(super) fn load_playlist_source(
     master_tracks: Rc<RefCell<Vec<TrackObject>>>,
     browser_widget: gtk::Box,
     browser_state: super::browser::BrowserState,
+    folder_browser_state: super::folder_browser::FolderBrowserState,
+    app_config: Rc<RefCell<super::preferences::AppConfig>>,
     status_label: gtk::Label,
     column_view: gtk::ColumnView,
 ) {
@@ -610,8 +612,11 @@ pub(super) fn load_playlist_source(
                         &master_tracks,
                         &browser_widget,
                         &browser_state,
+                        &folder_browser_state,
+                        &app_config,
                         &status_label,
                         &column_view,
+                        false,
                     );
                 }
                 return;
@@ -645,8 +650,11 @@ pub(super) fn load_playlist_source(
                 &master_tracks,
                 &browser_widget,
                 &browser_state,
+                &folder_browser_state,
+                &app_config,
                 &status_label,
                 &column_view,
+                false,
             );
         } else {
             tracing::debug!(
@@ -677,6 +685,7 @@ pub fn setup_source_connect(state: &WindowState) {
     let near_me_consent_request = state.near_me_consent_request.clone();
     let browser_widget = state.browser_widget.clone();
     let browser_state = state.browser_state.clone();
+    let folder_browser_state = state.folder_browser_state.clone();
     let status_label = state.status_label.clone();
     let column_view = state.column_view.clone();
     let app_config = state.app_config.clone();
@@ -776,8 +785,11 @@ pub fn setup_source_connect(state: &WindowState) {
                 &master_tracks,
                 &browser_widget,
                 &browser_state,
+                &folder_browser_state,
+                &app_config,
                 &status_label,
                 &column_view,
+                false,
             );
             return;
         }
@@ -808,8 +820,11 @@ pub fn setup_source_connect(state: &WindowState) {
                 &master_tracks,
                 &browser_widget,
                 &browser_state,
+                &folder_browser_state,
+                &app_config,
                 &status_label,
                 &column_view,
+                false,
             );
 
             load_playlist_source(
@@ -825,6 +840,8 @@ pub fn setup_source_connect(state: &WindowState) {
                 master_tracks.clone(),
                 browser_widget.clone(),
                 browser_state.clone(),
+                folder_browser_state.clone(),
+                app_config.clone(),
                 status_label.clone(),
                 column_view.clone(),
             );
@@ -863,8 +880,11 @@ pub fn setup_source_connect(state: &WindowState) {
                 &master_tracks,
                 &browser_widget,
                 &browser_state,
+                &folder_browser_state,
+                &app_config,
                 &status_label,
                 &column_view,
+                false,
             );
             if let Some(category) = retained_failure {
                 status_label.set_text(&category.user_message("Removable media"));
@@ -892,8 +912,11 @@ pub fn setup_source_connect(state: &WindowState) {
                     &master_tracks,
                     &browser_widget,
                     &browser_state,
+                    &folder_browser_state,
+                    &app_config,
                     &status_label,
                     &column_view,
+                    false,
                 );
             } else {
                 track_store.remove_all();
@@ -926,6 +949,7 @@ pub fn setup_source_connect(state: &WindowState) {
                 let master_tracks = master_tracks.clone();
                 let browser_widget = browser_widget.clone();
                 let browser_state = browser_state.clone();
+                let folder_browser_state = folder_browser_state.clone();
                 let status_label = status_label.clone();
                 let column_view = column_view.clone();
                 let active_source_key = active_source_key.clone();
@@ -943,6 +967,7 @@ pub fn setup_source_connect(state: &WindowState) {
                     master_tracks,
                     browser_widget,
                     browser_state,
+                    folder_browser_state,
                     status_label,
                     column_view,
                     active_source_key,
@@ -984,8 +1009,11 @@ pub fn setup_source_connect(state: &WindowState) {
                 &master_tracks,
                 &browser_widget,
                 &browser_state,
+                &folder_browser_state,
+                &app_config,
                 &status_label,
                 &column_view,
+                false,
             );
             return;
         }

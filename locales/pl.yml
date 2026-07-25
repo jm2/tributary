@@ -47,6 +47,7 @@ browser:
   genre: "Gatunek"
   artist: "Artysta"
   album: "Album"
+  folders: "Foldery"
   all: "Wszystkie"
 
 # ── Tracklist columns ──────────────────────────────────────────────

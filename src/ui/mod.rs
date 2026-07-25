@@ -5,6 +5,7 @@ pub mod browser;
 pub mod context_menu;
 pub mod discovery_handler;
 pub mod dummy_data;
+pub mod folder_browser;
 pub mod header_bar;
 mod library_commands;
 pub mod objects;

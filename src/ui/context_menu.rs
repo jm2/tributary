@@ -114,6 +114,8 @@ struct PlaylistMutationContext {
     source_navigation: std::rc::Rc<std::cell::RefCell<super::source_navigation::SourceNavigation>>,
     browser_widget: gtk::Box,
     browser_state: super::browser::BrowserState,
+    folder_browser_state: super::folder_browser::FolderBrowserState,
+    app_config: std::rc::Rc<std::cell::RefCell<super::preferences::AppConfig>>,
     status_label: gtk::Label,
     column_view: gtk::ColumnView,
 }
@@ -132,6 +134,8 @@ impl PlaylistMutationContext {
             source_navigation: state.source_navigation.clone(),
             browser_widget: state.browser_widget.clone(),
             browser_state: state.browser_state.clone(),
+            folder_browser_state: state.folder_browser_state.clone(),
+            app_config: state.app_config.clone(),
             status_label: state.status_label.clone(),
             column_view: state.column_view.clone(),
         }
@@ -190,8 +194,11 @@ impl PlaylistMutationContext {
             &self.master_tracks,
             &self.browser_widget,
             &self.browser_state,
+            &self.folder_browser_state,
+            &self.app_config,
             &self.status_label,
             &self.column_view,
+            false,
         );
         super::source_connect::load_playlist_source(
             self.rt_handle.clone(),
@@ -206,6 +213,8 @@ impl PlaylistMutationContext {
             self.master_tracks.clone(),
             self.browser_widget.clone(),
             self.browser_state.clone(),
+            self.folder_browser_state.clone(),
+            self.app_config.clone(),
             self.status_label.clone(),
             self.column_view.clone(),
         );

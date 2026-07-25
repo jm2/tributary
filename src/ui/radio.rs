@@ -14,6 +14,7 @@ use tracing::info;
 use crate::architecture::ViewOrigin;
 
 use super::browser;
+use super::folder_browser;
 use super::objects::TrackObject;
 use super::preferences;
 use super::source_navigation::{SourceNavigation, SourceRequest};
@@ -104,6 +105,7 @@ fn fall_back_to_local(
     master_tracks: &Rc<RefCell<Vec<TrackObject>>>,
     browser_widget: &gtk::Box,
     browser_state: &browser::BrowserState,
+    folder_browser_state: &folder_browser::FolderBrowserState,
     status_label: &gtk::Label,
     column_view: &gtk::ColumnView,
     active_source_key: &Rc<RefCell<String>>,
@@ -133,8 +135,11 @@ fn fall_back_to_local(
         master_tracks,
         browser_widget,
         browser_state,
+        folder_browser_state,
+        app_config,
         status_label,
         column_view,
+        false,
     );
 }
 
@@ -148,6 +153,7 @@ pub fn handle_radio_nearme(
     master_tracks: Rc<RefCell<Vec<TrackObject>>>,
     browser_widget: gtk::Box,
     browser_state: browser::BrowserState,
+    folder_browser_state: folder_browser::FolderBrowserState,
     status_label: gtk::Label,
     column_view: gtk::ColumnView,
     active_source_key: Rc<RefCell<String>>,
@@ -174,6 +180,7 @@ pub fn handle_radio_nearme(
                 &master_tracks,
                 &browser_widget,
                 &browser_state,
+                &folder_browser_state,
                 &status_label,
                 &column_view,
                 &active_source_key,
@@ -227,6 +234,7 @@ pub fn handle_radio_nearme(
                         &master_tracks,
                         &browser_widget,
                         &browser_state,
+                        &folder_browser_state,
                         &status_label,
                         &column_view,
                         &active_source_key,

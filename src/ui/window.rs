@@ -27,6 +27,7 @@ use crate::local::playlist_sidebar::{
 use crate::ui::header_bar::RepeatMode;
 
 use super::browser;
+use super::folder_browser;
 use super::header_bar;
 use super::objects::{HeaderKind, SourceObject, TrackObject};
 use super::output_dialogs::{load_saved_outputs, show_add_output_dialog};
@@ -354,6 +355,7 @@ struct SourceReducerContext {
     master_tracks: Rc<RefCell<Vec<TrackObject>>>,
     browser_widget: gtk::Box,
     browser_state: browser::BrowserState,
+    folder_browser_state: folder_browser::FolderBrowserState,
     status_label: gtk::Label,
     column_view: gtk::ColumnView,
     app_config: Rc<RefCell<preferences::AppConfig>>,
@@ -525,6 +527,7 @@ impl SourceReducerContext {
             master_tracks: state.master_tracks.clone(),
             browser_widget: state.browser_widget.clone(),
             browser_state: state.browser_state.clone(),
+            folder_browser_state: state.folder_browser_state.clone(),
             status_label: state.status_label.clone(),
             column_view: state.column_view.clone(),
             app_config: state.app_config.clone(),
@@ -691,8 +694,11 @@ fn display_local_fallback(context: &SourceReducerContext, retired_key: &str) {
         &context.master_tracks,
         &context.browser_widget,
         &context.browser_state,
+        &context.folder_browser_state,
+        &context.app_config,
         &context.status_label,
         &context.column_view,
+        false,
     );
 }
 
@@ -973,8 +979,11 @@ fn publish_radio_view(
             &context.master_tracks,
             &context.browser_widget,
             &context.browser_state,
+            &context.folder_browser_state,
+            &context.app_config,
             &context.status_label,
             &context.column_view,
+            false,
         );
     }
 }
@@ -1200,6 +1209,8 @@ fn reconcile_source_baseline(
                     &context.master_tracks,
                     &context.browser_widget,
                     &context.browser_state,
+                    &context.folder_browser_state,
+                    &context.app_config,
                     &context.status_label,
                     &context.column_view,
                 );
@@ -1305,6 +1316,8 @@ fn reconcile_source_baseline(
             &context.master_tracks,
             &context.browser_widget,
             &context.browser_state,
+            &context.folder_browser_state,
+            &context.app_config,
             &context.status_label,
             &context.column_view,
         );
@@ -1744,28 +1757,41 @@ pub(crate) fn build_window(
     let source_navigation = Rc::new(RefCell::new(SourceNavigation::new("local")));
     let near_me_consent_request: Rc<RefCell<Option<SourceRequest>>> = Rc::new(RefCell::new(None));
 
-    // ── Browser (starts empty, updated by FullSync) ──────────────────
-    let track_store_for_filter = track_store.clone();
-    let status_label_for_filter = status_label.clone();
-    let master_for_filter = master_tracks.clone();
-    let app_config_for_filter = app_config.clone();
-    let on_filter = Box::new(
-        move |genre: Option<String>,
-              artist: Option<String>,
-              album: Option<String>,
-              search_text: String| {
-            let master = master_for_filter.borrow();
-            let search_lower = search_text.to_lowercase();
-            let use_album_artist = app_config_for_filter.borrow().group_by_album_artist;
+    // ── Filter state shared with the folder pane ────────────────────
+    // Genre / artist / album filtering is driven by the existing browser
+    // panes; the folder pane (see `build_folder_browser`) sets
+    // `folder_filter` whenever the user picks a folder. Both sources
+    // compose into a single tracklist view.
+    #[derive(Default, Clone)]
+    struct FilterSnapshot {
+        genre: Option<String>,
+        artist: Option<String>,
+        album: Option<String>,
+        search_text: String,
+        folder_filter: Option<folder_browser::TracklistFilter>,
+    }
+    let filter_snapshot: Rc<RefCell<FilterSnapshot>> =
+        Rc::new(RefCell::new(FilterSnapshot::default()));
+    let apply_combined = {
+        let track_store = track_store.clone();
+        let status_label = status_label.clone();
+        let master = master_tracks.clone();
+        let app_config = app_config.clone();
+        let snapshot = filter_snapshot.clone();
+        move || {
+            let snapshot = snapshot.borrow().clone();
+            let master = master.borrow();
+            let search_lower = snapshot.search_text.to_lowercase();
+            let use_album_artist = app_config.borrow().group_by_album_artist;
             let filtered: Vec<TrackObject> = master
                 .iter()
                 .filter(|t| {
-                    if let Some(ref g) = genre {
+                    if let Some(ref g) = snapshot.genre {
                         if &t.genre() != g {
                             return false;
                         }
                     }
-                    if let Some(ref a) = artist {
+                    if let Some(ref a) = snapshot.artist {
                         // When album-artist grouping is on, match against
                         // the album-artist tag (falling back to track artist
                         // for tracks that lack one), so selecting an album
@@ -1781,7 +1807,7 @@ pub(crate) fn build_window(
                             return false;
                         }
                     }
-                    if let Some(ref al) = album {
+                    if let Some(ref al) = snapshot.album {
                         if &t.album() != al {
                             return false;
                         }
@@ -1796,6 +1822,34 @@ pub(crate) fn build_window(
                             return false;
                         }
                     }
+                    // Folder filter: when the user picked a folder row,
+                    // restrict the tracklist to tracks that live under
+                    // that exact root-relative path. The URI on each track
+                    // is `file://…` for local files; convert it back to a
+                    // path before prefix-matching. Non-file URIs (remote
+                    // tracks) are intentionally excluded from the folder
+                    // pane's selection by design.
+                    if let Some(ref folder) = snapshot.folder_filter {
+                        let folder_browser::TracklistFilter::Prefix(root, relative) = folder;
+                        let uri = t.uri();
+                        let track_path = match url::Url::parse(&uri) {
+                            Ok(parsed) if parsed.scheme() == "file" => {
+                                match parsed.to_file_path() {
+                                    Ok(p) => p,
+                                    Err(()) => return false,
+                                }
+                            }
+                            _ => return false,
+                        };
+                        let Ok(under_relative) = track_path.strip_prefix(root) else {
+                            return false;
+                        };
+                        if !relative.as_os_str().is_empty()
+                            && !under_relative.starts_with(relative)
+                        {
+                            return false;
+                        }
+                    }
                     true
                 })
                 // Clone bumps the GObject refcount, so the same instance may
@@ -1807,14 +1861,58 @@ pub(crate) fn build_window(
             // `items-changed` signal instead of N appends and keeps the rows'
             // identity. Playback navigation uses its own immutable queue and
             // is deliberately unaffected by this view mutation.
-            track_store_for_filter.splice(0, track_store_for_filter.n_items(), &filtered);
-            tracklist::update_status(&status_label_for_filter, &filtered);
-        },
-    );
+            track_store.splice(0, track_store.n_items(), &filtered);
+            tracklist::update_status(&status_label, &filtered);
+        }
+    };
+    let apply_combined = Rc::new(apply_combined);
+    let on_filter = {
+        let apply_combined = apply_combined.clone();
+        let snapshot = filter_snapshot.clone();
+        Box::new(
+            move |genre: Option<String>,
+                  artist: Option<String>,
+                  album: Option<String>,
+                  search_text: String| {
+                {
+                    let mut snap = snapshot.borrow_mut();
+                    snap.genre = genre;
+                    snap.artist = artist;
+                    snap.album = album;
+                    snap.search_text = search_text;
+                }
+                apply_combined();
+            },
+        )
+    };
 
     let initial_use_album_artist = app_config.borrow().group_by_album_artist;
     let (browser_widget, browser_state) =
         browser::build_browser(&empty_tracks, initial_use_album_artist, on_filter);
+
+    // ── Folder pane (root-relative folder browsing, P2.3) ───────────
+    let folder_browser_state = folder_browser::FolderBrowserState::new();
+    let folder_pane_widget = folder_browser::build_folder_browser(
+        &folder_browser_state,
+        {
+            let snapshot = filter_snapshot.clone();
+            let apply_combined = apply_combined.clone();
+            move |filter: Option<folder_browser::TracklistFilter>| {
+                snapshot.borrow_mut().folder_filter = filter;
+                apply_combined();
+            }
+        },
+    );
+    // Insert the folder pane as the fourth child of the browser's
+    // panes_box so it lives alongside genre / artist / album. We walk
+    // the same children that `update_browser_visibility` walks so the
+    // visibility contract continues to hold.
+    if let Some(panes_box) = browser_widget
+        .last_child()
+        .and_then(|w| w.downcast::<gtk::Box>().ok())
+    {
+        panes_box.append(&folder_pane_widget);
+    }
 
     // ── Right content ────────────────────────────────────────────────
     let right_paned = gtk::Paned::builder()
@@ -2210,6 +2308,7 @@ pub(crate) fn build_window(
             playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
             browser_widget: browser_widget.clone(),
             browser_state: browser_state.clone(),
+            folder_browser_state: folder_browser_state.clone(),
             status_label: status_label.clone(),
             column_view: column_view.clone(),
             sort_model: sort_model.clone(),
@@ -2332,6 +2431,7 @@ pub(crate) fn build_window(
         playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
         browser_widget: browser_widget.clone(),
         browser_state: browser_state.clone(),
+        folder_browser_state: folder_browser_state.clone(),
         status_label: status_label.clone(),
         column_view: column_view.clone(),
         sort_model: sort_model.clone(),
@@ -2420,6 +2520,7 @@ pub(crate) fn build_window(
                 source_navigation.clone(),
                 &browser_widget,
                 browser_state,
+                folder_browser_state,
                 &column_view,
                 sidebar_store_for_events,
                 sidebar_sel_for_events,
@@ -2911,6 +3012,7 @@ pub(crate) fn build_window(
         playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
         browser_widget: browser_widget.clone(),
         browser_state: browser_state.clone(),
+        folder_browser_state: folder_browser_state.clone(),
         status_label: status_label.clone(),
         column_view: column_view.clone(),
         sort_model: sort_model.clone(),
@@ -3498,6 +3600,7 @@ pub(crate) fn build_window(
         source_navigation,
         &browser_widget,
         browser_state,
+        folder_browser_state,
         &column_view,
         sidebar_store_for_events,
         sidebar_sel_for_events,
@@ -3519,14 +3622,18 @@ pub(crate) fn build_window(
 
 /// Replace the visible tracklist, browser, and master track list with a
 /// new set of tracks (e.g., when switching sidebar sources).
+#[allow(clippy::too_many_arguments)] // Mirrors the existing 7-arg variant; the new pane and filter state ride along.
 pub fn display_tracks(
     objects: &[TrackObject],
     track_store: &gtk::gio::ListStore,
     master_tracks: &RefCell<Vec<TrackObject>>,
     browser_widget: &gtk::Box,
     browser_state: &browser::BrowserState,
+    folder_browser_state: &folder_browser::FolderBrowserState,
+    app_config: &Rc<RefCell<preferences::AppConfig>>,
     status_label: &gtk::Label,
     column_view: &gtk::ColumnView,
+    pathless_source: bool,
 ) {
     // Use splice() to replace all items in a single operation.
     // This emits one `items-changed` signal instead of N individual
@@ -3536,8 +3643,45 @@ pub fn display_tracks(
 
     tracklist::update_status(status_label, objects);
     browser::rebuild_browser_data(browser_widget, browser_state, objects);
+    display_folder_browser(folder_browser_state, app_config, objects, pathless_source);
     *master_tracks.borrow_mut() = objects.to_vec();
     column_view.scroll_to(0, None, gtk::ListScrollFlags::NONE, None);
+}
+
+/// Rebuild the root-relative folder pane from the supplied track slice.
+///
+/// Pass an empty `persisted_roots` slice when the caller cannot reach the
+/// database synchronously; the pane still shows the configured roots and
+/// their children, with only the persisted-availability annotation
+/// omitted.  Wire the persisted-state lookup in a follow-up slice that
+/// owns the database connection.
+pub fn display_folder_browser(
+    state: &folder_browser::FolderBrowserState,
+    app_config: &Rc<RefCell<preferences::AppConfig>>,
+    objects: &[TrackObject],
+    pathless_source: bool,
+) {
+    let configured_paths = app_config
+        .borrow()
+        .library_paths
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect::<Vec<_>>();
+    let track_paths = objects.iter().map(track_path_for_filter).collect::<Vec<_>>();
+    state.rebuild(configured_paths, &[], track_paths, pathless_source);
+}
+
+/// Convert a `TrackObject`'s URI to a `PathBuf` suitable for folder
+/// filtering.  Returns `None` for non-file URIs (remote tracks) so the
+/// folder pane can apply the documented omission policy for pathless
+/// sources.
+fn track_path_for_filter(track: &TrackObject) -> Option<std::path::PathBuf> {
+    let uri = track.uri();
+    let parsed = url::Url::parse(&uri).ok()?;
+    if parsed.scheme() != "file" {
+        return None;
+    }
+    parsed.to_file_path().ok()
 }
 
 /// Re-resolve queued library items from committed library state.
@@ -3700,6 +3844,8 @@ fn invalidate_playlist_projections(
     master_tracks: &Rc<RefCell<Vec<TrackObject>>>,
     browser_widget: &gtk::Box,
     browser_state: &browser::BrowserState,
+    folder_browser_state: &folder_browser::FolderBrowserState,
+    app_config: &Rc<RefCell<preferences::AppConfig>>,
     status_label: &gtk::Label,
     column_view: &gtk::ColumnView,
 ) {
@@ -3726,8 +3872,11 @@ fn invalidate_playlist_projections(
         master_tracks,
         browser_widget,
         browser_state,
+        folder_browser_state,
+        app_config,
         status_label,
         column_view,
+        false,
     );
 
     // During remote authentication, visible source and latest navigation
@@ -3748,6 +3897,8 @@ fn invalidate_playlist_projections(
             master_tracks.clone(),
             browser_widget.clone(),
             browser_state.clone(),
+            folder_browser_state.clone(),
+            app_config.clone(),
             status_label.clone(),
             column_view.clone(),
         );
@@ -3769,6 +3920,7 @@ fn setup_library_events(
     source_navigation: Rc<RefCell<SourceNavigation>>,
     browser_widget: &gtk::Box,
     browser_state: browser::BrowserState,
+    folder_browser_state: folder_browser::FolderBrowserState,
     column_view: &gtk::ColumnView,
     sidebar_store: gtk::gio::ListStore,
     sidebar_selection: gtk::SingleSelection,
@@ -3784,6 +3936,7 @@ fn setup_library_events(
 ) {
     let window = window.clone();
     let browser_widget = browser_widget.clone();
+    let folder_browser_state = folder_browser_state.clone();
     let column_view = column_view.clone();
 
     // ── Debounce browser rebuilds for TrackUpserted / TrackRemoved ──
@@ -3830,8 +3983,11 @@ fn setup_library_events(
                             &master_tracks,
                             &browser_widget,
                             &browser_state,
+                            &folder_browser_state,
+                            &app_config,
                             &status_label,
                             &column_view,
+                            false,
                         );
                     }
                 }
@@ -4069,6 +4225,8 @@ fn setup_library_events(
                         &master_tracks,
                         &browser_widget,
                         &browser_state,
+                        &folder_browser_state,
+                        &app_config,
                         &status_label,
                         &column_view,
                     );
@@ -4102,6 +4260,8 @@ fn setup_library_events(
                         &master_tracks,
                         &browser_widget,
                         &browser_state,
+                        &folder_browser_state,
+                        &app_config,
                         &status_label,
                         &column_view,
                     );
@@ -4303,6 +4463,8 @@ fn publish_remote_library(
     master_tracks: &Rc<RefCell<Vec<TrackObject>>>,
     browser_widget: &gtk::Box,
     browser_state: &browser::BrowserState,
+    folder_browser_state: &folder_browser::FolderBrowserState,
+    app_config: &Rc<RefCell<preferences::AppConfig>>,
     status_label: &gtk::Label,
     column_view: &gtk::ColumnView,
 ) {
@@ -4355,8 +4517,11 @@ fn publish_remote_library(
             master_tracks,
             browser_widget,
             browser_state,
+            folder_browser_state,
+            app_config,
             status_label,
             column_view,
+            false,
         );
     }
 }

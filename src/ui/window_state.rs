@@ -12,6 +12,7 @@ use std::rc::Rc;
 use crate::local::engine::LibraryEvent;
 
 use super::browser::BrowserState;
+use super::folder_browser::FolderBrowserState;
 use super::objects::TrackObject;
 use super::preferences;
 use super::source_navigation::{PendingConnection, SourceNavigation, SourceRequest};
@@ -100,6 +101,10 @@ pub struct WindowState {
     /// Opaque browser state for rebuilding pane data.
     /// Used by: discovery_handler, source_connect, context_menu, window.
     pub browser_state: BrowserState,
+
+    /// Opaque folder-browser state for rebuilding the root-relative
+    /// folder pane (P2.3, issue #14). Used by: window (full-sync path).
+    pub folder_browser_state: FolderBrowserState,
 
     /// The "N tracks — HH:MM total" status label under the tracklist.
     /// Used by: discovery_handler, source_connect, context_menu, window.

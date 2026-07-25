@@ -47,6 +47,7 @@ browser:
   genre: "Genre"
   artist: "Künstler"
   album: "Album"
+  folders: "Ordner"
   all: "Alle"
 
 # ── Tracklist columns ──────────────────────────────────────────────
