@@ -68,9 +68,17 @@ pub struct AlbumArtCell {
 
 impl AlbumArtCell {
     pub fn new(placeholder_icon: &'static str) -> Self {
+        // `-1` is GTK4's sentinel for "use the icon theme's default size
+        // for the requested icon name". Passing `0` requests the icon at
+        // a literal 0×0 pixel size, which is the wrong knob for a
+        // thumbnail column — the placeholder would render at zero
+        // pixels until a real texture overwrites it. The bind factory
+        // sets the actual side length from the controller's size knob
+        // on every bind, so a freshly-built cell is only the icon-theme
+        // fallback.
         let image = gtk::Image::builder()
             .icon_name(placeholder_icon)
-            .pixel_size(0)
+            .pixel_size(-1)
             .build();
         image.set_accessible_role(gtk::AccessibleRole::Img);
         let label = gtk::Label::builder()
@@ -288,6 +296,14 @@ impl AlbumArtCellState {
 pub struct AlbumArtController {
     cache: AlbumArtCache,
     source_registry: Rc<RefCell<Option<crate::source_registry::SourceRegistry>>>,
+    /// Side length (in device pixels) of each rendered thumbnail.
+    /// Wired in from the browser's `BrowserState::album_pane_artwork_size`
+    /// cell so the bind factory and the cache probe both read the
+    /// live preference, not a hardcoded default. `None` until the
+    /// browser's setup step attaches a source; until then the
+    /// controller falls back to [`AlbumArtController::default_pixel_size`]
+    /// so a late wiring (e.g., tests) still renders at a sensible size.
+    pixel_size: Rc<RefCell<Option<Rc<Cell<i32>>>>>,
     placeholder_icon: &'static str,
 }
 
@@ -296,6 +312,7 @@ impl AlbumArtController {
         Self {
             cache: AlbumArtCache::new(),
             source_registry: Rc::new(RefCell::new(None)),
+            pixel_size: Rc::new(RefCell::new(None)),
             placeholder_icon,
         }
     }
@@ -308,6 +325,17 @@ impl AlbumArtController {
         *self.source_registry.borrow_mut() = Some(source_registry);
     }
 
+    /// Wire the live size knob in. The bind factory and the cache probe
+    /// read this cell on every bind, so a subsequent
+    /// [`crate::ui::browser::set_album_pane_artwork_size`] takes effect
+    /// for any row that scrolls into view afterwards. The cell is shared
+    /// with the `BrowserState` so a write through the public setter is
+    /// observed here without any further wiring.
+    #[allow(dead_code)]
+    pub fn attach_pixel_size(&self, pixel_size: Rc<Cell<i32>>) {
+        *self.pixel_size.borrow_mut() = Some(pixel_size);
+    }
+
     pub fn cache(&self) -> &AlbumArtCache {
         &self.cache
     }
@@ -315,6 +343,17 @@ impl AlbumArtController {
     #[allow(dead_code)]
     pub fn placeholder_icon(&self) -> &'static str {
         self.placeholder_icon
+    }
+
+    /// Resolve the side length to render at. Reads the live size knob
+    /// when the controller has been wired to one, otherwise returns
+    /// [`AlbumArtController::default_pixel_size`].
+    fn current_pixel_size(&self) -> i32 {
+        if let Some(cell) = self.pixel_size.borrow().as_ref() {
+            cell.get()
+        } else {
+            Self::default_pixel_size()
+        }
     }
 
     /// Build the bind factory pair (`setup` + `bind`) for the album pane.
@@ -333,7 +372,7 @@ impl AlbumArtController {
     /// bind phase updates those existing widgets in place; `unbind`
     /// disconnects the artwork-paintable notify handler so the next bind
     /// can install a fresh one without leaking observers.
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, dead_code)]
     pub fn build_binder(
         &self,
     ) -> (
@@ -342,6 +381,40 @@ impl AlbumArtController {
         impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
         AlbumArtBinder,
     ) {
+        self.build_binder_with_size_internal(None)
+    }
+
+    /// Build the bind factory pair, additionally wiring the controller
+    /// to the supplied size knob. Equivalent to `build_binder` followed
+    /// by `attach_pixel_size`, but folded into a single call so the
+    /// browser's pane-rebuild path doesn't have to plumb the cell
+    /// through a second setter.
+    #[allow(clippy::type_complexity)]
+    pub fn build_binder_with_size(
+        &self,
+        pixel_size: Rc<Cell<i32>>,
+    ) -> (
+        impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
+        impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
+        impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
+        AlbumArtBinder,
+    ) {
+        self.build_binder_with_size_internal(Some(pixel_size))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn build_binder_with_size_internal(
+        &self,
+        pixel_size: Option<Rc<Cell<i32>>>,
+    ) -> (
+        impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
+        impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
+        impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
+        AlbumArtBinder,
+    ) {
+        if let Some(cell) = pixel_size {
+            *self.pixel_size.borrow_mut() = Some(cell);
+        }
         let placeholder_icon = self.placeholder_icon;
         let binder = AlbumArtBinder::new(self.clone());
         let cell_states = binder.cell_states.clone();
@@ -399,12 +472,17 @@ impl AlbumArtBinder {
                 .cloned()
                 .expect("setup closure must register a cell state for this list_item");
 
+            // Apply the live pixel size to the cell's image before
+            // deciding between cache hit, cache miss, or no candidate.
+            // `AlbumArtCell::new` requests the icon-theme default, so a
+            // bind here is what tells GTK the actual side length the
+            // placeholder and the eventual texture should render at.
+            let pixel_size = controller.current_pixel_size();
+            cell_state.cell.image.set_pixel_size(pixel_size);
+
             // Cache hit: paint straight from the cache.
             if let Some(ref candidate) = candidate {
-                if let Some(texture) = controller.cache.get(
-                    &candidate.track_id,
-                    AlbumArtController::default_pixel_size(),
-                ) {
+                if let Some(texture) = controller.cache.get(&candidate.track_id, pixel_size) {
                     let generation = cell_state.current_generation().next();
                     cell_state.generation.set(generation);
                     cell_state
@@ -469,7 +547,7 @@ impl AlbumArtController {
         let cache = self.cache.clone();
         let source_registry = self.source_registry.clone();
         let album_key = candidate.track_id.clone();
-        let pixel_size = Self::default_pixel_size();
+        let pixel_size = self.current_pixel_size();
         let cover_art_url = candidate.cover_art_url.clone();
         let uri = candidate.uri.clone();
         let source_id = candidate.source_id;
@@ -696,17 +774,16 @@ mod tests {
     #[test]
     fn bind_generation_advances_on_reset() {
         // `AlbumArtCell::new` builds a real `gtk::Image`, so we need
-        // GTK to be initialised for this test. The first call to
-        // `gtk::init` per test binary wins; ignore the "already
-        // initialised" error so a later test can run before us. Run
-        // this test serially with `--test-threads=1` if a test runner
-        // ever chooses to spawn a GTK worker off-thread.
-        let _ = gtk::init();
-        let cell = AlbumArtCell::new("audio-x-generic-symbolic");
-        let state = AlbumArtCellState::new(cell);
-        let initial = state.current_generation();
-        state.reset("Album A", "Album A");
-        assert_ne!(state.current_generation(), initial);
+        // GTK to be initialised. GTK4 may only be used from the main
+        // thread, so route this test through `gtk::test_synced`, which
+        // runs the closure on GTK's exclusive thread pool.
+        gtk::test_synced(|| {
+            let cell = AlbumArtCell::new("audio-x-generic-symbolic");
+            let state = AlbumArtCellState::new(cell);
+            let initial = state.current_generation();
+            state.reset("Album A", "Album A");
+            assert_ne!(state.current_generation(), initial);
+        });
     }
 
     #[test]
@@ -778,5 +855,57 @@ mod tests {
             AlbumArtController::default_pixel_size(),
             AlbumArtSize::Medium.pixel_size()
         );
+    }
+
+    #[test]
+    fn current_pixel_size_falls_back_to_default_without_source() {
+        // A controller constructed without a size source must render at
+        // the same size the default knob advertises, so an untested
+        // call site doesn't see a different thumbnail size than the
+        // documented default.
+        let controller = AlbumArtController::new("audio-x-generic-symbolic");
+        assert_eq!(
+            controller.current_pixel_size(),
+            AlbumArtController::default_pixel_size()
+        );
+    }
+
+    #[test]
+    fn current_pixel_size_reads_live_source_cell() {
+        // The persisted layout preference must reach the bind path:
+        // flipping the cell from Small to Large must be observed by the
+        // next call into `current_pixel_size`, otherwise the
+        // Small/Large selector in the preferences dialog is inert.
+        let controller = AlbumArtController::new("audio-x-generic-symbolic");
+        let source: Rc<Cell<i32>> = Rc::new(Cell::new(AlbumArtSize::Small.pixel_size()));
+        controller.attach_pixel_size(source.clone());
+        assert_eq!(
+            controller.current_pixel_size(),
+            AlbumArtSize::Small.pixel_size()
+        );
+        source.set(AlbumArtSize::Large.pixel_size());
+        assert_eq!(
+            controller.current_pixel_size(),
+            AlbumArtSize::Large.pixel_size()
+        );
+        source.set(AlbumArtSize::Medium.pixel_size());
+        assert_eq!(
+            controller.current_pixel_size(),
+            AlbumArtSize::Medium.pixel_size()
+        );
+    }
+
+    #[test]
+    fn cell_pixel_size_starts_at_icon_theme_sentinel() {
+        // GTK4's "use the icon theme's default size" sentinel is -1; a
+        // freshly-built cell must request the placeholder at that
+        // sentinel, not at a literal 0 pixels, so the icon-theme
+        // fallback is visible until the bind factory applies the live
+        // side length. GTK4 may only be used from the main thread, so
+        // route through `gtk::test_synced`.
+        gtk::test_synced(|| {
+            let cell = AlbumArtCell::new("audio-x-generic-symbolic");
+            assert_eq!(cell.image.pixel_size(), -1);
+        });
     }
 }
