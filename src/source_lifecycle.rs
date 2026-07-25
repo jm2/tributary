@@ -458,6 +458,13 @@ impl fmt::Debug for CancellationObserver {
 }
 
 impl CancellationObserver {
+    /// Construct a never-cancelled observer. Useful for tests and for code
+    /// paths that accept a cancellation handle but have no upstream source.
+    pub fn never_cancelled() -> Self {
+        let (_sender, receiver) = watch::channel(false);
+        Self { receiver }
+    }
+
     pub fn is_cancelled(&self) -> bool {
         *self.receiver.borrow()
     }

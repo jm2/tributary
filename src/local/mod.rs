@@ -10,9 +10,11 @@ pub mod resolver;
 pub mod rhythmbox_import;
 pub mod rhythmbox_migration;
 mod rhythmbox_smart_playlist;
-mod root_authority;
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) mod root_authority;
 pub mod server_playlist_browser;
 pub mod server_playlist_runtime;
 pub mod smart_rules;
 pub mod tag_parser;
 pub mod tag_writer;
+pub mod write_authority;
