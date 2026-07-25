@@ -5,6 +5,8 @@
 //! platform context-menu key / Shift+F10.
 
 use adw::prelude::*;
+use gtk::gio::prelude::ActionExt;
+use gtk::glib;
 use std::rc::Rc;
 
 use super::objects::{SourceObject, TrackObject};
@@ -13,16 +15,9 @@ use crate::architecture::{MediaKey, SourceId, TrackId};
 use crate::local::playlist_manager::{PlaylistEntryAddOutcome, PlaylistEntryInput};
 use crate::source_registry::{RegularPlaylistTrackResolution, SourceRegistry};
 
-const CONTEXT_MENU_ACTION_GROUP: &str = "tracklist-ctx";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextMenuControllerPlan {
     EventControllerKeyBubble,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextMenuActionOwner {
-    Popover,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +25,6 @@ struct ContextMenuInteractionPlan {
     keyboard_controller: ContextMenuControllerPlan,
     has_popup: bool,
     accessible_key_shortcuts: &'static str,
-    action_owner: ContextMenuActionOwner,
 }
 
 const CONTEXT_MENU_INTERACTION: ContextMenuInteractionPlan = ContextMenuInteractionPlan {
@@ -39,7 +33,6 @@ const CONTEXT_MENU_INTERACTION: ContextMenuInteractionPlan = ContextMenuInteract
     // GTK/GDK calls the physical key `Menu`; the GTK accessible shortcut
     // grammar uses the standardized `ContextMenu` token.
     accessible_key_shortcuts: "Shift+F10 ContextMenu",
-    action_owner: ContextMenuActionOwner::Popover,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,14 +50,12 @@ impl SelectionSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ContextMenuPopupPlan {
     selection: SelectionSnapshot,
-    action_owner: ContextMenuActionOwner,
 }
 
 impl ContextMenuPopupPlan {
     fn from_positions(positions: impl IntoIterator<Item = u32>) -> Option<Self> {
         Some(Self {
             selection: SelectionSnapshot::from_positions(positions)?,
-            action_owner: CONTEXT_MENU_INTERACTION.action_owner,
         })
     }
 }
@@ -382,25 +373,10 @@ pub fn setup_context_menu(state: &WindowState) {
                 return false;
             }
 
-            let popover = gtk::PopoverMenu::from_model(Some(&menu));
-            popover.set_parent(cv);
-            match popup_plan.action_owner {
-                ContextMenuActionOwner::Popover => {
-                    popover.insert_action_group(CONTEXT_MENU_ACTION_GROUP, Some(&action_group));
-                }
-            }
+            let popover = popover_from_menu_model(cv, &menu, &action_group);
             if let Some(anchor) = anchor {
                 popover.set_pointing_to(Some(&anchor));
             }
-
-            // Disable the internal ScrolledWindow that GTK4 PopoverMenu
-            // creates — it adds unnecessary scrollbars for small menus.
-            disable_popover_scrollbars(&popover);
-
-            // Popovers created for a snapshot are one-shot. Explicitly detach the
-            // closed widget so repeated keyboard or pointer invocations do not
-            // retain obsolete action groups or captured selections.
-            popover.connect_closed(|popover| popover.unparent());
             popover.popup();
             true
         },
@@ -883,12 +859,20 @@ fn build_properties_action(
     }
 
     let props_action = gtk::gio::SimpleAction::new("properties", None);
-    let win_for_props = column_view
+    let win_for_props: Option<adw::ApplicationWindow> = column_view
         .root()
         .and_then(|root| root.downcast::<adw::ApplicationWindow>().ok());
+    tracing::debug!(
+        has_win = win_for_props.is_some(),
+        track_count = track_infos.len(),
+        "build_properties_action"
+    );
 
     props_action.connect_activate(move |_, _| {
-        let Some(ref win) = win_for_props else { return };
+        let Some(ref win) = win_for_props else {
+            tracing::warn!("properties action: win_for_props is None, cannot show dialog");
+            return;
+        };
         super::properties_dialog::show_properties_dialog(win, &track_infos, automatic_device);
     });
 
@@ -940,23 +924,82 @@ fn active_source_is_automatic_device(
     })
 }
 
-/// Traverse a `PopoverMenu`'s widget tree and disable scrollbars on any
-/// internal `ScrolledWindow`.  GTK4's `PopoverMenu::from_model()` wraps
-/// its content in a `ScrolledWindow` that adds unnecessary scrollbars
-/// for small menus (e.g., "Add to Playlist" with only 2–3 entries).
-fn disable_popover_scrollbars(popover: &gtk::PopoverMenu) {
-    fn walk(widget: &gtk::Widget) {
-        if let Some(sw) = widget.downcast_ref::<gtk::ScrolledWindow>() {
-            sw.set_hscrollbar_policy(gtk::PolicyType::Never);
-            sw.set_vscrollbar_policy(gtk::PolicyType::Never);
-        }
-        let mut child = widget.first_child();
-        while let Some(c) = child {
-            walk(&c);
-            child = c.next_sibling();
+/// Build a `gtk::Popover` from a `gio::Menu` model and an action group.
+///
+/// Each menu item with an enabled action becomes a flat `gtk::Button`;
+/// disabled actions render as section-header labels. The popover is
+/// parented to `parent` and self-unparents on close.
+///
+/// Submenus are not supported — items with no action reference are
+/// silently skipped.
+///
+/// This is a deliberate departure from `gtk::PopoverMenu::from_model`:
+/// on some Linux desktop configurations that binding can produce an
+/// invisible popover (no widget tree attached), which manifested as
+/// Track Properties / New Playlist / New Smart Playlist dialogs failing
+/// to open after the user clicked their menu entries. Hosting plain
+/// buttons in a generic `gtk::Popover` keeps the same one-shot popover
+/// lifecycle without relying on the broken binding.
+pub fn popover_from_menu_model(
+    parent: &impl IsA<gtk::Widget>,
+    menu: &gtk::gio::Menu,
+    action_group: &gtk::gio::SimpleActionGroup,
+) -> gtk::Popover {
+    let popover = gtk::Popover::new();
+    popover.set_parent(parent);
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+    for i in 0..menu.n_items() {
+        let Some(action_ref) = menu
+            .item_attribute_value(i, "action", Some(glib::VariantTy::STRING))
+            .and_then(|v| v.str().map(|s| s.to_string()))
+        else {
+            continue;
+        };
+        let Some(label) = menu
+            .item_attribute_value(i, "label", Some(glib::VariantTy::STRING))
+            .and_then(|v| v.str().map(|s| s.to_string()))
+        else {
+            continue;
+        };
+
+        let bare_name = action_ref
+            .rsplit('.')
+            .next()
+            .unwrap_or(&action_ref)
+            .to_string();
+
+        if let Some(action) = action_group.lookup_action(&bare_name) {
+            if action.is_enabled() {
+                let btn = gtk::Button::builder()
+                    .label(&label)
+                    .hexpand(true)
+                    .css_classes(["flat"])
+                    .build();
+                let act = action.clone();
+                let pop = popover.clone();
+                btn.connect_clicked(move |_| {
+                    act.activate(None::<&glib::Variant>);
+                    pop.popdown();
+                });
+                vbox.append(&btn);
+            } else {
+                let lbl = gtk::Label::builder()
+                    .label(&label)
+                    .halign(gtk::Align::Start)
+                    .css_classes(["heading", "dim-label"])
+                    .margin_start(8)
+                    .margin_top(4)
+                    .margin_bottom(2)
+                    .build();
+                vbox.append(&lbl);
+            }
         }
     }
-    walk(popover.upcast_ref::<gtk::Widget>());
+
+    popover.set_child(Some(&vbox));
+    popover.connect_closed(|popover| popover.unparent());
+    popover
 }
 
 #[cfg(test)]
@@ -1346,7 +1389,6 @@ mod tests {
                 keyboard_controller: ContextMenuControllerPlan::EventControllerKeyBubble,
                 has_popup: true,
                 accessible_key_shortcuts: "Shift+F10 ContextMenu",
-                action_owner: ContextMenuActionOwner::Popover,
             }
         );
 
@@ -1370,6 +1412,74 @@ mod tests {
         live_selection.clear();
         live_selection.push(4);
         assert_eq!(popup_plan.selection.positions, vec![1, 3]);
-        assert_eq!(popup_plan.action_owner, ContextMenuActionOwner::Popover);
+    }
+
+    /// Regression test for the "dialogs not appearing on Linux" bug:
+    /// `gtk::PopoverMenu::from_model` can produce an invisible popover on
+    /// some Linux desktop configurations, which manifested as Track
+    /// Properties / New Playlist / New Smart Playlist dialogs failing to
+    /// open after the user clicked their menu entries. The fix routes all
+    /// menu display through `popover_from_menu_model`, which always sets a
+    /// non-null child widget built from the menu's actions.
+    ///
+    /// This test exercises that contract end-to-end: with a populated
+    /// menu and matching action group, the resulting popover MUST have a
+    /// child widget containing one button per enabled action. If a future
+    /// change drops the child assignment (e.g. by re-introducing
+    /// `gtk::PopoverMenu::from_model`), this test will fail.
+    #[test]
+    fn popover_from_menu_model_attaches_a_visible_child_widget() {
+        gtk::init().expect("GTK must initialize for this regression test");
+
+        let menu = gtk::gio::Menu::new();
+        menu.append(Some("Open Properties"), Some("ctx.properties"));
+        menu.append(Some("Add to Playlist"), Some("ctx.add"));
+
+        let actions = gtk::gio::SimpleActionGroup::new();
+        let prop_action = gtk::gio::SimpleAction::new("properties", None);
+        let (prop_tx, prop_rx) = async_channel::unbounded::<()>();
+        prop_action.connect_activate(move |_, _| {
+            let _ = prop_tx.send_blocking(());
+        });
+        actions.add_action(&prop_action);
+
+        let add_action = gtk::gio::SimpleAction::new("add", None);
+        let (add_tx, add_rx) = async_channel::unbounded::<()>();
+        add_action.connect_activate(move |_, _| {
+            let _ = add_tx.send_blocking(());
+        });
+        actions.add_action(&add_action);
+
+        let parent = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let popover = popover_from_menu_model(&parent, &menu, &actions);
+
+        let child = popover
+            .child()
+            .expect("popover must have a non-null child after construction");
+        let vbox = child
+            .downcast::<gtk::Box>()
+            .expect("popover child must be the menu's Box");
+        assert_eq!(
+            vbox.observe_children().n_items(),
+            2,
+            "one button per enabled action"
+        );
+
+        // Clicking the first button must activate the corresponding
+        // action and close the popover — that's the user-visible fix.
+        let first_button = vbox
+            .observe_children()
+            .item(0)
+            .and_then(|o| o.downcast::<gtk::Button>().ok())
+            .expect("first child must be a button");
+        assert_eq!(first_button.label().as_deref(), Some("Open Properties"));
+
+        first_button.emit_clicked();
+        assert_eq!(prop_rx.try_recv(), Ok(()), "properties action must fire");
+        assert_eq!(
+            add_rx.try_recv(),
+            Err(async_channel::TryRecvError::Empty),
+            "non-clicked actions must not fire"
+        );
     }
 }

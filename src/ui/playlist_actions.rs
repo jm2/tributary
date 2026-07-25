@@ -7,8 +7,9 @@
 use adw::prelude::*;
 use gtk::glib;
 use std::cell::Cell;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::objects::{PlaylistSidebarKind, SourceObject};
 use super::sidebar;
@@ -65,74 +66,125 @@ pub fn setup_playlist_actions(
     let win = state.window.clone();
     let playlist_sidebar_refresh = state.playlist_sidebar_refresh.clone();
 
+    debug!("setup_playlist_actions: async task spawned");
     glib::MainContext::default().spawn_local(async move {
+        debug!("setup_playlist_actions: async task started polling");
         while let Ok(action) = playlist_action_rx.recv().await {
-            // Receiver closure still permits already-buffered values to be
-            // drained. Do not present a queued dialog after shutdown made the
-            // window inert.
+            debug!(?action, "setup_playlist_actions: action received, window_closing={}", window_closing.get());
+
             if window_closing.get() {
+                debug!("setup_playlist_actions: window_closing, breaking loop");
                 break;
             }
             match action {
                 sidebar::PlaylistAction::CreateRegular => {
-                    handle_create_regular(&win, &rt_handle, &playlist_sidebar_refresh);
+                    debug!("dispatching CreateRegular");
+                    if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
+                        handle_create_regular(&win, &rt_handle, &playlist_sidebar_refresh);
+                    })) {
+                        error!("CreateRegular handler panicked: {e:?}");
+                    }
                 }
 
                 sidebar::PlaylistAction::CreateSmart => {
-                    handle_create_smart(&win, &rt_handle, &playlist_sidebar_refresh);
+                    debug!("dispatching CreateSmart");
+                    if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
+                        handle_create_smart(&win, &rt_handle, &playlist_sidebar_refresh);
+                    })) {
+                        error!("CreateSmart handler panicked: {e:?}");
+                    }
                 }
 
                 sidebar::PlaylistAction::Rename(playlist_id) => {
+                    debug!(id = %playlist_id, "dispatching Rename");
                     if playlist_allows_ordinary_actions(&sidebar_store, &playlist_id) {
-                        handle_rename(
-                            &win,
-                            &sidebar_store,
-                            &rt_handle,
-                            &playlist_sidebar_refresh,
-                            &playlist_id,
-                        );
+                        if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
+                            handle_rename(
+                                &win,
+                                &sidebar_store,
+                                &rt_handle,
+                                &playlist_sidebar_refresh,
+                                &playlist_id,
+                            );
+                        })) {
+                            error!(id = %playlist_id, "Rename handler panicked: {e:?}");
+                        }
+                    } else {
+                        debug!(id = %playlist_id, "Rename: playlist_allows_ordinary_actions rejected");
                     }
                 }
 
                 sidebar::PlaylistAction::Delete(playlist_id) => {
+                    debug!(id = %playlist_id, "dispatching Delete");
                     if playlist_allows_ordinary_actions(&sidebar_store, &playlist_id) {
-                        handle_delete(
-                            &win,
-                            &sidebar_store,
-                            &rt_handle,
-                            &playlist_sidebar_refresh,
-                            &playlist_id,
-                        );
+                        if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
+                            handle_delete(
+                                &win,
+                                &sidebar_store,
+                                &rt_handle,
+                                &playlist_sidebar_refresh,
+                                &playlist_id,
+                            );
+                        })) {
+                            error!(id = %playlist_id, "Delete handler panicked: {e:?}");
+                        }
+                    } else {
+                        debug!(id = %playlist_id, "Delete: playlist_allows_ordinary_actions rejected");
                     }
                 }
 
                 sidebar::PlaylistAction::EditSmart(playlist_id) => {
+                    debug!(id = %playlist_id, "dispatching EditSmart");
                     if playlist_is_editable_smart(&sidebar_store, &playlist_id) {
-                        handle_edit_smart(
-                            &win,
-                            &sidebar_store,
-                            &rt_handle,
-                            &playlist_sidebar_refresh,
-                            &playlist_id,
-                        );
+                        if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
+                            handle_edit_smart(
+                                &win,
+                                &sidebar_store,
+                                &rt_handle,
+                                &playlist_sidebar_refresh,
+                                &playlist_id,
+                            );
+                        })) {
+                            error!(id = %playlist_id, "EditSmart handler panicked: {e:?}");
+                        }
+                    } else {
+                        debug!(id = %playlist_id, "EditSmart: playlist_is_editable_smart rejected");
                     }
                 }
 
                 sidebar::PlaylistAction::ImportPlaylist => {
-                    handle_import_playlist(&win, &rt_handle, &playlist_sidebar_refresh);
+                    debug!("dispatching ImportPlaylist");
+                    if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
+                        handle_import_playlist(&win, &rt_handle, &playlist_sidebar_refresh);
+                    })) {
+                        error!("ImportPlaylist handler panicked: {e:?}");
+                    }
                 }
 
                 sidebar::PlaylistAction::BrowseServerPlaylists => {
-                    browse_server_playlists();
+                    debug!("dispatching BrowseServerPlaylists");
+                    if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
+                        browse_server_playlists();
+                    })) {
+                        error!("BrowseServerPlaylists handler panicked: {e:?}");
+                    }
                 }
 
                 sidebar::PlaylistAction::ExportPlaylist(playlist_id) => {
+                    debug!(id = %playlist_id, "dispatching ExportPlaylist");
                     if playlist_allows_ordinary_actions(&sidebar_store, &playlist_id) {
-                        handle_export_playlist(&win, &sidebar_store, &rt_handle, &playlist_id);
+                        if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
+                            handle_export_playlist(&win, &sidebar_store, &rt_handle, &playlist_id);
+                        })) {
+                            error!(id = %playlist_id, "ExportPlaylist handler panicked: {e:?}");
+                        }
+                    } else {
+                        debug!(id = %playlist_id, "ExportPlaylist: playlist_allows_ordinary_actions rejected");
                     }
                 }
             }
         }
+        info!("setup_playlist_actions: async task finished (channel closed or loop exited)");
     });
 }
 
