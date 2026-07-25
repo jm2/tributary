@@ -7,7 +7,7 @@ mod browser_item;
 mod source_object;
 mod track_object;
 
-pub use browser_item::BrowserItem;
+pub use browser_item::{AlbumArtCandidate, BrowserItem};
 pub use source_object::{HeaderKind, PlaylistSidebarKind, SourceObject};
 pub use track_object::TrackObject;
 pub use track_object::{
