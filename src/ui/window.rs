@@ -1856,8 +1856,21 @@ pub(crate) fn build_window(
     );
 
     let initial_use_album_artist = app_config.borrow().group_by_album_artist;
-    let (browser_widget, browser_state) =
-        browser::build_browser(&empty_tracks, initial_use_album_artist, on_filter);
+    let initial_album_pane_artwork = app_config.borrow().album_pane_artwork;
+    let initial_album_pane_artwork_size =
+        preferences::AlbumArtSize::pixel_size(app_config.borrow().album_pane_artwork_size);
+    let (browser_widget, browser_state) = browser::build_browser(
+        &empty_tracks,
+        initial_use_album_artist,
+        initial_album_pane_artwork,
+        initial_album_pane_artwork_size,
+        on_filter,
+    );
+    // The album-art controller now needs the live source registry to
+    // resolve credential-isolated remote artwork. Wire it in here so
+    // the first bind (which may run as soon as the user scrolls the
+    // album pane) sees the registry.
+    browser::attach_source_registry(&browser_state, source_registry.clone());
 
     // ── Right content ────────────────────────────────────────────────
     let right_paned = gtk::Paned::builder()
@@ -3557,19 +3570,44 @@ pub(crate) fn build_window(
         let master_for_pref = master_tracks.clone();
         let prefs_action = gtk::gio::SimpleAction::new("show-preferences", None);
         prefs_action.connect_activate(move |_, _| {
-            let bw_for_cb = bw.clone();
-            let bs_for_cb = bs.clone();
-            let master_for_cb = master_for_pref.clone();
+            let bw_for_aa = bw.clone();
+            let bs_for_aa = bs.clone();
+            let master_for_aa = master_for_pref.clone();
             let on_aa_change: std::rc::Rc<dyn Fn(bool)> = std::rc::Rc::new(move |enabled: bool| {
                 // Refresh the browser snapshot so the album-artist
                 // grouping change takes effect against the latest
                 // library state, not just whatever was loaded when
                 // the browser was first built.
-                let tracks = master_for_cb.borrow().clone();
-                browser::rebuild_browser_data(&bw_for_cb, &bs_for_cb, &tracks);
-                browser::set_album_artist_grouping(&bw_for_cb, &bs_for_cb, enabled);
+                let tracks = master_for_aa.borrow().clone();
+                browser::rebuild_browser_data(&bw_for_aa, &bs_for_aa, &tracks);
+                browser::set_album_artist_grouping(&bw_for_aa, &bs_for_aa, enabled);
             });
-            preferences::show_preferences(&win, &cv, &bw, &cfg, on_aa_change);
+            let bw_for_art = bw.clone();
+            let bs_for_art = bs.clone();
+            let on_art_change: std::rc::Rc<dyn Fn(bool)> =
+                std::rc::Rc::new(move |enabled: bool| {
+                    // The album pane is the 3rd child of the panes
+                    // box; swapping the bind factory is the only path
+                    // GTK's ListView exposes for changing factory
+                    // behaviour, and rebuilding the pane also drops
+                    // any cached `gdk::Texture` handles from the old
+                    // size.
+                    browser::set_album_pane_artwork(&bw_for_art, &bs_for_art, enabled);
+                });
+            let bs_for_size = bs.clone();
+            let on_art_size_change: std::rc::Rc<dyn Fn(preferences::AlbumArtSize)> =
+                std::rc::Rc::new(move |size: preferences::AlbumArtSize| {
+                    browser::set_album_pane_artwork_size(&bs_for_size, size.pixel_size());
+                });
+            preferences::show_preferences(
+                &win,
+                &cv,
+                &bw,
+                &cfg,
+                on_aa_change,
+                on_art_change,
+                on_art_size_change,
+            );
         });
         window.add_action(&prefs_action);
     }
