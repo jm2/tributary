@@ -229,56 +229,6 @@ fn playlist_creation_action_group(
     action_group
 }
 
-/// Build one immutable action snapshot for a playlist context-menu popover.
-///
-/// A `GtkListItem` and its row widget may be rebound while the menu remains
-/// open, so the actions must capture the target ID once and be owned by the
-/// one-shot popover rather than by the recycled row.
-#[allow(dead_code)]
-fn playlist_popup_action_group(
-    tx: &async_channel::Sender<PlaylistAction>,
-    playlist_id: Option<&str>,
-) -> gio::SimpleActionGroup {
-    let action_group = playlist_creation_action_group(tx);
-    let Some(playlist_id) = playlist_id else {
-        return action_group;
-    };
-    let playlist_id = playlist_id.to_string();
-
-    let tx_rename = tx.clone();
-    let pid = playlist_id.clone();
-    let rename = gio::SimpleAction::new("rename", None);
-    rename.connect_activate(move |_, _| {
-        let _ = tx_rename.try_send(PlaylistAction::Rename(pid.clone()));
-    });
-    action_group.add_action(&rename);
-
-    let tx_delete = tx.clone();
-    let pid = playlist_id.clone();
-    let delete = gio::SimpleAction::new("delete", None);
-    delete.connect_activate(move |_, _| {
-        let _ = tx_delete.try_send(PlaylistAction::Delete(pid.clone()));
-    });
-    action_group.add_action(&delete);
-
-    let tx_edit = tx.clone();
-    let pid = playlist_id.clone();
-    let edit_smart = gio::SimpleAction::new("edit-smart", None);
-    edit_smart.connect_activate(move |_, _| {
-        let _ = tx_edit.try_send(PlaylistAction::EditSmart(pid.clone()));
-    });
-    action_group.add_action(&edit_smart);
-
-    let tx_export = tx.clone();
-    let export = gio::SimpleAction::new("export", None);
-    export.connect_activate(move |_, _| {
-        let _ = tx_export.try_send(PlaylistAction::ExportPlaylist(playlist_id.clone()));
-    });
-    action_group.add_action(&export);
-
-    action_group
-}
-
 /// Build the source sidebar.
 ///
 /// Returns `(sidebar_box, ListStore, SingleSelection, disconnect_rx, delete_rx, add_button, playlist_action_rx)`.
@@ -875,26 +825,5 @@ mod tests {
             label.str(),
             Some(rust_i18n::t!("server_playlists.browse_menu").as_ref())
         );
-    }
-
-    #[test]
-    fn playlist_popup_actions_are_popover_owned_immutable_snapshots() {
-        let (tx, rx) = async_channel::unbounded();
-        let first_popup = playlist_popup_action_group(&tx, Some("first-playlist"));
-        let rebound_popup = playlist_popup_action_group(&tx, Some("rebound-playlist"));
-
-        // Creating the action snapshot for a rebound row cannot retarget the
-        // already-open popover's immutable snapshot.
-        rebound_popup.activate_action("rename", None);
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            PlaylistAction::Rename("rebound-playlist".to_string())
-        );
-        first_popup.activate_action("rename", None);
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            PlaylistAction::Rename("first-playlist".to_string())
-        );
-        assert_empty(&rx);
     }
 }
