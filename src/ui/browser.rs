@@ -537,10 +537,7 @@ fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
             .item()
             .and_downcast::<BrowserItem>()
             .expect("BrowserItem");
-        let row = list_item
-            .child()
-            .and_downcast::<gtk::Box>()
-            .expect("Box");
+        let row = list_item.child().and_downcast::<gtk::Box>().expect("Box");
         let first = row
             .first_child()
             .and_downcast::<gtk::Label>()
