@@ -780,16 +780,58 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
 
 // ── Chromecast mDNS event processing ────────────────────────────────────
 
+/// Whether an IPv6 address is a reachable LAN-routable candidate for the
+/// cast HTTP control endpoint. Mirrors the listener-side
+/// `cast_http_server::is_reachable_ipv6` rule (global unicast 2000::/3 or
+/// unique-local fc00::/7) so the two sides cannot diverge on what counts as
+/// "reachable".
+fn reachable_chromecast_v6_control(ip: &std::net::Ipv6Addr) -> bool {
+    crate::audio::cast_http_server::is_reachable_ipv6(ip)
+}
+
+/// Whether the cast HTTP control endpoint from `info` is something the
+/// receiver can actually be reached on — and, for IPv6, whether the
+/// receiver-facility listener has actually bound V6 so the control channel
+/// and the media channel share an address family.
+///
+/// An IPv4 endpoint is accepted on the existing reachability rules:
+/// non-loopback, non-link-local, non-unspecified, non-multicast, non-broadcast,
+/// and a non-zero port.
+///
+/// An IPv6 endpoint is accepted only when all of the following hold:
+/// - the listener has actually bound an IPv6 socket on this host (so the
+///   media ticket is reachable over the same family — the symmetric-publish
+///   guarantee that the bead requires);
+/// - the address is reachable by the same global-unicast / unique-local rule
+///   the listener uses (no link-local, loopback, unspecified, or multicast);
+/// - the port is non-zero.
+///
+/// Scoped and link-local IPv6 addresses are skipped because a portable
+/// receiver URL cannot carry the required zone identifier.
 fn usable_chromecast_control_address(address: &SocketAddr) -> bool {
-    let SocketAddr::V4(address) = address else {
+    if address.port() == 0 {
         return false;
-    };
-    let ip = *address.ip();
-    address.port() != 0
-        && !ip.is_unspecified()
-        && !ip.is_loopback()
-        && !ip.is_multicast()
-        && ip != Ipv4Addr::BROADCAST
+    }
+    match address {
+        SocketAddr::V4(v4) => {
+            let ip = *v4.ip();
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_multicast()
+                && ip != Ipv4Addr::BROADCAST
+        }
+        SocketAddr::V6(v6) => {
+            let ip = *v6.ip();
+            if !crate::audio::cast_http_server::cast_listener_binds_ipv6() {
+                return false;
+            }
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_multicast()
+                && !ip.is_unicast_link_local()
+                && reachable_chromecast_v6_control(&ip)
+        }
+    }
 }
 
 /// Process a Chromecast mDNS event.
@@ -841,7 +883,7 @@ fn process_chromecast_event(
                 .copied()
                 .find(usable_chromecast_control_address)
             else {
-                warn!(name = %name, "Chromecast has no advertised IPv4 control address");
+                warn!(name = %name, "Chromecast has no advertised LAN-routable control address");
                 publish_mdns_events(publications.remove(&key), tx);
                 return;
             };
@@ -1050,6 +1092,30 @@ mod tests {
         events
     }
 
+    /// Reset the cast listener's IPv6 latch to the supplied value for the
+    /// duration of the test. The latch is process-global, so every test
+    /// that depends on its value must install the desired state explicitly
+    /// and hold the process-wide lock so parallel tests cannot race the
+    /// swap.
+    fn with_listener_binds_ipv6<R>(value: bool, f: impl FnOnce() -> R) -> R {
+        // Recover from a freshly-poisoned lock: a panic in one test should
+        // not strand every other test that observes the latch.
+        let _guard = LISTENER_BINDS_IPV6_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let previous =
+            crate::audio::cast_http_server::set_cast_listener_binds_ipv6_for_test_and_swap(value);
+        let result = f();
+        crate::audio::cast_http_server::set_cast_listener_binds_ipv6_for_test_and_swap(previous);
+        result
+    }
+
+    /// Process-wide serial lock for the cast listener's IPv6 latch. Tests
+    /// that observe or mutate the latch must hold this lock so the
+    /// `swap → observe → swap-back` discipline is not racy across parallel
+    /// `cargo test` threads.
+    static LISTENER_BINDS_IPV6_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn found(events: &[DiscoveryEvent]) -> &super::DiscoveredServer {
         assert_eq!(events.len(), 1);
         let DiscoveryEvent::Found(server) = &events[0] else {
@@ -1060,87 +1126,196 @@ mod tests {
 
     #[test]
     fn chromecast_publication_uses_a_numeric_advertised_ipv4_endpoint() {
-        let mut publications = MdnsPublications::default();
-        let event = chromecast_resolved_event(
-            "Living Room",
-            "speaker.local.",
-            &["2001:db8::45", "192.0.2.45", "192.0.2.44"],
-            8009,
-        );
+        with_listener_binds_ipv6(false, || {
+            let mut publications = MdnsPublications::default();
+            let event = chromecast_resolved_event(
+                "Living Room",
+                "speaker.local.",
+                &["2001:db8::45", "192.0.2.45", "192.0.2.44"],
+                8009,
+            );
 
-        let events = process_chromecast(&mut publications, event);
-        let server = found(&events);
-        assert_eq!(server.url, "cast://192.0.2.44:8009");
-        assert!(!server.url.contains("speaker.local"));
+            let events = process_chromecast(&mut publications, event);
+            let server = found(&events);
+            assert_eq!(server.url, "cast://192.0.2.44:8009");
+            assert!(!server.url.contains("speaker.local"));
+        });
     }
 
     #[test]
     fn chromecast_publication_skips_unusable_ipv4_control_endpoints() {
-        let mut publications = MdnsPublications::default();
-        let event = chromecast_resolved_event(
-            "Living Room",
-            "speaker.local.",
-            &[
-                "0.0.0.0",
-                "127.0.0.1",
-                "224.0.0.1",
-                "255.255.255.255",
-                "192.0.2.45",
-            ],
-            8009,
-        );
+        with_listener_binds_ipv6(false, || {
+            let mut publications = MdnsPublications::default();
+            let event = chromecast_resolved_event(
+                "Living Room",
+                "speaker.local.",
+                &[
+                    "0.0.0.0",
+                    "127.0.0.1",
+                    "224.0.0.1",
+                    "255.255.255.255",
+                    "192.0.2.45",
+                ],
+                8009,
+            );
 
-        let events = process_chromecast(&mut publications, event);
-        assert_eq!(found(&events).url, "cast://192.0.2.45:8009");
-        assert!(!usable_chromecast_control_address(
-            &"192.0.2.45:0".parse().expect("port-zero endpoint")
-        ));
+            let events = process_chromecast(&mut publications, event);
+            assert_eq!(found(&events).url, "cast://192.0.2.45:8009");
+            assert!(!usable_chromecast_control_address(
+                &"192.0.2.45:0".parse().expect("port-zero endpoint")
+            ));
+        });
     }
 
     #[test]
     fn unusable_chromecast_update_retires_the_previous_ipv4_endpoint() {
-        let mut publications = MdnsPublications::default();
-        let initial =
-            chromecast_resolved_event("Living Room", "speaker.local.", &["192.0.2.44"], 8009);
-        assert!(matches!(
-            process_chromecast(&mut publications, initial).as_slice(),
-            [DiscoveryEvent::Found(server)] if server.url == "cast://192.0.2.44:8009"
-        ));
+        with_listener_binds_ipv6(false, || {
+            let mut publications = MdnsPublications::default();
+            let initial =
+                chromecast_resolved_event("Living Room", "speaker.local.", &["192.0.2.44"], 8009);
+            assert!(matches!(
+                process_chromecast(&mut publications, initial).as_slice(),
+                [DiscoveryEvent::Found(server)] if server.url == "cast://192.0.2.44:8009"
+            ));
 
-        let update =
-            chromecast_resolved_event("Living Room", "speaker.local.", &["2001:db8::45"], 8009);
-        assert_eq!(
-            process_chromecast(&mut publications, update),
-            vec![DiscoveryEvent::Lost {
-                url: "cast://192.0.2.44:8009".to_string(),
-                service_type: "chromecast".to_string(),
-            }]
-        );
-        assert!(publications.by_instance.is_empty());
+            let update =
+                chromecast_resolved_event("Living Room", "speaker.local.", &["2001:db8::45"], 8009);
+            assert_eq!(
+                process_chromecast(&mut publications, update),
+                vec![DiscoveryEvent::Lost {
+                    url: "cast://192.0.2.44:8009".to_string(),
+                    service_type: "chromecast".to_string(),
+                }]
+            );
+            assert!(publications.by_instance.is_empty());
+        });
     }
 
     #[test]
     fn chromecast_address_change_loses_old_endpoint_before_finding_new() {
-        let mut publications = MdnsPublications::default();
-        let initial =
-            chromecast_resolved_event("Living Room", "speaker.local.", &["192.0.2.44"], 8009);
-        let _ = process_chromecast(&mut publications, initial);
+        with_listener_binds_ipv6(false, || {
+            let mut publications = MdnsPublications::default();
+            let initial =
+                chromecast_resolved_event("Living Room", "speaker.local.", &["192.0.2.44"], 8009);
+            let _ = process_chromecast(&mut publications, initial);
 
-        let replacement =
-            chromecast_resolved_event("Living Room", "speaker.local.", &["192.0.2.45"], 8009);
-        let events = process_chromecast(&mut publications, replacement);
-        assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[0],
-            DiscoveryEvent::Lost {
-                url: "cast://192.0.2.44:8009".to_string(),
-                service_type: "chromecast".to_string(),
+            let replacement =
+                chromecast_resolved_event("Living Room", "speaker.local.", &["192.0.2.45"], 8009);
+            let events = process_chromecast(&mut publications, replacement);
+            assert_eq!(events.len(), 2);
+            assert_eq!(
+                events[0],
+                DiscoveryEvent::Lost {
+                    url: "cast://192.0.2.44:8009".to_string(),
+                    service_type: "chromecast".to_string(),
+                }
+            );
+            assert!(matches!(
+                &events[1],
+                DiscoveryEvent::Found(server) if server.url == "cast://192.0.2.45:8009"
+            ));
+        });
+    }
+
+    /// When the listener has actually bound an IPv6 socket, a global-unicast
+    /// IPv6 control endpoint is accepted and the chromecast is published with
+    /// a bracketed `cast://` URL — the bead's symmetric-publish guarantee.
+    #[test]
+    fn chromecast_publication_accepts_a_reachable_ipv6_endpoint_when_listener_is_v6() {
+        with_listener_binds_ipv6(true, || {
+            let mut publications = MdnsPublications::default();
+            let event =
+                chromecast_resolved_event("Living Room", "speaker.local.", &["2001:db8::45"], 8009);
+
+            let events = process_chromecast(&mut publications, event);
+            assert_eq!(found(&events).url, "cast://[2001:db8::45]:8009");
+        });
+    }
+
+    /// Unique-local IPv6 (RFC 4193, fc00::/7) is reachable on a LAN without
+    /// upstream routing and is accepted when the listener is bound on V6.
+    #[test]
+    fn chromecast_publication_accepts_unique_local_ipv6_when_listener_is_v6() {
+        with_listener_binds_ipv6(true, || {
+            let mut publications = MdnsPublications::default();
+            let event =
+                chromecast_resolved_event("Living Room", "speaker.local.", &["fd00:beef::1"], 8009);
+
+            let events = process_chromecast(&mut publications, event);
+            assert_eq!(found(&events).url, "cast://[fd00:beef::1]:8009");
+        });
+    }
+
+    /// On a network that exposes both families, an IPv4 control endpoint is
+    /// preferred even when the listener is bound on V6 — the existing
+    /// `cast://<ipv4>:<port>` receiver contract reaches more devices than the
+    /// bracketed V6 form.
+    #[test]
+    fn chromecast_publication_prefers_ipv4_when_both_families_are_advertised() {
+        with_listener_binds_ipv6(true, || {
+            let mut publications = MdnsPublications::default();
+            let event = chromecast_resolved_event(
+                "Living Room",
+                "speaker.local.",
+                &["2001:db8::45", "192.0.2.45"],
+                8009,
+            );
+
+            let events = process_chromecast(&mut publications, event);
+            assert_eq!(found(&events).url, "cast://192.0.2.45:8009");
+        });
+    }
+
+    /// When the listener is bound on IPv4 only, an IPv6-only control endpoint
+    /// is rejected — the bead's symmetric-publish guarantee requires the
+    /// receiver URL and the listener to share an address family.
+    #[test]
+    fn chromecast_publication_rejects_ipv6_only_when_listener_is_v4() {
+        with_listener_binds_ipv6(false, || {
+            let mut publications = MdnsPublications::default();
+            let event =
+                chromecast_resolved_event("Living Room", "speaker.local.", &["2001:db8::45"], 8009);
+
+            let events = process_chromecast(&mut publications, event);
+            assert!(events.is_empty(), "no Chromecast should be published");
+            assert!(publications.by_instance.is_empty());
+        });
+    }
+
+    /// Link-local and loopback IPv6 endpoints are still rejected even when the
+    /// listener is bound on V6 — a portable receiver URL cannot carry the
+    /// required zone identifier.
+    #[test]
+    fn chromecast_publication_rejects_link_local_and_loopback_ipv6_even_when_listener_is_v6() {
+        with_listener_binds_ipv6(true, || {
+            for addresses in [
+                &["fe80::45"][..],
+                &["::1"][..],
+                &["ff02::1"][..],
+                &["::"][..],
+            ] {
+                let mut publications = MdnsPublications::default();
+                let event =
+                    chromecast_resolved_event("Living Room", "speaker.local.", addresses, 8009);
+                let events = process_chromecast(&mut publications, event);
+                assert!(
+                    events.is_empty(),
+                    "{addresses:?} must not produce a Found event when the listener is V6: {events:?}"
+                );
+                assert!(publications.by_instance.is_empty());
             }
-        );
-        assert!(matches!(
-            &events[1],
-            DiscoveryEvent::Found(server) if server.url == "cast://192.0.2.45:8009"
-        ));
+        });
+    }
+
+    /// A port-zero V6 endpoint is rejected for the same reason the IPv4 case
+    /// is rejected: the cast control channel has no port to dial.
+    #[test]
+    fn chromecast_publication_rejects_port_zero_ipv6_endpoint() {
+        with_listener_binds_ipv6(true, || {
+            assert!(!usable_chromecast_control_address(
+                &"[2001:db8::45]:0".parse().expect("port-zero V6 endpoint")
+            ));
+        });
     }
 
     #[test]
