@@ -384,7 +384,8 @@ full acceptance is binding; the checklist below indexes it. No new record has a 
 
 - [ ] **P2.4-A** — Design the equalizer filter graph, band/preset/preamp/clipping contract,
   live-reconfiguration boundary, persistence, and capability matrix for local, AirPlay, Chromecast,
-  and MPD outputs ([#49](https://github.com/jm2/tributary/issues/49)).
+  and MPD outputs ([#49](https://github.com/jm2/tributary/issues/49);
+  [contract in progress](equalizer.md)).
 
   In flight; #183 / `tr-sbp`. Accept the measured DSP/clipping contract before P2.4-B.
 
