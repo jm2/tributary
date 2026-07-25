@@ -1376,21 +1376,25 @@ could not transmit to the device that was clicked.
   GTK main thread; they run synchronously under `load_uri` today. Resolved by removal: there is no
   subprocess left to probe, spawn, or tear down. The remaining teardown is a plain GStreamer
   `set_state(Null)`, identical to the local output's lifecycle.
-- [x] Add a test proving a missing `raopsink` produces a localized, non-silent refusal rather than
-  a no-op stream. `a_missing_raopsink_is_refused_with_install_guidance` pins the refusal at the
-  policy seam (`ensure_raopsink(false)`), and
-  `a_missing_raopsink_load_fails_loudly_not_silently` proves the load path emits `Error` (with
-  the localized message) then `Stopped` — never a silent stream. The guidance text intentionally
-  names only `raopsink`; recommending `gst-plugins-bad` would be wrong because current supported
-  GStreamer, Homebrew, and MSYS2 packages do not ship that element (see
-  `release-component-policy.md`).
+- [x] Remove the non-working fallback and surface a localized error naming the unavailable
+  `raopsink` sender instead of silently spawning a subprocess that cannot work. The fallback is
+  removed: `build_shairport_pipeline`, the `Session` child-process/fd plumbing, and both `cfg`
+  variants are gone. `open_prepared_session` now gates every load on `ensure_raopsink`. The current
+  message intentionally does **not** recommend `gst-plugins-bad`: the provenance review in
+  `release-component-policy.md` established that no current official GStreamer, Homebrew, or MSYS2
+  package ships `raopsink`. Because `PlayerEvent::Error` messages were previously log-only — no user
+  would ever have seen the failure — the window's error branch now also surfaces every player error
+  as a toast; output failure messages were already reduced to fixed, credential- and URL-free
+  categories, so verbatim display is safe.
+- [x] Move the `which` probe (`airplay_output.rs:298`), the subprocess spawn, and teardown off the GTK main thread; they run synchronously under `load_uri` today. Resolved by removal: there is no subprocess left to probe, spawn, or tear down. The remaining teardown is a plain GStreamer `set_state(Null)`, identical to the local output's lifecycle.
+- [x] Add tests proving a missing `raopsink` produces a localized, non-silent refusal rather than a no-op stream. The focused tests pin the refusal at the policy seam and prove the load path emits `Error` (with the localized message) then `Stopped` — never a silent stream. The guidance intentionally names only `raopsink`; recommending `gst-plugins-bad` would be wrong because current supported GStreamer, Homebrew, and MSYS2 packages do not ship that element (see `release-component-policy.md`).
 - [x] Record implementation: PR #99.
 
 Acceptance criteria: superseded. The current acceptance for AirPlay 1 sending is captured in the
 active backlog at `docs/task.md:1009/1012/1015` — an AirPlay sender design investigation that
 first resolves the non-shipped `raopsink` seam, then selects and implements a maintained sender
 path. Until that lands, the localized error is the truthful behavior, not actionable install
-guidance.
+  guidance.
 
 ### P2.10 Bound MPD resolution and command ingress
 
