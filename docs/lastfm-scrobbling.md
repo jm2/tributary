@@ -7,7 +7,7 @@
   implemented; production startup remains Dormant because no activation authority is issued, and
   product integration is pending
 - Decision date: 2026-07-20
-- Implementation status date: 2026-07-22
+- Implementation status date: 2026-07-27
 - Tracking issue: [#50](https://github.com/jm2/tributary/issues/50)
 - Playback evidence foundation: [`playback-history.md`](playback-history.md)
 
@@ -18,7 +18,7 @@ permission to disclose listening activity.
 
 ## Dated implementation boundary
 
-The following inventory describes the internal implementation as of 2026-07-22. The rest of this
+The following inventory describes the internal implementation as of 2026-07-27. The rest of this
 document remains the accepted normative contract for the complete feature; present-tense contract
 language does not mean that every required product layer or acceptance case has shipped.
 
@@ -142,7 +142,12 @@ The implemented internal foundation includes:
   drain is terminal. Database, Starting, and Active publication linearize with close. The retained
   runtime barrier is supervised; unexpected exit closes application ingress, retires the bridge,
   joins the runtime, and only then publishes a fixed terminal failure, while an application close
-  that wins the gate remains a normal drain. Status and diagnostics contain only fixed categories;
+  that wins the gate remains a normal drain. While the status gate remains usable, every terminal
+  activation rollback synchronously publishes its `Failed` snapshot before resolving the
+  independently signalled command completion, so command receipt establishes the documented
+  status-observation boundary. If the status gate is poisoned, the owner instead preserves the
+  original fixed command error before propagating terminal shutdown failure; it cannot publish a
+  snapshot through the poisoned gate. Status and diagnostics contain only fixed categories;
 - shipping first-window composition for exactly one application owner. It is constructed after the
   exact process-coordinator window bind and before asynchronous database initialization. When
   database initialization succeeds before shutdown, a capable build attaches the migrated database
@@ -377,11 +382,17 @@ activation lease as one generation. A duplicate or concurrent activation cannot 
 runtime or playback owner. Any failure after runtime start closes and joins that runtime before a
 retry can be considered; a failed coordinator or runtime drain is sticky and terminal. A database
 or start result that completes after close cannot publish AwaitingConsent, Starting, or Active or
-resurrect authority. Once Active, the owner selects between application commands and the retained
-runtime's persistent barrier. Unexpected runtime settlement atomically closes application ingress,
-retires the coordinator before consuming the runtime join side, and publishes only the fixed
-`RuntimeTerminated` failure after cleanup. If application close wins that same gate first, its
-ordinary bridge-before-runtime drain and Stopped/Drain result remain authoritative.
+resurrect authority. On the normal path, runtime-start, playback-ingress-claim, and
+coordinator-activation failures publish their content-free terminal snapshot synchronously before
+signalling the command's independent completion channel; after a waiter receives that fixed
+failure, an immediate status read therefore observes `Failed` rather than an intermediate
+`Starting` snapshot. A poisoned status gate cannot publish that snapshot; its fallback still sends
+the original fixed command error before propagating terminal shutdown failure. Once Active, the
+owner selects between application commands and the retained runtime's persistent barrier.
+Unexpected runtime settlement atomically closes application ingress, retires the coordinator
+before consuming the runtime join side, and publishes only the fixed `RuntimeTerminated` failure
+after cleanup. If application close wins that same gate first, its ordinary bridge-before-runtime
+drain and Stopped/Drain result remain authoritative.
 
 Remote policy is immutable for the lifetime of one activation. A policy replacement must first
 close coordinator admission, drain accepted operations and supervised queue-insert completions,

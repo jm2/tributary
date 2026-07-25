@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Last.fm application activation failures now publish their terminal status before waking the
+  command waiter** ([#169](https://github.com/jm2/tributary/pull/169)). The application owner's
+  runtime-start, playback-ingress, and coordinator-activation rollback paths no longer race an
+  immediate status read across independent watch and completion channels. Status publication
+  remains synchronous on the normal path, while a poisoned status gate still returns the original
+  fixed command error before the owner reports its terminal shutdown failure.
+
 ### Added
 - **Last.fm now has a fail-closed protocol, desktop-authorization, credential-vault, durable-queue,
   playback-evidence/owner, delivery/lifecycle runtime, and application-owner foundation**
