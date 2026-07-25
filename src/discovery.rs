@@ -829,11 +829,12 @@ fn process_chromecast_event(
                         .to_string()
                 });
 
-            // Chromecast media tickets are already served over Tributary's
-            // non-loopback LAN IPv4 listener. Retain a matching numeric
-            // control endpoint from the resolved mDNS record; falling back to
-            // the `.local` hostname here would put unbounded name resolution
-            // back inside the later connection attempt.
+            // Chromecast media tickets are served over Tributary's non-loopback
+            // LAN listener, which prefers IPv4 and falls back to a reachable
+            // global-unicast or unique-local IPv6 address. Retain a matching
+            // numeric control endpoint from the resolved mDNS record; falling
+            // back to the `.local` hostname here would put unbounded name
+            // resolution back inside the later connection attempt.
             let addresses = advertised_socket_addrs(&info);
             let Some(address) = addresses
                 .iter()
