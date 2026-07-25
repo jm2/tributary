@@ -367,7 +367,7 @@ fn pick_lan_bind_address(candidates: &[(String, std::net::IpAddr)]) -> Option<st
         std::net::IpAddr::V4(v4) => {
             !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified()
         }
-        _ => false,
+        std::net::IpAddr::V6(_) => false,
     }) {
         return Some(*ipv4);
     }
