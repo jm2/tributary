@@ -401,8 +401,11 @@ full acceptance is binding; the checklist below indexes it. No new record has a 
   pairing, encrypted control, audio/timing, licensing, key provenance, packaging, and real-device
   tests.
 
-  In flight; #170 / `tr-vp9`, draft. Design acceptance includes protocol evidence,
-  licensing/key provenance, process/native packaging and representative device prerequisites.
+  In flight; #170 / `tr-vp9`, draft. The investigation document is
+  [`airplay-sender-design.md`](airplay-sender-design.md); implementation is deliberately deferred
+  to a subsequent bead once a maintainer accepts the seam refactor and policy review outlined
+  there. Design acceptance includes protocol evidence, licensing/key provenance, process/native
+  packaging and representative device prerequisites.
 
 - [ ] **P2.4-D** — Implement the selected maintained AirPlay sender path without presenting
   unsupported discovered receivers as playable; keep simultaneous multi-room sync out of scope
