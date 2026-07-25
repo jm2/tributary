@@ -1034,7 +1034,8 @@ selecting and validating a maintained AirPlay path.
 
 - [ ] Design persistent source-scoped offline identity, authenticated/resumable download jobs,
   atomic storage, server capability, credential, licensing, and reconciliation contracts
-  ([#11](https://github.com/jm2/tributary/issues/11)).
+  ([#11](https://github.com/jm2/tributary/issues/11),
+  [`offline-media.md`](offline-media.md)).
 - [ ] Implement the bounded download/cache engine with restart recovery, integrity checks,
   cancellation, quota/eviction, source replacement, and offline catalogue resolution.
 - [ ] Add accessible download/progress/storage UI and test online-to-offline transitions, stale
