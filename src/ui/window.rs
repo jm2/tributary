@@ -1610,6 +1610,7 @@ pub(crate) fn build_window(
         sidebar_widget,
         sidebar_store,
         sidebar_selection,
+        sidebar_view,
         disconnect_rx,
         delete_rx,
         add_button,
@@ -2194,6 +2195,7 @@ pub(crate) fn build_window(
     super::discovery_handler::setup_discovery(
         &WindowState {
             window: window.clone(),
+            toast_overlay: toast_overlay.clone(),
             rt_handle: rt_handle.clone(),
             engine_tx: engine_tx.clone(),
             playlist_sidebar_refresh: playlist_sidebar_refresh.clone(),
@@ -2207,6 +2209,7 @@ pub(crate) fn build_window(
             near_me_consent_request: near_me_consent_request.clone(),
             sidebar_store: sidebar_store.clone(),
             sidebar_selection: sidebar_selection.clone(),
+            sidebar_view: sidebar_view.clone(),
             playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
             browser_widget: browser_widget.clone(),
             browser_state: browser_state.clone(),
@@ -2316,6 +2319,7 @@ pub(crate) fn build_window(
     let pre_connect_selection_for_events = pre_connect_selection.clone();
     let source_connection_state = WindowState {
         window: window.clone(),
+        toast_overlay: toast_overlay.clone(),
         rt_handle: rt_handle.clone(),
         engine_tx: engine_tx.clone(),
         playlist_sidebar_refresh: playlist_sidebar_refresh.clone(),
@@ -2329,6 +2333,7 @@ pub(crate) fn build_window(
         near_me_consent_request: near_me_consent_request.clone(),
         sidebar_store: sidebar_store.clone(),
         sidebar_selection: sidebar_selection.clone(),
+        sidebar_view: sidebar_view.clone(),
         playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
         browser_widget: browser_widget.clone(),
         browser_state: browser_state.clone(),
@@ -2895,6 +2900,7 @@ pub(crate) fn build_window(
     // ── Right-click context menu on tracklist ────────────────────────
     super::context_menu::setup_context_menu(&WindowState {
         window: window.clone(),
+        toast_overlay: toast_overlay.clone(),
         rt_handle: rt_handle.clone(),
         engine_tx: engine_tx.clone(),
         playlist_sidebar_refresh: playlist_sidebar_refresh.clone(),
@@ -2908,6 +2914,7 @@ pub(crate) fn build_window(
         near_me_consent_request: near_me_consent_request.clone(),
         sidebar_store: sidebar_store_for_events.clone(),
         sidebar_selection: sidebar_sel_for_events.clone(),
+        sidebar_view: sidebar_view.clone(),
         playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
         browser_widget: browser_widget.clone(),
         browser_state: browser_state.clone(),

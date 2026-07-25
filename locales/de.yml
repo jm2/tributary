@@ -192,6 +192,8 @@ context:
   remove_from_playlist: "Aus Wiedergabeliste entfernen"
   playlist_add_unsupported_heading: "Titel wurden nicht hinzugefügt"
   playlist_add_unsupported_body: "Mindestens ein ausgewählter Titel ist nicht verfügbar oder wird in regulären Wiedergabelisten nicht unterstützt. Es wurde nichts hinzugefügt."
+  playlist_drag_description: "Ausgewählte Titel auf eine reguläre Wiedergabeliste ziehen. Escape bricht ab; Umschalt+F10 bietet die Tastaturalternative."
+  playlist_add_success: "%{count} Titel zu %{playlist} hinzugefügt."
 
 # ── Reguläre Wiedergabelisten ─────────────────────────────────────
 regular_playlist:

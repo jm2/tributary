@@ -192,6 +192,8 @@ context:
   remove_from_playlist: "Usuń z listy odtwarzania"
   playlist_add_unsupported_heading: "Utwory nie zostały dodane"
   playlist_add_unsupported_body: "Co najmniej jeden wybrany utwór jest niedostępny lub nie jest obsługiwany w zwykłych listach odtwarzania. Nic nie dodano."
+  playlist_drag_description: "Przeciągnij wybrane utwory na zwykłą listę. Escape anuluje; Shift+F10 zapewnia odpowiednik klawiaturowy."
+  playlist_add_success: "Dodano %{count} utworów do %{playlist}."
 
 # ── Zwykłe listy odtwarzania ───────────────────────────────────────
 regular_playlist:
