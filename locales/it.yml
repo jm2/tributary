@@ -144,6 +144,8 @@ dialogs:
   output_port: "Porta"
   output_exclusive_control_warning: "I comandi MPD pausa, arresto, ripetizione, casuale, singolo e consumo influiscono sull'intera partizione di riproduzione. Non condividerla con un altro controller o un'altra istanza di Tributary."
   output_exclusive_control_confirmation: "Confermo che Tributary ha il controllo esclusivo di questa partizione di riproduzione MPD."
+  output_detection_warning: "Tributary può rilevare se nessun altro controller sta modificando la partizione osservando più risposte di stato consecutive prima di abilitare la pulizia automatica degli orfani. Il rilevamento è a prova di errore: qualsiasi brano corrente esterno, modifica di opzione esterna o finestra di osservazione non aggiornata ripristina l'impostazione predefinita conservativa di conservare la voce in coda orfana."
+  output_detection_confirmation: "Consenti a Tributary di rilevare automaticamente il controllo esclusivo prima della pulizia automatica degli orfani."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:

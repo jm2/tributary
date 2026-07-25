@@ -144,6 +144,8 @@ dialogs:
   output_port: "連接埠"
   output_exclusive_control_warning: "MPD 的暫停、停止、重複、隨機、單曲和 consume 指令會影響整個播放分割區。請勿與其他控制器或 Tributary 執行個體共用。"
   output_exclusive_control_confirmation: "我確認 Tributary 獨佔控制此 MPD 播放分割區。"
+  output_detection_warning: "在啟用自動孤兒清理之前,Tributary 可以透過觀察多個連續的狀態回應來偵測是否有其他控制器正在修改分割區。偵測是故障安全的:任何外部當前歌曲、外部選項變更或過時的觀察視窗都會還原為保留孤兒佇列項目的保守預設值。"
+  output_detection_confirmation: "允許 Tributary 在自動孤兒清理之前自動偵測獨佔控制。"
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:

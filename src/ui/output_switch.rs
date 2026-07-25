@@ -27,6 +27,11 @@ pub enum OutputTarget {
         host: String,
         port: u16,
         exclusive_control: bool,
+        /// User opted in to automatic detection of exclusive control before
+        /// automatic orphan cleanup. Independent of `exclusive_control`: a
+        /// user can confirm exclusive control without opting in to detection
+        /// (and vice versa). The default for new saved entries is `false`.
+        detection_enabled: bool,
     },
     AirPlay {
         host: String,
@@ -328,12 +333,18 @@ pub fn setup_output_selector(
                 host,
                 port,
                 exclusive_control,
+                detection_enabled,
             } => {
+                let control_mode = if *detection_enabled {
+                    MpdControlMode::Detected
+                } else {
+                    MpdControlMode::from(*exclusive_control)
+                };
                 let output = MpdOutput::new(
                     &row_name,
                     host,
                     *port,
-                    MpdControlMode::from(*exclusive_control),
+                    control_mode,
                     event_sender.clone(),
                 )
                 .with_runtime(rt_handle.clone());
@@ -404,6 +415,7 @@ fn target_for_row(
         host: entry.host.clone(),
         port: entry.port,
         exclusive_control: entry.exclusive_control,
+        detection_enabled: entry.detection_enabled,
     })
 }
 
@@ -639,6 +651,7 @@ mod tests {
             host: "music.local".to_string(),
             port: 6600,
             exclusive_control: true,
+            detection_enabled: false,
         };
         assert!(!output_change_required(&current, &current));
     }
@@ -649,13 +662,32 @@ mod tests {
             host: "music.local".to_string(),
             port: 6600,
             exclusive_control: false,
+            detection_enabled: false,
         };
         let exclusive = OutputTarget::Mpd {
             host: "music.local".to_string(),
             port: 6600,
             exclusive_control: true,
+            detection_enabled: false,
         };
         assert!(output_change_required(&unconfirmed, &exclusive));
+    }
+
+    #[test]
+    fn enabling_detection_for_the_same_mpd_endpoint_is_a_real_output_change() {
+        let confirmed = OutputTarget::Mpd {
+            host: "music.local".to_string(),
+            port: 6600,
+            exclusive_control: true,
+            detection_enabled: false,
+        };
+        let detected = OutputTarget::Mpd {
+            host: "music.local".to_string(),
+            port: 6600,
+            exclusive_control: true,
+            detection_enabled: true,
+        };
+        assert!(output_change_required(&confirmed, &detected));
     }
 
     #[test]
@@ -721,6 +753,7 @@ mod tests {
                 host: "music.local".to_string(),
                 port: 6600,
                 exclusive_control: true,
+                detection_enabled: false,
             },
             &playback_session,
             &active_output,
@@ -855,6 +888,7 @@ mod tests {
             host: "music.local".to_string(),
             port: 6600,
             exclusive_control: true,
+            detection_enabled: false,
         };
         let (remote, remote_state) = FakeOutput::boxed("mpd", OutputType::Mpd, 1);
         assert_eq!(
@@ -993,6 +1027,7 @@ mod tests {
                     host: "music.local".to_string(),
                     port: 6600,
                     exclusive_control: true,
+                    detection_enabled: false,
                 },
                 &mut session,
                 &mut active_output,
@@ -1012,6 +1047,7 @@ mod tests {
             host: "music.local".to_string(),
             port: 6600,
             exclusive_control: true,
+            detection_enabled: false,
         };
         let (mut active_output, remote_state) = FakeOutput::boxed("mpd", OutputType::Mpd, 0);
         let (wrong_parked, wrong_parked_state) =

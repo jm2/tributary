@@ -144,6 +144,8 @@ dialogs:
   output_port: "Poort"
   output_exclusive_control_warning: "MPD-opdrachten voor pauzeren, stoppen, herhalen, willekeurig, enkel en verbruiken beïnvloeden de hele afspeelpartitie. Deel deze niet met een andere controller of Tributary-instantie."
   output_exclusive_control_confirmation: "Ik bevestig dat Tributary exclusieve controle over deze MPD-afspeelpartitie heeft."
+  output_detection_warning: "Tributary kan detecteren of geen enkele andere controller de partitie wijzigt door meerdere opeenvolgende statusreacties te observeren voordat de automatische weesopruiming wordt ingeschakeld. Detectie is fail-safe: elk vreemd huidig nummer, vreemde optiewijziging of verouderd observatievenster valt terug op de conservatieve standaard om het wees-wachtrij-item te behouden."
+  output_detection_confirmation: "Tributary toestaan om automatisch exclusieve controle te detecteren vóór automatische weesopruiming."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
