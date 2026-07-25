@@ -22,17 +22,37 @@ use adw::prelude::*;
 use gtk::glib;
 use tracing::{info, warn};
 
+use crate::local::mutation_authority::RetainedMutationAuthority;
 #[cfg(target_os = "windows")]
 use crate::local::tag_writer::preflight_tag_write_target_access;
 use crate::local::tag_writer::{
     preflight_tag_write_directory, validate_tag_write_target, TagEdits, TagWritePreflightError,
 };
 
+/// Where a tag edit is rooted.
+///
+/// Local-library rows carry a [`PathBuf`] today and are still edited by
+/// the path-based writer. Pathless rows (mount-attached removable media,
+/// future OS-opened-file identity rows) carry a [`RetainedMutationAuthority`]
+/// instead — the writer revalidates the mount, ancestor chain, exact file
+/// object, write rights, and replacement target through commit before the
+/// rename is persisted.
+#[derive(Debug, Clone)]
+pub enum TrackTarget {
+    /// Path-based local-library row.
+    Path(PathBuf),
+    /// Pathless row governed by a retained mutation authority.
+    ///
+    /// No path is exposed to the UI; the authority is dropped on dialog
+    /// close.
+    Retained(RetainedMutationAuthority),
+}
+
 /// Information about a track passed into the dialog.
 #[derive(Debug, Clone)]
 pub struct TrackInfo {
-    /// Validated native path for this local track.
-    pub path: PathBuf,
+    /// Where the dialog edits this track.
+    pub target: TrackTarget,
     /// Current metadata values (for pre-populating the form).
     pub title: String,
     pub artist: String,
@@ -99,13 +119,34 @@ enum SaveOutcome {
     },
 }
 
-fn unique_track_paths(tracks: &[TrackInfo]) -> Vec<PathBuf> {
+fn unique_track_paths(tracks: &[TrackInfo]) -> Vec<TrackTarget> {
     let mut seen = HashSet::new();
     tracks
         .iter()
-        .filter(|track| seen.insert(track.path.clone()))
-        .map(|track| track.path.clone())
+        .filter(|track| seen.insert(track.target.display_key()))
+        .map(|track| track.target.clone())
         .collect()
+}
+
+impl TrackTarget {
+    fn display_key(&self) -> String {
+        match self {
+            Self::Path(path) => format!("path:{}", path.display()),
+            Self::Retained(authority) => format!(
+                "retained:{}:{}",
+                authority.source_id(),
+                authority.track_id()
+            ),
+        }
+    }
+
+    /// Return the path if and only if this target is a path-based row.
+    fn as_path(&self) -> Option<&PathBuf> {
+        match self {
+            Self::Path(path) => Some(path),
+            Self::Retained(_) => None,
+        }
+    }
 }
 
 fn merge_preflight_failure(
@@ -137,7 +178,7 @@ fn merge_preflight_failure(
 }
 
 fn preflight_distinct_parents(
-    paths: &[PathBuf],
+    paths: &[&PathBuf],
     mut probe: impl FnMut(&std::path::Path) -> Result<(), TagWritePreflightError>,
 ) -> TagEditingAvailability {
     let mut parents = HashSet::new();
@@ -160,7 +201,7 @@ fn preflight_distinct_parents(
 
 #[cfg(any(target_os = "windows", test))]
 fn preflight_each_target(
-    paths: &[PathBuf],
+    paths: &[&PathBuf],
     mut probe: impl FnMut(&std::path::Path) -> Result<(), TagWritePreflightError>,
 ) -> TagEditingAvailability {
     for path in paths {
@@ -172,12 +213,40 @@ fn preflight_each_target(
 }
 
 /// Probe a complete, exact-deduplicated selection on a worker thread.
-fn preflight_paths(paths: &[PathBuf]) -> TagEditingAvailability {
-    if paths.is_empty() {
+fn preflight_paths(targets: &[TrackTarget]) -> TagEditingAvailability {
+    if targets.is_empty() {
         return TagEditingAvailability::InvalidFile;
     }
 
-    let validation = paths
+    // Pathless rows validate their mount/ancestor/format chain inside
+    // `RetainedMutationAuthority::write_tags` itself. The dialog
+    // preflight therefore only needs to confirm that the path-based
+    // rows are still admissible; retained rows are accepted as
+    // Ready here and revalidated on Save. A preflight-time failure
+    // for a removable row only surfaces when the mint itself
+    // returned a degenerate target (empty Source/Track), which we
+    // additionally guard against.
+    let any_retained = targets
+        .iter()
+        .any(|target| matches!(target, TrackTarget::Retained(_)));
+    if targets
+        .iter()
+        .all(|target| matches!(target, TrackTarget::Retained(_)))
+    {
+        // Pure retained selection. Always check availability through
+        // the writer; preflight just needs to admit the call.
+        return if any_retained {
+            TagEditingAvailability::Ready
+        } else {
+            TagEditingAvailability::InvalidFile
+        };
+    }
+
+    let path_targets: Vec<&PathBuf> = targets.iter().filter_map(TrackTarget::as_path).collect();
+    if path_targets.is_empty() {
+        return TagEditingAvailability::Ready;
+    }
+    let validation = path_targets
         .iter()
         .fold(
             TagEditingAvailability::Ready,
@@ -195,7 +264,7 @@ fn preflight_paths(paths: &[PathBuf]) -> TagEditingAvailability {
         // Windows DACLs are file-specific even inside one directory. Rehearse
         // the post-DACL read/write/delete reopen for every exact target before
         // any Save can begin.
-        let target_access = preflight_each_target(paths, preflight_tag_write_target_access);
+        let target_access = preflight_each_target(&path_targets, preflight_tag_write_target_access);
         if target_access != TagEditingAvailability::Ready {
             return target_access;
         }
@@ -204,7 +273,7 @@ fn preflight_paths(paths: &[PathBuf]) -> TagEditingAvailability {
     // Directory mechanics are parent-scoped. Rehearse the flushed atomic
     // replacement once per exact parent while retaining the per-file checks
     // above (including Windows read-only attributes).
-    preflight_distinct_parents(paths, preflight_tag_write_directory)
+    preflight_distinct_parents(&path_targets, preflight_tag_write_directory)
 }
 
 fn apply_tag_editing_availability(
@@ -417,9 +486,19 @@ pub fn show_properties_dialog(
         add_info_row(&info_group, "Sample Rate", &t.sample_rate);
         add_info_row(&info_group, "Duration", &t.duration);
 
-        // Show file path
-        if let Some(path) = file_paths.first() {
-            add_info_row(&info_group, "File", &path.to_string_lossy());
+        // Show the row's identity. Path-based rows expose a native
+        // path; pathless rows expose the typed (Source, TrackId) shape
+        // — never the mount root or the relative path.
+        if let Some(target) = file_paths.first() {
+            match target {
+                TrackTarget::Path(path) => {
+                    add_info_row(&info_group, "File", &path.to_string_lossy());
+                }
+                TrackTarget::Retained(authority) => {
+                    add_info_row(&info_group, "Source", &authority.source_id().to_string());
+                    add_info_row(&info_group, "Track", &authority.track_id().to_string());
+                }
+            }
         }
 
         form.append(&info_group);
@@ -672,14 +751,21 @@ pub fn show_properties_dialog(
 
             let mut modified = 0usize;
             let mut failed = 0usize;
-            for path in &paths {
-                match crate::local::tag_writer::write_tags(path, &edits) {
-                    Ok(()) => {
+            for target in &paths {
+                let outcome = match target {
+                    TrackTarget::Path(path) => crate::local::tag_writer::write_tags(path, &edits)
+                        .map(|()| target.display_key()),
+                    TrackTarget::Retained(authority) => {
+                        authority.write_tags(&edits).map(|()| target.display_key())
+                    }
+                };
+                match outcome {
+                    Ok(_) => {
                         modified += 1;
                     }
                     Err(e) => {
                         warn!(
-                            path = %path.display(),
+                            target = %target.display_key(),
                             error = %e,
                             "Failed to write tags"
                         );
@@ -1001,7 +1087,7 @@ mod tests {
 
     fn track(path: PathBuf) -> TrackInfo {
         TrackInfo {
-            path,
+            target: TrackTarget::Path(path),
             title: "Title".to_string(),
             artist: "Artist".to_string(),
             album: "Album".to_string(),
@@ -1027,7 +1113,61 @@ mod tests {
             track(second.clone()),
         ];
 
-        assert_eq!(unique_track_paths(&tracks), vec![first, second]);
+        let deduped = unique_track_paths(&tracks);
+        assert_eq!(deduped.len(), 2);
+        assert!(matches!(deduped[0], TrackTarget::Path(ref p) if p == &first));
+        assert!(matches!(deduped[1], TrackTarget::Path(ref p) if p == &second));
+    }
+
+    #[test]
+    fn pathless_tracks_are_deduplicated_by_source_and_track_id() {
+        // Constructed without a real mount so the displayed keys stay
+        // stable across runs.
+        let first_authority =
+            crate::local::mutation_authority::RetainedMutationAuthorityBuilder::finish_for_test(
+                crate::architecture::SourceId::removable("ui:test:dedup-a")
+                    .expect("source identity"),
+                crate::architecture::TrackId::new("removable-a:song").expect("track id"),
+            );
+        let second_authority =
+            crate::local::mutation_authority::RetainedMutationAuthorityBuilder::finish_for_test(
+                crate::architecture::SourceId::removable("ui:test:dedup-b")
+                    .expect("source identity"),
+                crate::architecture::TrackId::new("removable-b:song").expect("track id"),
+            );
+        let first = TrackInfo {
+            target: TrackTarget::Retained(first_authority.clone()),
+            title: "Title".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            genre: String::new(),
+            composer: String::new(),
+            year: String::new(),
+            track_number: String::new(),
+            disc_number: String::new(),
+            format: "FLAC".to_string(),
+            bitrate: String::new(),
+            sample_rate: String::new(),
+            duration: String::new(),
+        };
+        let second = TrackInfo {
+            target: TrackTarget::Retained(second_authority.clone()),
+            title: "Title".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            genre: String::new(),
+            composer: String::new(),
+            year: String::new(),
+            track_number: String::new(),
+            disc_number: String::new(),
+            format: "FLAC".to_string(),
+            bitrate: String::new(),
+            sample_rate: String::new(),
+            duration: String::new(),
+        };
+        let tracks = vec![first.clone(), first.clone(), second.clone()];
+        let deduped = unique_track_paths(&tracks);
+        assert_eq!(deduped.len(), 2);
     }
 
     #[test]
@@ -1088,14 +1228,14 @@ mod tests {
 
     #[test]
     fn directory_preflight_stops_after_the_first_failure() {
-        let paths = vec![
+        let paths = [
             PathBuf::from("/first/song.flac"),
             PathBuf::from("/second/song.flac"),
             PathBuf::from("/third/song.flac"),
         ];
         let mut probed = Vec::new();
 
-        let availability = preflight_distinct_parents(&paths, |path| {
+        let availability = preflight_distinct_parents(&paths.iter().collect::<Vec<_>>(), |path| {
             probed.push(path.to_path_buf());
             Err(TagWritePreflightError::Unavailable)
         });
@@ -1106,14 +1246,14 @@ mod tests {
 
     #[test]
     fn file_access_preflight_checks_each_same_parent_target_and_stops_on_failure() {
-        let paths = vec![
+        let paths = [
             PathBuf::from("album/first.flac"),
             PathBuf::from("album/second.flac"),
             PathBuf::from("album/third.flac"),
         ];
         let mut probed = Vec::new();
 
-        let availability = preflight_each_target(&paths, |path| {
+        let availability = preflight_each_target(&paths.iter().collect::<Vec<_>>(), |path| {
             probed.push(path.to_path_buf());
             if path == paths[1] {
                 Err(TagWritePreflightError::Unavailable)
@@ -1137,7 +1277,7 @@ mod tests {
         std::fs::write(&unsupported, b"audio").expect("write unsupported fixture");
 
         assert_eq!(
-            preflight_paths(&[supported, unsupported]),
+            preflight_paths(&[TrackTarget::Path(supported), TrackTarget::Path(unsupported)]),
             TagEditingAvailability::UnsupportedFormat
         );
         assert!(

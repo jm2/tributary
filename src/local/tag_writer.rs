@@ -38,7 +38,7 @@ use uuid::Uuid;
 const TAG_WRITE_TEMP_PREFIX: &str = ".tributary-tag-";
 
 /// Formats whose tags Tributary can rewrite safely.
-const WRITABLE_EXTENSIONS: &[&str] = &["mp3", "m4a", "aac", "ogg", "flac"];
+pub const WRITABLE_EXTENSIONS: &[&str] = &["mp3", "m4a", "aac", "ogg", "flac"];
 
 /// Why a file cannot currently enter the tag-write path.
 ///

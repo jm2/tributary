@@ -31,7 +31,6 @@ const MAX_TAG_TEXT_BYTES: usize = 64 * 1024;
 /// One mounted removable source whose catalogue and media authority share an
 /// exact lifecycle generation.
 pub struct RemovableMediaAdapter {
-    #[cfg(test)]
     source_id: SourceId,
     authority: Arc<MountedRootAuthority>,
     tracks: Vec<Track>,
@@ -157,7 +156,6 @@ impl RemovableMediaAdapter {
         }
 
         Ok(Some(Self {
-            #[cfg(test)]
             source_id,
             authority,
             tracks,
@@ -190,6 +188,12 @@ impl LifecycleAdapter for RemovableMediaAdapter {
 impl ManagedSourceAdapter for RemovableMediaAdapter {
     fn playback_attribution_capability(&self) -> PlaybackAttributionCapability {
         PlaybackAttributionCapability::Removable
+    }
+
+    fn as_removable_mint(
+        &self,
+    ) -> Option<&dyn crate::source_registry::RemovableMutationAuthorityMinter> {
+        Some(self)
     }
 
     fn playback_attribution_profile(
@@ -319,6 +323,58 @@ fn scan_failed() -> BackendError {
 
 fn resolution_failed() -> BackendError {
     BackendError::Internal(anyhow::anyhow!("removable media identity is unavailable"))
+}
+
+impl crate::source_registry::RemovableMutationAuthorityMinter for RemovableMediaAdapter {
+    fn mint_mutation_authority(
+        &self,
+        track_id: &TrackId,
+    ) -> Result<
+        crate::local::mutation_authority::RetainedMutationAuthorityBuilder,
+        MintMutationAuthorityError,
+    > {
+        if !self.accepted_track_ids.contains(track_id) {
+            return Err(MintMutationAuthorityError::UnacceptedTrack {
+                track_id: track_id.clone(),
+            });
+        }
+        let relative_path = track_id
+            .removable_relative_path()
+            .map_err(|_| MintMutationAuthorityError::InvalidTrackId)?;
+        let extension =
+            extension_hint(&relative_path).ok_or(MintMutationAuthorityError::InvalidTrackId)?;
+        let builder = crate::local::mutation_authority::RetainedMutationAuthorityBuilder::try_new(
+            self.source_id,
+            track_id.clone(),
+            Arc::clone(&self.authority),
+            &relative_path,
+            &extension,
+        )?;
+        Ok(builder)
+    }
+}
+
+/// Why [`RemovableMediaAdapter::mint_mutation_authority`] refused to build
+/// a pathless retained mutation authority.
+#[derive(Debug, thiserror::Error)]
+pub enum MintMutationAuthorityError {
+    #[error("removable media row was not part of the accepted scan")]
+    UnacceptedTrack { track_id: TrackId },
+    #[error("removable media identity is invalid for mutation-authority minting")]
+    InvalidTrackId,
+    #[error("retained mutation authority builder rejected the request")]
+    Builder {
+        #[source]
+        source: crate::local::mutation_authority::RetainedMutationAuthorityError,
+    },
+}
+
+impl From<crate::local::mutation_authority::RetainedMutationAuthorityError>
+    for MintMutationAuthorityError
+{
+    fn from(source: crate::local::mutation_authority::RetainedMutationAuthorityError) -> Self {
+        Self::Builder { source }
+    }
 }
 
 #[cfg(test)]

@@ -30,6 +30,9 @@ use crate::architecture::{
     ViewOrigin,
 };
 use crate::external_file::{ExternalFileCandidate, ExternalFileHint};
+use crate::local::mutation_authority::{
+    RetainedMutationAuthority, RetainedMutationAuthorityBuilder,
+};
 use crate::local::resolver::ResolvedFileMedia;
 use crate::source_lifecycle::{
     AdapterCloseFuture, AdapterStream, AdapterTaskResult, CatalogueCommitAuthority,
@@ -931,6 +934,18 @@ impl AcceptedSourcePayload {
 
 /// Heterogeneous operational contract stored by one lifecycle registry.
 pub trait ManagedSourceAdapter: LifecycleAdapter + Send + Sync {
+    /// Downcast into the adapter's removable-media view, if it exposes
+    /// one. The default returns `None` so only adapters that explicitly
+    /// accept the pathless mutation contract can opt in.
+    ///
+    /// Minting a retained mutation authority for a pathless removable
+    /// row is the only production consumer. Remote, OS-opened, and
+    /// local-library adapters fail closed until they review the typed
+    /// authority contract end-to-end.
+    fn as_removable_mint(&self) -> Option<&dyn RemovableMutationAuthorityMinter> {
+        None
+    }
+
     /// Explicit, reviewed opt-in for structured playback attribution.
     ///
     /// Future managed adapters remain ineligible until their source kind,
@@ -1195,6 +1210,31 @@ mod sealed {
 /// deliberately cannot satisfy it. Plex's legacy durable credential has no
 /// safe per-token close operation and is documented separately above.
 pub trait AbortableSourceAdapter: ManagedSourceAdapter + sealed::AbortableSourceAdapter {}
+
+/// Minter for pathless retained mutation authorities.
+///
+/// A separate trait keeps [`ManagedSourceAdapter`] generic over every
+/// source kind while still letting a removable adapter advertise the
+/// mutation contract. The implementation is intentionally narrow:
+///
+/// - The minter must reject rows it did not admit during the accepted
+///   scan,
+/// - The minter must not expose any locator, path, or URL,
+/// - The minter must produce a builder that finishes into a
+///   self-contained [`RetainedMutationAuthority`] carrying the bound
+///   mount, exact relative components, and live `SourceId`/`TrackId`
+///   snapshot from when the mint was observed.
+pub trait RemovableMutationAuthorityMinter {
+    /// Construct one builder for the accepted row identified by
+    /// `track_id`. Returns `Err` for unaccepted rows.
+    fn mint_mutation_authority(
+        &self,
+        track_id: &TrackId,
+    ) -> Result<
+        crate::local::mutation_authority::RetainedMutationAuthorityBuilder,
+        crate::removable::MintMutationAuthorityError,
+    >;
+}
 
 macro_rules! abortable_remote_adapter {
     ($adapter:ty) => {
@@ -1672,6 +1712,38 @@ impl SourceRegistry {
                 })
             },
         )
+    }
+
+    /// Mint one retained mutation authority over one accepted pathless
+    /// row owned by a live removable source.
+    ///
+    /// Minting executes under the lifecycle state lock: the source must
+    /// still own its adapter, the claimed session must still be live,
+    /// the row must belong to the adapter's accepted catalogue, and the
+    /// adapter must be a removable adapter. Returning `None` means the
+    /// mint failed closed — the registry saw a non-removable row, a
+    /// torn-down session, or any revocation that prevented the minter
+    /// from observing a current state.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn mint_retained_mutation_authority(
+        &self,
+        source_id: SourceId,
+        session_epoch: u64,
+        track_id: TrackId,
+    ) -> Option<RetainedMutationAuthority> {
+        let track_id_for_mint = track_id.clone();
+        let builder: Option<RetainedMutationAuthorityBuilder> = self
+            .inner
+            .lifecycle
+            .project_exact_session(source_id, session_epoch, move |adapter, provenance| {
+                if !provenance.contains(SourceProvenance::Removable) {
+                    return None;
+                }
+                let removable = adapter.as_removable_mint()?;
+                let builder = removable.mint_mutation_authority(&track_id_for_mint).ok()?;
+                Some(builder)
+            });
+        builder.map(RetainedMutationAuthorityBuilder::finish)
     }
 
     /// Atomically revalidate one managed playback occurrence and perform a
@@ -8451,6 +8523,89 @@ mod tests {
             .await
             .expect("inspection coordinator drains");
         refresh.close();
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn mint_retained_mutation_authority_succeeds_for_accepted_removable_row() {
+        let registry = registry();
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let path = mount.path().join("kept.flac");
+        std::fs::write(
+            &path,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        )
+        .expect("copy fixture FLAC");
+        let source_id =
+            SourceId::removable("registry:test:mint-authority").expect("source identity");
+        let claim = registry
+            .claim_provenance(source_id, SourceProvenance::Removable)
+            .expect("claim removable source");
+        registry
+            .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+            .expect("removable connection admitted");
+        let (_, session_epoch) = wait_for_catalogue(&registry, source_id).await;
+        let track_id = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .and_then(|catalogue| catalogue.value.tracks().first().cloned())
+            .and_then(|track| track.native_track_id)
+            .expect("removable native track id");
+
+        let authority = registry
+            .mint_retained_mutation_authority(source_id, session_epoch, track_id.clone())
+            .expect("mint retained mutation authority");
+        assert_eq!(authority.source_id(), &source_id);
+        assert_eq!(authority.track_id(), &track_id);
+
+        // The mint is session-scoped. Releasing provenance and waiting
+        // for a fresh connect_revocation must surface the same call as
+        // a non-mint because the authority itself only retains file
+        // handles — it does not extend the lifecycle.
+        assert!(registry.release_provenance(source_id, claim));
+        wait_until_pruned(&registry, source_id).await;
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn mint_retained_mutation_authority_rejects_unaccepted_row() {
+        let registry = registry();
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let accepted_path = mount.path().join("accepted.wav");
+        std::fs::write(&accepted_path, minimal_wav_bytes(0x80)).expect("write accepted WAV");
+        let source_id =
+            SourceId::removable("registry:test:mint-unaccepted").expect("source identity");
+        registry
+            .claim_provenance(source_id, SourceProvenance::Removable)
+            .expect("claim removable source");
+        registry
+            .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+            .expect("removable connection admitted");
+        let (_, session_epoch) = wait_for_catalogue(&registry, source_id).await;
+        let unseen_path = mount.path().join("unlisted.wav");
+        std::fs::write(&unseen_path, minimal_wav_bytes(0x40)).expect("write unlisted WAV");
+        let unseen_id = TrackId::removable_relative(mount.path(), &unseen_path).expect("unseen id");
+
+        let authority =
+            registry.mint_retained_mutation_authority(source_id, session_epoch, unseen_id.clone());
+        assert!(authority.is_none(), "unaccepted rows must fail closed");
+
+        registry.shutdown().wait().await;
+    }
+
+    #[tokio::test]
+    async fn mint_retained_mutation_authority_rejects_remote_source() {
+        let registry = registry();
+        let source_id = SourceId::radio_browser();
+        let track_id = TrackId::new("non-removable:dummy").expect("synthetic track id");
+        let authority = registry.mint_retained_mutation_authority(source_id, 1, track_id);
+        assert!(
+            authority.is_none(),
+            "non-removable sources must fail closed"
+        );
         registry.shutdown().wait().await;
     }
 }

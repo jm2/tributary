@@ -136,6 +136,12 @@ impl fmt::Display for SourceId {
     }
 }
 
+impl fmt::Display for TrackId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 impl FromStr for SourceId {
     type Err = IdentityError;
 

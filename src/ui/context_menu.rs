@@ -376,6 +376,7 @@ pub fn setup_context_menu(state: &WindowState) {
                 &sm,
                 &popup_plan.selection,
                 automatic_device,
+                &mutation_context.source_registry,
             );
 
             if menu.n_items() == 0 {
@@ -837,12 +838,14 @@ fn build_properties_action(
     sm: &gtk::SortListModel,
     selection: &SelectionSnapshot,
     automatic_device: bool,
+    registry: &SourceRegistry,
 ) {
     // Snapshot the exact selection while building the menu. Properties is an
-    // all-or-none path-authorized local-file operation: silently dropping a
-    // malformed, remote, or pathless lifecycle row would let a batch edit
-    // only an unexpected subset. Removable rows deliberately remain absent
-    // until a typed mutation target can revalidate their exact live epoch.
+    // all-or-none operation: silently dropping a malformed, remote, or
+    // un-mintable pathless lifecycle row would let a batch edit only an
+    // unexpected subset. Pathless rows must mint a
+    // `RetainedMutationAuthority` under the registry session lock so the
+    // authority attaches to the still-live mount and accepted catalogue.
     let mut track_infos = Vec::new();
     for &position in &selection.positions {
         let Some(item) = sm.item(position) else {
@@ -851,11 +854,35 @@ fn build_properties_action(
         let Some(track) = item.downcast_ref::<TrackObject>() else {
             return;
         };
-        let Some(path) = local_file_path(&track.uri()) else {
-            return;
+
+        let target = match local_file_path(&track.uri()) {
+            Some(path) => super::properties_dialog::TrackTarget::Path(path),
+            None => {
+                // Pathless authoring: a removable row mints one retained
+                // mutation authority. Any unrecognised source kind
+                // (radio, remote, malformed) fails the whole selection
+                // closed so the menu does not surface a partial batch.
+                let (Some(source_id), Some(track_id_str), Some(session_epoch)) = (
+                    track.source_id(),
+                    track_id_for_track(track),
+                    track.source_session_epoch(),
+                ) else {
+                    return;
+                };
+                let Some(track_id) = TrackId::new(track_id_str.clone()).ok() else {
+                    return;
+                };
+                let Some(authority) =
+                    registry.mint_retained_mutation_authority(source_id, session_epoch, track_id)
+                else {
+                    return;
+                };
+                super::properties_dialog::TrackTarget::Retained(authority)
+            }
         };
+
         track_infos.push(super::properties_dialog::TrackInfo {
-            path,
+            target,
             title: track.title(),
             artist: track.artist(),
             album: track.album(),
@@ -919,6 +946,20 @@ fn local_file_path(uri: &str) -> Option<std::path::PathBuf> {
     (url.scheme() == "file")
         .then(|| url.to_file_path().ok())
         .flatten()
+}
+
+/// Identity used to mint a retained mutation authority.
+///
+/// Prefers the explicit native track ID set by the registry; falls back
+/// to the URI-derived string only when the row carries no native ID.
+fn track_id_for_track(track: &super::objects::TrackObject) -> Option<String> {
+    if !track.track_id().is_empty() {
+        return Some(track.track_id());
+    }
+    if !track.uri().is_empty() {
+        return Some(track.uri());
+    }
+    None
 }
 
 /// Match the active lifecycle source against exact sidebar metadata. Opaque
