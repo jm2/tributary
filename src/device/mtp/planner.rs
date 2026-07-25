@@ -16,12 +16,10 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use thiserror::Error;
-use uuid::Uuid;
 
 use super::identity::MtpDeviceId;
 use super::transport::{MtpObjectHandle, MtpSession, MtpStorageDescriptor, MtpTransportError};
@@ -420,16 +418,6 @@ fn destination_path_for(
     Ok(path)
 }
 
-#[allow(dead_code)]
-fn _unused_uuid() -> Uuid {
-    Uuid::new_v4()
-}
-
-#[allow(dead_code)]
-fn _unused_io_error(context: &str) -> io::Error {
-    io::Error::other(context.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +426,7 @@ mod tests {
     use crate::device::mtp::MtpUsbDescriptor;
     use std::fs;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     fn descriptor() -> MtpUsbDescriptor {
         MtpUsbDescriptor::new(0x04e8, 0x6860, "ABC123").expect("descriptor")
