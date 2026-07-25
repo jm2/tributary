@@ -1014,9 +1014,12 @@ selecting and validating a maintained AirPlay path.
 - [ ] Implement the supported equalizer path and accessible settings UI, then test format changes,
   gapless navigation, disabled/bypass behavior, clipping policy, and each output's supported or
   explicitly unavailable state.
-- [ ] Open and complete an AirPlay sender design investigation that first resolves the current
+- [x] Open and complete an AirPlay sender design investigation that first resolves the current
   non-shipped `raopsink` seam, then scopes maintained RAOP and/or AirPlay 2 dependencies, pairing,
   encrypted control, audio/timing, licensing, key provenance, packaging, and real-device tests.
+  See [`airplay-sender-design.md`](airplay-sender-design.md); implementation is deliberately
+  deferred to a subsequent bead once a maintainer accepts the seam refactor and policy review
+  outlined there.
 - [ ] Implement the selected maintained AirPlay sender path without presenting unsupported
   discovered receivers as playable; keep simultaneous multi-room sync out of scope unless
   separately approved.
