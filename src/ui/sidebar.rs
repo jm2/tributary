@@ -10,6 +10,9 @@ use gtk::glib::variant::{FromVariant, ToVariant};
 use gtk::prelude::*;
 use gtk::{gio, glib};
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use super::context_menu;
 use super::objects::{PlaylistSidebarKind, SourceObject};
 use tracing::debug;
@@ -274,6 +277,12 @@ fn playlist_creation_action_group(
 ///   the user clicks its trash button.
 /// * `add_button` is the `+` button for adding manual servers (wired in `window.rs`).
 /// * `playlist_action_rx` emits playlist CRUD actions from the context menu.
+/// * `playlist_row_drop`, when provided, attaches a per-row `DropTarget` to
+///   every sidebar row during factory setup so drops resolve to the row the
+///   pointer is on, not the row the keyboard selection last visited. The
+///   context is created by the caller after `WindowState` is wired, so the
+///   factory stores an `Rc<RefCell<Option<...>>>` and consults it lazily on
+///   each row.
 type SidebarBuildOutput = (
     gtk::Box,
     gio::ListStore,
@@ -285,7 +294,10 @@ type SidebarBuildOutput = (
     async_channel::Receiver<PlaylistAction>,
 );
 
-pub fn build_sidebar(initial_sources: &[SourceObject]) -> SidebarBuildOutput {
+pub fn build_sidebar(
+    initial_sources: &[SourceObject],
+    playlist_row_drop: Rc<RefCell<Option<super::context_menu::PlaylistRowDropContext>>>,
+) -> SidebarBuildOutput {
     let store = gio::ListStore::new::<SourceObject>();
     for src in initial_sources {
         store.append(src);
@@ -312,6 +324,7 @@ pub fn build_sidebar(initial_sources: &[SourceObject]) -> SidebarBuildOutput {
         let tx_for_setup = playlist_action_tx.clone();
         let disconnect_tx_for_setup = disconnect_tx.clone();
         let delete_tx_for_setup = delete_tx.clone();
+        let playlist_row_drop_for_setup = playlist_row_drop.clone();
         factory.connect_setup(move |_, list_item| {
             let list_item = list_item
                 .downcast_ref::<gtk::ListItem>()
@@ -582,6 +595,23 @@ pub fn build_sidebar(initial_sources: &[SourceObject]) -> SidebarBuildOutput {
                 });
             }
             row_box.add_controller(drop_target);
+
+            // Per-row drop target. A `ListView`-level `DropTarget` would
+            // resolve the destination from `selection.selected_item()`,
+            // which is empty for the non-selectable header rows and
+            // always equals the keyboard-focused row — the source being
+            // viewed in the tracklist — regardless of the row the pointer
+            // is actually over. Resolving via `list_item.position()` (the
+            // row this widget is currently bound to) sidesteps both
+            // problems: a drop on a server row refuses (not an editable
+            // regular playlist) instead of falling back to whatever
+            // playlist the user last selected. The reorder target above
+            // and this track-drop target coexist because they accept
+            // different payload types (string playlist id vs
+            // `PlaylistDragPayload`) under different drag actions.
+            if let Some(drop) = playlist_row_drop_for_setup.borrow().as_ref() {
+                super::context_menu::attach_playlist_drop_target(&row_box, list_item, drop);
+            }
         });
     }
 

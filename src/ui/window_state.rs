@@ -90,6 +90,7 @@ pub struct WindowState {
     pub sidebar_selection: gtk::SingleSelection,
 
     /// Sidebar list view used for playlist drop targeting.
+    #[allow(dead_code)]
     pub sidebar_view: gtk::ListView,
 
     /// True only while the authoritative playlist snapshot is replacing
