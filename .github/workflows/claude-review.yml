@@ -23,7 +23,16 @@ jobs:
           fetch-depth: 1
 
       - name: Claude PR review
-        uses: anthropics/claude-code-action@v1
+        # Pinned to a full-length commit SHA, not the mutable `v1` tag: a tag can
+        # be repointed at any commit, so only a SHA makes a third-party action
+        # immutable. Codacy flags the tag form (jm2/tributary check-run
+        # 89730846612, .github/workflows/claude-review.yml:26).
+        #
+        # NOTE: `v1` is an ANNOTATED tag, so refs/tags/v1 resolves to a tag
+        # OBJECT (c96dd0a84e0232ab86947fca5fe34f1caae8792f). That is NOT usable
+        # here -- `uses:` needs the COMMIT the tag dereferences to. Re-pin with
+        # `gh api repos/anthropics/claude-code-action/git/tags/<tag-object-sha>`.
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
