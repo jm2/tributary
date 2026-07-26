@@ -15,6 +15,7 @@ use super::models::{
     Album, Artist, LibraryStats, Rating, RatingCapability, SearchResults, SortField, SortOrder,
     Track,
 };
+use super::offline::OfflineCapability;
 
 /// The result type used throughout backend operations.
 pub type BackendResult<T> = Result<T, BackendError>;
@@ -151,6 +152,26 @@ pub trait MediaBackend: Send + Sync {
 
     /// Aggregate library statistics for this backend.
     async fn get_stats(&self) -> BackendResult<LibraryStats>;
+
+    // -------------------------------------------------------------------
+    // Offline capability
+    // -------------------------------------------------------------------
+
+    /// Default-deny offline capability declaration.
+    ///
+    /// The contract in `docs/offline-media.md` requires every backend to
+    /// declare its offline position explicitly. The fail-closed default
+    /// returns [`OfflineCapability::None`], which the engine treats as
+    /// "this source has not declared offline capability and is therefore
+    /// not eligible for the cache". The same set of backends that opt
+    /// into live `ServerPlaylist`-style read authority (Subsonic,
+    /// Jellyfin, Plex, DAAP) may opt in here; Radio-Browser, removable,
+    /// external-file, and the built-in local source must remain
+    /// `None` because they are not credentialed, are already local, or
+    /// are lifecycle-bound without a credential lane.
+    fn offline_capability(&self) -> OfflineCapability {
+        OfflineCapability::default_deny()
+    }
 }
 
 #[cfg(test)]
