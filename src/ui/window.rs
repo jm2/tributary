@@ -1606,6 +1606,14 @@ pub(crate) fn build_window(
     }
 
     // ── Sidebar ──────────────────────────────────────────────────────
+    // Late-bound per-row drop target context: the sidebar factory consults
+    // this on every row setup, and `setup_context_menu` populates it once
+    // `WindowState` is wired. Rows realized before that point will not
+    // retroactively gain a drop target, so the factory must read the slot
+    // lazily (and `setup_playlist_transfer` must run before the first
+    // row is mapped, which is guaranteed by the build order below).
+    let playlist_row_drop: Rc<RefCell<Option<super::context_menu::PlaylistRowDropContext>>> =
+        Rc::new(RefCell::new(None));
     let (
         sidebar_widget,
         sidebar_store,
@@ -1615,7 +1623,7 @@ pub(crate) fn build_window(
         delete_rx,
         add_button,
         playlist_action_rx,
-    ) = sidebar::build_sidebar(&sources);
+    ) = sidebar::build_sidebar(&sources, playlist_row_drop.clone());
 
     // Commands are queued synchronously on the GTK thread. Playback and
     // rating producers share one unbounded FIFO so admitted mutations cannot
@@ -2898,33 +2906,36 @@ pub(crate) fn build_window(
     }
 
     // ── Right-click context menu on tracklist ────────────────────────
-    super::context_menu::setup_context_menu(&WindowState {
-        window: window.clone(),
-        toast_overlay: toast_overlay.clone(),
-        rt_handle: rt_handle.clone(),
-        engine_tx: engine_tx.clone(),
-        playlist_sidebar_refresh: playlist_sidebar_refresh.clone(),
-        source_registry: source_registry.clone(),
-        remote_provenance: remote_provenance.clone(),
-        track_store: track_store.clone(),
-        master_tracks: master_tracks.clone(),
-        source_tracks: source_tracks.clone(),
-        active_source_key: active_source_key.clone(),
-        source_navigation: source_navigation.clone(),
-        near_me_consent_request: near_me_consent_request.clone(),
-        sidebar_store: sidebar_store_for_events.clone(),
-        sidebar_selection: sidebar_sel_for_events.clone(),
-        sidebar_view: sidebar_view.clone(),
-        playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
-        browser_widget: browser_widget.clone(),
-        browser_state: browser_state.clone(),
-        status_label: status_label.clone(),
-        column_view: column_view.clone(),
-        sort_model: sort_model.clone(),
-        app_config: app_config.clone(),
-        pending_connection: pending_connection_for_events.clone(),
-        pre_connect_selection: pre_connect_selection_for_events.clone(),
-    });
+    super::context_menu::setup_context_menu(
+        &WindowState {
+            window: window.clone(),
+            toast_overlay: toast_overlay.clone(),
+            rt_handle: rt_handle.clone(),
+            engine_tx: engine_tx.clone(),
+            playlist_sidebar_refresh: playlist_sidebar_refresh.clone(),
+            source_registry: source_registry.clone(),
+            remote_provenance: remote_provenance.clone(),
+            track_store: track_store.clone(),
+            master_tracks: master_tracks.clone(),
+            source_tracks: source_tracks.clone(),
+            active_source_key: active_source_key.clone(),
+            source_navigation: source_navigation.clone(),
+            near_me_consent_request: near_me_consent_request.clone(),
+            sidebar_store: sidebar_store_for_events.clone(),
+            sidebar_selection: sidebar_sel_for_events.clone(),
+            sidebar_view: sidebar_view.clone(),
+            playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
+            browser_widget: browser_widget.clone(),
+            browser_state: browser_state.clone(),
+            status_label: status_label.clone(),
+            column_view: column_view.clone(),
+            sort_model: sort_model.clone(),
+            app_config: app_config.clone(),
+            pending_connection: pending_connection_for_events.clone(),
+            pre_connect_selection: pre_connect_selection_for_events.clone(),
+        },
+        playlist_row_drop,
+    );
 
     // ── Wire Next button ────────────────────────────────────────────
     {

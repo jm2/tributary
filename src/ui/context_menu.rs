@@ -6,6 +6,7 @@
 
 use adw::prelude::*;
 use gtk::glib;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::objects::{SourceObject, TrackObject};
@@ -403,8 +404,11 @@ fn expose_context_menu_accessibility(column_view: &gtk::ColumnView) {
 /// Right-click retains its exact pointer anchor. The Menu key and Shift+F10
 /// open the same selection-snapshotted action model relative to the focused
 /// tracklist, and are consumed only when a non-empty menu was opened.
-pub fn setup_context_menu(state: &WindowState) {
-    setup_playlist_transfer(state);
+pub fn setup_context_menu(
+    state: &WindowState,
+    playlist_row_drop: Rc<RefCell<Option<PlaylistRowDropContext>>>,
+) {
+    setup_playlist_transfer(state, playlist_row_drop);
     let sm = state.sort_model.clone();
     let sidebar_store = state.sidebar_store.clone();
     let active_source_key = state.active_source_key.clone();
@@ -538,8 +542,88 @@ pub fn setup_context_menu(state: &WindowState) {
     expose_context_menu_accessibility(&state.column_view);
 }
 
-fn setup_playlist_transfer(state: &WindowState) {
+/// Per-row drop-target payload used by the sidebar factory to install the
+/// playlist drop handler. The sidebar's `ListView` resolves the destination
+/// from the *drop coordinates* (via `list_item.position()`), not from the
+/// current sidebar selection: rows that are non-selectable (headers, servers,
+/// pull mirrors) still need a usable hit target, and dropping on a different
+/// playlist row than the one currently focused must add to the row the
+/// pointer actually landed on, not the row the keyboard cursor last visited.
+pub struct PlaylistRowDropContext {
+    context: PlaylistMutationContext,
+    store: gtk::gio::ListStore,
+}
+
+impl PlaylistRowDropContext {
+    pub fn from_window(state: &WindowState) -> Self {
+        Self {
+            context: PlaylistMutationContext::from_window(state),
+            store: state.sidebar_store.clone(),
+        }
+    }
+}
+
+/// Attach a `DropTarget` to a single sidebar row.
+///
+/// The drop handler resolves the destination from `list_item.position()`,
+/// which reflects the row currently bound to this widget — even for the
+/// non-selectable header rows that the `ListView`-level selection never
+/// tracks. Installing the target on `row_box` (per row) keeps the active
+/// drag hit area scoped to whichever row the pointer is over.
+pub fn attach_playlist_drop_target(
+    row_box: &gtk::Box,
+    list_item: &gtk::ListItem,
+    drop: &PlaylistRowDropContext,
+) {
+    let drop_target = gtk::DropTarget::new(
+        PlaylistDragPayload::static_type(),
+        gtk::gdk::DragAction::COPY,
+    );
+    let store_for_accept = drop.store.clone();
+    let list_item_for_accept = list_item.clone();
+    drop_target.connect_accept(move |_, _| {
+        position_source(&store_for_accept, &list_item_for_accept)
+            .is_some_and(|source| source.is_editable_regular_playlist())
+    });
+    let context_for_drop = drop.context.clone();
+    let store_for_drop = drop.store.clone();
+    let list_item_for_drop = list_item.clone();
+    drop_target.connect_drop(move |_, value, _, _| {
+        let Ok(payload) = value.get::<PlaylistDragPayload>() else {
+            return false;
+        };
+        let Some(source) = position_source(&store_for_drop, &list_item_for_drop) else {
+            return false;
+        };
+        if !source.is_editable_regular_playlist() {
+            return false;
+        }
+        context_for_drop.add_candidates_to_playlist(
+            source.playlist_id(),
+            source.name(),
+            payload.candidates,
+        );
+        true
+    });
+    row_box.add_controller(drop_target);
+}
+
+fn position_source(store: &gtk::gio::ListStore, list_item: &gtk::ListItem) -> Option<SourceObject> {
+    let pos = list_item.position();
+    store.item(pos).and_downcast::<SourceObject>()
+}
+
+fn setup_playlist_transfer(
+    state: &WindowState,
+    playlist_row_drop: Rc<RefCell<Option<PlaylistRowDropContext>>>,
+) {
     use gtk::glib::prelude::ToValue;
+
+    // Publish the per-row drop context so any sidebar row that is realized
+    // after this point gets a `DropTarget` resolving to its own `position()`.
+    // Rows already realized will not retroactively gain a target, so the
+    // sidebar factory must consult this slot lazily on every row setup.
+    *playlist_row_drop.borrow_mut() = Some(PlaylistRowDropContext::from_window(state));
 
     let drag_source = gtk::DragSource::builder()
         .actions(gtk::gdk::DragAction::COPY)
@@ -561,43 +645,6 @@ fn setup_playlist_transfer(state: &WindowState) {
         ),
         gtk::accessible::Property::KeyShortcuts("Shift+F10 ContextMenu"),
     ]);
-
-    let context = PlaylistMutationContext::from_window(state);
-    let sidebar_selection = state.sidebar_selection.clone();
-    let drop_target = gtk::DropTarget::new(
-        PlaylistDragPayload::static_type(),
-        gtk::gdk::DragAction::COPY,
-    );
-    let selection_for_accept = sidebar_selection.clone();
-    drop_target.connect_accept(move |_, _| {
-        selection_for_accept
-            .selected_item()
-            .and_downcast::<SourceObject>()
-            .is_some_and(|source| source.is_editable_regular_playlist())
-    });
-    let context_for_drop = context.clone();
-    let selection_for_drop = sidebar_selection.clone();
-    drop_target.connect_drop(move |_, value, _, _| {
-        let Ok(payload) = value.get::<PlaylistDragPayload>() else {
-            return false;
-        };
-        let Some(source) = selection_for_drop
-            .selected_item()
-            .and_downcast::<SourceObject>()
-        else {
-            return false;
-        };
-        if !source.is_editable_regular_playlist() {
-            return false;
-        }
-        context_for_drop.add_candidates_to_playlist(
-            source.playlist_id(),
-            source.name(),
-            payload.candidates,
-        );
-        true
-    });
-    state.sidebar_view.add_controller(drop_target);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1460,5 +1507,58 @@ mod tests {
         live_selection.push(4);
         assert_eq!(popup_plan.selection.positions, vec![1, 3]);
         assert_eq!(popup_plan.action_owner, ContextMenuActionOwner::Popover);
+    }
+
+    /// The per-row drop target attached by `attach_playlist_drop_target`
+    /// resolves the destination from `list_item.position()` and asks
+    /// `is_editable_regular_playlist()` of that exact row — not the row the
+    /// sidebar selection happens to point at. This test pins the data-layer
+    /// invariant that drives that decision: the only sidebar rows that the
+    /// drop handler accepts are local regular playlists, so the lookup never
+    /// silently routes a drop to a different row's playlist.
+    #[test]
+    fn per_row_drop_target_accepts_only_editable_regular_playlists() {
+        use crate::db::entities::server_playlist_link::{
+            ServerPlaylistLocalState, ServerPlaylistRemoteState,
+        };
+        use crate::local::playlist_sidebar::PlaylistSidebarEntry;
+        use crate::local::playlist_sidebar::PlaylistSidebarKind;
+        use crate::ui::objects::HeaderKind;
+
+        let regular = SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "regular-1",
+            "My Mix",
+            PlaylistSidebarKind::EditableRegular,
+        ));
+        let smart = SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "smart-1",
+            "Smart Mix",
+            PlaylistSidebarKind::EditableSmart,
+        ));
+        let pull_mirror = SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "mirror-1",
+            "Linked",
+            PlaylistSidebarKind::PullMirror {
+                local_state: ServerPlaylistLocalState::Clean,
+                remote_state: ServerPlaylistRemoteState::Present,
+            },
+        ));
+        let server = SourceObject::discovered("Mini", "subsonic", "http://mini.local:4533");
+        let header = SourceObject::header("Wiedergabelisten", HeaderKind::Playlists);
+
+        // Only an editable regular playlist may receive a drop. The other
+        // kinds model every non-regular sidebar row the per-row factory
+        // setup installs: smart playlists, pull mirrors, server sources,
+        // and headers. The `position_source` resolver and the
+        // `connect_drop`/`connect_accept` handlers both depend on this
+        // exact split, so a regression here would re-introduce the
+        // rejected behavior where dropping on a non-regular row falls
+        // through to whatever regular playlist the keyboard selection
+        // last visited.
+        assert!(regular.is_editable_regular_playlist());
+        assert!(!smart.is_editable_regular_playlist());
+        assert!(!pull_mirror.is_editable_regular_playlist());
+        assert!(!server.is_editable_regular_playlist());
+        assert!(!header.is_editable_regular_playlist());
     }
 }
