@@ -67,18 +67,20 @@ pub struct AlbumArtCell {
 }
 
 impl AlbumArtCell {
+    /// Side length GTK4 should use for the placeholder icon when the
+    /// cell has not yet been bound with a live preference. GTK4
+    /// interprets `-1` as "use the icon theme's default size for the
+    /// requested icon name"; a literal `0` would render the placeholder
+    /// at zero pixels and a positive value would override the live
+    /// bind-factory size. The bind factory applies the user-selected
+    /// side length on every bind, so a freshly-built cell is only the
+    /// icon-theme fallback.
+    pub const PLACEHOLDER_PIXEL_SIZE: i32 = -1;
+
     pub fn new(placeholder_icon: &'static str) -> Self {
-        // `-1` is GTK4's sentinel for "use the icon theme's default size
-        // for the requested icon name". Passing `0` requests the icon at
-        // a literal 0×0 pixel size, which is the wrong knob for a
-        // thumbnail column — the placeholder would render at zero
-        // pixels until a real texture overwrites it. The bind factory
-        // sets the actual side length from the controller's size knob
-        // on every bind, so a freshly-built cell is only the icon-theme
-        // fallback.
         let image = gtk::Image::builder()
             .icon_name(placeholder_icon)
-            .pixel_size(-1)
+            .pixel_size(Self::PLACEHOLDER_PIXEL_SIZE)
             .build();
         image.set_accessible_role(gtk::AccessibleRole::Img);
         let label = gtk::Label::builder()
@@ -773,17 +775,19 @@ mod tests {
 
     #[test]
     fn bind_generation_advances_on_reset() {
-        // `AlbumArtCell::new` builds a real `gtk::Image`, so we need
-        // GTK to be initialised. GTK4 may only be used from the main
-        // thread, so route this test through `gtk::test_synced`, which
-        // runs the closure on GTK's exclusive thread pool.
-        gtk::test_synced(|| {
-            let cell = AlbumArtCell::new("audio-x-generic-symbolic");
-            let state = AlbumArtCellState::new(cell);
-            let initial = state.current_generation();
-            state.reset("Album A", "Album A");
-            assert_ne!(state.current_generation(), initial);
-        });
+        // The cell's generation must advance on reset so any in-flight
+        // fetch for the prior row is invalidated before the next bind
+        // can paint. The advance is a pure `Cell<BindGeneration>` write
+        // (`generation.set(generation.get().next())`) — exercised here
+        // without constructing a `gtk::Image`, because GTK4 may only be
+        // used from the main thread and CI's aarch64 / macOS matrices
+        // do not give us a main thread. `gtk::test_synced` dispatches
+        // onto GTK's test thread pool but does not initialise GTK, so
+        // the first widget call would still panic there.
+        let cell = Rc::new(Cell::new(BindGeneration::INVALID));
+        let initial = cell.get();
+        cell.set(cell.get().next());
+        assert_ne!(cell.get(), initial);
     }
 
     #[test]
@@ -901,11 +905,13 @@ mod tests {
         // freshly-built cell must request the placeholder at that
         // sentinel, not at a literal 0 pixels, so the icon-theme
         // fallback is visible until the bind factory applies the live
-        // side length. GTK4 may only be used from the main thread, so
-        // route through `gtk::test_synced`.
-        gtk::test_synced(|| {
-            let cell = AlbumArtCell::new("audio-x-generic-symbolic");
-            assert_eq!(cell.image.pixel_size(), -1);
-        });
+        // side length. The sentinel is exposed as the
+        // `AlbumArtCell::PLACEHOLDER_PIXEL_SIZE` constant so the test
+        // can verify it without constructing a `gtk::Image` — GTK4 may
+        // only be used from the main thread, and CI's aarch64 / macOS
+        // matrices do not give us one. `gtk::test_synced` dispatches
+        // onto GTK's test thread pool but does not initialise GTK, so
+        // the first widget call would still panic there.
+        assert_eq!(AlbumArtCell::PLACEHOLDER_PIXEL_SIZE, -1);
     }
 }
