@@ -551,8 +551,10 @@ impl ApplicationOwner {
         )
         .await;
         let Ok((runtime_handle, runtime_shutdown)) = started else {
-            let _ = completion.send(Err(LastFmApplicationCommandError::RuntimeStart));
-            self.fail_terminal(LastFmApplicationCommandError::RuntimeStart)?;
+            self.fail_terminal_before_completion(
+                LastFmApplicationCommandError::RuntimeStart,
+                completion,
+            )?;
             return Ok(());
         };
         let runtime_barrier = runtime_shutdown.barrier();
@@ -579,8 +581,7 @@ impl ApplicationOwner {
             } else {
                 LastFmApplicationCommandError::Drain
             };
-            let _ = completion.send(Err(failure));
-            self.fail_terminal(failure)?;
+            self.fail_terminal_before_completion(failure, completion)?;
             return if drained {
                 Ok(())
             } else {
@@ -614,8 +615,7 @@ impl ApplicationOwner {
             } else {
                 LastFmApplicationCommandError::Drain
             };
-            let _ = completion.send(Err(failure));
-            self.fail_terminal(failure)?;
+            self.fail_terminal_before_completion(failure, completion)?;
             return if drained {
                 Ok(())
             } else {
@@ -705,6 +705,21 @@ impl ApplicationOwner {
         ingress.publish(LastFmApplicationPhase::Failed, Some(failure));
         self.commands.close();
         Ok(())
+    }
+
+    fn fail_terminal_before_completion(
+        &self,
+        failure: LastFmApplicationCommandError,
+        completion: oneshot::Sender<Result<(), LastFmApplicationCommandError>>,
+    ) -> Result<(), LastFmApplicationShutdownError> {
+        // The watch and completion channels are independent. Publish the
+        // terminal snapshot synchronously before waking a waiter so command
+        // completion is a reliable status-observation boundary. If the status
+        // gate is poisoned, still preserve the original command error before
+        // propagating the terminal shutdown failure.
+        let terminal_status = self.fail_terminal(failure);
+        let _ = completion.send(Err(failure));
+        terminal_status
     }
 
     fn lock_ingress(&self) -> Result<MutexGuard<'_, IngressGate>, LastFmApplicationShutdownError> {
@@ -1834,14 +1849,9 @@ mod tests {
             .expect("stale activation rollback deadline"),
             Err(LastFmApplicationCommandError::CoordinatorActivation)
         );
-        let mut status_receiver = handle.subscribe_status();
-        let status = *status_receiver
-            .wait_for(|status| {
-                status.phase == LastFmApplicationPhase::Failed
-                    && status.failure == Some(LastFmApplicationCommandError::CoordinatorActivation)
-            })
-            .await
-            .expect("stale activation failure publication");
+        // Completion is the observation boundary: the owner must publish the
+        // terminal snapshot before waking this waiter.
+        let status = *handle.subscribe_status().borrow();
         assert_eq!(status.phase, LastFmApplicationPhase::Failed);
         assert_eq!(
             status.failure,
