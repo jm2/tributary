@@ -1,7 +1,7 @@
 # tr-d3z — Watcher backlog / root-confirmation ordering harness JUDGEMENT
 
 **Bead:** tr-d3z (P3.4 backlog)
-**Source record:** docs/task.md:1059-1060 (P3.4)
+**Source record:** `docs/task.md`, P3.4 — Maintenance and coverage
 **Decision date:** 2026-07-25
 **Decision:** DO NOT build the end-to-end harness. Existing focused unit coverage
 already locks down the ordering properties the new harness would re-prove, and
@@ -9,12 +9,10 @@ the fixture cost is not justified by the marginal coverage gain.
 
 ## 1. What the record asks for
 
-`docs/task.md` P3.4 line 1059:
+`docs/task.md`, under P3.4, asks:
 
 > Add a direct end-to-end watcher-backlog/root-confirmation ordering harness
 > **if its incremental coverage remains worth the platform-fixture cost**.
-> Current ordering is already exercised through engine-loop and control-flow
-> unit components (archived P0.2, ~366-368).
 
 The bead description makes the conditionality explicit:
 
@@ -120,10 +118,12 @@ requires:
 
 - **Platform-specific backend selection.** `notify::RecommendedWatcher` selects
   a backend at runtime. The harness must either pin a backend per platform
-  (adding CI complexity on Windows + macOS + Linux) or accept that the
-  harness is `#[cfg]`-scoped. The current repository CI runs Linux x86_64
-  only (CI workflows in `.github/workflows/ci.yml`), so a Linux-only harness
-  would not raise the macOS/Windows CI floor.
+  (adding CI complexity on Windows + macOS + Linux) or accept that the harness
+  is `#[cfg]`-scoped. The coverage aggregate and enforced floor run only on
+  Linux x86_64, although CI also runs tests on macOS and Windows. A
+  Linux-scoped harness would therefore add no native-backend evidence on those
+  platforms; a cross-platform harness requires a separate fixture design for
+  each backend.
 
 - **Timing-sensitive async loop.** The harness needs `tokio::test` with a
   `process_directory_events`-like driver to apply real filesystem mutations
@@ -165,7 +165,9 @@ a real timer, cross-platform coalescing) are either:
   (`enqueue_watcher_result` tests cover the callback → queue edge; debounce
   window expiry is exercised implicitly through `process_directory_events`'s
   polling loop in the application test suite).
-- Out of scope of the Linux-only CI runner (cross-platform coalescing).
+- Not captured by the Linux x86_64 coverage aggregate without adding and
+  maintaining native-backend fixtures in the existing macOS and Windows jobs
+  (cross-platform coalescing).
 - Subject to host-load variance in CI (real debounce-window timing).
 
 The fixture cost (§4) is therefore high relative to the marginal coverage
