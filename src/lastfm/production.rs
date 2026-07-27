@@ -1834,7 +1834,14 @@ mod tests {
             .expect("stale activation rollback deadline"),
             Err(LastFmApplicationCommandError::CoordinatorActivation)
         );
-        let status = *handle.subscribe_status().borrow();
+        let mut status_receiver = handle.subscribe_status();
+        let status = *status_receiver
+            .wait_for(|status| {
+                status.phase == LastFmApplicationPhase::Failed
+                    && status.failure == Some(LastFmApplicationCommandError::CoordinatorActivation)
+            })
+            .await
+            .expect("stale activation failure publication");
         assert_eq!(status.phase, LastFmApplicationPhase::Failed);
         assert_eq!(
             status.failure,
