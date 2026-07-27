@@ -15,7 +15,8 @@ equalization, room correction, and per-track profiles are out of scope.
 ## Scope
 
 Tributary offers a single ten-band parametric-style equalizer with five named presets, a global
-preamp, and a hard limiter to prevent inter-sample clipping. The equalizer runs in the **local**
+preamp, and a soft-knee signal compressor that engages above −6 dBFS with an asymptotic output
+ceiling at 0 dBFS to reduce the likelihood of hard clipping. The equalizer runs in the **local**
 pipeline only. AirPlay (RAOP), Chromecast, and MPD outputs are explicitly listed with their
 supported, partially supported, or unsupported status and the user-visible behavior for each
 non-supported state. The settings UI surfaces the equalizer unconditionally; for unsupported
@@ -38,7 +39,7 @@ them.
 | Preset          | enum       | `Flat` / `Pop` / `Rock` / `Jazz` / `Classical`     | —         | `Flat`     |
 | Preamp          | linear dB  | `−24.0` … `0.0` … `+12.0` dB; integer or half-step | 0.5 dB    | `0.0` dB   |
 | Bands 1..10     | linear dB  | `−24.0` … `0.0` … `+12.0` dB                       | 0.5 dB    | `0.0` dB   |
-| Clip protection | enum       | `Off` / `Soft` (transparent limiter at −1 dBFS)    | —         | `Off`      |
+| Clip protection | enum       | `Off` / `Soft` (soft-knee compressor, 0 dBFS asymptotic ceiling, −6 dBFS threshold) | —         | `Off`      |
 
 Ten band center frequencies are taken from the canonical `equalizer-10bands` element
 (`gst-plugins-good` 1.28.5, verified with `gst-inspect-1.0`): **29 Hz, 59 Hz, 119 Hz, 237 Hz,
@@ -67,10 +68,18 @@ free-form; reviewers must reject any PR that introduces a new band value without
 entry in the appendix.
 
 `Clip protection` is a global safety feature independent of the equalizer engine. When `Soft` is
-enabled, the engine inserts a single peak limiter immediately after the equalizer stage so that
-loud passages cannot exceed −1 dBFS after preamp+EQ. The limiter is transparent and adds no
-user-visible control. When `Off`, no limiter exists in the pipeline and clipping can occur; the
-state is preserved for power users who explicitly want raw output.
+enabled, the engine inserts an `rglimiter` element immediately after the equalizer stage. The
+element's own description in GStreamer is "Apply signal compression to raw audio data" — it is a
+**soft-knee signal compressor**, not a peak limiter. With `enabled=true` it applies a fixed
+−6 dBFS threshold above which it compresses progressively, with an asymptotic output ceiling of
+0 dBFS: it never lets the signal exceed full scale, but the asymptotic nature means levels near
+the ceiling are heavily compressed rather than held flat. The element exposes no user-tunable
+parameters — attack, release, threshold, and ceiling are all fixed by the element. The protection
+is therefore "the compressor prevents the output from exceeding full scale," not "the compressor
+prevents inter-sample peaks": a 0 dBFS ceiling provides no inter-sample headroom, and a
+soft-knee compressor engaging from −6 dBFS will compress most of a typical modern programme
+rather than catching only occasional peaks. When `Off`, no limiter exists in the pipeline and
+clipping can occur; the state is preserved for power users who explicitly want raw output.
 
 `Enabled = false` is global bypass: the equalizer filter (and its preamp stage) is *not inserted*
 in the local-output pipeline at all, so the pipeline reduces to the existing passthrough chain
@@ -112,13 +121,17 @@ Where:
   element's canonical centres and does not touch `bandN::freq`; `band0` (29 Hz) through `band9`
   (15011 Hz) are written as flat `bandN=<gain>` properties.
 - `rglimiter` (`gst-plugins-good`, plugin `replaygain`) is the clip-protection limiter. Its only
-  behavioural property is `enabled` (Boolean, default `true`); when enabled it applies a fixed
-  brick-wall ceiling at approximately −1 dBFS, which is the contract's "transparent limiter at
-  −1 dBFS". The element takes no other tuning; attack, release, and ceiling are fixed by the
-  element. Clip protection is the second of the five deliverables named by the bead; the
-  contract pins it to `rglimiter` rather than to `audioamplify`, which is not a limiter (it is a
-  static amplifier with hard-clip / wrap / none options, no envelope follower, and no
-  `max-amplitude` property).
+  behavioural property is `enabled` (Boolean, default `true`); the element's own description is
+  "Apply signal compression to raw audio data". When `enabled=true` it acts as a soft-knee
+  compressor with a fixed −6 dBFS threshold, smoothly compressing levels above the threshold with
+  an asymptotic output ceiling at 0 dBFS. There is no brick-wall behaviour and no inter-sample
+  headroom: the element prevents output from exceeding full scale, but a 0 dBFS signal at the
+  limiter's input is compressed by approximately 1.1 dB before it reaches the sink. The element
+  exposes no user-tunable parameters — attack, release, threshold, and ceiling are fixed by the
+  element. Clip protection is one of the five deliverables named by the bead; the contract pins
+  it to `rglimiter` rather than to `audioamplify`, which is not a limiter (it is a static
+  amplifier with hard-clip / wrap / none options, no envelope follower, and no `max-amplitude`
+  property).
 - `audioconvert` immediately before the preamp element normalises sample rate and channel layout
   for the biquad cascade that follows. The post-limiter `audioconvert` downconverts to the sink
   caps. Both `audioconvert` instances are the same `audioconvert` the existing pipeline already
@@ -177,8 +190,9 @@ preset again is required to switch back to a named response. The contract does n
 "modified" flag in storage; the active preset name is the source of truth.
 
 `Clip protection = Soft` inserts `rglimiter enabled=true` immediately after the EQ stage. The
-limiter's ceiling is fixed by the element at approximately −1 dBFS. Limiter attack, release, and
-ceiling are fixed by the element; no user-visible controls are exposed.
+element behaves as a soft-knee compressor with a −6 dBFS threshold and an asymptotic 0 dBFS
+output ceiling. Limiter attack, release, threshold, and ceiling are fixed by the element; no
+user-visible controls are exposed.
 
 Pre-LP clip behavior is what clip protection actually guards against: the EQ can elevate peaks
 above 0 dBFS even with a sane-looking preamp, especially on already-mastered pop/rock material.
@@ -372,9 +386,8 @@ current value, the unit (decibels), and the boundary (e.g. `−6.0 dB, range min
 plus twelve`). The `Preset` combo box announces the active preset name and exposes only the
 five named values listed above.
 
-The settings UI is localized in the same locale set as the rest of the application
-(`locales/en.yml`, `de.yml`, `es.yml`, `fr.yml`, `it.yml`, `ja.yml`, `ko.yml`, `nl.yml`,
-`pl.yml`, `pt-BR.yml`). The five preset names are translated, but the keys stored in
+The settings UI is localized in the same locale set as the rest of the application (see the
+files under `locales/`). The five preset names are translated, but the keys stored in
 `equalizer.cfg` remain English (`flat`, `pop`, `rock`, `jazz`, `classical`). The migration of
 older non-English keys is not expected; an unknown preset value is treated as `Flat`.
 
@@ -390,6 +403,7 @@ for this contract; new conditions require a new revision.
 | Change a single band mid-playback                       | Buffer passes; no gapless discontinuity; new value reaches the filter      |
 | Select Pop preset mid-playback                          | All ten bands + preamp updated atomically; preset name updates in UI      |
 | Cycle clip protection Off → Soft → Off                   | Pause/resume swap each time; total swap ≤ 100 ms per toggle              |
+| Sine input above +6 dBFS with clip protection = Soft    | Output peak converges asymptotically to 0 dBFS without exceeding it; soft-knee compression engages at the −6 dBFS threshold; a 0 dBFS input is attenuated by approximately 1.1 dB; reflects the `rglimiter` element's own description "Apply signal compression to raw audio data" |
 | Switch active output to AirPlay                         | EQ module renders disabled in UI; no equalizer chain runs on the RAOP pipeline |
 | Switch active output back to Local                      | EQ module renders enabled in UI if previously enabled; pipeline re-attaches the chain |
 | Quit while a slider drag is in progress                 | Last debounced write is persisted; no partial writes                       |
