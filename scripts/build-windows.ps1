@@ -814,18 +814,59 @@ function Assert-WindowsApplicationResourceContract {
     }
     $typeCounts = @{ "3" = 0; "14" = 0; "16" = 0 }
     $dataCounts = @{ "3" = 0; "14" = 0; "16" = 0 }
+    $iconDataSizes = @{}
+    $groupIconBytes = [System.Collections.Generic.List[byte]]::new()
+    $groupIconDeclaredSize = $null
+    $groupIconDataSeen = $false
+    $capturingGroupIconData = $false
     $currentTypeId = ""
+    $currentResourceNameId = $null
     $totalResourceCount = $null
     $totalResourceLines = 0
 
     foreach ($lineValue in $lines) {
         $line = [string]$lineValue
+        if ($capturingGroupIconData) {
+            if ($line -match '^\s*\)\s*$') {
+                $capturingGroupIconData = $false
+                continue
+            }
+            if ($line -notmatch '^\s*([0-9A-Fa-f]+):\s+([0-9A-Fa-f]+(?:\s+[0-9A-Fa-f]+)*)\s+\|.*$') {
+                throw "GROUP_ICON resource contains a malformed hexadecimal payload"
+            }
+            $lineOffset = [Convert]::ToInt64($matches[1], 16)
+            if ($lineOffset -ne $groupIconBytes.Count) {
+                throw "GROUP_ICON resource contains a discontinuous hexadecimal payload"
+            }
+            $hexPayload = ""
+            foreach ($hexWord in @($matches[2] -split '\s+')) {
+                if ($hexWord.Length -lt 2 -or $hexWord.Length -gt 8 -or
+                    ($hexWord.Length % 2) -ne 0) {
+                    throw "GROUP_ICON resource contains a malformed hexadecimal word"
+                }
+                $hexPayload += $hexWord
+            }
+            for ($hexOffset = 0; $hexOffset -lt $hexPayload.Length; $hexOffset += 2) {
+                if ($groupIconBytes.Count -ge [int64]$groupIconDeclaredSize) {
+                    throw "GROUP_ICON hexadecimal payload exceeds its declared size"
+                }
+                $groupIconBytes.Add(
+                    [Convert]::ToByte($hexPayload.Substring($hexOffset, 2), 16)
+                )
+            }
+            continue
+        }
         if ($line -match '^\s*Total Number of Resources:\s*([0-9]+)\s*$') {
             $totalResourceLines++
             $totalResourceCount = [int64]$matches[1]
             continue
         }
-        if ($line -match '^\s*Type:\s*([A-Z_]+)\s+\(ID\s+([0-9]+)\)\s*\[\s*$') {
+        if ($line -match '^\s*Type:') {
+            $currentTypeId = ""
+            $currentResourceNameId = $null
+            if ($line -notmatch '^\s*Type:\s*([A-Z_]+)\s+\(ID\s+([0-9]+)\)\s*\[\s*$') {
+                continue
+            }
             $resourceTypeName = $matches[1]
             $currentTypeId = $matches[2]
             if ($requiredTypeNames.ContainsKey($currentTypeId)) {
@@ -836,15 +877,55 @@ function Assert-WindowsApplicationResourceContract {
             }
             continue
         }
+        if ($line -match '^\s*Name:') {
+            $currentResourceNameId = $null
+            if ($line -match '^\s*Name:\s*\(ID\s+([0-9]+)\)\s*\[\s*$') {
+                $currentResourceNameId = $matches[1]
+            }
+            elseif ($currentTypeId -eq "3" -or $currentTypeId -eq "14") {
+                throw "Required $($requiredTypeNames[$currentTypeId]) resource used a nonnumeric name"
+            }
+            continue
+        }
         if ($line -match '^\s*DataSize:\s*([0-9]+)\s*$' -and
             $requiredTypeNames.ContainsKey($currentTypeId)) {
-            if ([int64]$matches[1] -le 0) {
+            $dataSize = [int64]$matches[1]
+            if ($dataSize -le 0) {
                 throw "Required $($requiredTypeNames[$currentTypeId]) resource has an empty payload"
             }
             $dataCounts[$currentTypeId] = [int]$dataCounts[$currentTypeId] + 1
+            if ($currentTypeId -eq "3") {
+                if ($null -eq $currentResourceNameId) {
+                    throw "ICON resource payload is missing its numeric resource ID"
+                }
+                if ($iconDataSizes.ContainsKey($currentResourceNameId)) {
+                    throw "ICON resource ID $currentResourceNameId has multiple payloads"
+                }
+                $iconDataSizes[$currentResourceNameId] = $dataSize
+            }
+            elseif ($currentTypeId -eq "14") {
+                if ($null -eq $currentResourceNameId) {
+                    throw "GROUP_ICON resource payload is missing its numeric resource ID"
+                }
+                if ($null -ne $groupIconDeclaredSize) {
+                    throw "Final tributary.exe contains multiple GROUP_ICON payloads"
+                }
+                $groupIconDeclaredSize = $dataSize
+            }
+            continue
+        }
+        if ($line -match '^\s*Data\s+\(\s*$' -and $currentTypeId -eq "14") {
+            if ($null -eq $groupIconDeclaredSize -or $groupIconDataSeen) {
+                throw "GROUP_ICON resource contains an unexpected hexadecimal payload"
+            }
+            $groupIconDataSeen = $true
+            $capturingGroupIconData = $true
         }
     }
 
+    if ($capturingGroupIconData) {
+        throw "GROUP_ICON resource contains a truncated hexadecimal payload"
+    }
     if ($totalResourceLines -ne 1 -or $null -eq $totalResourceCount -or
         $totalResourceCount -lt 8) {
         throw "PE resource inspector did not report one plausible resource total"
@@ -857,6 +938,56 @@ function Assert-WindowsApplicationResourceContract {
         $requiredDataCount = [int]$requiredDataCounts[$resourceTypeId]
         if ([int]$dataCounts[$resourceTypeId] -ne $requiredDataCount) {
             throw "Final tributary.exe must contain exactly $requiredDataCount nonempty $resourceTypeName resource(s)"
+        }
+    }
+
+    if (-not $groupIconDataSeen -or $null -eq $groupIconDeclaredSize) {
+        throw "Final tributary.exe GROUP_ICON payload was not reported"
+    }
+    if ($groupIconBytes.Count -ne [int64]$groupIconDeclaredSize) {
+        throw "GROUP_ICON hexadecimal payload does not match its declared size"
+    }
+    if ($groupIconBytes.Count -lt 6) {
+        throw "GROUP_ICON payload is too short to contain a directory header"
+    }
+    $groupIconPayload = $groupIconBytes.ToArray()
+    $groupIconReserved = [BitConverter]::ToUInt16($groupIconPayload, 0)
+    $groupIconType = [BitConverter]::ToUInt16($groupIconPayload, 2)
+    $groupIconEntryCount = [BitConverter]::ToUInt16($groupIconPayload, 4)
+    if ($groupIconReserved -ne 0 -or $groupIconType -ne 1) {
+        throw "GROUP_ICON payload has an invalid directory header"
+    }
+    if ($groupIconEntryCount -ne 6) {
+        throw "GROUP_ICON directory must contain exactly six entries"
+    }
+    $expectedGroupIconSize = 6 + (14 * [int]$groupIconEntryCount)
+    if ($groupIconPayload.Length -ne $expectedGroupIconSize) {
+        throw "GROUP_ICON payload length does not match its directory entry count"
+    }
+
+    $groupIconResourceIds = @{}
+    for ($entryIndex = 0; $entryIndex -lt $groupIconEntryCount; $entryIndex++) {
+        $entryOffset = 6 + (14 * $entryIndex)
+        $bytesInResource = [BitConverter]::ToUInt32($groupIconPayload, $entryOffset + 8)
+        $iconResourceId = [BitConverter]::ToUInt16($groupIconPayload, $entryOffset + 12)
+        $iconResourceIdKey = [string]$iconResourceId
+        if ($groupIconResourceIds.ContainsKey($iconResourceIdKey)) {
+            throw "GROUP_ICON directory contains duplicate ICON resource ID $iconResourceId"
+        }
+        $groupIconResourceIds[$iconResourceIdKey] = $true
+        if (-not $iconDataSizes.ContainsKey($iconResourceIdKey)) {
+            throw "GROUP_ICON directory references missing ICON resource ID $iconResourceId"
+        }
+        if ([uint64]$bytesInResource -ne [uint64]$iconDataSizes[$iconResourceIdKey]) {
+            throw "GROUP_ICON directory size does not match ICON resource ID $iconResourceId"
+        }
+    }
+    if ($groupIconResourceIds.Count -ne $iconDataSizes.Count) {
+        throw "GROUP_ICON directory does not reference the complete ICON resource set"
+    }
+    foreach ($iconResourceIdKey in $iconDataSizes.Keys) {
+        if (-not $groupIconResourceIds.ContainsKey($iconResourceIdKey)) {
+            throw "GROUP_ICON directory does not reference ICON resource ID $iconResourceIdKey"
         }
     }
 

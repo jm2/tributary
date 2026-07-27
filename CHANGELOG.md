@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or version resources even though the source ICO and the Inno Setup icon were intact. The
   generated icon and `VERSIONINFO` resource is now linked specifically to the `tributary` binary.
   Windows packaging rejects a final app executable unless it contains all six icon payloads,
-  its group-icon, and its version resource with the expected product metadata on both supported
+  a well-formed group-icon directory that references every payload exactly once with the correct
+  byte size, and its version resource with the expected product metadata on both supported
   architectures. macOS packaging now likewise verifies that `CFBundleIconFile` resolves to a
   parseable ICNS containing every required representation, verifies all bundled GTK hicolor app
   icons, and includes the previously missing 1024×1024 Retina source representation. These

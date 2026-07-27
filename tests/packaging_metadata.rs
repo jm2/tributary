@@ -483,25 +483,39 @@ fn windows_artifacts_fail_closed_on_missing_application_resources() {
         "a stale installer source tree must fail before Inno Setup runs"
     );
 
-    assert!(
-        build_windows.contains("function Invoke-BoundedPeResourceInspection")
-            && build_windows.contains("function Assert-WindowsApplicationResourceContract")
-            && build_windows.contains("$arguments = '--coff-resources \"' + $Application + '\"'")
-            && build_windows.contains("$outputByteLimit = 8388608")
-            && build_windows.contains("$processDeadlineMs = 45000")
-            && build_windows.contains("\"3\" = \"ICON\"")
-            && build_windows.contains("\"14\" = \"GROUP_ICON\"")
-            && build_windows.contains("\"16\" = \"VERSIONINFO\"")
-            && build_windows.contains("\"3\" = 6")
-            && build_windows.contains("\"14\" = 1")
-            && build_windows.contains("\"16\" = 1")
-            && build_windows.contains("DataSize:")
-            && build_windows.contains("[System.Diagnostics.FileVersionInfo]::GetVersionInfo")
-            && build_windows.contains("$versionInfo.ProductName -cne \"Tributary\"")
-            && build_windows.contains("$versionInfo.FileVersion -cne $ExpectedVersion")
-            && build_windows.contains("$finalSnapshot -ne $applicationSnapshot"),
-        "the gate must inspect bounded PE data, require the complete six-frame icon plus group/version resources, validate product metadata, and detect a changing executable"
-    );
+    for fragment in [
+        "function Invoke-BoundedPeResourceInspection",
+        "function Assert-WindowsApplicationResourceContract",
+        "$arguments = '--coff-resources \"' + $Application + '\"'",
+        "$outputByteLimit = 8388608",
+        "$processDeadlineMs = 45000",
+        "\"3\" = \"ICON\"",
+        "\"14\" = \"GROUP_ICON\"",
+        "\"16\" = \"VERSIONINFO\"",
+        "\"3\" = 6",
+        "\"14\" = 1",
+        "\"16\" = 1",
+        "DataSize:",
+        "Name:\\s*\\(ID\\s+([0-9]+)\\)",
+        "$groupIconBytes.Add(",
+        "$groupIconBytes.Count -ne [int64]$groupIconDeclaredSize",
+        "$groupIconReserved -ne 0 -or $groupIconType -ne 1",
+        "$groupIconEntryCount -ne 6",
+        "$groupIconPayload.Length -ne $expectedGroupIconSize",
+        "$groupIconResourceIds.ContainsKey($iconResourceIdKey)",
+        "-not $iconDataSizes.ContainsKey($iconResourceIdKey)",
+        "[uint64]$bytesInResource -ne [uint64]$iconDataSizes[$iconResourceIdKey]",
+        "$groupIconResourceIds.Count -ne $iconDataSizes.Count",
+        "[System.Diagnostics.FileVersionInfo]::GetVersionInfo",
+        "$versionInfo.ProductName -cne \"Tributary\"",
+        "$versionInfo.FileVersion -cne $ExpectedVersion",
+        "$finalSnapshot -ne $applicationSnapshot",
+    ] {
+        assert!(
+            build_windows.contains(fragment),
+            "the Windows application-resource gate is missing its contract: {fragment}"
+        );
+    }
 
     for (workflow, label) in [(windows_ci, "CI"), (windows_release, "release")] {
         assert!(
