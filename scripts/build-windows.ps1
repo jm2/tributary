@@ -619,6 +619,265 @@ function Invoke-BoundedPeImportBatch {
     return $stdoutLines
 }
 
+# Inspect the application's PE resources without loading or executing it.
+# llvm-readobj emits the raw resource payload as hex, so keep the same bounded
+# process, output, and diagnostic discipline used by import inspection. The
+# shipped icon set is under 200 KiB; the larger ceiling leaves room for normal
+# metadata growth while treating an unexpectedly huge resource table as a
+# packaging failure instead of allowing it to exhaust a CI runner.
+function Invoke-BoundedPeResourceInspection {
+    param(
+        [string]$Inspector,
+        [string]$Application
+    )
+
+    $applicationLabel = Format-PeImportTargetForDiagnostic $Application
+    if ([string]::IsNullOrWhiteSpace($Application) -or
+        [System.Text.RegularExpressions.Regex]::IsMatch(
+            $Application,
+            '[\p{Cc}\p{Zl}\p{Zp}"]'
+        )) {
+        throw "PE resource-inspection target contains an unsupported quote or control character ($applicationLabel)"
+    }
+
+    $arguments = '--coff-resources "' + $Application + '"'
+    $argumentCharacterLimit = 24000
+    if ($arguments.Length -gt $argumentCharacterLimit) {
+        throw "PE resource-inspection command exceeded its $argumentCharacterLimit-character limit"
+    }
+
+    $outputByteLimit = 8388608
+    $processDeadlineMs = 45000
+    $token = [Guid]::NewGuid().ToString("N")
+    $tempRoot = [System.IO.Path]::GetTempPath()
+    $stdoutPath = Join-Path $tempRoot "tributary-resource-readobj-$token.stdout"
+    $stderrPath = Join-Path $tempRoot "tributary-resource-readobj-$token.stderr"
+    $process = $null
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $failure = $null
+    $diagnostic = ""
+    $stdoutLines = @()
+
+    try {
+        $process = Start-Process -FilePath $Inspector -ArgumentList $arguments `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath `
+            -NoNewWindow -PassThru
+
+        while (-not $process.WaitForExit(50)) {
+            $stdoutLength = if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
+                (Get-Item -LiteralPath $stdoutPath).Length
+            } else { 0 }
+            $stderrLength = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+                (Get-Item -LiteralPath $stderrPath).Length
+            } else { 0 }
+            if (($stdoutLength + $stderrLength) -gt $outputByteLimit) {
+                throw "PE resource inspector output crossed its $outputByteLimit-byte limit ($applicationLabel)"
+            }
+            if ($clock.ElapsedMilliseconds -ge $processDeadlineMs) {
+                throw "PE resource inspector exceeded its $processDeadlineMs-millisecond deadline ($applicationLabel)"
+            }
+        }
+
+        $stdoutLength = if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
+            (Get-Item -LiteralPath $stdoutPath).Length
+        } else { 0 }
+        $stderrLength = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+            (Get-Item -LiteralPath $stderrPath).Length
+        } else { 0 }
+        if (($stdoutLength + $stderrLength) -gt $outputByteLimit) {
+            throw "PE resource inspector output crossed its $outputByteLimit-byte limit ($applicationLabel)"
+        }
+        if ($clock.ElapsedMilliseconds -ge $processDeadlineMs) {
+            throw "PE resource inspector exceeded its $processDeadlineMs-millisecond deadline ($applicationLabel)"
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "PE resource inspector exited with status $($process.ExitCode) ($applicationLabel)"
+        }
+        $stdoutLines = @([System.IO.File]::ReadAllLines($stdoutPath))
+    }
+    catch {
+        $failure = $_.Exception.Message
+    }
+    finally {
+        try {
+            Stop-BoundedProcessTree $process "PE resource inspector"
+        }
+        catch {
+            if ($failure) { $failure += "; $($_.Exception.Message)" }
+            else { $failure = $_.Exception.Message }
+        }
+        if ($failure) {
+            $diagnostic = Get-BoundedProbeDiagnostic $stderrPath "PE resource inspector stderr" 8192
+            if (-not $diagnostic) {
+                $diagnostic = Get-BoundedProbeDiagnostic $stdoutPath "PE resource inspector stdout" 8192
+            }
+        }
+        if ($null -ne $process) { $process.Dispose() }
+        Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($failure) {
+        if ($diagnostic) { throw "$failure`n$diagnostic" }
+        throw $failure
+    }
+    return $stdoutLines
+}
+
+# Fail closed unless the final application executable contains its complete
+# Windows shell identity. RT_ICON supplies the image payload, RT_GROUP_ICON is
+# what Explorer and shortcuts resolve, and RT_VERSION carries the user-visible
+# product metadata. Checking the copied application at each artifact boundary
+# prevents a successful Cargo build from silently publishing a generic-icon
+# executable when package topology or linker behavior changes.
+function Assert-WindowsApplicationResourceContract {
+    param(
+        [string]$Application,
+        [string]$Inspector,
+        [string]$ExpectedVersion
+    )
+
+    $applicationLabel = Format-PeImportTargetForDiagnostic $Application
+    if ([string]::IsNullOrWhiteSpace($Application) -or
+        -not [System.IO.Path]::IsPathRooted($Application)) {
+        throw "Windows application resource target must be absolute ($applicationLabel)"
+    }
+    $applicationFull = [System.IO.Path]::GetFullPath($Application)
+    if (-not (Test-Path -LiteralPath $applicationFull -PathType Leaf)) {
+        throw "Windows application resource target was not found: $applicationLabel"
+    }
+    $applicationItem = Get-Item -LiteralPath $applicationFull -Force -ErrorAction Stop
+    if (($applicationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Windows application resource target must not be a filesystem reparse point: $applicationLabel"
+    }
+    if ($applicationItem.Name -ine "tributary.exe") {
+        throw "Windows application resource target must be tributary.exe: $applicationLabel"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Inspector) -or
+        -not [System.IO.Path]::IsPathRooted($Inspector)) {
+        throw "PE resource inspector path must be absolute"
+    }
+    $inspectorFull = [System.IO.Path]::GetFullPath($Inspector)
+    if (-not (Test-Path -LiteralPath $inspectorFull -PathType Leaf)) {
+        throw "Required PE resource inspector was not found: $inspectorFull"
+    }
+    $inspectorItem = Get-Item -LiteralPath $inspectorFull -Force -ErrorAction Stop
+    if (($inspectorItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "PE resource inspector must not be a filesystem reparse point: $inspectorFull"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ExpectedVersion) -or
+        [System.Text.RegularExpressions.Regex]::IsMatch(
+            $ExpectedVersion,
+            '[\p{Cc}\p{Zl}\p{Zp}"]'
+        )) {
+        throw "Expected Windows application version is empty or contains unsupported characters"
+    }
+
+    $stream = [System.IO.File]::Open(
+        $applicationFull,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    try {
+        if ($stream.Length -lt 2 -or $stream.ReadByte() -ne 0x4D -or
+            $stream.ReadByte() -ne 0x5A) {
+            throw "Windows application resource target does not have an MZ header: $applicationLabel"
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+
+    $applicationSnapshot = "$($applicationItem.Length):$($applicationItem.LastWriteTimeUtc.Ticks)"
+    $lines = @(Invoke-BoundedPeResourceInspection `
+        -Inspector $inspectorFull `
+        -Application $applicationFull)
+
+    $requiredTypeNames = @{
+        "3" = "ICON"
+        "14" = "GROUP_ICON"
+        "16" = "VERSIONINFO"
+    }
+    $requiredDataCounts = @{
+        "3" = 6
+        "14" = 1
+        "16" = 1
+    }
+    $typeCounts = @{ "3" = 0; "14" = 0; "16" = 0 }
+    $dataCounts = @{ "3" = 0; "14" = 0; "16" = 0 }
+    $currentTypeId = ""
+    $totalResourceCount = $null
+    $totalResourceLines = 0
+
+    foreach ($lineValue in $lines) {
+        $line = [string]$lineValue
+        if ($line -match '^\s*Total Number of Resources:\s*([0-9]+)\s*$') {
+            $totalResourceLines++
+            $totalResourceCount = [int64]$matches[1]
+            continue
+        }
+        if ($line -match '^\s*Type:\s*([A-Z_]+)\s+\(ID\s+([0-9]+)\)\s*\[\s*$') {
+            $resourceTypeName = $matches[1]
+            $currentTypeId = $matches[2]
+            if ($requiredTypeNames.ContainsKey($currentTypeId)) {
+                if ($resourceTypeName -cne $requiredTypeNames[$currentTypeId]) {
+                    throw "PE resource ID $currentTypeId used unexpected type name '$resourceTypeName'"
+                }
+                $typeCounts[$currentTypeId] = [int]$typeCounts[$currentTypeId] + 1
+            }
+            continue
+        }
+        if ($line -match '^\s*DataSize:\s*([0-9]+)\s*$' -and
+            $requiredTypeNames.ContainsKey($currentTypeId)) {
+            if ([int64]$matches[1] -le 0) {
+                throw "Required $($requiredTypeNames[$currentTypeId]) resource has an empty payload"
+            }
+            $dataCounts[$currentTypeId] = [int]$dataCounts[$currentTypeId] + 1
+        }
+    }
+
+    if ($totalResourceLines -ne 1 -or $null -eq $totalResourceCount -or
+        $totalResourceCount -lt 8) {
+        throw "PE resource inspector did not report one plausible resource total"
+    }
+    foreach ($resourceTypeId in @("3", "14", "16")) {
+        $resourceTypeName = $requiredTypeNames[$resourceTypeId]
+        if ([int]$typeCounts[$resourceTypeId] -ne 1) {
+            throw "Final tributary.exe must contain exactly one $resourceTypeName resource table"
+        }
+        $requiredDataCount = [int]$requiredDataCounts[$resourceTypeId]
+        if ([int]$dataCounts[$resourceTypeId] -ne $requiredDataCount) {
+            throw "Final tributary.exe must contain exactly $requiredDataCount nonempty $resourceTypeName resource(s)"
+        }
+    }
+
+    $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($applicationFull)
+    if ([string]$versionInfo.ProductName -cne "Tributary") {
+        throw "Final tributary.exe ProductName metadata must be 'Tributary'"
+    }
+    if ([string]$versionInfo.FileDescription -cne "Tributary") {
+        throw "Final tributary.exe FileDescription metadata must be 'Tributary'"
+    }
+    if ([string]$versionInfo.FileVersion -cne $ExpectedVersion) {
+        throw "Final tributary.exe FileVersion metadata does not match package version $ExpectedVersion"
+    }
+    if ([string]$versionInfo.ProductVersion -cne $ExpectedVersion) {
+        throw "Final tributary.exe ProductVersion metadata does not match package version $ExpectedVersion"
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$versionInfo.LegalCopyright)) {
+        throw "Final tributary.exe LegalCopyright metadata is empty"
+    }
+
+    $finalApplicationItem = Get-Item -LiteralPath $applicationFull -Force -ErrorAction Stop
+    $finalSnapshot = "$($finalApplicationItem.Length):$($finalApplicationItem.LastWriteTimeUtc.Ticks)"
+    if (($finalApplicationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $finalSnapshot -ne $applicationSnapshot) {
+        throw "Final tributary.exe changed during PE resource validation"
+    }
+}
+
 # Reinspect the completed application tree without copying or repairing
 # anything. This final gate runs after every normal-mode writer (including the
 # packaged runtime probe) and is also available to installer-only mode, whose
@@ -840,6 +1099,16 @@ if ($InnoSetup -and $SkipBundle) {
     catch {
         Write-Err "Installer source PE import validation failed: $($_.Exception.Message)"
     }
+    try {
+        Assert-WindowsApplicationResourceContract `
+            -Application (Join-Path $sourceDir "tributary.exe") `
+            -Inspector $installerPeImportInspector `
+            -ExpectedVersion $CargoVersion
+    }
+    catch {
+        Write-Err "Installer source application resource validation failed: $($_.Exception.Message)"
+    }
+    Write-Info "Installer source application icon and version resources passed."
 
     Write-Info "Running Inno Setup compiler..."
     & $iscc /DAppVersion="$CargoVersion" /DSourceDir="$sourceDir" /DOutputDir="$outputDir" /DTargetArch="$InnoArch" $issFile
@@ -1744,6 +2013,19 @@ try {
 catch {
     Write-Err "Final Windows PE import validation failed: $($_.Exception.Message)"
 }
+try {
+    $expectedApplicationVersion = (Select-String -Path "Cargo.toml" `
+        -Pattern '^version\s*=\s*"(.+)"' |
+        Select-Object -First 1).Matches.Groups[1].Value
+    Assert-WindowsApplicationResourceContract `
+        -Application $exeBundleDest `
+        -Inspector $peImportInspector `
+        -ExpectedVersion $expectedApplicationVersion
+}
+catch {
+    Write-Err "Final Windows application resource validation failed: $($_.Exception.Message)"
+}
+Write-Info "Final Windows application icon and version resources passed."
 Write-Info "Creating zip archive..."
 $zipPath = "dist\tributary-windows.zip"
 Remove-Item $zipPath -ErrorAction SilentlyContinue

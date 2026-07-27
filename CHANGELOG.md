@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Native application icon packaging is now explicit and fail-closed.** Adding the package's
+  library target had caused `winresource`'s package-wide link directive to attach to the library
+  instead of `tributary.exe`, so the Windows executables published in v0.5.1 contained no PE icon
+  or version resources even though the source ICO and the Inno Setup icon were intact. The
+  generated icon and `VERSIONINFO` resource is now linked specifically to the `tributary` binary.
+  Windows packaging rejects a final app executable unless it contains all six icon payloads,
+  its group-icon, and its version resource with the expected product metadata on both supported
+  architectures. macOS packaging now likewise verifies that `CFBundleIconFile` resolves to a
+  parseable ICNS containing every required representation, verifies all bundled GTK hicolor app
+  icons, and includes the previously missing 1024×1024 Retina source representation. These
+  artifact-level contracts cover the independent shell/Finder and GTK/About icon paths that
+  allowed earlier packaging regressions to pass otherwise-successful builds.
 - **Last.fm application activation failures now publish their terminal status before waking the
   command waiter** ([#169](https://github.com/jm2/tributary/pull/169)). The application owner's
   runtime-start, playback-ingress, and coordinator-activation rollback paths no longer race an

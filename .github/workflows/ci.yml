@@ -24,6 +24,7 @@ jobs:
       - name: Test package compliance policies
         run: |
           build-aux/linux/test-package-compliance.sh
+          scripts/test-macos-icon-bundle-policy.sh
           scripts/test-macos-package-policy.sh
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
@@ -454,7 +455,7 @@ jobs:
           export PKG_CONFIG_PATH="/${{ matrix.msys_env }}/lib/pkgconfig"
           cargo test --release --target ${{ matrix.rust_target }}
 
-      - name: Bundle DLLs and create zip
+      - name: Bundle DLLs, validate app resources, and create zip
         run: |
           MSYS_ROOT=$(cygpath -w /)
           pwsh -File scripts/build-windows.ps1 -Msys2Root "$MSYS_ROOT" -NoCargoBuild

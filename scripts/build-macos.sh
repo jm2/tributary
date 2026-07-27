@@ -54,18 +54,26 @@ error() { echo -e "${RED}[tributary]${NC} $*" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MACOS_PACKAGE_POLICY_HELPER="${SCRIPT_DIR}/macos-package-policy.sh"
+MACOS_ICON_POLICY_HELPER="${SCRIPT_DIR}/macos-icon-bundle-policy.sh"
 [[ -f "$MACOS_PACKAGE_POLICY_HELPER" ]] \
   || error "macOS package-policy helper is missing: ${MACOS_PACKAGE_POLICY_HELPER}"
+[[ -f "$MACOS_ICON_POLICY_HELPER" ]] \
+  || error "macOS icon-policy helper is missing: ${MACOS_ICON_POLICY_HELPER}"
 # shellcheck source=macos-package-policy.sh
 source "$MACOS_PACKAGE_POLICY_HELPER"
+# shellcheck source=macos-icon-bundle-policy.sh
+source "$MACOS_ICON_POLICY_HELPER"
 
-# Test-only policy hooks remain available to the sourced helper, but a release
-# build must use the repository policy and the platform inspection tools even
-# when its parent environment happens to define those hook names.
+# Test-only command hooks remain available to the sourced helpers, but a
+# release build must use the repository policy and platform inspection tools
+# even when its parent environment happens to define those hook names.
 readonly MACOS_BUNDLED_COMPONENT_POLICY="${SCRIPT_DIR}/../build-aux/packaging/forbidden-bundled-components.txt"
 readonly MACOS_FIND_COMMAND="/usr/bin/find"
 readonly MACOS_OTOOL_COMMAND="/usr/bin/otool"
 readonly MACOS_OD_COMMAND="/usr/bin/od"
+readonly MACOS_PLUTIL_COMMAND="/usr/bin/plutil"
+readonly MACOS_ICONUTIL_COMMAND="/usr/bin/iconutil"
+readonly MACOS_SIPS_COMMAND="/usr/bin/sips"
 
 APP_NAME="Tributary"
 BUNDLE_ID="io.github.tributary.Tributary"
@@ -139,10 +147,20 @@ fi
 for policy_tool in "$MACOS_FIND_COMMAND" "$MACOS_OTOOL_COMMAND" "$MACOS_OD_COMMAND"; do
   [[ -x "$policy_tool" ]] || error "Required macOS package-policy tool is unavailable: ${policy_tool}"
 done
+for icon_tool in "$MACOS_PLUTIL_COMMAND" "$MACOS_ICONUTIL_COMMAND" "$MACOS_SIPS_COMMAND"; do
+  [[ -x "$icon_tool" ]] || error "Required macOS icon inspection tool is unavailable: ${icon_tool}"
+done
 if ! macos_package_policy_load "$MACOS_BUNDLED_COMPONENT_POLICY"; then
   error "$MACOS_PACKAGE_POLICY_REASON"
 fi
 info "Loaded ${MACOS_FORBIDDEN_COMPONENT_TOKEN_COUNT} forbidden bundle filename tokens."
+
+ICONSET_SRC="data/tributary.iconset"
+APP_ICONS_SRC="data/icons/hicolor"
+if ! macos_validate_icon_sources "$ICONSET_SRC" "$APP_ICONS_SRC" "$BUNDLE_ID"; then
+  error "macOS app icon source validation failed: ${MACOS_ICON_POLICY_REASON}"
+fi
+info "macOS app icon sources are complete and parseable."
 
 # ── Rust Build ───────────────────────────────────────────────────────────────
 info "Building Tributary (release)..."
@@ -194,11 +212,8 @@ cp -RL "${BREW_PREFIX}/share/icons/hicolor" "${RESOURCES_DIR}/share/icons/" 2>/d
 cp -RL "${BREW_PREFIX}/share/icons/Adwaita" "${RESOURCES_DIR}/share/icons/" 2>/dev/null || true
 
 # Bundle the app's own hicolor icons (About dialog, etc.)
-APP_ICONS_SRC="data/icons/hicolor"
-if [[ -d "$APP_ICONS_SRC" ]]; then
-  info "Bundling app hicolor icons..."
-  cp -R "$APP_ICONS_SRC"/* "${RESOURCES_DIR}/share/icons/hicolor/" 2>/dev/null || true
-fi
+info "Bundling app hicolor icons..."
+cp -R "${APP_ICONS_SRC}/." "${RESOURCES_DIR}/share/icons/hicolor/"
 
 # Compile GTK Icon Caches (Fixes the missing SVG errors)
 info "Compiling icon caches..."
@@ -285,15 +300,10 @@ else
 fi
 
 # Generate .icns from the iconset PNGs
-ICONSET_SRC="data/tributary.iconset"
-if [[ -d "$ICONSET_SRC" ]] && command -v iconutil &>/dev/null; then
-  iconutil -c icns -o "${RESOURCES_DIR}/tributary.icns" "$ICONSET_SRC"
-  info "App icon created via iconutil."
-elif [[ -f "data/tributary.icns" ]]; then
-  cp "data/tributary.icns" "${RESOURCES_DIR}/tributary.icns"
-else
-  warn "No app icon found — .app will use default icon."
-fi
+APP_ICNS="${RESOURCES_DIR}/tributary.icns"
+"$MACOS_ICONUTIL_COMMAND" -c icns -o "$APP_ICNS" "$ICONSET_SRC"
+[[ -s "$APP_ICNS" ]] || error "iconutil did not create a nonempty app icon: ${APP_ICNS}"
+info "App icon created via iconutil."
 
 # Write Info.plist
 # NOTE: LSEnvironment is intentionally omitted.  Its relative paths
@@ -338,6 +348,11 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+if ! macos_validate_app_icon_bundle "$APP_BUNDLE" "$BUNDLE_ID"; then
+  error "macOS app icon bundle validation failed: ${MACOS_ICON_POLICY_REASON}"
+fi
+info "macOS Info.plist, ICNS, and bundled GTK icons passed validation."
 
 # ── Copy and fix dylibs (recursive) ─────────────────────────────────────────
 info "Bundling dylibs and fixing rpaths (recursive — this may take a moment)..."
@@ -558,8 +573,16 @@ if [[ -e "$PROBE_APP/Contents/MacOS/gst-registry.bin" \
 fi
 codesign --verify --deep --strict --verbose=2 "$PROBE_APP"
 
-# The packaged app was not launched or mutated after signing. This final
-# strict verification is fatal and remains the last operation on the bundle.
+# Revalidate the completed original bundle after every writer has finished.
+# This inspection only reads the signed app and creates decoded ICNS data in a
+# temporary directory outside it.
+if ! macos_validate_app_icon_bundle "$APP_BUNDLE" "$BUNDLE_ID"; then
+  error "final macOS app icon bundle validation failed: ${MACOS_ICON_POLICY_REASON}"
+fi
+info "Final macOS app icon bundle validation passed."
+
+# The packaged app was not launched or mutated after signing. This final strict
+# signature verification is fatal and remains the last operation on the bundle.
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 info "Signed runtime probe and final signature verification passed."
 

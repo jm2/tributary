@@ -132,6 +132,7 @@ zbus-secret-service-keyring-store = { version = "1", default-features = false, f
 rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
+embed-resource = "3.0"
 winresource = "0.1"
 
 [package.metadata.deb]

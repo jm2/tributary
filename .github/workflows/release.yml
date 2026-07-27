@@ -291,7 +291,7 @@ jobs:
           export PKG_CONFIG_PATH="/${{ matrix.msys_env }}/lib/pkgconfig"
           cargo build --release --target ${{ matrix.rust_target }}
 
-      - name: Bundle DLLs and create zip
+      - name: Bundle DLLs, validate app resources, and create zip
         run: |
           MSYS_ROOT=$(cygpath -w /)
           pwsh -File scripts/build-windows.ps1 -Msys2Root "$MSYS_ROOT" -NoCargoBuild

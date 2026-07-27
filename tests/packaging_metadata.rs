@@ -5,8 +5,10 @@ const RPM_SPEC: &str = include_str!("../build-aux/rpm/tributary.spec");
 const ARCH_PKGBUILD: &str = include_str!("../build-aux/arch/PKGBUILD");
 const DESKTOP_ENTRY: &str = include_str!("../data/io.github.tributary.Tributary.desktop");
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
+const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
 const COVERAGE_BASELINE: &str = include_str!("../coverage-baseline.txt");
 const README: &str = include_str!("../README.md");
+const BUILD_SCRIPT: &str = include_str!("../build.rs");
 const BUILD_LINUX: &str = include_str!("../scripts/build-linux.sh");
 const BUILD_MACOS: &str = include_str!("../scripts/build-macos.sh");
 const BUILD_WINDOWS: &str = include_str!("../scripts/build-windows.ps1");
@@ -437,6 +439,111 @@ fn windows_bundle_validates_the_completed_zip_and_ci_parser() {
             && windows_ci.contains("System.Management.Automation.Language.Parser]::ParseFile")
             && windows_ci.contains("if (@($parseErrors).Count -gt 0)"),
         "Windows CI must prove that the bundler parses under inbox Windows PowerShell 5.1"
+    );
+}
+
+#[test]
+fn windows_artifacts_fail_closed_on_missing_application_resources() {
+    let build_windows = BUILD_WINDOWS.replace("\r\n", "\n");
+    let windows_ci = workflow_job(CI_WORKFLOW, "build-windows");
+    let windows_release = workflow_job(RELEASE_WORKFLOW, "windows");
+
+    let archive_section = build_windows
+        .find("# ── Zip Archive")
+        .expect("the Windows ZIP section must exist");
+    let final_import_assertion = build_windows[archive_section..]
+        .find("Assert-WindowsBundlePeImportPolicy $DIST $peImportInspector")
+        .map(|offset| archive_section + offset)
+        .expect("the final import gate must remain recognizable");
+    let final_resource_assertion = build_windows[archive_section..]
+        .find("Assert-WindowsApplicationResourceContract `")
+        .map(|offset| archive_section + offset)
+        .expect("the final executable resource gate must exist");
+    let archive = build_windows
+        .find("Write-Info \"Creating zip archive...\"")
+        .expect("the Windows ZIP boundary must exist");
+    assert!(
+        final_import_assertion < final_resource_assertion && final_resource_assertion < archive,
+        "the copied application must pass its resource contract after all writers and before ZIP creation"
+    );
+
+    let installer_only = build_windows
+        .find("# ── Inno Setup only mode")
+        .expect("the installer-only path must exist");
+    let installer_resource_assertion = build_windows[installer_only..]
+        .find("-Application (Join-Path $sourceDir \"tributary.exe\")")
+        .map(|offset| installer_only + offset)
+        .expect("installer-only mode must revalidate the application resources");
+    let installer_compile = build_windows[installer_resource_assertion..]
+        .find("& $iscc")
+        .map(|offset| installer_resource_assertion + offset)
+        .expect("the installer compiler invocation must remain recognizable");
+    assert!(
+        installer_resource_assertion < installer_compile,
+        "a stale installer source tree must fail before Inno Setup runs"
+    );
+
+    assert!(
+        build_windows.contains("function Invoke-BoundedPeResourceInspection")
+            && build_windows.contains("function Assert-WindowsApplicationResourceContract")
+            && build_windows.contains("$arguments = '--coff-resources \"' + $Application + '\"'")
+            && build_windows.contains("$outputByteLimit = 8388608")
+            && build_windows.contains("$processDeadlineMs = 45000")
+            && build_windows.contains("\"3\" = \"ICON\"")
+            && build_windows.contains("\"14\" = \"GROUP_ICON\"")
+            && build_windows.contains("\"16\" = \"VERSIONINFO\"")
+            && build_windows.contains("\"3\" = 6")
+            && build_windows.contains("\"14\" = 1")
+            && build_windows.contains("\"16\" = 1")
+            && build_windows.contains("DataSize:")
+            && build_windows.contains("[System.Diagnostics.FileVersionInfo]::GetVersionInfo")
+            && build_windows.contains("$versionInfo.ProductName -cne \"Tributary\"")
+            && build_windows.contains("$versionInfo.FileVersion -cne $ExpectedVersion")
+            && build_windows.contains("$finalSnapshot -ne $applicationSnapshot"),
+        "the gate must inspect bounded PE data, require the complete six-frame icon plus group/version resources, validate product metadata, and detect a changing executable"
+    );
+
+    for (workflow, label) in [(windows_ci, "CI"), (windows_release, "release")] {
+        assert!(
+            workflow.contains("arch: x86_64")
+                && workflow.contains("arch: aarch64")
+                && workflow.contains("name: Bundle DLLs, validate app resources, and create zip")
+                && workflow.contains("pwsh -File scripts/build-windows.ps1"),
+            "the shared fail-closed bundler must run for both {label} Windows architectures"
+        );
+    }
+}
+
+#[test]
+fn windows_resources_are_linked_to_the_application_binary() {
+    let manifest = manifest();
+    let windows_build_dependencies =
+        &manifest["target"]["cfg(target_os = \"windows\")"]["build-dependencies"];
+
+    assert_eq!(
+        windows_build_dependencies["winresource"].as_str(),
+        Some("0.1"),
+        "winresource must remain the canonical dynamic icon/version resource generator"
+    );
+    assert_eq!(
+        windows_build_dependencies["embed-resource"].as_str(),
+        Some("3.0"),
+        "embed-resource must provide mixed-package binary-scoped linkage"
+    );
+    for fragment in [
+        "res.write_resource_file(&resource_file)",
+        "embed_resource::compile_for(&resource_file, [\"tributary\"], embed_resource::NONE)",
+        ".manifest_required()",
+        "manifest_dir.join(\"data/tributary.ico\")",
+    ] {
+        assert!(
+            BUILD_SCRIPT.contains(fragment),
+            "Windows resource build is missing its binary-scoped contract: {fragment}"
+        );
+    }
+    assert!(
+        !BUILD_SCRIPT.contains("res.compile()"),
+        "winresource's package-wide link directive must not return while a library target exists"
     );
 }
 
