@@ -626,11 +626,6 @@ function Invoke-BoundedPeImportBatch {
 # metadata growth while treating an unexpectedly huge resource table as a
 # packaging failure instead of allowing it to exhaust a CI runner.
 function Invoke-BoundedPeResourceInspection {
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
-        "PSAvoidUsingPositionalParameters",
-        "",
-        Justification = "PSScriptAnalyzer misclassifies the explicitly named Get-BoundedProbeDiagnostic calls."
-    )]
     param(
         [string]$Inspector,
         [string]$Application
@@ -712,9 +707,16 @@ function Invoke-BoundedPeResourceInspection {
             else { $failure = $_.Exception.Message }
         }
         if ($failure) {
-            $diagnostic = Get-BoundedProbeDiagnostic -Path $stderrPath -Label "PE resource inspector stderr" -Limit 8192
+            $diagnosticArguments = @{
+                Path = $stderrPath
+                Label = "PE resource inspector stderr"
+                Limit = 8192
+            }
+            $diagnostic = Get-BoundedProbeDiagnostic @diagnosticArguments
             if (-not $diagnostic) {
-                $diagnostic = Get-BoundedProbeDiagnostic -Path $stdoutPath -Label "PE resource inspector stdout" -Limit 8192
+                $diagnosticArguments.Path = $stdoutPath
+                $diagnosticArguments.Label = "PE resource inspector stdout"
+                $diagnostic = Get-BoundedProbeDiagnostic @diagnosticArguments
             }
         }
         if ($null -ne $process) { $process.Dispose() }
