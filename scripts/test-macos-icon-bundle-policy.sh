@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=macos-icon-bundle-policy.sh
+# shellcheck source=scripts/macos-icon-bundle-policy.sh
 source "${SCRIPT_DIR}/macos-icon-bundle-policy.sh"
 
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/tributary-macos-icon-policy.XXXXXX")"
@@ -85,62 +85,62 @@ FAKE_SIPS="${TEST_ROOT}/fake-sips"
 FAKE_PLUTIL="${TEST_ROOT}/fake-plutil"
 FAKE_ICONUTIL="${TEST_ROOT}/fake-iconutil"
 
-printf '%s\n' \
-  '#!/usr/bin/env bash' \
-  'set -euo pipefail' \
-  'icon_path=""' \
-  'for argument in "$@"; do icon_path="$argument"; done' \
-  '[[ ! -e "${icon_path}.sips-fail" ]] || exit 65' \
-  'read -r width height < "${icon_path}.dimensions"' \
-  'printf "%s:\\n  pixelWidth: %s\\n  pixelHeight: %s\\n" "$icon_path" "$width" "$height"' \
-  > "$FAKE_SIPS"
+cat > "$FAKE_SIPS" <<'FAKE_SIPS_SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+icon_path=""
+for argument in "$@"; do icon_path="$argument"; done
+[[ ! -e "${icon_path}.sips-fail" ]] || exit 65
+read -r width height < "${icon_path}.dimensions"
+printf "%s:\n  pixelWidth: %s\n  pixelHeight: %s\n" "$icon_path" "$width" "$height"
+FAKE_SIPS_SCRIPT
 
-printf '%s\n' \
-  '#!/usr/bin/env bash' \
-  'set -euo pipefail' \
-  'plist_path=""' \
-  'for argument in "$@"; do plist_path="$argument"; done' \
-  '[[ ! -e "${plist_path}.plutil-fail" ]] || exit 66' \
-  'cat "${plist_path}.icon-name"' \
-  > "$FAKE_PLUTIL"
+cat > "$FAKE_PLUTIL" <<'FAKE_PLUTIL_SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+plist_path=""
+for argument in "$@"; do plist_path="$argument"; done
+[[ ! -e "${plist_path}.plutil-fail" ]] || exit 66
+cat "${plist_path}.icon-name"
+FAKE_PLUTIL_SCRIPT
 
-printf '%s\n' \
-  '#!/usr/bin/env bash' \
-  'set -euo pipefail' \
-  'conversion=""' \
-  'output_path=""' \
-  'input_path=""' \
-  'while [[ $# -gt 0 ]]; do' \
-  '  case "$1" in' \
-  '    -c) conversion="$2"; shift 2 ;;' \
-  '    -o) output_path="$2"; shift 2 ;;' \
-  '    *) input_path="$1"; shift ;;' \
-  '  esac' \
-  'done' \
-  '[[ "$conversion" == iconset && -n "$output_path" && -n "$input_path" ]] || exit 67' \
-  'grep -Fq invalid-icns "$input_path" && exit 68' \
-  'mkdir -p "$output_path"' \
-  'while IFS=: read -r name size; do' \
-  '  if [[ "$size" == 1024 ]] && grep -Fq no-1024 "$input_path"; then continue; fi' \
-  '  if [[ "$name" == icon_16x16@2x.png ]] && grep -Fq no-16-retina "$input_path"; then continue; fi' \
-  '  printf "decoded-png\\n" > "${output_path}/${name}"' \
-  '  printf "%s %s\\n" "$size" "$size" > "${output_path}/${name}.dimensions"' \
-  '  if [[ "$size" == 256 ]] && grep -Fq bad-decoded-png "$input_path"; then' \
-  '    touch "${output_path}/${name}.sips-fail"' \
-  '  fi' \
-  'done <<EOF' \
-  'icon_16x16.png:16' \
-  'icon_16x16@2x.png:32' \
-  'icon_32x32.png:32' \
-  'icon_32x32@2x.png:64' \
-  'icon_128x128.png:128' \
-  'icon_128x128@2x.png:256' \
-  'icon_256x256.png:256' \
-  'icon_256x256@2x.png:512' \
-  'icon_512x512.png:512' \
-  'icon_512x512@2x.png:1024' \
-  'EOF' \
-  > "$FAKE_ICONUTIL"
+cat > "$FAKE_ICONUTIL" <<'FAKE_ICONUTIL_SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+conversion=""
+output_path=""
+input_path=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c) conversion="$2"; shift 2 ;;
+    -o) output_path="$2"; shift 2 ;;
+    *) input_path="$1"; shift ;;
+  esac
+done
+[[ "$conversion" == iconset && -n "$output_path" && -n "$input_path" ]] || exit 67
+grep -Fq invalid-icns "$input_path" && exit 68
+mkdir -p "$output_path"
+while IFS=: read -r name size; do
+  if [[ "$size" == 1024 ]] && grep -Fq no-1024 "$input_path"; then continue; fi
+  if [[ "$name" == icon_16x16@2x.png ]] && grep -Fq no-16-retina "$input_path"; then continue; fi
+  printf "decoded-png\n" > "${output_path}/${name}"
+  printf "%s %s\n" "$size" "$size" > "${output_path}/${name}.dimensions"
+  if [[ "$size" == 256 ]] && grep -Fq bad-decoded-png "$input_path"; then
+    touch "${output_path}/${name}.sips-fail"
+  fi
+done <<'ICON_ENTRIES'
+icon_16x16.png:16
+icon_16x16@2x.png:32
+icon_32x32.png:32
+icon_32x32@2x.png:64
+icon_128x128.png:128
+icon_128x128@2x.png:256
+icon_256x256.png:256
+icon_256x256@2x.png:512
+icon_512x512.png:512
+icon_512x512@2x.png:1024
+ICON_ENTRIES
+FAKE_ICONUTIL_SCRIPT
 
 chmod +x "$FAKE_SIPS" "$FAKE_PLUTIL" "$FAKE_ICONUTIL"
 MACOS_SIPS_COMMAND="$FAKE_SIPS"

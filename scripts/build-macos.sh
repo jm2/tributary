@@ -61,7 +61,7 @@ MACOS_ICON_POLICY_HELPER="${SCRIPT_DIR}/macos-icon-bundle-policy.sh"
   || error "macOS icon-policy helper is missing: ${MACOS_ICON_POLICY_HELPER}"
 # shellcheck source=macos-package-policy.sh
 source "$MACOS_PACKAGE_POLICY_HELPER"
-# shellcheck source=macos-icon-bundle-policy.sh
+# shellcheck source=scripts/macos-icon-bundle-policy.sh
 source "$MACOS_ICON_POLICY_HELPER"
 
 # Test-only command hooks remain available to the sourced helpers, but a
@@ -213,6 +213,7 @@ cp -RL "${BREW_PREFIX}/share/icons/Adwaita" "${RESOURCES_DIR}/share/icons/" 2>/d
 
 # Bundle the app's own hicolor icons (About dialog, etc.)
 info "Bundling app hicolor icons..."
+mkdir -p "${RESOURCES_DIR}/share/icons/hicolor"
 cp -R "${APP_ICONS_SRC}/." "${RESOURCES_DIR}/share/icons/hicolor/"
 
 # Compile GTK Icon Caches (Fixes the missing SVG errors)
