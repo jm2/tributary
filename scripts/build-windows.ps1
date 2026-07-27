@@ -626,12 +626,17 @@ function Invoke-BoundedPeImportBatch {
 # metadata growth while treating an unexpectedly huge resource table as a
 # packaging failure instead of allowing it to exhaust a CI runner.
 function Invoke-BoundedPeResourceInspection {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        "PSAvoidUsingPositionalParameters",
+        "",
+        Justification = "PSScriptAnalyzer misclassifies the explicitly named Get-BoundedProbeDiagnostic calls."
+    )]
     param(
         [string]$Inspector,
         [string]$Application
     )
 
-    $applicationLabel = Format-PeImportTargetForDiagnostic $Application
+    $applicationLabel = Format-PeImportTargetForDiagnostic -Target $Application
     if ([string]::IsNullOrWhiteSpace($Application) -or
         [System.Text.RegularExpressions.Regex]::IsMatch(
             $Application,
@@ -650,8 +655,8 @@ function Invoke-BoundedPeResourceInspection {
     $processDeadlineMs = 45000
     $token = [Guid]::NewGuid().ToString("N")
     $tempRoot = [System.IO.Path]::GetTempPath()
-    $stdoutPath = Join-Path $tempRoot "tributary-resource-readobj-$token.stdout"
-    $stderrPath = Join-Path $tempRoot "tributary-resource-readobj-$token.stderr"
+    $stdoutPath = Join-Path -Path $tempRoot -ChildPath "tributary-resource-readobj-$token.stdout"
+    $stderrPath = Join-Path -Path $tempRoot -ChildPath "tributary-resource-readobj-$token.stderr"
     $process = $null
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $failure = $null
@@ -700,7 +705,7 @@ function Invoke-BoundedPeResourceInspection {
     }
     finally {
         try {
-            Stop-BoundedProcessTree $process "PE resource inspector"
+            Stop-BoundedProcessTree -Process $process -Label "PE resource inspector"
         }
         catch {
             if ($failure) { $failure += "; $($_.Exception.Message)" }
