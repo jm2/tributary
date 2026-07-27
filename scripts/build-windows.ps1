@@ -707,11 +707,9 @@ function Invoke-BoundedPeResourceInspection {
             else { $failure = $_.Exception.Message }
         }
         if ($failure) {
-            $diagnostic = Get-BoundedProbeDiagnostic `
-                -Path $stderrPath -Label "PE resource inspector stderr" -Limit 8192
+            $diagnostic = Get-BoundedProbeDiagnostic -Path $stderrPath -Label "PE resource inspector stderr" -Limit 8192
             if (-not $diagnostic) {
-                $diagnostic = Get-BoundedProbeDiagnostic `
-                    -Path $stdoutPath -Label "PE resource inspector stdout" -Limit 8192
+                $diagnostic = Get-BoundedProbeDiagnostic -Path $stdoutPath -Label "PE resource inspector stdout" -Limit 8192
             }
         }
         if ($null -ne $process) { $process.Dispose() }
