@@ -43,7 +43,8 @@ uridecodebin ! audioconvert ! avenc_alac ! raopsink
 
 Every AirPlay 1 load gates on `gst::Registry::get().find_feature("raopsink", ...)`.
 When the element is absent (the documented current state on every
-supported platform), `ensure_raopsink` returns the localized
+supported PACKAGED deployment, absent a separately supplied compatible
+raopsink), `ensure_raopsink` returns the localized
 `errors.playback.airplay_raopsink_missing` error and the pipeline is
 never built. Tests `a_missing_raopsink_is_refused_with_honest_guidance`,
 `raopsink_guidance_is_localized_for_every_catalog`, and
