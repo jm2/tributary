@@ -619,6 +619,403 @@ function Invoke-BoundedPeImportBatch {
     return $stdoutLines
 }
 
+# Inspect the application's PE resources without loading or executing it.
+# llvm-readobj emits the raw resource payload as hex, so keep the same bounded
+# process, output, and diagnostic discipline used by import inspection. The
+# shipped icon set is under 200 KiB; the larger ceiling leaves room for normal
+# metadata growth while treating an unexpectedly huge resource table as a
+# packaging failure instead of allowing it to exhaust a CI runner.
+function Invoke-BoundedPeResourceInspection {
+    param(
+        [string]$Inspector,
+        [string]$Application
+    )
+
+    $applicationLabel = Format-PeImportTargetForDiagnostic -Target $Application
+    if ([string]::IsNullOrWhiteSpace($Application) -or
+        [System.Text.RegularExpressions.Regex]::IsMatch(
+            $Application,
+            '[\p{Cc}\p{Zl}\p{Zp}"]'
+        )) {
+        throw "PE resource-inspection target contains an unsupported quote or control character ($applicationLabel)"
+    }
+
+    $arguments = '--coff-resources "' + $Application + '"'
+    $argumentCharacterLimit = 24000
+    if ($arguments.Length -gt $argumentCharacterLimit) {
+        throw "PE resource-inspection command exceeded its $argumentCharacterLimit-character limit"
+    }
+
+    $outputByteLimit = 8388608
+    $processDeadlineMs = 45000
+    $token = [Guid]::NewGuid().ToString("N")
+    $tempRoot = [System.IO.Path]::GetTempPath()
+    $stdoutPath = Join-Path -Path $tempRoot -ChildPath "tributary-resource-readobj-$token.stdout"
+    $stderrPath = Join-Path -Path $tempRoot -ChildPath "tributary-resource-readobj-$token.stderr"
+    $process = $null
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $failure = $null
+    $diagnostic = ""
+    $stdoutLines = @()
+
+    try {
+        $process = Start-Process -FilePath $Inspector -ArgumentList $arguments `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath `
+            -NoNewWindow -PassThru
+
+        while (-not $process.WaitForExit(50)) {
+            $stdoutLength = if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
+                (Get-Item -LiteralPath $stdoutPath).Length
+            } else { 0 }
+            $stderrLength = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+                (Get-Item -LiteralPath $stderrPath).Length
+            } else { 0 }
+            if (($stdoutLength + $stderrLength) -gt $outputByteLimit) {
+                throw "PE resource inspector output crossed its $outputByteLimit-byte limit ($applicationLabel)"
+            }
+            if ($clock.ElapsedMilliseconds -ge $processDeadlineMs) {
+                throw "PE resource inspector exceeded its $processDeadlineMs-millisecond deadline ($applicationLabel)"
+            }
+        }
+
+        $stdoutLength = if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
+            (Get-Item -LiteralPath $stdoutPath).Length
+        } else { 0 }
+        $stderrLength = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+            (Get-Item -LiteralPath $stderrPath).Length
+        } else { 0 }
+        if (($stdoutLength + $stderrLength) -gt $outputByteLimit) {
+            throw "PE resource inspector output crossed its $outputByteLimit-byte limit ($applicationLabel)"
+        }
+        if ($clock.ElapsedMilliseconds -ge $processDeadlineMs) {
+            throw "PE resource inspector exceeded its $processDeadlineMs-millisecond deadline ($applicationLabel)"
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "PE resource inspector exited with status $($process.ExitCode) ($applicationLabel)"
+        }
+        $stdoutLines = @([System.IO.File]::ReadAllLines($stdoutPath))
+    }
+    catch {
+        $failure = $_.Exception.Message
+    }
+    finally {
+        try {
+            Stop-BoundedProcessTree -Process $process -Label "PE resource inspector"
+        }
+        catch {
+            if ($failure) { $failure += "; $($_.Exception.Message)" }
+            else { $failure = $_.Exception.Message }
+        }
+        if ($failure) {
+            $diagnosticArguments = @{
+                Path = $stderrPath
+                Label = "PE resource inspector stderr"
+                Limit = 8192
+            }
+            $diagnostic = Get-BoundedProbeDiagnostic @diagnosticArguments
+            if (-not $diagnostic) {
+                $diagnosticArguments.Path = $stdoutPath
+                $diagnosticArguments.Label = "PE resource inspector stdout"
+                $diagnostic = Get-BoundedProbeDiagnostic @diagnosticArguments
+            }
+        }
+        if ($null -ne $process) { $process.Dispose() }
+        Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($failure) {
+        if ($diagnostic) { throw "$failure`n$diagnostic" }
+        throw $failure
+    }
+    return $stdoutLines
+}
+
+# Fail closed unless the final application executable contains its complete
+# Windows shell identity. RT_ICON supplies the image payload, RT_GROUP_ICON is
+# what Explorer and shortcuts resolve, and RT_VERSION carries the user-visible
+# product metadata. Checking the copied application at each artifact boundary
+# prevents a successful Cargo build from silently publishing a generic-icon
+# executable when package topology or linker behavior changes.
+function Assert-WindowsApplicationResourceContract {
+    param(
+        [string]$Application,
+        [string]$Inspector,
+        [string]$ExpectedVersion
+    )
+
+    $applicationLabel = Format-PeImportTargetForDiagnostic $Application
+    if ([string]::IsNullOrWhiteSpace($Application) -or
+        -not [System.IO.Path]::IsPathRooted($Application)) {
+        throw "Windows application resource target must be absolute ($applicationLabel)"
+    }
+    $applicationFull = [System.IO.Path]::GetFullPath($Application)
+    if (-not (Test-Path -LiteralPath $applicationFull -PathType Leaf)) {
+        throw "Windows application resource target was not found: $applicationLabel"
+    }
+    $applicationItem = Get-Item -LiteralPath $applicationFull -Force -ErrorAction Stop
+    if (($applicationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Windows application resource target must not be a filesystem reparse point: $applicationLabel"
+    }
+    if ($applicationItem.Name -ine "tributary.exe") {
+        throw "Windows application resource target must be tributary.exe: $applicationLabel"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Inspector) -or
+        -not [System.IO.Path]::IsPathRooted($Inspector)) {
+        throw "PE resource inspector path must be absolute"
+    }
+    $inspectorFull = [System.IO.Path]::GetFullPath($Inspector)
+    if (-not (Test-Path -LiteralPath $inspectorFull -PathType Leaf)) {
+        throw "Required PE resource inspector was not found: $inspectorFull"
+    }
+    $inspectorItem = Get-Item -LiteralPath $inspectorFull -Force -ErrorAction Stop
+    if (($inspectorItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "PE resource inspector must not be a filesystem reparse point: $inspectorFull"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ExpectedVersion) -or
+        [System.Text.RegularExpressions.Regex]::IsMatch(
+            $ExpectedVersion,
+            '[\p{Cc}\p{Zl}\p{Zp}"]'
+        )) {
+        throw "Expected Windows application version is empty or contains unsupported characters"
+    }
+
+    $stream = [System.IO.File]::Open(
+        $applicationFull,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    try {
+        if ($stream.Length -lt 2 -or $stream.ReadByte() -ne 0x4D -or
+            $stream.ReadByte() -ne 0x5A) {
+            throw "Windows application resource target does not have an MZ header: $applicationLabel"
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+
+    $applicationSnapshot = "$($applicationItem.Length):$($applicationItem.LastWriteTimeUtc.Ticks)"
+    $lines = @(Invoke-BoundedPeResourceInspection `
+        -Inspector $inspectorFull `
+        -Application $applicationFull)
+
+    $requiredTypeNames = @{
+        "3" = "ICON"
+        "14" = "GROUP_ICON"
+        "16" = "VERSIONINFO"
+    }
+    $requiredDataCounts = @{
+        "3" = 6
+        "14" = 1
+        "16" = 1
+    }
+    $typeCounts = @{ "3" = 0; "14" = 0; "16" = 0 }
+    $dataCounts = @{ "3" = 0; "14" = 0; "16" = 0 }
+    $iconDataSizes = @{}
+    $groupIconBytes = [System.Collections.Generic.List[byte]]::new()
+    $groupIconDeclaredSize = $null
+    $groupIconDataSeen = $false
+    $capturingGroupIconData = $false
+    $currentTypeId = ""
+    $currentResourceNameId = $null
+    $totalResourceCount = $null
+    $totalResourceLines = 0
+
+    foreach ($lineValue in $lines) {
+        $line = [string]$lineValue
+        if ($capturingGroupIconData) {
+            if ($line -match '^\s*\)\s*$') {
+                $capturingGroupIconData = $false
+                continue
+            }
+            if ($line -notmatch '^\s*([0-9A-Fa-f]+):\s+([0-9A-Fa-f]+(?:\s+[0-9A-Fa-f]+)*)\s+\|.*$') {
+                throw "GROUP_ICON resource contains a malformed hexadecimal payload"
+            }
+            $lineOffset = [Convert]::ToInt64($matches[1], 16)
+            if ($lineOffset -ne $groupIconBytes.Count) {
+                throw "GROUP_ICON resource contains a discontinuous hexadecimal payload"
+            }
+            $hexPayload = ""
+            foreach ($hexWord in @($matches[2] -split '\s+')) {
+                if ($hexWord.Length -lt 2 -or $hexWord.Length -gt 8 -or
+                    ($hexWord.Length % 2) -ne 0) {
+                    throw "GROUP_ICON resource contains a malformed hexadecimal word"
+                }
+                $hexPayload += $hexWord
+            }
+            for ($hexOffset = 0; $hexOffset -lt $hexPayload.Length; $hexOffset += 2) {
+                if ($groupIconBytes.Count -ge [int64]$groupIconDeclaredSize) {
+                    throw "GROUP_ICON hexadecimal payload exceeds its declared size"
+                }
+                $groupIconBytes.Add(
+                    [Convert]::ToByte($hexPayload.Substring($hexOffset, 2), 16)
+                )
+            }
+            continue
+        }
+        if ($line -match '^\s*Total Number of Resources:\s*([0-9]+)\s*$') {
+            $totalResourceLines++
+            $totalResourceCount = [int64]$matches[1]
+            continue
+        }
+        if ($line -match '^\s*Type:') {
+            $currentTypeId = ""
+            $currentResourceNameId = $null
+            if ($line -notmatch '^\s*Type:\s*([A-Z_]+)\s+\(ID\s+([0-9]+)\)\s*\[\s*$') {
+                continue
+            }
+            $resourceTypeName = $matches[1]
+            $currentTypeId = $matches[2]
+            if ($requiredTypeNames.ContainsKey($currentTypeId)) {
+                if ($resourceTypeName -cne $requiredTypeNames[$currentTypeId]) {
+                    throw "PE resource ID $currentTypeId used unexpected type name '$resourceTypeName'"
+                }
+                $typeCounts[$currentTypeId] = [int]$typeCounts[$currentTypeId] + 1
+            }
+            continue
+        }
+        if ($line -match '^\s*Name:') {
+            $currentResourceNameId = $null
+            if ($line -match '^\s*Name:\s*\(ID\s+([0-9]+)\)\s*\[\s*$') {
+                $currentResourceNameId = $matches[1]
+            }
+            elseif ($currentTypeId -eq "3" -or $currentTypeId -eq "14") {
+                throw "Required $($requiredTypeNames[$currentTypeId]) resource used a nonnumeric name"
+            }
+            continue
+        }
+        if ($line -match '^\s*DataSize:\s*([0-9]+)\s*$' -and
+            $requiredTypeNames.ContainsKey($currentTypeId)) {
+            $dataSize = [int64]$matches[1]
+            if ($dataSize -le 0) {
+                throw "Required $($requiredTypeNames[$currentTypeId]) resource has an empty payload"
+            }
+            $dataCounts[$currentTypeId] = [int]$dataCounts[$currentTypeId] + 1
+            if ($currentTypeId -eq "3") {
+                if ($null -eq $currentResourceNameId) {
+                    throw "ICON resource payload is missing its numeric resource ID"
+                }
+                if ($iconDataSizes.ContainsKey($currentResourceNameId)) {
+                    throw "ICON resource ID $currentResourceNameId has multiple payloads"
+                }
+                $iconDataSizes[$currentResourceNameId] = $dataSize
+            }
+            elseif ($currentTypeId -eq "14") {
+                if ($null -eq $currentResourceNameId) {
+                    throw "GROUP_ICON resource payload is missing its numeric resource ID"
+                }
+                if ($null -ne $groupIconDeclaredSize) {
+                    throw "Final tributary.exe contains multiple GROUP_ICON payloads"
+                }
+                $groupIconDeclaredSize = $dataSize
+            }
+            continue
+        }
+        if ($line -match '^\s*Data\s+\(\s*$' -and $currentTypeId -eq "14") {
+            if ($null -eq $groupIconDeclaredSize -or $groupIconDataSeen) {
+                throw "GROUP_ICON resource contains an unexpected hexadecimal payload"
+            }
+            $groupIconDataSeen = $true
+            $capturingGroupIconData = $true
+        }
+    }
+
+    if ($capturingGroupIconData) {
+        throw "GROUP_ICON resource contains a truncated hexadecimal payload"
+    }
+    if ($totalResourceLines -ne 1 -or $null -eq $totalResourceCount -or
+        $totalResourceCount -lt 8) {
+        throw "PE resource inspector did not report one plausible resource total"
+    }
+    foreach ($resourceTypeId in @("3", "14", "16")) {
+        $resourceTypeName = $requiredTypeNames[$resourceTypeId]
+        if ([int]$typeCounts[$resourceTypeId] -ne 1) {
+            throw "Final tributary.exe must contain exactly one $resourceTypeName resource table"
+        }
+        $requiredDataCount = [int]$requiredDataCounts[$resourceTypeId]
+        if ([int]$dataCounts[$resourceTypeId] -ne $requiredDataCount) {
+            throw "Final tributary.exe must contain exactly $requiredDataCount nonempty $resourceTypeName resource(s)"
+        }
+    }
+
+    if (-not $groupIconDataSeen -or $null -eq $groupIconDeclaredSize) {
+        throw "Final tributary.exe GROUP_ICON payload was not reported"
+    }
+    if ($groupIconBytes.Count -ne [int64]$groupIconDeclaredSize) {
+        throw "GROUP_ICON hexadecimal payload does not match its declared size"
+    }
+    if ($groupIconBytes.Count -lt 6) {
+        throw "GROUP_ICON payload is too short to contain a directory header"
+    }
+    $groupIconPayload = $groupIconBytes.ToArray()
+    $groupIconReserved = [BitConverter]::ToUInt16($groupIconPayload, 0)
+    $groupIconType = [BitConverter]::ToUInt16($groupIconPayload, 2)
+    $groupIconEntryCount = [BitConverter]::ToUInt16($groupIconPayload, 4)
+    if ($groupIconReserved -ne 0 -or $groupIconType -ne 1) {
+        throw "GROUP_ICON payload has an invalid directory header"
+    }
+    if ($groupIconEntryCount -ne 6) {
+        throw "GROUP_ICON directory must contain exactly six entries"
+    }
+    $expectedGroupIconSize = 6 + (14 * [int]$groupIconEntryCount)
+    if ($groupIconPayload.Length -ne $expectedGroupIconSize) {
+        throw "GROUP_ICON payload length does not match its directory entry count"
+    }
+
+    $groupIconResourceIds = @{}
+    for ($entryIndex = 0; $entryIndex -lt $groupIconEntryCount; $entryIndex++) {
+        $entryOffset = 6 + (14 * $entryIndex)
+        $bytesInResource = [BitConverter]::ToUInt32($groupIconPayload, $entryOffset + 8)
+        $iconResourceId = [BitConverter]::ToUInt16($groupIconPayload, $entryOffset + 12)
+        $iconResourceIdKey = [string]$iconResourceId
+        if ($groupIconResourceIds.ContainsKey($iconResourceIdKey)) {
+            throw "GROUP_ICON directory contains duplicate ICON resource ID $iconResourceId"
+        }
+        $groupIconResourceIds[$iconResourceIdKey] = $true
+        if (-not $iconDataSizes.ContainsKey($iconResourceIdKey)) {
+            throw "GROUP_ICON directory references missing ICON resource ID $iconResourceId"
+        }
+        if ([uint64]$bytesInResource -ne [uint64]$iconDataSizes[$iconResourceIdKey]) {
+            throw "GROUP_ICON directory size does not match ICON resource ID $iconResourceId"
+        }
+    }
+    if ($groupIconResourceIds.Count -ne $iconDataSizes.Count) {
+        throw "GROUP_ICON directory does not reference the complete ICON resource set"
+    }
+    foreach ($iconResourceIdKey in $iconDataSizes.Keys) {
+        if (-not $groupIconResourceIds.ContainsKey($iconResourceIdKey)) {
+            throw "GROUP_ICON directory does not reference ICON resource ID $iconResourceIdKey"
+        }
+    }
+
+    $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($applicationFull)
+    if ([string]$versionInfo.ProductName -cne "Tributary") {
+        throw "Final tributary.exe ProductName metadata must be 'Tributary'"
+    }
+    if ([string]$versionInfo.FileDescription -cne "Tributary") {
+        throw "Final tributary.exe FileDescription metadata must be 'Tributary'"
+    }
+    if ([string]$versionInfo.FileVersion -cne $ExpectedVersion) {
+        throw "Final tributary.exe FileVersion metadata does not match package version $ExpectedVersion"
+    }
+    if ([string]$versionInfo.ProductVersion -cne $ExpectedVersion) {
+        throw "Final tributary.exe ProductVersion metadata does not match package version $ExpectedVersion"
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$versionInfo.LegalCopyright)) {
+        throw "Final tributary.exe LegalCopyright metadata is empty"
+    }
+
+    $finalApplicationItem = Get-Item -LiteralPath $applicationFull -Force -ErrorAction Stop
+    $finalSnapshot = "$($finalApplicationItem.Length):$($finalApplicationItem.LastWriteTimeUtc.Ticks)"
+    if (($finalApplicationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $finalSnapshot -ne $applicationSnapshot) {
+        throw "Final tributary.exe changed during PE resource validation"
+    }
+}
+
 # Reinspect the completed application tree without copying or repairing
 # anything. This final gate runs after every normal-mode writer (including the
 # packaged runtime probe) and is also available to installer-only mode, whose
@@ -840,6 +1237,16 @@ if ($InnoSetup -and $SkipBundle) {
     catch {
         Write-Err "Installer source PE import validation failed: $($_.Exception.Message)"
     }
+    try {
+        Assert-WindowsApplicationResourceContract `
+            -Application (Join-Path $sourceDir "tributary.exe") `
+            -Inspector $installerPeImportInspector `
+            -ExpectedVersion $CargoVersion
+    }
+    catch {
+        Write-Err "Installer source application resource validation failed: $($_.Exception.Message)"
+    }
+    Write-Info "Installer source application icon and version resources passed."
 
     Write-Info "Running Inno Setup compiler..."
     & $iscc /DAppVersion="$CargoVersion" /DSourceDir="$sourceDir" /DOutputDir="$outputDir" /DTargetArch="$InnoArch" $issFile
@@ -1744,6 +2151,19 @@ try {
 catch {
     Write-Err "Final Windows PE import validation failed: $($_.Exception.Message)"
 }
+try {
+    $expectedApplicationVersion = (Select-String -Path "Cargo.toml" `
+        -Pattern '^version\s*=\s*"(.+)"' |
+        Select-Object -First 1).Matches.Groups[1].Value
+    Assert-WindowsApplicationResourceContract `
+        -Application $exeBundleDest `
+        -Inspector $peImportInspector `
+        -ExpectedVersion $expectedApplicationVersion
+}
+catch {
+    Write-Err "Final Windows application resource validation failed: $($_.Exception.Message)"
+}
+Write-Info "Final Windows application icon and version resources passed."
 Write-Info "Creating zip archive..."
 $zipPath = "dist\tributary-windows.zip"
 Remove-Item $zipPath -ErrorAction SilentlyContinue
