@@ -1543,7 +1543,7 @@ Write-Host "  [ok] souphttpsrc plugin and Soup runtime"
 if (-not (Test-Path -LiteralPath $requiredWasapiPluginSrc -PathType Leaf)) {
     Write-Err "Required Windows audio output plugin ($requiredWasapiPluginName) is missing. Install the matching $PkgPrefix-gst-plugins-bad package."
 }
-Write-Host "  [ok] wasapi2sink plugin"
+Write-Output "  [ok] wasapi2sink plugin"
 
 $pluginWarnings = @()
 foreach ($plugin in @("gst-plugins-good", "gst-plugins-bad", "gst-libav")) {
