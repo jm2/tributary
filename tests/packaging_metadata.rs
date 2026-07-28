@@ -449,7 +449,7 @@ fn windows_bundle_requires_dynamic_system_audio_output_support() {
         WINDOWS_AUDIO.contains("property.flags().contains(glib::ParamFlags::WRITABLE)")
             && WINDOWS_AUDIO.contains("sink.set_property(\"continue-on-error\", true)")
             && WINDOWS_AUDIO.contains("claim_warning_recovery(recovery_claimed)")
-            && WINDOWS_AUDIO.contains("recovery_claimed_for_watch.set(false)"),
+            && WINDOWS_AUDIO.contains("recovery_claimed.set(false)"),
         "the Windows audio path must feature-detect live switching and bound warning recovery"
     );
 }

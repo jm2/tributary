@@ -40,65 +40,10 @@ impl WindowsAudioRoute {
         volume: Rc<Cell<f64>>,
         recovery_claimed: Rc<Cell<bool>>,
     ) -> Option<Self> {
-        let sink = match gst::ElementFactory::make(WASAPI2_FACTORY).build() {
-            Ok(sink) => sink,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "wasapi2sink unavailable; system output changes use GStreamer's fallback behavior"
-                );
-                return None;
-            }
-        };
-        if !configure_wasapi2_sink(&sink) {
-            warn!(
-                "wasapi2sink lacks dynamic-device recovery; system output changes use GStreamer's fallback behavior"
-            );
-            return None;
-        }
-
-        let monitor = gst::DeviceMonitor::new();
-        if monitor.add_filter(Some("Audio/Sink"), None).is_none() {
-            warn!(
-                "No Windows audio device provider available; system output changes use GStreamer's fallback behavior"
-            );
-            return None;
-        }
-
-        let sink_for_watch = sink.clone();
-        let playbin_weak = playbin.downgrade();
-        let recovery_claimed_for_watch = Rc::clone(&recovery_claimed);
-        let monitor_watch = match monitor.bus().add_watch_local(move |_bus, message| {
-            let device = match message.view() {
-                gst::MessageView::DeviceAdded(added) => Some(added.device()),
-                gst::MessageView::DeviceChanged(changed) => Some(changed.device()),
-                _ => None,
-            };
-            let Some(device) = device else {
-                return glib::ControlFlow::Continue;
-            };
-            let Some(endpoint_id) = default_wasapi2_endpoint_id(device.properties().as_deref())
-            else {
-                return glib::ControlFlow::Continue;
-            };
-
-            recovery_claimed_for_watch.set(false);
-            sink_for_watch.set_property("device", endpoint_id.as_str());
-            if let Some(playbin) = playbin_weak.upgrade() {
-                reapply_cached_volume(&playbin, volume.get());
-            }
-            info!("Windows system audio output changed");
-            glib::ControlFlow::Continue
-        }) {
-            Ok(watch) => watch,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "Could not watch Windows audio devices; system output changes use GStreamer's fallback behavior"
-                );
-                return None;
-            }
-        };
+        let sink = configured_wasapi2_sink()?;
+        let monitor = default_audio_monitor()?;
+        let monitor_watch =
+            watch_default_audio_endpoint(&monitor, &sink, playbin, volume, recovery_claimed)?;
 
         if let Err(error) = monitor.start() {
             warn!(
@@ -121,6 +66,80 @@ impl WindowsAudioRoute {
             monitor,
             _monitor_watch: monitor_watch,
         })
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn configured_wasapi2_sink() -> Option<gst::Element> {
+    let sink = match gst::ElementFactory::make(WASAPI2_FACTORY).build() {
+        Ok(sink) => sink,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "wasapi2sink unavailable; system output changes use GStreamer's fallback behavior"
+            );
+            return None;
+        }
+    };
+    if !configure_wasapi2_sink(&sink) {
+        warn!(
+            "wasapi2sink lacks dynamic-device recovery; system output changes use GStreamer's fallback behavior"
+        );
+        return None;
+    }
+    Some(sink)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn default_audio_monitor() -> Option<gst::DeviceMonitor> {
+    let monitor = gst::DeviceMonitor::new();
+    if monitor.add_filter(Some("Audio/Sink"), None).is_none() {
+        warn!(
+            "No Windows audio device provider available; system output changes use GStreamer's fallback behavior"
+        );
+        return None;
+    }
+    Some(monitor)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn watch_default_audio_endpoint(
+    monitor: &gst::DeviceMonitor,
+    sink: &gst::Element,
+    playbin: &gst::Element,
+    volume: Rc<Cell<f64>>,
+    recovery_claimed: Rc<Cell<bool>>,
+) -> Option<gst::bus::BusWatchGuard> {
+    let sink = sink.clone();
+    let playbin = playbin.downgrade();
+    let watch = monitor.bus().add_watch_local(move |_bus, message| {
+        let device = match message.view() {
+            gst::MessageView::DeviceAdded(added) => Some(added.device()),
+            gst::MessageView::DeviceChanged(changed) => Some(changed.device()),
+            _ => None,
+        };
+        if let Some(endpoint_id) =
+            device.and_then(|device| default_wasapi2_endpoint_id(device.properties().as_deref()))
+        {
+            recovery_claimed.set(false);
+            sink.set_property("device", endpoint_id.as_str());
+            if let Some(playbin) = playbin.upgrade() {
+                reapply_cached_volume(&playbin, volume.get());
+            }
+            info!("Windows system audio output changed");
+        }
+        glib::ControlFlow::Continue
+    });
+
+    match watch {
+        Ok(watch) => Some(watch),
+        Err(error) => {
+            warn!(
+                error = %error,
+                "Could not watch Windows audio devices; system output changes use GStreamer's fallback behavior"
+            );
+            None
+        }
     }
 }
 
