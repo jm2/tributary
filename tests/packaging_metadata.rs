@@ -708,16 +708,73 @@ fn ci_compile_proves_the_exact_declared_msrv() {
     );
 }
 
-#[test]
-fn claude_review_accepts_bot_prs_without_opening_the_non_write_user_gate() {
-    let workflow: serde_yaml::Value =
-        serde_yaml::from_str(CLAUDE_REVIEW_WORKFLOW).expect("Claude review workflow must parse");
-    let triggers = workflow
+fn claude_review_workflow() -> serde_yaml::Value {
+    serde_yaml::from_str(CLAUDE_REVIEW_WORKFLOW).expect("Claude review workflow must parse")
+}
+
+fn claude_review_job<'a>(workflow: &'a serde_yaml::Value, name: &str) -> &'a serde_yaml::Value {
+    workflow
+        .get("jobs")
+        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(|jobs| jobs.get(serde_yaml::Value::String(name.into())))
+        .unwrap_or_else(|| panic!("Claude review job {name} must exist"))
+}
+
+fn claude_review_steps(job: &serde_yaml::Value) -> &[serde_yaml::Value] {
+    job.get("steps")
+        .and_then(serde_yaml::Value::as_sequence)
+        .expect("Claude review job steps must be a sequence")
+}
+
+fn claude_review_step_named<'a>(job: &'a serde_yaml::Value, name: &str) -> &'a serde_yaml::Value {
+    claude_review_steps(job)
+        .iter()
+        .find(|step| step.get("name").and_then(serde_yaml::Value::as_str) == Some(name))
+        .unwrap_or_else(|| panic!("Claude review step {name} must exist"))
+}
+
+fn claude_review_step_using<'a>(job: &'a serde_yaml::Value, action: &str) -> &'a serde_yaml::Value {
+    claude_review_steps(job)
+        .iter()
+        .find(|step| {
+            step.get("uses")
+                .and_then(serde_yaml::Value::as_str)
+                .is_some_and(|uses| uses.starts_with(action))
+        })
+        .unwrap_or_else(|| panic!("Claude review action {action} must exist"))
+}
+
+fn claude_review_step_with_id<'a>(job: &'a serde_yaml::Value, id: &str) -> &'a serde_yaml::Value {
+    claude_review_steps(job)
+        .iter()
+        .find(|step| step.get("id").and_then(serde_yaml::Value::as_str) == Some(id))
+        .unwrap_or_else(|| panic!("Claude review step id {id} must exist"))
+}
+
+fn claude_review_inputs(step: &serde_yaml::Value) -> &serde_yaml::Mapping {
+    step.get("with")
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("Claude review action inputs must be a mapping")
+}
+
+fn claude_input<'a>(inputs: &'a serde_yaml::Mapping, name: &str) -> Option<&'a serde_yaml::Value> {
+    inputs.get(serde_yaml::Value::String(name.into()))
+}
+
+fn normalized_job_admission(job: &serde_yaml::Value) -> String {
+    job.get("if")
+        .and_then(serde_yaml::Value::as_str)
+        .expect("Claude review job must gate its event")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn assert_claude_review_triggers(workflow: &serde_yaml::Value) {
+    let workflow_run = workflow
         .get("on")
         .and_then(serde_yaml::Value::as_mapping)
-        .expect("Claude review workflow must declare event triggers");
-    let workflow_run = triggers
-        .get(serde_yaml::Value::String("workflow_run".into()))
+        .and_then(|triggers| triggers.get(serde_yaml::Value::String("workflow_run".into())))
         .and_then(serde_yaml::Value::as_mapping)
         .expect("bot reviews must use a trusted workflow_run follow-up");
     let source_workflows: Vec<_> = workflow_run
@@ -732,7 +789,7 @@ fn claude_review_accepts_bot_prs_without_opening_the_non_write_user_gate() {
         ["CI"],
         "bot reviews must be coupled to the unprivileged CI request"
     );
-    let workflow_run_types: Vec<_> = workflow_run
+    let activity_types: Vec<_> = workflow_run
         .get(serde_yaml::Value::String("types".into()))
         .and_then(serde_yaml::Value::as_sequence)
         .expect("workflow_run must restrict its activity type")
@@ -740,157 +797,108 @@ fn claude_review_accepts_bot_prs_without_opening_the_non_write_user_gate() {
         .filter_map(serde_yaml::Value::as_str)
         .collect();
     assert_eq!(
-        workflow_run_types,
+        activity_types,
         ["requested"],
         "the trusted bot follow-up must start without waiting for CI completion"
     );
+}
 
-    let jobs = workflow
-        .get("jobs")
-        .and_then(serde_yaml::Value::as_mapping)
-        .expect("Claude review jobs must be a mapping");
-    let direct_job = jobs
-        .get(serde_yaml::Value::String("claude-review".into()))
-        .expect("direct Claude review job must exist");
-    let direct_admission = direct_job
-        .get("if")
-        .and_then(serde_yaml::Value::as_str)
-        .expect("direct Claude review job must gate its event");
+fn assert_direct_claude_review_boundaries(workflow: &serde_yaml::Value) {
+    let job = claude_review_job(workflow, "claude-review");
     assert_eq!(
-        direct_admission
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" "),
+        normalized_job_admission(job),
         "github.event_name == 'pull_request' && github.event.sender.type == 'User'",
         "direct reviews must remain limited to User-triggered pull_request events"
     );
-    let direct_steps = direct_job
-        .get("steps")
-        .and_then(serde_yaml::Value::as_sequence)
-        .expect("direct Claude review steps must be a sequence");
-    let direct_claude = direct_steps
-        .iter()
-        .find(|step| {
-            step.get("uses")
-                .and_then(serde_yaml::Value::as_str)
-                .is_some_and(|uses| uses.starts_with("anthropics/claude-code-action@"))
-        })
-        .expect("direct Claude review action step must exist");
-    let direct_inputs = direct_claude
-        .get("with")
-        .and_then(serde_yaml::Value::as_mapping)
-        .expect("direct Claude review inputs must be a mapping");
+    let inputs = claude_review_inputs(claude_review_step_using(
+        job,
+        "anthropics/claude-code-action@",
+    ));
     assert_eq!(
-        direct_inputs
-            .get(serde_yaml::Value::String("track_progress".into()))
-            .and_then(serde_yaml::Value::as_bool),
+        claude_input(inputs, "track_progress").and_then(serde_yaml::Value::as_bool),
         Some(true),
         "direct reviews must retain their tracking comment"
     );
     assert!(
-        !direct_inputs.contains_key(serde_yaml::Value::String("allowed_bots".into()))
-            && !direct_inputs
-                .contains_key(serde_yaml::Value::String("allowed_non_write_users".into())),
+        claude_input(inputs, "allowed_bots").is_none()
+            && claude_input(inputs, "allowed_non_write_users").is_none(),
         "the direct User path must not contain an actor bypass"
     );
+}
 
-    let bot_job = jobs
-        .get(serde_yaml::Value::String("claude-bot-review".into()))
-        .expect("trusted Claude bot review job must exist");
-    let bot_admission = bot_job
-        .get("if")
-        .and_then(serde_yaml::Value::as_str)
-        .expect("trusted Claude bot review job must gate its event");
+fn assert_bot_claude_review_admission(workflow: &serde_yaml::Value) {
+    let job = claude_review_job(workflow, "claude-bot-review");
     assert_eq!(
-        bot_admission.split_whitespace().collect::<Vec<_>>().join(" "),
+        normalized_job_admission(job),
         "github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.actor.type != 'User' && github.event.workflow_run.pull_requests[0]",
         "the trusted follow-up must admit only non-User PR workflow runs"
     );
-    let bot_permissions = bot_job
+    let permissions = job
         .get("permissions")
         .and_then(serde_yaml::Value::as_mapping)
         .expect("trusted Claude bot review permissions must be explicit");
     assert!(
-        !bot_permissions.contains_key(serde_yaml::Value::String("id-token".into())),
+        !permissions.contains_key(serde_yaml::Value::String("id-token".into())),
         "the untrusted-diff review path must not receive OIDC minting authority"
     );
+}
 
-    let bot_steps = bot_job
-        .get("steps")
-        .and_then(serde_yaml::Value::as_sequence)
-        .expect("trusted Claude bot review steps must be a sequence");
-    let bot_checkout = bot_steps
-        .iter()
-        .find(|step| {
-            step.get("uses")
-                .and_then(serde_yaml::Value::as_str)
-                .is_some_and(|uses| uses.starts_with("actions/checkout@"))
-        })
-        .expect("trusted Claude bot review must check out a base revision");
-    let bot_checkout_inputs = bot_checkout
-        .get("with")
-        .and_then(serde_yaml::Value::as_mapping)
-        .expect("trusted bot checkout inputs must be a mapping");
+fn assert_bot_claude_review_checkout(workflow: &serde_yaml::Value) {
+    let checkout = claude_review_step_using(
+        claude_review_job(workflow, "claude-bot-review"),
+        "actions/checkout@",
+    );
+    let inputs = claude_review_inputs(checkout);
     assert_eq!(
-        bot_checkout_inputs
-            .get(serde_yaml::Value::String("ref".into()))
-            .and_then(serde_yaml::Value::as_str),
-        Some("${{ github.event.workflow_run.pull_requests[0].base.sha }}"),
-        "the privileged workflow_run path must never check out the PR head"
+        claude_input(inputs, "ref").and_then(serde_yaml::Value::as_str),
+        Some("${{ github.sha }}"),
+        "workflow_run must check out only its trusted default-branch SHA"
     );
     assert_eq!(
-        bot_checkout_inputs
-            .get(serde_yaml::Value::String("persist-credentials".into()))
-            .and_then(serde_yaml::Value::as_bool),
+        claude_input(inputs, "persist-credentials").and_then(serde_yaml::Value::as_bool),
         Some(false),
         "the privileged checkout must not persist its job token"
     );
+}
 
-    let bot_preparer = bot_steps
-        .iter()
-        .find(|step| {
-            step.get("name").and_then(serde_yaml::Value::as_str) == Some("Prepare inert PR diff")
-        })
-        .expect("trusted code must prepare the bot review input");
-    let prepare_script = bot_preparer
+fn assert_bot_claude_review_input(workflow: &serde_yaml::Value) {
+    let preparer = claude_review_step_named(
+        claude_review_job(workflow, "claude-bot-review"),
+        "Prepare inert PR diff",
+    );
+    let script = preparer
         .get("run")
         .and_then(serde_yaml::Value::as_str)
         .expect("bot review input preparation must be a shell script");
     assert!(
-        prepare_script.contains("--json baseRefOid,headRefOid,state")
-            && prepare_script.contains(".baseRefOid == $base")
-            && prepare_script.contains(".headRefOid == $head")
-            && prepare_script
-                .contains("\"repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA\"")
-            && !prepare_script.contains("gh pr diff"),
+        script.contains("--json baseRefOid,headRefOid,state")
+            && script.contains(".baseRefOid == $base")
+            && script.contains(".headRefOid == $head")
+            && script.contains("\"repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA\"")
+            && !script.contains("gh pr diff"),
         "bot reviews must bind both admission and diff retrieval to the triggering revision"
     );
     assert!(
-        prepare_script.contains("head -c 50000")
-            && prepare_script.contains("tr -d '\\000-\\010\\013\\014\\016-\\037\\177'")
-            && prepare_script.contains("[Diff truncated at 50,000 bytes.]"),
+        script.contains("head -c 50000")
+            && script.contains("tr -d '\\000-\\010\\013\\014\\016-\\037\\177'")
+            && script.contains("[Diff truncated at 50,000 bytes.]"),
         "the normalized diff must remain below the action's per-environment-string limit"
     );
+}
 
-    let bot_claude = bot_steps
-        .iter()
-        .find(|step| step.get("id").and_then(serde_yaml::Value::as_str) == Some("bot-review"))
-        .expect("tool-free Claude bot review action step must exist");
-    let bot_inputs = bot_claude
-        .get("with")
-        .and_then(serde_yaml::Value::as_mapping)
-        .expect("tool-free Claude bot review inputs must be a mapping");
+fn assert_bot_claude_review_action_inputs(workflow: &serde_yaml::Value) {
+    let action = claude_review_step_with_id(
+        claude_review_job(workflow, "claude-bot-review"),
+        "bot-review",
+    );
+    let inputs = claude_review_inputs(action);
     assert_eq!(
-        bot_inputs
-            .get(serde_yaml::Value::String("allowed_bots".into()))
-            .and_then(serde_yaml::Value::as_str),
+        claude_input(inputs, "allowed_bots").and_then(serde_yaml::Value::as_str),
         Some("*"),
         "Claude review must admit every GitHub Bot/App actor"
     );
     assert_eq!(
-        bot_inputs
-            .get(serde_yaml::Value::String("github_token".into()))
-            .and_then(serde_yaml::Value::as_str),
+        claude_input(inputs, "github_token").and_then(serde_yaml::Value::as_str),
         Some("${{ github.token }}"),
         "the bot path must use only the short-lived, job-scoped GitHub token"
     );
@@ -900,65 +908,87 @@ fn claude_review_accepts_bot_prs_without_opening_the_non_write_user_gate() {
         "include_fix_links",
     ] {
         assert_eq!(
-            bot_inputs
-                .get(serde_yaml::Value::String(input.into()))
-                .and_then(serde_yaml::Value::as_bool),
+            claude_input(inputs, input).and_then(serde_yaml::Value::as_bool),
             Some(false),
             "the tool-free bot path must disable action side-channel output"
         );
     }
     assert!(
-        !bot_inputs.contains_key(serde_yaml::Value::String("allowed_non_write_users".into()))
-            && !bot_inputs.contains_key(serde_yaml::Value::String("track_progress".into())),
+        claude_input(inputs, "allowed_non_write_users").is_none()
+            && claude_input(inputs, "track_progress").is_none(),
         "bot admission must not bypass write-permission checks for ordinary User actors"
     );
-    let bot_args = bot_inputs
-        .get(serde_yaml::Value::String("claude_args".into()))
+}
+
+fn assert_bot_claude_review_tools(workflow: &serde_yaml::Value) {
+    let action = claude_review_step_with_id(
+        claude_review_job(workflow, "claude-bot-review"),
+        "bot-review",
+    );
+    let args = claude_input(claude_review_inputs(action), "claude_args")
         .and_then(serde_yaml::Value::as_str)
         .expect("tool-free bot review must constrain Claude arguments");
     assert!(
-        bot_args.contains("--tools \"Read\"")
-            && bot_args.contains("--allowedTools \"mcp__disabled__no_tools\"")
-            && bot_args.contains("--disallowedTools \"Bash,Read,")
-            && bot_args.contains("\"maxLength\":12000")
-            && bot_args.contains("\"pattern\":\"^[^\\\\u0000"),
+        args.contains("--tools \"Read\"")
+            && args.contains("--allowedTools \"mcp__disabled__no_tools\"")
+            && args.contains("--disallowedTools \"Bash,Read,")
+            && args.contains("\"maxLength\":12000")
+            && args.contains("\"pattern\":\"^[^\\\\u0000"),
         "the sole advertised built-in must also be bare-denied in the schema-constrained session"
     );
     assert_eq!(
-        bot_claude.get("if").and_then(serde_yaml::Value::as_str),
+        action.get("if").and_then(serde_yaml::Value::as_str),
         Some("steps.bot-input.outputs.current == 'true'"),
         "Claude must not run after a stale revision is detected"
     );
+}
 
-    let publisher = bot_steps
-        .iter()
-        .find(|step| {
-            step.get("name").and_then(serde_yaml::Value::as_str)
-                == Some("Publish structured bot review")
-        })
-        .expect("a trusted step must publish the structured bot review");
+fn assert_bot_claude_review_publisher(workflow: &serde_yaml::Value) {
+    let publisher = claude_review_step_named(
+        claude_review_job(workflow, "claude-bot-review"),
+        "Publish structured bot review",
+    );
     assert_eq!(
         publisher.get("if").and_then(serde_yaml::Value::as_str),
         Some("steps.bot-input.outputs.current == 'true'"),
         "the trusted publisher must not run after a stale revision is detected"
     );
-    let publish_script = publisher
+    let script = publisher
         .get("run")
         .and_then(serde_yaml::Value::as_str)
         .expect("structured review publication must be a fixed shell script");
     assert!(
-        publish_script.contains("--json baseRefOid,headRefOid,state")
-            && publish_script.contains(".baseRefOid == $base")
-            && publish_script.contains(".headRefOid == $head"),
+        script.contains("--json baseRefOid,headRefOid,state")
+            && script.contains(".baseRefOid == $base")
+            && script.contains(".headRefOid == $head"),
         "the publisher must discard results made stale while Claude was running"
     );
     assert!(
-        publish_script.contains("tr -d '\\000-\\010\\013\\014\\016-\\037\\177'")
-            && publish_script.contains("| sed 's/^/    /'")
-            && publish_script.contains("--body-file \"$RUNNER_TEMP/bot-review.md\"")
-            && !publish_script.contains("--body \"$REVIEW\""),
+        script.contains("tr -d '\\000-\\010\\013\\014\\016-\\037\\177'")
+            && script.contains("| sed 's/^/    /'")
+            && script.contains("--body-file \"$RUNNER_TEMP/bot-review.md\"")
+            && !script.contains("--body \"$REVIEW\""),
         "model output must be rendered as inert text by a fixed publishing command"
     );
+}
+
+#[test]
+fn claude_review_accepts_bot_prs_without_opening_the_non_write_user_gate() {
+    let workflow = claude_review_workflow();
+    assert_claude_review_triggers(&workflow);
+
+    assert_direct_claude_review_boundaries(&workflow);
+
+    assert_bot_claude_review_admission(&workflow);
+
+    assert_bot_claude_review_checkout(&workflow);
+
+    assert_bot_claude_review_input(&workflow);
+
+    assert_bot_claude_review_action_inputs(&workflow);
+    assert_bot_claude_review_tools(&workflow);
+
+    assert_bot_claude_review_publisher(&workflow);
 }
 
 #[test]

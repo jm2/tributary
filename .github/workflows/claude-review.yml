@@ -103,12 +103,13 @@ jobs:
       pull-requests: write
       issues: write
     steps:
-      - name: Checkout trusted base
+      - name: Checkout trusted default revision
         uses: actions/checkout@v6
         with:
           # workflow_run has repository secrets. Never change this to the PR
           # head or execute/download PR artifacts in this privileged job.
-          ref: ${{ github.event.workflow_run.pull_requests[0].base.sha }}
+          # On workflow_run, github.sha is the trusted default-branch commit.
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
 

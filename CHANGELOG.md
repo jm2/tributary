@@ -13,14 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Dependabot and every other GitHub Bot/App actor—including GasTown automation when classified as
   non-User—are admitted by `allowed_bots: "*"` in a trusted `workflow_run` follow-up as soon as CI
   is requested, where the normal Actions Claude credential is available. That privileged path pins
-  checkout to the PR's trusted base SHA, fetches a revision-bound and size-capped comparison through
-  GitHub, and never checks out or executes PR code. The model receives no tools, OIDC authority, or
-  broader App credential; it can return only a bounded schema-validated string, and the action uses
-  only the job-scoped token. A fixed publisher revalidates the PR revision, discards stale results,
-  and renders the review as inert text before commenting, preventing hostile diff instructions from
-  turning model output into credential access, shell execution, links, mentions, or bot commands.
-  Ordinary non-write `User` actors remain behind the action's repository-permission gate, and the
-  broader non-write-user bypass remains disabled.
+  checkout to the immutable trusted default-branch SHA, fetches a revision-bound and size-capped
+  comparison through GitHub, and never checks out or executes PR code. The model receives no tools,
+  OIDC authority, or broader App credential; it can return only a bounded schema-validated string,
+  and the action uses only the job-scoped token. A fixed publisher revalidates the PR revision,
+  discards stale results, and renders the review as inert text before commenting, preventing hostile
+  diff instructions from turning model output into credential access, shell execution, links,
+  mentions, or bot commands. Ordinary non-write `User` actors remain behind the action's
+  repository-permission gate, and the broader non-write-user bypass remains disabled.
 - **Native application icon packaging is now explicit and fail-closed.** Adding the package's
   library target had caused `winresource`'s package-wide link directive to attach to the library
   instead of `tributary.exe`, so the Windows executables published in v0.5.1 contained no PE icon
