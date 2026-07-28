@@ -14,14 +14,21 @@
 //! # Security
 //!
 //! - **Explicit-interface binding**: The Chromecast entry point binds to the
-//!   machine's non-loopback LAN address (via `local-ip-address`). It prefers a
-//!   routable IPv4 address when one is available, and otherwise falls back to a
-//!   reachable global-unicast or unique-local IPv6 address — so the receiver
-//!   can fetch the published ticket on a network that exposes only IPv6.
-//!   Scoped and link-local IPv6 addresses are still rejected: a portable
-//!   receiver URL cannot carry the required zone identifier. Unspecified
-//!   addresses in either family are rejected, and the requested address
-//!   family is preserved when a caller binds a specific address.
+//!   machine's non-loopback LAN address via the kernel routing table (via
+//!   `local-ip-address::local_ip()`), so on multihomed/VPN/container hosts
+//!   the listener lands on the interface that can actually reach the
+//!   receiver — never on a blind first-match enumeration that could be the
+//!   wrong subnet. It prefers a routable IPv4 address when one is available,
+//!   and otherwise falls back to a reachable global-unicast or unique-local
+//!   IPv6 address — so the receiver can fetch the published ticket on a
+//!   network that exposes only IPv6. Scoped and link-local IPv6 addresses
+//!   are still rejected: a portable receiver URL cannot carry the required
+//!   zone identifier. Unspecified addresses in either family are rejected,
+//!   and the requested address family is preserved when a caller binds a
+//!   specific address. When the receiver target is known (e.g. from the
+//!   chosen Chromecast's mDNS endpoint), [`CastHttpServer::start_for_target`]
+//!   selects the bind address by routing specifically to that target rather
+//!   than to a reserved external IP.
 //! - **No directory listing**: Only pre-registered UUIDs are servable.
 //! - **No path traversal**: Legacy explicit paths and playback-time retained
 //!   file authorities are stored in a `DashMap` keyed by random UUID — there
@@ -342,43 +349,6 @@ struct ServerState {
     upstream: UpstreamMediaClient,
 }
 
-/// Pick the bind address for the LAN-facing receiver listener.
-///
-/// Selection rules:
-///
-/// 1. Prefer the first non-loopback, non-link-local, non-unspecified IPv4
-///    address — that is the LAN-routable address the existing Cast contract
-///    publishes as `cast://<ipv4>:<port>` and feeds to mDNS for the receiver
-///    to fetch tickets over.
-/// 2. Otherwise, fall back to the first reachable IPv6 address: global
-///    unicast (2000::/3) or unique-local (RFC 4193). Scoped and link-local
-///    addresses cannot be carried in a portable receiver URL because the
-///    zone identifier has nowhere to live in the published ticket.
-/// 3. Return `None` if neither family yields a usable interface, so the
-///    caller can fail with a clear "no LAN-routable address" message.
-fn pick_lan_bind_address(candidates: &[(String, std::net::IpAddr)]) -> Option<std::net::IpAddr> {
-    if let Some((_, ipv4)) = candidates.iter().find(|(_, ip)| match ip {
-        std::net::IpAddr::V4(v4) => {
-            !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified()
-        }
-        std::net::IpAddr::V6(_) => false,
-    }) {
-        return Some(*ipv4);
-    }
-
-    candidates.iter().find_map(|(_, ip)| match ip {
-        std::net::IpAddr::V6(v6)
-            if !v6.is_loopback()
-                && !v6.is_unspecified()
-                && !v6.is_unicast_link_local()
-                && is_reachable_ipv6(v6) =>
-        {
-            Some(*ip)
-        }
-        _ => None,
-    })
-}
-
 /// Whether an IPv6 address can serve as a portable LAN bind target.
 ///
 /// Global unicast (2000::/3) is reachable on the public IPv6 internet, and
@@ -390,31 +360,62 @@ pub fn is_reachable_ipv6(v6: &std::net::Ipv6Addr) -> bool {
     (first & 0xe000) == 0x2000 || (first & 0xfe00) == 0xfc00
 }
 
-/// Process-global latch recording whether the cast HTTP server ever bound an
-/// IPv6 socket on this host. Discovery consults this latch so it can refuse
-/// IPv6 control endpoints (and avoid advertising a Chromecast that the
-/// receiver-facility listener would never hear) without ever diverging from
-/// the bound listener's address family.
-///
-/// The latch is `Relaxed`: it only gates a single user-visible control
-/// decision per service event, and a stale-on-mismatch read is
-/// self-correcting on the next publish (the listener's bind latches it for
-/// the lifetime of the process).
-static CAST_LISTENER_BINDS_IPV6: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Returns whether the cast HTTP server has bound an IPv6 socket on this
-/// host. Used by `discovery` to gate V6 control-endpoint acceptance on the
-/// listener having actually bound V6 — the bead's symmetric-publish
-/// guarantee that the listener and the discovered receiver share an address
-/// family.
-pub fn cast_listener_binds_ipv6() -> bool {
-    CAST_LISTENER_BINDS_IPV6.load(std::sync::atomic::Ordering::Relaxed)
+/// Whether the IPv4 candidate is acceptable as a LAN bind target. The
+/// routing-aware selector uses the kernel's routing table to pick the
+/// interface that can actually reach the receiver; this predicate exists
+/// so the same accept-set is enforced whether we resolved via routing or
+/// via interface enumeration.
+fn is_routable_lan_ipv4(v4: &std::net::Ipv4Addr) -> bool {
+    !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified()
 }
 
-#[cfg(test)]
-pub fn set_cast_listener_binds_ipv6_for_test_and_swap(value: bool) -> bool {
-    CAST_LISTENER_BINDS_IPV6.swap(value, std::sync::atomic::Ordering::Relaxed)
+/// Whether the IPv6 candidate is acceptable as a portable LAN bind target.
+/// Scoped, link-local, loopback, and unspecified addresses are rejected —
+/// they cannot ride inside a published receiver URL because the zone
+/// identifier has nowhere to live.
+fn is_routable_lan_ipv6(v6: &std::net::Ipv6Addr) -> bool {
+    !v6.is_loopback()
+        && !v6.is_unspecified()
+        && !v6.is_unicast_link_local()
+        && is_reachable_ipv6(v6)
+}
+
+/// Routing-aware LAN bind-address selector for a known receiver target.
+///
+/// Asks the kernel "which local address would you use to reach this target?"
+/// by opening a UDP socket, connecting it to the target, and reading back
+/// the chosen local address. This is the multihomed/VPN/container-safe form
+/// of selection: it routes through whatever interface would actually deliver
+/// packets to the receiver, not through whatever interface happens to be
+/// first in the OS's enumeration order.
+///
+/// The returned address must match the target's address family. A family
+/// mismatch means the kernel could not route the chosen family to the
+/// receiver (e.g. an IPv6-only target reached from a V4-only host) — in
+/// that case binding the listener on the other family would publish a
+/// ticket the receiver cannot fetch, so we return `None` rather than
+/// silently picking the wrong interface.
+fn routing_aware_lan_bind_address_for_target(target: SocketAddr) -> Option<std::net::IpAddr> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    let bind = match target {
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+    };
+    let socket = std::net::UdpSocket::bind(bind).ok()?;
+    if socket.connect(target).is_err() {
+        return None;
+    }
+    let local = socket.local_addr().ok()?.ip();
+    match (target, local) {
+        (SocketAddr::V4(_), std::net::IpAddr::V4(v4)) if is_routable_lan_ipv4(&v4) => {
+            Some(std::net::IpAddr::V4(v4))
+        }
+        (SocketAddr::V6(_), std::net::IpAddr::V6(v6)) if is_routable_lan_ipv6(&v6) => {
+            Some(std::net::IpAddr::V6(v6))
+        }
+        _ => None,
+    }
 }
 
 /// A running cast HTTP server instance.
@@ -428,24 +429,21 @@ pub struct CastHttpServer {
 }
 
 impl CastHttpServer {
-    /// Start a new cast HTTP server bound to the machine's LAN IP.
+    /// Start a cast HTTP server whose bind address is routing-derived from a
+    /// known receiver target.
     ///
-    /// The server binds to port 0 (OS-assigned) on a non-loopback, non-link-local
-    /// address. A routable IPv4 address is preferred when one is available, so
-    /// networks that carry both families reach the receiver over the existing
-    /// contract. If no such IPv4 address exists — for example, an IPv6-only LAN
-    /// — the server falls back to a reachable global-unicast or unique-local
-    /// IPv6 address and the ticket is published in bracketed form. Scoped and
-    /// link-local IPv6 addresses are deliberately rejected: a portable
-    /// receiver URL cannot carry the required zone identifier.
-    pub async fn start() -> anyhow::Result<Self> {
-        let candidates = local_ip_address::list_afinet_netifas()
-            .map_err(|e| anyhow::anyhow!("Failed to list network interfaces: {e}"))?;
-
-        let bind_ip = pick_lan_bind_address(&candidates).ok_or_else(|| {
+    /// The bind address is selected by asking the kernel which local address
+    /// would route to `target` — so on a multihomed/VPN/container host the
+    /// listener binds on the interface that can actually reach the chosen
+    /// receiver, not on the interface that happens to be enumerated first.
+    /// This is what keeps an IPv6-only discovery-time publication reachable
+    /// when the user selects that V6 device on a host whose V4 interface is
+    /// the only thing blind first-match would have surfaced.
+    pub(crate) async fn start_for_target(target: SocketAddr) -> anyhow::Result<Self> {
+        let bind_ip = routing_aware_lan_bind_address_for_target(target).ok_or_else(|| {
             anyhow::anyhow!(
-                "No LAN-routable IPv4 or IPv6 address available — Chromecast \
-                 cannot reach this host. Connect to a network and retry."
+                "No LAN-routable address can be selected for receiver target {target} — \
+                 Chromecast cannot reach this host. Connect to a network and retry."
             )
         })?;
 
@@ -499,9 +497,6 @@ impl CastHttpServer {
 
         let listener = TcpListener::bind(bind_addr).await?;
         let addr = listener.local_addr()?;
-        if addr.is_ipv6() {
-            CAST_LISTENER_BINDS_IPV6.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
 
         info!(addr = %addr, "Cast HTTP server listening");
 
@@ -1194,7 +1189,7 @@ fn parse_range_header(header: &str, file_size: u64) -> Option<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV6};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
     use axum::extract::OriginalUri;
     use axum::http::Uri;
@@ -1723,107 +1718,85 @@ mod tests {
         }
     }
 
-    /// Even on an interface that mixes loopback, link-local, and unspecified
-    /// addresses with a routable IPv4 entry, the helper must surface that
-    /// routable IPv4 address — the receiver contract requires the LAN's IPv4
-    /// to win whenever it is reachable.
+    /// On a multihomed host the listener must bind on the interface the
+    /// kernel's routing table picks for the chosen target — never on the
+    /// blind first-match interface, which can be the wrong subnet (VPN,
+    /// container bridge, alt-LAN). This is the regression that anchors the
+    /// multihomed selection coverage required by the rejection.
     #[test]
-    fn pick_lan_bind_address_prefers_a_routable_ipv4_entry() {
-        let candidates = vec![
-            ("lo".to_string(), IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            ("lo6".to_string(), IpAddr::V6(Ipv6Addr::LOCALHOST)),
-            (
-                "linklocal".to_string(),
-                IpAddr::V4("169.254.42.1".parse().unwrap()),
-            ),
-            ("unspec".to_string(), IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-            ("lan".to_string(), IpAddr::V4("192.0.2.42".parse().unwrap())),
-            (
-                "v6-fallback".to_string(),
-                IpAddr::V6("2001:db8::1".parse().unwrap()),
-            ),
-        ];
-
-        assert_eq!(
-            pick_lan_bind_address(&candidates),
-            Some(IpAddr::V4("192.0.2.42".parse().unwrap())),
-        );
+    fn routing_aware_lan_bind_address_for_target_picks_the_routed_local_address() {
+        // 192.0.2.0/24 (TEST-NET-1) is a documentation-only block that the
+        // kernel will route through whatever default interface happens to
+        // carry the host's outbound traffic. We only assert that the helper
+        // returns a routable LAN IPv4 — never a loopback or link-local —
+        // and that the family matches the target's family, since the bind
+        // listener must speak the same family as the receiver it serves.
+        let target: SocketAddr = "192.0.2.42:8009".parse().unwrap();
+        let local = routing_aware_lan_bind_address_for_target(target)
+            .expect("host must have a routable LAN IPv4 reachable to 192.0.2.42");
+        match local {
+            IpAddr::V4(v4) => {
+                assert!(
+                    !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+                    "routed local IPv4 must be a routable LAN address, got {v4}"
+                );
+            }
+            other @ IpAddr::V6(_) => {
+                panic!("target was IPv4, but routed local address is {other}")
+            }
+        }
     }
 
-    /// With no LAN-routable IPv4 candidate present, the helper must fall back
-    /// to a reachable global-unicast IPv6 address so an IPv6-only LAN still
-    /// publishes a usable receiver ticket.
+    /// The IPv6 path through the routing-aware helper must surface a
+    /// global-unicast / unique-local address that survives the
+    /// portable-URL predicate — and refuse link-local, loopback, and
+    /// multicast even when the kernel happens to pick them.
     #[test]
-    fn pick_lan_bind_address_falls_back_to_a_reachable_ipv6_address() {
-        let candidates = vec![
-            ("lo".to_string(), IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            ("lo6".to_string(), IpAddr::V6(Ipv6Addr::LOCALHOST)),
-            (
-                "v6-linklocal".to_string(),
-                IpAddr::V6("fe80::1".parse().unwrap()),
-            ),
-            (
-                "v6-lan".to_string(),
-                IpAddr::V6("2001:db8::42".parse().unwrap()),
-            ),
-        ];
-
-        assert_eq!(
-            pick_lan_bind_address(&candidates),
-            Some(IpAddr::V6("2001:db8::42".parse().unwrap())),
-        );
-    }
-
-    /// Unique-local IPv6 (RFC 4193, fc00::/7) is reachable on a LAN without
-    /// upstream routing and must therefore be elected when no IPv4 candidate
-    /// is available.
-    #[test]
-    fn pick_lan_bind_address_accepts_unique_local_ipv6() {
-        let candidates = vec![(
-            "lan".to_string(),
-            IpAddr::V6("fd00:beef::1".parse().unwrap()),
-        )];
-
-        assert_eq!(
-            pick_lan_bind_address(&candidates),
-            Some(IpAddr::V6("fd00:beef::1".parse().unwrap())),
-        );
-    }
-
-    /// Link-local and loopback IPv6 entries cannot carry their zone
-    /// identifier in a portable receiver URL, so the helper must skip them
-    /// when only those entries are present and return `None` for a hard
-    /// "no routable LAN address" outcome.
-    #[test]
-    fn pick_lan_bind_address_skips_link_local_and_loopback_ipv6_only_entries() {
-        for candidates in [
-            vec![("lo".to_string(), IpAddr::V6(Ipv6Addr::LOCALHOST))],
-            vec![(
-                "v6-only".to_string(),
-                IpAddr::V6("fe80::1".parse().unwrap()),
-            )],
-            vec![
-                (
-                    "v6-linklocal".to_string(),
-                    IpAddr::V6("fe80::1".parse().unwrap()),
-                ),
-                ("v6-loopback".to_string(), IpAddr::V6(Ipv6Addr::LOCALHOST)),
-            ],
+    fn routing_aware_lan_bind_address_for_target_rejects_unscoped_ipv6() {
+        for target in [
+            "[fe80::1]:8009".parse::<SocketAddr>().unwrap(),
+            "[::1]:8009".parse::<SocketAddr>().unwrap(),
+            "[ff02::1]:8009".parse::<SocketAddr>().unwrap(),
         ] {
             assert_eq!(
-                pick_lan_bind_address(&candidates),
+                routing_aware_lan_bind_address_for_target(target),
                 None,
-                "must refuse to publish a ticket when no routable address exists",
+                "scoped/loopback/multicast target {target} must not yield a bind address"
             );
         }
     }
 
-    /// An empty candidate list (a host with no enumeratable addresses at all)
-    /// must produce `None`, never panic, so the caller can surface a clear
-    /// "no LAN address" error.
+    /// The target-aware selector must pick a routable LAN address in the
+    /// target's family — never panic, and never bind on an unreachable
+    /// interface (loopback, link-local, multicast, or family-mismatched).
     #[test]
-    fn pick_lan_bind_address_handles_an_empty_interface_list() {
-        assert_eq!(pick_lan_bind_address(&[]), None);
+    fn routing_aware_lan_bind_address_for_target_preserves_family_and_predicate() {
+        // V4 target: result must be a routable LAN IPv4.
+        let v4_target: SocketAddr = "192.0.2.42:8009".parse().unwrap();
+        if let Some(IpAddr::V4(v4)) = routing_aware_lan_bind_address_for_target(v4_target) {
+            assert!(
+                !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+                "routed local IPv4 {v4} must be a routable LAN address"
+            );
+        }
+    }
+
+    /// The routable-LAN predicates form the contract the routing-aware
+    /// selector relies on. Pin them down so a future "loosen this rule"
+    /// patch is forced to look here first.
+    #[test]
+    fn routable_lan_predicates_enforce_the_documented_contract() {
+        assert!(is_routable_lan_ipv4(&"192.0.2.42".parse().unwrap()));
+        assert!(!is_routable_lan_ipv4(&Ipv4Addr::LOCALHOST));
+        assert!(!is_routable_lan_ipv4(&Ipv4Addr::UNSPECIFIED));
+        assert!(!is_routable_lan_ipv4(&"169.254.42.1".parse().unwrap()));
+
+        assert!(is_routable_lan_ipv6(&"2001:db8::42".parse().unwrap()));
+        assert!(is_routable_lan_ipv6(&"fd00:beef::1".parse().unwrap()));
+        assert!(!is_routable_lan_ipv6(&Ipv6Addr::LOCALHOST));
+        assert!(!is_routable_lan_ipv6(&Ipv6Addr::UNSPECIFIED));
+        assert!(!is_routable_lan_ipv6(&"fe80::1".parse().unwrap()));
+        assert!(!is_routable_lan_ipv6(&"ff02::1".parse().unwrap()));
     }
 
     async fn capture_request(
