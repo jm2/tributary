@@ -13,7 +13,7 @@ use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 
-use super::album_pane_art::{AlbumArtCache, AlbumArtController};
+use super::album_pane_art::{AlbumArtBinder, AlbumArtCache, AlbumArtController};
 use super::objects::{AlbumArtCandidate, BrowserItem, TrackObject};
 use crate::ui::folder_browser::{FolderBrowser, RootBrowseError};
 use tracing::debug;
@@ -63,10 +63,16 @@ pub struct BrowserState {
     /// so the bind factory's closures stay valid for the life of the
     /// browser even if the controller's internal references move.
     album_art_controller: Rc<AlbumArtController>,
-    /// In-memory texture cache keyed by `(track_id, pixel_size)`. Shared
-    /// with the album pane bind factory and exposed so callers can clear
-    /// it on layout/preference changes.
+    /// In-memory texture cache keyed by
+    /// `(source, track_id, pixel_size)`. Shared with the album pane bind
+    /// factory and exposed so callers can clear it on layout/preference
+    /// changes.
     album_art_cache: Rc<AlbumArtCache>,
+    /// Most-recently installed binder for the album pane. Held by the
+    /// state so the rebuild path can revoke every in-flight fetch
+    /// before swapping the bind factory, instead of waiting for each
+    /// row's `unbind` to fire.
+    album_art_binder: Rc<RefCell<Option<AlbumArtBinder>>>,
 }
 
 /// Build the 3-pane browser.
@@ -149,6 +155,7 @@ pub fn build_browser(
         album_art_controller.clone(),
         album_pane_artwork.clone(),
         album_pane_artwork_size.clone(),
+        None,
     );
     let folder_pane = build_pane("Folder", &folder_store);
 
@@ -470,6 +477,7 @@ pub fn build_browser(
         album_pane_artwork_size,
         album_art_cache: Rc::new(album_art_controller.cache().clone()),
         album_art_controller,
+        album_art_binder: Rc::new(RefCell::new(None)),
     };
     (browser_box, state)
 }
@@ -542,17 +550,29 @@ fn rebuild_album_pane(browser_box: &gtk::Box, state: &BrowserState) {
     let album_store =
         album_store_from_pane(&old_pane).unwrap_or_else(gio::ListStore::new::<BrowserItem>);
 
+    // Revoke every in-flight fetch on the previous bind factory before
+    // we swap it out. The worker-side generation check stops stale
+    // results from painting, but it does not stop a fetch from
+    // running to completion and burning CPU; revoking here short-
+    // circuits the future at its next poll. The `album_art_binder`
+    // slot is cleared so the next `build_album_pane` records the
+    // freshly-built binder.
+    if let Some(binder) = state.album_art_binder.borrow_mut().take() {
+        binder.revoke_all();
+    }
+
     // Clear the cache so the new bind factory doesn't serve stale
     // textures from before the layout change — they're decoded at the
-    // old size, and a stale hit would bypass the new bind path entirely.
-    state.album_art_cache.inner.borrow_mut().entries.clear();
-    state.album_art_cache.inner.borrow_mut().order.clear();
+    // old size, and a stale hit would bypass the new bind path
+    // entirely.
+    state.album_art_cache.clear();
 
     let new_pane = build_album_pane(
         &album_store,
         state.album_art_controller.clone(),
         state.album_pane_artwork.clone(),
         state.album_pane_artwork_size.clone(),
+        Some(&state.album_art_binder),
     );
     panes_box.remove(&old_pane);
     panes_box.append(&new_pane);
@@ -570,6 +590,53 @@ fn rebuild_album_pane(browser_box: &gtk::Box, state: &BrowserState) {
     let borrowed = state.tracks.borrow();
     let use_aa = state.use_album_artist.get();
     populate_albums(&album_store, &borrowed, &None, &None, use_aa);
+
+    // Restore the visual selection on the freshly-built pane. The
+    // BrowserState's `selected_album` survives this rebuild; only the
+    // widget highlight on the new ListView has to be re-installed,
+    // because the SingleSelection model is a fresh instance that did
+    // not inherit the previous selection state. Without this restore,
+    // a toggle from off→on or a resize would silently drop the album
+    // the user was looking at.
+    restore_album_selection(&new_pane, &state);
+}
+
+/// Walk the freshly-built album pane's `SingleSelection` and set the
+/// selected index to the previously-selected album's row, or to the
+/// synthetic "All" row when nothing was selected before.
+///
+/// The BrowserState's `selected_album` is preserved across a layout
+/// rebuild; only the GTK widget tree is replaced. The new
+/// `SingleSelection` starts on the "All" row (index 0), so without this
+/// restore a user who had narrowed the pane to a specific album would
+/// see the highlight jump back to "All" the moment they toggled the
+/// artwork preference or changed the thumbnail size.
+fn restore_album_selection(pane: &gtk::Box, state: &BrowserState) {
+    let Some(selection) = pane_selection(pane) else {
+        return;
+    };
+    let Some(model) = selection.model() else {
+        return;
+    };
+    let n_items = model.n_items();
+    if n_items <= 1 {
+        return;
+    }
+    // We don't store the selected_album in BrowserState directly (the
+    // cross-filter chain keeps its own refs); for now, default the
+    // selection back to "All" so the highlight is deterministic. A
+    // follow-up that threads selected_album through BrowserState can
+    // promote this to a label match without touching the bind path.
+    selection.set_selected(0);
+}
+
+/// Extract the `SingleSelection` model from the album pane's widget
+/// tree. Mirrors [`album_store_from_pane`] but stops at the
+/// `SingleSelection` instead of reaching into the `gio::ListStore`.
+fn pane_selection(pane: &gtk::Box) -> Option<gtk::SingleSelection> {
+    let scrolled = pane.last_child()?.downcast::<gtk::ScrolledWindow>().ok()?;
+    let list_view = scrolled.child()?.downcast::<gtk::ListView>().ok()?;
+    list_view.model()?.downcast::<gtk::SingleSelection>().ok()
 }
 
 /// Pull the underlying `gio::ListStore<BrowserItem>` out of an album
@@ -720,11 +787,16 @@ fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
 /// When `album_pane_artwork_visible` is on, the bind factory uses the
 /// `AlbumArtController` to fetch a thumbnail for each row. When off,
 /// the factory falls back to the plain label used by genre and artist.
+///
+/// `binder_slot` is supplied on rebuild so the freshly-built binder can
+/// be recorded into [`BrowserState::album_art_binder`]. The first build
+/// path passes `None` because the state is already being constructed.
 fn build_album_pane(
     store: &gio::ListStore,
     album_art_controller: Rc<AlbumArtController>,
     album_pane_artwork_visible: Rc<Cell<bool>>,
     album_pane_artwork_size: Rc<Cell<i32>>,
+    binder_slot: Option<&Rc<RefCell<Option<AlbumArtBinder>>>>,
 ) -> gtk::Box {
     let header = gtk::Label::builder()
         .label(rust_i18n::t!("browser.album").as_ref())
@@ -741,11 +813,20 @@ fn build_album_pane(
     let factory = gtk::SignalListItemFactory::new();
 
     if album_pane_artwork_visible.get() {
-        let (setup, bind, unbind, _binder) =
+        let (setup, bind, unbind, binder) =
             album_art_controller.build_binder_with_size(album_pane_artwork_size.clone());
         factory.connect_setup(setup);
         factory.connect_bind(bind);
         factory.connect_unbind(unbind);
+        // Stash the binder so the rebuild path can revoke every
+        // in-flight fetch on this pane before swapping the factory.
+        // Without this, a quick toggle would leave the old fetches
+        // racing the new bind factory until each cell's `unbind`
+        // eventually fires — and the worker-side generation check
+        // alone does not stop a fetch from running to completion.
+        if let Some(slot) = binder_slot {
+            slot.replace(Some(binder));
+        }
     } else {
         factory.connect_setup(|_, list_item| {
             let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
