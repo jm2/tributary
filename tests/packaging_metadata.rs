@@ -885,15 +885,18 @@ fn assert_bot_claude_review_checkout(workflow: &serde_yaml::Value) {
     );
 }
 
-fn assert_bot_claude_review_input(workflow: &serde_yaml::Value) {
-    let preparer = claude_review_step_named(
+fn bot_claude_review_input_script(workflow: &serde_yaml::Value) -> &str {
+    claude_review_step_named(
         claude_review_job(workflow, "claude-bot-review"),
         "Prepare inert PR diff",
-    );
-    let script = preparer
-        .get("run")
-        .and_then(serde_yaml::Value::as_str)
-        .expect("bot review input preparation must be a shell script");
+    )
+    .get("run")
+    .and_then(serde_yaml::Value::as_str)
+    .expect("bot review input preparation must be a shell script")
+}
+
+fn assert_bot_claude_review_input_revision(workflow: &serde_yaml::Value) {
+    let script = bot_claude_review_input_script(workflow);
     assert!(
         script.starts_with("set -euo pipefail\n"),
         "trusted input preparation must fail closed on shell and pipeline errors"
@@ -906,6 +909,10 @@ fn assert_bot_claude_review_input(workflow: &serde_yaml::Value) {
             && !script.contains("gh pr diff"),
         "bot reviews must bind both admission and diff retrieval to the triggering revision"
     );
+}
+
+fn assert_bot_claude_review_input_limits(workflow: &serde_yaml::Value) {
+    let script = bot_claude_review_input_script(workflow);
     assert!(
         script.contains("head -c 50000")
             && script.contains("tr -d '\\000-\\010\\013\\014\\016-\\037\\177'")
@@ -918,6 +925,10 @@ fn assert_bot_claude_review_input(workflow: &serde_yaml::Value) {
             && script.matches("current=false").count() >= 2,
         "an unavailable comparison must use the established no-review path"
     );
+}
+
+fn assert_bot_claude_review_input_boundary(workflow: &serde_yaml::Value) {
+    let script = bot_claude_review_input_script(workflow);
     assert!(
         script.contains("delimiter=\"DIFF_$(cat /proc/sys/kernel/random/uuid)\"")
             && script
@@ -1091,7 +1102,9 @@ fn claude_review_accepts_bot_prs_without_opening_the_non_write_user_gate() {
 
     assert_bot_claude_review_checkout(&workflow);
 
-    assert_bot_claude_review_input(&workflow);
+    assert_bot_claude_review_input_revision(&workflow);
+    assert_bot_claude_review_input_limits(&workflow);
+    assert_bot_claude_review_input_boundary(&workflow);
 
     assert_bot_claude_review_action_inputs(&workflow);
     assert_bot_claude_review_tools(&workflow);
