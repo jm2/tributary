@@ -710,19 +710,100 @@ fn ci_compile_proves_the_exact_declared_msrv() {
 
 #[test]
 fn claude_review_accepts_bot_prs_without_opening_the_non_write_user_gate() {
-    let review_job = workflow_job(CLAUDE_REVIEW_WORKFLOW, "claude-review");
-    let allowed_bot_wildcards = review_job.matches("allowed_bots: \"*\"").count();
-    let non_write_user_bypasses = review_job
-        .lines()
-        .filter(|line| line.trim_start().starts_with("allowed_non_write_users:"))
-        .count();
-
+    let workflow: serde_yaml::Value =
+        serde_yaml::from_str(CLAUDE_REVIEW_WORKFLOW).expect("Claude review workflow must parse");
+    let triggers = workflow
+        .get("on")
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("Claude review workflow must declare event triggers");
+    let workflow_run = triggers
+        .get(serde_yaml::Value::String("workflow_run".into()))
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("bot reviews must use a trusted workflow_run follow-up");
     assert_eq!(
-        allowed_bot_wildcards, 1,
-        "Claude review must admit every GitHub Bot/App PR actor exactly once"
+        workflow_run
+            .get(serde_yaml::Value::String("workflows".into()))
+            .and_then(serde_yaml::Value::as_sequence)
+            .and_then(|workflows| workflows.first())
+            .and_then(serde_yaml::Value::as_str),
+        Some("CI"),
+        "bot reviews must be coupled to the unprivileged CI request"
     );
     assert_eq!(
-        non_write_user_bypasses, 0,
+        workflow_run
+            .get(serde_yaml::Value::String("types".into()))
+            .and_then(serde_yaml::Value::as_sequence)
+            .and_then(|types| types.first())
+            .and_then(serde_yaml::Value::as_str),
+        Some("requested"),
+        "the trusted bot follow-up must start without waiting for CI completion"
+    );
+
+    let review_job = workflow
+        .get("jobs")
+        .and_then(|jobs| jobs.get("claude-review"))
+        .expect("Claude review job must exist");
+    let admission = review_job
+        .get("if")
+        .and_then(serde_yaml::Value::as_str)
+        .expect("Claude review job must gate direct and trusted paths");
+    assert!(
+        admission.contains("pull_request.user.type == 'User'")
+            && admission.contains("workflow_run.actor.type != 'User'"),
+        "direct reviews must remain User-only while the trusted follow-up remains bot/App-only"
+    );
+
+    let steps = review_job
+        .get("steps")
+        .and_then(serde_yaml::Value::as_sequence)
+        .expect("Claude review job steps must be a sequence");
+    let checkout = steps
+        .iter()
+        .find(|step| {
+            step.get("uses")
+                .and_then(serde_yaml::Value::as_str)
+                .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+        })
+        .expect("Claude review job must check out a trusted review context");
+    assert_eq!(
+        checkout
+            .get("with")
+            .and_then(|inputs| inputs.get("ref"))
+            .and_then(serde_yaml::Value::as_str),
+        Some(
+            "${{ github.event_name == 'workflow_run' && github.event.workflow_run.pull_requests[0].base.sha || github.sha }}"
+        ),
+        "the privileged workflow_run path must never check out the PR head"
+    );
+
+    let claude_step = steps
+        .iter()
+        .find(|step| {
+            step.get("uses")
+                .and_then(serde_yaml::Value::as_str)
+                .is_some_and(|uses| uses.starts_with("anthropics/claude-code-action@"))
+        })
+        .expect("Claude review action step must exist");
+    let inputs = claude_step
+        .get("with")
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("Claude review action inputs must be a mapping");
+    assert_eq!(
+        inputs
+            .get(serde_yaml::Value::String("allowed_bots".into()))
+            .and_then(serde_yaml::Value::as_str),
+        Some("*"),
+        "Claude review must admit every GitHub Bot/App actor"
+    );
+    assert_eq!(
+        inputs
+            .get(serde_yaml::Value::String("track_progress".into()))
+            .and_then(serde_yaml::Value::as_str),
+        Some("${{ github.event_name == 'pull_request' }}"),
+        "tracking comments must stay disabled on the unsupported workflow_run event"
+    );
+    assert!(
+        !inputs.contains_key(serde_yaml::Value::String("allowed_non_write_users".into())),
         "bot admission must not bypass write-permission checks for ordinary User actors"
     );
 }

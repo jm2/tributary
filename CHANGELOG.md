@@ -8,11 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- **Claude's automatic PR review now admits bot-authored pull requests.** The pinned action's
-  explicit `allowed_bots: "*"` policy lets Dependabot and other GitHub Bot/App actors—including
-  GasTown automation when classified as non-User—receive the same fixed-prompt review instead of
-  failing CI before analysis. Ordinary non-write `User` actors remain behind the action's
-  repository-permission gate; the broader non-write-user bypass remains disabled.
+- **Claude's automatic PR review now admits bot-authored pull requests without depending on
+  unavailable bot-event secrets.** Direct `pull_request` reviews remain limited to `User` actors.
+  Dependabot and every other GitHub Bot/App actor—including GasTown automation when classified as
+  non-User—are admitted by `allowed_bots: "*"` in a trusted `workflow_run` follow-up as soon as CI
+  is requested, where the normal Actions Claude credential is available. That privileged path pins
+  checkout to the PR's trusted base SHA and treats the proposed diff only as GitHub API data; it
+  never checks out or executes PR code. Ordinary non-write `User` actors remain behind the action's
+  repository-permission gate, and the broader non-write-user bypass remains disabled.
 - **Native application icon packaging is now explicit and fail-closed.** Adding the package's
   library target had caused `winresource`'s package-wide link directive to attach to the library
   instead of `tributary.exe`, so the Windows executables published in v0.5.1 contained no PE icon

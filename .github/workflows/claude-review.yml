@@ -7,9 +7,23 @@ name: Claude PR Review
 on:
   pull_request:
     types: [opened, synchronize]
+  # Dependabot and other bot-authored pull_request runs cannot read normal
+  # Actions secrets. CI's requested event gives a trusted default-branch
+  # follow-up access to the existing Claude credential without executing PR
+  # code. See the job gate and checkout invariant below.
+  workflow_run:
+    workflows: ["CI"]
+    types: [requested]
 
 jobs:
   claude-review:
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.user.type == 'User') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.event == 'pull_request' &&
+       github.event.workflow_run.actor.type != 'User' &&
+       github.event.workflow_run.pull_requests[0])
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -17,10 +31,15 @@ jobs:
       issues: write
       id-token: write
     steps:
-      - name: Checkout repository
+      - name: Checkout trusted review context
         uses: actions/checkout@v6
         with:
+          # A direct user PR uses its merge SHA. A privileged bot follow-up
+          # checks out only the trusted base SHA; never change this to the PR
+          # head or execute/download PR artifacts in the workflow_run path.
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.pull_requests[0].base.sha || github.sha }}
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Claude PR review
         # Pinned to a full-length commit SHA, not the mutable `v1` tag: a tag can
@@ -43,12 +62,14 @@ jobs:
           allowed_bots: "*"
 
           # Creates a tracking comment with progress checkboxes and updates it
-          # as the review proceeds.
-          track_progress: true
+          # for direct PR events. The pinned action rejects this input on the
+          # workflow_run automation path.
+          track_progress: ${{ github.event_name == 'pull_request' }}
 
           prompt: |
             REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number }}
+            PR NUMBER: ${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number }}
+            REVIEW EVENT: ${{ github.event_name }}
 
             Perform a comprehensive code review with the following focus areas:
 
@@ -81,8 +102,13 @@ jobs:
             evidence from the diff, and say so plainly when you are uncertain
             rather than speculating.
 
-            Provide detailed feedback using inline comments for specific issues.
-            Use top-level comments for general observations or praise.
+            For a pull_request event, provide detailed feedback using inline
+            comments for specific issues and top-level comments for general
+            observations. For a workflow_run event, the privileged runner has
+            intentionally checked out only the trusted base SHA: inspect the PR
+            only with `gh pr diff` and `gh pr view`, never fetch, check out, or
+            execute PR code, and publish one consolidated review with
+            `gh pr comment`.
 
           claude_args: |
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
