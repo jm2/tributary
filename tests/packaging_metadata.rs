@@ -5,6 +5,7 @@ const RPM_SPEC: &str = include_str!("../build-aux/rpm/tributary.spec");
 const ARCH_PKGBUILD: &str = include_str!("../build-aux/arch/PKGBUILD");
 const DESKTOP_ENTRY: &str = include_str!("../data/io.github.tributary.Tributary.desktop");
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
+const CLAUDE_REVIEW_WORKFLOW: &str = include_str!("../.github/workflows/claude-review.yml");
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
 const COVERAGE_BASELINE: &str = include_str!("../coverage-baseline.txt");
 const README: &str = include_str!("../README.md");
@@ -704,6 +705,25 @@ fn ci_compile_proves_the_exact_declared_msrv() {
     assert!(
         msrv_job.contains("run: cargo check --all-targets --locked"),
         "CI must compile-check every target against the committed lockfile"
+    );
+}
+
+#[test]
+fn claude_review_accepts_bot_prs_without_opening_the_non_write_user_gate() {
+    let review_job = workflow_job(CLAUDE_REVIEW_WORKFLOW, "claude-review");
+    let allowed_bot_wildcards = review_job.matches("allowed_bots: \"*\"").count();
+    let non_write_user_bypasses = review_job
+        .lines()
+        .filter(|line| line.trim_start().starts_with("allowed_non_write_users:"))
+        .count();
+
+    assert_eq!(
+        allowed_bot_wildcards, 1,
+        "Claude review must admit every GitHub Bot/App PR actor exactly once"
+    );
+    assert_eq!(
+        non_write_user_bypasses, 0,
+        "bot admission must not bypass write-permission checks for ordinary User actors"
     );
 }
 

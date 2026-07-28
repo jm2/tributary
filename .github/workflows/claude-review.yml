@@ -36,6 +36,12 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
+          # Review PRs opened by Dependabot and any other GitHub Bot/App actor,
+          # including GasTown automation if GitHub classifies it as non-User.
+          # This intentionally accepts the public-repo external-App trigger
+          # tradeoff; keep the non-write User bypass unset.
+          allowed_bots: "*"
+
           # Creates a tracking comment with progress checkboxes and updates it
           # as the review proceeds.
           track_progress: true
