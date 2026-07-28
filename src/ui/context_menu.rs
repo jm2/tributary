@@ -977,10 +977,12 @@ pub fn popover_from_menu_model(
                     .css_classes(["flat"])
                     .build();
                 let act = action.clone();
-                let pop = popover.clone();
+                let pop = popover.downgrade();
                 btn.connect_clicked(move |_| {
                     act.activate(None::<&glib::Variant>);
-                    pop.popdown();
+                    if let Some(pop) = pop.upgrade() {
+                        pop.popdown();
+                    }
                 });
                 vbox.append(&btn);
             } else {
