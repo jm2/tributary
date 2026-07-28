@@ -113,14 +113,7 @@ fn watch_default_audio_endpoint(
     let sink = sink.clone();
     let playbin = playbin.downgrade();
     let watch = monitor.bus().add_watch_local(move |_bus, message| {
-        let device = match message.view() {
-            gst::MessageView::DeviceAdded(added) => Some(added.device()),
-            gst::MessageView::DeviceChanged(changed) => Some(changed.device()),
-            _ => None,
-        };
-        if let Some(endpoint_id) =
-            device.and_then(|device| default_wasapi2_endpoint_id(device.properties().as_deref()))
-        {
+        if let Some(endpoint_id) = default_wasapi2_endpoint_from_message(message) {
             recovery_claimed.set(false);
             sink.set_property("device", endpoint_id.as_str());
             if let Some(playbin) = playbin.upgrade() {
@@ -141,6 +134,18 @@ fn watch_default_audio_endpoint(
             None
         }
     }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn default_wasapi2_endpoint_from_message(message: &gst::MessageRef) -> Option<String> {
+    let device = match message.view() {
+        gst::MessageView::DeviceAdded(added) => Some(added.device()),
+        // GStreamer defines `device()` as the new immutable snapshot;
+        // the generated `device_changed_()` accessor is the old one.
+        gst::MessageView::DeviceChanged(changed) => Some(changed.device()),
+        _ => None,
+    }?;
+    default_wasapi2_endpoint_id(device.properties().as_deref())
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -185,6 +190,13 @@ pub(super) fn recover_warning(
     volume: f64,
     recovery_claimed: &Cell<bool>,
 ) -> bool {
+    let gst::MessageView::Warning(warning) = message.view() else {
+        return false;
+    };
+    if !is_recoverable_wasapi2_warning_code(&warning.error()) {
+        return false;
+    }
+
     let Some(sink) = message.src().and_then(|source| {
         source.downcast_ref::<gst::Element>().filter(|element| {
             element
@@ -210,6 +222,11 @@ pub(super) fn recover_warning(
         warn!("Windows audio endpoint was invalidated; requested one bounded reconnection");
     }
     true
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn is_recoverable_wasapi2_warning_code(error: &glib::Error) -> bool {
+    error.matches(gst::ResourceError::OpenReadWrite) || error.matches(gst::ResourceError::Write)
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -242,6 +259,30 @@ fn default_wasapi2_endpoint_id(properties: Option<&gst::StructureRef>) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gst::subclass::prelude::*;
+
+    mod test_device {
+        use super::*;
+
+        #[derive(Default)]
+        pub struct TestDevice;
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for TestDevice {
+            const NAME: &'static str = "TributaryWindowsAudioTestDevice";
+            type Type = super::TestDevice;
+            type ParentType = gst::Device;
+        }
+
+        impl ObjectImpl for TestDevice {}
+        impl GstObjectImpl for TestDevice {}
+        impl DeviceImpl for TestDevice {}
+    }
+
+    glib::wrapper! {
+        pub struct TestDevice(ObjectSubclass<test_device::TestDevice>)
+            @extends gst::Device, gst::Object;
+    }
 
     fn properties(api: &str, is_default: bool, actual_id: &str) -> gst::Structure {
         gst::init().expect("initialize GStreamer");
@@ -250,6 +291,16 @@ mod tests {
             .field("device.default", is_default)
             .field("device.actual-id", actual_id)
             .build()
+    }
+
+    fn device(properties: gst::Structure) -> gst::Device {
+        glib::Object::builder::<TestDevice>()
+            .property("display-name", "Test output")
+            .property("device-class", "Audio/Sink")
+            .property("caps", gst::Caps::new_any())
+            .property("properties", properties)
+            .build()
+            .upcast()
     }
 
     #[test]
@@ -282,6 +333,19 @@ mod tests {
     }
 
     #[test]
+    fn device_changed_selects_the_new_snapshot_not_the_replaced_one() {
+        gst::init().expect("initialize GStreamer");
+        let replacement = device(properties(WASAPI2_API, true, "{new-default}"));
+        let replaced = device(properties(WASAPI2_API, false, "{old-default}"));
+        let message = gst::message::DeviceChanged::new(&replacement, &replaced);
+
+        assert_eq!(
+            default_wasapi2_endpoint_from_message(message.as_ref()).as_deref(),
+            Some("{new-default}")
+        );
+    }
+
+    #[test]
     fn warning_recovery_is_single_flight_until_an_external_reset() {
         let claimed = Cell::new(false);
 
@@ -289,5 +353,18 @@ mod tests {
         assert!(!claim_warning_recovery(&claimed));
         claimed.set(false);
         assert!(claim_warning_recovery(&claimed));
+    }
+
+    #[test]
+    fn only_wasapi2_output_device_warning_codes_are_recoverable() {
+        let open = glib::Error::new(gst::ResourceError::OpenReadWrite, "open");
+        let write = glib::Error::new(gst::ResourceError::Write, "write");
+        let unrelated_resource = glib::Error::new(gst::ResourceError::Read, "read");
+        let unrelated_domain = glib::Error::new(gst::CoreError::Failed, "core");
+
+        assert!(is_recoverable_wasapi2_warning_code(&open));
+        assert!(is_recoverable_wasapi2_warning_code(&write));
+        assert!(!is_recoverable_wasapi2_warning_code(&unrelated_resource));
+        assert!(!is_recoverable_wasapi2_warning_code(&unrelated_domain));
     }
 }

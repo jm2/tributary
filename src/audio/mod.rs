@@ -553,8 +553,8 @@ impl Player {
         generation: PlayerEventGeneration,
         media_proxy: Arc<GstreamerMediaProxy>,
         media_ticket: Option<Arc<GstreamerMediaTicket>>,
-        _volume: Rc<Cell<f64>>,
-        _sink_recovery_claimed: Rc<Cell<bool>>,
+        volume: Rc<Cell<f64>>,
+        sink_recovery_claimed: Rc<Cell<bool>>,
     ) -> anyhow::Result<gst::bus::BusWatchGuard> {
         let bus = playbin
             .bus()
@@ -563,9 +563,20 @@ impl Player {
         let tx = event_tx.clone();
         let playbin_name = playbin.name();
         let started_at = Instant::now();
+        #[cfg(any(target_os = "windows", test))]
+        let playbin_for_recovery = playbin.downgrade();
+        #[cfg(not(any(target_os = "windows", test)))]
+        let _ = (&volume, &sink_recovery_claimed);
 
         bus.add_watch_local(move |_bus, msg| {
             use gst::MessageView;
+
+            #[cfg(any(target_os = "windows", test))]
+            if playbin_for_recovery.upgrade().is_some_and(|playbin| {
+                windows_audio::recover_warning(msg, &playbin, volume.get(), &sink_recovery_claimed)
+            }) {
+                return glib::ControlFlow::Continue;
+            }
 
             match msg.view() {
                 MessageView::Eos(_) => {
@@ -603,18 +614,6 @@ impl Player {
                         warn!(error = %e, "dropped Error event — UI consumer may be stalled");
                     }
                     return glib::ControlFlow::Break;
-                }
-
-                MessageView::Warning(_) => {
-                    #[cfg(target_os = "windows")]
-                    if windows_audio::recover_warning(
-                        msg,
-                        &playbin,
-                        _volume.get(),
-                        &_sink_recovery_claimed,
-                    ) {
-                        return glib::ControlFlow::Continue;
-                    }
                 }
 
                 MessageView::StateChanged(sc) => {

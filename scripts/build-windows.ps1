@@ -1241,7 +1241,10 @@ function Assert-WindowsWasapi2ProbeReceipt {
         throw "The Windows WASAPI2 capability-probe receipt is not a bounded regular file."
     }
 
-    $lines = [System.IO.File]::ReadAllLines($receiptItem.FullName)
+    $lines = [System.IO.File]::ReadAllLines(
+        $receiptItem.FullName,
+        [System.Text.UTF8Encoding]::new($false, $true)
+    )
     if ($lines.Count -ne 3 -or
         $lines[0] -cne "tributary-windows-wasapi2-probe-v2") {
         throw "The Windows WASAPI2 capability-probe receipt has an unsupported format."

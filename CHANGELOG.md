@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   active volume-capable output, so returning to a parked Local output no longer restores its stale
   cached volume; MPD remains untouched. Packaged Windows playback now uses the bundled WASAPI2 sink
   explicitly, monitors the default render endpoint, retargets the live sink when Windows changes
-  that endpoint, tolerates temporary device loss, and uses one bounded warning-triggered reconnect
-  instead of risking a retry loop while no endpoint exists. It reapplies Tributary's cached
+  that endpoint, tolerates temporary device loss, and permits one bounded reconnect only for
+  WASAPI2's specific output-device warning codes instead of risking a retry loop while no endpoint
+  exists. It reapplies Tributary's cached
   perceptual volume during both change and recovery. Packaging/runtime validation now treats that
   WASAPI2 capability as required rather than relying on broad plugin copying. Installer-only
   rebuilds also require a versioned successful-probe receipt bound to the exact application and
