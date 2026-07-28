@@ -489,6 +489,17 @@ impl TrackSnapshot {
     }
 }
 
+/// Widgets owned by a single browser-pane [`gtk::ListItem`]. Held by the
+/// ListItem via `set_data` so bind / unbind can address them by name
+/// instead of relying on insertion order (`first_child` / `last_child`).
+struct RowWidgets {
+    label: gtk::Label,
+    count: gtk::Label,
+    row: gtk::Box,
+}
+
+const ROW_WIDGETS_KEY: &str = "tributary-browser-row-widgets";
+
 fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
     let header = gtk::Label::builder()
         .label(title)
@@ -516,7 +527,7 @@ fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
         let count = gtk::Label::builder()
             .halign(gtk::Align::End)
             .valign(gtk::Align::Center)
-            .css_classes(["dim-label", "caption", "numeric"])
+            .css_classes(["dim-label", "caption", "numeric", "browser-count"])
             .build();
         let row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -528,6 +539,23 @@ fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
             .build();
         row.append(&label);
         row.append(&count);
+        // Mark the child labels as presentational so the screen reader
+        // does not announce them as separate items; the combined text
+        // is announced from the row's accessible label set in bind.
+        label.set_accessible_role(gtk::AccessibleRole::Presentation);
+        count.set_accessible_role(gtk::AccessibleRole::Presentation);
+        // Stable ownership: hold the labels and the row as a wrapper
+        // attached to the ListItem so bind / unbind can address them by
+        // name instead of by first_child / last_child (which depends on
+        // insertion order).
+        let widgets = RowWidgets {
+            label: label.clone(),
+            count: count.clone(),
+            row: row.clone(),
+        };
+        unsafe {
+            list_item.set_data(ROW_WIDGETS_KEY, widgets);
+        }
         list_item.set_child(Some(&row));
     });
 
@@ -537,17 +565,32 @@ fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
             .item()
             .and_downcast::<BrowserItem>()
             .expect("BrowserItem");
-        let row = list_item.child().and_downcast::<gtk::Box>().expect("Box");
-        let first = row
-            .first_child()
-            .and_downcast::<gtk::Label>()
-            .expect("Label");
-        let second = row
-            .last_child()
-            .and_downcast::<gtk::Label>()
-            .expect("Label");
-        first.set_text(&item.label());
-        second.set_text(&format!("({})", item.count()));
+        let widgets = unsafe { list_item.data::<RowWidgets>(ROW_WIDGETS_KEY) }
+            .expect("RowWidgets attached in setup");
+        let widgets = unsafe { widgets.as_ref() };
+        widgets.label.set_text(&item.label());
+        let count_text = format!("({})", item.count());
+        widgets.count.set_text(&count_text);
+        // Combine the label and parenthesized count into a single
+        // accessible label so a screen reader announces the row as one
+        // utterance ("Artist Name, 123") rather than two adjacent
+        // separate labels. The child labels are marked Presentation in
+        // setup so they are not announced individually.
+        let accessible = format!("{}, {}", item.label(), count_text);
+        widgets
+            .row
+            .update_property(&[gtk::accessible::Property::Label(&accessible)]);
+    });
+
+    factory.connect_unbind(|_, list_item| {
+        let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
+        let Some(widgets) = (unsafe { list_item.data::<RowWidgets>(ROW_WIDGETS_KEY) }) else {
+            return;
+        };
+        let widgets = unsafe { widgets.as_ref() };
+        widgets.label.set_text("");
+        widgets.count.set_text("");
+        widgets.row.reset_property(gtk::AccessibleProperty::Label);
     });
 
     let list_view = gtk::ListView::builder()

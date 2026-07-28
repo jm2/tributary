@@ -63,10 +63,12 @@ searchentry {
     border-radius: 6px;
 }
 
-/* Numeric (right-aligned) secondary text in browser rows — keep the
- * dim-label opacity but lift the minimum contrast a touch so the
- * count remains legible at small caption size. */
-.caption.dim-label.numeric {
+/* Numeric secondary text in browser rows — keep the dim-label opacity
+ * but lift the minimum contrast a touch so the count remains legible
+ * at small caption size. Scoped to the dedicated `.browser-count` class
+ * so the rule does not also re-style the header-bar scrubber time
+ * labels (which share the same `dim-label caption numeric` triplet). */
+.browser-count {
     opacity: 0.75;
 }
 
