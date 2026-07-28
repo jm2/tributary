@@ -13,6 +13,8 @@ const BUILD_SCRIPT: &str = include_str!("../build.rs");
 const BUILD_LINUX: &str = include_str!("../scripts/build-linux.sh");
 const BUILD_MACOS: &str = include_str!("../scripts/build-macos.sh");
 const BUILD_WINDOWS: &str = include_str!("../scripts/build-windows.ps1");
+const WINDOWS_AUDIO: &str = include_str!("../src/audio/windows_audio.rs");
+const WINDOWS_RUNTIME_PROBE: &str = include_str!("../src/audio/runtime_probe.rs");
 const FORBIDDEN_BUNDLED_COMPONENTS: &str =
     include_str!("../build-aux/packaging/forbidden-bundled-components.txt");
 
@@ -384,6 +386,71 @@ fn windows_bundle_applies_policy_at_copy_and_installer_boundaries() {
                 "PE import inspector returned an unsupported dependency spelling for $SourceLabel"
             ),
         "the recursive closure must fail closed on an import spelling it cannot safely resolve"
+    );
+}
+
+#[test]
+fn windows_bundle_requires_dynamic_system_audio_output_support() {
+    let installer_only = BUILD_WINDOWS
+        .find("# ── Inno Setup only mode")
+        .expect("the installer-only path must exist");
+    let installer_compile = BUILD_WINDOWS[installer_only..]
+        .find("& $iscc")
+        .map(|offset| installer_only + offset)
+        .expect("the installer-only path must invoke Inno Setup");
+    let probe_success_gate = BUILD_WINDOWS
+        .find("if ($probeFailure) { Write-Err \"Packaged Windows runtime probe failed")
+        .expect("the normal packaged probe must have a failure gate");
+    let receipt_write = BUILD_WINDOWS
+        .find("Write-WindowsWasapi2ProbeReceipt $distFull")
+        .expect("the successful normal probe must persist a capability receipt");
+    let zip_boundary = BUILD_WINDOWS
+        .find("# ── Zip Archive")
+        .expect("the Windows ZIP boundary must exist");
+    assert_eq!(
+        dependency_api_floor(&manifest(), "gstreamer", (1, 16)),
+        "1.16",
+        "DeviceChanged handling requires the GStreamer 1.16 Rust API"
+    );
+    assert!(
+        BUILD_WINDOWS.contains("$requiredWasapiPluginName = \"libgstwasapi2.dll\"")
+            && BUILD_WINDOWS.contains("Assert-WindowsWasapi2BundleContract $DIST")
+            && BUILD_WINDOWS.contains("Required wasapi2sink plugin was not PE-inspected"),
+        "the Windows bundle must require and inspect its WASAPI2 output plugin"
+    );
+    assert!(
+        BUILD_WINDOWS
+            .contains("$plugin = Join-Path $Root \"lib\\gstreamer-1.0\\libgstwasapi2.dll\"")
+            && BUILD_WINDOWS.contains("return \"$Root.wasapi2-probe-v2\"")
+            && BUILD_WINDOWS.contains("\"tributary-windows-wasapi2-probe-v2\"")
+            && BUILD_WINDOWS.contains("\"tributary-windows-runtime-probe-v2`n\"")
+            && BUILD_WINDOWS.contains("\"tributary.exe=$(Get-WindowsProbeSha256 $application)\"")
+            && BUILD_WINDOWS.contains("\"libgstwasapi2.dll=$(Get-WindowsProbeSha256 $plugin)\""),
+        "the capability receipt must be versioned, external to the bundle, and hash-bound"
+    );
+    assert!(
+        probe_success_gate < receipt_write && receipt_write < zip_boundary,
+        "only a successful normal packaged probe may publish the receipt before artifacts"
+    );
+    assert_eq!(
+        BUILD_WINDOWS[installer_only..installer_compile]
+            .matches("Assert-WindowsWasapi2ProbeReceipt $sourceDir")
+            .count(),
+        2,
+        "installer-only mode must verify the hash-bound capability before and after source checks"
+    );
+    assert!(
+        WINDOWS_RUNTIME_PROBE.contains("bundled_factory(\"wasapi2sink\", &canonical_plugin_dir)?")
+            && WINDOWS_RUNTIME_PROBE
+                .contains("windows_audio::configure_wasapi2_sink(&wasapi2_sink)"),
+        "the packaged runtime probe must verify dynamic WASAPI2 recovery"
+    );
+    assert!(
+        WINDOWS_AUDIO.contains("property.flags().contains(glib::ParamFlags::WRITABLE)")
+            && WINDOWS_AUDIO.contains("sink.set_property(\"continue-on-error\", true)")
+            && WINDOWS_AUDIO.contains("claim_warning_recovery(recovery_claimed)")
+            && WINDOWS_AUDIO.contains("recovery_claimed_for_watch.set(false)"),
+        "the Windows audio path must feature-detect live switching and bound warning recovery"
     );
 }
 

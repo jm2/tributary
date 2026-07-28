@@ -382,6 +382,10 @@ rustup target add x86_64-pc-windows-gnullvm
 ```
 
 This produces `dist/tributary-windows.zip` with the executable and all required DLLs/resources.
+The packaged-runtime probe requires WASAPI2's dynamic device-recovery capability and records an
+unshipped, versioned receipt bound to the exact application and WASAPI2 plugin hashes. A later
+`-InnoSetup -SkipBundle` run accepts the existing tree only while that receipt still matches; rerun
+the full bundle/probe after changing either file.
 
 ### Release artifact component policy
 
@@ -1068,7 +1072,11 @@ podcasts. Tributary deliberately does not guess through any of those gaps.
   the unchanged current track.
 - **Repeat** — cycles through Off → All → One
 - **Seek** — drag the progress scrubber
-- **Volume** — drag the volume slider (cubic perceptual curve)
+- **Volume** — drag the volume slider (cubic perceptual curve). Its level is shared across
+  Tributary outputs that support application volume, including when returning to a previously
+  parked Local output; outputs such as MPD that own their volume remain unchanged. On Windows,
+  packaged local playback follows changes to the system default audio device and reapplies the
+  selected level after sink recovery.
 
 The [local playback-history contract](docs/playback-history.md) defines a counted play as half of a
 known duration, rounded up and capped at four minutes, with a conservative unknown-duration rule.

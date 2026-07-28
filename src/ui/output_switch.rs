@@ -71,6 +71,20 @@ fn output_type_for_target(target: &OutputTarget) -> OutputType {
     }
 }
 
+/// Keep the header slider authoritative when changing output implementations.
+///
+/// Remote outputs are constructed from the slider value, but the parked local
+/// output retains its previous cached volume. Reapplying the slider after every
+/// committed selection prevents restoring Local from silently reviving that
+/// stale level. Outputs such as MPD that own their volume remain untouched.
+fn reconcile_selected_output_volume(output: &mut dyn AudioOutput, slider_volume: f64) -> bool {
+    let supports_volume = output.supports_volume();
+    if supports_volume {
+        output.set_volume(slider_volume.clamp(0.0, 1.0));
+    }
+    supports_volume
+}
+
 /// Validate a requested endpoint without touching the playback session or
 /// invoking either output. The activation stays owned by the caller until the
 /// coordinator has retired the predecessor occurrence.
@@ -300,8 +314,8 @@ pub fn setup_output_selector(
         );
 
         let row_name = output_row_name(activated_row);
-        let (activation, supports_volume) = match &requested_target {
-            OutputTarget::Local => (OutputActivation::Local, true),
+        let activation = match &requested_target {
+            OutputTarget::Local => OutputActivation::Local,
             OutputTarget::Chromecast { address } => {
                 let output = ChromecastOutput::new(
                     &row_name,
@@ -310,7 +324,7 @@ pub fn setup_output_selector(
                     volume_scale.value(),
                 )
                 .with_runtime(rt_handle.clone());
-                (OutputActivation::Remote(Box::new(output)), true)
+                OutputActivation::Remote(Box::new(output))
             }
             OutputTarget::AirPlay { host, port } => {
                 let output = AirPlayOutput::new(
@@ -321,8 +335,7 @@ pub fn setup_output_selector(
                     volume_scale.value(),
                 )
                 .with_runtime(rt_handle.clone());
-                let supports_volume = output.supports_volume();
-                (OutputActivation::Remote(Box::new(output)), supports_volume)
+                OutputActivation::Remote(Box::new(output))
             }
             OutputTarget::Mpd {
                 host,
@@ -337,7 +350,7 @@ pub fn setup_output_selector(
                     event_sender.clone(),
                 )
                 .with_runtime(rt_handle.clone());
-                (OutputActivation::Remote(Box::new(output)), false)
+                OutputActivation::Remote(Box::new(output))
             }
         };
 
@@ -365,6 +378,10 @@ pub fn setup_output_selector(
         }
 
         clear_playback_ui();
+        let supports_volume = reconcile_selected_output_volume(
+            active_output.borrow_mut().as_mut(),
+            volume_scale.value(),
+        );
         volume_scale.set_sensitive(supports_volume);
         info!(output = %row_name, "Audio output changed");
 
@@ -668,6 +685,66 @@ mod tests {
         };
         assert!(output_change_required(&first, &second));
         assert!(output_change_required(&first, &OutputTarget::Local));
+    }
+
+    #[test]
+    fn committed_output_changes_keep_the_slider_volume_across_local_restore() {
+        let (mut active_output, _) = FakeOutput::boxed("local", OutputType::Local, 0);
+        active_output.set_volume(0.2);
+        let mut parked_local = None;
+        let mut active_target = OutputTarget::Local;
+        let mut session = PlaybackSession::default();
+
+        let (cast, _) = FakeOutput::boxed("cast", OutputType::Chromecast, 0);
+        assert_eq!(
+            apply_output_selection(
+                &mut active_target,
+                OutputTarget::Chromecast {
+                    address: "192.0.2.10:8009".parse().unwrap(),
+                },
+                &mut session,
+                &mut active_output,
+                &mut parked_local,
+                OutputActivation::Remote(cast),
+            ),
+            OutputSelectionOutcome::Changed
+        );
+        assert!(reconcile_selected_output_volume(
+            active_output.as_mut(),
+            0.8
+        ));
+        assert_eq!(active_output.volume().to_bits(), 0.8_f64.to_bits());
+
+        assert_eq!(
+            apply_output_selection(
+                &mut active_target,
+                OutputTarget::Local,
+                &mut session,
+                &mut active_output,
+                &mut parked_local,
+                OutputActivation::Local,
+            ),
+            OutputSelectionOutcome::Changed
+        );
+        assert_eq!(
+            active_output.volume().to_bits(),
+            0.2_f64.to_bits(),
+            "the parked output still has its old cached level before reconciliation"
+        );
+        assert!(reconcile_selected_output_volume(
+            active_output.as_mut(),
+            0.8
+        ));
+        assert_eq!(active_output.volume().to_bits(), 0.8_f64.to_bits());
+    }
+
+    #[test]
+    fn selected_outputs_without_volume_control_are_not_mutated() {
+        let (mut mpd, _) = FakeOutput::boxed("mpd", OutputType::Mpd, 0);
+        let original = mpd.volume();
+
+        assert!(!reconcile_selected_output_volume(mpd.as_mut(), 0.8));
+        assert_eq!(mpd.volume().to_bits(), original.to_bits());
     }
 
     #[test]

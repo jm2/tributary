@@ -543,6 +543,12 @@ The playback-history contract makes the remaining Last.fm behavior much less amb
 
 ### 4. Plan audio-output work explicitly
 
+Local output already treats the header slider as one shared level across volume-capable Tributary
+outputs. The Windows pipeline retains the packaged WASAPI2 sink and monitors the system default
+render endpoint so a device change or temporary invalidation does not revive a stale sink volume;
+MPD continues to own its volume independently. A physical Windows switch/unplug/replug check is
+release acceptance for that baseline, not a separate feature record.
+
 1. **Equalizer ([#49]).** Define the GStreamer filter graph, bands/presets, preamp and clipping
    policy, live reconfiguration, persistence, and per-output behavior. Local and AirPlay pipelines
    can potentially process locally; Chromecast and MPD may need receiver-side support or an

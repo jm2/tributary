@@ -36,6 +36,8 @@ mod runtime_probe;
 pub(crate) use runtime_probe::run_packaged_windows_runtime_probe;
 #[cfg(test)]
 pub mod test_support;
+#[cfg(any(target_os = "windows", test))]
+mod windows_audio;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -166,7 +168,10 @@ pub enum PlayerState {
 /// the [`async_channel::Receiver`] returned by [`Player::new`].
 pub struct Player {
     playbin: gst::Element,
-    volume: f64,
+    volume: Rc<Cell<f64>>,
+    /// Allows at most one warning-triggered sink reconnect until a new load
+    /// or an observed system-device change establishes a fresh boundary.
+    sink_recovery_claimed: Rc<Cell<bool>>,
     event_tx: async_channel::Sender<PlayerEvent>,
     /// App-owned exact-origin fetch boundary for authenticated media. The
     /// pipeline receives only a dedicated loopback ticket, never the backend
@@ -182,6 +187,10 @@ pub struct Player {
     /// load's generation, so even an already-queued message from the previous
     /// pipeline incarnation remains identifiable as stale.
     bus_watch: RefCell<Option<gst::bus::BusWatchGuard>>,
+    /// Retains the Windows device monitor and its bus watch for the lifetime
+    /// of the local playback pipeline.
+    #[cfg(target_os = "windows")]
+    _windows_audio_route: Option<windows_audio::WindowsAudioRoute>,
 }
 
 impl Player {
@@ -245,8 +254,17 @@ impl Player {
         #[cfg(target_os = "macos")]
         Self::install_macos_channel_cap(&playbin);
 
-        let volume = load_saved_volume().unwrap_or(1.0);
-        playbin.set_property("volume", slider_to_pipeline(volume));
+        let volume = Rc::new(Cell::new(load_saved_volume().unwrap_or(1.0)));
+        let sink_recovery_claimed = Rc::new(Cell::new(false));
+
+        #[cfg(target_os = "windows")]
+        let windows_audio_route = windows_audio::WindowsAudioRoute::install(
+            &playbin,
+            Rc::clone(&volume),
+            Rc::clone(&sink_recovery_claimed),
+        );
+
+        playbin.set_property("volume", slider_to_pipeline(volume.get()));
 
         let (event_tx, event_rx) = async_channel::unbounded();
 
@@ -256,11 +274,14 @@ impl Player {
         let player = Self {
             playbin,
             volume,
+            sink_recovery_claimed,
             event_tx,
             media_proxy: Arc::new(GstreamerMediaProxy::new(Some(rt_handle))),
             event_generation,
             volume_save_pending: Rc::new(Cell::new(None)),
             bus_watch: RefCell::new(None),
+            #[cfg(target_os = "windows")]
+            _windows_audio_route: windows_audio_route,
         };
 
         Ok((player, event_rx))
@@ -334,7 +355,8 @@ impl Player {
         self.playbin.set_property("uri", prepared.uri());
         // Re-apply volume — the NULL transition resets it to 1.0.
         self.playbin
-            .set_property("volume", slider_to_pipeline(self.volume));
+            .set_property("volume", slider_to_pipeline(self.volume.get()));
+        self.sink_recovery_claimed.set(false);
         if let Some(bus) = self.playbin.bus() {
             bus.set_flushing(false);
         }
@@ -348,6 +370,8 @@ impl Player {
             generation,
             Arc::clone(&self.media_proxy),
             ticket.clone(),
+            Rc::clone(&self.volume),
+            Rc::clone(&self.sink_recovery_claimed),
         ) {
             Ok(watch) => *self.bus_watch.borrow_mut() = Some(watch),
             Err(error) => {
@@ -456,12 +480,12 @@ impl Player {
     /// Set pipeline volume (clamped to 0.0 – 1.0, linear).
     /// Set volume from a linear slider position (0.0 – 1.0).
     /// Internally applies a cubic curve for perceptually linear loudness.
-    pub fn set_volume(&mut self, level: f64) {
-        self.volume = level.clamp(0.0, 1.0);
+    pub fn set_volume(&self, level: f64) {
+        self.volume.set(level.clamp(0.0, 1.0));
         self.playbin
-            .set_property("volume", slider_to_pipeline(self.volume));
+            .set_property("volume", slider_to_pipeline(self.volume.get()));
         self.save_volume_debounced();
-        debug!(volume = self.volume, "Volume set");
+        debug!(volume = self.volume.get(), "Volume set");
     }
 
     /// Persist the current volume off the GTK main-thread hot path.
@@ -474,7 +498,7 @@ impl Player {
     /// the slider has settled on.
     fn save_volume_debounced(&self) {
         let already_scheduled = self.volume_save_pending.get().is_some();
-        self.volume_save_pending.set(Some(self.volume));
+        self.volume_save_pending.set(Some(self.volume.get()));
         if already_scheduled {
             return;
         }
@@ -488,7 +512,7 @@ impl Player {
 
     /// Current pipeline volume (0.0 – 1.0).
     pub fn volume(&self) -> f64 {
-        self.volume
+        self.volume.get()
     }
 
     // ── State / position queries ────────────────────────────────────
@@ -529,6 +553,8 @@ impl Player {
         generation: PlayerEventGeneration,
         media_proxy: Arc<GstreamerMediaProxy>,
         media_ticket: Option<Arc<GstreamerMediaTicket>>,
+        _volume: Rc<Cell<f64>>,
+        _sink_recovery_claimed: Rc<Cell<bool>>,
     ) -> anyhow::Result<gst::bus::BusWatchGuard> {
         let bus = playbin
             .bus()
@@ -577,6 +603,18 @@ impl Player {
                         warn!(error = %e, "dropped Error event — UI consumer may be stalled");
                     }
                     return glib::ControlFlow::Break;
+                }
+
+                MessageView::Warning(_) => {
+                    #[cfg(target_os = "windows")]
+                    if windows_audio::recover_warning(
+                        msg,
+                        &playbin,
+                        _volume.get(),
+                        &_sink_recovery_claimed,
+                    ) {
+                        return glib::ControlFlow::Continue;
+                    }
                 }
 
                 MessageView::StateChanged(sc) => {

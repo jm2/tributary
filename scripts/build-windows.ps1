@@ -1168,6 +1168,94 @@ function Assert-WindowsBundlePeImportPolicy {
     }
 }
 
+function Assert-WindowsWasapi2BundleContract {
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    $plugin = Join-Path $Root "lib\gstreamer-1.0\libgstwasapi2.dll"
+    if (-not (Test-Path -LiteralPath $plugin -PathType Leaf)) {
+        throw "Required wasapi2sink plugin is missing from the Windows bundle."
+    }
+    $item = Get-Item -LiteralPath $plugin -Force -ErrorAction Stop
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Required wasapi2sink plugin must be a regular bundled file."
+    }
+}
+
+function Get-WindowsWasapi2ProbeReceiptPath {
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    return "$Root.wasapi2-probe-v2"
+}
+
+function Get-WindowsProbeSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "A Windows runtime-probe receipt input must be a regular file."
+    }
+    return (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Write-WindowsWasapi2ProbeReceipt {
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    Assert-WindowsWasapi2BundleContract $Root
+    $application = Join-Path $Root "tributary.exe"
+    if (-not (Test-Path -LiteralPath $application -PathType Leaf)) {
+        throw "Required application is missing from the probed Windows bundle."
+    }
+    $plugin = Join-Path $Root "lib\gstreamer-1.0\libgstwasapi2.dll"
+    $receipt = Get-WindowsWasapi2ProbeReceiptPath $Root
+    $temporary = "$receipt.$([Guid]::NewGuid().ToString('N')).tmp"
+    $lines = @(
+        "tributary-windows-wasapi2-probe-v2",
+        "tributary.exe=$(Get-WindowsProbeSha256 $application)",
+        "libgstwasapi2.dll=$(Get-WindowsProbeSha256 $plugin)"
+    )
+
+    try {
+        [System.IO.File]::WriteAllLines(
+            $temporary,
+            $lines,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $temporary -Destination $receipt -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Assert-WindowsWasapi2ProbeReceipt {
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    Assert-WindowsWasapi2BundleContract $Root
+    $receipt = Get-WindowsWasapi2ProbeReceiptPath $Root
+    if (-not (Test-Path -LiteralPath $receipt -PathType Leaf)) {
+        throw "The existing Windows bundle has no WASAPI2 capability-probe receipt."
+    }
+    $receiptItem = Get-Item -LiteralPath $receipt -Force -ErrorAction Stop
+    if (($receiptItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $receiptItem.Length -gt 512) {
+        throw "The Windows WASAPI2 capability-probe receipt is not a bounded regular file."
+    }
+
+    $lines = [System.IO.File]::ReadAllLines($receiptItem.FullName)
+    if ($lines.Count -ne 3 -or
+        $lines[0] -cne "tributary-windows-wasapi2-probe-v2") {
+        throw "The Windows WASAPI2 capability-probe receipt has an unsupported format."
+    }
+    $applicationHash = (Get-WindowsProbeSha256 (Join-Path $Root "tributary.exe"))
+    $pluginHash = (Get-WindowsProbeSha256 (
+        Join-Path $Root "lib\gstreamer-1.0\libgstwasapi2.dll"
+    ))
+    if ($lines[1] -cne "tributary.exe=$applicationHash" -or
+        $lines[2] -cne "libgstwasapi2.dll=$pluginHash") {
+        throw "The Windows WASAPI2 capability-probe receipt does not match the installer source."
+    }
+}
+
 # Auto-detect ARM64 when env vars are not explicitly set.
 $NativeArch = if ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
     "arm64"
@@ -1196,8 +1284,9 @@ $DIST = "dist\tributary-windows"
 # ── Inno Setup only mode ─────────────────────────────────────────────────────
 # When -InnoSetup is passed with -SkipBundle, use an existing, already-probed
 # dist tree and skip straight to installer creation. The runtime probe is not
-# repeated, but the existing tree still crosses the component-policy gate
-# immediately before the installer compiler runs.
+# repeated: its versioned external receipt must match the exact application
+# and WASAPI2 plugin before and after the existing tree crosses the other
+# component, PE-import, and application-resource gates.
 if ($InnoSetup -and $SkipBundle) {
     Write-Info "Building Inno Setup installer from the existing dist tree (bundle/runtime probe skipped)..."
 
@@ -1227,6 +1316,7 @@ if ($InnoSetup -and $SkipBundle) {
     $issFile = "build-aux\inno\tributary.iss"
     $sourceDir = (Resolve-Path $DIST).Path
     $outputDir = (Resolve-Path "dist").Path
+    Assert-WindowsWasapi2ProbeReceipt $sourceDir
     Assert-WindowsBundleComponentPolicy $sourceDir
     $installerPeImportInspector = [System.IO.Path]::GetFullPath(
         (Join-Path $MsysPath "bin\llvm-readobj.exe")
@@ -1248,6 +1338,7 @@ if ($InnoSetup -and $SkipBundle) {
     }
     Write-Info "Installer source application icon and version resources passed."
 
+    Assert-WindowsWasapi2ProbeReceipt $sourceDir
     Write-Info "Running Inno Setup compiler..."
     & $iscc /DAppVersion="$CargoVersion" /DSourceDir="$sourceDir" /DOutputDir="$outputDir" /DTargetArch="$InnoArch" $issFile
     if ($LASTEXITCODE -ne 0) { Write-Err "Inno Setup compilation failed." }
@@ -1426,12 +1517,14 @@ if ($missing.Count -gt 0) {
     Write-Err "Missing compile-time packages. In MSYS2 shell, run:`n  pacman -S $($missing -join ' ')"
 }
 
-# Runtime GStreamer plugins (Soup source required; additional codecs warn only)
+# Runtime GStreamer plugins (HTTP and system-device output required; codecs warn only)
 $gstPluginDir = Join-Path $MsysPath "lib\gstreamer-1.0"
 $requiredSoupPluginName = "libgstsoup.dll"
 $requiredSoupRuntimeName = "libsoup-3.0-0.dll"
+$requiredWasapiPluginName = "libgstwasapi2.dll"
 $requiredSoupPluginSrc = Join-Path $gstPluginDir $requiredSoupPluginName
 $requiredSoupRuntimeSrc = Join-Path $MsysPath "bin\$requiredSoupRuntimeName"
+$requiredWasapiPluginSrc = Join-Path $gstPluginDir $requiredWasapiPluginName
 $missingSoupRuntime = @()
 if (-not (Test-Path -LiteralPath $requiredSoupPluginSrc -PathType Leaf)) {
     $missingSoupRuntime += "GStreamer Soup source plugin ($requiredSoupPluginName)"
@@ -1443,6 +1536,11 @@ if ($missingSoupRuntime.Count -gt 0) {
     Write-Err "Required souphttpsrc runtime is incomplete: $($missingSoupRuntime -join ', '). Install the matching $PkgPrefix-gst-plugins-good and $PkgPrefix-libsoup3 packages."
 }
 Write-Host "  [ok] souphttpsrc plugin and Soup runtime"
+
+if (-not (Test-Path -LiteralPath $requiredWasapiPluginSrc -PathType Leaf)) {
+    Write-Err "Required Windows audio output plugin ($requiredWasapiPluginName) is missing. Install the matching $PkgPrefix-gst-plugins-bad package."
+}
+Write-Host "  [ok] wasapi2sink plugin"
 
 $pluginWarnings = @()
 foreach ($plugin in @("gst-plugins-good", "gst-plugins-bad", "gst-libav")) {
@@ -1764,6 +1862,13 @@ $requiredSoupPluginDest = Join-Path $DIST "lib\gstreamer-1.0\$requiredSoupPlugin
 if (-not (Test-Path -LiteralPath $requiredSoupPluginDest -PathType Leaf)) {
     Write-Err "Required souphttpsrc plugin was not copied into the Windows bundle."
 }
+$requiredWasapiPluginDest = Join-Path $DIST "lib\gstreamer-1.0\$requiredWasapiPluginName"
+try {
+    Assert-WindowsWasapi2BundleContract $DIST
+}
+catch {
+    Write-Err $_.Exception.Message
+}
 
 $maxDllScanTargets = 4096
 $maxPeInspectorOutputLines = 131072
@@ -1787,6 +1892,7 @@ foreach ($bin in $initialDllScanTargets) {
 }
 
 $requiredSoupPluginFull = [System.IO.Path]::GetFullPath($requiredSoupPluginDest)
+$requiredWasapiPluginFull = [System.IO.Path]::GetFullPath($requiredWasapiPluginDest)
 $requiredSoupRuntimeDest = Join-Path $DIST $requiredSoupRuntimeName
 $requiredSoupRuntimeFull = [System.IO.Path]::GetFullPath($requiredSoupRuntimeDest)
 $soupPluginScanned = $false
@@ -1909,6 +2015,9 @@ if (-not (Test-Path -LiteralPath $requiredSoupRuntimeDest -PathType Leaf) -or
     -not $scannedDllTargets.ContainsKey($requiredSoupRuntimeFull)) {
     Write-Err "Required souphttpsrc runtime dependency $requiredSoupRuntimeName was not copied and PE-inspected."
 }
+if (-not $scannedDllTargets.ContainsKey($requiredWasapiPluginFull)) {
+    Write-Err "Required wasapi2sink plugin was not PE-inspected."
+}
 
 Write-Host "  dependency closure complete: $($scannedDllTargets.Count) binary target(s) in $peInspectorRound round(s)"
 
@@ -1983,7 +2092,7 @@ $probeCache = Join-Path $probeWorkspace "Fresh Cache With Spaces"
 $probeStdout = Join-Path $probeWorkspace "stdout.log"
 $probeStderr = Join-Path $probeWorkspace "stderr.log"
 $probeSentinel = Join-Path $probeCache "tributary-platform-runtime-probe.ok"
-$expectedSentinel = [System.Text.Encoding]::UTF8.GetBytes("tributary-windows-runtime-probe-v1`n")
+$expectedSentinel = [System.Text.Encoding]::UTF8.GetBytes("tributary-windows-runtime-probe-v2`n")
 $probeOutputLimit = 1MB
 $probeProcess = $null
 $stdoutStream = $null
@@ -2139,6 +2248,12 @@ finally {
 }
 
 if ($probeFailure) { Write-Err "Packaged Windows runtime probe failed: $probeFailure" }
+try {
+    Write-WindowsWasapi2ProbeReceipt $distFull
+}
+catch {
+    Write-Err "Could not persist the Windows WASAPI2 capability-probe receipt: $($_.Exception.Message)"
+}
 Write-Info "Packaged Windows runtime probe passed."
 
 # ── Zip Archive ──────────────────────────────────────────────────────────────
