@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Volume now remains coherent across supported output and Windows audio-device changes.**
+  Selecting a different Tributary output reapplies the header slider's current level to the newly
+  active volume-capable output, so returning to a parked Local output no longer restores its stale
+  cached volume; MPD remains untouched. Packaged Windows playback now uses the bundled WASAPI2 sink
+  explicitly, monitors the default render endpoint, retargets the live sink when Windows changes
+  that endpoint, tolerates temporary device loss, and permits one bounded reconnect only for
+  WASAPI2's specific output-device warning codes instead of risking a retry loop while no endpoint
+  exists. It reapplies Tributary's cached
+  perceptual volume during both change and recovery. Packaging/runtime validation now treats that
+  WASAPI2 capability as required rather than relying on broad plugin copying. Installer-only
+  rebuilds also require a versioned successful-probe receipt bound to the exact application and
+  WASAPI2 plugin hashes, so an older regular DLL cannot satisfy the capability gate by name alone.
 - **Claude's automatic PR review now admits bot-authored pull requests without depending on
   unavailable bot-event secrets.** Direct `pull_request` reviews remain limited to `User` actors.
   Dependabot and every other GitHub Bot/App actor—including GasTown automation when classified as

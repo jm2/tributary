@@ -57,8 +57,16 @@ pub(crate) fn run_packaged_windows_runtime_probe(plugin_dir: &Path) -> anyhow::R
 
     let playbin_factory = bundled_factory("playbin3", &canonical_plugin_dir)?;
     let _soup_factory = bundled_factory("souphttpsrc", &canonical_plugin_dir)?;
+    let wasapi2_factory = bundled_factory("wasapi2sink", &canonical_plugin_dir)?;
     let fakesink_factory = bundled_factory("fakesink", &canonical_plugin_dir)?;
     let filesrc_factory = bundled_factory("filesrc", &canonical_plugin_dir)?;
+    let wasapi2_sink = wasapi2_factory
+        .create()
+        .build()
+        .map_err(|_| anyhow!("packaged audio probe could not create wasapi2sink"))?;
+    if !super::windows_audio::configure_wasapi2_sink(&wasapi2_sink) {
+        bail!("packaged Windows audio sink lacks dynamic device recovery");
+    }
     media_server.arm()?;
     poison_server.arm()?;
 

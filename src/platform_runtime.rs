@@ -20,7 +20,7 @@ const PLATFORM_RUNTIME_PROBE_FLAG: &str = "--tributary-platform-runtime-probe";
 #[cfg(any(test, target_os = "windows"))]
 const WINDOWS_PROBE_SENTINEL_NAME: &str = "tributary-platform-runtime-probe.ok";
 #[cfg(any(test, target_os = "windows"))]
-const WINDOWS_PROBE_SENTINEL: &[u8] = b"tributary-windows-runtime-probe-v1\n";
+const WINDOWS_PROBE_SENTINEL: &[u8] = b"tributary-windows-runtime-probe-v2\n";
 
 #[cfg(any(test, target_os = "macos"))]
 const PIXBUF_CACHE_LIMIT: usize = 1024 * 1024;

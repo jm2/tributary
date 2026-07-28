@@ -95,8 +95,9 @@ mdns-sd = "0.20"
 # DAAP/DMAP binary protocol parsing
 nom = "8"
 
-# Audio playback (GStreamer pipeline)
-gstreamer = "0.25"
+# Audio playback (GStreamer pipeline). v1_16 exposes DeviceChanged messages
+# used to follow the Windows system-default output endpoint.
+gstreamer = { version = "0.25", features = ["v1_16"] }
 
 # Chromecast (Cast V2 protocol) — MIT-licensed clean-room implementation
 rust_cast = "0.21"

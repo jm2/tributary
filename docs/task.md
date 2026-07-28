@@ -1,6 +1,6 @@
 # Tributary active implementation backlog
 
-Last audited: 2026-07-27
+Last audited: 2026-07-28
 
 This is the executable backlog for feature fixes and additions. It replaces the completed
 holistic-review tracker, which is preserved as
@@ -211,6 +211,28 @@ random prompt boundary, environment-safe cap, sole trusted-default checkout, wil
 output containment, stale/blank-result checks, idempotent actor-owned publication, and absence of
 the broader non-write-user bypass.
 P2.1 remains the feature focus at **14/38 (36.8%)**.
+
+The 2026-07-28 audio-output stability correction likewise remains outside the feature numerator.
+No existing issue, pull request, roadmap entry, or archived task recorded the reported Windows
+failure: the closest prior correction only reapplied playbin volume after Tributary itself drove
+the pipeline through `NULL` for a track change. Local playback otherwise left sink selection
+entirely to GStreamer, did not observe system-device changes, and initialized the header slider
+only once. The correction makes the slider authoritative across committed Tributary output
+changes, without mutating MPD's independently owned volume. On Windows it explicitly retains the
+packaged WASAPI2 sink, enables its bounded continue-on-device-error behavior, monitors the default
+`Audio/Sink` endpoint, retargets the sink from the replacement snapshot on default-device
+additions/changes, recovers an invalidated endpoint with at most one reconnect for WASAPI2's specific
+output-device warning codes before a new load or device event, and reapplies the cached perceptual
+volume at each boundary. That single-flight rule prevents a missing endpoint from causing a
+warning/reconnect loop without consuming recovery authority for unrelated sink warnings. The
+packaged-runtime gate now requires the same sink and recovery property. Pure regressions cover
+Local/receiver volume transfer, MPD non-mutation, replacement endpoint classification, warning-code
+filtering, and the recovery latch. A versioned, unshipped
+successful-probe receipt binds installer-only reuse to the exact application and WASAPI2 plugin
+hashes, preventing a stale pre-1.28 DLL from passing by filename and PE shape alone. Windows CI
+covers the platform integration and bundle policy. A physical Windows switch/unplug/replug smoke
+check remains useful release acceptance, but is not missing implementation. P2.1 remains the
+feature focus and the total remains **14/38 (36.8%)**.
 
 ## P1 — Correctness and shared feature foundations
 
@@ -1126,6 +1148,7 @@ P2.1 remains the feature focus at **14/38 (36.8%)**.
 
 | Date | Task | PR | Result |
 |---|---|---|---|
+| 2026-07-28 | Windows default-device and cross-output volume stability | [#187](https://github.com/jm2/tributary/pull/187) | Made the header slider authoritative across every committed switch to a volume-capable Tributary output, including restoration of the parked Local player, while leaving MPD's independently owned level alone. Windows local playback now retains the packaged WASAPI2 sink, follows the replacement snapshot for the monitored default render endpoint, tolerates device invalidation, permits only one reconnect for its specific output-device warning codes before a new load/device event, and reapplies the cached perceptual level across sink transitions. The packaged-runtime policy requires that exact capability, and installer-only reuse requires its versioned receipt to match the application and WASAPI2 hashes. Focused tests cover supported/unsupported output reconciliation, replacement endpoint classification, warning-code filtering, the no-loop recovery latch, and stale-installer rejection; Windows CI covers platform integration and bundle policy, while a physical switch/unplug/replug smoke check remains release acceptance. This correctness fix does not advance the 14/38 feature numerator. |
 | 2026-07-28 | Claude PR review bot admission | [#186](https://github.com/jm2/tributary/pull/186) | Split automatic review by the triggering actor into a direct `User` path and a trusted bot/App `workflow_run` follow-up, fixing both Dependabot's empty allowlist rejection and the unavailable Actions Claude credential that would have failed next. The bot path starts when CI is requested, admits every Bot/App including GasTown automation classified as non-User, performs exactly one checkout at the immutable trusted default-branch SHA, and fetches an exact base/head comparison capped below the runner's environment-string limit. It skips unavailable comparisons, uses a post-submission random prompt boundary, supplies no usable tools, OIDC authority, or broader App token, and accepts only bounded schema output. The strict fixed publisher requires nonblank output, revalidates the revision, discards stale work, renders model output as inert text, and updates one actor-owned marked comment under per-PR concurrency rather than accumulating duplicates. Ordinary non-write `User` actors remain permission-gated. A semantic metadata regression pins all of those boundaries and the absent non-write-user bypass. This CI reliability fix does not advance the 14/38 feature numerator. |
 | 2026-07-27 | Native icon-bundle integrity correction | [#185](https://github.com/jm2/tributary/pull/185) | Restored Windows application PE identity after the mixed library/binary package topology diverted `winresource`'s package-wide link directive away from `tributary.exe`. The generated ICO and `VERSIONINFO` payload is now attached explicitly to the app binary. Final x86_64 and ARM64 packaging fails before ZIP or installer creation unless the copied EXE has all six icon payloads; a well-formed group-icon directory that references every distinct payload exactly once with the correct byte size; its version resource; and exact package/product metadata. macOS packaging now fails unless the source iconset and GTK hicolor set are complete, `CFBundleIconFile` resolves to a parseable ICNS with every required scale-specific representation, and the app bundle retains its GTK/About icons; the canonical iconset now includes its missing 1024×1024 Retina representation. Focused policy regressions cover missing, malformed, mis-sized, unreferenced, and incomplete resources. This correctness fix does not advance the 14/38 feature numerator. |
 | 2026-07-27 | P2.1 Last.fm application-owner completion ordering | [#169](https://github.com/jm2/tributary/pull/169) | Made runtime-start, playback-ingress-claim, and coordinator-activation rollback publish the terminal `Failed` snapshot synchronously before resolving the independent command-completion channel on the normal path. A poisoned status gate instead preserves the original fixed command error before propagating terminal shutdown failure. This establishes the status-before-receipt contract without retries, sleeps, ignored tests, or weakened assertions; the original immediate stale-coordinator assertion remains the regression. The focused multi-thread regression passed 100/100 local stress iterations after rebasing onto current `main`, and the original patch's complete Linux, macOS, Windows, Flatpak, MSRV, audit, coverage, and CodeQL matrix was green. The correction changes no feature scope, so P2.1 remains open and the total stays 14/38 (36.8%). |
