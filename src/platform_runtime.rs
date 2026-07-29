@@ -1009,6 +1009,12 @@ fn run_macos_runtime_probe(
     if gstreamer::ElementFactory::find("playbin3").is_none() {
         bail!("required bundled GStreamer playbin3 factory was not discovered");
     }
+    if gstreamer::ElementFactory::find("identity").is_none() {
+        bail!("required bundled GStreamer identity factory was not discovered");
+    }
+    if gstreamer::ElementFactory::find("osxaudiosink").is_none() {
+        bail!("required bundled GStreamer osxaudiosink factory was not discovered");
+    }
 
     verify_probe_cache(&caches.pixbuf_loaders, &layout.resources_dir)?;
     verify_probe_cache(&caches.gst_registry, &layout.resources_dir)?;

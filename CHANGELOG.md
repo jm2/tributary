@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- **Volume now remains coherent across supported output and Windows audio-device changes.**
+- **Volume now remains coherent across supported output and Windows/macOS audio-device changes.**
   Selecting a different Tributary output reapplies the header slider's current level to the newly
   active volume-capable output, so returning to a parked Local output no longer restores its stale
   cached volume; MPD remains untouched. Packaged Windows playback now uses the bundled WASAPI2 sink
@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   WASAPI2 capability as required rather than relying on broad plugin copying. Installer-only
   rebuilds also require a versioned successful-probe receipt bound to the exact application and
   WASAPI2 plugin hashes, so an older regular DLL cannot satisfy the capability gate by name alone.
+  On macOS, Tributary now owns the missing default-output boundary directly instead of waiting for
+  or patching GStreamer: an exact CoreAudio listener coalesces route notifications, blocks an
+  app-owned pad, and reopens only one retained `osxaudiosink` on the current device. The playbin,
+  URI, queue occurrence, position, paused/playing intent, and software-volume chain remain intact;
+  Tributary does not force a pause/play clock cycle. Output storms are single-flight and replay the
+  newest generation, listener/probe teardown precedes pipeline shutdown, and an idle sink merely
+  records the endpoint for its next normal open. The existing multi-channel CoreAudio workaround
+  is now installed directly before every native sink can negotiate and remains attached across
+  every reopen; its caps rewrite preserves features and touches only raw-audio channel counts, so
+  compressed formats are not narrowed. macOS packaging fails closed when either the `identity`
+  gate or OS X audio plugin is absent, and the signed-bundle runtime probe must discover both
+  factories. This app-owned path is deliberately independent of a future upstream GStreamer fix;
+  removal remains a separately reviewed change gated on affected multi-channel hardware.
 - **Claude's automatic PR review now admits bot-authored pull requests without depending on
   unavailable bot-event secrets.** Direct `pull_request` reviews remain limited to `User` actors.
   Dependabot and every other GitHub Bot/App actor—including GasTown automation when classified as

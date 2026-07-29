@@ -124,6 +124,11 @@ windows-native-keyring-store = "1.1"
 [target.'cfg(target_os = "macos")'.dependencies]
 gdk-pixbuf = "0.22"
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
+# CoreAudio's block listener reports changes to the system-default output.
+# These target-only bindings link Apple's system frameworks and add no bundled
+# native runtime.
+block2 = { version = "0.6.2", default-features = false, features = ["alloc"] }
+objc2-core-audio = { version = "0.3.2", default-features = false, features = ["AudioHardware", "block2", "dispatch2", "objc2"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus-secret-service-keyring-store = { version = "1", default-features = false, features = ["crypto-rust"] }

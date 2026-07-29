@@ -27,6 +27,8 @@ pub mod cast_http_server;
 pub mod chromecast_output;
 mod gstreamer_media;
 pub mod local_output;
+#[cfg(any(target_os = "macos", test))]
+mod macos_audio;
 pub mod mpd_output;
 pub mod output;
 #[cfg(target_os = "windows")]
@@ -167,6 +169,11 @@ pub enum PlayerState {
 /// main-thread-only control surface.  State updates are pushed through
 /// the [`async_channel::Receiver`] returned by [`Player::new`].
 pub struct Player {
+    /// Retains the CoreAudio default-output listener and the explicitly
+    /// configured `osxaudiosink`. `Player::drop` retires it before taking the
+    /// pipeline to `NULL`.
+    #[cfg(target_os = "macos")]
+    _macos_audio_route: Option<macos_audio::MacosAudioRoute>,
     playbin: gst::Element,
     volume: Rc<Cell<f64>>,
     /// Allows at most one warning-triggered sink reconnect until a new load
@@ -236,23 +243,8 @@ impl Player {
         // an ambient system proxy can never receive that ticket.
         Self::install_loopback_http_source_policy(&playbin);
 
-        // ── macOS: work around GStreamer ≤1.28 channel-negotiation bug ──
-        // On multi-channel audio devices (e.g. monitors with spatial audio
-        // speakers reporting 8 channels to Core Audio), osxaudiosink
-        // advertises channels=[1,N] in its caps.  audioconvert's
-        // fixate_caps then picks the maximum channel count and sets
-        // channel-mask=0x0 (no positions).  The resulting 2→N channel
-        // conversion fails with "Failed to make converter", surfacing as
-        // "not-negotiated" on every file.
-        //
-        // Workaround: use playbin's "element-setup" signal to intercept
-        // osxaudiosink when it is created, and install a pad probe on its
-        // sink pad that rewrites CAPS query results to cap channels at 2.
-        // This makes audioconvert preserve the source channel count.
-        //
-        // TODO: remove once GStreamer ships a fix (likely ≥1.28.3 or 1.30).
         #[cfg(target_os = "macos")]
-        Self::install_macos_channel_cap(&playbin);
+        let macos_audio_route = macos_audio::MacosAudioRoute::install(&playbin);
 
         let volume = Rc::new(Cell::new(load_saved_volume().unwrap_or(1.0)));
         let sink_recovery_claimed = Rc::new(Cell::new(false));
@@ -272,6 +264,8 @@ impl Player {
         Self::start_position_timer(&playbin, &event_tx, Rc::clone(&event_generation));
 
         let player = Self {
+            #[cfg(target_os = "macos")]
+            _macos_audio_route: macos_audio_route,
             playbin,
             volume,
             sink_recovery_claimed,
@@ -750,83 +744,6 @@ impl Player {
             None
         });
     }
-
-    /// Install a pad probe on `osxaudiosink` that caps the negotiated
-    /// channel count to stereo.
-    ///
-    /// On multi-channel Core Audio devices (e.g. monitors reporting 8
-    /// channels), `audioconvert` fixates to the device maximum and then
-    /// fails to build a channel converter because the fixated caps have
-    /// `channel-mask=0x0` (no positions).
-    ///
-    /// This method connects to playbin's `element-setup` signal and,
-    /// when `osxaudiosink` is created, installs a `QUERY_DOWNSTREAM`
-    /// pad probe on its sink pad.  The probe intercepts `CAPS` queries
-    /// and rewrites the `channels` field from `[1, N]` to `[1, 2]`,
-    /// causing `audioconvert` to preserve the source channel count.
-    #[cfg(target_os = "macos")]
-    fn install_macos_channel_cap(playbin: &gst::Element) {
-        use gst::prelude::*;
-
-        playbin.connect("element-setup", false, |args| {
-            let element = args[1].get::<gst::Element>().ok()?;
-            let factory = element.factory()?;
-            if factory.name() != "osxaudiosink" {
-                return None;
-            }
-
-            let pad = element.static_pad("sink")?;
-            pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |pad, info| {
-                let Some(query) = info.query_mut() else {
-                    return gst::PadProbeReturn::Ok;
-                };
-                if query.type_() != gst::QueryType::Caps {
-                    return gst::PadProbeReturn::Ok;
-                }
-
-                // Let the original handler run first so we can rewrite
-                // its result.
-                let parent = pad.parent_element();
-                let handled = if let Some(ref el) = parent {
-                    gst::Pad::query_default(pad, Some(el), query)
-                } else {
-                    false
-                };
-                if !handled {
-                    return gst::PadProbeReturn::Ok;
-                }
-
-                // Rewrite every structure's channels field to [1, 2].
-                if let gst::QueryViewMut::Caps(ref mut q) = query.view_mut() {
-                    if let Some(result) = q.result_owned() {
-                        let mut capped = gst::Caps::new_empty();
-                        {
-                            let capped_mut = capped.make_mut();
-                            for i in 0..result.size() {
-                                if let Some(s) = result.structure(i) {
-                                    let mut s = s.to_owned();
-                                    if s.name().as_str() == "audio/x-raw" && s.has_field("channels")
-                                    {
-                                        s.set("channels", gst::IntRange::new(1, 2));
-                                    }
-                                    capped_mut.append_structure(s);
-                                }
-                            }
-                        }
-                        q.set_result(&capped);
-                    }
-                }
-
-                gst::PadProbeReturn::Handled
-            });
-
-            info!(
-                "macOS: installed channel-cap probe on osxaudiosink \
-                 (GStreamer ≤1.28 workaround)"
-            );
-            None
-        });
-    }
 }
 
 /// Recognize only opaque HTTP tickets created by Tributary's dedicated local
@@ -987,6 +904,8 @@ fn pipeline_error_domain(error: &glib::Error) -> &'static str {
 impl Drop for Player {
     fn drop(&mut self) {
         info!("Shutting down GStreamer pipeline");
+        #[cfg(target_os = "macos")]
+        drop(self._macos_audio_route.take());
         let _ = self.playbin.set_state(gst::State::Null);
     }
 }

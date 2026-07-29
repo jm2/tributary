@@ -15,6 +15,8 @@ const BUILD_MACOS: &str = include_str!("../scripts/build-macos.sh");
 const BUILD_WINDOWS: &str = include_str!("../scripts/build-windows.ps1");
 const WINDOWS_AUDIO: &str = include_str!("../src/audio/windows_audio.rs");
 const WINDOWS_RUNTIME_PROBE: &str = include_str!("../src/audio/runtime_probe.rs");
+const MACOS_AUDIO: &str = include_str!("../src/audio/macos_audio.rs");
+const PLATFORM_RUNTIME: &str = include_str!("../src/platform_runtime.rs");
 const FORBIDDEN_BUNDLED_COMPONENTS: &str =
     include_str!("../build-aux/packaging/forbidden-bundled-components.txt");
 
@@ -453,6 +455,61 @@ fn windows_bundle_requires_dynamic_system_audio_output_support() {
             && WINDOWS_AUDIO.contains("claim_warning_recovery(recovery_claimed)")
             && WINDOWS_AUDIO.contains("recovery_claimed.set(false)"),
         "the Windows audio path must feature-detect live switching and bound warning recovery"
+    );
+}
+
+#[test]
+fn macos_bundle_requires_app_owned_system_audio_output_support() {
+    let manifest = manifest();
+    let macos_dependencies = &manifest["target"]["cfg(target_os = \"macos\")"]["dependencies"];
+
+    assert!(
+        macos_dependencies["objc2-core-audio"].is_table()
+            && macos_dependencies["block2"].is_table(),
+        "CoreAudio output notifications must remain target-only macOS dependencies"
+    );
+    assert!(
+        BUILD_MACOS.contains("for required_route_plugin in libgstcoreelements libgstosxaudio; do")
+            && BUILD_MACOS.contains(
+                "error \"Missing required GStreamer audio-route plugin: ${required_route_plugin}\""
+            ),
+        "the macOS bundle must fail closed when its explicit route elements are absent"
+    );
+    assert!(
+        PLATFORM_RUNTIME.contains("gstreamer::ElementFactory::find(\"identity\").is_none()")
+            && PLATFORM_RUNTIME
+                .contains("required bundled GStreamer identity factory was not discovered")
+            && PLATFORM_RUNTIME
+                .contains("gstreamer::ElementFactory::find(\"osxaudiosink\").is_none()")
+            && PLATFORM_RUNTIME
+                .contains("required bundled GStreamer osxaudiosink factory was not discovered"),
+        "the signed macOS bundle must discover the complete route through its isolated runtime"
+    );
+
+    let configured_call = MACOS_AUDIO
+        .find("let sink = match configured_sink_bin()")
+        .expect("the app must construct its configured sink");
+    let sink_publish = MACOS_AUDIO
+        .find("playbin.set_property(\"audio-sink\", &sink.bin)")
+        .expect("playbin must receive the configured sink");
+    let configured_definition = MACOS_AUDIO
+        .find("fn configured_sink_bin()")
+        .expect("the configured sink constructor must exist");
+    let cap_install = MACOS_AUDIO[configured_definition..]
+        .find("install_channel_cap_on_sink(&native)")
+        .map(|offset| configured_definition + offset)
+        .expect("the native sink must receive the channel cap");
+    let configured_return = MACOS_AUDIO[cap_install..]
+        .find("Ok(ConfiguredSinkBin")
+        .map(|offset| cap_install + offset)
+        .expect("the configured sink must be returned");
+    assert!(
+        configured_call < sink_publish
+            && configured_definition < cap_install
+            && cap_install < configured_return
+            && MACOS_AUDIO.contains("gst::PadProbeType::IDLE")
+            && MACOS_AUDIO.contains("sink.sync_state_with_parent()"),
+        "every app-owned sink must be capped before publication and reopened behind an upstream gate"
     );
 }
 
