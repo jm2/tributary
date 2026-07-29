@@ -212,6 +212,21 @@ fn default_output_is_available() -> bool {
         && device != kAudioObjectUnknown
 }
 
+#[derive(Clone, Copy)]
+struct ReopenAttempt {
+    requested_generation: u64,
+    attempts_remaining: usize,
+}
+
+impl ReopenAttempt {
+    fn fresh(requested_generation: u64) -> Self {
+        Self {
+            requested_generation,
+            attempts_remaining: SINK_REOPEN_ATTEMPT_LIMIT,
+        }
+    }
+}
+
 pub(super) fn request_sink_reopen(
     playbin: &gst::Element,
     sink: &gst::Element,
@@ -220,7 +235,7 @@ pub(super) fn request_sink_reopen(
     coordinator: Arc<ReopenCoordinator>,
     pending_probe: PendingRouteProbe,
 ) {
-    let requested_generation = coordinator.snapshot();
+    let attempt = ReopenAttempt::fresh(coordinator.snapshot());
     request_sink_reopen_with_attempts(
         playbin,
         sink,
@@ -228,8 +243,7 @@ pub(super) fn request_sink_reopen(
         alive,
         coordinator,
         pending_probe,
-        requested_generation,
-        SINK_REOPEN_ATTEMPT_LIMIT,
+        attempt,
     );
 }
 
@@ -240,8 +254,7 @@ fn request_sink_reopen_with_attempts(
     alive: Arc<AtomicBool>,
     coordinator: Arc<ReopenCoordinator>,
     pending_probe: PendingRouteProbe,
-    requested_generation: u64,
-    attempts_remaining: usize,
+    attempt: ReopenAttempt,
 ) {
     if !alive.load(Ordering::Acquire) || !coordinator.claim() {
         return;
@@ -264,8 +277,7 @@ fn request_sink_reopen_with_attempts(
             Arc::clone(&alive),
             Arc::clone(&coordinator_from_probe),
             Arc::clone(&pending_from_probe),
-            requested_generation,
-            attempts_remaining,
+            attempt,
         );
 
         gst::PadProbeReturn::Ok
@@ -301,8 +313,7 @@ fn schedule_sink_reopen(
     alive: Arc<AtomicBool>,
     coordinator: Arc<ReopenCoordinator>,
     pending_probe: PendingRouteProbe,
-    requested_generation: u64,
-    attempts_remaining: usize,
+    attempt: ReopenAttempt,
 ) {
     // A probe may execute on a streaming thread. The combined
     // IDLE/BLOCK/query mask remains flow-blocking after this callback
@@ -316,8 +327,7 @@ fn schedule_sink_reopen(
             alive,
             coordinator,
             pending_probe,
-            requested_generation,
-            attempts_remaining,
+            attempt,
         );
     });
 }
@@ -329,17 +339,16 @@ fn finish_sink_reopen_on_main_context(
     alive: Arc<AtomicBool>,
     coordinator: Arc<ReopenCoordinator>,
     pending_probe: PendingRouteProbe,
-    requested_generation: u64,
-    attempts_remaining: usize,
+    attempt: ReopenAttempt,
 ) {
     let attempt = if alive.load(Ordering::Acquire) {
         match (playbin.upgrade(), sink.upgrade()) {
             (Some(playbin), Some(sink)) => {
                 let generation = coordinator.snapshot();
                 let attempts_remaining = reopen_attempts_for_generation(
-                    requested_generation,
+                    attempt.requested_generation,
                     generation,
-                    attempts_remaining,
+                    attempt.attempts_remaining,
                 );
                 let succeeded = reopen_sink_on_main_context(&playbin, &sink);
                 Some((generation, succeeded, attempts_remaining))
@@ -369,8 +378,7 @@ fn finish_sink_reopen_on_main_context(
             &alive,
             &coordinator,
             &pending_probe,
-            coordinator.snapshot(),
-            SINK_REOPEN_ATTEMPT_LIMIT,
+            ReopenAttempt::fresh(coordinator.snapshot()),
         ),
         ReopenFollowUp::RetryFailure { attempts_remaining } => {
             schedule_failed_reopen_retry(
@@ -380,8 +388,10 @@ fn finish_sink_reopen_on_main_context(
                 alive,
                 coordinator,
                 pending_probe,
-                generation,
-                attempts_remaining,
+                ReopenAttempt {
+                    requested_generation: generation,
+                    attempts_remaining,
+                },
             );
         }
         ReopenFollowUp::Exhausted => {
@@ -400,8 +410,7 @@ fn request_reopen_from_weak_refs(
     alive: &Arc<AtomicBool>,
     coordinator: &Arc<ReopenCoordinator>,
     pending_probe: &PendingRouteProbe,
-    requested_generation: u64,
-    attempts_remaining: usize,
+    attempt: ReopenAttempt,
 ) {
     if let (Some(playbin), Some(sink)) = (playbin.upgrade(), sink.upgrade()) {
         request_sink_reopen_with_attempts(
@@ -411,8 +420,7 @@ fn request_reopen_from_weak_refs(
             Arc::clone(alive),
             Arc::clone(coordinator),
             Arc::clone(pending_probe),
-            requested_generation,
-            attempts_remaining,
+            attempt,
         );
     }
 }
@@ -424,11 +432,11 @@ fn schedule_failed_reopen_retry(
     alive: Arc<AtomicBool>,
     coordinator: Arc<ReopenCoordinator>,
     pending_probe: PendingRouteProbe,
-    failed_generation: u64,
-    attempts_remaining: usize,
+    attempt: ReopenAttempt,
 ) {
     glib::timeout_add_once(DEFAULT_OUTPUT_RETRY_DELAY, move || {
-        if !alive.load(Ordering::Acquire) || coordinator.snapshot() != failed_generation {
+        if !alive.load(Ordering::Acquire) || coordinator.snapshot() != attempt.requested_generation
+        {
             return;
         }
         request_reopen_from_weak_refs(
@@ -438,8 +446,7 @@ fn schedule_failed_reopen_retry(
             &alive,
             &coordinator,
             &pending_probe,
-            failed_generation,
-            attempts_remaining,
+            attempt,
         );
     });
 }
