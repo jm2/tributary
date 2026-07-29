@@ -335,6 +335,7 @@ mod native {
             // block only performs a nonblocking send through a Send + Sync
             // channel.
             let status = unsafe {
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 AudioObjectAddPropertyListenerBlock(
                     system_object(),
                     NonNull::from(&mut address),
@@ -408,6 +409,7 @@ mod native {
             // SAFETY: This exactly matches registration: same system object,
             // address, no dispatch queue, and the still-live block pointer.
             let status = unsafe {
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 AudioObjectRemovePropertyListenerBlock(
                     system_object(),
                     NonNull::from(&mut self.address),
@@ -445,6 +447,7 @@ mod native {
         // SAFETY: Every pointer refers to a live, correctly sized local for
         // the duration of this synchronous CoreAudio property query.
         let status = unsafe {
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             AudioObjectGetPropertyData(
                 system_object(),
                 NonNull::from(&mut address),
