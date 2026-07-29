@@ -546,8 +546,22 @@ The playback-history contract makes the remaining Last.fm behavior much less amb
 Local output already treats the header slider as one shared level across volume-capable Tributary
 outputs. The Windows pipeline retains the packaged WASAPI2 sink and monitors the system default
 render endpoint so a device change or temporary invalidation does not revive a stale sink volume;
-MPD continues to own its volume independently. A physical Windows switch/unplug/replug check is
-release acceptance for that baseline, not a separate feature record.
+the macOS pipeline now listens for the exact CoreAudio default-output property and reopens one
+  retained, app-owned `osxaudiosink` behind a stable upstream gate that holds downstream
+  buffers/events/queries through the complete main-context reopen, without rebuilding playbin,
+  changing the queue occurrence, seeking, or forcing a pause/play clock cycle. Every initial and
+  reopened macOS sink retains a native-template-derived `capsfilter` that intersects only raw-audio
+  channels with `[1, 2]`, avoiding the known multi-channel converter failure without bypassing the
+  sink's device-specific caps query or narrowing compressed formats. Reopens use the native
+  current-default sentinel instead of forcing CoreAudio's opaque UInt32 identifier through
+  GStreamer's signed device property. A transient native reopen failure gets three bounded attempts
+  at 50 ms intervals, while a newer route generation supersedes the retry and exhaustion waits for
+  another real notification. This route layer is owned by Tributary rather than a vendored/upstream
+  GStreamer patch, and the packaged bundle must contain and discover its `identity` gate,
+  `capsfilter`, and `osxaudiosink`. MPD continues to own its volume independently.
+  Physical Windows and macOS switch/unplug/replug checks—including an affected multi-channel macOS
+  endpoint and negotiated raw channels no greater than two before and after switching—are release
+  acceptance for these baselines, not separate feature records.
 
 1. **Equalizer ([#49]).** Define the GStreamer filter graph, bands/presets, preamp and clipping
    policy, live reconfiguration, persistence, and per-output behavior. Local and AirPlay pipelines
@@ -632,8 +646,10 @@ license, distribution, key-material provenance, and interoperability review.
 - Re-evaluate the unmaintained `paste` and `proc-macro-error2` dependency paths and the inactive,
   lockfile-only RSA advisory by 2026-10-10 or the next release, and immediately if MySQL support is
   ever enabled.
-- Remove the macOS GStreamer channel-cap workaround only after an upstream fix is available in the
-  supported runtime floor and has been validated on affected multi-channel hardware.
+- Remove the app-owned macOS GStreamer channel-cap workaround only through an explicit reviewed
+  change after an upstream fix is available in the supported runtime floor and has been validated
+  on affected multi-channel hardware. Default-output following must not inherit or silently remove
+  that guard when GStreamer changes.
 - A direct end-to-end watcher-backlog/root-confirmation ordering harness would strengthen existing
   component and engine-loop coverage, although the remediation acceptance record is already closed.
 - Evaluate replacing the broad Windows/macOS GStreamer plugin copy with a capability-derived audio

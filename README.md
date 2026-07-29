@@ -355,6 +355,9 @@ brew install create-dmg   # optional, for DMG packaging
 The app bundle is at `dist/Tributary.app`, and the DMG at `dist/Tributary.dmg`.
 
 > **Note:** The `.app` bundle includes rpath-fixed dylibs and is ad-hoc code-signed so it can run without Homebrew on the target machine. For distribution, proper Apple Developer code signing and notarization are recommended.
+> Its packaged-runtime probe also requires the bundled `identity`, `capsfilter`, and `osxaudiosink`
+> factories used by Tributary's app-owned CoreAudio default-output follower and persistent
+> multi-channel negotiation guard.
 
 ### Windows
 
@@ -1074,9 +1077,12 @@ podcasts. Tributary deliberately does not guess through any of those gaps.
 - **Seek** — drag the progress scrubber
 - **Volume** — drag the volume slider (cubic perceptual curve). Its level is shared across
   Tributary outputs that support application volume, including when returning to a previously
-  parked Local output; outputs such as MPD that own their volume remain unchanged. On Windows,
-  packaged local playback follows changes to the system default audio device and reapplies the
-  selected level after sink recovery.
+  parked Local output; outputs such as MPD that own their volume remain unchanged. Packaged Windows
+  and macOS local playback follow changes to the system default audio device and reapply the
+  selected level after sink recovery. On macOS the same retained sink bin keeps Tributary's
+  native-template-derived stereo `capsfilter` across every device reopen, so route following does
+  not undo the existing multi-channel-output workaround or bypass device-specific format/rate
+  discovery.
 
 The [local playback-history contract](docs/playback-history.md) defines a counted play as half of a
 known duration, rounded up and capped at four minutes, with a conservative unknown-duration rule.
