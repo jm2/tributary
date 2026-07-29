@@ -16,6 +16,8 @@ const BUILD_WINDOWS: &str = include_str!("../scripts/build-windows.ps1");
 const WINDOWS_AUDIO: &str = include_str!("../src/audio/windows_audio.rs");
 const WINDOWS_RUNTIME_PROBE: &str = include_str!("../src/audio/runtime_probe.rs");
 const MACOS_AUDIO: &str = include_str!("../src/audio/macos_audio.rs");
+const MACOS_AUDIO_NATIVE: &str = include_str!("../src/audio/macos_audio_native.rs");
+const MACOS_AUDIO_TESTS: &str = include_str!("../src/audio/macos_audio_tests.rs");
 const PLATFORM_RUNTIME: &str = include_str!("../src/platform_runtime.rs");
 const FORBIDDEN_BUNDLED_COMPONENTS: &str =
     include_str!("../build-aux/packaging/forbidden-bundled-components.txt");
@@ -531,10 +533,12 @@ fn macos_bundle_requires_app_owned_system_audio_output_support() {
             && MACOS_AUDIO.contains(
                 "gst::PadProbeType::QUERY_DOWNSTREAM | gst::PadProbeType::PULL"
             )
-            && MACOS_AUDIO.contains("route_gate_stays_flow_blocking_until_removed")
+            && MACOS_AUDIO_TESTS.contains("route_gate_stays_flow_blocking_until_removed")
             && !MACOS_AUDIO.contains("gst::Pad::query_default")
-            && MACOS_AUDIO.contains("sink.set_property(\"device\", CURRENT_DEFAULT_DEVICE)")
-            && MACOS_AUDIO.contains("sink.sync_state_with_parent()"),
+            && !MACOS_AUDIO_NATIVE.contains("gst::Pad::query_default")
+            && MACOS_AUDIO_NATIVE
+                .contains("sink.set_property(\"device\", CURRENT_DEFAULT_DEVICE)")
+            && MACOS_AUDIO_NATIVE.contains("sink.sync_state_with_parent()"),
         "every app-owned sink must be filtered before publication, reopen on the full-width current default, and retain a safe guarded fallback"
     );
 }
