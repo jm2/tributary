@@ -14,13 +14,14 @@ equalization, room correction, and per-track profiles are out of scope.
 
 ## Scope
 
-Tributary offers a single ten-band parametric-style equalizer with five named presets, a global
-preamp, and a soft-knee signal compressor that engages above −6 dBFS with an asymptotic output
-ceiling at 0 dBFS to reduce the likelihood of hard clipping. The equalizer runs in the **local**
-pipeline only. AirPlay (RAOP), Chromecast, and MPD outputs are explicitly listed with their
-supported, partially supported, or unsupported status and the user-visible behavior for each
-non-supported state. The settings UI surfaces the equalizer unconditionally; for unsupported
-outputs the controls are rendered disabled with a closed-form explanation.
+Tributary offers a single ten-band parametric-style equalizer with five named presets, a
+write-only `Custom` state for manually edited bands, a global preamp, and a soft-knee signal
+compressor that engages above −6 dBFS with an asymptotic output ceiling at 0 dBFS to reduce the
+likelihood of hard clipping. The equalizer runs in the **local** pipeline only. AirPlay (RAOP),
+Chromecast, and MPD outputs are explicitly listed with their supported, partially supported, or
+unsupported status and the user-visible behavior for each non-supported state. The settings UI
+surfaces the equalizer unconditionally; for unsupported outputs the controls are rendered
+disabled with a closed-form explanation.
 
 Future work (multi-band parametric, room correction, per-track profiles, per-source overrides,
 lossy-format adaptive EQ, LUFS/R128 loudness normalization) requires a refined implementation
@@ -36,7 +37,7 @@ them.
 | Control         | Type       | Range / values                                     | Precision | Default    |
 |-----------------|------------|----------------------------------------------------|-----------|------------|
 | Enabled         | bool       | `true` / `false` (global bypass)                   | —         | `false`    |
-| Preset          | enum       | `Flat` / `Pop` / `Rock` / `Jazz` / `Classical`     | —         | `Flat`     |
+| Preset          | enum       | `Flat` / `Pop` / `Rock` / `Jazz` / `Classical` / `Custom` (write-only) | —         | `Flat`     |
 | Preamp          | linear dB  | `−24.0` … `0.0` … `+12.0` dB; integer or half-step | 0.5 dB    | `0.0` dB   |
 | Bands 1..10     | linear dB  | `−24.0` … `0.0` … `+12.0` dB                       | 0.5 dB    | `0.0` dB   |
 | Clip protection | enum       | `Off` / `Soft` (soft-knee compressor, 0 dBFS asymptotic ceiling, −6 dBFS threshold) | —         | `Off`      |
@@ -52,8 +53,9 @@ ten centres listed above.
 
 Each named preset is a fixed vector of ten band gains in dB and a recommended preamp. Presets
 are immutable; loading a preset always replaces the entire band vector *and* the preamp to its
-recommended value. Switching presets must record that the present vector now describes the new
-preset, not a manual edit of the previous one.
+recommended value. Once the user manually edits any band or the preamp, the persisted preset
+name transitions to `Custom` (see *Band and preamp mechanics* below); the named preset is no
+longer the source of truth and is over-written by `Custom` in storage.
 
 | Preset      | Recommended preamp | Description                                                       |
 |-------------|--------------------|-------------------------------------------------------------------|
@@ -89,24 +91,60 @@ equalizer stage with the persisted bands and preamp intact. The default for fres
 
 ## Filter graph
 
-All equalizer DSP runs in the local-output `playbin3` pipeline by inserting a chain of three
-elements between decoder and sink: a preamp `volume` element, the canonical
-`equalizer-10bands` filter, and an optional `rglimiter` peak limiter. None of these elements is
-substituted for a different one without a contract change.
+All equalizer DSP runs in the local-output `playbin3` pipeline by installing a single
+`playbin3`-managed audio-filter bin between the decoder output and the audio sink. The bin owns
+one src pad (`audio-filter-src`) and one sink pad (`audio-filter-sink`); `playbin3` links the bin
+to its audio stream exactly once during the pause/relink seam and unwinds the link when the bin
+is removed. None of the elements inside the bin is substituted for a different one without a
+contract change.
+
+The bin carries a `caps` property pinned to
+`audio/x-raw, format=F32LE, channels=2, layout=interleaved, rate=<samplerate>` (where
+`<samplerate>` is the rate `playbin3` negotiated with the decoder on the bin's sink pad at
+chain-construction time). `playbin3` uses this caps property to negotiate the upstream format;
+if the upstream decoder cannot deliver that caps — typically only on a malformed or non-PCM
+source — the bin's sink pad `activate` mode returns `FALSE`, `playbin3` propagates the error to
+the bus, the implementation does **not** insert the bin, and the pipeline falls back to the
+existing passthrough layout (a single info-level diagnostic names the source URI). This is the
+spec's only rollback path: there is no element-by-element fallback inside the bin, and a failed
+`audio-filter-caps` negotiation does not leave the chain half-inserted.
 
 The chain layout for the *enabled, clip-protection-on* state is:
 
 ```
-uridecodebin ! audioconvert !
-    volume name=eq-preamp volume=<factor> !
+playbin3.audio-filter (bin "eq-bin") {
+    audioresample !
+    audioconvert !
+    capsfilter caps="audio/x-raw,format=F32LE,channels=2,layout=interleaved" !
+    volume       name=eq-preamp    volume=<factor> !
     equalizer-10bands name=eq
         band0=<gain> band1=<gain> ... band9=<gain> !
-    rglimiter name=clipper enabled=true !
-    audioconvert ! playsink
+    rglimiter   name=clipper       enabled=true !
+    audioconvert !
+    audioresample !
+    capsfilter  caps=<sink-caps>
+} !
+playbin3.audio-sink
 ```
 
 Where:
 
+- `audioresample` (`gst-plugins-base`) is the sample-rate converter. It resamples the upstream
+  decoder's negotiated rate to the rate the bin's caps property pins (above). Two instances live
+  in the chain: one before the EQ stage (to set the rate the biquad and limiter operate on) and
+  one after (to bring the rate back in line with the audio sink's negotiated rate on the way out
+  in case the limiter has shifted it).
+- `audioconvert` (`gst-plugins-base`) is the format/channel converter. Two instances flank the
+  EQ stage: one before the EQ (to convert to the format/channel layout the biquad and limiter
+  expect) and one after (to convert back to whatever the sink accepts). `audioconvert` does *not*
+  change sample rate, so it cannot satisfy the limiter's F32LE requirement on its own; the
+  `capsfilter` does the format pinning.
+- `capsfilter` (`gst-plugins-base`) pins audio caps on a pad. The pre-EQ `capsfilter` pins the
+  format the biquad and limiter both accept (`audio/x-raw, format=F32LE, channels=2,
+  layout=interleaved`). The post-EQ `capsfilter` pins to `<sink-caps>`, the audio sink's
+  negotiated caps filled in by `playbin3` at chain-construction time. This is the only element
+  in the chain that *negotiates* a format; `audioconvert` does conversion work, `capsfilter`
+  enforces the boundary.
 - `volume` (`gst-plugins-base`, plugin `volume`) provides the preamp. `volume` is a multiplicative
   gain element whose `volume` property ranges `0.0` to `10.0`, with `1.0` meaning unity (0 dB).
   The preamp dB value is converted to a factor at write time as `factor = 10^(dB/20)`, so the
@@ -132,42 +170,25 @@ Where:
   it to `rglimiter` rather than to `audioamplify`, which is not a limiter (it is a static
   amplifier with hard-clip / wrap / none options, no envelope follower, and no `max-amplitude`
   property).
-- `audioconvert` immediately before the preamp element normalises sample rate and channel layout
-  for the biquad cascade that follows. The post-limiter `audioconvert` downconverts to the sink
-  caps. Both `audioconvert` instances are the same `audioconvert` the existing pipeline already
-  negotiates.
 
-The chain layout for the *enabled, clip-protection-off* state is:
+`equalizer-10bands` runs at 32-bit floating-point internally. The pre-EQ capsfilter pins
+`audio/x-raw, format=F32LE, channels=2, layout=interleaved` so the biquad and the limiter's F32LE
+requirement are both satisfied by the format the bin negotiates upstream of `equalizer-10bands`.
+The post-EQ `capsfilter` (with `<sink-caps>` filled in at chain-construction time) re-pins to the
+audio sink's negotiated caps, which may be a different rate, channel count, or signedness but is
+not constrained to F32LE. `playbin3`'s gapless navigation keeps the same bin installed across URI
+transitions; the equalizer state is not re-applied automatically on each new URI (see
+*Live-reconfiguration boundary* below).
 
-```
-uridecodebin ! audioconvert !
-    volume name=eq-preamp volume=<factor> !
-    equalizer-10bands name=eq
-        band0=<gain> band1=<gain> ... band9=<gain> !
-    audioconvert ! playsink
-```
+The chain layout for the *enabled, clip-protection-off* state is the bin without the
+`rglimiter` element. The `rglimiter`'s `enabled` flag is moot in this state because the element
+is not present in the bin.
 
-The `rglimiter` element is removed from the graph; its `enabled` flag is irrelevant because the
-element is not in the chain.
-
-The chain layout for the *disabled* state is the existing pipeline, untouched:
-
-```
-uridecodebin ! audioconvert ! playsink
-```
-
-The preamp `volume`, `equalizer-10bands`, and `rglimiter` are all absent. The persisted bands,
-preamp, and clip-protection setting are dormant in this state but preserved on disk, so toggling
-`Enabled` back to `true` re-inserts the chain with the prior configuration.
-
-`equalizer-10bands` runs at 32-bit floating-point internally. The pre-EQ `audioconvert` is the
-default configuration that the existing pipeline already negotiates; the `equalizer-10bands`
-element's caps accept any PCM layout the rest of the pipeline produces. `rglimiter` requires
-`F32LE`; the post-EQ `audioconvert` (when the limiter is in the chain) is responsible for
-negotiating that format. The pipeline continues to honor gapless navigation: the
-`equalizer-10bands` and preamp `volume` properties are set before the URI transitions to
-`Playing`, and `playbin`'s gapless event hook only re-applies volume and event generation, not
-EQ settings.
+The chain layout for the *disabled* state is the existing pipeline without the equalizer bin at
+all. `playbin3.audio-filter` is `NULL`. The persisted bands, preamp, and clip-protection
+setting remain on disk but the bin is not installed, so toggling `Enabled` back to `true`
+requires the pause/relink seam (see *Live-reconfiguration boundary* below) to install the bin
+fresh.
 
 The equalizer never reaches the receiver-side path; AirPlay, Chromecast, and MPD outputs do not
 have an equalizer chain and never will under this contract.
@@ -181,13 +202,15 @@ centres (29 Hz through 15011 Hz) are the element's own; bands are written as `ba
 through `band9` (15011 Hz).
 
 The preamp is a single linear gain applied by the dedicated `volume` element *before* the band
-stack; selecting a named preset overwrites *all ten* band gains *and* the preamp in a single
-atomic property write sequence. The UI must show the new preset name as the active preset; it
-must not allow manual band edits to silently rename the preset.
-
-Manual edits to the band vector always begin from the current band vector; selecting a different
-preset again is required to switch back to a named response. The contract does not preserve a
-"modified" flag in storage; the active preset name is the source of truth.
+stack. Selecting a named preset (`Flat`, `Pop`, `Rock`, `Jazz`, `Classical`) writes that
+preset's full band vector and recommended preamp, and sets the persisted `preset` field to the
+preset's key. After this write, manual edits to any band gain or to the preamp move the
+persisted `preset` field to a sixth value, `Custom`; the UI displays `Custom` in the preset
+combo to signal that the active vector no longer matches any named response. Loading a named
+preset from the `Custom` state replaces the band vector and preamp with that preset's values
+and sets the persisted `preset` field back to the named preset's key. `Custom` is *not*
+selectable from the preset menu; it is a write-only field that the implementation sets as a
+side-effect of a manual edit.
 
 `Clip protection = Soft` inserts `rglimiter enabled=true` immediately after the EQ stage. The
 element behaves as a soft-knee compressor with a −6 dBFS threshold and an asymptotic 0 dBFS
@@ -205,27 +228,24 @@ installs starting with enabled EQ.
 The contract intentionally limits which knobs can change mid-playback and at which pipeline stage
 the changes take effect. The boundary is:
 
-| Knob                   | Mid-playback? | Mechanism                                            |
-|------------------------|---------------|-----------------------------------------------------|
-| `Enabled`              | yes           | Pause → chain insert/remove → resume                 |
-| `Preset`               | yes           | Atomic ten-band property write + preamp property write |
-| `Preamp`               | yes           | Single property write on the preamp `volume` element |
-| Single band `bandN`    | yes           | Single property write on the `equalizer-10bands` element |
-| Multiple bands at once | yes           | Batched property writes, delivered as one transition |
-| `Clip protection`      | yes           | Pause → `rglimiter` insert/remove → resume           |
-| Band centres / Q       | NO            | Frozen by the spec; changing requires a new contract |
+| Knob                   | Mid-playback? | Mechanism                                                |
+|------------------------|---------------|----------------------------------------------------------|
+| `Enabled`              | yes           | Pause → bin install/remove → resume                       |
+| `Preset`               | yes           | Buffer-boundary property-write transaction on the bin    |
+| `Preamp`               | yes           | Buffer-boundary property-write transaction on the bin    |
+| Single band `bandN`    | yes           | Buffer-boundary property-write transaction on the bin    |
+| Multiple bands at once | yes           | Buffer-boundary property-write transaction on the bin    |
+| `Clip protection`      | yes           | Pause → `rglimiter` insert/remove inside the bin → resume |
+| Band centres / Q       | NO            | Frozen by the spec; changing requires a new contract     |
 
-Live reconfiguration of `Enabled` flips the entire equalizer chain (preamp `volume` +
-`equalizer-10bands`, with or without `rglimiter`) between *present-in-the-graph* and
-*absent-from-the-graph*. Because the chain includes upstream and downstream elements of the
-existing passthrough, the toggle requires the same pause/relink seam as `Clip protection`:
+Live reconfiguration of `Enabled` installs or removes the equalizer bin at the
+`playbin3.audio-filter` slot using the pause/relink seam:
 
 1. Pause the pipeline (`gst::State::Paused`),
-2. Insert or remove the equalizer chain elements as one edit (preamp `volume`,
-   `equalizer-10bands`, and `rglimiter` if `Clip protection = Soft`),
-3. Re-link the new chain (`audioconvert` ↔ preamp `volume` ↔ `equalizer-10bands` ↔
-   `rglimiter` ↔ `audioconvert` when enabled, or directly `audioconvert` ↔ `audioconvert` when
-   disabled),
+2. Set or clear `playbin3.audio-filter` as one edit (a single `GstBin` with the chain inside,
+   or `NULL` when disabled),
+3. Re-link the new audio filter (`audio-filter-sink` ↔ decoder output, `audio-filter-src` ↔
+   audio sink), or remove the link when disabled,
 4. Re-enter `Playing`,
 5. Mark the change in metrics as a brief swap (≤ 100 ms by spec).
 
@@ -233,18 +253,42 @@ The persisted bands, preamp, and clip-protection setting are not touched on eith
 transition.
 
 Live reconfiguration of band gains, the preamp, and the preset is delivered through property
-writes (`g_object_set`) on the running elements so that coefficients update on the next audio
-buffer without a pipeline state transition. No re-link, no re-instantiate, no seek, no
-EOS-resending. A `Buffering` event may be observed during the bus-flush the property write
-produces; the UI may briefly show a spinner, but playback must continue to advance position.
+writes (`g_object_set`) on the running elements inside the bin so that coefficients update on
+the next audio buffer without a pipeline state transition. No re-link, no re-instantiate, no
+seek, no EOS-resending.
 
-`Clip protection` toggles the `rglimiter` element's *presence* in the graph (insert or remove)
-using the same pause/relink seam:
+The *buffer-boundary transaction* the spec requires is a three-step sequence on the application
+side:
+
+1. Capture the new band vector and preamp into a single typed struct (`EqSettings`).
+2. Wrap the property writes in `g_object_freeze_notify` / `g_object_thaw_notify` on each
+   affected element (`equalizer-10bands` for the ten bands, `volume` for the preamp). Inside
+   the freeze, each `g_object_set` only mutates the element's internal state; the
+   `properties-changed` notification is suppressed until `thaw_notify` returns. The bus sees
+   **one** `properties-changed` notification per element per transaction, not eleven.
+3. Wait for the next `GST_MESSAGE_ELEMENT` carrying a `GST_EVENT_CAPS` or `GST_EVENT_SEGMENT`
+   on the bus from `equalizer-10bands` or `volume`. That message marks the buffer boundary at
+   which the new coefficients are picked up by the audio thread; `thaw_notify` returning
+   *before* the buffer-boundary message is published does not mean the new coefficients have
+   yet been read by the audio thread — it only means the property state is now visible to
+   readers. Single-band writes skip the freeze/thaw wrapper and skip the boundary wait; only
+   multi-property transactions (preamp changes, preset loads, multi-band batched edits)
+   require it.
+
+Because `g_object_set` is a GObject state mutation and produces no GStreamer pipeline event,
+**no `Buffering` event is produced by configuration updates.** A `Buffering` event observed on
+the bus during normal playback originates from the upstream decoder (network radio underrun,
+file EOF, decoder flush) and is unrelated to the equalizer update; the UI must not show a
+configuration-update spinner based on a `Buffering` event.
+
+`Clip protection` toggles the `rglimiter` element's *presence* inside the bin (insert or
+remove) using the same pause/relink seam applied at the element level (the surrounding bin
+itself remains installed):
 
 1. Pause the pipeline (`gst::State::Paused`),
-2. Insert or remove the `rglimiter` element,
-3. Re-link the new chain (`equalizer-10bands` ↔ `rglimiter` ↔ `audioconvert`, or directly
-   `equalizer-10bands` ↔ `audioconvert` when the limiter is removed),
+2. Insert or remove the `rglimiter` element inside the bin (unlink, add, link),
+3. Re-link the chain (`equalizer-10bands` ↔ `rglimiter` ↔ post-EQ `audioconvert`, or directly
+   `equalizer-10bands` ↔ post-EQ `audioconvert` when the limiter is removed),
 4. Re-enter `Playing`,
 5. Mark the change in metrics as a brief swap (≤ 100 ms by spec).
 
@@ -253,65 +297,101 @@ either kind. The contract accepts this cost because it is paid only on user-init
 `Enabled` or `Clip protection` toggles, neither of which the user is expected to perform
 frequently.
 
-When the playing track is a live stream with no `gapless` table (e.g. a remote radio URL), element
-insert/remove must not disturb the upstream decoder's buffering; the same pause/insert/resume
-seam is used and a one-time metadata-free "reconfiguring audio output" diagnostic is published.
-A failure to re-attach the limiter is treated as a recoverable error: the chain degrades to
-the no-limiter layout and the user-visible status becomes the same as `Clip protection = Off`.
+When the playing track is a live stream with no `gapless` table (e.g. a remote radio URL),
+element insert/remove must not disturb the upstream decoder's buffering; the same
+pause/insert/resume seam is used and a one-time metadata-free "reconfiguring audio output"
+diagnostic is published. A failure to re-attach the limiter is treated as a recoverable error:
+the chain degrades to the no-limiter layout and the user-visible status becomes the same as
+`Clip protection = Off`.
 
 ## Persistence
 
-Persisted equalizer state is six values:
+Persisted equalizer state is six keys in a single file. The on-disk grammar is:
 
-| Field            | Type                  | Storage                                                                 |
-|------------------|-----------------------|-------------------------------------------------------------------------|
-| `enabled`        | bool                  | `equalizer.cfg` key `enabled`                                            |
-| `preset`         | enum (named string)   | `equalizer.cfg` key `preset`                                             |
-| `preamp_db`      | f32 in range `[−24, +12]` | `equalizer.cfg` key `preamp_db` (formatted to one decimal)         |
-| `bands_db`       | `[f32; 10]` per bounds | `equalizer.cfg` keys `band0_db`…`band9_db` (one decimal each)         |
-| `clip_protect`   | enum (`off` / `soft`) | `equalizer.cfg` key `clip_protect`                                      |
-| `schema_version` | u32 = `1`             | `equalizer.cfg` key `schema_version`                                    |
+```
+key="value"
+key="value"
+...
+```
+
+Where:
+
+- Every key is one of the six listed below, in the listed order (the parser is order-insensitive
+  on read but the writer always emits them in the canonical order so diffs and bugs are
+  reproducible).
+- Every value is a double-quoted UTF-8 string. Quotes inside a value are escaped as `\"`; the
+  backslash is escaped as `\\`; newlines are not permitted in values. Floats are emitted with
+  one decimal place (e.g. `"-24.0"`, `"0.0"`, `"+12.0"`) so that precision is bounded by the
+  schema, not by the writer's locale or precision settings. The parser requires the value to be
+  double-quoted; an unquoted value is a malformed file and triggers the validation rule below.
+
+The six keys:
+
+| Key              | Type                       | Range / values                                          |
+|------------------|----------------------------|---------------------------------------------------------|
+| `schema_version` | quoted integer literal     | `"1"` (the only supported value at this revision)       |
+| `enabled`        | quoted boolean literal     | `"true"` / `"false"`                                    |
+| `preset`         | quoted preset name         | `"flat"` / `"pop"` / `"rock"` / `"jazz"` / `"classical"` / `"custom"` |
+| `preamp_db`      | quoted float (one decimal) | `"-24.0"` … `"0.0"` … `"+12.0"`                         |
+| `band0_db`…`band9_db` | quoted float (one decimal) | `"-24.0"` … `"0.0"` … `"+12.0"`                    |
+| `clip_protect`   | quoted enum                | `"off"` / `"soft"`                                      |
 
 `equalizer.cfg` lives in the existing `dirs::data_dir()/tributary/` directory beside
-`volume`. The on-disk format is one line per key, comments are not permitted, key order is
-stable (the keys above, in that order), and values are quoted with `"…"` so that whitespace,
-quotes, or unicode values cannot break parsing.
+`volume`. The file is owned by the equalizer module; no other module reads or writes it.
 
-Persistence uses the same debounced single-writer pattern already used by `Player::save_volume`.
-A 750 ms idle interval coalesces slider-drag changes into one write per change-spell. The save
-runs on the GTK main loop and is suppressed entirely when the `Enabled = false` state matches
-the default, the preset is `Flat`, all bands are zero, preamp is zero, and clip protection is
-`Off`.
+The writer uses an *atomic replace* protocol: it constructs the new content in memory, opens
+`equalizer.cfg.tmp` next to the destination (mode `0600`, owned by the user), writes the entire
+file in a single `write()`/`pwrite()` (the size is bounded by the schema — at most a few hundred
+bytes even at the maximum band precision), `fsync`s the file descriptor, then `close()`s it,
+then `rename(2)`s the temp file to `equalizer.cfg`, then `fsync`s the directory. After the
+directory `fsync` returns, the new file is durable; an on-disk reader observes either the prior
+file or the new file, never a partial one. The temp file is opened with `O_EXCL` so that a
+concurrent writer cannot race the rename.
+
+Persistence uses a debounced single-writer pattern: a 750 ms idle interval coalesces slider-drag
+changes into one write per change-spell. The save runs on the GTK main loop and is suppressed
+entirely when the state matches the fresh-install default (Enabled `false`, preset `Flat`, all
+bands zero, preamp zero, clip protection `Off`). The debounce timer is reset on every change so
+drag-induced writes are flushed on the trailing edge of the gesture.
+
+In addition to the debounce, the equalizer module installs a *shutdown flush* hook: on
+`gtk::main_quit` (and on `SIGTERM`/`SIGINT` via the application's main-loop signal hook), the
+module synchronously performs an atomic-replace write of the current state to disk before the
+GTK main loop exits. The shutdown flush is its own write-temp-and-rename cycle; it does not
+wait for the debounce timer and runs even if the timer is armed. This guarantees that no
+partial write is observable on disk if the user quits while the debounce is pending.
 
 Fresh-install default state is exactly:
 
 ```ini
-schema_version=1
-enabled=false
-preset=flat
-preamp_db=0.0
-band0_db=0.0
+schema_version="1"
+enabled="false"
+preset="flat"
+preamp_db="0.0"
+band0_db="0.0"
 …
-band9_db=0.0
-clip_protect=off
+band9_db="0.0"
+clip_protect="off"
 ```
 
-The `dirs::data_dir()/tributary/equalizer.cfg` file is owned by the equalizer module; no other
-module reads or writes it. Migration from prior versions is out of scope; any pre-existing
-equalizer file from a different schema is replaced with the default state on first load.
+Migration from prior versions is out of scope; any pre-existing equalizer file from a different
+schema is replaced with the default state on first load.
 
 Validation rules on read:
 
-- `schema_version` must equal `1`; any other value replaces the file with defaults.
-- All listed keys must be present; a missing key becomes the default for that key.
-- `bands_db` values outside `[-24.0, +12.0]` are clamped to the boundary.
+- `schema_version` must equal `"1"`; any other value replaces the file with defaults.
+- Each line must match the `key="value"` grammar; a malformed line replaces the file with
+  defaults and the parser remembers which line failed for the diagnostic below.
+- `bandN_db` values outside `[-24.0, +12.0]` are clamped to the boundary.
 - `preamp_db` outside `[-24.0, +12.0]` is clamped to the boundary.
-- `preset` outside the named set becomes `Flat`.
-- `enabled` not parseable as bool becomes `false`.
-- `clip_protect` outside `off` / `soft` becomes `off`.
+- `preset` outside the named set (including unknown legacy values) becomes `"flat"`; the band
+  vector is *not* reset, only the persisted name is coerced.
+- `enabled` not parseable as bool becomes `"false"`.
+- `clip_protect` outside `"off"` / `"soft"` becomes `"off"`.
 
-A malformed file is replaced with the default state, the user's prior preferences are recorded
-in a typed diagnostic with file path, byte count, and the bad key, and the change is not silent.
+A malformed file is replaced with the default state via the same atomic-replace protocol above,
+the user's prior preferences are recorded in a typed diagnostic with file path, byte count, and
+the bad key, and the change is not silent.
 
 ## Capability matrix
 
@@ -330,12 +410,16 @@ status must ship the matching UI rendering at the same time.
 For each `unsupported` output, the user-visible settings UI renders the equalizer controls as
 disabled with a tool-tip explaining the limitation (e.g. "AirPlay receivers render audio
 end-to-end, so Tributary's equalizer cannot reach the speaker.") Disabled controls preserve the
-last-saved values locally; the equalizer does run for the local output even while the user's
-active output is unsupported, so a later switch back to local reflects the same persisted bands.
+last-saved values locally.
 
-If the active output is unsupported, the equalizer is *not* applied to anything — the
-local-output pipeline is not the active pipeline, so re-running the filter on the local sink
-is ignored by the application. The persisted equalizer is dormant in this state, not lost.
+The contract states one unambiguous output-activation rule: when the active output is
+`unsupported`, the equalizer bin is *not* installed in any pipeline, no equalizer DSP runs, and
+the local-output `playbin3.audio-filter` is `NULL`. The persisted bands, preamp, and
+clip-protection setting remain on disk but are dormant — they are not lost, they are simply not
+processed because no pipeline is rendering them. No CPU is spent on dormant equalizer DSP. When
+the active output switches back to a `supported` output (e.g. `local`), the bin installs via
+the pause/relink seam with the persisted configuration intact, so a later switch back to local
+reflects the same persisted bands without further user action.
 
 If a future output gains native equalizer support, the capability matrix moves that row from
 `unsupported` to `supported`, gains a fixed contract for how the receiver side behaves
@@ -384,12 +468,14 @@ The settings UI shall advertise each equalizer control with its accessible label
 keyboard accelerator that increases and decreases the value. Numeric bands must announce their
 current value, the unit (decibels), and the boundary (e.g. `−6.0 dB, range minus twenty-four to
 plus twelve`). The `Preset` combo box announces the active preset name and exposes only the
-five named values listed above.
+five named values listed above; `Custom` is shown in the combo but is *not* selectable from it
+(only the five named values are clickable).
 
 The settings UI is localized in the same locale set as the rest of the application (see the
-files under `locales/`). The five preset names are translated, but the keys stored in
-`equalizer.cfg` remain English (`flat`, `pop`, `rock`, `jazz`, `classical`). The migration of
-older non-English keys is not expected; an unknown preset value is treated as `Flat`.
+files under `locales/`). The five named preset names are translated, but the keys stored in
+`equalizer.cfg` remain English (`flat`, `pop`, `rock`, `jazz`, `classical`, `custom`). The
+migration of older non-English keys is not expected; an unknown preset value is treated as
+`flat`.
 
 ## Acceptance matrix
 
@@ -398,21 +484,22 @@ for this contract; new conditions require a new revision.
 
 | Scenario                                                | Expected outcome                                                          |
 |---------------------------------------------------------|---------------------------------------------------------------------------|
-| Fresh install, EQ disabled                              | Persisted state matches the default; equalizer chain is absent from the pipeline |
-| Enable EQ on local output                               | Preamp `volume` + `equalizer-10bands` (+ `rglimiter` if `Clip protection=Soft`) inserted via pause/relink seam; pipeline returns to `Playing`; total swap ≤ 100 ms |
-| Change a single band mid-playback                       | Buffer passes; no gapless discontinuity; new value reaches the filter      |
-| Select Pop preset mid-playback                          | All ten bands + preamp updated atomically; preset name updates in UI      |
-| Cycle clip protection Off → Soft → Off                   | Pause/resume swap each time; total swap ≤ 100 ms per toggle              |
+| Fresh install, EQ disabled                              | Persisted state matches the default; `playbin3.audio-filter` is `NULL`; no equalizer bin is constructed |
+| Enable EQ on local output                               | Equalizer bin is constructed and installed at `playbin3.audio-filter` via the pause/relink seam; `audio-filter-caps` is `audio/x-raw, format=F32LE, channels=2, layout=interleaved`; pipeline returns to `Playing`; total swap ≤ 100 ms |
+| Change a single band mid-playback                       | Single-property write reaches `equalizer-10bands`; buffer passes; no gapless discontinuity; new value reaches the filter on the next buffer |
+| Select Pop preset mid-playback                          | `EqSettings` struct captures ten bands + preamp; one `g_object_freeze_notify`/`thaw_notify` pair on `equalizer-10bands` writes all ten bands; one on `volume` writes the preamp; bus sees one `properties-changed` per element; preset combo displays `Pop` |
+| Manual band edit mid-playback                           | Single property write on `bandN`; persisted `preset` field becomes `custom`; UI combo displays `Custom` |
+| Cycle clip protection Off → Soft → Off                   | Pause/resume swap each time; `rglimiter` inserts inside the bin; total swap ≤ 100 ms per toggle |
 | Sine input above +6 dBFS with clip protection = Soft    | Output peak converges asymptotically to 0 dBFS without exceeding it; soft-knee compression engages at the −6 dBFS threshold; a 0 dBFS input is attenuated by approximately 1.1 dB; reflects the `rglimiter` element's own description "Apply signal compression to raw audio data" |
-| Switch active output to AirPlay                         | EQ module renders disabled in UI; no equalizer chain runs on the RAOP pipeline |
-| Switch active output back to Local                      | EQ module renders enabled in UI if previously enabled; pipeline re-attaches the chain |
-| Quit while a slider drag is in progress                 | Last debounced write is persisted; no partial writes                       |
-| Malformed `equalizer.cfg` on disk                       | Replaced with defaults; single warn-level diagnostic published             |
+| Switch active output to AirPlay                         | EQ module renders disabled in UI; `playbin3.audio-filter` becomes `NULL`; no equalizer DSP runs |
+| Switch active output back to Local                      | EQ module renders enabled in UI if previously enabled; bin re-installs at `playbin3.audio-filter` with persisted bands and preamp |
+| Quit while a slider drag is in progress                 | Shutdown flush hook writes the current state to disk via atomic replace before `gtk::main_quit` returns; no partial writes |
+| Malformed `equalizer.cfg` on disk                       | Defaults re-written via atomic replace; single warn-level diagnostic published (file path, byte count, bad key) |
 | Preamp outside bounds in saved file                     | Value clamped to range; preset and bands remain valid                     |
 | Band value outside bounds in saved file                 | Value clamped to range; other bands remain valid                          |
-| Preset name not in the named set on disk                | Coerced to `Flat`; band vector becomes all zeros                          |
+| Preset name not in the named set on disk                | Coerced to `flat`; band vector remains as written on disk                |
 | Hardware sink with 8-channel layout (macOS)             | Pre-EQ `audioconvert` caps remain `[1, 2]`; EQ runs in stereo; same cap fix as existing module |
-| Gapless album transition                                | EQ settings re-applied to the new generation; no audible difference       |
+| Gapless album transition                                | Bin persists across URI transitions; equalizer state is not re-applied automatically on each new URI; no audible discontinuity |
 | Preamp `0.0 dB` selected                                | Preamp `volume` element is in the chain with `volume=1.0`; gain flat       |
 
 ## Implementation boundary
@@ -424,11 +511,15 @@ is the source of truth for the contract and changes only by revision.
 
 The implementation record:
 
-- Adds the preamp `volume` + `equalizer-10bands` (+ optional `rglimiter`) chain wiring to the
-  local pipeline, with all three elements' spellings (`volume name=eq-preamp volume=<factor>`,
-  `equalizer-10bands name=eq band0=<gain> ... band9=<gain>`,
-  `rglimiter name=clipper enabled=true`) as specified in *Filter graph* above.
-- Adds the `rglimiter` insert/remove behind the single `Clip protection` boolean.
+- Adds the equalizer bin (per the layout in *Filter graph*) to the local pipeline as
+  `playbin3.audio-filter`, with the elements' spellings inside the bin
+  (`audioresample ! audioconvert ! capsfilter caps="audio/x-raw,format=F32LE,channels=2,layout=interleaved" !
+  volume name=eq-preamp volume=<factor> !
+  equalizer-10bands name=eq band0=<gain> ... band9=<gain> !
+  rglimiter name=clipper enabled=true !
+  audioconvert ! audioresample ! capsfilter caps=<sink-caps>`) as specified in *Filter graph*
+  above.
+- Adds the `rglimiter` insert/remove inside the bin behind the single `Clip protection` boolean.
 - Adds the `equalizer.cfg` reader and writer.
 - Adds the trait method `AudioOutput::supports_equalizer` and implements it honestly per row
   of the capability matrix.
