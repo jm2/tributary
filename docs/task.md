@@ -239,27 +239,35 @@ numerator. Rather than vendoring GStreamer or automatically inheriting a future 
 Tributary now owns the exact CoreAudio default-output notification boundary. A bounded native
 callback wakes the GLib main context, validates the current device, and coalesces change storms
 through one generation-aware reopen. The pipeline uses a stable
-`ghost pad → identity → retained osxaudiosink` bin: it blocks the app-owned identity source pad,
-cycles only the native sink through `NULL`, pins the notified device, synchronizes it back to its
-parent, and requests upstream renegotiation. It does not rebuild playbin, change the URI or queue
-occurrence, seek, or force a pause/play clock cycle, so position, paused/playing intent, and the
-software-volume chain remain owned by the existing session. A pending gate is removed
-synchronously during teardown after the CoreAudio listener is retired and before the pipeline is
-taken down.
+`ghost pad → identity → capsfilter → retained osxaudiosink` bin: a combined idle/downstream-blocking
+probe holds buffers, events, and queries at the app-owned identity source pad until main-context
+work cycles only the native sink through `NULL`, restores the native zero/current-default sentinel,
+synchronizes it back to its parent, requests upstream renegotiation, and explicitly removes the
+gate. This avoids
+narrowing CoreAudio's opaque UInt32 identifier through GStreamer's signed explicit-device property
+and resolves the latest default even if another change races the reopen. It does not rebuild
+playbin, change the URI or queue occurrence, seek, or force a pause/play clock cycle, so position,
+paused/playing intent, and the software-volume chain remain owned by the existing session. A
+pending gate is removed synchronously during teardown after the CoreAudio listener is retired and
+before the pipeline is taken down.
 
 The historical multi-channel-output fix is now an explicit invariant rather than an incidental
-playbin callback: the raw-audio `[1, 2]` channel cap is attached to each concrete
-`osxaudiosink` before playbin can open it, survives every reopen on that same object, preserves caps
-features, and leaves compressed structures untouched. The automatic-sink fallback still receives
-the cap in an unpackaged/degraded environment. macOS packaging now fails closed without both
-`libgstcoreelements` and `libgstosxaudio`, and the signed-bundle runtime probe must discover the
-`identity` and `osxaudiosink` factories. Portable tests cover cap/features preservation plus
-notification coalescing and same-device reconnect replay; native macOS CI compiles the
-CoreAudio/block boundary and constructs and queries two complete separately capped route wrappers
-before open. Physical switch/unplug/replug testing while playing and paused—including a
-multi-channel/spatial endpoint—remains useful release acceptance, not missing implementation.
-Removing the cap still requires the existing explicit P3.4 review and affected-hardware evidence.
-P2.1 remains the feature focus at **14/38 (36.8%)**.
+playbin callback: a persistent `capsfilter` derives its allowed caps from each native sink's pad
+template, intersects only raw-audio channels with `[1, 2]`, and stays in the app-owned bin across
+every reopen. Native rate/format constraints, caps features, mono-only limits, and compressed
+structures remain intact because the real `osxaudiosink` caps query still runs downstream. The
+automatic-sink fallback uses a post-query PULL probe in an unpackaged/degraded environment, so it
+also narrows the completed native result rather than bypassing that query. macOS packaging now
+fails closed without both `libgstcoreelements` and `libgstosxaudio`, and the signed-bundle runtime
+probe must discover the `identity`, `capsfilter`, and `osxaudiosink` factories. Portable tests cover
+cap/features preservation, non-widening intersection, notification coalescing, repeated reconnect
+replay, and a live pipeline whose downstream handoff count remains frozen until the route gate is
+removed; native macOS CI compiles the CoreAudio/block boundary and constructs and queries two
+complete separately guarded route wrappers before open. Physical switch/unplug/replug testing while
+playing and paused—including a multi-channel/spatial endpoint and verification that negotiated raw
+channels remain at most two before and after switching—remains useful release acceptance, not
+missing implementation. Removing the cap still requires the existing explicit P3.4 review and
+affected-hardware evidence. P2.1 remains the feature focus at **14/38 (36.8%)**.
 
 ## P1 — Correctness and shared feature foundations
 
@@ -1175,7 +1183,7 @@ P2.1 remains the feature focus at **14/38 (36.8%)**.
 
 | Date | Task | PR | Result |
 |---|---|---|---|
-| 2026-07-28 | macOS default-output stability without multi-channel regression | [#188](https://github.com/jm2/tributary/pull/188) | Added a Tributary-owned CoreAudio default-output listener and a stable app-owned gate around one retained `osxaudiosink`. Route notifications are bounded, validated, generation-coalesced, and replayed without rebuilding playbin, seeking, replacing the queue occurrence, or forcing pause/play; shutdown retires the listener and any pending probe before pipeline teardown. Every native sink receives the raw-audio 1–2-channel cap before publication, keeps it across reopen, preserves caps features, and leaves compressed caps alone, while the degraded automatic-sink fallback remains protected. macOS packaging now requires both `libgstcoreelements` and `libgstosxaudio`, and the signed-bundle probe must discover the `identity` and `osxaudiosink` factories. Portable regressions cover cap preservation and single-flight/same-ID replay, native macOS CI covers CoreAudio compilation plus repeated construction and pre-open caps for the complete route wrapper, and physical route/multi-channel hardware checks remain release acceptance. This correctness fix does not advance the 14/38 feature numerator. |
+| 2026-07-28 | macOS default-output stability without multi-channel regression | [#188](https://github.com/jm2/tributary/pull/188) | Added a Tributary-owned CoreAudio default-output listener and a stable `identity → capsfilter → osxaudiosink` route around one retained native sink. Route notifications are bounded, validated, generation-coalesced, and replayed without rebuilding playbin, seeking, replacing the queue occurrence, or forcing pause/play; a combined idle/downstream-blocking probe holds buffers, events, and queries until main-context reopen completes, and shutdown retires the listener and any pending probe before pipeline teardown. Reopen uses `osxaudiosink`'s zero/current-default sentinel rather than narrowing CoreAudio's opaque UInt32 ID into the signed explicit-device property, so the latest default wins races. The persistent filter is derived from native template caps and intersects only raw channels with 1–2, preserving mono-only limits, device-specific format/rate discovery, caps features, and compressed pass-through; the degraded automatic-sink fallback narrows the completed native query result instead of bypassing it. macOS packaging requires both `libgstcoreelements` and `libgstosxaudio`, and the signed-bundle probe must discover the `identity`, `capsfilter`, and `osxaudiosink` factories. Portable regressions cover cap preservation/non-widening, single-flight/repeated reconnect replay, and a live flow-blocking gate; native macOS CI covers CoreAudio compilation plus repeated construction and pre-open caps for the complete route wrapper, and physical route/multi-channel negotiated-channel checks remain release acceptance. This correctness fix does not advance the 14/38 feature numerator. |
 | 2026-07-28 | Windows default-device and cross-output volume stability | [#187](https://github.com/jm2/tributary/pull/187) | Made the header slider authoritative across every committed switch to a volume-capable Tributary output, including restoration of the parked Local player, while leaving MPD's independently owned level alone. Windows local playback now retains the packaged WASAPI2 sink, follows the replacement snapshot for the monitored default render endpoint, tolerates device invalidation, permits only one reconnect for its specific output-device warning codes before a new load/device event, and reapplies the cached perceptual level across sink transitions. The packaged-runtime policy requires that exact capability, and installer-only reuse requires its versioned receipt to match the application and WASAPI2 hashes. Focused tests cover supported/unsupported output reconciliation, replacement endpoint classification, warning-code filtering, the no-loop recovery latch, and stale-installer rejection; Windows CI covers platform integration and bundle policy, while a physical switch/unplug/replug smoke check remains release acceptance. This correctness fix does not advance the 14/38 feature numerator. |
 | 2026-07-28 | Claude PR review bot admission | [#186](https://github.com/jm2/tributary/pull/186) | Split automatic review by the triggering actor into a direct `User` path and a trusted bot/App `workflow_run` follow-up, fixing both Dependabot's empty allowlist rejection and the unavailable Actions Claude credential that would have failed next. The bot path starts when CI is requested, admits every Bot/App including GasTown automation classified as non-User, performs exactly one checkout at the immutable trusted default-branch SHA, and fetches an exact base/head comparison capped below the runner's environment-string limit. It skips unavailable comparisons, uses a post-submission random prompt boundary, supplies no usable tools, OIDC authority, or broader App token, and accepts only bounded schema output. The strict fixed publisher requires nonblank output, revalidates the revision, discards stale work, renders model output as inert text, and updates one actor-owned marked comment under per-PR concurrency rather than accumulating duplicates. Ordinary non-write `User` actors remain permission-gated. A semantic metadata regression pins all of those boundaries and the absent non-write-user bypass. This CI reliability fix does not advance the 14/38 feature numerator. |
 | 2026-07-27 | Native icon-bundle integrity correction | [#185](https://github.com/jm2/tributary/pull/185) | Restored Windows application PE identity after the mixed library/binary package topology diverted `winresource`'s package-wide link directive away from `tributary.exe`. The generated ICO and `VERSIONINFO` payload is now attached explicitly to the app binary. Final x86_64 and ARM64 packaging fails before ZIP or installer creation unless the copied EXE has all six icon payloads; a well-formed group-icon directory that references every distinct payload exactly once with the correct byte size; its version resource; and exact package/product metadata. macOS packaging now fails unless the source iconset and GTK hicolor set are complete, `CFBundleIconFile` resolves to a parseable ICNS with every required scale-specific representation, and the app bundle retains its GTK/About icons; the canonical iconset now includes its missing 1024×1024 Retina representation. Focused policy regressions cover missing, malformed, mis-sized, unreferenced, and incomplete resources. This correctness fix does not advance the 14/38 feature numerator. |

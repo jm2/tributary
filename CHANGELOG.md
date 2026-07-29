@@ -21,16 +21,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rebuilds also require a versioned successful-probe receipt bound to the exact application and
   WASAPI2 plugin hashes, so an older regular DLL cannot satisfy the capability gate by name alone.
   On macOS, Tributary now owns the missing default-output boundary directly instead of waiting for
-  or patching GStreamer: an exact CoreAudio listener coalesces route notifications, blocks an
-  app-owned pad, and reopens only one retained `osxaudiosink` on the current device. The playbin,
+  or patching GStreamer: an exact CoreAudio listener coalesces route notifications, holds
+  downstream buffer/event/query flow at an app-owned pad, and reopens only one retained
+  `osxaudiosink` against the latest system default. The playbin,
   URI, queue occurrence, position, paused/playing intent, and software-volume chain remain intact;
   Tributary does not force a pause/play clock cycle. Output storms are single-flight and replay the
-  newest generation, listener/probe teardown precedes pipeline shutdown, and an idle sink merely
-  records the endpoint for its next normal open. The existing multi-channel CoreAudio workaround
-  is now installed directly before every native sink can negotiate and remains attached across
-  every reopen; its caps rewrite preserves features and touches only raw-audio channel counts, so
-  compressed formats are not narrowed. macOS packaging fails closed when either the `identity`
-  gate or OS X audio plugin is absent, and the signed-bundle runtime probe must discover both
+  newest generation. The combined idle/block gate remains flow-blocking until main-context reopen
+  work explicitly removes it; listener/probe teardown precedes pipeline shutdown, and an idle sink
+  stays unpinned so its next normal open resolves the then-current default. Tributary deliberately uses
+  `osxaudiosink`'s zero/current-default sentinel rather than narrowing CoreAudio's opaque UInt32
+  device identifier into GStreamer's signed property. The existing multi-channel CoreAudio
+  workaround is now a persistent `capsfilter` immediately before the native sink and remains in the
+  app-owned bin across every reopen. Its cap is derived from the native pad template and intersects
+  only raw-audio channels with `[1, 2]`, so it cannot widen mono-only support and preserves native
+  rates, formats, features, and compressed pass-through. The degraded automatic-sink path uses a
+  post-native-query guard rather than bypassing `osxaudiosink`'s device-specific caps query. macOS
+  packaging fails closed when either the core-elements or OS X audio plugin is absent, and the
+  signed-bundle runtime probe must discover the `identity`, `capsfilter`, and `osxaudiosink`
   factories. This app-owned path is deliberately independent of a future upstream GStreamer fix;
   removal remains a separately reviewed change gated on affected multi-channel hardware.
 - **Claude's automatic PR review now admits bot-authored pull requests without depending on

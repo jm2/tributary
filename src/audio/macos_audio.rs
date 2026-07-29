@@ -8,30 +8,32 @@
 //! native callback thread, then the existing sink is reopened on the GLib main
 //! context without rebuilding playbin or changing the playback session.
 //!
-//! Every sink is decorated before playbin sees it with the existing
-//! two-channel caps workaround. Reopening the same decorated sink makes that
-//! workaround an invariant across output changes instead of relying on
-//! playbin's incidental `element-setup` ordering.
+//! Every sink is wrapped behind a persistent two-channel `capsfilter` before
+//! playbin sees it. Reopening the same guarded sink makes that workaround an
+//! invariant across output changes instead of relying on playbin's incidental
+//! `element-setup` ordering.
 
 #![cfg_attr(test, allow(dead_code))]
 
 #[cfg(any(target_os = "macos", test))]
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_os = "macos")]
 use gst::prelude::*;
 use gstreamer as gst;
 #[cfg(target_os = "macos")]
 use gtk::glib;
 
 const OSX_AUDIO_FACTORY: &str = "osxaudiosink";
+#[cfg(target_os = "macos")]
+const CHANNEL_FILTER_FACTORY: &str = "capsfilter";
 
 /// Coalesces native route notifications across the interval in which the
 /// GStreamer gate is installed and its main-context reopen is still pending.
 #[cfg(any(target_os = "macos", test))]
 struct ReopenCoordinator {
-    latest_device: AtomicI32,
     generation: AtomicU64,
     pending: AtomicBool,
 }
@@ -40,14 +42,12 @@ struct ReopenCoordinator {
 impl ReopenCoordinator {
     const fn new() -> Self {
         Self {
-            latest_device: AtomicI32::new(0),
             generation: AtomicU64::new(0),
             pending: AtomicBool::new(false),
         }
     }
 
-    fn record(&self, device_id: i32) {
-        self.latest_device.store(device_id, Ordering::Release);
+    fn record(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -57,15 +57,8 @@ impl ReopenCoordinator {
             .is_ok()
     }
 
-    fn snapshot(&self) -> (i32, u64) {
-        loop {
-            let before = self.generation.load(Ordering::Acquire);
-            let device_id = self.latest_device.load(Ordering::Acquire);
-            let after = self.generation.load(Ordering::Acquire);
-            if before == after {
-                return (device_id, after);
-            }
-        }
+    fn snapshot(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     fn finish(&self, applied_generation: u64) -> bool {
@@ -92,6 +85,17 @@ fn remove_pending_route_probe(pending: &PendingRouteProbe) {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn route_gate_probe_type() -> gst::PadProbeType {
+    // IDLE schedules as soon as the current push drains. BLOCK_DOWNSTREAM
+    // holds later buffers/lists/downstream events, while QUERY_DOWNSTREAM
+    // closes the query gap in that aggregate mask. Upstream RECONFIGURE is
+    // deliberately not matched and can still leave the reopened sink.
+    gst::PadProbeType::IDLE
+        | gst::PadProbeType::BLOCK_DOWNSTREAM
+        | gst::PadProbeType::QUERY_DOWNSTREAM
+}
+
 /// Retains the explicit native sink and, on macOS, its CoreAudio listener.
 #[cfg(target_os = "macos")]
 pub(super) struct MacosAudioRoute {
@@ -109,13 +113,12 @@ impl MacosAudioRoute {
             Err(error) => {
                 tracing::warn!(
                     error = %error,
-                    "osxaudiosink unavailable; macOS system-output changes use GStreamer's fallback behavior"
+                    "Could not construct the app-owned macOS audio route; using guarded automatic-sink fallback"
                 );
                 install_playbin_channel_cap_fallback(playbin);
                 return None;
             }
         };
-
         // The explicit sink is configured before playbin can open or
         // negotiate it. It remains the same object across route changes.
         playbin.set_property("audio-sink", &sink.bin);
@@ -160,15 +163,27 @@ fn configured_sink_bin() -> Result<ConfiguredSinkBin, glib::BoolError> {
     let native = gst::ElementFactory::make(OSX_AUDIO_FACTORY)
         .build()
         .map_err(|_| glib::bool_error!("could not create osxaudiosink"))?;
-    if !install_channel_cap_on_sink(&native) {
-        return Err(glib::bool_error!("osxaudiosink has no usable sink pad"));
+    let native_pad = native
+        .static_pad("sink")
+        .ok_or_else(|| glib::bool_error!("osxaudiosink has no sink pad"))?;
+    let channel_caps = cap_raw_audio_channels(native_pad.pad_template_caps());
+    if !has_stereo_channel_cap(&channel_caps) {
+        return Err(glib::bool_error!(
+            "osxaudiosink did not advertise channel-bearing raw-audio caps"
+        ));
     }
+
+    let channel_filter = gst::ElementFactory::make(CHANNEL_FILTER_FACTORY)
+        .build()
+        .map_err(|_| glib::bool_error!("could not create macOS channel guard"))?;
+    channel_filter.set_property("caps", &channel_caps);
     let identity = gst::ElementFactory::make("identity")
         .build()
         .map_err(|_| glib::bool_error!("could not create macOS audio route gate"))?;
     let bin = gst::Bin::with_name("tributary-macos-audio-route");
-    bin.add_many([&identity, &native])?;
-    identity.link(&native)?;
+    bin.add_many([&identity, &channel_filter, &native])?;
+    identity.link(&channel_filter)?;
+    channel_filter.link(&native)?;
 
     let identity_sink = identity
         .static_pad("sink")
@@ -196,14 +211,46 @@ impl Drop for MacosAudioRoute {
     }
 }
 
-/// Install the multichannel-negotiation workaround directly on one native
-/// sink before it can be opened.
-///
-/// Some CoreAudio devices advertise up to eight channels without usable
-/// channel positions. GStreamer's converter can then fixate a stereo stream to
-/// that maximum and fail `not-negotiated`. Restricting the queried raw-audio
-/// channel range to one or two preserves the source layout.
-fn install_channel_cap_on_sink(sink: &gst::Element) -> bool {
+/// Restrict raw structures by intersection, never replacement. This preserves
+/// every native rate/format/feature and cannot widen a mono-only device to
+/// stereo. Compressed structures pass through unchanged.
+fn cap_raw_audio_channels(caps: gst::Caps) -> gst::Caps {
+    if caps.is_any() {
+        return caps;
+    }
+
+    let raw_stereo_limit = gst::Structure::builder("audio/x-raw")
+        .field("channels", gst::IntRange::new(1, 2))
+        .build();
+    let mut capped = gst::Caps::new_empty();
+    for (structure, features) in caps.iter_with_features() {
+        let restricted = if structure.name().as_str() == "audio/x-raw" {
+            structure.intersect(&raw_stereo_limit)
+        } else {
+            Some(structure.to_owned())
+        };
+        if let Some(structure) = restricted {
+            capped
+                .make_mut()
+                .append_structure_full(structure, Some(features.to_owned()));
+        }
+    }
+    capped
+}
+
+fn has_stereo_channel_cap(caps: &gst::CapsRef) -> bool {
+    let raw = gst::Caps::builder("audio/x-raw").build();
+    let raw_over_stereo = gst::Caps::builder("audio/x-raw")
+        .field("channels", gst::IntRange::new(3, i32::MAX))
+        .build();
+    caps.can_intersect(&raw) && !caps.can_intersect(&raw_over_stereo)
+}
+
+/// Degraded source-build fallback for a runtime missing one explicit-route
+/// element. PULL query probes run after the pad's real query function, so the
+/// native sink still supplies device-specific caps before they are narrowed.
+#[cfg(target_os = "macos")]
+fn install_channel_cap_after_native_query(sink: &gst::Element) -> bool {
     if sink
         .factory()
         .is_none_or(|factory| factory.name() != OSX_AUDIO_FACTORY)
@@ -213,61 +260,32 @@ fn install_channel_cap_on_sink(sink: &gst::Element) -> bool {
     let Some(pad) = sink.static_pad("sink") else {
         return false;
     };
-
-    pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |pad, info| {
-        let Some(query) = info.query_mut() else {
-            return gst::PadProbeReturn::Ok;
-        };
-        if query.type_() != gst::QueryType::Caps {
-            return gst::PadProbeReturn::Ok;
-        }
-
-        // Let the native sink answer first, then narrow only its raw-audio
-        // channel field. All other fields and caps features remain unchanged.
-        let parent = pad.parent_element();
-        let handled = parent
-            .as_ref()
-            .is_some_and(|element| gst::Pad::query_default(pad, Some(element), query));
-        if !handled {
-            return gst::PadProbeReturn::Ok;
-        }
-
-        if let gst::QueryViewMut::Caps(caps_query) = query.view_mut() {
-            if let Some(result) = caps_query.result_owned() {
-                caps_query.set_result(&cap_raw_audio_channels(result));
+    let probe = pad.add_probe(
+        gst::PadProbeType::QUERY_DOWNSTREAM | gst::PadProbeType::PULL,
+        |_pad, info| {
+            let Some(query) = info.query_mut() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            if let gst::QueryViewMut::Caps(caps_query) = query.view_mut() {
+                if let Some(result) = caps_query.result_owned() {
+                    caps_query.set_result(&cap_raw_audio_channels(result));
+                }
             }
-        }
-
-        gst::PadProbeReturn::Handled
-    });
-
-    tracing::info!("macOS: installed the stereo channel-cap invariant on osxaudiosink");
-    true
+            gst::PadProbeReturn::Ok
+        },
+    );
+    probe.is_some()
 }
 
-/// Retain the old automatic-sink behavior if the explicit native sink cannot
-/// be constructed. This still applies the channel cap if playbin later creates
-/// an `osxaudiosink`, but route following is unavailable in that degraded path.
 #[cfg(target_os = "macos")]
 fn install_playbin_channel_cap_fallback(playbin: &gst::Element) {
     playbin.connect("element-setup", false, |args| {
         let element = args.get(1)?.get::<gst::Element>().ok()?;
-        install_channel_cap_on_sink(&element);
+        if install_channel_cap_after_native_query(&element) {
+            tracing::info!("macOS: installed the post-query stereo guard on fallback osxaudiosink");
+        }
         None
     });
-}
-
-fn cap_raw_audio_channels(mut caps: gst::Caps) -> gst::Caps {
-    if caps.is_any() {
-        return caps;
-    }
-
-    for structure in caps.make_mut().iter_mut() {
-        if structure.name().as_str() == "audio/x-raw" && structure.has_field("channels") {
-            structure.set("channels", gst::IntRange::new(1, 2));
-        }
-    }
-    caps
 }
 
 #[cfg(target_os = "macos")]
@@ -295,7 +313,9 @@ mod native {
         AudioObjectID, AudioObjectPropertyAddress, AudioObjectRemovePropertyListenerBlock,
     };
 
-    use super::{remove_pending_route_probe, PendingRouteProbe, ReopenCoordinator};
+    use super::{
+        remove_pending_route_probe, route_gate_probe_type, PendingRouteProbe, ReopenCoordinator,
+    };
 
     type ListenerBlock = RcBlock<dyn Fn(u32, NonNull<AudioObjectPropertyAddress>) + 'static>;
 
@@ -334,8 +354,8 @@ mod native {
             // permits CoreAudio's callback thread, which is safe because the
             // block only performs a nonblocking send through a Send + Sync
             // channel.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let status = unsafe {
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 AudioObjectAddPropertyListenerBlock(
                     system_object(),
                     NonNull::from(&mut address),
@@ -358,10 +378,10 @@ mod native {
                         break;
                     }
 
-                    let mut usable_device = None;
+                    let mut output_available = false;
                     for attempt in 0..DEFAULT_OUTPUT_RETRY_COUNT {
-                        usable_device = current_default_output();
-                        if usable_device.is_some() {
+                        output_available = default_output_is_available();
+                        if output_available {
                             break;
                         }
                         if attempt + 1 < DEFAULT_OUTPUT_RETRY_COUNT {
@@ -369,14 +389,14 @@ mod native {
                         }
                     }
 
-                    let Some(device_id) = usable_device else {
+                    if !output_available {
                         tracing::warn!(
                             "macOS default audio output is temporarily unavailable; retaining the current sink"
                         );
                         continue;
-                    };
+                    }
 
-                    coordinator.record(device_id);
+                    coordinator.record();
                     let (Some(playbin), Some(sink), Some(gate)) =
                         (playbin.upgrade(), sink.upgrade(), gate.upgrade())
                     else {
@@ -408,8 +428,8 @@ mod native {
             self.signal_tx.close();
             // SAFETY: This exactly matches registration: same system object,
             // address, no dispatch queue, and the still-live block pointer.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let status = unsafe {
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 AudioObjectRemovePropertyListenerBlock(
                     system_object(),
                     NonNull::from(&mut self.address),
@@ -438,7 +458,7 @@ mod native {
         kAudioObjectSystemObject
     }
 
-    fn current_default_output() -> Option<i32> {
+    fn default_output_is_available() -> bool {
         let mut address = default_output_address();
         let mut size = u32::try_from(size_of::<AudioObjectID>())
             .expect("AudioObjectID size fits CoreAudio's UInt32");
@@ -446,8 +466,8 @@ mod native {
 
         // SAFETY: Every pointer refers to a live, correctly sized local for
         // the duration of this synchronous CoreAudio property query.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let status = unsafe {
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             AudioObjectGetPropertyData(
                 system_object(),
                 NonNull::from(&mut address),
@@ -457,13 +477,11 @@ mod native {
                 NonNull::from(&mut device).cast::<c_void>(),
             )
         };
-        let valid = status == kAudioHardwareNoError
-            && size == u32::try_from(size_of::<AudioObjectID>()).ok()?
-            && device != kAudioObjectUnknown;
-        if !valid {
-            return None;
-        }
-        i32::try_from(device).ok()
+        status == kAudioHardwareNoError
+            && size
+                == u32::try_from(size_of::<AudioObjectID>())
+                    .expect("AudioObjectID size fits CoreAudio's UInt32")
+            && device != kAudioObjectUnknown
     }
 
     pub(super) fn request_sink_reopen(
@@ -483,7 +501,7 @@ mod native {
         let dispatched_from_probe = Arc::clone(&dispatched);
         let pending_from_probe = Arc::clone(&pending_probe);
 
-        let probe = gate.add_probe(gst::PadProbeType::IDLE, move |gate, _info| {
+        let probe = gate.add_probe(route_gate_probe_type(), move |gate, _info| {
             if dispatched_from_probe.swap(true, Ordering::AcqRel) {
                 return gst::PadProbeReturn::Ok;
             }
@@ -494,23 +512,25 @@ mod native {
             let coordinator = Arc::clone(&coordinator);
             let pending_probe = Arc::clone(&pending_from_probe);
 
-            // A probe may execute on a streaming thread. Keep it blocking and
-            // perform every state mutation on the default GLib main context.
+            // A probe may execute on a streaming thread. The combined
+            // IDLE/BLOCK/query mask remains flow-blocking after this callback
+            // returns; perform every state mutation on the default GLib main
+            // context, then remove the tracked probe to release the stream.
             glib::idle_add_once(move || {
                 let mut applied_generation = None;
                 if alive.load(Ordering::Acquire) {
                     if let (Some(playbin), Some(sink)) = (playbin.upgrade(), sink.upgrade()) {
-                        let (device_id, generation) = coordinator.snapshot();
-                        reopen_sink_on_main_context(&playbin, &sink, device_id);
+                        let generation = coordinator.snapshot();
+                        reopen_sink_on_main_context(&playbin, &sink);
                         applied_generation = Some(generation);
                     }
                 }
                 remove_pending_route_probe(&pending_probe);
 
                 // A second notification may arrive after the first request
-                // installed its gate. The latest ID is used above, and a
-                // generation mismatch closes the remaining race—even when a
-                // disconnect/reconnect reports the same numeric device ID.
+                // installed its gate. Reopening resolves the latest system
+                // default, and a generation mismatch closes the remaining
+                // race—even for disconnect/reconnect of the same endpoint.
                 let replay =
                     applied_generation.is_some_and(|generation| coordinator.finish(generation));
                 if alive.load(Ordering::Acquire) && replay {
@@ -547,12 +567,14 @@ mod native {
         }
     }
 
-    fn reopen_sink_on_main_context(playbin: &gst::Element, sink: &gst::Element, device_id: i32) {
+    fn reopen_sink_on_main_context(playbin: &gst::Element, sink: &gst::Element) {
+        const CURRENT_DEFAULT_DEVICE: i32 = 0;
+
         let (_, current, pending) = sink.state(gst::ClockTime::ZERO);
         if current == gst::State::Null && pending == gst::State::VoidPending {
-            // Pin the notification's current default without opening an idle
-            // sink. The next normal playbin state change uses this endpoint.
-            sink.set_property("device", device_id);
+            // Keep the sink unpinned. Its next normal open resolves whatever
+            // CoreAudio default is current at that time.
+            sink.set_property("device", CURRENT_DEFAULT_DEVICE);
             return;
         }
 
@@ -561,10 +583,11 @@ mod native {
             tracing::warn!("Could not close the previous macOS audio output");
             return;
         }
-        // osxaudiosink clears this during READY→NULL. Pin the valid default
-        // snapshot that triggered this reopen; a subsequent CoreAudio change
-        // queues another bounded reopen.
-        sink.set_property("device", device_id);
+        // `AudioObjectID` is an opaque UInt32, while osxaudiosink's explicit
+        // `device` property accepts only 0..G_MAXINT. Its zero sentinel asks
+        // GStreamer to resolve the full-width current CoreAudio default and
+        // also selects the newest default if another change raced this reopen.
+        sink.set_property("device", CURRENT_DEFAULT_DEVICE);
         if let Err(error) = sink.sync_state_with_parent() {
             tracing::warn!(
                 error = %error,
@@ -575,7 +598,7 @@ mod native {
 
         // The new endpoint can advertise different formats/channels. Ask
         // upstream conversion to negotiate again while the pad is still
-        // blocked; the channel-cap probe remains installed on this sink.
+        // blocked; the channel `capsfilter` remains in the retained sink bin.
         if let Some(sink_pad) = sink.static_pad("sink") {
             if !sink_pad.push_event(gst::event::Reconfigure::new()) {
                 tracing::warn!(
@@ -591,6 +614,7 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gst::prelude::*;
 
     #[test]
     fn caps_channel_cap_preserves_other_fields_structures_and_features() {
@@ -635,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn caps_channel_cap_handles_any_empty_and_missing_channel_caps() {
+    fn caps_channel_cap_handles_any_empty_and_constrains_missing_channels() {
         gst::init().expect("initialize GStreamer");
         assert!(cap_raw_audio_channels(gst::Caps::new_any()).is_any());
         assert!(cap_raw_audio_channels(gst::Caps::new_empty()).is_empty());
@@ -644,24 +668,230 @@ mod tests {
             .field("format", "S16LE")
             .build();
         let capped = cap_raw_audio_channels(caps);
-        assert!(!capped
-            .structure(0)
-            .expect("raw structure")
-            .has_field("channels"));
+        assert_eq!(
+            capped
+                .structure(0)
+                .expect("raw structure")
+                .get::<gst::IntRange<i32>>("channels"),
+            Ok(gst::IntRange::new(1, 2))
+        );
+    }
+
+    #[test]
+    fn caps_channel_cap_intersects_without_widening_native_support() {
+        gst::init().expect("initialize GStreamer");
+        let mono = gst::Caps::builder("audio/x-raw")
+            .field("channels", 1_i32)
+            .build();
+        let capped_mono = cap_raw_audio_channels(mono);
+        assert_eq!(
+            capped_mono
+                .structure(0)
+                .expect("mono raw structure")
+                .get::<i32>("channels"),
+            Ok(1)
+        );
+
+        let surround_only = gst::Caps::builder("audio/x-raw")
+            .field("channels", gst::IntRange::new(3, 8))
+            .build();
+        assert!(cap_raw_audio_channels(surround_only).is_empty());
+    }
+
+    #[test]
+    fn persistent_capsfilter_preserves_and_refreshes_downstream_constraints() {
+        gst::init().expect("initialize GStreamer");
+        let native_template = gst::Caps::builder_full()
+            .structure(
+                gst::Structure::builder("audio/x-raw")
+                    .field("rate", gst::IntRange::new(8_000, 192_000))
+                    .field("channels", gst::IntRange::new(1, 8))
+                    .build(),
+            )
+            .structure(
+                gst::Structure::builder("audio/x-ac3")
+                    .field("framed", true)
+                    .build(),
+            )
+            .build();
+        let guard = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("channel capsfilter");
+        guard.set_property("caps", cap_raw_audio_channels(native_template));
+        let device = gst::ElementFactory::make("capsfilter")
+            .build()
+            .expect("simulated device capsfilter");
+        let sink = gst::ElementFactory::make("fakesink")
+            .build()
+            .expect("query sink");
+        guard.link(&device).expect("link channel guard");
+        device.link(&sink).expect("link simulated device");
+
+        let first_device_caps = gst::Caps::builder_full()
+            .structure(
+                gst::Structure::builder("audio/x-raw")
+                    .field("format", "F32LE")
+                    .field("rate", 48_000_i32)
+                    .field("channels", gst::IntRange::new(1, 8))
+                    .build(),
+            )
+            .structure(
+                gst::Structure::builder("audio/x-ac3")
+                    .field("framed", true)
+                    .build(),
+            )
+            .build();
+        device.set_property("caps", &first_device_caps);
+        let guard_pad = guard.static_pad("sink").expect("channel guard sink pad");
+        let first = guard_pad.query_caps(None);
+        let first_raw = first
+            .iter()
+            .find(|structure| structure.name().as_str() == "audio/x-raw")
+            .expect("first device raw caps");
+        assert_eq!(first_raw.get::<&str>("format"), Ok("F32LE"));
+        assert_eq!(first_raw.get::<i32>("rate"), Ok(48_000));
+        assert_eq!(
+            first_raw.get::<gst::IntRange<i32>>("channels"),
+            Ok(gst::IntRange::new(1, 2))
+        );
+        assert!(first
+            .iter()
+            .any(|structure| structure.name().as_str() == "audio/x-ac3"));
+
+        let eight_channels = gst::Caps::builder("audio/x-raw")
+            .field("format", "F32LE")
+            .field("rate", 48_000_i32)
+            .field("channels", 8_i32)
+            .build();
+        let stereo = gst::Caps::builder("audio/x-raw")
+            .field("format", "F32LE")
+            .field("rate", 48_000_i32)
+            .field("channels", 2_i32)
+            .build();
+        let ac3 = gst::Caps::builder("audio/x-ac3")
+            .field("framed", true)
+            .build();
+        assert!(!guard_pad.query_accept_caps(&eight_channels));
+        assert!(guard_pad.query_accept_caps(&stereo));
+        assert!(guard_pad.query_accept_caps(&ac3));
+
+        let second_device_caps = gst::Caps::builder("audio/x-raw")
+            .field("format", "S16LE")
+            .field("rate", 44_100_i32)
+            .field("channels", 1_i32)
+            .build();
+        device.set_property("caps", &second_device_caps);
+        let second = guard_pad.query_caps(None);
+        let second_raw = second.structure(0).expect("second device raw caps");
+        assert_eq!(second_raw.get::<&str>("format"), Ok("S16LE"));
+        assert_eq!(second_raw.get::<i32>("rate"), Ok(44_100));
+        assert_eq!(second_raw.get::<i32>("channels"), Ok(1));
+        assert!(!second
+            .iter()
+            .any(|structure| structure.name().as_str() == "audio/x-ac3"));
+    }
+
+    #[test]
+    fn route_gate_stays_flow_blocking_until_removed() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        gst::init().expect("initialize GStreamer");
+        let pipeline = gst::Pipeline::new();
+        let source = gst::ElementFactory::make("audiotestsrc")
+            .property("is-live", true)
+            .build()
+            .expect("live audio source");
+        let gate_element = gst::ElementFactory::make("identity")
+            .build()
+            .expect("route gate");
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .build()
+            .expect("audio sink");
+        pipeline
+            .add_many([&source, &gate_element, &sink])
+            .expect("assemble route-gate pipeline");
+        source.link(&gate_element).expect("link source to gate");
+        gate_element.link(&sink).expect("link gate to sink");
+
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_from_probe = Arc::clone(&delivered);
+        let sink_pad = sink.static_pad("sink").expect("sink pad");
+        let delivery_probe = sink_pad
+            .add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                delivered_from_probe.fetch_add(1, AtomicOrdering::AcqRel);
+                gst::PadProbeReturn::Ok
+            })
+            .expect("delivery counter probe");
+
+        pipeline
+            .set_state(gst::State::Playing)
+            .expect("start route-gate pipeline");
+        let startup_deadline = Instant::now() + Duration::from_secs(2);
+        while delivered.load(AtomicOrdering::Acquire) < 5 && Instant::now() < startup_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            delivered.load(AtomicOrdering::Acquire) >= 5,
+            "live test pipeline did not begin delivering buffers"
+        );
+
+        let gate = gate_element.static_pad("src").expect("route gate pad");
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let dispatched_from_gate = Arc::clone(&dispatched);
+        let route_probe = gate
+            .add_probe(route_gate_probe_type(), move |_pad, _info| {
+                dispatched_from_gate.store(true, Ordering::Release);
+                gst::PadProbeReturn::Ok
+            })
+            .expect("install route gate");
+        let block_deadline = Instant::now() + Duration::from_secs(2);
+        while (!dispatched.load(Ordering::Acquire) || !gate.is_blocking())
+            && Instant::now() < block_deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(dispatched.load(Ordering::Acquire));
+        assert!(gate.is_blocking(), "route gate did not hold the stream");
+
+        let held_count = delivered.load(AtomicOrdering::Acquire);
+        std::thread::sleep(Duration::from_millis(75));
+        assert_eq!(
+            delivered.load(AtomicOrdering::Acquire),
+            held_count,
+            "buffers crossed the route gate while native sink mutation was pending"
+        );
+
+        gate.remove_probe(route_probe);
+        let release_deadline = Instant::now() + Duration::from_secs(2);
+        while delivered.load(AtomicOrdering::Acquire) == held_count
+            && Instant::now() < release_deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            delivered.load(AtomicOrdering::Acquire) > held_count,
+            "removing the route gate did not resume the stream"
+        );
+
+        sink_pad.remove_probe(delivery_probe);
+        pipeline
+            .set_state(gst::State::Null)
+            .expect("stop route-gate pipeline");
     }
 
     #[test]
     fn reopen_coordinator_coalesces_and_replays_changes_during_a_pending_reopen() {
         let coordinator = ReopenCoordinator::new();
-        coordinator.record(17);
+        coordinator.record();
         assert!(coordinator.claim());
-        let (first_device, first_generation) = coordinator.snapshot();
-        assert_eq!(first_device, 17);
+        let first_generation = coordinator.snapshot();
 
-        coordinator.record(23);
+        coordinator.record();
         assert!(!coordinator.claim());
-        let (latest_device, latest_generation) = coordinator.snapshot();
-        assert_eq!(latest_device, 23);
+        let latest_generation = coordinator.snapshot();
         assert!(latest_generation > first_generation);
         assert!(coordinator.finish(first_generation));
         assert!(coordinator.claim());
@@ -669,12 +899,12 @@ mod tests {
     }
 
     #[test]
-    fn reopen_coordinator_replays_same_device_reconnect_notifications() {
+    fn reopen_coordinator_replays_reconnect_notifications() {
         let coordinator = ReopenCoordinator::new();
-        coordinator.record(17);
+        coordinator.record();
         assert!(coordinator.claim());
-        let (_, first_generation) = coordinator.snapshot();
-        coordinator.record(17);
+        let first_generation = coordinator.snapshot();
+        coordinator.record();
         assert!(coordinator.finish(first_generation));
     }
 
@@ -686,9 +916,9 @@ mod tests {
             let route = configured_sink_bin().expect("construct app-owned route");
             assert!(route.bin.static_pad("sink").is_some());
             let caps = route
-                .native
+                .bin
                 .static_pad("sink")
-                .expect("osxaudiosink pad")
+                .expect("app-owned route pad")
                 .query_caps(None);
             let mut saw_raw_channels = false;
             for structure in caps.iter() {
@@ -705,5 +935,20 @@ mod tests {
                 "osxaudiosink must expose channel-bearing raw-audio caps"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn automatic_sink_fallback_caps_the_completed_native_query() {
+        gst::init().expect("initialize GStreamer");
+        let native = gst::ElementFactory::make(OSX_AUDIO_FACTORY)
+            .build()
+            .expect("construct fallback osxaudiosink");
+        assert!(install_channel_cap_after_native_query(&native));
+        let caps = native
+            .static_pad("sink")
+            .expect("fallback osxaudiosink pad")
+            .query_caps(None);
+        assert!(has_stereo_channel_cap(&caps));
     }
 }

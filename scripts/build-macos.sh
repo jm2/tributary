@@ -479,8 +479,9 @@ rm -f "$PIXBUF_CACHE"
 rm -f "${APP_BUNDLE}/Contents/MacOS/gst-registry.bin"
 
 # Verify critical GStreamer plugins for audio playback. Tributary explicitly
-# owns the system-default route through identity → osxaudiosink, so those
-# plugins are hard package contracts rather than decoder/container warnings.
+# owns the system-default route through identity → capsfilter → osxaudiosink,
+# so those plugins are hard package contracts rather than decoder/container
+# warnings.
 for required_route_plugin in libgstcoreelements libgstosxaudio; do
   if [[ ! -f "$GST_PLUGIN_DEST/${required_route_plugin}.dylib" ]]; then
     error "Missing required GStreamer audio-route plugin: ${required_route_plugin}"

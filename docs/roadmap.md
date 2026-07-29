@@ -547,15 +547,19 @@ Local output already treats the header slider as one shared level across volume-
 outputs. The Windows pipeline retains the packaged WASAPI2 sink and monitors the system default
 render endpoint so a device change or temporary invalidation does not revive a stale sink volume;
 the macOS pipeline now listens for the exact CoreAudio default-output property and reopens one
-retained, app-owned `osxaudiosink` behind a stable upstream gate without rebuilding playbin,
-changing the queue occurrence, seeking, or forcing a pause/play clock cycle. Every initial and
-reopened macOS sink retains the pre-negotiation raw-audio stereo cap that avoids the known
-multi-channel converter failure, including caps features; compressed formats remain untouched.
-This route layer is owned by Tributary rather than a vendored/upstream GStreamer patch, and the
-packaged bundle must contain and discover both its `identity` gate and `osxaudiosink`. MPD
-continues to own its volume independently. Physical Windows and macOS switch/unplug/replug
-checks—including an affected multi-channel macOS endpoint—are release acceptance for these
-baselines, not separate feature records.
+  retained, app-owned `osxaudiosink` behind a stable upstream gate that holds downstream
+  buffers/events/queries through the complete main-context reopen, without rebuilding playbin,
+  changing the queue occurrence, seeking, or forcing a pause/play clock cycle. Every initial and
+  reopened macOS sink retains a native-template-derived `capsfilter` that intersects only raw-audio
+  channels with `[1, 2]`, avoiding the known multi-channel converter failure without bypassing the
+  sink's device-specific caps query or narrowing compressed formats. Reopens use the native
+  current-default sentinel instead of forcing CoreAudio's opaque UInt32 identifier through
+  GStreamer's signed device property. This route layer is owned by Tributary rather than a
+  vendored/upstream GStreamer patch, and the packaged bundle must contain and discover its
+  `identity` gate, `capsfilter`, and `osxaudiosink`. MPD continues to own its volume independently.
+  Physical Windows and macOS switch/unplug/replug checks—including an affected multi-channel macOS
+  endpoint and negotiated raw channels no greater than two before and after switching—are release
+  acceptance for these baselines, not separate feature records.
 
 1. **Equalizer ([#49]).** Define the GStreamer filter graph, bands/presets, preamp and clipping
    policy, live reconfiguration, persistence, and per-output behavior. Local and AirPlay pipelines

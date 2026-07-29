@@ -480,6 +480,10 @@ fn macos_bundle_requires_app_owned_system_audio_output_support() {
             && PLATFORM_RUNTIME
                 .contains("required bundled GStreamer identity factory was not discovered")
             && PLATFORM_RUNTIME
+                .contains("gstreamer::ElementFactory::find(\"capsfilter\").is_none()")
+            && PLATFORM_RUNTIME
+                .contains("required bundled GStreamer capsfilter factory was not discovered")
+            && PLATFORM_RUNTIME
                 .contains("gstreamer::ElementFactory::find(\"osxaudiosink\").is_none()")
             && PLATFORM_RUNTIME
                 .contains("required bundled GStreamer osxaudiosink factory was not discovered"),
@@ -495,21 +499,43 @@ fn macos_bundle_requires_app_owned_system_audio_output_support() {
     let configured_definition = MACOS_AUDIO
         .find("fn configured_sink_bin()")
         .expect("the configured sink constructor must exist");
-    let cap_install = MACOS_AUDIO[configured_definition..]
-        .find("install_channel_cap_on_sink(&native)")
+    let cap_build = MACOS_AUDIO[configured_definition..]
+        .find("let channel_caps = cap_raw_audio_channels(native_pad.pad_template_caps())")
         .map(|offset| configured_definition + offset)
-        .expect("the native sink must receive the channel cap");
-    let configured_return = MACOS_AUDIO[cap_install..]
+        .expect("the channel guard must derive from the native template caps");
+    let filter_build = MACOS_AUDIO[cap_build..]
+        .find("ElementFactory::make(CHANNEL_FILTER_FACTORY)")
+        .map(|offset| cap_build + offset)
+        .expect("the app-owned route must construct its channel capsfilter");
+    let filter_configure = MACOS_AUDIO[filter_build..]
+        .find("channel_filter.set_property(\"caps\", &channel_caps)")
+        .map(|offset| filter_build + offset)
+        .expect("the capsfilter must receive the narrowed native template");
+    let filter_link = MACOS_AUDIO[filter_configure..]
+        .find("channel_filter.link(&native)")
+        .map(|offset| filter_configure + offset)
+        .expect("the channel guard must remain directly upstream of the native sink");
+    let configured_return = MACOS_AUDIO[filter_link..]
         .find("Ok(ConfiguredSinkBin")
-        .map(|offset| cap_install + offset)
+        .map(|offset| filter_link + offset)
         .expect("the configured sink must be returned");
     assert!(
         configured_call < sink_publish
-            && configured_definition < cap_install
-            && cap_install < configured_return
+            && configured_definition < cap_build
+            && cap_build < filter_build
+            && filter_build < filter_configure
+            && filter_configure < filter_link
+            && filter_link < configured_return
             && MACOS_AUDIO.contains("gst::PadProbeType::IDLE")
+            && MACOS_AUDIO.contains("gst::PadProbeType::BLOCK_DOWNSTREAM")
+            && MACOS_AUDIO.contains(
+                "gst::PadProbeType::QUERY_DOWNSTREAM | gst::PadProbeType::PULL"
+            )
+            && MACOS_AUDIO.contains("route_gate_stays_flow_blocking_until_removed")
+            && !MACOS_AUDIO.contains("gst::Pad::query_default")
+            && MACOS_AUDIO.contains("sink.set_property(\"device\", CURRENT_DEFAULT_DEVICE)")
             && MACOS_AUDIO.contains("sink.sync_state_with_parent()"),
-        "every app-owned sink must be capped before publication and reopened behind an upstream gate"
+        "every app-owned sink must be filtered before publication, reopen on the full-width current default, and retain a safe guarded fallback"
     );
 }
 

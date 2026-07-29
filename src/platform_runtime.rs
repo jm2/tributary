@@ -1012,6 +1012,9 @@ fn run_macos_runtime_probe(
     if gstreamer::ElementFactory::find("identity").is_none() {
         bail!("required bundled GStreamer identity factory was not discovered");
     }
+    if gstreamer::ElementFactory::find("capsfilter").is_none() {
+        bail!("required bundled GStreamer capsfilter factory was not discovered");
+    }
     if gstreamer::ElementFactory::find("osxaudiosink").is_none() {
         bail!("required bundled GStreamer osxaudiosink factory was not discovered");
     }
