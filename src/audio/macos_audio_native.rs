@@ -227,6 +227,16 @@ impl ReopenAttempt {
     }
 }
 
+#[derive(Clone)]
+struct ReopenContext {
+    gate: gst::Pad,
+    playbin: glib::WeakRef<gst::Element>,
+    sink: glib::WeakRef<gst::Element>,
+    alive: Arc<AtomicBool>,
+    coordinator: Arc<ReopenCoordinator>,
+    pending_probe: PendingRouteProbe,
+}
+
 pub(super) fn request_sink_reopen(
     playbin: &gst::Element,
     sink: &gst::Element,
@@ -236,53 +246,41 @@ pub(super) fn request_sink_reopen(
     pending_probe: PendingRouteProbe,
 ) {
     let attempt = ReopenAttempt::fresh(coordinator.snapshot());
-    request_sink_reopen_with_attempts(
-        playbin,
-        sink,
-        gate,
+    let context = ReopenContext {
+        gate: gate.clone(),
+        playbin: playbin.downgrade(),
+        sink: sink.downgrade(),
         alive,
         coordinator,
         pending_probe,
-        attempt,
-    );
+    };
+    request_sink_reopen_with_attempts(context, attempt);
 }
 
-fn request_sink_reopen_with_attempts(
-    playbin: &gst::Element,
-    sink: &gst::Element,
-    gate: &gst::Pad,
-    alive: Arc<AtomicBool>,
-    coordinator: Arc<ReopenCoordinator>,
-    pending_probe: PendingRouteProbe,
-    attempt: ReopenAttempt,
-) {
-    if !alive.load(Ordering::Acquire) || !coordinator.claim() {
+fn request_sink_reopen_with_attempts(context: ReopenContext, attempt: ReopenAttempt) {
+    if !context.alive.load(Ordering::Acquire) || !context.coordinator.claim() {
         return;
     }
-    let playbin = playbin.downgrade();
-    let sink = sink.downgrade();
     let dispatched = Arc::new(AtomicBool::new(false));
     let dispatched_from_probe = Arc::clone(&dispatched);
-    let pending_from_probe = Arc::clone(&pending_probe);
-    let coordinator_from_probe = Arc::clone(&coordinator);
+    let context_from_probe = context.clone();
 
-    let probe = gate.add_probe(route_gate_probe_type(), move |gate, _info| {
-        if dispatched_from_probe.swap(true, Ordering::AcqRel) {
-            return gst::PadProbeReturn::Ok;
-        }
-        schedule_sink_reopen(
-            gate.clone(),
-            playbin.clone(),
-            sink.clone(),
-            Arc::clone(&alive),
-            Arc::clone(&coordinator_from_probe),
-            Arc::clone(&pending_from_probe),
-            attempt,
-        );
+    let probe = context
+        .gate
+        .add_probe(route_gate_probe_type(), move |_gate, _info| {
+            if dispatched_from_probe.swap(true, Ordering::AcqRel) {
+                return gst::PadProbeReturn::Ok;
+            }
+            schedule_sink_reopen(context_from_probe.clone(), attempt);
 
-        gst::PadProbeReturn::Ok
-    });
-    track_route_probe(probe, gate, &pending_probe, &coordinator);
+            gst::PadProbeReturn::Ok
+        });
+    track_route_probe(
+        probe,
+        &context.gate,
+        &context.pending_probe,
+        &context.coordinator,
+    );
 }
 
 fn track_route_probe(
@@ -306,88 +304,64 @@ fn track_route_probe(
     }
 }
 
-fn schedule_sink_reopen(
-    gate: gst::Pad,
-    playbin: glib::WeakRef<gst::Element>,
-    sink: glib::WeakRef<gst::Element>,
-    alive: Arc<AtomicBool>,
-    coordinator: Arc<ReopenCoordinator>,
-    pending_probe: PendingRouteProbe,
-    attempt: ReopenAttempt,
-) {
+fn schedule_sink_reopen(context: ReopenContext, attempt: ReopenAttempt) {
     // A probe may execute on a streaming thread. The combined
     // IDLE/BLOCK/query mask remains flow-blocking after this callback
     // returns; perform every state mutation on the default GLib main
     // context, then remove the tracked probe to release the stream.
     glib::idle_add_once(move || {
-        finish_sink_reopen_on_main_context(
-            gate,
-            playbin,
-            sink,
-            alive,
-            coordinator,
-            pending_probe,
-            attempt,
-        );
+        finish_sink_reopen_on_main_context(context, attempt);
     });
 }
 
-fn finish_sink_reopen_on_main_context(
-    gate: gst::Pad,
-    playbin: glib::WeakRef<gst::Element>,
-    sink: glib::WeakRef<gst::Element>,
-    alive: Arc<AtomicBool>,
-    coordinator: Arc<ReopenCoordinator>,
-    pending_probe: PendingRouteProbe,
-    attempt: ReopenAttempt,
-) {
-    let attempt = if alive.load(Ordering::Acquire) {
-        match (playbin.upgrade(), sink.upgrade()) {
-            (Some(playbin), Some(sink)) => {
-                let generation = coordinator.snapshot();
-                let attempts_remaining = reopen_attempts_for_generation(
-                    attempt.requested_generation,
-                    generation,
-                    attempt.attempts_remaining,
-                );
-                let succeeded = reopen_sink_on_main_context(&playbin, &sink);
-                Some((generation, succeeded, attempts_remaining))
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
-    remove_pending_route_probe(&pending_probe);
+fn finish_sink_reopen_on_main_context(context: ReopenContext, attempt: ReopenAttempt) {
+    let outcome = perform_sink_reopen(&context, attempt);
+    remove_pending_route_probe(&context.pending_probe);
 
-    let Some((generation, succeeded, attempts_remaining)) = attempt else {
-        coordinator.abandon();
+    let Some((generation, succeeded, attempts_remaining)) = outcome else {
+        context.coordinator.abandon();
         return;
     };
-    let generation_changed = coordinator.finish(generation);
-    if !alive.load(Ordering::Acquire) {
+    let generation_changed = context.coordinator.finish(generation);
+    if !context.alive.load(Ordering::Acquire) {
         return;
     }
 
-    match reopen_follow_up(generation_changed, succeeded, attempts_remaining) {
+    dispatch_reopen_follow_up(
+        context,
+        generation,
+        reopen_follow_up(generation_changed, succeeded, attempts_remaining),
+    );
+}
+
+fn perform_sink_reopen(
+    context: &ReopenContext,
+    attempt: ReopenAttempt,
+) -> Option<(u64, bool, usize)> {
+    if !context.alive.load(Ordering::Acquire) {
+        return None;
+    }
+    let (playbin, sink) = (context.playbin.upgrade()?, context.sink.upgrade()?);
+    let generation = context.coordinator.snapshot();
+    let attempts_remaining = reopen_attempts_for_generation(
+        attempt.requested_generation,
+        generation,
+        attempt.attempts_remaining,
+    );
+    let succeeded = reopen_sink_on_main_context(&playbin, &sink);
+    Some((generation, succeeded, attempts_remaining))
+}
+
+fn dispatch_reopen_follow_up(context: ReopenContext, generation: u64, follow_up: ReopenFollowUp) {
+    match follow_up {
         ReopenFollowUp::None => {}
         ReopenFollowUp::ReplayLatest => request_reopen_from_weak_refs(
-            &gate,
-            &playbin,
-            &sink,
-            &alive,
-            &coordinator,
-            &pending_probe,
-            ReopenAttempt::fresh(coordinator.snapshot()),
+            &context,
+            ReopenAttempt::fresh(context.coordinator.snapshot()),
         ),
         ReopenFollowUp::RetryFailure { attempts_remaining } => {
             schedule_failed_reopen_retry(
-                gate,
-                playbin,
-                sink,
-                alive,
-                coordinator,
-                pending_probe,
+                context,
                 ReopenAttempt {
                     requested_generation: generation,
                     attempts_remaining,
@@ -403,51 +377,22 @@ fn finish_sink_reopen_on_main_context(
     }
 }
 
-fn request_reopen_from_weak_refs(
-    gate: &gst::Pad,
-    playbin: &glib::WeakRef<gst::Element>,
-    sink: &glib::WeakRef<gst::Element>,
-    alive: &Arc<AtomicBool>,
-    coordinator: &Arc<ReopenCoordinator>,
-    pending_probe: &PendingRouteProbe,
-    attempt: ReopenAttempt,
-) {
-    if let (Some(playbin), Some(sink)) = (playbin.upgrade(), sink.upgrade()) {
-        request_sink_reopen_with_attempts(
-            &playbin,
-            &sink,
-            gate,
-            Arc::clone(alive),
-            Arc::clone(coordinator),
-            Arc::clone(pending_probe),
-            attempt,
-        );
+fn request_reopen_from_weak_refs(context: &ReopenContext, attempt: ReopenAttempt) {
+    if let (Some(_playbin_guard), Some(_sink_guard)) =
+        (context.playbin.upgrade(), context.sink.upgrade())
+    {
+        request_sink_reopen_with_attempts(context.clone(), attempt);
     }
 }
 
-fn schedule_failed_reopen_retry(
-    gate: gst::Pad,
-    playbin: glib::WeakRef<gst::Element>,
-    sink: glib::WeakRef<gst::Element>,
-    alive: Arc<AtomicBool>,
-    coordinator: Arc<ReopenCoordinator>,
-    pending_probe: PendingRouteProbe,
-    attempt: ReopenAttempt,
-) {
+fn schedule_failed_reopen_retry(context: ReopenContext, attempt: ReopenAttempt) {
     glib::timeout_add_once(DEFAULT_OUTPUT_RETRY_DELAY, move || {
-        if !alive.load(Ordering::Acquire) || coordinator.snapshot() != attempt.requested_generation
+        if !context.alive.load(Ordering::Acquire)
+            || context.coordinator.snapshot() != attempt.requested_generation
         {
             return;
         }
-        request_reopen_from_weak_refs(
-            &gate,
-            &playbin,
-            &sink,
-            &alive,
-            &coordinator,
-            &pending_probe,
-            attempt,
-        );
+        request_reopen_from_weak_refs(&context, attempt);
     });
 }
 
