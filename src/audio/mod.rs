@@ -173,7 +173,7 @@ pub struct Player {
     /// configured `osxaudiosink`. `Player::drop` retires it before taking the
     /// pipeline to `NULL`.
     #[cfg(target_os = "macos")]
-    _macos_audio_route: Option<macos_audio::MacosAudioRoute>,
+    macos_audio_route: Option<macos_audio::MacosAudioRoute>,
     playbin: gst::Element,
     volume: Rc<Cell<f64>>,
     /// Allows at most one warning-triggered sink reconnect until a new load
@@ -265,7 +265,7 @@ impl Player {
 
         let player = Self {
             #[cfg(target_os = "macos")]
-            _macos_audio_route: macos_audio_route,
+            macos_audio_route,
             playbin,
             volume,
             sink_recovery_claimed,
@@ -905,7 +905,7 @@ impl Drop for Player {
     fn drop(&mut self) {
         info!("Shutting down GStreamer pipeline");
         #[cfg(target_os = "macos")]
-        drop(self._macos_audio_route.take());
+        drop(self.macos_audio_route.take());
         let _ = self.playbin.set_state(gst::State::Null);
     }
 }
