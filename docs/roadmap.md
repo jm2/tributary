@@ -554,9 +554,11 @@ the macOS pipeline now listens for the exact CoreAudio default-output property a
   channels with `[1, 2]`, avoiding the known multi-channel converter failure without bypassing the
   sink's device-specific caps query or narrowing compressed formats. Reopens use the native
   current-default sentinel instead of forcing CoreAudio's opaque UInt32 identifier through
-  GStreamer's signed device property. This route layer is owned by Tributary rather than a
-  vendored/upstream GStreamer patch, and the packaged bundle must contain and discover its
-  `identity` gate, `capsfilter`, and `osxaudiosink`. MPD continues to own its volume independently.
+  GStreamer's signed device property. A transient native reopen failure gets three bounded attempts
+  at 50 ms intervals, while a newer route generation supersedes the retry and exhaustion waits for
+  another real notification. This route layer is owned by Tributary rather than a vendored/upstream
+  GStreamer patch, and the packaged bundle must contain and discover its `identity` gate,
+  `capsfilter`, and `osxaudiosink`. MPD continues to own its volume independently.
   Physical Windows and macOS switch/unplug/replug checks—including an affected multi-channel macOS
   endpoint and negotiated raw channels no greater than two before and after switching—are release
   acceptance for these baselines, not separate feature records.

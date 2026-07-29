@@ -19,7 +19,9 @@ use objc2_core_audio::{
 };
 
 use super::{
-    remove_pending_route_probe, route_gate_probe_type, PendingRouteProbe, ReopenCoordinator,
+    remove_pending_route_probe, reopen_attempts_for_generation, reopen_follow_up,
+    route_gate_probe_type, PendingRouteProbe, ReopenCoordinator, ReopenFollowUp,
+    SINK_REOPEN_ATTEMPT_LIMIT,
 };
 
 type ListenerBlock = RcBlock<dyn Fn(u32, NonNull<AudioObjectPropertyAddress>) + 'static>;
@@ -218,6 +220,29 @@ pub(super) fn request_sink_reopen(
     coordinator: Arc<ReopenCoordinator>,
     pending_probe: PendingRouteProbe,
 ) {
+    let requested_generation = coordinator.snapshot();
+    request_sink_reopen_with_attempts(
+        playbin,
+        sink,
+        gate,
+        alive,
+        coordinator,
+        pending_probe,
+        requested_generation,
+        SINK_REOPEN_ATTEMPT_LIMIT,
+    );
+}
+
+fn request_sink_reopen_with_attempts(
+    playbin: &gst::Element,
+    sink: &gst::Element,
+    gate: &gst::Pad,
+    alive: Arc<AtomicBool>,
+    coordinator: Arc<ReopenCoordinator>,
+    pending_probe: PendingRouteProbe,
+    requested_generation: u64,
+    attempts_remaining: usize,
+) {
     if !alive.load(Ordering::Acquire) || !coordinator.claim() {
         return;
     }
@@ -239,6 +264,8 @@ pub(super) fn request_sink_reopen(
             Arc::clone(&alive),
             Arc::clone(&coordinator_from_probe),
             Arc::clone(&pending_from_probe),
+            requested_generation,
+            attempts_remaining,
         );
 
         gst::PadProbeReturn::Ok
@@ -274,13 +301,24 @@ fn schedule_sink_reopen(
     alive: Arc<AtomicBool>,
     coordinator: Arc<ReopenCoordinator>,
     pending_probe: PendingRouteProbe,
+    requested_generation: u64,
+    attempts_remaining: usize,
 ) {
     // A probe may execute on a streaming thread. The combined
     // IDLE/BLOCK/query mask remains flow-blocking after this callback
     // returns; perform every state mutation on the default GLib main
     // context, then remove the tracked probe to release the stream.
     glib::idle_add_once(move || {
-        finish_sink_reopen_on_main_context(gate, playbin, sink, alive, coordinator, pending_probe);
+        finish_sink_reopen_on_main_context(
+            gate,
+            playbin,
+            sink,
+            alive,
+            coordinator,
+            pending_probe,
+            requested_generation,
+            attempts_remaining,
+        );
     });
 }
 
@@ -291,51 +329,128 @@ fn finish_sink_reopen_on_main_context(
     alive: Arc<AtomicBool>,
     coordinator: Arc<ReopenCoordinator>,
     pending_probe: PendingRouteProbe,
+    requested_generation: u64,
+    attempts_remaining: usize,
 ) {
-    let mut applied_generation = None;
-    if alive.load(Ordering::Acquire) {
-        if let (Some(playbin), Some(sink)) = (playbin.upgrade(), sink.upgrade()) {
-            let generation = coordinator.snapshot();
-            reopen_sink_on_main_context(&playbin, &sink);
-            applied_generation = Some(generation);
+    let attempt = if alive.load(Ordering::Acquire) {
+        match (playbin.upgrade(), sink.upgrade()) {
+            (Some(playbin), Some(sink)) => {
+                let generation = coordinator.snapshot();
+                let attempts_remaining = reopen_attempts_for_generation(
+                    requested_generation,
+                    generation,
+                    attempts_remaining,
+                );
+                let succeeded = reopen_sink_on_main_context(&playbin, &sink);
+                Some((generation, succeeded, attempts_remaining))
+            }
+            _ => None,
         }
-    }
+    } else {
+        None
+    };
     remove_pending_route_probe(&pending_probe);
 
-    // A notification arriving after this gate was installed must replay.
-    // Resolving the current default handles same-device reconnects too.
-    let replay = applied_generation.is_some_and(|generation| coordinator.finish(generation));
-    if alive.load(Ordering::Acquire) && replay {
-        if let (Some(playbin), Some(sink)) = (playbin.upgrade(), sink.upgrade()) {
-            request_sink_reopen(
-                &playbin,
-                &sink,
-                &gate,
-                Arc::clone(&alive),
-                Arc::clone(&coordinator),
-                Arc::clone(&pending_probe),
+    let Some((generation, succeeded, attempts_remaining)) = attempt else {
+        coordinator.abandon();
+        return;
+    };
+    let generation_changed = coordinator.finish(generation);
+    if !alive.load(Ordering::Acquire) {
+        return;
+    }
+
+    match reopen_follow_up(generation_changed, succeeded, attempts_remaining) {
+        ReopenFollowUp::None => {}
+        ReopenFollowUp::ReplayLatest => request_reopen_from_weak_refs(
+            &gate,
+            &playbin,
+            &sink,
+            &alive,
+            &coordinator,
+            &pending_probe,
+            coordinator.snapshot(),
+            SINK_REOPEN_ATTEMPT_LIMIT,
+        ),
+        ReopenFollowUp::RetryFailure { attempts_remaining } => {
+            schedule_failed_reopen_retry(
+                gate,
+                playbin,
+                sink,
+                alive,
+                coordinator,
+                pending_probe,
+                generation,
+                attempts_remaining,
             );
         }
-    } else if applied_generation.is_none() {
-        coordinator.abandon();
+        ReopenFollowUp::Exhausted => {
+            tracing::warn!(
+                attempts = SINK_REOPEN_ATTEMPT_LIMIT,
+                "macOS audio sink reopen retries exhausted; waiting for the next route notification"
+            );
+        }
     }
 }
 
-fn reopen_sink_on_main_context(playbin: &gst::Element, sink: &gst::Element) {
-    const CURRENT_DEFAULT_DEVICE: i32 = 0;
-
-    let (_, current, pending) = sink.state(gst::ClockTime::ZERO);
-    if current == gst::State::Null && pending == gst::State::VoidPending {
-        // Keep the sink unpinned. Its next normal open resolves whatever
-        // CoreAudio default is current at that time.
-        sink.set_property("device", CURRENT_DEFAULT_DEVICE);
-        return;
+fn request_reopen_from_weak_refs(
+    gate: &gst::Pad,
+    playbin: &glib::WeakRef<gst::Element>,
+    sink: &glib::WeakRef<gst::Element>,
+    alive: &Arc<AtomicBool>,
+    coordinator: &Arc<ReopenCoordinator>,
+    pending_probe: &PendingRouteProbe,
+    requested_generation: u64,
+    attempts_remaining: usize,
+) {
+    if let (Some(playbin), Some(sink)) = (playbin.upgrade(), sink.upgrade()) {
+        request_sink_reopen_with_attempts(
+            &playbin,
+            &sink,
+            gate,
+            Arc::clone(alive),
+            Arc::clone(coordinator),
+            Arc::clone(pending_probe),
+            requested_generation,
+            attempts_remaining,
+        );
     }
+}
+
+fn schedule_failed_reopen_retry(
+    gate: gst::Pad,
+    playbin: glib::WeakRef<gst::Element>,
+    sink: glib::WeakRef<gst::Element>,
+    alive: Arc<AtomicBool>,
+    coordinator: Arc<ReopenCoordinator>,
+    pending_probe: PendingRouteProbe,
+    failed_generation: u64,
+    attempts_remaining: usize,
+) {
+    glib::timeout_add_once(DEFAULT_OUTPUT_RETRY_DELAY, move || {
+        if !alive.load(Ordering::Acquire) || coordinator.snapshot() != failed_generation {
+            return;
+        }
+        request_reopen_from_weak_refs(
+            &gate,
+            &playbin,
+            &sink,
+            &alive,
+            &coordinator,
+            &pending_probe,
+            failed_generation,
+            attempts_remaining,
+        );
+    });
+}
+
+fn reopen_sink_on_main_context(playbin: &gst::Element, sink: &gst::Element) -> bool {
+    const CURRENT_DEFAULT_DEVICE: i32 = 0;
 
     let volume = playbin.property::<f64>("volume");
     if sink.set_state(gst::State::Null).is_err() {
         tracing::warn!("Could not close the previous macOS audio output");
-        return;
+        return false;
     }
     // `AudioObjectID` is an opaque UInt32, while osxaudiosink's explicit
     // `device` property accepts only 0..G_MAXINT. Its zero sentinel asks
@@ -347,7 +462,15 @@ fn reopen_sink_on_main_context(playbin: &gst::Element, sink: &gst::Element) {
             error = %error,
             "Could not reopen the macOS audio sink on the current system output"
         );
-        return;
+        return false;
+    }
+    playbin.set_property("volume", volume);
+
+    let (_, current, pending) = sink.state(gst::ClockTime::ZERO);
+    if current == gst::State::Null && pending == gst::State::VoidPending {
+        // An inactive parent intentionally leaves the sink unpinned. Its
+        // next normal open resolves whatever CoreAudio default is current.
+        return true;
     }
 
     // The new endpoint can advertise different formats/channels. Ask
@@ -356,8 +479,12 @@ fn reopen_sink_on_main_context(playbin: &gst::Element, sink: &gst::Element) {
     if let Some(sink_pad) = sink.static_pad("sink") {
         if !sink_pad.push_event(gst::event::Reconfigure::new()) {
             tracing::warn!("Could not request macOS audio renegotiation after an output change");
+            return false;
         }
+    } else {
+        tracing::warn!("Reopened macOS audio sink has no sink pad for renegotiation");
+        return false;
     }
-    playbin.set_property("volume", volume);
     tracing::info!("macOS system audio output changed");
+    true
 }

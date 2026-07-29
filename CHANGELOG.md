@@ -26,9 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `osxaudiosink` against the latest system default. The playbin,
   URI, queue occurrence, position, paused/playing intent, and software-volume chain remain intact;
   Tributary does not force a pause/play clock cycle. Output storms are single-flight and replay the
-  newest generation. The combined idle/block gate remains flow-blocking until main-context reopen
-  work explicitly removes it; listener/probe teardown precedes pipeline shutdown, and an idle sink
-  stays unpinned so its next normal open resolves the then-current default. Tributary deliberately uses
+  newest generation. A failed native close/reopen/renegotiation receives at most two 50 ms retries
+  (three total attempts), yields immediately to any newer route generation, and then waits for the
+  next notification instead of spinning indefinitely. The combined idle/block gate remains
+  flow-blocking until main-context reopen work explicitly removes it; listener/probe teardown
+  precedes pipeline shutdown, and an idle sink stays unpinned so its next normal open resolves the
+  then-current default. Tributary deliberately uses
   `osxaudiosink`'s zero/current-default sentinel rather than narrowing CoreAudio's opaque UInt32
   device identifier into GStreamer's signed property. The existing multi-channel CoreAudio
   workaround is now a persistent `capsfilter` immediately before the native sink and remains in the

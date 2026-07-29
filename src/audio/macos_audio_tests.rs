@@ -353,6 +353,40 @@ fn reopen_coordinator_replays_reconnect_notifications() {
     assert!(coordinator.finish(first_generation));
 }
 
+#[test]
+fn reopen_failures_retry_boundedly_and_new_generations_take_priority() {
+    assert_eq!(
+        reopen_follow_up(false, true, SINK_REOPEN_ATTEMPT_LIMIT),
+        ReopenFollowUp::None
+    );
+    assert_eq!(
+        reopen_follow_up(false, false, SINK_REOPEN_ATTEMPT_LIMIT),
+        ReopenFollowUp::RetryFailure {
+            attempts_remaining: 2
+        }
+    );
+    assert_eq!(
+        reopen_follow_up(false, false, 2),
+        ReopenFollowUp::RetryFailure {
+            attempts_remaining: 1
+        }
+    );
+    assert_eq!(reopen_follow_up(false, false, 1), ReopenFollowUp::Exhausted);
+    assert_eq!(
+        reopen_follow_up(true, false, 1),
+        ReopenFollowUp::ReplayLatest
+    );
+    assert_eq!(
+        reopen_follow_up(true, true, 1),
+        ReopenFollowUp::ReplayLatest
+    );
+    assert_eq!(reopen_attempts_for_generation(7, 7, 1), 1);
+    assert_eq!(
+        reopen_attempts_for_generation(7, 8, 1),
+        SINK_REOPEN_ATTEMPT_LIMIT
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn every_route_wrapper_is_complete_and_capped_before_open() {

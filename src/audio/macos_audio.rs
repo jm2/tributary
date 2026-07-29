@@ -29,6 +29,49 @@ use gtk::glib;
 const OSX_AUDIO_FACTORY: &str = "osxaudiosink";
 #[cfg(target_os = "macos")]
 const CHANNEL_FILTER_FACTORY: &str = "capsfilter";
+#[cfg(any(target_os = "macos", test))]
+const SINK_REOPEN_ATTEMPT_LIMIT: usize = 3;
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReopenFollowUp {
+    None,
+    ReplayLatest,
+    RetryFailure { attempts_remaining: usize },
+    Exhausted,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn reopen_follow_up(
+    generation_changed: bool,
+    reopen_succeeded: bool,
+    attempts_remaining: usize,
+) -> ReopenFollowUp {
+    if generation_changed {
+        ReopenFollowUp::ReplayLatest
+    } else if reopen_succeeded {
+        ReopenFollowUp::None
+    } else if attempts_remaining > 1 {
+        ReopenFollowUp::RetryFailure {
+            attempts_remaining: attempts_remaining - 1,
+        }
+    } else {
+        ReopenFollowUp::Exhausted
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn reopen_attempts_for_generation(
+    requested_generation: u64,
+    observed_generation: u64,
+    attempts_remaining: usize,
+) -> usize {
+    if requested_generation == observed_generation {
+        attempts_remaining
+    } else {
+        SINK_REOPEN_ATTEMPT_LIMIT
+    }
+}
 
 /// Coalesces native route notifications across the interval in which the
 /// GStreamer gate is installed and its main-context reopen is still pending.
