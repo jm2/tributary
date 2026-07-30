@@ -192,6 +192,8 @@ context:
   remove_from_playlist: "Remover da lista de reprodução"
   playlist_add_unsupported_heading: "As faixas não foram adicionadas"
   playlist_add_unsupported_body: "Pelo menos uma faixa selecionada não está disponível ou não é compatível com listas de reprodução comuns. Nada foi adicionado."
+  playlist_drag_description: "Arraste as faixas selecionadas para uma playlist comum. Escape cancela; Shift+F10 oferece a alternativa pelo teclado."
+  playlist_add_success: "%{count} faixas adicionadas a %{playlist}."
 
 # ── Listas de reprodução comuns ─────────────────────────────────────
 regular_playlist:

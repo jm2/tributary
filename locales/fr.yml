@@ -192,6 +192,8 @@ context:
   remove_from_playlist: "Retirer de la liste de lecture"
   playlist_add_unsupported_heading: "Les pistes n’ont pas été ajoutées"
   playlist_add_unsupported_body: "Au moins une piste sélectionnée est indisponible ou n’est pas prise en charge dans les listes de lecture normales. Aucune piste n’a été ajoutée."
+  playlist_drag_description: "Faites glisser les pistes sélectionnées sur une liste normale. Échap annule ; Maj+F10 offre l’équivalent clavier."
+  playlist_add_success: "%{count} pistes ajoutées à %{playlist}."
 
 # ── Listes de lecture normales ───────────────────────────────────────
 regular_playlist:

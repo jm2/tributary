@@ -192,6 +192,8 @@ context:
   remove_from_playlist: "Quitar de lista de reproducción"
   playlist_add_unsupported_heading: "No se añadieron pistas"
   playlist_add_unsupported_body: "Al menos una pista seleccionada no está disponible o no es compatible con las listas de reproducción normales. No se añadió nada."
+  playlist_drag_description: "Arrastra las pistas seleccionadas a una lista normal. Escape cancela; Mayús+F10 ofrece la alternativa de teclado."
+  playlist_add_success: "%{count} pistas añadidas a %{playlist}."
 
 # ── Listas de reproducción normales ───────────────────────────────────
 regular_playlist:

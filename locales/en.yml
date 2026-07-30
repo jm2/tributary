@@ -225,6 +225,8 @@ context:
   remove_from_playlist: "Remove from Playlist"
   playlist_add_unsupported_heading: "Tracks Weren’t Added"
   playlist_add_unsupported_body: "At least one selected track is unavailable or is not supported in regular playlists. Nothing was added."
+  playlist_drag_description: "Select tracks, then drag them onto a regular playlist. Press Escape to cancel. Use Shift+F10 for the keyboard equivalent."
+  playlist_add_success: "%{count} tracks added to %{playlist}."
 
 # ── Regular playlists ──────────────────────────────────────────────
 regular_playlist:

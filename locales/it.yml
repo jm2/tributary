@@ -192,6 +192,8 @@ context:
   remove_from_playlist: "Rimuovi dalla playlist"
   playlist_add_unsupported_heading: "I brani non sono stati aggiunti"
   playlist_add_unsupported_body: "Almeno un brano selezionato non è disponibile o non è supportato nelle playlist normali. Non è stato aggiunto nulla."
+  playlist_drag_description: "Trascina i brani selezionati su una playlist normale. Esc annulla; Maiusc+F10 offre l’alternativa da tastiera."
+  playlist_add_success: "%{count} brani aggiunti a %{playlist}."
 
 # ── Playlist normali ─────────────────────────────────────────────
 regular_playlist:
