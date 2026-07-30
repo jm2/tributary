@@ -13,6 +13,12 @@
 version: 2
 updates:
   # ── Rust crates (Cargo.toml / Cargo.lock) ─────────────────────────────────
+  #
+  # The fuzz crate is deliberately a separate Cargo workspace and therefore
+  # needs its own Dependabot entry below. A root update can still change direct
+  # production dependencies inherited by fuzz through its path dependency on
+  # Tributary; CI detects that cross-lock drift and the repository-owned repair
+  # command is documented in docs/dependency-updates.md.
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -21,12 +27,52 @@ updates:
     cooldown:
       default-days: 5
     groups:
+      # SeaORM's runtime and migration crates are one compatibility surface.
+      # Keep every update level in one PR. Repository policy tests also require
+      # their manifest requirements and resolved versions to remain paired.
+      seaorm:
+        applies-to: version-updates
+        patterns:
+          - "sea-orm"
+          - "sea-orm-migration"
+      seaorm-security:
+        applies-to: security-updates
+        patterns:
+          - "sea-orm"
+          - "sea-orm-migration"
+
       # One PR for ALL non-breaking crate bumps (patch + minor). Majors are
       # deliberately EXCLUDED so each major arrives as its own PR for human
       # review. This also keeps the grouped PR's update-type at
       # semver-minor/semver-patch, which is exactly what the auto-merge
       # workflow is allowed to merge.
       cargo-minor-and-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "sea-orm"
+          - "sea-orm-migration"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ── Rust fuzz workspace (fuzz/Cargo.toml / fuzz/Cargo.lock) ───────────────
+  - package-ecosystem: "cargo"
+    directory: "/fuzz"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 5
+    groups:
+      seaorm-security:
+        applies-to: security-updates
+        patterns:
+          - "sea-orm"
+          - "sea-orm-migration"
+
+      fuzz-minor-and-patch:
         applies-to: version-updates
         patterns:
           - "*"
@@ -43,10 +89,35 @@ updates:
     cooldown:
       default-days: 5
     groups:
+      # The exact dtolnay/rust-toolchain refs are also the trigger for a
+      # coordinated MSRV proposal. Do not ignore them: Dependabot should open
+      # the PR, then the repair lane synchronizes Cargo.toml, CI, and README and
+      # runs the complete matrix. The auto-merge workflow explicitly excludes
+      # this dependency at every update level.
+      rust-toolchain:
+        applies-to: version-updates
+        patterns:
+          - "dtolnay/rust-toolchain"
+
+      # Updating the privileged metadata action must be an isolated,
+      # review-only PR. The workflow's read-only preflight denies any PR that
+      # changes its own file, so a proposed ref cannot execute before review.
+      dependabot-metadata:
+        applies-to: version-updates
+        patterns:
+          - "dependabot/fetch-metadata"
+      dependabot-metadata-security:
+        applies-to: security-updates
+        patterns:
+          - "dependabot/fetch-metadata"
+
       actions-minor-and-patch:
         applies-to: version-updates
         patterns:
           - "*"
+        exclude-patterns:
+          - "dtolnay/rust-toolchain"
+          - "dependabot/fetch-metadata"
         update-types:
           - "minor"
           - "patch"

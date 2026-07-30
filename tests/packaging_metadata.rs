@@ -1,10 +1,14 @@
 use toml::Value;
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
+const ROOT_LOCK: &str = include_str!("../Cargo.lock");
+const FUZZ_LOCK: &str = include_str!("../fuzz/Cargo.lock");
 const RPM_SPEC: &str = include_str!("../build-aux/rpm/tributary.spec");
 const ARCH_PKGBUILD: &str = include_str!("../build-aux/arch/PKGBUILD");
 const DESKTOP_ENTRY: &str = include_str!("../data/io.github.tributary.Tributary.desktop");
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
+const DEPENDABOT_CONFIG: &str = include_str!("../.github/dependabot.yml");
+const DEPENDABOT_AUTOMERGE: &str = include_str!("../.github/workflows/dependabot-automerge.yml");
 const CLAUDE_REVIEW_WORKFLOW: &str = include_str!("../.github/workflows/claude-review.yml");
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
 const COVERAGE_BASELINE: &str = include_str!("../coverage-baseline.txt");
@@ -24,6 +28,65 @@ const FORBIDDEN_BUNDLED_COMPONENTS: &str =
 
 fn manifest() -> Value {
     toml::from_str(MANIFEST).expect("Cargo.toml must parse")
+}
+
+fn locked_version(source: &str, package: &str) -> String {
+    let lock: Value = toml::from_str(source).expect("Cargo lockfile must parse");
+    let versions: Vec<_> = lock["package"]
+        .as_array()
+        .expect("Cargo lockfile must contain package records")
+        .iter()
+        .filter(|candidate| candidate["name"].as_str() == Some(package))
+        .map(|candidate| {
+            candidate["version"]
+                .as_str()
+                .expect("locked package must have a version")
+        })
+        .collect();
+    assert_eq!(
+        versions.len(),
+        1,
+        "{package} must resolve to exactly one version; actual: {versions:?}"
+    );
+    versions[0].to_owned()
+}
+
+fn yaml_string_list(value: &serde_yaml::Value, field: &str) -> Vec<String> {
+    value
+        .get(field)
+        .unwrap_or_else(|| panic!("missing YAML field {field}"))
+        .as_sequence()
+        .unwrap_or_else(|| panic!("YAML field {field} must be a sequence"))
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .unwrap_or_else(|| panic!("{field} entries must be strings"))
+                .to_owned()
+        })
+        .collect()
+}
+
+fn dependabot_update<'a>(
+    config: &'a serde_yaml::Value,
+    ecosystem: &str,
+    directory: &str,
+) -> &'a serde_yaml::Value {
+    let matches: Vec<_> = config["updates"]
+        .as_sequence()
+        .expect("Dependabot updates must be a sequence")
+        .iter()
+        .filter(|update| {
+            update["package-ecosystem"].as_str() == Some(ecosystem)
+                && update["directory"].as_str() == Some(directory)
+        })
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Dependabot must define exactly one {ecosystem} update at {directory}"
+    );
+    matches[0]
 }
 
 fn parse_api_feature(feature: &str) -> Option<(u32, u32)> {
@@ -841,26 +904,281 @@ fn ci_compile_proves_the_exact_declared_msrv() {
     let rust_version = manifest["package"]["rust-version"]
         .as_str()
         .expect("package.rust-version must be a string");
-    let msrv_job = workflow_job(CI_WORKFLOW, "msrv");
-    let crlf_workflow = CI_WORKFLOW.lines().collect::<Vec<_>>().join("\r\n");
+    let rust_release = format!("{rust_version}.0");
+    let normalized_workflow = CI_WORKFLOW.replace("\r\n", "\n");
+    let msrv_job = workflow_job(&normalized_workflow, "msrv");
+    let crlf_workflow = normalized_workflow.lines().collect::<Vec<_>>().join("\r\n");
     let crlf_msrv_job = workflow_job(&crlf_workflow, "msrv");
 
-    assert_eq!(rust_version, "1.92");
     assert!(
-        crlf_msrv_job.contains("name: MSRV (1.92)"),
+        rust_version.split_once('.').is_some_and(
+            |(major, minor)| major.parse::<u32>().is_ok() && minor.parse::<u32>().is_ok()
+        ),
+        "package.rust-version must use canonical X.Y form"
+    );
+    assert!(
+        crlf_msrv_job.contains("name: MSRV\r\n"),
         "CI workflow contract checks must accept Windows CRLF checkouts"
     );
     assert!(
-        msrv_job.contains("name: MSRV (1.92)"),
-        "CI job name must expose the declared MSRV"
+        msrv_job.contains("name: MSRV\n")
+            && !msrv_job.contains(&format!("name: MSRV ({rust_version})")),
+        "CI job name must remain stable for branch rules and GasCity"
     );
     assert!(
-        msrv_job.contains("uses: dtolnay/rust-toolchain@1.92.0"),
+        msrv_job.contains(&format!("uses: dtolnay/rust-toolchain@{rust_release}")),
         "CI must install the exact declared Rust release"
     );
     assert!(
         msrv_job.contains("run: cargo check --all-targets --locked"),
         "CI must compile-check every target against the committed lockfile"
+    );
+    assert!(
+        README.contains(&format!("Rust {rust_version}+"))
+            && README.contains(&format!("toolchain install {rust_release}"))
+            && README.contains(&format!("cargo +{rust_release} llvm-cov"))
+            && README.contains(&format!("pinned to Rust {rust_release}")),
+        "README prerequisites and coverage commands must match the declared MSRV"
+    );
+}
+
+#[test]
+fn seaorm_runtime_and_migration_dependencies_move_as_one_unit() {
+    let manifest = manifest();
+    assert_eq!(
+        manifest["dependencies"]["sea-orm"]["version"],
+        manifest["dependencies"]["sea-orm-migration"]["version"],
+        "SeaORM runtime and migration manifest requirements must match"
+    );
+
+    for (name, source) in [("root", ROOT_LOCK), ("fuzz", FUZZ_LOCK)] {
+        assert_eq!(
+            locked_version(source, "sea-orm"),
+            locked_version(source, "sea-orm-migration"),
+            "{name} lockfile must resolve SeaORM runtime and migration to one version"
+        );
+    }
+}
+
+#[test]
+// The assertions form one policy contract: splitting them would obscure
+// whether grouping and auto-merge exclusions remain mutually consistent.
+// #lizard forgives
+fn dependabot_groups_coupled_updates_and_excludes_toolchains_from_automerge() {
+    let config: serde_yaml::Value =
+        serde_yaml::from_str(DEPENDABOT_CONFIG).expect("dependabot.yml must parse");
+    assert_eq!(config["version"].as_u64(), Some(2));
+
+    let root = dependabot_update(&config, "cargo", "/");
+    let root_groups = root["groups"]
+        .as_mapping()
+        .expect("root Cargo groups must be a mapping");
+    assert!(
+        !root_groups.is_empty(),
+        "root Cargo groups must not be empty"
+    );
+    let seaorm = &root["groups"]["seaorm"];
+    assert_eq!(
+        yaml_string_list(seaorm, "patterns"),
+        ["sea-orm", "sea-orm-migration"]
+    );
+    assert!(
+        seaorm.get("update-types").is_none(),
+        "the SeaORM pair must stay grouped for majors as well as routine updates"
+    );
+    let seaorm_security = &root["groups"]["seaorm-security"];
+    assert_eq!(
+        seaorm_security["applies-to"].as_str(),
+        Some("security-updates")
+    );
+    assert_eq!(
+        yaml_string_list(seaorm_security, "patterns"),
+        ["sea-orm", "sea-orm-migration"]
+    );
+
+    let routine_cargo = &root["groups"]["cargo-minor-and-patch"];
+    assert_eq!(
+        yaml_string_list(routine_cargo, "update-types"),
+        ["minor", "patch"]
+    );
+    assert_eq!(
+        yaml_string_list(routine_cargo, "exclude-patterns"),
+        ["sea-orm", "sea-orm-migration"]
+    );
+
+    let fuzz = dependabot_update(&config, "cargo", "/fuzz");
+    let fuzz_seaorm_security = &fuzz["groups"]["seaorm-security"];
+    assert_eq!(
+        fuzz_seaorm_security["applies-to"].as_str(),
+        Some("security-updates")
+    );
+    assert_eq!(
+        yaml_string_list(fuzz_seaorm_security, "patterns"),
+        ["sea-orm", "sea-orm-migration"]
+    );
+    let fuzz_group = &fuzz["groups"]["fuzz-minor-and-patch"];
+    assert_eq!(
+        yaml_string_list(fuzz_group, "update-types"),
+        ["minor", "patch"]
+    );
+
+    let actions = dependabot_update(&config, "github-actions", "/");
+    actions["groups"]
+        .as_mapping()
+        .expect("Actions groups must be a mapping");
+    let toolchain = &actions["groups"]["rust-toolchain"];
+    assert_eq!(
+        yaml_string_list(toolchain, "patterns"),
+        ["dtolnay/rust-toolchain"]
+    );
+    assert!(
+        toolchain.get("update-types").is_none() && actions.get("ignore").is_none(),
+        "Rust release updates must remain enabled at every SemVer level"
+    );
+    let routine_actions = &actions["groups"]["actions-minor-and-patch"];
+    assert_eq!(
+        yaml_string_list(routine_actions, "exclude-patterns"),
+        ["dtolnay/rust-toolchain", "dependabot/fetch-metadata"]
+    );
+    let metadata_action = &actions["groups"]["dependabot-metadata"];
+    assert_eq!(
+        yaml_string_list(metadata_action, "patterns"),
+        ["dependabot/fetch-metadata"]
+    );
+    assert_eq!(
+        metadata_action["applies-to"].as_str(),
+        Some("version-updates")
+    );
+    let metadata_action_security = &actions["groups"]["dependabot-metadata-security"];
+    assert_eq!(
+        yaml_string_list(metadata_action_security, "patterns"),
+        ["dependabot/fetch-metadata"]
+    );
+    assert_eq!(
+        metadata_action_security["applies-to"].as_str(),
+        Some("security-updates")
+    );
+}
+
+fn dependabot_automerge_workflow() -> serde_yaml::Value {
+    serde_yaml::from_str(DEPENDABOT_AUTOMERGE).expect("Dependabot auto-merge workflow must parse")
+}
+
+#[test]
+fn dependabot_automerge_inspection_and_metadata_stay_read_only_and_head_bound() {
+    let workflow = dependabot_automerge_workflow();
+    assert!(
+        workflow["permissions"]
+            .as_mapping()
+            .is_some_and(serde_yaml::Mapping::is_empty),
+        "the workflow default token must have no permissions"
+    );
+    let inspect = &workflow["jobs"]["inspect_changed_files"];
+    assert_eq!(
+        inspect["permissions"]["pull-requests"].as_str(),
+        Some("read")
+    );
+    assert!(
+        inspect["permissions"].get("contents").is_none(),
+        "changed-file inspection must not receive content write permission"
+    );
+    let inspect_steps = inspect["steps"]
+        .as_sequence()
+        .expect("changed-file inspection steps must be a sequence");
+    assert!(
+        inspect_steps
+            .first()
+            .is_some_and(|step| step.get("uses").is_none()),
+        "changed-file and exact-head denial must be inline and action-free"
+    );
+    assert!(
+        inspect_steps.iter().any(|step| {
+            step.get("uses").and_then(serde_yaml::Value::as_str)
+                == Some("dependabot/fetch-metadata@d7267f607e9d3fb96fc2fbe83e0af444713e90b7")
+                && step.get("if").and_then(serde_yaml::Value::as_str)
+                    == Some("steps.pre_metadata_head.outputs.matches == 'true'")
+        }),
+        "metadata extraction must run only after a fresh read-only exact-head preflight"
+    );
+}
+
+#[test]
+// These assertions jointly prove one privileged boundary and should fail as a
+// unit if an action, permission, concurrency rule, or exact-head guard regresses.
+// #lizard forgives
+fn dependabot_automerge_writer_is_action_free_concurrent_and_exact_head_guarded() {
+    let workflow = dependabot_automerge_workflow();
+    let writer = &workflow["jobs"]["dependabot-automerge"];
+    assert_eq!(writer["needs"].as_str(), Some("inspect_changed_files"));
+    assert_eq!(writer["permissions"]["contents"].as_str(), Some("write"));
+    assert_eq!(
+        writer["permissions"]["pull-requests"].as_str(),
+        Some("write")
+    );
+    assert!(
+        writer["if"]
+            .as_str()
+            .is_some_and(|condition| condition.contains(
+                "needs.inspect_changed_files.outputs.privileged_workflow_unchanged == 'true'"
+            )),
+        "the write job must depend on an affirmative read-only inspection result"
+    );
+    let writer_steps = writer["steps"]
+        .as_sequence()
+        .expect("write job steps must be a sequence");
+    assert!(
+        writer_steps.iter().all(|step| step.get("uses").is_none()),
+        "the write-capable job must remain third-party-action-free"
+    );
+    assert_eq!(
+        writer_steps.len(),
+        1,
+        "the write-capable job must contain only the guarded merge command"
+    );
+    assert_eq!(
+        workflow["concurrency"]["cancel-in-progress"].as_bool(),
+        Some(true),
+        "a newer revision of one PR must cancel its stale automation run"
+    );
+    assert!(
+        workflow["concurrency"]["group"]
+            .as_str()
+            .is_some_and(|group| group.contains("github.event.pull_request.number")),
+        "workflow concurrency must be scoped to the exact pull request"
+    );
+
+    assert!(
+        DEPENDABOT_AUTOMERGE.contains("pull_request:")
+            && !DEPENDABOT_AUTOMERGE.contains("\non: pull_request_target\n")
+            && !DEPENDABOT_AUTOMERGE.contains("actions/checkout")
+            && DEPENDABOT_AUTOMERGE.contains("gh api --paginate")
+            && DEPENDABOT_AUTOMERGE.contains("github.event.pull_request.changed_files")
+            && DEPENDABOT_AUTOMERGE.contains("github.event.pull_request.head.sha")
+            && DEPENDABOT_AUTOMERGE.contains("observed_head_before")
+            && DEPENDABOT_AUTOMERGE.contains("observed_head_after")
+            && DEPENDABOT_AUTOMERGE.contains("pre_metadata_head")
+            && DEPENDABOT_AUTOMERGE.contains("metadata_head")
+            && DEPENDABOT_AUTOMERGE.contains("observed_head")
+            && DEPENDABOT_AUTOMERGE.contains("--match-head-commit")
+            && DEPENDABOT_AUTOMERGE.contains(".previous_filename")
+            && DEPENDABOT_AUTOMERGE.contains("observed_changed_files")
+            && DEPENDABOT_AUTOMERGE.contains(
+                "dependabot/fetch-metadata@d7267f607e9d3fb96fc2fbe83e0af444713e90b7"
+            )
+            && !DEPENDABOT_AUTOMERGE.contains("dependabot/fetch-metadata@v3")
+            && DEPENDABOT_AUTOMERGE
+                .contains("\".github/workflows/dependabot-automerge.yml\"")
+            && DEPENDABOT_AUTOMERGE.contains("github.actor == 'dependabot[bot]'")
+            && DEPENDABOT_AUTOMERGE
+                .contains("github.event.pull_request.user.login == 'dependabot[bot]'")
+            && DEPENDABOT_AUTOMERGE.contains("github.repository == 'jm2/tributary'")
+            && DEPENDABOT_AUTOMERGE.contains(
+                "!contains(needs.inspect_changed_files.outputs.dependency_names, 'dtolnay/rust-toolchain')"
+            )
+            && DEPENDABOT_AUTOMERGE.contains(
+                "!contains(needs.inspect_changed_files.outputs.dependency_names, 'dependabot/fetch-metadata')"
+            ),
+        "Dependabot automation must be pinned, checkout-free, exact-head API-preflighted, narrowly admitted, race-contained, mixed-path self-update-safe, and refuse toolchain auto-merge"
     );
 }
 
