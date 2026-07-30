@@ -4,8 +4,8 @@
 **Source record:** `docs/task.md`, P3.4 — Maintenance and coverage
 **Decision date:** 2026-07-25
 **Decision:** DO NOT build the end-to-end harness. Existing focused unit coverage
-already locks down the ordering properties the new harness would re-prove, and
-the fixture cost is not justified by the marginal coverage gain.
+already locks down the deterministic ordering properties the new harness would
+re-prove, and the fixture cost is not justified by the marginal coverage gain.
 
 ## 1. What the record asks for
 
@@ -14,11 +14,11 @@ the fixture cost is not justified by the marginal coverage gain.
 > Add a direct end-to-end watcher-backlog/root-confirmation ordering harness
 > **if its incremental coverage remains worth the platform-fixture cost**.
 
-The bead description makes the conditionality explicit:
+The current bead description makes the conditionality explicit:
 
-> First deliverable is therefore a JUDGEMENT: is the added coverage worth
-> the fixture cost? Record the reasoning either way. Only build the harness
-> if the answer is yes.
+> First deliverable is therefore a judgement: inventory the ordering invariants
+> already covered, identify the live-backend gap, and decide whether that gap
+> justifies the fixture. Build the harness only if the answer is yes.
 
 This document records the judgement and the supporting analysis.
 
@@ -37,15 +37,17 @@ focused tests inside `src/local/engine.rs`. The relevant group:
 | `watcher_error_discards_mixed_incremental_batch_and_backlog` | Mixed incremental + `notify::Error` + stale queued event: the incremental batch is discarded, the queue is drained, no event is applied. |
 | `watcher_reconciliation_preserves_racing_overflow_and_new_events` | After a stale backlog is drained, an event arriving during the reconciliation scan remains queued for the next loop iteration; the overflow signal is not cleared at the end of the scan. |
 | `watcher_retries_a_root_that_appears_during_bootstrap` | `install_directory_watcher` + `watch_available_directories` retain old registrations and close new gaps when a missing root appears mid-bootstrap. |
-| `discard_watcher_backlog` (helper, exercised at three call sites) | Drain of `mpsc::Receiver<notify::Result<notify::Event>>` is best-effort and total; events arriving after the drain remain queued. |
+| `discard_watcher_backlog` (helper, invoked at two production sites and in two unit tests) | Drain of `mpsc::Receiver<notify::Result<notify::Event>>` is best-effort and total; events arriving after the drain remain queued. |
 
-The three call sites for `discard_watcher_backlog` are:
+The four invocations of `discard_watcher_backlog` are:
 
-1. `reconcile_unreliable_watcher_stream` (src/local/engine.rs:5336) — drain
+1. Production: `reconcile_unreliable_watcher_stream`
+   (src/local/engine.rs:5336) — drain
    on stream-loss before the authoritative scan.
-2. `process_directory_events` (src/local/engine.rs:5393) — drain at a
+2. Production: `process_directory_events` (src/local/engine.rs:5393) — drain at a
    pending-root-trust-scan boundary.
-3. Two unit tests above.
+3. Unit test: `watcher_error_discards_mixed_incremental_batch_and_backlog`.
+4. Unit test: `watcher_reconciliation_preserves_racing_overflow_and_new_events`.
 
 Together these cover: **when the backlog is discarded**, **what survives the
 discard**, and **what survives the subsequent authoritative scan**.
@@ -156,30 +158,29 @@ requires:
 
 ## 5. Net judgement
 
-The properties pinned by the focused tests in §2 are the **behavioral**
-properties the end-to-end harness would re-prove. The properties not
-covered in §3 (real `notify` callback firing, debounce-window expiry with
-a real timer, cross-platform coalescing) are either:
+The properties pinned by the focused tests in §2 are the **deterministic
+behavioral** properties the end-to-end harness would re-prove. The properties
+not covered in §3 (real `notify` callback firing, debounce-window expiry with a
+real timer, cross-platform coalescing) have different tradeoffs:
 
-- Already covered by the existing focused tests at a lower layer
-  (`enqueue_watcher_result` tests cover the callback → queue edge; debounce
-  window expiry is exercised implicitly through `process_directory_events`'s
-  polling loop in the application test suite).
+- Existing `enqueue_watcher_result` tests cover the callback → queue edge at a
+  lower layer, but the live end-to-end callback chain and real 1500ms
+  debounce-window expiry remain untested.
 - Not captured by the Linux x86_64 coverage aggregate without adding and
   maintaining native-backend fixtures in the existing macOS and Windows jobs
   (cross-platform coalescing).
 - Subject to host-load variance in CI (real debounce-window timing).
 
 The fixture cost (§4) is therefore high relative to the marginal coverage
-gain: the harness would re-prove properties already pinned, and the
-properties it would newly cover are either implicit in adjacent tests or
-out of the CI's supported coverage matrix.
+gain: the harness would re-prove deterministic properties already pinned while
+adding timing-sensitive, platform-specific evidence for the acknowledged live
+callback and timer gaps.
 
-**Verdict:** the harness is not justified. The focused unit coverage
-already satisfies the ordering invariants the bead was meant to protect.
-Any future regression in backlog-discard / root-confirmation ordering
-would be caught by the existing tests in `src/local/engine.rs::tests`,
-which are stable, deterministic, and CI-friendly.
+**Verdict:** the harness is not justified at this time. The focused unit
+coverage protects the deterministic ordering invariants, while live callback
+ordering and real debounce-window expiry remain explicit, accepted gaps. The
+platform-fixture and timing cost does not justify closing those gaps without
+incident evidence that makes them load-bearing.
 
 ## 6. Forward-looking note
 
