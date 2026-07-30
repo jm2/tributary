@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import os
-import subprocess
+import shutil
+# Tests execute checked-in scripts with argv-only subprocess calls.
+import subprocess  # nosec B404
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,7 +17,6 @@ import sync_rust_toolchain
 
 def workflow_run_script(job: str, step_name: str) -> str:
     """Extract one literal Bash `run: |` body from the checked-in workflow."""
-
     workflow = (
         sync_fuzz_lock.REPOSITORY
         / ".github"
@@ -65,6 +66,8 @@ def lock(direct: list[str], versions: dict[str, list[str]]) -> dict:
 
 
 class DependabotAutomergeRaceTests(unittest.TestCase):
+    # The fixture intentionally keeps creation, execution, and evidence capture
+    # together so every workflow race test uses the same hermetic boundary.
     def run_workflow_script(
         self,
         script: str,
@@ -73,6 +76,7 @@ class DependabotAutomergeRaceTests(unittest.TestCase):
         expected_head: str = "H1",
         merge_head: str = "H1",
     ) -> tuple[subprocess.CompletedProcess[str], str, str]:
+        #lizard forgives
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             fake_bin = root / "bin"
@@ -118,7 +122,8 @@ raise SystemExit(64)
                 "RUNNER_TEMP": str(root),
                 "GITHUB_OUTPUT": str(output),
                 "GITHUB_REPOSITORY": "jm2/tributary",
-                "GH_TOKEN": "read-only-test-token",
+                # This value is synthetic and unique to the temporary fixture.
+                "GH_TOKEN": f"test-only-{root.name}",
                 "PR_NUMBER": "7",
                 "PR_URL": "https://github.invalid/jm2/tributary/pull/7",
                 "EXPECTED_HEAD_SHA": expected_head,
@@ -128,14 +133,20 @@ raise SystemExit(64)
                 "FAKE_GH_HEADS": heads,
                 "FAKE_MERGE_HEAD": merge_head,
             }
-            completed = subprocess.run(
-                ["bash"],
+            bash = shutil.which("bash")
+            if bash is None:
+                raise AssertionError("bash is required for workflow policy tests")
+            # The test intentionally executes a literal checked-in workflow
+            # body inside a temporary directory with a fake GitHub CLI.
+            completed = subprocess.run(  # nosec B603  # nosemgrep
+                [bash],
                 input=script,
                 cwd=sync_fuzz_lock.REPOSITORY,
                 env=environment,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                check=False,
             )
             return (
                 completed,
@@ -174,6 +185,10 @@ raise SystemExit(64)
 
 
 class FuzzLockPolicyTests(unittest.TestCase):
+    def test_git_reader_requires_an_exact_commit_sha(self):
+        with self.assertRaises(sync_fuzz_lock.PolicyError):
+            sync_fuzz_lock.load_toml_from_git("--help", "Cargo.lock")
+
     def test_changed_shared_production_dependency_requires_exact_fuzz_version(self):
         base = lock(["tokio"], {"tokio": ["1.52.0"]})
         current = lock(["tokio"], {"tokio": ["1.53.0"]})

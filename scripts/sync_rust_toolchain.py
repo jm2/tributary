@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Validate or synchronize Tributary's authoritative Rust/MSRV declarations.
+"""
+Validate or synchronize Tributary's authoritative Rust/MSRV declarations.
 
 Dependabot is expected to propose updates to the exact
 `dtolnay/rust-toolchain@X.Y.0` refs. Those proposals deliberately do not

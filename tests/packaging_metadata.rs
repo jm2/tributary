@@ -960,6 +960,9 @@ fn seaorm_runtime_and_migration_dependencies_move_as_one_unit() {
 }
 
 #[test]
+// The assertions form one policy contract: splitting them would obscure
+// whether grouping and auto-merge exclusions remain mutually consistent.
+// #lizard forgives
 fn dependabot_groups_coupled_updates_and_excludes_toolchains_from_automerge() {
     let config: serde_yaml::Value =
         serde_yaml::from_str(DEPENDABOT_CONFIG).expect("dependabot.yml must parse");
@@ -1099,6 +1102,9 @@ fn dependabot_automerge_inspection_and_metadata_stay_read_only_and_head_bound() 
 }
 
 #[test]
+// These assertions jointly prove one privileged boundary and should fail as a
+// unit if an action, permission, concurrency rule, or exact-head guard regresses.
+// #lizard forgives
 fn dependabot_automerge_writer_is_action_free_concurrent_and_exact_head_guarded() {
     let workflow = dependabot_automerge_workflow();
     let writer = &workflow["jobs"]["dependabot-automerge"];

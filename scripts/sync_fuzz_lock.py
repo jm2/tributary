@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Keep root dependency updates coherent with the separate fuzz workspace.
+"""
+Keep root dependency updates coherent with the separate fuzz workspace.
 
 The fuzz crate intentionally owns a separate Cargo.lock. Dependabot updates the
 root lock independently, so a root PR can otherwise pass with the fuzz build
@@ -14,7 +15,10 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import subprocess
+import re
+import shutil
+# Subprocesses below use explicit argv, resolved executables, and no shell.
+import subprocess  # nosec B404
 import sys
 import tomllib
 from pathlib import Path
@@ -25,6 +29,7 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 ROOT_LOCK = REPOSITORY / "Cargo.lock"
 FUZZ_LOCK = REPOSITORY / "fuzz" / "Cargo.lock"
 ROOT_MANIFEST = REPOSITORY / "Cargo.toml"
+FULL_COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
 
 class PolicyError(RuntimeError):
@@ -38,15 +43,28 @@ class Transition:
     target_root_version: str
 
 
+def required_executable(name: str) -> str:
+    executable = shutil.which(name)
+    if executable is None:
+        raise PolicyError(f"required executable {name!r} is not available")
+    return executable
+
+
 def load_toml(path: Path) -> dict[str, Any]:
     with path.open("rb") as source:
         return tomllib.load(source)
 
 
 def load_toml_from_git(reference: str, path: str) -> dict[str, Any]:
+    if FULL_COMMIT.fullmatch(reference) is None:
+        raise PolicyError(
+            "base ref must be a full 40- or 64-character lowercase commit SHA"
+        )
     try:
-        encoded = subprocess.check_output(
-            ["git", "show", f"{reference}:{path}"],
+        # The revision is a validated full SHA, the path is internal, and no
+        # shell participates in this read-only Git invocation.
+        encoded = subprocess.check_output(  # nosec B603  # nosemgrep
+            [required_executable("git"), "show", f"{reference}:{path}"],
             cwd=REPOSITORY,
             stderr=subprocess.PIPE,
         )
@@ -83,7 +101,6 @@ def resolved_direct_versions(
     lock: dict[str, Any], package_name: str = "tributary"
 ) -> dict[str, str]:
     """Resolve Cargo.lock dependency specs to the selected package versions."""
-
     by_name = packages_by_name(lock)
     package = workspace_package(lock, package_name)
     result: dict[str, str] = {}
@@ -128,7 +145,6 @@ def production_dependency_declarations(
     manifest: dict[str, Any],
 ) -> dict[str, tuple[Any, ...]]:
     """Return normalized declarations inherited through the Tributary path dep."""
-
     result: dict[str, list[Any]] = {}
 
     def add_table(scope: str, table: Any) -> None:
@@ -164,7 +180,6 @@ def production_dependency_declarations(
 
 def production_dependency_names(manifest: dict[str, Any]) -> set[str]:
     """Return package names inherited by fuzz through its Tributary path dep."""
-
     return set(production_dependency_declarations(manifest))
 
 
@@ -230,7 +245,6 @@ def dependency_closure_identities(
     roots: set[tuple[str, str]],
 ) -> set[tuple[str, str]]:
     """Return the exact package identities reachable from lockfile roots."""
-
     records = package_records_by_identity(lock)
     pending = list(roots)
     visited: set[tuple[str, str]] = set()
@@ -265,6 +279,8 @@ def resolved_dependency_edges(
     }
 
 
+# The explicit fail-closed branches mirror distinct lockfile invariants; folding
+# them together would make the safety proof harder to audit.
 def validate_dependency_edges(
     before_lock: dict[str, Any],
     after_lock: dict[str, Any],
@@ -272,7 +288,7 @@ def validate_dependency_edges(
     authorized_identities: set[tuple[str, str]],
 ) -> None:
     """Reject semantic edge changes outside the reviewed dependency surface."""
-
+    #lizard forgives
     before_records = package_records_by_identity(before_lock)
     after_records = package_records_by_identity(after_lock)
     transition_targets = {
@@ -340,6 +356,8 @@ def validate_dependency_edges(
             )
 
 
+# This function keeps each authorization set and its rejection adjacent so a
+# reviewer can audit the complete bounded-change proof in one place.
 def validate_bounded_package_changes(
     base_root_lock: dict[str, Any],
     current_root_lock: dict[str, Any],
@@ -348,7 +366,7 @@ def validate_bounded_package_changes(
     transitions: list[Transition],
 ) -> None:
     """Reject drift outside exact closures rooted at the requested transition."""
-
+    #lizard forgives
     old_roots = {
         (transition.name, transition.current_fuzz_version)
         for transition in transitions
@@ -417,14 +435,14 @@ def validate_submitted_fuzz_update(
     current_fuzz_lock: dict[str, Any],
     current_manifest: dict[str, Any],
 ) -> tuple[list[Transition], list[Transition]]:
-    """Apply the same base-fuzz-to-head proof used by CI `check` mode.
+    """
+    Apply the same base-fuzz-to-head proof used by CI `check` mode.
 
     An independent fuzz-only update has no requested root-coherence
     transitions and remains owned by its dedicated Dependabot/CI lane. When
     the base fuzz lock is stale relative to the current root, every submitted
     base-to-head change must instead fit the bounded exact-closure proof.
     """
-
     requested_transitions = required_transitions(
         base_root_lock,
         current_root_lock,
@@ -483,15 +501,20 @@ def required_transitions(
 
 
 def cargo_command(arguments: list[str], *, offline: bool) -> None:
-    command = ["cargo", *arguments]
+    command = [required_executable("cargo"), *arguments]
     if offline:
         command.insert(2, "--offline")
-    subprocess.run(command, cwd=REPOSITORY, check=True)
+    # Arguments are derived from validated lockfile identities and never use a
+    # shell. A variable argv is intrinsic to this narrowly scoped Cargo helper.
+    subprocess.run(  # nosec B603  # nosemgrep
+        command,
+        cwd=REPOSITORY,
+        check=True,
+    )
 
 
 def refresh_tributary_dependency_graph(*, offline: bool) -> None:
     """Re-resolve the path package so new direct majors can coexist with old."""
-
     cargo_command(
         [
             "update",
@@ -550,14 +573,17 @@ def validate_locked_fuzz_metadata(*, offline: bool) -> None:
     if offline:
         fetch_command.insert(1, "--offline")
         metadata_command.insert(1, "--offline")
-    subprocess.run(
-        ["cargo", *fetch_command],
+    cargo = required_executable("cargo")
+    # Both argv lists are built locally from fixed Cargo metadata operations;
+    # the resolved executable is explicit and no shell is used.
+    subprocess.run(  # nosec B603  # nosemgrep
+        [cargo, *fetch_command],
         cwd=REPOSITORY,
         stdout=subprocess.DEVNULL,
         check=True,
     )
-    subprocess.run(
-        ["cargo", *metadata_command],
+    subprocess.run(  # nosec B603  # nosemgrep
+        [cargo, *metadata_command],
         cwd=REPOSITORY,
         stdout=subprocess.DEVNULL,
         check=True,
@@ -580,7 +606,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# The orchestration stays linear so every mutation is visibly inside the one
+# rollback boundary and every exit follows the same policy-error path.
 def main() -> int:
+    #lizard forgives
     args = parse_args()
     try:
         base = load_toml_from_git(args.base_ref, "Cargo.lock")
