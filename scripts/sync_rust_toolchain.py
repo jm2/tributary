@@ -26,6 +26,7 @@ RELEASE_VERSION = re.compile(r"^([1-9][0-9]*\.[0-9]+)\.0$")
 EXACT_TOOLCHAIN = re.compile(
     r"(?m)^(\s*uses:\s*dtolnay/rust-toolchain@)([1-9][0-9]*\.[0-9]+\.0)\s*$"
 )
+STABLE_MSRV_CHECK = re.compile(r"(?m)^    name: MSRV\s*$")
 
 
 class PolicyError(RuntimeError):
@@ -83,9 +84,12 @@ def check_consistency() -> None:
             f"numeric CI toolchain refs {sorted(set(releases))} do not match "
             f"Cargo.toml rust-version {line}"
         )
+    if STABLE_MSRV_CHECK.search(ci_source) is None:
+        raise PolicyError(
+            "MSRV job check name must remain stable as 'MSRV' for external gates"
+        )
 
     for needle, description in [
-        (f"name: MSRV ({line})", "MSRV job name"),
         (f"Install Rust toolchain ({line})", "MSRV install step"),
         (f"rustc {line}", "MSRV rationale"),
         (f"coverage-{release}-llvm-cov-", "coverage cache"),
@@ -133,7 +137,6 @@ def synchronize(target_line: str) -> None:
     if count != 2:
         raise PolicyError("could not normalize both exact CI toolchain refs")
     for old, new, description in [
-        (f"MSRV ({old_line})", f"MSRV ({target_line})", "MSRV job name"),
         (
             f"toolchain ({old_line})",
             f"toolchain ({target_line})",

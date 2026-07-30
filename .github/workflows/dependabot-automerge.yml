@@ -16,27 +16,76 @@ name: Dependabot auto-merge
 #     authoritative pin and requires the complete CI matrix first.
 #
 # Security: uses `pull_request` (NOT `pull_request_target`) and never checks out
-# the PR head, so untrusted code never runs here.
-on: pull_request
+# the PR head, so untrusted code never runs here. A read-only first job queries
+# every changed filename through GitHub's API. The write-capable job cannot
+# start if this workflow is among them, even in a mixed-path PR, so a proposed
+# replacement action ref cannot execute itself before review.
+on:
+  pull_request:
+    paths-ignore:
+      - ".github/workflows/dependabot-automerge.yml"
 
-# Least privilege — just enough to enable auto-merge. GitHub grants these write
-# scopes to Dependabot-triggered runs for the pull_request event.
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
 
 jobs:
-  dependabot-automerge:
+  inspect_changed_files:
     runs-on: ubuntu-latest
-    # Belt-and-suspenders: only ever act on Dependabot's own PRs.
     if: |
       github.actor == 'dependabot[bot]' &&
       github.event.pull_request.user.login == 'dependabot[bot]' &&
       github.repository == 'jm2/tributary'
+    permissions:
+      pull-requests: read
+    outputs:
+      privileged_workflow_unchanged: ${{ steps.changed_files.outputs.safe }}
+    steps:
+      # Inline and API-only by design: no proposed third-party action executes
+      # before the complete changed-file set has been proven safe.
+      - name: Deny privileged workflow changes
+        id: changed_files
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          set -euo pipefail
+          changed_file_list="${RUNNER_TEMP}/dependabot-changed-files.txt"
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+            --jq '.[] | [.filename, (.previous_filename // "")] | @tsv' \
+            > "${changed_file_list}"
+
+          observed_changed_files="$(wc -l < "${changed_file_list}")"
+          if [ "${observed_changed_files}" -ne "${EXPECTED_CHANGED_FILES}" ]; then
+            echo "Changed-file enumeration was incomplete; refusing write access." >&2
+            exit 1
+          fi
+
+          if grep -Fq -- \
+            '.github/workflows/dependabot-automerge.yml' \
+            "${changed_file_list}"; then
+            echo "safe=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "safe=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+  dependabot-automerge:
+    needs: inspect_changed_files
+    runs-on: ubuntu-latest
+    if: |
+      needs.inspect_changed_files.outputs.privileged_workflow_unchanged == 'true' &&
+      github.actor == 'dependabot[bot]' &&
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.repository == 'jm2/tributary'
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - name: Fetch Dependabot metadata
         id: meta
-        uses: dependabot/fetch-metadata@v3
+        # v3, pinned to the full commit published in GitHub's current example.
+        uses: dependabot/fetch-metadata@d7267f607e9d3fb96fc2fbe83e0af444713e90b7
         with:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
 
@@ -47,6 +96,7 @@ jobs:
       - name: Enable auto-merge for patch & minor updates
         if: |
           !contains(steps.meta.outputs.dependency-names, 'dtolnay/rust-toolchain') &&
+          !contains(steps.meta.outputs.dependency-names, 'dependabot/fetch-metadata') &&
           (
             steps.meta.outputs.update-type == 'version-update:semver-patch' ||
             steps.meta.outputs.update-type == 'version-update:semver-minor'

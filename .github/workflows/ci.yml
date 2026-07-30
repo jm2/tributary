@@ -54,7 +54,8 @@ jobs:
   # toolchain pin below in lockstep with that field: the gtk-rs 0.11 release
   # series sets the current floor (rustc 1.92).
   msrv:
-    name: MSRV (1.92)
+    # Keep this check name stable: branch rules and GasCity require "MSRV".
+    name: MSRV
     runs-on: ubuntu-24.04
     container:
       image: fedora:41

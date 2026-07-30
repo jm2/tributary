@@ -916,12 +916,13 @@ fn ci_compile_proves_the_exact_declared_msrv() {
         "package.rust-version must use canonical X.Y form"
     );
     assert!(
-        crlf_msrv_job.contains(&format!("name: MSRV ({rust_version})")),
+        crlf_msrv_job.contains("name: MSRV\r\n"),
         "CI workflow contract checks must accept Windows CRLF checkouts"
     );
     assert!(
-        msrv_job.contains(&format!("name: MSRV ({rust_version})")),
-        "CI job name must expose the declared MSRV"
+        msrv_job.contains("name: MSRV\n")
+            && !msrv_job.contains(&format!("name: MSRV ({rust_version})")),
+        "CI job name must remain stable for branch rules and GasCity"
     );
     assert!(
         msrv_job.contains(&format!("uses: dtolnay/rust-toolchain@{rust_release}")),
@@ -981,6 +982,15 @@ fn dependabot_groups_coupled_updates_and_excludes_toolchains_from_automerge() {
         seaorm.get("update-types").is_none(),
         "the SeaORM pair must stay grouped for majors as well as routine updates"
     );
+    let seaorm_security = &root["groups"]["seaorm-security"];
+    assert_eq!(
+        seaorm_security["applies-to"].as_str(),
+        Some("security-updates")
+    );
+    assert_eq!(
+        yaml_string_list(seaorm_security, "patterns"),
+        ["sea-orm", "sea-orm-migration"]
+    );
 
     let routine_cargo = &root["groups"]["cargo-minor-and-patch"];
     assert_eq!(
@@ -993,6 +1003,15 @@ fn dependabot_groups_coupled_updates_and_excludes_toolchains_from_automerge() {
     );
 
     let fuzz = dependabot_update(&config, "cargo", "/fuzz");
+    let fuzz_seaorm_security = &fuzz["groups"]["seaorm-security"];
+    assert_eq!(
+        fuzz_seaorm_security["applies-to"].as_str(),
+        Some("security-updates")
+    );
+    assert_eq!(
+        yaml_string_list(fuzz_seaorm_security, "patterns"),
+        ["sea-orm", "sea-orm-migration"]
+    );
     let fuzz_group = &fuzz["groups"]["fuzz-minor-and-patch"];
     assert_eq!(
         yaml_string_list(fuzz_group, "update-types"),
@@ -1015,23 +1034,97 @@ fn dependabot_groups_coupled_updates_and_excludes_toolchains_from_automerge() {
     let routine_actions = &actions["groups"]["actions-minor-and-patch"];
     assert_eq!(
         yaml_string_list(routine_actions, "exclude-patterns"),
-        ["dtolnay/rust-toolchain"]
+        ["dtolnay/rust-toolchain", "dependabot/fetch-metadata"]
     );
+    let metadata_action = &actions["groups"]["dependabot-metadata"];
+    assert_eq!(
+        yaml_string_list(metadata_action, "patterns"),
+        ["dependabot/fetch-metadata"]
+    );
+    assert_eq!(
+        metadata_action["applies-to"].as_str(),
+        Some("version-updates")
+    );
+    let metadata_action_security = &actions["groups"]["dependabot-metadata-security"];
+    assert_eq!(
+        yaml_string_list(metadata_action_security, "patterns"),
+        ["dependabot/fetch-metadata"]
+    );
+    assert_eq!(
+        metadata_action_security["applies-to"].as_str(),
+        Some("security-updates")
+    );
+}
 
-    let _: serde_yaml::Value = serde_yaml::from_str(DEPENDABOT_AUTOMERGE)
+#[test]
+fn dependabot_automerge_has_read_only_mixed_path_preflight() {
+    let workflow: serde_yaml::Value = serde_yaml::from_str(DEPENDABOT_AUTOMERGE)
         .expect("Dependabot auto-merge workflow must parse");
     assert!(
-        DEPENDABOT_AUTOMERGE.contains("on: pull_request")
+        workflow["permissions"]
+            .as_mapping()
+            .is_some_and(serde_yaml::Mapping::is_empty),
+        "the workflow default token must have no permissions"
+    );
+    let inspect = &workflow["jobs"]["inspect_changed_files"];
+    assert_eq!(
+        inspect["permissions"]["pull-requests"].as_str(),
+        Some("read")
+    );
+    assert!(
+        inspect["permissions"].get("contents").is_none(),
+        "changed-file inspection must not receive content write permission"
+    );
+    let inspect_steps = inspect["steps"]
+        .as_sequence()
+        .expect("changed-file inspection steps must be a sequence");
+    assert!(
+        inspect_steps.iter().all(|step| step.get("uses").is_none()),
+        "no third-party action may run before changed-file denial"
+    );
+
+    let writer = &workflow["jobs"]["dependabot-automerge"];
+    assert_eq!(writer["needs"].as_str(), Some("inspect_changed_files"));
+    assert_eq!(writer["permissions"]["contents"].as_str(), Some("write"));
+    assert_eq!(
+        writer["permissions"]["pull-requests"].as_str(),
+        Some("write")
+    );
+    assert!(
+        writer["if"]
+            .as_str()
+            .is_some_and(|condition| condition.contains(
+                "needs.inspect_changed_files.outputs.privileged_workflow_unchanged == 'true'"
+            )),
+        "the write job must depend on an affirmative read-only inspection result"
+    );
+
+    assert!(
+        DEPENDABOT_AUTOMERGE.contains("pull_request:")
             && !DEPENDABOT_AUTOMERGE.contains("\non: pull_request_target\n")
             && !DEPENDABOT_AUTOMERGE.contains("actions/checkout")
+            && DEPENDABOT_AUTOMERGE.contains("gh api --paginate")
+            && DEPENDABOT_AUTOMERGE.contains("github.event.pull_request.changed_files")
+            && DEPENDABOT_AUTOMERGE.contains(".previous_filename")
+            && DEPENDABOT_AUTOMERGE.contains("observed_changed_files")
+            && DEPENDABOT_AUTOMERGE.contains("grep -Fq")
+            && DEPENDABOT_AUTOMERGE.contains(
+                "dependabot/fetch-metadata@d7267f607e9d3fb96fc2fbe83e0af444713e90b7"
+            )
+            && !DEPENDABOT_AUTOMERGE.contains("dependabot/fetch-metadata@v3")
+            && DEPENDABOT_AUTOMERGE
+                .contains("\".github/workflows/dependabot-automerge.yml\"")
             && DEPENDABOT_AUTOMERGE.contains("github.actor == 'dependabot[bot]'")
             && DEPENDABOT_AUTOMERGE
                 .contains("github.event.pull_request.user.login == 'dependabot[bot]'")
             && DEPENDABOT_AUTOMERGE.contains("github.repository == 'jm2/tributary'")
             && DEPENDABOT_AUTOMERGE.contains(
                 "!contains(steps.meta.outputs.dependency-names, 'dtolnay/rust-toolchain')"
+            )
+            && DEPENDABOT_AUTOMERGE.contains(
+                "!contains(steps.meta.outputs.dependency-names, 'dependabot/fetch-metadata')"
             ),
-        "write-capable Dependabot automation must be checkout-free, narrowly admitted, and refuse toolchain auto-merge"
+        "write-capable Dependabot automation must be pinned, checkout-free, API-preflighted, narrowly admitted, mixed-path self-update-safe, and refuse toolchain auto-merge"
     );
 }
 

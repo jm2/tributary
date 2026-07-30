@@ -20,8 +20,8 @@ changes which need coordinated repair:
 
 A root Cargo update may also change production dependencies inherited by the
 fuzz workspace. Pull-request CI compares the root lock against the exact base
-SHA and fails if a changed shared direct dependency remains stale in
-`fuzz/Cargo.lock`.
+SHA and also enforces absolute root-authoritative equality for every shared
+production-direct dependency in `fuzz/Cargo.lock`.
 
 GasCity should handle that expected failure in a trusted isolated worktree:
 
@@ -31,13 +31,32 @@ python3 scripts/sync_fuzz_lock.py check --base-ref <exact-base-sha>
 ```
 
 The write command uses targeted `cargo update --precise` operations. It does
-not commit, push, approve, or merge. The Repairer must verify that only the
-expected lock state changed, commit the repair to the existing Dependabot
-branch, and require the complete CI matrix. Graph rewrites which cannot be
-expressed as a version substitution fail closed for manual repair.
+one path-package re-resolution first when the root dependency declaration
+changed. That permits a new direct major to coexist with an older major still
+required transitively. It then requires exact transition readback, rejects any
+package-version drift outside the old/new dependency closures, and compares
+every changed dependency edge by its resolved `(name, version)` identity.
+Formatting-only disambiguation is harmless, but a semantic rebind must remain
+inside the reviewed root-update/closure surface; the Tributary path record may
+move only the exact requested direct transitions. The independent fuzz
+resolver may select a different compatible transitive version inside that
+bounded closure. A broad resolver rewrite, failed command, or failed proof
+restores the original fuzz lock.
+
+The command does not commit, push, approve, or merge. The Repairer must verify
+the resulting lock diff, commit the repair to the existing Dependabot branch,
+and require the complete CI matrix. Graph rewrites which cannot be proven by
+this bounded version-selection policy fail closed for manual repair.
 `--offline` is available for a pre-populated Cargo cache; normal repair runs
 may use the registry to obtain the exact versions already selected in the root
 lock.
+
+Transitive-only root-lock updates are deliberately not projected into the
+independent fuzz resolver: its graph can legitimately select a different
+compatible version. The dedicated `/fuzz` Dependabot entry and locked fuzz CI
+own those updates. A security update affecting both lockfiles must therefore
+be raised or repaired in both rather than inferred from coincident package
+names.
 
 ## Rust toolchain and MSRV repair
 
@@ -50,18 +69,25 @@ python3 scripts/sync_rust_toolchain.py --check
 ```
 
 This synchronizes the Cargo MSRV, exact MSRV and coverage toolchains, cache
-keys, job labels, and current README commands. The bump is feasible only when
+keys, versioned step labels, and current README commands. The CI job/check name
+remains the stable `MSRV` so branch rules and GasCity do not deadlock when the
+compiler version changes. The bump is feasible only when
 the full Linux, macOS, Windows, Flatpak, fuzz, audit, coverage, and repository
-policy matrix passes. It then needs independent semantic review and the normal
-Refinery exact-SHA merge gate; the Dependabot auto-merge workflow will not
-merge it.
+policy matrix passes. The repository enforces consistency and prevents native
+auto-merge; GasCity must separately provide independent semantic review and
+the normal Refinery exact-SHA merge gate before merging it.
 
 ## Workflow security boundary
 
 No workflow checks out pull-request code while holding a write token. The
 auto-merge workflow uses `pull_request`, verifies the actor, PR author, and
-repository, fetches only GitHub-provided Dependabot metadata, and enables
-GitHub's native guarded auto-merge without checking out the branch.
+repository, and enables GitHub's native guarded auto-merge without checking
+out the branch. A read-only first job enumerates every changed filename through
+GitHub's API and fails closed if the result is incomplete. The separate
+write-capable job cannot start when the privileged workflow changed or was
+renamed, including in a mixed-path PR. Its metadata action is pinned to a full
+commit and has isolated version- and security-update groups, so a proposed
+replacement ref cannot execute itself with the write token.
 
 Lockfile and toolchain repair intentionally remain GasCity Repairer operations
 instead of a `pull_request_target` writer. This keeps untrusted dependency or
