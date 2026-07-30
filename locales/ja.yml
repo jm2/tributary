@@ -144,6 +144,8 @@ dialogs:
   output_port: "ポート"
   output_exclusive_control_warning: "MPD の一時停止、停止、リピート、ランダム、シングル、consume コマンドは再生パーティション全体に影響します。別のコントローラーや Tributary インスタンスと共有しないでください。"
   output_exclusive_control_confirmation: "Tributary がこの MPD 再生パーティションを排他的に制御することを確認します。"
+  output_detection_warning: "Tributary は、自動オーファンクリーンアップを有効にする前に、複数の連続したステータス応答を観察することで、他のコントローラーがパーティションを変更していないことを検出できます。検出はフェイルセーフです。外部の現在の曲、外部のオプション変更、または古い観察ウィンドウが発生すると、孤児キューエントリを保持する保守的なデフォルトに戻ります。"
+  output_detection_confirmation: "自動オーファンクリーンアップの前に、Tributary が排他制御を自動的に検出することを許可します。"
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:

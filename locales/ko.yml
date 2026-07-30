@@ -144,6 +144,8 @@ dialogs:
   output_port: "포트"
   output_exclusive_control_warning: "MPD의 일시 정지, 정지, 반복, 무작위, 단일 및 consume 명령은 전체 재생 파티션에 영향을 줍니다. 다른 컨트롤러나 Tributary 인스턴스와 공유하지 마세요."
   output_exclusive_control_confirmation: "Tributary가 이 MPD 재생 파티션을 독점 제어함을 확인합니다."
+  output_detection_warning: "Tributary는 자동 고아 정리를 활성화하기 전에 여러 연속 상태 응답을 관찰하여 다른 컨트롤러가 파티션을 변경하지 않는지 감지할 수 있습니다. 감지는 페일 세이프입니다. 외부 현재 곡, 외부 옵션 변경 또는 오래된 관찰 창이 발생하면 고아 큐 항목을 유지하는 보수적 기본값으로 되돌아갑니다."
+  output_detection_confirmation: "자동 고아 정리 전에 Tributary가 독점 제어를 자동으로 감지하도록 허용합니다."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:

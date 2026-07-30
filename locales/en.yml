@@ -149,6 +149,8 @@ dialogs:
   output_port: "Port"
   output_exclusive_control_warning: "MPD pause, stop, repeat, random, single, and consume commands affect the entire playback partition. Do not share it with another controller or Tributary instance."
   output_exclusive_control_confirmation: "I confirm Tributary has exclusive control of this MPD playback partition."
+  output_detection_warning: "Tributary can detect whether no other controller is mutating the partition by observing multiple consecutive status responses before enabling automatic orphan cleanup. Detection is fail-closed: any foreign current song, foreign option change, or stale observation window reverts to the conservative default of retaining the orphaned queue entry."
+  output_detection_confirmation: "Allow Tributary to detect exclusive control automatically before automatic orphan cleanup."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:

@@ -80,6 +80,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixed command error before the owner reports its terminal shutdown failure.
 
 ### Added
+- **MPD gains an optional, detectable exclusive-control/ownership mode that enables automatic
+  orphan cleanup only after a bounded observation window proves the partition is genuinely
+  ours** (`src/audio/mpd_output.rs`, `src/ui/output_dialogs.rs`,
+  `src/ui/output_switch.rs`, `locales/*.yml`). A new `MpdControlMode::Detected` variant and
+  matching `detection_enabled` persisted field opt in to a bipartite detection probe: the worker
+  restarts the probe on every successful load, advances it on each clean status observation
+  (no foreign current song, no option drift, no stale observation window), and only promotes it
+  to `Confirmed` after `MIN_DETECTION_OBSERVATIONS = 3` consecutive clean observations spanning
+  `MIN_DETECTION_AGE = 250 ms`. While `Confirmed`, automatic orphan cleanup is permitted
+  (matching the user-confirmed `Exclusive` mode); on a foreign current song, any of
+  `repeat`/`random`/`single`/`consume` flipped away from the enforced defaults, or an
+  observation gap beyond `MAX_DETECTION_GAP = 2 s`, the probe lapses and the partition is
+  treated as `Unconfirmed` until the next load restarts the probe. The legacy
+  `exclusive_control: false` default and the fail-closed load gate are preserved; legacy
+  `outputs.json` entries continue to deserialize with `detection_enabled: false` so the
+  conservative retain-on-cleanup path is the default. A new opt-in checkbox in the Add
+  Output dialog pairs with a localized warning/confirmation message in every supported
+  catalog (13 locales).
 - **Last.fm now has a fail-closed protocol, desktop-authorization, credential-vault, durable-queue,
   playback-evidence/owner, delivery/lifecycle runtime, and application-owner foundation**
   ([#50](https://github.com/jm2/tributary/issues/50),
