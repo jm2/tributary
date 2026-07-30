@@ -20,12 +20,30 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The dependency policy compares PR lock state with the exact base.
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Test package compliance policies
         run: |
           build-aux/linux/test-package-compliance.sh
           scripts/test-macos-icon-bundle-policy.sh
           scripts/test-macos-package-policy.sh
+
+      - name: Test dependency update policy
+        run: |
+          python3 scripts/test_dependency_update_policy.py
+          python3 scripts/sync_rust_toolchain.py --check
+
+      - name: Verify root and fuzz lock update coherence
+        if: github.event_name == 'pull_request'
+        env:
+          DEPENDENCY_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: >-
+          python3 scripts/sync_fuzz_lock.py check
+          --base-ref "$DEPENDENCY_BASE_SHA"
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Run cargo audit

@@ -3,6 +3,10 @@
 /coverage/
 **/*.rs.bk
 
+# Python policy-script caches
+__pycache__/
+*.py[cod]
+
 # IDE
 .vscode/
 .idea/

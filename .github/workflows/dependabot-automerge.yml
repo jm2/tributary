@@ -10,7 +10,10 @@ name: Dependabot auto-merge
 #     the required checks pass. Without that ruleset, `--auto` would either
 #     error or merge immediately without waiting — so the ruleset is required.
 #   * Majors are NOT auto-merged: they fall through the update-type guard below
-#     and wait for a human.
+#     and wait for coordinated repair and review.
+#   * Rust toolchain/MSRV proposals are NOT auto-merged at any SemVer level.
+#     Dependabot still opens them; the repair lane synchronizes every
+#     authoritative pin and requires the complete CI matrix first.
 #
 # Security: uses `pull_request` (NOT `pull_request_target`) and never checks out
 # the PR head, so untrusted code never runs here.
@@ -26,7 +29,10 @@ jobs:
   dependabot-automerge:
     runs-on: ubuntu-latest
     # Belt-and-suspenders: only ever act on Dependabot's own PRs.
-    if: github.actor == 'dependabot[bot]'
+    if: |
+      github.actor == 'dependabot[bot]' &&
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.repository == 'jm2/tributary'
     steps:
       - name: Fetch Dependabot metadata
         id: meta
@@ -34,15 +40,17 @@ jobs:
         with:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
 
-      # Enable auto-merge ONLY for patch + minor bumps. Major bumps
-      # (version-update:semver-major) are left for a human. For GROUPED PRs,
-      # fetch-metadata reports the HIGHEST semver bump in the group; the groups
-      # in dependabot.yml only contain minor+patch, so grouped PRs always report
-      # semver-minor / semver-patch.
+      # Enable auto-merge ONLY for patch + minor bumps which are not Rust
+      # toolchain proposals. Major bumps (version-update:semver-major) and every
+      # dtolnay/rust-toolchain bump are left for coordinated repair/review. For
+      # grouped PRs, fetch-metadata reports the highest SemVer bump in the group.
       - name: Enable auto-merge for patch & minor updates
         if: |
-          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
-          steps.meta.outputs.update-type == 'version-update:semver-minor'
+          !contains(steps.meta.outputs.dependency-names, 'dtolnay/rust-toolchain') &&
+          (
+            steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+            steps.meta.outputs.update-type == 'version-update:semver-minor'
+          )
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
