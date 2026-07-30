@@ -905,8 +905,9 @@ fn ci_compile_proves_the_exact_declared_msrv() {
         .as_str()
         .expect("package.rust-version must be a string");
     let rust_release = format!("{rust_version}.0");
-    let msrv_job = workflow_job(CI_WORKFLOW, "msrv");
-    let crlf_workflow = CI_WORKFLOW.lines().collect::<Vec<_>>().join("\r\n");
+    let normalized_workflow = CI_WORKFLOW.replace("\r\n", "\n");
+    let msrv_job = workflow_job(&normalized_workflow, "msrv");
+    let crlf_workflow = normalized_workflow.lines().collect::<Vec<_>>().join("\r\n");
     let crlf_msrv_job = workflow_job(&crlf_workflow, "msrv");
 
     assert!(
