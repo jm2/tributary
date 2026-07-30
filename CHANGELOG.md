@@ -854,6 +854,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `apexsink` used a public key to encrypt outbound audio and is not bundled by Tributary.
 
 ### Fixed
+- **Track Properties, New Playlist, and New Smart Playlist dialogs now open on Linux** —
+  Right-clicking a track or playlist sidebar entry no longer relies on `gtk::PopoverMenu::from_model`,
+  which on some Linux desktop configurations produced an invisible popover whose action clicks
+  were dispatched to handlers that the dialog-opening code never reached. Track Properties, the
+  sidebar playlist-creation button's popover, and every per-row right-click popover are now built
+  through a new `popover_from_menu_model` helper that always attaches a child widget containing
+  one button per enabled action; the existing sidebar `SimpleActionGroup` actions are reused as
+  the activation targets, so the handler-side wiring is unchanged. A regression test verifies
+  that the helper builds a visible popover with the right number of buttons and that clicking
+  one fires its action. Thanks to ggtrigg for the high-quality bug report, reference
+  implementation, and tracing instrumentation that made the root cause visible
+  ([#167](https://github.com/jm2/tributary/pull/167)).
 - **Linux library reads no longer feed a recursive rescan loop** — Filesystem notifications
   explicitly classified as access or access-time observations and produced by Tributary's own
   metadata reads are discarded in the watcher callback, before they can consume the bounded event
