@@ -106,12 +106,14 @@ that depend on the live `notify` backend:
    The production loop uses `WATCHER_DEBOUNCE_MS = 1500ms`. The window
    boundary is not exercised under a real timer.
 
-3. **Cross-platform coalescing behavior.** inotify emits From/To pairs as
-   distinct events; FSEvents emits a single `Modify(Name::Both)`; Windows
-   `ReadDirectoryChangesW` produces a sequence of `Rename` operations that
-   may be coalesced. The current `watcher_batch_pairs_only_adjacent_untracked_windows_halves`
-   covers the inotify shape; the FSEvents/Windows shape is implicit in
-   `watcher_batch_routes_unpairable_and_directory_events_to_reconciliation`.
+3. **Cross-platform backend event shapes.** In pinned `notify` 8.2.0,
+   Linux/inotify emits tracked `From` and `To` events and synthesizes a tracked
+   `Both`; `watcher_batch_deduplicates_linux_from_to_and_both_events` covers
+   that shape. FSEvents emits `Modify(Name::Any)`;
+   `watcher_batch_routes_unpairable_and_directory_events_to_reconciliation`
+   covers that shape. Windows emits untracked `From` and `To` events;
+   `watcher_batch_pairs_only_adjacent_untracked_windows_halves` covers that
+   shape.
 
 ## 4. Fixture cost analysis
 
