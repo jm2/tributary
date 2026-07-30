@@ -251,16 +251,6 @@ def dependency_closure_identities(
     return visited
 
 
-def dependency_closure_names(
-    lock: dict[str, Any],
-    roots: set[tuple[str, str]],
-) -> set[str]:
-    return {
-        name
-        for name, _ in dependency_closure_identities(lock, roots)
-    }
-
-
 def resolved_dependency_edges(
     package: dict[str, Any],
     records: dict[tuple[str, str], dict[str, Any]],
@@ -279,7 +269,6 @@ def validate_dependency_edges(
     before_lock: dict[str, Any],
     after_lock: dict[str, Any],
     transitions: list[Transition],
-    authorized_names: set[str],
     authorized_identities: set[tuple[str, str]],
 ) -> None:
     """Reject semantic edge changes outside the reviewed dependency surface."""
@@ -340,9 +329,7 @@ def validate_dependency_edges(
             edge_surface = set(before_targets) | set(after_targets)
             if (
                 identity in authorized_identities
-                or identity[0] in authorized_names
                 or edge_surface <= authorized_identities
-                or {name for name, _ in edge_surface} <= authorized_names
             ):
                 continue
 
@@ -360,7 +347,7 @@ def validate_bounded_package_changes(
     after_fuzz_lock: dict[str, Any],
     transitions: list[Transition],
 ) -> None:
-    """Reject package-version drift outside the exact root update surface."""
+    """Reject drift outside exact closures rooted at the requested transition."""
 
     old_roots = {
         (transition.name, transition.current_fuzz_version)
@@ -370,26 +357,95 @@ def validate_bounded_package_changes(
         (transition.name, transition.target_root_version)
         for transition in transitions
     }
-    authorized_identities = dependency_closure_identities(
-        before_fuzz_lock, old_roots
-    ) | dependency_closure_identities(current_root_lock, new_roots)
-    allowed_names = changed_package_version_names(base_root_lock, current_root_lock)
-    allowed_names.update(transition.name for transition in transitions)
-    allowed_names.update(name for name, _ in authorized_identities)
+    old_identities = dependency_closure_identities(before_fuzz_lock, old_roots)
+    after_identities = dependency_closure_identities(after_fuzz_lock, new_roots)
+    authorized_identities = old_identities | after_identities
+
+    before_records = package_records_by_identity(before_fuzz_lock)
+    after_records = package_records_by_identity(after_fuzz_lock)
+    root_records = package_records_by_identity(current_root_lock)
+    removed_identities = before_records.keys() - after_records.keys()
+    added_identities = after_records.keys() - before_records.keys()
+    unexpected_removed = removed_identities - old_identities
+    unexpected_added = added_identities - after_identities
+    if unexpected_removed:
+        raise PolicyError(
+            "fuzz lock repair removed package identities outside the exact old "
+            f"dependency closure: {sorted(unexpected_removed)}"
+        )
+    if unexpected_added:
+        raise PolicyError(
+            "fuzz lock repair added package identities outside the exact new "
+            f"dependency closure: {sorted(unexpected_added)}"
+        )
+
+    # Cargo may independently select a different compatible transitive in the
+    # fuzz workspace (for example r-efi 5.2 where the root selected 5.3). Such
+    # an exact after-closure identity is verified by locked Cargo
+    # materialization below. Whenever the exact identity also exists in the
+    # root lock, however, its immutable source/checksum metadata must match the
+    # authoritative root record byte-for-byte.
+    for identity in sorted(after_records.keys() & root_records.keys()):
+        after_metadata = {
+            key: value
+            for key, value in after_records[identity].items()
+            if key != "dependencies"
+        }
+        root_metadata = {
+            key: value
+            for key, value in root_records[identity].items()
+            if key != "dependencies"
+        }
+        if freeze(after_metadata) != freeze(root_metadata):
+            raise PolicyError(
+                "fuzz lock package metadata disagrees with the authoritative "
+                f"root record for {identity[0]}@{identity[1]}"
+            )
+
     validate_dependency_edges(
         before_fuzz_lock,
         after_fuzz_lock,
         transitions,
-        allowed_names,
         authorized_identities,
     )
-    actual_names = changed_package_version_names(before_fuzz_lock, after_fuzz_lock)
-    unexpected_names = actual_names - allowed_names
-    if unexpected_names:
-        raise PolicyError(
-            "fuzz lock repair changed package versions outside the root update "
-            f"surface: {sorted(unexpected_names)}"
+
+
+def validate_submitted_fuzz_update(
+    base_root_lock: dict[str, Any],
+    current_root_lock: dict[str, Any],
+    base_fuzz_lock: dict[str, Any],
+    current_fuzz_lock: dict[str, Any],
+    current_manifest: dict[str, Any],
+) -> tuple[list[Transition], list[Transition]]:
+    """Apply the same base-fuzz-to-head proof used by CI `check` mode.
+
+    An independent fuzz-only update has no requested root-coherence
+    transitions and remains owned by its dedicated Dependabot/CI lane. When
+    the base fuzz lock is stale relative to the current root, every submitted
+    base-to-head change must instead fit the bounded exact-closure proof.
+    """
+
+    requested_transitions = required_transitions(
+        base_root_lock,
+        current_root_lock,
+        base_fuzz_lock,
+        current_manifest,
+    )
+    remaining_transitions = required_transitions(
+        base_root_lock,
+        current_root_lock,
+        current_fuzz_lock,
+        current_manifest,
+    )
+    if requested_transitions and not remaining_transitions:
+        validate_bounded_package_changes(
+            base_root_lock,
+            current_root_lock,
+            base_fuzz_lock,
+            current_fuzz_lock,
+            requested_transitions,
         )
+    return requested_transitions, remaining_transitions
 
 
 def required_transitions(
@@ -476,7 +532,13 @@ def update_fuzz_lock(transitions: list[Transition], *, offline: bool) -> None:
 
 
 def validate_locked_fuzz_metadata(*, offline: bool) -> None:
-    command = [
+    fetch_command = [
+        "fetch",
+        "--manifest-path",
+        str(REPOSITORY / "fuzz" / "Cargo.toml"),
+        "--locked",
+    ]
+    metadata_command = [
         "metadata",
         "--manifest-path",
         str(REPOSITORY / "fuzz" / "Cargo.toml"),
@@ -486,9 +548,16 @@ def validate_locked_fuzz_metadata(*, offline: bool) -> None:
         "--no-deps",
     ]
     if offline:
-        command.insert(1, "--offline")
+        fetch_command.insert(1, "--offline")
+        metadata_command.insert(1, "--offline")
     subprocess.run(
-        ["cargo", *command],
+        ["cargo", *fetch_command],
+        cwd=REPOSITORY,
+        stdout=subprocess.DEVNULL,
+        check=True,
+    )
+    subprocess.run(
+        ["cargo", *metadata_command],
         cwd=REPOSITORY,
         stdout=subprocess.DEVNULL,
         check=True,
@@ -516,19 +585,30 @@ def main() -> int:
     try:
         base = load_toml_from_git(args.base_ref, "Cargo.lock")
         base_manifest = load_toml_from_git(args.base_ref, "Cargo.toml")
+        base_fuzz = load_toml_from_git(args.base_ref, "fuzz/Cargo.lock")
         current = load_toml(ROOT_LOCK)
         fuzz = load_toml(FUZZ_LOCK)
         manifest = load_toml(ROOT_MANIFEST)
-        transitions = required_transitions(base, current, fuzz, manifest)
+        requested_transitions, transitions = validate_submitted_fuzz_update(
+            base,
+            current,
+            base_fuzz,
+            fuzz,
+            manifest,
+        )
 
         if args.mode == "write":
+            if transitions and not requested_transitions:
+                raise PolicyError(
+                    "current fuzz direct-dependency drift was not requested by "
+                    "the exact base-to-root transition; refusing to rewrite it"
+                )
             original_lock = FUZZ_LOCK.read_bytes()
-            original_transitions = transitions
             base_declarations = production_dependency_declarations(base_manifest)
             current_declarations = production_dependency_declarations(manifest)
             graph_refresh_names = {
                 transition.name
-                for transition in transitions
+                for transition in requested_transitions
                 if base_declarations.get(transition.name)
                 != current_declarations.get(transition.name)
             }
@@ -541,22 +621,20 @@ def main() -> int:
                 )
                 update_fuzz_lock(transitions, offline=args.offline)
                 repaired_fuzz = load_toml(FUZZ_LOCK)
-                transitions = required_transitions(
-                    base, current, repaired_fuzz, manifest
+                requested_transitions, transitions = validate_submitted_fuzz_update(
+                    base,
+                    current,
+                    base_fuzz,
+                    repaired_fuzz,
+                    manifest,
                 )
                 if transitions:
                     raise PolicyError(
                         "repair completed without proving every requested "
                         f"transition: {transitions}"
                     )
-                validate_bounded_package_changes(
-                    base,
-                    current,
-                    fuzz,
-                    repaired_fuzz,
-                    original_transitions,
-                )
-                validate_locked_fuzz_metadata(offline=args.offline)
+                if requested_transitions:
+                    validate_locked_fuzz_metadata(offline=args.offline)
             except (
                 OSError,
                 PolicyError,
@@ -565,6 +643,11 @@ def main() -> int:
             ):
                 FUZZ_LOCK.write_bytes(original_lock)
                 raise
+        elif requested_transitions and not transitions:
+            # New exact after-closure identities which are not represented in
+            # the root lock obtain authority from Cargo's locked
+            # source/checksum materialization, not from a crate-name fallback.
+            validate_locked_fuzz_metadata(offline=args.offline)
 
         if transitions:
             print(

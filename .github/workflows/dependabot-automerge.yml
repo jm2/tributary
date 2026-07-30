@@ -4,11 +4,11 @@ name: Dependabot auto-merge
 #
 # How the pieces fit together:
 #   * This workflow only ENABLES GitHub's native auto-merge on the PR.
-#   * The actual gate ("wait for green CI") is enforced by the branch ruleset
-#     on `main` that requires the CI status checks. Auto-merge engages because
-#     that ruleset makes the PR non-immediately-mergeable, then lands it once
-#     the required checks pass. Without that ruleset, `--auto` would either
-#     error or merge immediately without waiting — so the ruleset is required.
+#   * The actual gate ("wait for configured required checks") is enforced by
+#     the live branch ruleset on `main`, not by this file. Before deploying this
+#     workflow, that ruleset must be migrated to the documented stable check
+#     names, including `MSRV`. Auto-merge then lands the PR only after that
+#     configured set passes.
 #   * Majors are NOT auto-merged: they fall through the update-type guard below
 #     and wait for coordinated repair and review.
 #   * Rust toolchain/MSRV proposals are NOT auto-merged at any SemVer level.
@@ -16,16 +16,19 @@ name: Dependabot auto-merge
 #     authoritative pin and requires the complete CI matrix first.
 #
 # Security: uses `pull_request` (NOT `pull_request_target`) and never checks out
-# the PR head, so untrusted code never runs here. A read-only first job queries
-# every changed filename through GitHub's API. The write-capable job cannot
-# start if this workflow is among them, even in a mixed-path PR, so a proposed
-# replacement action ref cannot execute itself before review.
+# the PR head. A read-only first job binds changed-file inspection and metadata
+# extraction to the event's exact head SHA. The action-free write job checks
+# that SHA again immediately before an exact-head-guarded merge request.
 on:
   pull_request:
     paths-ignore:
       - ".github/workflows/dependabot-automerge.yml"
 
 permissions: {}
+
+concurrency:
+  group: dependabot-automerge-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   inspect_changed_files:
@@ -38,6 +41,9 @@ jobs:
       pull-requests: read
     outputs:
       privileged_workflow_unchanged: ${{ steps.changed_files.outputs.safe }}
+      inspected_head_sha: ${{ steps.metadata_head.outputs.head_sha }}
+      dependency_names: ${{ steps.meta.outputs.dependency-names }}
+      update_type: ${{ steps.meta.outputs.update-type }}
     steps:
       # Inline and API-only by design: no proposed third-party action executes
       # before the complete changed-file set has been proven safe.
@@ -47,14 +53,29 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EXPECTED_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
         run: |
           set -euo pipefail
+          pr_api="repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}"
           changed_file_list="${RUNNER_TEMP}/dependabot-changed-files.txt"
+
+          observed_head_before="$(gh api "${pr_api}" --jq '.head.sha')"
+          if [ "${observed_head_before}" != "${EXPECTED_HEAD_SHA}" ]; then
+            echo "PR head changed before file inspection; refusing write access." >&2
+            exit 1
+          fi
+
           gh api --paginate \
-            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+            "${pr_api}/files?per_page=100" \
             --jq '.[] | [.filename, (.previous_filename // "")] | @tsv' \
             > "${changed_file_list}"
+
+          observed_head_after="$(gh api "${pr_api}" --jq '.head.sha')"
+          if [ "${observed_head_after}" != "${EXPECTED_HEAD_SHA}" ]; then
+            echo "PR head changed during file inspection; refusing write access." >&2
+            exit 1
+          fi
 
           observed_changed_files="$(wc -l < "${changed_file_list}")"
           if [ "${observed_changed_files}" -ne "${EXPECTED_CHANGED_FILES}" ]; then
@@ -62,46 +83,102 @@ jobs:
             exit 1
           fi
 
-          if grep -Fq -- \
-            '.github/workflows/dependabot-automerge.yml' \
-            "${changed_file_list}"; then
-            echo "safe=false" >> "${GITHUB_OUTPUT}"
-          else
-            echo "safe=true" >> "${GITHUB_OUTPUT}"
+          safe=true
+          while IFS=$'\t' read -r filename previous_filename; do
+            if [ "${filename}" = '.github/workflows/dependabot-automerge.yml' ] ||
+               [ "${previous_filename}" = '.github/workflows/dependabot-automerge.yml' ]; then
+              safe=false
+              break
+            fi
+          done < "${changed_file_list}"
+
+          echo "safe=${safe}" >> "${GITHUB_OUTPUT}"
+          echo "head_sha=${EXPECTED_HEAD_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Revalidate exact head before metadata
+        id: pre_metadata_head
+        if: steps.changed_files.outputs.safe == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_SHA: ${{ steps.changed_files.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          observed_head="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
+            --jq '.head.sha')"
+          if [ "${observed_head}" != "${EXPECTED_HEAD_SHA}" ]; then
+            echo "PR head changed before metadata extraction; refusing." >&2
+            exit 1
           fi
+          echo "matches=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Fetch Dependabot metadata
+        id: meta
+        if: steps.pre_metadata_head.outputs.matches == 'true'
+        # v3, pinned to the full commit published in GitHub's current example.
+        uses: dependabot/fetch-metadata@d7267f607e9d3fb96fc2fbe83e0af444713e90b7
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Revalidate exact head after metadata
+        id: metadata_head
+        if: steps.meta.outcome == 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_SHA: ${{ steps.changed_files.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          observed_head="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
+            --jq '.head.sha')"
+          if [ "${observed_head}" != "${EXPECTED_HEAD_SHA}" ]; then
+            echo "PR head changed during metadata extraction; refusing." >&2
+            exit 1
+          fi
+          echo "head_sha=${EXPECTED_HEAD_SHA}" >> "${GITHUB_OUTPUT}"
 
   dependabot-automerge:
     needs: inspect_changed_files
     runs-on: ubuntu-latest
     if: |
       needs.inspect_changed_files.outputs.privileged_workflow_unchanged == 'true' &&
+      needs.inspect_changed_files.outputs.inspected_head_sha == github.event.pull_request.head.sha &&
       github.actor == 'dependabot[bot]' &&
       github.event.pull_request.user.login == 'dependabot[bot]' &&
-      github.repository == 'jm2/tributary'
+      github.repository == 'jm2/tributary' &&
+      !contains(needs.inspect_changed_files.outputs.dependency_names, 'dtolnay/rust-toolchain') &&
+      !contains(needs.inspect_changed_files.outputs.dependency_names, 'dependabot/fetch-metadata') &&
+      (
+        needs.inspect_changed_files.outputs.update_type == 'version-update:semver-patch' ||
+        needs.inspect_changed_files.outputs.update_type == 'version-update:semver-minor'
+      )
     permissions:
       contents: write
       pull-requests: write
     steps:
-      - name: Fetch Dependabot metadata
-        id: meta
-        # v3, pinned to the full commit published in GitHub's current example.
-        uses: dependabot/fetch-metadata@d7267f607e9d3fb96fc2fbe83e0af444713e90b7
-        with:
-          github-token: "${{ secrets.GITHUB_TOKEN }}"
-
-      # Enable auto-merge ONLY for patch + minor bumps which are not Rust
-      # toolchain proposals. Major bumps (version-update:semver-major) and every
-      # dtolnay/rust-toolchain bump are left for coordinated repair/review. For
-      # grouped PRs, fetch-metadata reports the highest SemVer bump in the group.
-      - name: Enable auto-merge for patch & minor updates
-        if: |
-          !contains(steps.meta.outputs.dependency-names, 'dtolnay/rust-toolchain') &&
-          !contains(steps.meta.outputs.dependency-names, 'dependabot/fetch-metadata') &&
-          (
-            steps.meta.outputs.update-type == 'version-update:semver-patch' ||
-            steps.meta.outputs.update-type == 'version-update:semver-minor'
-          )
-        run: gh pr merge --auto --squash "$PR_URL"
+      # Major bumps, every Rust/MSRV proposal, and metadata-action self-updates
+      # never reach this action-free write job.
+      - name: Enable exact-head auto-merge for patch & minor updates
+        shell: bash
+        run: |
+          set -euo pipefail
+          pr_api="repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}"
+          observed_head="$(gh api "${pr_api}" --jq '.head.sha')"
+          if [ "${observed_head}" != "${EXPECTED_HEAD_SHA}" ]; then
+            echo "PR head changed before guarded merge; refusing auto-merge." >&2
+            exit 1
+          fi
+          gh pr merge \
+            --auto \
+            --squash \
+            --match-head-commit "${EXPECTED_HEAD_SHA}" \
+            "${PR_URL}"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_SHA: ${{ needs.inspect_changed_files.outputs.inspected_head_sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

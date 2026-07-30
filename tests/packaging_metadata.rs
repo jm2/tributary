@@ -1056,10 +1056,13 @@ fn dependabot_groups_coupled_updates_and_excludes_toolchains_from_automerge() {
     );
 }
 
+fn dependabot_automerge_workflow() -> serde_yaml::Value {
+    serde_yaml::from_str(DEPENDABOT_AUTOMERGE).expect("Dependabot auto-merge workflow must parse")
+}
+
 #[test]
-fn dependabot_automerge_has_read_only_mixed_path_preflight() {
-    let workflow: serde_yaml::Value = serde_yaml::from_str(DEPENDABOT_AUTOMERGE)
-        .expect("Dependabot auto-merge workflow must parse");
+fn dependabot_automerge_inspection_and_metadata_stay_read_only_and_head_bound() {
+    let workflow = dependabot_automerge_workflow();
     assert!(
         workflow["permissions"]
             .as_mapping()
@@ -1079,10 +1082,25 @@ fn dependabot_automerge_has_read_only_mixed_path_preflight() {
         .as_sequence()
         .expect("changed-file inspection steps must be a sequence");
     assert!(
-        inspect_steps.iter().all(|step| step.get("uses").is_none()),
-        "no third-party action may run before changed-file denial"
+        inspect_steps
+            .first()
+            .is_some_and(|step| step.get("uses").is_none()),
+        "changed-file and exact-head denial must be inline and action-free"
     );
+    assert!(
+        inspect_steps.iter().any(|step| {
+            step.get("uses").and_then(serde_yaml::Value::as_str)
+                == Some("dependabot/fetch-metadata@d7267f607e9d3fb96fc2fbe83e0af444713e90b7")
+                && step.get("if").and_then(serde_yaml::Value::as_str)
+                    == Some("steps.pre_metadata_head.outputs.matches == 'true'")
+        }),
+        "metadata extraction must run only after a fresh read-only exact-head preflight"
+    );
+}
 
+#[test]
+fn dependabot_automerge_writer_is_action_free_concurrent_and_exact_head_guarded() {
+    let workflow = dependabot_automerge_workflow();
     let writer = &workflow["jobs"]["dependabot-automerge"];
     assert_eq!(writer["needs"].as_str(), Some("inspect_changed_files"));
     assert_eq!(writer["permissions"]["contents"].as_str(), Some("write"));
@@ -1098,6 +1116,29 @@ fn dependabot_automerge_has_read_only_mixed_path_preflight() {
             )),
         "the write job must depend on an affirmative read-only inspection result"
     );
+    let writer_steps = writer["steps"]
+        .as_sequence()
+        .expect("write job steps must be a sequence");
+    assert!(
+        writer_steps.iter().all(|step| step.get("uses").is_none()),
+        "the write-capable job must remain third-party-action-free"
+    );
+    assert_eq!(
+        writer_steps.len(),
+        1,
+        "the write-capable job must contain only the guarded merge command"
+    );
+    assert_eq!(
+        workflow["concurrency"]["cancel-in-progress"].as_bool(),
+        Some(true),
+        "a newer revision of one PR must cancel its stale automation run"
+    );
+    assert!(
+        workflow["concurrency"]["group"]
+            .as_str()
+            .is_some_and(|group| group.contains("github.event.pull_request.number")),
+        "workflow concurrency must be scoped to the exact pull request"
+    );
 
     assert!(
         DEPENDABOT_AUTOMERGE.contains("pull_request:")
@@ -1105,9 +1146,15 @@ fn dependabot_automerge_has_read_only_mixed_path_preflight() {
             && !DEPENDABOT_AUTOMERGE.contains("actions/checkout")
             && DEPENDABOT_AUTOMERGE.contains("gh api --paginate")
             && DEPENDABOT_AUTOMERGE.contains("github.event.pull_request.changed_files")
+            && DEPENDABOT_AUTOMERGE.contains("github.event.pull_request.head.sha")
+            && DEPENDABOT_AUTOMERGE.contains("observed_head_before")
+            && DEPENDABOT_AUTOMERGE.contains("observed_head_after")
+            && DEPENDABOT_AUTOMERGE.contains("pre_metadata_head")
+            && DEPENDABOT_AUTOMERGE.contains("metadata_head")
+            && DEPENDABOT_AUTOMERGE.contains("observed_head")
+            && DEPENDABOT_AUTOMERGE.contains("--match-head-commit")
             && DEPENDABOT_AUTOMERGE.contains(".previous_filename")
             && DEPENDABOT_AUTOMERGE.contains("observed_changed_files")
-            && DEPENDABOT_AUTOMERGE.contains("grep -Fq")
             && DEPENDABOT_AUTOMERGE.contains(
                 "dependabot/fetch-metadata@d7267f607e9d3fb96fc2fbe83e0af444713e90b7"
             )
@@ -1119,12 +1166,12 @@ fn dependabot_automerge_has_read_only_mixed_path_preflight() {
                 .contains("github.event.pull_request.user.login == 'dependabot[bot]'")
             && DEPENDABOT_AUTOMERGE.contains("github.repository == 'jm2/tributary'")
             && DEPENDABOT_AUTOMERGE.contains(
-                "!contains(steps.meta.outputs.dependency-names, 'dtolnay/rust-toolchain')"
+                "!contains(needs.inspect_changed_files.outputs.dependency_names, 'dtolnay/rust-toolchain')"
             )
             && DEPENDABOT_AUTOMERGE.contains(
-                "!contains(steps.meta.outputs.dependency-names, 'dependabot/fetch-metadata')"
+                "!contains(needs.inspect_changed_files.outputs.dependency_names, 'dependabot/fetch-metadata')"
             ),
-        "write-capable Dependabot automation must be pinned, checkout-free, API-preflighted, narrowly admitted, mixed-path self-update-safe, and refuse toolchain auto-merge"
+        "Dependabot automation must be pinned, checkout-free, exact-head API-preflighted, narrowly admitted, race-contained, mixed-path self-update-safe, and refuse toolchain auto-merge"
     );
 }
 

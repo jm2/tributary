@@ -3,12 +3,45 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import sync_fuzz_lock
 import sync_rust_toolchain
+
+
+def workflow_run_script(job: str, step_name: str) -> str:
+    """Extract one literal Bash `run: |` body from the checked-in workflow."""
+
+    workflow = (
+        sync_fuzz_lock.REPOSITORY
+        / ".github"
+        / "workflows"
+        / "dependabot-automerge.yml"
+    ).read_text()
+    lines = workflow.splitlines()
+    job_marker = f"  {job}:"
+    step_marker = f"      - name: {step_name}"
+    try:
+        job_start = lines.index(job_marker)
+        step_start = lines.index(step_marker, job_start)
+        run_start = lines.index("        run: |", step_start) + 1
+    except ValueError as error:
+        raise AssertionError(
+            f"cannot locate {job}/{step_name} literal run body"
+        ) from error
+
+    body: list[str] = []
+    for line in lines[run_start:]:
+        if line and not line.startswith("          "):
+            break
+        body.append(line[10:] if line else "")
+    if not body:
+        raise AssertionError(f"{job}/{step_name} has an empty run body")
+    return "\n".join(body) + "\n"
 
 
 def lock(direct: list[str], versions: dict[str, list[str]]) -> dict:
@@ -29,6 +62,115 @@ def lock(direct: list[str], versions: dict[str, list[str]]) -> dict:
             for release in releases
         )
     return {"version": 4, "package": packages}
+
+
+class DependabotAutomergeRaceTests(unittest.TestCase):
+    def run_workflow_script(
+        self,
+        script: str,
+        *,
+        heads: str,
+        expected_head: str = "H1",
+        merge_head: str = "H1",
+    ) -> tuple[subprocess.CompletedProcess[str], str, str]:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            state = root / "state"
+            calls = root / "calls"
+            output = root / "output"
+            fake_gh = fake_bin / "gh"
+            fake_gh.write_text(
+                """#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+arguments = sys.argv[1:]
+state_path = pathlib.Path(os.environ["FAKE_GH_STATE"])
+calls_path = pathlib.Path(os.environ["FAKE_GH_CALLS"])
+with calls_path.open("a") as calls:
+    calls.write(repr(arguments) + "\\n")
+
+if arguments and arguments[0] == "api":
+    if any("/files?" in argument for argument in arguments):
+        print("Cargo.lock\\t")
+        raise SystemExit(0)
+    heads = os.environ["FAKE_GH_HEADS"].split(",")
+    index = int(state_path.read_text()) if state_path.exists() else 0
+    print(heads[min(index, len(heads) - 1)])
+    state_path.write_text(str(index + 1))
+    raise SystemExit(0)
+
+if arguments[:2] == ["pr", "merge"]:
+    guard_index = arguments.index("--match-head-commit") + 1
+    guarded_head = arguments[guard_index]
+    raise SystemExit(0 if guarded_head == os.environ["FAKE_MERGE_HEAD"] else 42)
+
+raise SystemExit(64)
+"""
+            )
+            fake_gh.chmod(0o755)
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "RUNNER_TEMP": str(root),
+                "GITHUB_OUTPUT": str(output),
+                "GITHUB_REPOSITORY": "jm2/tributary",
+                "GH_TOKEN": "read-only-test-token",
+                "PR_NUMBER": "7",
+                "PR_URL": "https://github.invalid/jm2/tributary/pull/7",
+                "EXPECTED_HEAD_SHA": expected_head,
+                "EXPECTED_CHANGED_FILES": "1",
+                "FAKE_GH_STATE": str(state),
+                "FAKE_GH_CALLS": str(calls),
+                "FAKE_GH_HEADS": heads,
+                "FAKE_MERGE_HEAD": merge_head,
+            }
+            completed = subprocess.run(
+                ["bash"],
+                input=script,
+                cwd=sync_fuzz_lock.REPOSITORY,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            return (
+                completed,
+                calls.read_text() if calls.exists() else "",
+                output.read_text() if output.exists() else "",
+            )
+
+    def test_same_count_h1_h2_file_inspection_fails_closed(self):
+        script = workflow_run_script(
+            "inspect_changed_files",
+            "Deny privileged workflow changes",
+        )
+        completed, calls, output = self.run_workflow_script(
+            script,
+            heads="H1,H2",
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("changed during file inspection", completed.stderr)
+        self.assertEqual(calls.count("/files?"), 1)
+        self.assertNotIn("safe=true", output)
+
+    def test_server_guard_rejects_h2_after_final_h1_readback(self):
+        script = workflow_run_script(
+            "dependabot-automerge",
+            "Enable exact-head auto-merge for patch & minor updates",
+        )
+        completed, calls, _ = self.run_workflow_script(
+            script,
+            heads="H1",
+            merge_head="H2",
+        )
+
+        self.assertEqual(completed.returncode, 42)
+        self.assertIn("'--match-head-commit', 'H1'", calls)
 
 
 class FuzzLockPolicyTests(unittest.TestCase):
@@ -227,6 +369,134 @@ class FuzzLockPolicyTests(unittest.TestCase):
                 [sync_fuzz_lock.Transition("sha2", "0.10.9", "0.11.0")],
             )
 
+    def test_bounded_repair_rejects_same_name_target_outside_exact_closures(self):
+        base = lock(
+            ["facade 1.0.0"],
+            {
+                "facade": ["1.0.0"],
+                "shared": ["1.0.0", "9.0.0"],
+                "unrelated": ["1.0.0"],
+            },
+        )
+        current = lock(
+            ["facade 1.1.0"],
+            {
+                "facade": ["1.0.0", "1.1.0"],
+                "shared": ["1.0.0", "9.0.0"],
+                "unrelated": ["1.0.0"],
+            },
+        )
+        stale_fuzz = lock(
+            ["facade 1.0.0"],
+            {
+                "facade": ["1.0.0"],
+                "shared": ["1.0.0", "9.0.0"],
+                "unrelated": ["1.0.0"],
+            },
+        )
+        stale_fuzz["package"][-1]["dependencies"] = ["shared 1.0.0"]
+        unsafe_fuzz = lock(
+            ["facade 1.1.0"],
+            {
+                "facade": ["1.0.0", "1.1.0"],
+                "shared": ["1.0.0", "9.0.0"],
+                "unrelated": ["1.0.0"],
+            },
+        )
+        unsafe_fuzz["package"][-1]["dependencies"] = ["shared 9.0.0"]
+
+        with self.assertRaises(sync_fuzz_lock.PolicyError):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                current,
+                stale_fuzz,
+                unsafe_fuzz,
+                [sync_fuzz_lock.Transition("facade", "1.0.0", "1.1.0")],
+            )
+
+    def test_check_mode_rejects_raw_rebind_after_direct_transition_is_repaired(self):
+        base = lock(
+            ["facade 1.0.0"],
+            {
+                "facade": ["1.0.0"],
+                "shared": ["1.0.0", "9.0.0"],
+                "unrelated": ["1.0.0"],
+            },
+        )
+        current = lock(
+            ["facade 1.1.0"],
+            {
+                "facade": ["1.0.0", "1.1.0"],
+                "shared": ["1.0.0", "9.0.0"],
+                "unrelated": ["1.0.0"],
+            },
+        )
+        base_fuzz = lock(
+            ["facade 1.0.0"],
+            {
+                "facade": ["1.0.0"],
+                "shared": ["1.0.0", "9.0.0"],
+                "unrelated": ["1.0.0"],
+            },
+        )
+        base_fuzz["package"][-1]["dependencies"] = ["shared 1.0.0"]
+        submitted_fuzz = lock(
+            ["facade 1.1.0"],
+            {
+                "facade": ["1.0.0", "1.1.0"],
+                "shared": ["1.0.0", "9.0.0"],
+                "unrelated": ["1.0.0"],
+            },
+        )
+        submitted_fuzz["package"][-1]["dependencies"] = ["shared 9.0.0"]
+
+        with self.assertRaises(sync_fuzz_lock.PolicyError):
+            sync_fuzz_lock.validate_submitted_fuzz_update(
+                base,
+                current,
+                base_fuzz,
+                submitted_fuzz,
+                {"dependencies": {"facade": "1"}},
+            )
+
+    def test_fuzz_only_update_remains_independent_when_base_needs_no_repair(self):
+        root = lock(
+            ["facade 1.1.0"],
+            {
+                "facade": ["1.1.0"],
+                "shared": ["1.0.0", "2.0.0"],
+                "fuzz-only": ["1.0.0"],
+            },
+        )
+        base_fuzz = lock(
+            ["facade 1.1.0"],
+            {
+                "facade": ["1.1.0"],
+                "shared": ["1.0.0", "2.0.0"],
+                "fuzz-only": ["1.0.0"],
+            },
+        )
+        base_fuzz["package"][-1]["dependencies"] = ["shared 1.0.0"]
+        updated_fuzz = lock(
+            ["facade 1.1.0"],
+            {
+                "facade": ["1.1.0"],
+                "shared": ["1.0.0", "2.0.0"],
+                "fuzz-only": ["1.0.0"],
+            },
+        )
+        updated_fuzz["package"][-1]["dependencies"] = ["shared 2.0.0"]
+
+        requested, remaining = sync_fuzz_lock.validate_submitted_fuzz_update(
+            root,
+            root,
+            base_fuzz,
+            updated_fuzz,
+            {"dependencies": {"facade": "1"}},
+        )
+        self.assertEqual(requested, [])
+        self.assertEqual(remaining, [])
+
     def test_bounded_repair_rejects_same_version_source_rewrite(self):
         base = lock(["sha2"], {"sha2": ["0.10.9"]})
         current = lock(
@@ -254,6 +524,66 @@ class FuzzLockPolicyTests(unittest.TestCase):
                 unsafe_fuzz,
                 [sync_fuzz_lock.Transition("sha2", "0.10.9", "0.11.0")],
             )
+
+    def test_bounded_repair_rejects_new_root_identity_source_and_checksum_mismatch(
+        self,
+    ):
+        base = lock(["facade 1.0.0"], {"facade": ["1.0.0"]})
+        current = lock(
+            ["facade 1.1.0"],
+            {"facade": ["1.0.0", "1.1.0"]},
+        )
+        stale_fuzz = lock(["facade 1.0.0"], {"facade": ["1.0.0"]})
+        unsafe_fuzz = lock(
+            ["facade 1.1.0"],
+            {"facade": ["1.0.0", "1.1.0"]},
+        )
+        for package in current["package"]:
+            if package["name"] == "facade" and package["version"] == "1.1.0":
+                package["checksum"] = "authoritative"
+        for package in unsafe_fuzz["package"]:
+            if package["name"] == "facade" and package["version"] == "1.1.0":
+                package["source"] = "git+https://invalid.example/facade"
+                package["checksum"] = "tampered"
+
+        with self.assertRaises(sync_fuzz_lock.PolicyError):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                current,
+                stale_fuzz,
+                unsafe_fuzz,
+                [sync_fuzz_lock.Transition("facade", "1.0.0", "1.1.0")],
+            )
+
+    def test_bounded_repair_allows_exact_new_fuzz_resolver_identity(self):
+        base = lock(
+            ["facade 1.0.0"],
+            {"facade": ["1.0.0"], "component": ["1.0.0"]},
+        )
+        base["package"][1]["dependencies"] = ["component 1.0.0"]
+        current = lock(
+            ["facade 1.1.0"],
+            {"facade": ["1.1.0"], "component": ["1.2.0"]},
+        )
+        current["package"][1]["dependencies"] = ["component 1.2.0"]
+        stale_fuzz = lock(
+            ["facade 1.0.0"],
+            {"facade": ["1.0.0"], "component": ["1.0.0"]},
+        )
+        stale_fuzz["package"][1]["dependencies"] = ["component 1.0.0"]
+        repaired_fuzz = lock(
+            ["facade 1.1.0"],
+            {"facade": ["1.1.0"], "component": ["1.1.0"]},
+        )
+        repaired_fuzz["package"][1]["dependencies"] = ["component 1.1.0"]
+
+        sync_fuzz_lock.validate_bounded_package_changes(
+            base,
+            current,
+            stale_fuzz,
+            repaired_fuzz,
+            [sync_fuzz_lock.Transition("facade", "1.0.0", "1.1.0")],
+        )
 
     def test_bounded_repair_allows_nonsemantic_edge_disambiguation(self):
         base = lock(["sha2"], {"sha2": ["0.10.9"]})
