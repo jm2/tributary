@@ -6,7 +6,10 @@ Method: 13 subsystem dimensions audited by independent agents, **every finding a
 
 ## Summary
 
-- **70 confirmed findings**: 0 critical · 7 high · 24 medium · 36 low · 3 info
+- **66 unique confirmed findings**: 0 critical · 7 high · 22 medium · 34 low · 3 info
+- Four duplicate verifier records from the original review were consolidated here: the DMAP
+  recursion, Chromecast polling lifecycle, local Chromecast startup, and non-hierarchical URL
+  findings had each been counted twice at different severities.
 - No memory-unsafety in `unsafe` blocks beyond the noted win32 HiDPI logic bug; the standout remote-crash risk is the **DMAP parser stack overflow** (high).
 - Recurring themes: credential leakage via **error-path logging** (reqwest URL Display), **no timeouts / unbounded buffering** on remote clients, **Chromecast/AirPlay output lifecycle** (thread+connection leaks, no teardown), **N+1 DB/HTTP** patterns, and **partial-failure non-atomicity** in playlist writes.
 
@@ -86,9 +89,11 @@ Net effect: selecting any library track (or auto-advancing) while AirPlay is the
 
 **What:** decode_value decodes any container-classified tag by re-entering the parser (Container => parse_nodes(content)); parse_nodes is many0(parse_single_node) and parse_single_node calls decode_value again. No recursion-depth limit. Seven tag codes are containers; an attacker nests the same container tag arbitrarily deep — each level is an 8-byte TLV header but ~3-4 stack frames, so tens of KB recurses thousands deep and overflows the 2 MiB tokio worker stack. take(length) bounds heap allocation, so only the call stack is unbounded. Remotely triggerable via a malicious/MITM DAAP server (plaintext HTTP LAN).
 
-**Impact:** 
+**Impact:** A malicious or malformed DAAP server on the local network can remotely abort the
+entire process.
 
-**Fix:** 
+**Fix:** Thread a depth counter through `parse_nodes`, `parse_single_node`, and `decode_value`,
+reject nesting beyond a small cap (for example, 32), and consider a total-node cap as well.
 
 **Verifier note:** The finding is real. The parser has a genuine unbounded mutual recursion with no depth limit, driven directly by attacker-controlled network bytes.
 
@@ -140,7 +145,7 @@ Impact: the leaked (t,s) pair is a replayable Subsonic credential (server verifi
 **Verifier note:** The reset click handler holds a RefMut for the duration of the closure: it acquires `let mut cfg = config.borrow_mut();` at line 478 and continues to use `cfg` at lines 488-490 (apply_column_visibility/apply_column_order/save_config), so under NLL the mutable borrow is alive while the loop at lines 485-487 runs. Line 486 calls `check.set_active(...)`. In GTK4, gtk::CheckButton::set_active emits the `toggled` signal synchronously whenever the active state changes, which immediately invokes the per-column `connect_toggled` closure. That closure does its own `let mut cfg = config.borrow_mut();` at line 444 on the same Rc<RefCell<AppConfig>> (cloned at line 440), producing a second live mutable borrow and a guaranteed `already mutably borrowed: BorrowMutError`. The closure runs across the GLib/FFI trampoline, so the panic cannot unwind and aborts the process. The trigger is the common case: DEFAULT_VISIBLE == ALL_COLUMNS (line 30), so reset sets every checkbox active; any previously-hidden column flips inactive->active, changing state and firing `toggled`. The Reset-to-Defaults button exists specifically to restore hidden columns, so the crash occurs in precisely its intended use. No signal blocking, early drop(cfg) before the loop, or re-entrancy guard exists. High severity is correct: a single click in a documented, common workflow crashes the entire app.
 
 
-### Medium (24)
+### Medium (22 unique; 2 duplicate verifier records retained)
 
 #### M1. Chromecast spawns a new polling thread + TLS connection per load_uri with no teardown — leak, duplicate TrackEnded, and stale events after output switch
 *`src/audio/chromecast_output.rs:176-212 (cast_media), 313-426 (polling loop); no Drop impl on ChromecastOutput (struct 62-83)` · audio-outputs · resource leak / race / stale state · verifier confidence: high*
@@ -234,7 +239,10 @@ Severity: this is a robustness/availability/UX defect (indefinite hang, stuck sp
 **Verifier note:** The cited code exhibits the described pattern with no mitigating invariant or guard. refresh_library (src/subsonic/backend.rs:115-240) issues one getArtists.view (line 119), then iterates artists in a plain `for` loop awaiting one getArtist.view per artist (lines 137-140), and within each artist iterates albums in a nested `for` loop awaiting one getAlbum.view per album (lines 160-163). Every request is awaited individually; there is no concurrency primitive (no join_all/try_join!/buffer_unordered), so the calls are strictly serialized. Each call is a genuine HTTP round-trip (src/subsonic/client.rs:190: `self.http.get(url.as_str()).send().await`). The total is exactly 1 + A + B serial round-trips. Because refresh_library is awaited inside connect (line 109) before the backend is returned, this latency blocks the whole connect path before any tracks reach the UI. This matches the finding precisely. Severity "medium" is appropriate: it is a real, user-visible performance/scalability problem (potentially minutes of startup latency on large remote libraries), but it is not a correctness, data-loss, or security defect — it degrades UX rather than producing wrong behavior, and small/local libraries are largely unaffected. The comparative claims (Jellyfin/Plex fewer calls, Subsonic bulk endpoints exist) are contextual and do not affect the verdict; the Subsonic code itself clearly demonstrates the serialized N+1 pattern.
 
 
-#### M7. DMAP parser recurses without a depth limit — a crafted DAAP response causes stack overflow and aborts the process
+#### M7. Duplicate verifier record for H5 — retained for provenance, not separately counted
+
+> Canonical finding and severity: **H5 (high)**. This original medium-severity verifier record is
+> retained only to preserve the review trail.
 *`src/daap/dmap.rs:178-186` · backends-remote · Untrusted input / crash (DoS) · verifier confidence: high*
 
 **What:** decode_value() for a container tag calls parse_nodes(content) (line 181), which calls parse_single_node -> decode_value again (line 172), with no recursion-depth bound. Several tags recurse (msrv, mlog, mupd, avdb, adbs, mlcl, mlit at tag_type lines 79-85), and mlit may nest inside mlit/mlcl, so an attacker can emit arbitrarily deep nesting using ~8 bytes of header per level. A few hundred KB of nested containers (~50k levels) exhausts the thread stack; a Rust stack overflow is an uncatchable SIGABRT that kills the whole GTK app, not just the parse task. DAAP servers are auto-discovered and one-click-connected (ui/source_connect.rs:549), so a rogue device advertising a share on the LAN can crash the app on connect.
@@ -258,7 +266,10 @@ Severity: this is a robustness/availability/UX defect (indefinite hang, stuck sp
 **Verifier note:** Both claims are confirmed by the current code. (A) refresh_library uses `?` on all three per-section calls (tracks backend.rs:159-162, albums 185-188, artists 218-221). Any error there propagates out of refresh_library, through init (backend.rs:106 `backend.refresh_library().await?;`), and fails connect()/from_client(). Because the cache is written only once at the end (backend.rs:258-265), a failure mid-iteration discards all data accumulated so far, including libraries that already fetched successfully — the whole backend connection fails on a single transient error. This is genuinely inconsistent with the Subsonic backend, which tolerates per-artist and per-album failures with `continue` (subsonic/backend.rs:144-152, 167-174). (B) The track/album/artist requests pass only `("type", "N")` with no X-Plex-Container-Start/Size (backend.rs:159-162), and the entire body is buffered in one shot via resp.json::<T>() at client.rs:256. The response's `size` field exists on the container (api.rs:93-99, also 211-218, 276-284) but refresh_library never reads it — only `.metadata` is iterated — so a server-capped/truncated response goes undetected. The factual basis is solid. Severity: this is a robustness/availability and correctness concern, not a crash, data-corruption, or security issue (errors are returned gracefully). The memory-spike angle is partly inherent to the design since the full library is held in the in-memory cache regardless, which tempers it; but the abort-everything-on-one-error behavior and silent-truncation risk are real and reinforce each other (the large unpaginated fetch is the request most likely to time out/500). Medium is a fair rating, though low would also be defensible.
 
 
-#### M9. Chromecast: every load_uri spawns an uncancellable session/polling thread — leaks threads + TLS connections and races duplicate PlayerEvents on manual Next/re-load
+#### M9. Duplicate verifier record for M1 — retained for provenance, not separately counted
+
+> Canonical finding and severity: **M1 (medium)**. This record is retained only to preserve the
+> review trail.
 *`src/audio/chromecast_output.rs:176-212, 216-427, 582-590` · concurrency · resource-leak / event-race · verifier confidence: high*
 
 **What:** load_uri() -> cast_media() (176-212) unconditionally spawns a fresh std::thread that opens its own CastDevice TLS connection and runs the infinite heartbeat/position poll loop in cast_media_with_session() (323-424). Nothing tracks or cancels the *previous* session's thread. The loop only `break`s on the device's own idle_reason (Finished/Cancelled/Error/Interrupted), a status error, or an empty media session (337-417). On a NATURAL track end the old thread sends TrackEnded and breaks before the new one starts, so auto-advance is clean. But on a MANUAL Next/Previous (or repeat-one replay) while casting, the main thread calls load_uri again and spawns thread T2 while the old thread T1 is still polling. T1 and T2 are separate sender connections to the same receiver app/transport, so after T2 calls media.load, T1's get_status returns the new media in `Playing` state (idle_reason None) and T1 keeps polling forever — emitting its own PositionChanged/StateChanged events (348-371) that compete with T2's. Both also write the shared current_state Arc<Mutex>. Result: one leaked background thread + TLS connection per manual navigation, plus duplicate position/state events that fight over the scrubber and play/pause icon on the GTK side.
@@ -375,9 +386,11 @@ I downgrade severity from high to medium because the finding's framing ("panics 
 
 **What:** Every DAAP response uses resp.bytes().await (buffers entire body, no size limit) and the shared client has no timeout. A malicious DAAP server can return a multi-GB/endless body -> OOM or indefinite hang on connect/fetch. Only probe_requires_password sets a 5s timeout; handshake + fetch_tracks set neither size cap nor timeout.
 
-**Impact:** 
+**Impact:** A malicious or misbehaving DAAP server can exhaust client memory or leave a
+connection/library fetch hung indefinitely.
 
-**Fix:** 
+**Fix:** Apply connect and whole-request deadlines and consume the response through a streamed hard
+byte cap; a `Content-Length` check alone is insufficient.
 
 **Verifier note:** The factual claims are confirmed by the current code. build_http_client() (src/daap/client.rs:445-452) constructs the reqwest::Client with no .timeout()/.connect_timeout(). Every handshake step in connect() and fetch_tracks() issues .send().await with no per-request .timeout() and then resp.bytes().await with no size cap: server-info (send L67, bytes L81-87), login (send L116-122, bytes L139-145), update (send L167-173, bytes L182-188), databases (send L206-212, bytes L221-227), and items (send L281-288, bytes L303-309). Only probe_requires_password sets .timeout(Duration::from_secs(5)) at L388. reqwest has no default request timeout and no default max-body limit, so bytes() reads the full body stream until EOF — a malicious/compromised DAAP server can return an endless/multi-GB body (OOM) or stall/trickle the body (indefinite hang). Callers in src/daap/backend.rs (connect L78, fetch_tracks L95) do not wrap these in tokio::time::timeout, so nothing mitigates it. The cited rationale that the shared client must stay timeout-less because streams are long-lived does not justify these specific metadata requests: audio streaming uses GStreamer via stream_url, not this client; http_clone is only reused for ping/logout. Other backends in the same repo do set timeouts (radio/client.rs, album_art.rs:39, window.rs:646), so this is an oversight/inconsistency, not a sound global decision. Impact is a client-side DoS (crash/hang) gated on connecting to a malicious server; for an mDNS-auto-discovering LAN client this precondition is low-friction, so medium is fair (low also defensible since there is no data/code compromise). Not a false positive — there is no invariant, guard, or platform behavior that bounds body size or read duration.
 
@@ -486,7 +499,7 @@ Net effect: "Add folder" shows a row but loads no tracks (no scan, no watch) unt
 **Verifier note:** on_filter rebuilds new TrackObjects and appends one by one after remove_all, emitting N signals, where the avoided splice path exists.
 
 
-### Low (36)
+### Low (34 unique; 2 duplicate verifier records retained)
 
 #### L1. MPD output selection picks the wrong saved server when Chromecast rows precede the MPD row
 *`src/ui/output_switch.rs:193-241 (handle_mpd_switch), 207-225` · audio-outputs · correctness / indexing · verifier confidence: high*
@@ -539,7 +552,10 @@ HOWEVER, the medium rating is overstated; the realistic added risk is low (defen
 The one genuinely novel leak — an honest-but-curious or compromised HTTPS endpoint redirecting an account-wide Plex token to a third party that does not already hold it — is a narrow scenario. Setting a stricter redirect policy (e.g. limiting/forbidding cross-origin redirects) is reasonable hardening, but it does not rise to a medium-severity vulnerability. Corrected severity: low.
 
 
-#### L4. api_url/stream_url use .expect("base URL cannot-be-a-base"), panicking on a user-entered non-hierarchical URL
+#### L4. Duplicate verifier record for M15 — retained for provenance, not separately counted
+
+> Canonical finding and severity: **M15 (medium)**. This original low-severity verifier record is
+> retained only to preserve the review trail.
 *`src/subsonic/client.rs:127` · backends-remote · Panic / input validation · verifier confidence: high*
 
 **What:** URL construction calls `url.path_segments_mut().expect("base URL cannot-be-a-base")` in Subsonic (client.rs:127), Jellyfin (client.rs:194), and Plex (client.rs:177). The server URL is user-entered in the connect dialogs. Url::parse accepts cannot-be-a-base inputs (e.g. `foo:bar`, `mailto:x`) without error, but path_segments_mut() then returns Err and .expect() panics. The panic occurs inside the detached connect spawn task, so it does not crash the whole process, but the task dies and no BackendError is delivered to the UI — the user just sees a connect that silently never completes.
@@ -582,7 +598,10 @@ However the rating is correctly kept LOW (not higher) because the threat model i
 Secondary context in the finding ("combined with the missing timeouts") is also borne out: the shared `build_http_client` (src/daap/client.rs:436-453) sets no timeout, and the inline comment at lines 383-385 confirms the shared client deliberately carries no timeout (only the password probe sets a per-request 5s override). That reinforces but is not central to this body-buffering finding.
 
 
-#### L6. Chromecast: rt_handle captured with Handle::try_current() on the GTK main thread is always None — embedded cast HTTP server / local-file casting is dead, and resolve_uri would block_on the main thread
+#### L6. Duplicate verifier record for M4 — retained for provenance, not separately counted
+
+> Canonical finding and severity: **M4 (medium)**. This original low-severity verifier record is
+> retained only to preserve the review trail.
 *`src/audio/chromecast_output.rs:110, 147-168` · concurrency · tokio-bridging · verifier confidence: high*
 
 **What:** ChromecastOutput::new() is only ever constructed from output_switch.rs:141, which runs inside a GTK signal callback on the main thread. The tokio runtime is created on a separate, parked background thread (main.rs:173-188: Builder::new_multi_thread() ... rt.block_on(pending())), so the GTK main thread has no current runtime context. Therefore `tokio::runtime::Handle::try_current().ok()` at line 110 always evaluates to None. resolve_uri() (147-168) then takes the `cast_server` Mutex and, for a file:// URI, returns Err("No tokio runtime available"), so the documented local-file casting feature (and the whole CastHttpServer) is non-functional. (It is additionally masked today because play_track_at/play_local_file auto-switch away from Chromecast for file:// URIs, so the path is doubly dead.) Note also that even if a handle were present, line 159 calls rt.block_on(CastHttpServer::start()) synchronously on the GTK main thread, which would block the UI on network bind.
@@ -655,9 +674,12 @@ Net: a real but minor robustness/defense-in-depth gap (trivial to fix by clampin
 
 **What:** reorder_entries iterates the new ordering doing find_by_id + update per entry (2N queries) with no surrounding transaction. A mid-loop failure leaves a mix of old/new positions (duplicate/gapped), and there is no UNIQUE(playlist_id, position) constraint to catch collisions. Corrupts a user-curated playlist ordering on interrupted drag-reorder or transient DB error.
 
-**Impact:** 
+**Impact:** If this currently unused method is called, a mid-reorder error can leave duplicate or
+gapped positions and nondeterministic ordering. Tracks are not lost, and a later successful reorder
+repairs the positions.
 
-**Fix:** 
+**Fix:** Run all reads and updates in one database transaction and commit only after every update
+succeeds.
 
 **Verifier note:** The finding's technical claims are all accurate against the actual code. reorder_entries (src/local/playlist_manager.rs:132-150) loops over the new ordering performing find_by_id + update per entry directly on &self.db with no transaction (no db.begin()/commit()), so a mid-loop failure at line 143 (RecordNotFound) or line 147 (update error) leaves the already-processed entries at new positions and the rest at old positions, producing duplicate/gapped positions. There is genuinely no UNIQUE(playlist_id, position) constraint to catch the collision: the migration (m20250102_000002_create_playlists.rs:115-134) creates only two NON-unique indexes and the entity (playlist_entry.rs) declares no unique constraint. So the latent code defect described is real and verifiable.
 
@@ -665,7 +687,7 @@ However, "medium" overstates the impact. (1) reorder_entries currently has zero 
 
 
 #### L12. reconcile_all runs a full table scan per orphan because lower() defeats the indexes (O×T)
-*`/home/jmulesa/tributary/src/local/playlist_manager.rs:261-318 (filter built 280-305, per-orphan query 307-310)` · db · performance/N+1 · verifier confidence: high*
+*`src/local/playlist_manager.rs:261-318 (filter built 280-305, per-orphan query 307-310)` · db · performance/N+1 · verifier confidence: high*
 
 **What:** reconcile_all loads every orphaned entry (track_id IS NULL) and, for each one, issues a separate SELECT against tracks whose WHERE clause wraps the columns in SQL lower(): lower(title)=?, lower(artist_name)=?, lower(album_title)=?. SQLite cannot use the existing idx_tracks_artist / idx_tracks_album (BINARY-collated, on the raw column) to satisfy a predicate over lower(col), so each query is a full table scan of tracks. With O orphans and T tracks this is O separate queries each scanning T rows (O×T). reconcile_all is invoked at the end of every initial_scan (engine.rs:218), i.e. on every startup/rescan, precisely the moment a large library is most likely to have many orphaned entries (after a path reorganisation or a transient unmount that deleted+re-inserted rows with fresh UUIDs). Secondary correctness nit: the stored match_* fields are lowercased AND trimmed (add_track line 113-115) but lower(col) is not trimmed, so titles with stray surrounding whitespace silently fail to match; and candidates.first() (line 312) picks an arbitrary row when several tracks share the fingerprint.
 
@@ -673,12 +695,11 @@ However, "medium" overstates the impact. (1) reorder_entries currently has zero 
 
 **Fix:** Load the candidate set once: SELECT all tracks (or just id,title,artist_name,album_title,duration_secs) in a single query, build an in-memory HashMap keyed by (title.lower().trim(), artist.lower().trim(), album.lower().trim()) -> Vec<track>, then resolve every orphan against the map. This turns O×T queries into one query + O(T) build + O(O) lookups. Alternatively add expression indexes (CREATE INDEX idx_tracks_lower_artist ON tracks(lower(artist_name)) ...) so the per-orphan queries are index-backed, and trim in the SQL expression to match the stored keys.
 
-**Verifier note:** reconcile_all issues one full-table-scan query per orphan: the WHERE wraps title/artist/album in SQL lower(), which cannot use the plain BINARY column indexes idx_tracks_artist/idx_tracks_album (no Title/Duration/expression index exists), so it is O orphans times T tracks, run at the end of every initial_scan. Secondary nits accurate too. But medium overstates it: the costly branch is gated behind track_id IS NULL with an early return, and track_id is only ever Set to Some in the whole codebase (never None) with no ON DELETE SET NULL FK, so no current path produces NULL orphans and the loop is latent. FullSync is sent before reconcile_all on the background scan task, so the library UI render is not stalled, only the playlist sidebar. Real but low, not medium.</parameter>
-</invoke>
+**Verifier note:** reconcile_all issues one full-table-scan query per orphan: the WHERE wraps title/artist/album in SQL lower(), which cannot use the plain BINARY column indexes idx_tracks_artist/idx_tracks_album (no Title/Duration/expression index exists), so it is O orphans times T tracks, run at the end of every initial_scan. Secondary nits accurate too. But medium overstates it: the costly branch is gated behind track_id IS NULL with an early return, and track_id is only ever Set to Some in the whole codebase (never None) with no ON DELETE SET NULL FK, so no current path produces NULL orphans and the loop is latent. FullSync is sent before reconcile_all on the background scan task, so the library UI render is not stalled, only the playlist sidebar. Real but low, not medium.
 
 
 #### L13. N+1 query in get_playlist_tracks: one find_by_id per entry
-*`/home/jmulesa/tributary/src/local/playlist_manager.rs:156-176` · db · N+1 · verifier confidence: high*
+*`src/local/playlist_manager.rs:156-176` · db · N+1 · verifier confidence: high*
 
 **What:** get_playlist_tracks fetches the playlist's entries (one query, ordered by position) and then loops over them calling track::Entity::find_by_id(track_id).one(&self.db) for each entry (line 167-170). For a playlist with N tracks this issues N+1 queries. This path is hit every time a regular playlist is opened (source_connect.rs:154) and during export (playlist_actions.rs:569), so it is on a hot, user-facing code path.
 
@@ -692,7 +713,7 @@ However, the medium severity is somewhat overstated. The DB is a local embedded 
 
 
 #### L14. initial_scan issues one SELECT per on-disk file instead of preloading existing rows
-*`/home/jmulesa/tributary/src/local/engine.rs:142-192 (per-file query at 147-150)` · db · performance/N+1 · verifier confidence: high*
+*`src/local/engine.rs:142-192 (per-file query at 147-150)` · db · performance/N+1 · verifier confidence: high*
 
 **What:** The initial scan loops over every audio file found on disk and, for each one, runs track::Entity::find().filter(FilePath.eq(path)).one(db) to look up the existing row and compare mtime. The file_path column is UNIQUE so each lookup is index-backed, but for a library of T files this is T sequential async round-trips through the connection pool on every startup scan, before any parsing decisions are made.
 
@@ -706,7 +727,7 @@ Severity: I downgrade from medium to low. The concern is real but the impact is 
 
 
 #### L15. LocalBackend loads the entire tracks table and aggregates in Rust; search() ignores SQL LIMIT
-*`/home/jmulesa/tributary/src/local/backend.rs:49-63 (search), 72-115 (list_albums), 117-153 (list_artists), 197-221 (get_stats)` · db · performance/full-table-scan · verifier confidence: high*
+*`src/local/backend.rs:49-63 (search), 72-115 (list_albums), 117-153 (list_artists), 197-221 (get_stats)` · db · performance/full-table-scan · verifier confidence: high*
 
 **What:** Every LocalBackend aggregation reads all tracks with track::Entity::find().all(&self.db) and then groups/sorts/counts in Rust: list_albums (line 74), list_artists (line 118, which additionally builds a second HashMap pass over all rows), and get_stats (line 198). evaluate_smart_playlist (playlist_manager.rs:246) does the same full load. Most notably, search() (line 50-63) applies the LIKE filter in SQL but then does .all(...).iter().take(limit) — it materialises every matching row and only truncates to `limit` in Rust instead of pushing the limit into the query.
 
@@ -718,7 +739,7 @@ Severity: I downgrade from medium to low. The concern is real but the impact is 
 
 
 #### L16. add_track computes next position via non-atomic read-then-write (no transaction / unique constraint)
-*`/home/jmulesa/tributary/src/local/playlist_manager.rs:98-121` · db · race/transaction · verifier confidence: high*
+*`src/local/playlist_manager.rs:98-121` · db · race/transaction · verifier confidence: high*
 
 **What:** add_track reads the current max position for the playlist (SELECT ... ORDER BY position DESC LIMIT 1) and then inserts a new entry at max+1, with no transaction spanning the read and the insert. Two concurrent add_track calls for the same playlist would both read the same max and insert duplicate positions. Similarly, the multi-write flows seed_defaults (lines 333-412: create_playlist + set_smart_rules x3) and the XSPF import loop (playlist_actions.rs:482-494: create_playlist + add_track per track) are not transactional, so a mid-sequence failure leaves a partially-populated playlist that the empty-check seeding logic will not re-create.
 
@@ -778,9 +799,11 @@ Severity assessment: correctly rated low. It requires the user to have symlinks 
 
 **What:** parse_audio_file fully delegates to lofty. engine.rs spawn_blocking call sites are panic-safe (JoinError), but play_local_file (playback.rs:191-200) calls it synchronously on the GTK main thread (Open With handler) and source_connect.rs:279 on a detached std::thread. If lofty panics on a crafted file, the main-thread case unwinds into gtk-rs FFI and aborts the process; the detached-thread case silently kills the scan.
 
-**Impact:** 
+**Impact:** A panic in the user-initiated Open With path can abort the application; a panic in the
+detached removable-media path can silently stop that scan.
 
-**Fix:** 
+**Fix:** Move parsing off the GTK thread and isolate third-party parser panics at every entry point,
+while continuing to report normal parse errors through `Result`.
 
 **Verifier note:** Every factual claim in the finding checks out against the current code:
 
@@ -833,9 +856,10 @@ Security impact (why low, not higher): Token auth does NOT expose the plaintext 
 
 **What:** register_file() inserts UUID->PathBuf on every local-file cast; nothing removes entries (no remove/clear/TTL). serve_file() keeps returning bytes of any path ever registered for the whole CastHttpServer lifetime (entire app session). The map grows unbounded and every previously-cast local file stays re-fetchable by anyone on the LAN who learned its UUID URL until the app exits.
 
-**Impact:** 
+**Impact:** A learned UUID URL remains reusable for the application session and the registry grows
+per cast. Random UUIDs prevent guessing, so this is a defense-in-depth concern.
 
-**Fix:** 
+**Fix:** Deregister entries on stop or track end, and add time-to-live or capacity cleanup.
 
 **Verifier note:** The factual core of the finding is correct. register_file() is insert-only (cast_http_server.rs:122) and the file registry has no removal, clear, TTL, or capacity logic anywhere — across the whole codebase the only operations on the files DashMap are the .insert at line 122 and the .get at line 151 in serve_file. The map's lifetime equals the CastHttpServer's lifetime: register_file is invoked from chromecast_output.rs:167 on every file:// track, stop() (chromecast_output.rs:608) never resets cast_server, and the Option<CastHttpServer> is never set back to None, so every previously-cast file remains servable for the entire output/app session. So serve_file will keep returning bytes for any UUID ever registered.\n\nHowever, the claimed "medium" overstates the real risk. (1) Access is gated by a random v4 UUID (~122 bits) and there is no directory listing or URL-to-path mapping — the module docstring (lines 12-14) makes unguessable random keys the actual access control, and it is intact. (2) The listener binds LAN-only to a non-loopback IPv4 (lines 64-81). (3) "Unbounded growth" is technically true but a non-issue in practice: each entry is a tiny String+PathBuf, bounded by the number of tracks played in a session — no realistic DoS. (4) For an attacker to re-fetch a stale file they must already have learned the exact UUID URL, which over plaintext HTTP means they were already positioned to capture the content during the legitimate transfer; persistence only widens the re-fetch window. This is a genuine defense-in-depth/hygiene gap (files should be deregistered when playback ends) but lands at low, not medium.
 
@@ -845,9 +869,11 @@ Security impact (why low, not higher): Token auth does NOT expose the plaintext 
 
 **What:** fetch_near_me_* build URLs with &countrycode={country_code}& where country_code comes verbatim from external geo providers (ipapi.co/ipwho.is/freeipapi.com) and is never validated; unlike state (which is urlencoding::encode-d) it is inserted raw, allowing query-parameter injection into the GET to the Radio-Browser API.
 
-**Impact:** 
+**Impact:** A compromised geolocation provider can inject Radio-Browser query parameters and alter
+filtering or ordering. The fixed authority prevents SSRF.
 
-**Fix:** 
+**Fix:** Require an ASCII two-letter country code and construct query parameters through
+`Url::query_pairs_mut` (or at least encode the value).
 
 **Verifier note:** The code matches the finding. `country_code` originates from third-party geolocation JSON, deserialized as an unvalidated `String` (#[serde(default)]) in api.rs:78,96,110 via try_ipapi_co/try_ipwhois/try_freeipapi (client.rs:239,255,275). The only guard before use is `!cc.is_empty()` (radio.rs:267,279,287); a grep for length/charset/ISO validation found none. It is then interpolated raw into request URLs: client.rs:101 (`&countrycode={country_code}&`), client.rs:120, and client.rs:136. The inconsistency the finding highlights is real: on the adjacent line 118 `state` is run through `urlencoding::encode`, but `country_code` is not. So a value containing `&`, `=`, or `#` would be injected unencoded into the query string of the GET to the Radio-Browser API — genuine query-parameter injection. However the impact is small: the host/authority is fixed (`https://{host}`, client.rs:34) so no SSRF is possible; the url crate percent-encodes/rejects control chars so no CRLF/header injection; exploitation requires a malicious or compromised HTTPS geo provider; and the worst outcome is pollution of a search query that only reorders/filters legitimate Radio-Browser stations (which still pass the http(s) scheme filter at client.rs:154-157). This is a valid input-validation/hardening gap rather than a high-impact vuln, so the claimed "low" severity is correct (could even be info).
 
@@ -857,9 +883,11 @@ Security impact (why low, not higher): Token auth does NOT expose the plaintext 
 
 **What:** send_commands_sync() loops reading response lines until one starts with OK/ACK; the 5s read timeout only fires on silence. A server that streams endless non-OK/ACK data lines keeps read_line returning within the timeout so the loop never exits. Each command spawns a fresh std::thread, so stuck threads + sockets accumulate. Host can come from mDNS discovery (not fully trusted).
 
-**Impact:** 
+**Impact:** A server that continuously emits nonterminal lines can pin one detached thread and
+socket per command; repeated controls accumulate resources.
 
-**Fix:** 
+**Fix:** Enforce a wall-clock deadline and response line/byte cap for the whole command, rather than
+only a per-read timeout.
 
 **Verifier note:** The loop only exits on OK or ACK and the read timeout fires only on silence so an endless data stream pins the detached worker thread and socket forever and threads accumulate per command with no cancellation so the bug is real and low severity is right
 
@@ -917,8 +945,7 @@ However, the claimed "medium" severity is slightly overstated. The dominant real
 
 **Fix:** On parse failure, log and return an explicit error (or an empty result), not a match-all default; consider versioning the rules JSON and migrating rather than silently discarding.
 
-**Verifier note:** Confirmed real. Parse failure of smart_rules_json is swallowed by unwrap_or, defaulting to MatchMode::All with zero rules. In evaluate, All over an empty rules vector is vacuously true so every track matches, and with limit None the smart playlist silently becomes the entire library. Callers cannot catch it since unwrap_or never errors. Genuine robustness/correctness defect but only triggers on DB corruption or future schema drift, worst case showing the whole library, so low severity is correct.</parameter>
-</invoke>
+**Verifier note:** Confirmed real. Parse failure of smart_rules_json is swallowed by unwrap_or, defaulting to MatchMode::All with zero rules. In evaluate, All over an empty rules vector is vacuously true so every track matches, and with limit None the smart playlist silently becomes the entire library. Callers cannot catch it since unwrap_or never errors. Genuine robustness/correctness defect but only triggers on DB corruption or future schema drift, worst case showing the whole library, so low severity is correct.
 
 
 #### L30. Inconsistent case sensitivity between limit-sort and compound-sort; 'Random' limit is deterministic
@@ -1030,7 +1057,7 @@ Both calls render the same tracklist/browser, so this is redundant work and pote
 ### Info (3)
 
 #### I1. Per-connection PRAGMAs in connection.rs rely on sqlx defaults; execute_unprepared only touches one pooled connection
-*`/home/jmulesa/tributary/src/db/connection.rs:41-42` · db · correctness/maintainability · verifier confidence: high*
+*`src/db/connection.rs:41-42` · db · correctness/maintainability · verifier confidence: high*
 
 **What:** The connection setup runs PRAGMA journal_mode=WAL and PRAGMA busy_timeout=5000 via db.execute_unprepared, which executes on a single connection borrowed from the pool. journal_mode=WAL is a persistent database-level setting so it correctly applies to the file regardless of which connection ran it. busy_timeout, however, is per-connection — this statement only configures one pooled connection. It is currently harmless because sqlx-sqlite 0.8.6 already sets busy_timeout=5s AND foreign_keys=ON on every connection by default (verified in the registry source: src/options/mod.rs:185,201 and src/connection/establish.rs:282-285), which is also what makes the playlist_entries FK CASCADE / SET NULL relations actually enforced and the reconciliation design work. The footgun: if the connection is ever rebuilt from explicit ConnectOptions that disable default pragmas, or sqlx changes its defaults, FK enforcement and the busy timeout would silently break on most pool connections while this code still 'looks' correct.
 
@@ -1054,9 +1081,11 @@ So this is not a false positive: the described situation (per-connection PRAGMA 
 
 **What:** connect_without_host_verification is used, so the TLS channel to the device is unauthenticated and session/transport ids + status fields are trusted from the peer. On a hostile LAN an IP impersonator can hijack the session and learn the cast HTTP URL of the local file. Largely inherent to Cast V2 (self-signed device certs). Numeric fields use saturating casts so no panic.
 
-**Impact:** 
+**Impact:** A LAN attacker able to impersonate the receiver may hijack the session or learn its
+local cast URL; this is constrained by Cast V2's self-signed device certificates.
 
-**Fix:** 
+**Fix:** Treat the limitation as an explicit trust boundary, minimize exposed session data, and
+retain LAN-only, short-lived media authorization.
 
 **Verifier note:** The finding matches the code and is honestly rated. The Chromecast paths disable TLS host verification and trust device supplied data. The LAN attacker risk is real but largely inherent to Cast V2 because devices use self signed certificates.
 
@@ -1077,6 +1106,11 @@ So this is not a false positive: the described situation (per-connection PRAGMA 
 ## Verified NOT-a-bug (dropped)
 
 - **MPD output forwards backend stream URLs (with embedded auth tokens) to the MPD server over cleartext TCP — undocumented** (`src/audio/mpd_output.rs`) — By-design necessary behavior whose real exposure is already documented; not a security defect.
-- **Discovery background threads loop forever, ignore a closed receiver, and the mDNS thread busy-polls 6 channels every 500ms** (`src/discovery.rs`) — The finding accurately describes the code, but the framed concern is not a genuine defect. The two discovery threads are an intentional app-lifetime singleton: discovery.rs:71-76 documents that the sender stays alive as long as the threads run and to call it once from GTK startup. It is called once 
-- **display_tracks updates master_tracks after rebuilding the browser, and rebuild_browser_data bypasses the re-entrancy guard** (`src/ui/browser.rs`) — The finding's harm mechanism requires that rebuild_browser_data's populate_* calls (store.remove_all() + store.append(), browser.rs:428/444 etc.) synchronously fire connect_selection_changed, re-entering the genre/artist/album handlers and invoking on_filter while master_tracks is stale. That mechan
-- **Playlist action handlers leak the GTK completion future when init_db() fails** (`src/ui/playlist_actions.rs`) — The finding's mechanism is incorrect. The channels are `async_channel::bounded` channels. The sender (done_tx/result_tx) is moved into the tokio task via `async move` and is the channel's only sender (never cloned). In the `init_db()` `Err(e)` arm the task does not call `send`, but when the async bl
+- **Discovery background threads loop forever, ignore a closed receiver, and the mDNS thread
+  polls six channels every 500 ms** (`src/discovery.rs`) — This is the intentional lifetime of a
+  once-per-process discovery service. The bounded polling interval does not grow retained resources,
+  and dropping the receiver only makes the nonblocking send fail.
+- **Playlist action handlers leak the GTK completion future when `init_db()` fails**
+  (`src/ui/playlist_actions.rs`) — The spawned task owns the channel's sole sender. Every return,
+  including the database-error path, drops that sender; the receiver wakes with an error and the GTK
+  future exits.

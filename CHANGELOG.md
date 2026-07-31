@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
 - **Rhythmbox migration** — Import ratings, play counts, optional last-played data, and supported
   static or smart playlists through a preview-first workflow. Matching is conservative, applying
   the migration is atomic, and unsupported or unmatched items are reported. (#57)
@@ -21,11 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   limits. Supported remote ratings are displayed read-only.
 - **Playback history** — Meaningful local playback now updates play count and last-played time.
   Recently Played and Top 25 use committed history and update without restarting Tributary.
-- **Last.fm groundwork** — Secure authorization, native credential storage, offline queueing, and
-  playback/runtime lifecycle foundations are present internally. Last.fm remains unavailable in
-  the shipping UI and no scrobbling is activated yet. (#50)
 
 ### Fixed
+
 - **Audio-output changes** — The volume slider remains authoritative when supported outputs change.
   Windows and macOS follow default-device replacement without losing the selected volume; the
   macOS route retains its mono/stereo channel guard.
@@ -42,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retain occurrence-aware behavior.
 
 ### Security
+
 - **Release component policy** — Windows, macOS, Linux, and Flatpak artifacts now reject unused
   optical-disc decryption and DRM components before publication while retaining ordinary audio
   codecs, TLS, and general-purpose cryptography.
@@ -51,6 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.5.1] — 2026-07-18
 
 ### Added
+
 - **Keyboard-accessible track actions** — Shift+F10 or the Context Menu key opens the same
   Add/Remove/Properties actions as right-click, and playback sliders have distinct accessible names.
 - **Library-root trust** — Tributary asks before a legacy, replaced, or unexpectedly empty library
@@ -60,6 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transactionally on restart.
 
 ### Changed
+
 - **Stable source and media identity** — Local, network, removable, radio, and externally opened
   media now use stable source/track identities and a shared lifecycle so stale work cannot retarget
   newer sessions.
@@ -75,6 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   minimums rather than allowing packages that install but cannot run.
 
 ### Fixed
+
 - **Library integrity** — Incomplete or unavailable scans no longer delete tracks or metadata;
   renames preserve IDs, history, and playlist membership; startup watcher events are replayed; and
   root replacement or remount mutations are revalidated before commit.
@@ -112,6 +115,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directories instead of modifying the application installation.
 
 ### Security
+
 - **Remote credentials stay inside Tributary** — Track, UI, and queue state no longer retains
   authenticated locators or credentials. Protected streams sent to Chromecast, MPD, local
   GStreamer, or AirPlay use opaque revocable proxy tickets with a hard 24-hour expiry.
@@ -130,6 +134,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exceptions are documented and time-bounded.
 
 ### Known limitations
+
 - **Native Linux compatibility** — The native packages require GTK 4.16 and libadwaita 1.6.
   Ubuntu 24.04 and Linux Mint 22.x do not provide those versions, so native packages are
   unsupported there; the Flatpak is the intended alternative.
