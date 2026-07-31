@@ -9,35 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Rhythmbox migration** — Import ratings, play counts, optional last-played data, and supported
-  static or smart playlists through a preview-first workflow. Matching is conservative, applying
-  the migration is atomic, and unsupported or unmatched items are reported. (#57)
-- **Subsonic server playlists** — Browse server playlists and either import an editable local copy
-  or keep a read-only pull-synced mirror. Offline, missing, and conflict states have visible
+- **Rhythmbox migration** — Import ratings, play counts, optional last-played
+  data, and supported static or smart playlists through a preview-first
+  workflow. Matching is conservative, applying the migration is atomic, and
+  unsupported or unmatched items are reported. (#57)
+- **Subsonic server playlists** — Browse server playlists and either import an
+  editable local copy or keep a read-only pull-synced mirror. Offline, missing,
+  and conflict states have visible
   recovery actions; Tributary never modifies the server playlist.
-- **Mixed-source playlists** — Regular playlists can contain local and currently available
-  Subsonic, Jellyfin, Plex, and DAAP tracks. Unavailable entries retain their position and can be
+- **Mixed-source playlists** — Regular playlists can contain local and currently
+  available Subsonic, Jellyfin, Plex, and DAAP tracks. Unavailable entries retain
+  their position and can be
   removed; XSPF interchange remains local-only.
-- **Ratings** — Local ratings can be set, cleared, sorted, and used by smart-playlist rules and
+- **Ratings** — Local ratings can be set, cleared, sorted, and used by
+  smart-playlist rules and
   limits. Supported remote ratings are displayed read-only.
-- **Playback history** — Meaningful local playback now updates play count and last-played time.
-  Recently Played and Top 25 use committed history and update without restarting Tributary.
+- **Playback history** — Meaningful local playback now updates play count and
+  last-played time. Recently Played and Top 25 use committed history and update
+  without restarting Tributary.
 
 ### Fixed
 
-- **Audio-output changes** — The volume slider remains authoritative when supported outputs change.
-  Windows and macOS follow default-device replacement without losing the selected volume; the
+- **Audio-output changes** — The volume slider remains authoritative when
+  supported outputs change. Windows and macOS follow default-device replacement
+  without losing the selected volume; the
   macOS route retains its mono/stereo channel guard.
-- **Native application icons** — Windows and macOS packaging now verifies the complete application
+- **Native application icons** — Windows and macOS packaging now verifies the
+  complete application
   icon and metadata payload before publishing an artifact.
-- **Linux dialogs** — Track Properties, New Playlist, and New Smart Playlist dialogs now appear
+- **Linux dialogs** — Track Properties, New Playlist, and New Smart Playlist
+  dialogs now appear
   instead of being constructed without presentation. (#168)
-- **Linux library rescan loop** — Access-only filesystem events caused by Tributary's own metadata
+- **Linux library rescan loop** — Access-only filesystem events caused by
+  Tributary's own metadata
   reads no longer trigger recursive rescans and unbounded resource growth. (#103)
-- **Unsupported playlist additions** — Unsupported or unavailable source selections now show an
+- **Unsupported playlist additions** — Unsupported or unavailable source
+  selections now show an
   error and write nothing instead of silently omitting entries.
-- **Shuffle navigation** — Previous follows a bounded history of tracks actually played, while Next
-  retraces that history before selecting a new shuffled item. Duplicate entries and repeat modes
+- **Shuffle navigation** — Previous follows a bounded history of tracks actually
+  played, while Next retraces that history before selecting a new shuffled item.
+  Duplicate entries and repeat modes
   retain occurrence-aware behavior.
 
 ### Security

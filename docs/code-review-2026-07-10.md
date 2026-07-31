@@ -44,7 +44,7 @@ operating system.
 
 ### H1. Playlist migration can corrupt ordering and block database startup
 
-[`m20250104_000004_unique_entry_position.rs`](../src/db/migration/m20250104_000004_unique_entry_position.rs#L22)
+`src/db/migration/m20250104_000004_unique_entry_position.rs:22`
 updates `position` while its correlated subquery reads rows already modified by that same
 statement. SQLite therefore produces results that depend on row-update order.
 
@@ -65,14 +65,16 @@ that differs from playlist order.
 ### H2. Partially unreadable library roots can lose persisted metadata
 
 The initial scan silently discards every `WalkDir` error in
-[`engine.rs`](../src/local/engine.rs#L121), then treats a root as available when at least one
+[`engine.rs`](../src/local/engine.rs#L121),
+then treats a root as available when at least one
 audio file was found under it at [`engine.rs`](../src/local/engine.rs#L144).
 
 This fails in both directions:
 
 - If one subtree becomes unreadable but another file is readable, the root is considered
   authoritative and rows from the unreadable subtree are deleted as stale at
-  [`engine.rs`](../src/local/engine.rs#L218). This destroys stable IDs, dates, play counts,
+  [`engine.rs`](../src/local/engine.rs#L218). This destroys stable IDs, dates,
+  play counts,
   and playlist linkage.
 - If a healthy directory is intentionally emptied while Tributary is closed, it is treated
   as unavailable, so its stale rows survive indefinitely.
@@ -99,13 +101,15 @@ application shutdown. Avoid network side effects in `Drop`.
 
 ### H4. Playback identity is coupled to a mutable view index
 
-[`playback.rs`](../src/ui/playback.rs#L47) stores `current_pos` as an index into the visible
+[`playback.rs`](../src/ui/playback.rs#L47) stores `current_pos` as an index into
+the visible
 `SortListModel`. Sorting does not remap that index. Source changes clear it while current
 audio continues, and Next/EOS with no index starts at row zero.
 
 As a result, sorting, filtering, or changing sources during playback can make Next,
 Previous, repeat-one, or automatic advance load an unrelated track. Output switching adds
-another inconsistent transition: [`output_switch.rs`](../src/ui/output_switch.rs#L42) stops
+another inconsistent transition:
+[`output_switch.rs`](../src/ui/output_switch.rs#L42) stops
 the current output before checking whether the selected target actually changed, constructs
 an empty output, and leaves `current_pos` populated.
 
@@ -116,8 +120,9 @@ no-op, and explicitly transfer or clear the session when changing output targets
 ### H5. Recycled sidebar rows retain destructive click handlers
 
 Every list-item bind calls `connect_clicked` in
-[`sidebar.rs`](../src/ui/sidebar.rs#L235), while unbind only hides the action button at
-[`sidebar.rs`](../src/ui/sidebar.rs#L398). GTK list items are recycled, and this code also
+[`sidebar.rs`](../src/ui/sidebar.rs#L235), while unbind only hides the action
+button at [`sidebar.rs`](../src/ui/sidebar.rs#L398). GTK list items are recycled,
+and this code also
 forces remove/reinsert rebinds.
 
 A button rebound from server A to server B can retain both handlers. Clicking B may also
@@ -129,12 +134,13 @@ list item, or retain and disconnect each `SignalHandlerId` during unbind.
 ### H6. Playlist track references do not have the declared database foreign key
 
 The playlist migration creates `track_id` at
-[`m20250102_000002_create_playlists.rs`](../src/db/migration/m20250102_000002_create_playlists.rs#L80)
+`src/db/migration/m20250102_000002_create_playlists.rs:80`
 but defines only the playlist foreign key. The SeaORM entity declares `ON DELETE SET NULL`,
 but entity metadata does not alter the SQLite schema.
 
 Deleting and rediscovering a track therefore leaves a non-null dangling ID. Meanwhile,
-[`reconcile_all`](../src/local/playlist_manager.rs#L333) only examines rows whose ID is null,
+[`reconcile_all`](../src/local/playlist_manager.rs#L333) only examines rows whose
+ID is null,
 so the playlist item remains invisible and can never be repaired. Watcher renames currently
 delete and reinsert tracks, making this reachable during ordinary file organization.
 
@@ -146,12 +152,14 @@ Handle paired filesystem renames as path updates that preserve track identity.
 
 Subsonic and DAAP put credentials in URL queries and use default reqwest redirect behavior.
 The album-art worker likewise follows redirects for every backend's credential-bearing URL
-at [`album_art.rs`](../src/ui/album_art.rs#L38). Reqwest enables automatic `Referer`; on an
+at [`album_art.rs`](../src/ui/album_art.rs#L38). Reqwest enables automatic
+`Referer`; on an
 allowed cross-origin redirect, that header can contain the full previous URL query.
 
 Plex and Jellyfin attempt to constrain redirects, but compare only `host_str` at
 [`plex/client.rs`](../src/plex/client.rs#L332) and
-[`jellyfin/client.rs`](../src/jellyfin/client.rs#L379). They therefore permit a port change or
+[`jellyfin/client.rs`](../src/jellyfin/client.rs#L379). They therefore permit a
+port change or
 HTTPS-to-HTTP downgrade while retaining custom token headers.
 
 **Recommendation:** disable automatic `Referer` for credential-bearing clients and allow
@@ -160,7 +168,8 @@ TLS downgrade. Rebuild authenticated requests only after validating the target.
 
 ### H8. Release Flatpak job executes mutable upstream code with write credentials
 
-[`release.yml`](../.github/workflows/release.yml#L13) grants `contents: write` to the entire
+[`release.yml`](../.github/workflows/release.yml#L13) grants `contents: write`
+to the entire
 workflow. Checkout persists credentials by default, after which the Flatpak job downloads
 and executes a Python script from the mutable `flatpak-builder-tools/master` branch at
 [`release.yml`](../.github/workflows/release.yml#L57).
@@ -175,7 +184,8 @@ release publication into a minimal job with write permission.
 ### H9. Manual release tag input is ignored
 
 The workflow declares a `tag` input at
-[`release.yml`](../.github/workflows/release.yml#L6), but no checkout references it. Manual
+[`release.yml`](../.github/workflows/release.yml#L6), but no checkout references
+it. Manual
 "build tag X" runs therefore build the dispatch branch or HEAD. The Arch job derives its
 version from `GITHUB_REF_NAME`, which can produce `pkgver=main`.
 
