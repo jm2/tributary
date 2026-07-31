@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-09  ·  **Version reviewed:** 0.5.0 (HEAD `0d22fc4`)  ·  **Scope:** full `src/` tree (~26k LOC)
 
-Method: 13 subsystem dimensions audited by independent agents, **every finding adversarially verified** against the actual code (re-read + skeptic pass); severities below are the *verifier-corrected* ratings, not the original reviewer's. 4 candidate findings were verified as **not-a-bug** and dropped. GitHub issues were triaged with a verify + prove-not-fixed double-check.
+Method: 13 subsystem dimensions audited by independent agents, **every finding adversarially verified** against the actual code (re-read + skeptic pass); severities below are the *verifier-corrected* ratings, not the original reviewer's. 3 candidate findings were verified as **not-a-bug** and dropped. GitHub issues were triaged with a verify + prove-not-fixed double-check.
 
 ## Summary
 
