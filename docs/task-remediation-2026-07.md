@@ -3,7 +3,7 @@
 > Archived 2026-07-18. This is the historical holistic-review remediation record. The active
 > feature backlog now lives in [`task.md`](task.md); do not add new product work here.
 
-Source review: [`CODE_REVIEW_2026-07-10.md`](../CODE_REVIEW_2026-07-10.md)
+Source review: [`code-review-2026-07-10.md`](code-review-2026-07-10.md)
 
 Reviewed commit: `598b332d31c6206aea620aa951b78335e4d659ed`
 Created: 2026-07-10
@@ -1350,7 +1350,7 @@ behavior remains unchanged; the completed compound P3.4 harness item records the
 
 ### P2.9 Repair the AirPlay fallback path
 
-Filed 2026-07-13. This is review finding **M3** (`CODE_REVIEW_2026-07-10.md:210-218`), which was
+Filed 2026-07-13. This is review finding **M3** (`code-review-2026-07-10.md:210-218`), which was
 never given a tracker item — the only AirPlay references in this file are about routing streams
 through the P1.6 proxy, which is a different problem.
 

@@ -14,7 +14,7 @@
 - Decision date: 2026-07-17
 - Historical tracker:
   [P3.1](../task-remediation-2026-07.md#p31-introduce-a-sourcesession-registry)
-- Review finding: [Architectural assessment](../../CODE_REVIEW_2026-07-10.md#architectural-assessment)
+- Review finding: [Architectural assessment](../code-review-2026-07-10.md#architectural-assessment)
 
 ## Context
 

@@ -44,7 +44,7 @@ operating system.
 
 ### H1. Playlist migration can corrupt ordering and block database startup
 
-[`m20250104_000004_unique_entry_position.rs`](src/db/migration/m20250104_000004_unique_entry_position.rs#L22)
+[`m20250104_000004_unique_entry_position.rs`](../src/db/migration/m20250104_000004_unique_entry_position.rs#L22)
 updates `position` while its correlated subquery reads rows already modified by that same
 statement. SQLite therefore produces results that depend on row-update order.
 
@@ -65,14 +65,14 @@ that differs from playlist order.
 ### H2. Partially unreadable library roots can lose persisted metadata
 
 The initial scan silently discards every `WalkDir` error in
-[`engine.rs`](src/local/engine.rs#L121), then treats a root as available when at least one
-audio file was found under it at [`engine.rs`](src/local/engine.rs#L144).
+[`engine.rs`](../src/local/engine.rs#L121), then treats a root as available when at least one
+audio file was found under it at [`engine.rs`](../src/local/engine.rs#L144).
 
 This fails in both directions:
 
 - If one subtree becomes unreadable but another file is readable, the root is considered
   authoritative and rows from the unreadable subtree are deleted as stale at
-  [`engine.rs`](src/local/engine.rs#L218). This destroys stable IDs, dates, play counts,
+  [`engine.rs`](../src/local/engine.rs#L218). This destroys stable IDs, dates, play counts,
   and playlist linkage.
 - If a healthy directory is intentionally emptied while Tributary is closed, it is treated
   as unavailable, so its stale rows survive indefinitely.
@@ -85,9 +85,9 @@ explicit unavailable-volume state for removable/network roots.
 ### H3. DAAP sessions are logged out immediately after loading tracks
 
 DAAP success paths copy `backend.all_tracks()` and then drop the backend in
-[`window.rs`](src/ui/window.rs#L496) and
-[`source_connect.rs`](src/ui/source_connect.rs#L716). `DaapBackend::drop` immediately
-spawns a logout request in [`daap/backend.rs`](src/daap/backend.rs#L428).
+[`window.rs`](../src/ui/window.rs#L496) and
+[`source_connect.rs`](../src/ui/source_connect.rs#L716). `DaapBackend::drop` immediately
+spawns a logout request in [`daap/backend.rs`](../src/daap/backend.rs#L428).
 
 The copied stream and artwork URLs contain the same session ID. A successful library sync
 therefore races an immediate logout, and playback fails once the server invalidates the
@@ -99,13 +99,13 @@ application shutdown. Avoid network side effects in `Drop`.
 
 ### H4. Playback identity is coupled to a mutable view index
 
-[`playback.rs`](src/ui/playback.rs#L47) stores `current_pos` as an index into the visible
+[`playback.rs`](../src/ui/playback.rs#L47) stores `current_pos` as an index into the visible
 `SortListModel`. Sorting does not remap that index. Source changes clear it while current
 audio continues, and Next/EOS with no index starts at row zero.
 
 As a result, sorting, filtering, or changing sources during playback can make Next,
 Previous, repeat-one, or automatic advance load an unrelated track. Output switching adds
-another inconsistent transition: [`output_switch.rs`](src/ui/output_switch.rs#L42) stops
+another inconsistent transition: [`output_switch.rs`](../src/ui/output_switch.rs#L42) stops
 the current output before checking whether the selected target actually changed, constructs
 an empty output, and leaves `current_pos` populated.
 
@@ -116,8 +116,8 @@ no-op, and explicitly transfer or clear the session when changing output targets
 ### H5. Recycled sidebar rows retain destructive click handlers
 
 Every list-item bind calls `connect_clicked` in
-[`sidebar.rs`](src/ui/sidebar.rs#L235), while unbind only hides the action button at
-[`sidebar.rs`](src/ui/sidebar.rs#L398). GTK list items are recycled, and this code also
+[`sidebar.rs`](../src/ui/sidebar.rs#L235), while unbind only hides the action button at
+[`sidebar.rs`](../src/ui/sidebar.rs#L398). GTK list items are recycled, and this code also
 forces remove/reinsert rebinds.
 
 A button rebound from server A to server B can retain both handlers. Clicking B may also
@@ -129,12 +129,12 @@ list item, or retain and disconnect each `SignalHandlerId` during unbind.
 ### H6. Playlist track references do not have the declared database foreign key
 
 The playlist migration creates `track_id` at
-[`m20250102_000002_create_playlists.rs`](src/db/migration/m20250102_000002_create_playlists.rs#L80)
+[`m20250102_000002_create_playlists.rs`](../src/db/migration/m20250102_000002_create_playlists.rs#L80)
 but defines only the playlist foreign key. The SeaORM entity declares `ON DELETE SET NULL`,
 but entity metadata does not alter the SQLite schema.
 
 Deleting and rediscovering a track therefore leaves a non-null dangling ID. Meanwhile,
-[`reconcile_all`](src/local/playlist_manager.rs#L333) only examines rows whose ID is null,
+[`reconcile_all`](../src/local/playlist_manager.rs#L333) only examines rows whose ID is null,
 so the playlist item remains invisible and can never be repaired. Watcher renames currently
 delete and reinsert tracks, making this reachable during ordinary file organization.
 
@@ -146,12 +146,12 @@ Handle paired filesystem renames as path updates that preserve track identity.
 
 Subsonic and DAAP put credentials in URL queries and use default reqwest redirect behavior.
 The album-art worker likewise follows redirects for every backend's credential-bearing URL
-at [`album_art.rs`](src/ui/album_art.rs#L38). Reqwest enables automatic `Referer`; on an
+at [`album_art.rs`](../src/ui/album_art.rs#L38). Reqwest enables automatic `Referer`; on an
 allowed cross-origin redirect, that header can contain the full previous URL query.
 
 Plex and Jellyfin attempt to constrain redirects, but compare only `host_str` at
-[`plex/client.rs`](src/plex/client.rs#L332) and
-[`jellyfin/client.rs`](src/jellyfin/client.rs#L379). They therefore permit a port change or
+[`plex/client.rs`](../src/plex/client.rs#L332) and
+[`jellyfin/client.rs`](../src/jellyfin/client.rs#L379). They therefore permit a port change or
 HTTPS-to-HTTP downgrade while retaining custom token headers.
 
 **Recommendation:** disable automatic `Referer` for credential-bearing clients and allow
@@ -160,10 +160,10 @@ TLS downgrade. Rebuild authenticated requests only after validating the target.
 
 ### H8. Release Flatpak job executes mutable upstream code with write credentials
 
-[`release.yml`](.github/workflows/release.yml#L13) grants `contents: write` to the entire
+[`release.yml`](../.github/workflows/release.yml#L13) grants `contents: write` to the entire
 workflow. Checkout persists credentials by default, after which the Flatpak job downloads
 and executes a Python script from the mutable `flatpak-builder-tools/master` branch at
-[`release.yml`](.github/workflows/release.yml#L57).
+[`release.yml`](../.github/workflows/release.yml#L57).
 
 An upstream compromise can poison release artifacts and potentially recover a repository
 write token from the checkout configuration. Unpinned pip packages compound the exposure.
@@ -175,7 +175,7 @@ release publication into a minimal job with write permission.
 ### H9. Manual release tag input is ignored
 
 The workflow declares a `tag` input at
-[`release.yml`](.github/workflows/release.yml#L6), but no checkout references it. Manual
+[`release.yml`](../.github/workflows/release.yml#L6), but no checkout references it. Manual
 "build tag X" runs therefore build the dispatch branch or HEAD. The Arch job derives its
 version from `GITHUB_REF_NAME`, which can produce `pkgver=main`.
 
@@ -187,7 +187,7 @@ pass it to every checkout, and derive package versions from the checked-out sour
 ### M1. Response body limits are bypassable with chunked transfers
 
 The Subsonic, Jellyfin, Plex, and DAAP guards inspect only `Content-Length`, for example in
-[`subsonic/client.rs`](src/subsonic/client.rs#L321), then call `json()`, `text()`, or
+[`subsonic/client.rs`](../src/subsonic/client.rs#L321), then call `json()`, `text()`, or
 `bytes()` and buffer the entire response. A chunked peer can send indefinitely while
 remaining inside the idle read timeout. Radio, authentication, and album-art responses have
 even less coverage.
@@ -198,8 +198,8 @@ apply a separate overall request deadline.
 ### M2. Scan/watcher handoff and directory events allow permanent drift
 
 The watcher is installed only after the complete initial scan at
-[`engine.rs`](src/local/engine.rs#L77), creating a gap where changes are missed. Event
-classification at [`engine.rs`](src/local/engine.rs#L351) filters every path by audio
+[`engine.rs`](../src/local/engine.rs#L77), creating a gap where changes are missed. Event
+classification at [`engine.rs`](../src/local/engine.rs#L351) filters every path by audio
 extension, so directory rename/removal events do nothing. A file rename is handled as
 delete-plus-insert, resetting identity and metadata.
 
@@ -209,7 +209,7 @@ watcher overflow/errors.
 
 ### M3. AirPlay `shairport-sync` fallback cannot transmit to the receiver
 
-[`airplay_output.rs`](src/audio/airplay_output.rs#L283) explicitly discards the selected
+[`airplay_output.rs`](../src/audio/airplay_output.rs#L283) explicitly discards the selected
 host and port, starts `shairport-sync -o pipe -- /dev/stdin`, then writes PCM into its stdin.
 Shairport Sync is an AirPlay receiver; its pipe backend outputs received audio rather than
 accepting audio to transmit.
@@ -219,7 +219,7 @@ pipeline teardown off the GTK main thread.
 
 ### M4. MPD output never reports successful playback state
 
-[`mpd_output.rs`](src/audio/mpd_output.rs#L245) emits `Buffering`, but successful commands
+[`mpd_output.rs`](../src/audio/mpd_output.rs#L245) emits `Buffering`, but successful commands
 never emit `Playing`, position, or track completion. The UI spinner can remain indefinitely,
 OS playback state is wrong, and automatic advance cannot work.
 
@@ -228,7 +228,7 @@ position, and completion events. Avoid logging the full `add "<authenticated URL
 
 ### M5. Chromecast cancellation occurs after stale external side effects
 
-[`chromecast_output.rs`](src/audio/chromecast_output.rs#L205) assigns a generation before
+[`chromecast_output.rs`](../src/audio/chromecast_output.rs#L205) assigns a generation before
 spawning, but the worker does not check it while connecting, launching the receiver, or
 loading media. A superseded worker can load an old track and emit `Playing` before its first
 generation check. Detached stop/play/seek operations are also unordered.
@@ -240,7 +240,7 @@ can be followed by a contradictory `Buffering` event.
 ### M6. Late async source results overwrite newer navigation
 
 Playlist and radio completions render unconditionally in
-[`source_connect.rs`](src/ui/source_connect.rs#L118) and `radio.rs`. If the user selects a
+[`source_connect.rs`](../src/ui/source_connect.rs#L118) and `radio.rs`. If the user selects a
 different source while a request is running, the late result replaces the current view.
 
 Capture a source key/generation with each operation, cache late results, and render only when
@@ -257,7 +257,7 @@ ticket. Keep credentials out of the generic track model.
 
 ### M8. DAAP session credentials remain visible in logs and errors
 
-[`daap/client.rs`](src/daap/client.rs#L179) logs the raw session ID at info level. Several
+[`daap/client.rs`](../src/daap/client.rs#L179) logs the raw session ID at info level. Several
 reqwest errors retain the request URL containing `session-id`, despite debug URL redaction.
 
 Omit or irreversibly fingerprint the session ID and call `without_url()` before formatting
@@ -265,10 +265,10 @@ or retaining request errors.
 
 ### M9. Smart-playlist date, limit, and live-update semantics are inconsistent
 
-[`smart_rules.rs`](src/local/smart_rules.rs#L472) compares RFC3339 timestamps to date-only
+[`smart_rules.rs`](../src/local/smart_rules.rs#L472) compares RFC3339 timestamps to date-only
 strings lexically, so `is 2026-07-10` fails for a track on that date while `is after` may
 incorrectly pass. Compound sorting is applied before limit selection, but the limit path
-sorts again at [`smart_rules.rs`](src/local/smart_rules.rs#L531), discarding the requested
+sorts again at [`smart_rules.rs`](../src/local/smart_rules.rs#L531), discarding the requested
 final order. `live_updating` is persisted but never changes evaluation behavior.
 
 Parse dates into chrono values with explicit date/instant semantics, select/truncate before
@@ -292,7 +292,7 @@ reconciliation, validate every edit up front, and surface matched/unmatched/erro
 ### M11. Removable-media traversal and Flatpak permissions conflict with the feature set
 
 USB browsing uses `WalkDir::follow_links(true)` at
-[`source_connect.rs`](src/ui/source_connect.rs#L267). A removable device can contain a
+[`source_connect.rs`](../src/ui/source_connect.rs#L267). A removable device can contain a
 symlink into the user's home, causing Tributary to traverse host files outside the selected
 volume.
 
@@ -305,13 +305,13 @@ mount APIs, and define narrow Flatpak/portal permissions for removable and custo
 
 ### M12. Packaging and desktop integration metadata are inconsistent
 
-- [`build-linux.sh`](scripts/build-linux.sh#L139) invokes a Flatpak generator absent from
+- [`build-linux.sh`](../scripts/build-linux.sh#L139) invokes a Flatpak generator absent from
   the repository and writes `cargo-sources.json` somewhere the manifest does not read.
 - The standalone RPM spec still declares `Version: v0.1.0` and constructs `vv0.1.0` in
   `Source0`.
-- [`Cargo.toml`](Cargo.toml#L13) enables GTK 4.16 and libadwaita 1.6 APIs, while native
+- [`Cargo.toml`](../Cargo.toml#L13) enables GTK 4.16 and libadwaita 1.6 APIs, while native
   package metadata permits GTK 4.14 and libadwaita 1.5.
-- [`io.github.tributary.Tributary.desktop`](data/io.github.tributary.Tributary.desktop#L6)
+- [`io.github.tributary.Tributary.desktop`](../data/io.github.tributary.Tributary.desktop#L6)
   declares audio MIME types but `Exec=tributary` has no `%F`/`%U`, so Linux file managers
   cannot pass selected files.
 - The README advertises Rust 1.80+, while `Cargo.toml` requires 1.85 and CI tests only the
