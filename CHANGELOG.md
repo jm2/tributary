@@ -5,6 +5,15 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Release checksum manifests** — Upload each validated Flatpak exactly once and reject missing,
+  unexpected, or duplicate package filenames before publishing release checksums.
+
+---
+
 ## [0.6.0] — 2026-07-31
 
 ### Added
@@ -460,6 +469,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.desktop` file and AppStream metainfo for Linux desktop integration.
 - Windows resource file with icon embedding.
 
+[Unreleased]: https://github.com/jm2/tributary/compare/v0.6.0...HEAD
 [0.6.0]: https://github.com/jm2/tributary/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/jm2/tributary/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/jm2/tributary/compare/v0.4.1...v0.5.0

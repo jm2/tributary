@@ -138,12 +138,14 @@ jobs:
           python3 build-aux/flatpak/flatpak-cargo-generator.py \
             Cargo.lock -o build-aux/flatpak/cargo-sources.json
 
-      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+      - name: Build Flatpak bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
           bundle: tributary-linux-${{ matrix.arch }}.flatpak
           manifest-path: build-aux/flatpak/io.github.tributary.Tributary.yml
           cache-key: flatpak-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
           arch: ${{ matrix.arch }}
+          upload-artifact: false
 
       - name: Validate completed Flatpak bundle payload
         run: >-
@@ -155,6 +157,7 @@ jobs:
         with:
           name: tributary-linux-${{ matrix.arch }}-flatpak
           path: tributary-linux-${{ matrix.arch }}.flatpak
+          if-no-files-found: error
 
   # ── macOS (.dmg) ──────────────────────────────────────────────────────────
   macos:
@@ -549,10 +552,61 @@ jobs:
       - name: Generate SHA256SUMS
         run: |
           cd artifacts
+          expected_assets=(
+            'tributary-aarch64.rpm'
+            'tributary-amd64.deb'
+            'tributary-arm64.deb'
+            'tributary-linux-aarch64.flatpak'
+            'tributary-linux-x86_64.flatpak'
+            'tributary-macos-aarch64.dmg'
+            'tributary-windows-aarch64-setup.exe'
+            'tributary-windows-aarch64.zip'
+            'tributary-windows-x86_64-setup.exe'
+            'tributary-windows-x86_64.zip'
+            'tributary-x86_64.pkg.tar.zst'
+            'tributary-x86_64.rpm'
+          )
+          release_file_list="$(mktemp)"
+          trap 'rm -f "$release_file_list"' EXIT
           find . -type f \( -name '*.zip' -o -name '*.dmg' -o -name '*.flatpak' \
             -o -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.zst' \
-            -o -name '*-setup.exe' \) \
-            -exec sha256sum {} + | sed 's|  .*/|  |' | sort -k2 > ../SHA256SUMS.txt
+            -o -name '*-setup.exe' \) -print0 > "$release_file_list"
+          mapfile -d '' release_files < "$release_file_list"
+          if (( ${#release_files[@]} == 0 )); then
+            echo 'No release artifacts were downloaded' >&2
+            exit 1
+          fi
+
+          declare -A release_paths=()
+          for path in "${release_files[@]}"; do
+            name="${path##*/}"
+            if [[ -n "${release_paths[$name]+present}" ]]; then
+              echo "Duplicate release artifact filename: ${name}" >&2
+              printf '  %s\n' "${release_paths[$name]}" "${path}" >&2
+              exit 1
+            fi
+            release_paths["$name"]="$path"
+          done
+
+          if (( ${#release_paths[@]} != ${#expected_assets[@]} )); then
+            echo "Expected ${#expected_assets[@]} unique release assets; found ${#release_paths[@]}" >&2
+            printf '  %s\n' "${!release_paths[@]}" | LC_ALL=C sort >&2
+            exit 1
+          fi
+
+          for name in "${expected_assets[@]}"; do
+            if [[ -z "${release_paths[$name]+present}" ]]; then
+              echo "Missing release artifact: ${name}" >&2
+              exit 1
+            fi
+          done
+
+          {
+            for name in "${expected_assets[@]}"; do
+              digest="$(sha256sum "${release_paths[$name]}")"
+              printf '%s  %s\n' "${digest%% *}" "$name"
+            done
+          } | LC_ALL=C sort -k2 > ../SHA256SUMS.txt
           cat ../SHA256SUMS.txt
 
       - name: Upload SHA256SUMS as artifact

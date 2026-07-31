@@ -181,6 +181,141 @@ fn workflow_job<'a>(source: &'a str, name: &str) -> &'a str {
     &source[start..]
 }
 
+fn assert_flatpak_artifact_boundary(
+    source: &str,
+    job_name: &str,
+    label: &str,
+    artifact_name: &str,
+    artifact_path: &str,
+) {
+    let job = workflow_job(source, job_name);
+    let build = job
+        .find("name: Build Flatpak bundle")
+        .unwrap_or_else(|| panic!("{label} must name its Flatpak build boundary"));
+    let validation = job
+        .find("name: Validate completed Flatpak bundle payload")
+        .unwrap_or_else(|| panic!("{label} must validate the completed Flatpak"));
+    let upload = job
+        .find("name: Upload Flatpak")
+        .unwrap_or_else(|| panic!("{label} must retain one explicit Flatpak upload"));
+
+    assert!(
+        build < validation && validation < upload,
+        "{label} must validate the completed Flatpak before making it a workflow artifact"
+    );
+    assert!(
+        job[build..validation].contains("upload-artifact: false"),
+        "{label} must disable flatpak-builder's implicit pre-validation artifact upload"
+    );
+    assert_eq!(
+        job.matches("uses: flatpak/flatpak-github-actions/flatpak-builder@v6")
+            .count(),
+        1,
+        "{label} must contain exactly one Flatpak builder action"
+    );
+    assert_eq!(
+        job.matches("uses: actions/upload-artifact@v7").count(),
+        1,
+        "{label} must upload the Flatpak exactly once"
+    );
+    let upload_step = &job[upload..];
+    assert!(
+        upload_step.contains(&format!("name: {artifact_name}"))
+            && upload_step.contains(&format!("path: {artifact_path}"))
+            && upload_step.contains("if-no-files-found: error"),
+        "{label} must upload the exact validated Flatpak and fail when it is missing"
+    );
+}
+
+#[test]
+fn flatpak_artifacts_publish_once_after_compliance_validation() {
+    assert_flatpak_artifact_boundary(
+        CI_WORKFLOW,
+        "build-flatpak",
+        "CI",
+        "tributary-flatpak",
+        "tributary.flatpak",
+    );
+    assert_flatpak_artifact_boundary(
+        RELEASE_WORKFLOW,
+        "flatpak",
+        "release",
+        "tributary-linux-${{ matrix.arch }}-flatpak",
+        "tributary-linux-${{ matrix.arch }}.flatpak",
+    );
+}
+
+#[test]
+fn release_checksums_require_one_exact_asset_set() {
+    let checksums = workflow_job(RELEASE_WORKFLOW, "checksums");
+    let expected_assets = shell_array(checksums, "expected_assets");
+    assert_eq!(
+        expected_assets,
+        [
+            "tributary-aarch64.rpm",
+            "tributary-amd64.deb",
+            "tributary-arm64.deb",
+            "tributary-linux-aarch64.flatpak",
+            "tributary-linux-x86_64.flatpak",
+            "tributary-macos-aarch64.dmg",
+            "tributary-windows-aarch64-setup.exe",
+            "tributary-windows-aarch64.zip",
+            "tributary-windows-x86_64-setup.exe",
+            "tributary-windows-x86_64.zip",
+            "tributary-x86_64.pkg.tar.zst",
+            "tributary-x86_64.rpm",
+        ],
+        "release checksums must cover exactly the published package set"
+    );
+
+    for fragment in [
+        "release_file_list=\"$(mktemp)\"",
+        "trap 'rm -f \"$release_file_list\"' EXIT",
+        ") -print0 > \"$release_file_list\"",
+        "mapfile -d '' release_files < \"$release_file_list\"",
+        "declare -A release_paths=()",
+        "release_paths[\"$name\"]=\"$path\"",
+        "${#release_paths[@]} != ${#expected_assets[@]}",
+        "${release_paths[$name]+present}",
+    ] {
+        assert!(
+            checksums.contains(fragment),
+            "release checksum validation is missing its fail-closed contract: {fragment}"
+        );
+    }
+
+    let discovery = checksums
+        .find("release_file_list=\"$(mktemp)\"")
+        .expect("release artifact discovery must use a checked temporary list");
+    let list_read = checksums
+        .find("mapfile -d '' release_files < \"$release_file_list\"")
+        .expect("the checked artifact list must be read without process substitution");
+    let duplicate_guard = checksums
+        .find("Duplicate release artifact filename")
+        .expect("duplicate package basenames must be rejected");
+    let exact_count_guard = checksums
+        .find("unique release assets; found")
+        .expect("the unique package count must be exact");
+    let missing_guard = checksums
+        .find("Missing release artifact")
+        .expect("every expected package basename must be present");
+    let hashing = checksums
+        .find("digest=\"$(sha256sum")
+        .expect("validated release packages must be hashed");
+    assert!(
+        discovery < list_read
+            && list_read < duplicate_guard
+            && duplicate_guard < exact_count_guard
+            && exact_count_guard < missing_guard
+            && missing_guard < hashing,
+        "checked discovery plus duplicate, extra, and missing guards must run before hashing"
+    );
+    assert!(
+        !checksums.contains("sort -u") && !checksums.contains("< <("),
+        "release checksums must neither hide duplicate names nor lose discovery failures"
+    );
+}
+
 fn forbidden_bundle_tokens() -> Vec<&'static str> {
     FORBIDDEN_BUNDLED_COMPONENTS
         .lines()

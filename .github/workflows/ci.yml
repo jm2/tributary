@@ -521,11 +521,13 @@ jobs:
       - name: Generate cargo-sources.json
         run: bash build-aux/flatpak/generate-cargo-sources.sh
 
-      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+      - name: Build Flatpak bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
           bundle: tributary.flatpak
           manifest-path: build-aux/flatpak/io.github.tributary.Tributary.yml
           cache-key: flatpak-${{ hashFiles('**/Cargo.lock') }}
+          upload-artifact: false
 
       - name: Validate completed Flatpak bundle payload
         run: build-aux/flatpak/validate-bundle-compliance.sh tributary.flatpak

@@ -28,10 +28,19 @@ checklist completion, not equal engineering effort: several P3 records are delib
 epics. The archived remediation remains **220/223 (98.7%)** complete; its three open records are
 real-environment validation, not missing implementation.
 
-Release checkpoint: v0.6.0 (2026-07-31) packages the completed migration, playlist, ratings,
-history, shuffle, audio-device, native-icon, Linux, and artifact-policy work summarized in the
-[`CHANGELOG.md`](../CHANGELOG.md). Cutting this release does not change the **14/38 (36.8%)**
-feature numerator; P2.1 Last.fm remains the next implementation focus after release publication.
+Release checkpoint: [v0.6.0](https://github.com/jm2/tributary/releases/tag/v0.6.0) (2026-07-31),
+prepared in [#199](https://github.com/jm2/tributary/pull/199), packages the completed migration,
+playlist, ratings, history, shuffle, audio-device, native-icon, Linux, and artifact-policy work
+summarized in the [`CHANGELOG.md`](../CHANGELOG.md). Cutting this release does not change the
+**14/38 (36.8%)** feature numerator; P2.1 Last.fm remains the next implementation focus after
+release publication.
+
+Post-publication verification downloaded and validated all 12 v0.6.0 package payloads, then
+replaced a checksum manifest that repeated the two Flatpak records with a canonical 12-entry
+manifest. The follow-up workflow correction disables Flatpak's pre-validation automatic upload,
+retains the explicit post-validation upload, and rejects missing, unexpected, or duplicate release
+asset filenames before generating future manifests. This distribution correction does not change
+the **14/38 (36.8%)** feature numerator.
 
 ## Current focus
 
