@@ -1,6 +1,6 @@
 # Tributary active implementation backlog
 
-Last audited: 2026-07-28
+Last audited: 2026-07-31
 
 This is the executable backlog for feature fixes and additions. It replaces the completed
 holistic-review tracker, which is preserved as
@@ -27,6 +27,11 @@ Current status: **14/38 (36.8%)** active implementation records complete. This p
 checklist completion, not equal engineering effort: several P3 records are deliberately large
 epics. The archived remediation remains **220/223 (98.7%)** complete; its three open records are
 real-environment validation, not missing implementation.
+
+Release checkpoint: v0.6.0 (2026-07-31) packages the completed migration, playlist, ratings,
+history, shuffle, audio-device, native-icon, Linux, and artifact-policy work summarized in the
+[`CHANGELOG.md`](../CHANGELOG.md). Cutting this release does not change the **14/38 (36.8%)**
+feature numerator; P2.1 Last.fm remains the next implementation focus after release publication.
 
 ## Current focus
 
