@@ -44,6 +44,19 @@
   </screenshots>
 
   <releases>
+    <release version="0.6.0" date="2026-07-31">
+      <description>
+        <p>Feature and reliability release:</p>
+        <ul>
+          <li>Import Rhythmbox ratings, play history, and playlists through a preview-first migration</li>
+          <li>Browse, import, and sync Subsonic playlists and build mixed-source playlists</li>
+          <li>Add local ratings and committed playback history for smart playlists, Recently Played, and Top 25</li>
+          <li>Preserve volume and default-device routing across Windows and macOS audio changes</li>
+          <li>Fix Linux dialogs and rescan loops, unsupported playlist writes, and shuffle navigation</li>
+          <li>Harden native application metadata and release-artifact component validation</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.5.1" date="2026-07-18">
       <description>
         <p>Security and reliability release:</p>
