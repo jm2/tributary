@@ -1391,18 +1391,22 @@ $env:PKG_CONFIG_PATH = $pkgConfigPath
 $env:PKG_CONFIG_ALLOW_CROSS = "1"
 $env:PATH = "$MsysPath\bin;" + $env:PATH
 
-# Force Cargo to use MSYS2 tools instead of Rustup's incomplete bundled toolchain.
+# Force target build scripts to use MSYS2 tools without overriding the native
+# compiler used by host build dependencies. Generic CC/CXX/AR variables also
+# apply to MSVC-hosted build scripts (for example `vswhom-sys`) and make them
+# invoke the MinGW compiler without the Visual Studio include environment.
+$ToolEnvTarget = $RustTarget.Replace("-", "_").Replace(".", "_")
 if ($MsysEnv -match "clang") {
-    $env:DLLTOOL = Join-Path $MsysPath "bin\llvm-dlltool.exe"
-    $env:CC = Join-Path $MsysPath "bin\clang.exe"
-    $env:CXX = Join-Path $MsysPath "bin\clang++.exe"
-    $env:AR = Join-Path $MsysPath "bin\llvm-ar.exe"
+    [Environment]::SetEnvironmentVariable("DLLTOOL_$ToolEnvTarget", (Join-Path $MsysPath "bin\llvm-dlltool.exe"), "Process")
+    [Environment]::SetEnvironmentVariable("CC_$ToolEnvTarget", (Join-Path $MsysPath "bin\clang.exe"), "Process")
+    [Environment]::SetEnvironmentVariable("CXX_$ToolEnvTarget", (Join-Path $MsysPath "bin\clang++.exe"), "Process")
+    [Environment]::SetEnvironmentVariable("AR_$ToolEnvTarget", (Join-Path $MsysPath "bin\llvm-ar.exe"), "Process")
 }
 else {
-    $env:DLLTOOL = Join-Path $MsysPath "bin\dlltool.exe"
-    $env:CC = Join-Path $MsysPath "bin\gcc.exe"
-    $env:CXX = Join-Path $MsysPath "bin\g++.exe"
-    $env:AR = Join-Path $MsysPath "bin\ar.exe"
+    [Environment]::SetEnvironmentVariable("DLLTOOL_$ToolEnvTarget", (Join-Path $MsysPath "bin\dlltool.exe"), "Process")
+    [Environment]::SetEnvironmentVariable("CC_$ToolEnvTarget", (Join-Path $MsysPath "bin\gcc.exe"), "Process")
+    [Environment]::SetEnvironmentVariable("CXX_$ToolEnvTarget", (Join-Path $MsysPath "bin\g++.exe"), "Process")
+    [Environment]::SetEnvironmentVariable("AR_$ToolEnvTarget", (Join-Path $MsysPath "bin\ar.exe"), "Process")
 }
 
 Write-Info "PKG_CONFIG_PATH set to $pkgConfigPath"

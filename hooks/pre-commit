@@ -18,13 +18,15 @@ set -e
 
 echo "[pre-commit] Checking code formatting..."
 
-if ! cargo fmt --check 2>/dev/null; then
+if ! cargo fmt --check 2>/dev/null ||
+   ! cargo fmt --manifest-path fuzz/Cargo.toml --package tributary-fuzz -- --check 2>/dev/null; then
     echo ""
     echo "╔══════════════════════════════════════════════════════════╗"
     echo "║  Commit blocked: code formatting issues detected.        ║"
     echo "║                                                          ║"
     echo "║  Run one of the following to fix:                        ║"
     echo "║    cargo fmt                                             ║"
+    echo "║    cargo fmt --manifest-path fuzz/Cargo.toml             ║"
     echo "║    ./scripts/build-windows.ps1 -Fmt   (Windows)          ║"
     echo "║                                                          ║"
     echo "║  Then stage the changes and try again.                   ║"
