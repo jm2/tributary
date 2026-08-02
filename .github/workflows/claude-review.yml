@@ -28,7 +28,7 @@ jobs:
       id-token: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
@@ -107,7 +107,7 @@ jobs:
       issues: write
     steps:
       - name: Checkout trusted default revision
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # workflow_run has repository secrets. Never change this to the PR
           # head or execute/download PR artifacts in this privileged job.
