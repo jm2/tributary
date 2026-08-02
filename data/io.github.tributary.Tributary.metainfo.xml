@@ -44,6 +44,18 @@
   </screenshots>
 
   <releases>
+    <release version="0.6.1" date="2026-08-02">
+      <description>
+        <p>Windows integration and reliability release:</p>
+        <ul>
+          <li>Restore unrestricted resizing across portrait and multi-monitor Windows desktops</li>
+          <li>Keep manually resized and maximized windows aligned with the taskbar work area</li>
+          <li>Enable Windows 11 Snap Layouts from GTK's client-side maximize button</li>
+          <li>Move Rhythmbox import into the Library section of Preferences</li>
+          <li>Correct Windows developer builds and harden release checksum generation</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.0" date="2026-07-31">
       <description>
         <p>Feature and reliability release:</p>
