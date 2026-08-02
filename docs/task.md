@@ -1,6 +1,6 @@
 # Tributary active implementation backlog
 
-Last audited: 2026-07-31
+Last audited: 2026-08-02
 
 This is the executable backlog for feature fixes and additions. It replaces the completed
 holistic-review tracker, which is preserved as
@@ -28,9 +28,8 @@ checklist completion, not equal engineering effort: several P3 records are delib
 epics. The archived remediation remains **220/223 (98.7%)** complete; its three open records are
 real-environment validation, not missing implementation.
 
-Release checkpoint: [v0.6.0](https://github.com/jm2/tributary/releases/tag/v0.6.0) (2026-07-31),
-prepared in [#199](https://github.com/jm2/tributary/pull/199), packages the completed migration,
-playlist, ratings, history, shuffle, audio-device, native-icon, Linux, and artifact-policy work
+Release checkpoint: v0.6.1 (2026-08-02) packages the Windows portrait-monitor resizing, taskbar
+work-area, Snap Layout, developer-build, Rhythmbox action-placement, and release-checksum fixes
 summarized in the [`CHANGELOG.md`](../CHANGELOG.md). Cutting this release does not change the
 **14/38 (36.8%)** feature numerator; P2.1 Last.fm remains the next implementation focus after
 release publication.

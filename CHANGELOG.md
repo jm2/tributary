@@ -5,10 +5,23 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.1] — 2026-08-02
+
+### Changed
+
+- **Rhythmbox import placement** — Move the migration action from the main-window menu to a
+  dedicated button beneath the Library controls in Preferences.
 
 ### Fixed
 
+- **Windows resizing and taskbar handling** — Allow restored windows to use the full width of
+  portrait and multi-monitor desktops while constraining only the actively dragged edge at a
+  taskbar or docked appbar. GTK's client-side shadow is accounted for so visible content reaches
+  the work-area edge without covering the taskbar.
+- **Windows 11 Snap Layouts** — Expose GTK's client-side maximize button through native non-client
+  hit testing while preserving maximize and restore clicks.
+- **Windows development builds** — Scope MSYS2 compiler tools to the GNU target so MSVC-hosted
+  build dependencies no longer inherit incompatible compiler settings.
 - **Release checksum manifests** — Upload each validated Flatpak exactly once and reject missing,
   unexpected, or duplicate package filenames before publishing release checksums.
 
@@ -469,7 +482,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.desktop` file and AppStream metainfo for Linux desktop integration.
 - Windows resource file with icon embedding.
 
-[Unreleased]: https://github.com/jm2/tributary/compare/v0.6.0...HEAD
+[0.6.1]: https://github.com/jm2/tributary/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/jm2/tributary/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/jm2/tributary/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/jm2/tributary/compare/v0.4.1...v0.5.0
