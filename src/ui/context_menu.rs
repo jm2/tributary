@@ -5,8 +5,6 @@
 //! platform context-menu key / Shift+F10.
 
 use adw::prelude::*;
-use gtk::gio::prelude::ActionExt;
-use gtk::glib;
 use std::rc::Rc;
 
 use super::objects::{SourceObject, TrackObject};
@@ -373,7 +371,7 @@ pub fn setup_context_menu(state: &WindowState) {
                 return false;
             }
 
-            let popover = popover_from_menu_model(cv, &menu, &action_group);
+            let popover = popover_from_menu_model(cv, &menu, "tracklist-ctx", &action_group);
             if let Some(anchor) = anchor {
                 popover.set_pointing_to(Some(&anchor));
             }
@@ -924,82 +922,25 @@ fn active_source_is_automatic_device(
     })
 }
 
-/// Build a `gtk::Popover` from a `gio::Menu` model and an action group.
+/// Build a native `gtk::PopoverMenu` from a `gio::Menu` model and an action group.
 ///
-/// Each menu item with an enabled action becomes a flat `gtk::Button`;
-/// disabled actions render as section-header labels. The popover is
-/// parented to `parent` and self-unparents on close.
-///
-/// Submenus are not supported — items with no action reference are
-/// silently skipped.
-///
-/// This is a deliberate departure from `gtk::PopoverMenu::from_model`:
-/// on some Linux desktop configurations that binding can produce an
-/// invisible popover (no widget tree attached), which manifested as
-/// Track Properties / New Playlist / New Smart Playlist dialogs failing
-/// to open after the user clicked their menu entries. Hosting plain
-/// buttons in a generic `gtk::Popover` keeps the same one-shot popover
-/// lifecycle without relying on the broken binding.
+/// Attaching the action group directly to the popover makes the model's
+/// namespaced actions resolvable in its widget subtree. This preserves GTK's
+/// native menu-item roles and keyboard navigation while keeping the popover's
+/// one-shot parent/unparent lifetime.
 pub fn popover_from_menu_model(
     parent: &impl IsA<gtk::Widget>,
     menu: &gtk::gio::Menu,
+    action_group_name: &str,
     action_group: &gtk::gio::SimpleActionGroup,
-) -> gtk::Popover {
-    let popover = gtk::Popover::new();
+) -> gtk::PopoverMenu {
+    // Build the shell before supplying its model.  This establishes the
+    // parent and action lookup scope first, avoiding the model-before-parent
+    // timing that previously yielded an invisible GTK popover on Linux.
+    let popover = gtk::PopoverMenu::from_model(None::<&gtk::gio::Menu>);
     popover.set_parent(parent);
-    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-
-    for i in 0..menu.n_items() {
-        let Some(action_ref) = menu
-            .item_attribute_value(i, "action", Some(glib::VariantTy::STRING))
-            .and_then(|v| v.str().map(|s| s.to_string()))
-        else {
-            continue;
-        };
-        let Some(label) = menu
-            .item_attribute_value(i, "label", Some(glib::VariantTy::STRING))
-            .and_then(|v| v.str().map(|s| s.to_string()))
-        else {
-            continue;
-        };
-
-        let bare_name = action_ref
-            .rsplit('.')
-            .next()
-            .unwrap_or(&action_ref)
-            .to_string();
-
-        if let Some(action) = action_group.lookup_action(&bare_name) {
-            if action.is_enabled() {
-                let btn = gtk::Button::builder()
-                    .label(&label)
-                    .hexpand(true)
-                    .css_classes(["flat"])
-                    .build();
-                let act = action.clone();
-                let pop = popover.downgrade();
-                btn.connect_clicked(move |_| {
-                    act.activate(None::<&glib::Variant>);
-                    if let Some(pop) = pop.upgrade() {
-                        pop.popdown();
-                    }
-                });
-                vbox.append(&btn);
-            } else {
-                let lbl = gtk::Label::builder()
-                    .label(&label)
-                    .halign(gtk::Align::Start)
-                    .css_classes(["heading", "dim-label"])
-                    .margin_start(8)
-                    .margin_top(4)
-                    .margin_bottom(2)
-                    .build();
-                vbox.append(&lbl);
-            }
-        }
-    }
-
-    popover.set_child(Some(&vbox));
+    popover.insert_action_group(action_group_name, Some(action_group));
+    popover.set_menu_model(Some(menu));
     popover.connect_closed(|popover| popover.unparent());
     popover
 }
@@ -1007,6 +948,70 @@ pub fn popover_from_menu_model(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    fn descendant_has_accessible_role(
+        widget: &impl IsA<gtk::Widget>,
+        role: gtk::AccessibleRole,
+    ) -> bool {
+        let widget = widget.as_ref();
+        if widget.accessible_role() == role {
+            return true;
+        }
+
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if descendant_has_accessible_role(&current, role) {
+                return true;
+            }
+            child = current.next_sibling();
+        }
+        false
+    }
+
+    fn descendant_menu_items(widget: &impl IsA<gtk::Widget>) -> Vec<gtk::Widget> {
+        let widget = widget.as_ref();
+        let mut items = Vec::new();
+        if widget.accessible_role() == gtk::AccessibleRole::MenuItem {
+            items.push(widget.clone());
+        }
+
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            items.extend(descendant_menu_items(&current));
+            child = current.next_sibling();
+        }
+        items
+    }
+
+    fn pump_main_context() {
+        let context = gtk::glib::MainContext::default();
+        for _ in 0..32 {
+            if !context.pending() {
+                return;
+            }
+            context.iteration(false);
+        }
+        assert!(
+            !context.pending(),
+            "GTK main context did not become idle within the bounded pump"
+        );
+    }
+
+    fn close_and_assert_popover_released(popover: gtk::PopoverMenu) {
+        let weak = popover.downgrade();
+        popover.popdown();
+        pump_main_context();
+        assert!(
+            popover.parent().is_none(),
+            "closing the one-shot menu must release its parent"
+        );
+        drop(popover);
+        pump_main_context();
+        assert!(
+            weak.upgrade().is_none(),
+            "closed menu must not remain alive through an action or signal cycle"
+        );
+    }
 
     use super::*;
 
@@ -1416,88 +1421,183 @@ mod tests {
         assert_eq!(popup_plan.selection.positions, vec![1, 3]);
     }
 
-    /// Regression test for the "dialogs not appearing on Linux" bug:
-    /// `gtk::PopoverMenu::from_model` can produce an invisible popover on
-    /// some Linux desktop configurations, which manifested as Track
-    /// Properties / New Playlist / New Smart Playlist dialogs failing to
-    /// open after the user clicked their menu entries. The fix routes all
-    /// menu display through `popover_from_menu_model`, which always sets a
-    /// non-null child widget built from the menu's actions.
-    ///
-    /// This test exercises that contract end-to-end: with a populated
-    /// menu and matching action group, the resulting popover MUST have a
-    /// child widget containing one button per enabled action. If a future
-    /// change drops the child assignment (e.g. by re-introducing
-    /// `gtk::PopoverMenu::from_model`), this test will fail.
-    ///
-    /// Headless CI (cargo test on fedora:41 with no X/Wayland socket)
-    /// cannot initialize GTK, so the test gates on `gtk::init()`'s
-    /// non-panicking result and skips with a printed reason when GTK
-    /// cannot acquire a display. macOS is excluded because GTK's Quartz
-    /// backend panics when initialized from the test harness worker thread.
-    /// The contract still holds on any machine with a display — the test is
-    /// therefore meaningful on a developer box and harmless in CI.
+    /// Exercise the shipped menu models and action groups through generated
+    /// native GTK menu items. The required CI lane runs this under `xvfb-run`
+    /// and fails closed if GTK cannot acquire that display.
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn popover_from_menu_model_attaches_a_visible_child_widget() {
+    fn popover_menu_opens_production_dialogs_with_native_navigation() {
         if let Err(e) = gtk::init() {
+            assert!(
+                std::env::var_os("TRIBUTARY_REQUIRE_DISPLAY_TEST").is_none(),
+                "GTK must initialize on the required virtual display: {e}"
+            );
             eprintln!(
-                "popover_from_menu_model_attaches_a_visible_child_widget: \
+                "popover_menu_opens_production_dialogs_with_native_navigation: \
                  GTK unavailable ({e}); skipping. Re-run on a box with a display \
                  session to exercise the contract."
             );
             return;
         }
 
-        let menu = gtk::gio::Menu::new();
-        menu.append(Some("Open Properties"), Some("ctx.properties"));
-        menu.append(Some("Add to Playlist"), Some("ctx.add"));
-
-        let actions = gtk::gio::SimpleActionGroup::new();
-        let prop_action = gtk::gio::SimpleAction::new("properties", None);
-        let (prop_tx, prop_rx) = async_channel::unbounded::<()>();
-        prop_action.connect_activate(move |_, _| {
-            let _ = prop_tx.send_blocking(());
-        });
-        actions.add_action(&prop_action);
-
-        let add_action = gtk::gio::SimpleAction::new("add", None);
-        let (add_tx, add_rx) = async_channel::unbounded::<()>();
-        add_action.connect_activate(move |_, _| {
-            let _ = add_tx.send_blocking(());
-        });
-        actions.add_action(&add_action);
-
-        let parent = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let popover = popover_from_menu_model(&parent, &menu, &actions);
-
-        let child = popover
-            .child()
-            .expect("popover must have a non-null child after construction");
-        let vbox = child
-            .downcast::<gtk::Box>()
-            .expect("popover child must be the menu's Box");
-        assert_eq!(
-            vbox.observe_children().n_items(),
-            2,
-            "one button per enabled action"
+        let track = TrackObject::new(
+            1,
+            "Display-backed properties fixture",
+            60,
+            "Artist",
+            "Album",
+            "Genre",
+            "Composer",
+            2026,
+            "",
+            320,
+            44_100,
+            0,
+            "FLAC",
+            "file:///tmp/tributary-popover-fixture.flac",
         );
+        let tracks = gtk::gio::ListStore::new::<TrackObject>();
+        tracks.append(&track);
+        let sorted_tracks = gtk::SortListModel::new(Some(tracks), None::<gtk::Sorter>);
+        let selection_model = gtk::MultiSelection::new(Some(sorted_tracks.clone()));
+        let column_view = gtk::ColumnView::builder().model(&selection_model).build();
+        let window = adw::ApplicationWindow::builder()
+            .title("Native menu test")
+            .content(&column_view)
+            .build();
+        window.present();
+        pump_main_context();
 
-        // Clicking the first button must activate the corresponding
-        // action and close the popover — that's the user-visible fix.
-        let first_button = vbox
-            .observe_children()
-            .item(0)
-            .and_then(|o| o.downcast::<gtk::Button>().ok())
-            .expect("first child must be a button");
-        assert_eq!(first_button.label().as_deref(), Some("Open Properties"));
-
-        first_button.emit_clicked();
-        assert_eq!(prop_rx.try_recv(), Ok(()), "properties action must fire");
-        assert_eq!(
-            add_rx.try_recv(),
-            Err(async_channel::TryRecvError::Empty),
-            "non-clicked actions must not fire"
+        let properties_menu = gtk::gio::Menu::new();
+        let properties_actions = gtk::gio::SimpleActionGroup::new();
+        build_properties_action(
+            &properties_menu,
+            &properties_actions,
+            &column_view,
+            &sorted_tracks,
+            &SelectionSnapshot { positions: vec![0] },
+            false,
         );
+        let properties_popover = popover_from_menu_model(
+            &column_view,
+            &properties_menu,
+            "tracklist-ctx",
+            &properties_actions,
+        );
+        properties_popover.popup();
+        pump_main_context();
+        assert!(
+            properties_popover.is_visible(),
+            "native menu must become visible"
+        );
+        assert!(
+            descendant_has_accessible_role(&properties_popover, gtk::AccessibleRole::Menu),
+            "native popover must expose a Menu accessibility role"
+        );
+        let properties_items = descendant_menu_items(&properties_popover);
+        assert_eq!(
+            properties_items.len(),
+            1,
+            "production Track Properties model must generate one menu item"
+        );
+        assert!(
+            properties_items[0].activate(),
+            "generated Track Properties item must activate its production action"
+        );
+        pump_main_context();
+        let properties_dialog = window
+            .visible_dialog()
+            .expect("Track Properties action must present its real Libadwaita dialog");
+        properties_dialog.close();
+        pump_main_context();
+        close_and_assert_popover_released(properties_popover);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test Tokio runtime");
+        let (refresh, _refresh_receiver) =
+            crate::local::playlist_sidebar::playlist_sidebar_refresh_channel();
+
+        let (playlist_tx, playlist_rx) = async_channel::unbounded();
+        let playlist_popover = popover_from_menu_model(
+            &column_view,
+            &super::super::sidebar::playlist_creation_menu(),
+            "pl-add",
+            &super::super::sidebar::playlist_creation_action_group(&playlist_tx),
+        );
+        playlist_popover.popup();
+        pump_main_context();
+        let playlist_items = descendant_menu_items(&playlist_popover);
+        assert_eq!(
+            playlist_items.len(),
+            4,
+            "production playlist menu must generate its four native items"
+        );
+        assert!(
+            playlist_items[0].grab_focus(),
+            "first menu item must accept focus"
+        );
+        assert!(playlist_items[0].has_focus());
+        assert!(
+            playlist_popover.child_focus(gtk::DirectionType::Down),
+            "Down navigation must move through generated native menu items"
+        );
+        assert!(
+            playlist_items[1].has_focus(),
+            "Down must focus New Smart Playlist"
+        );
+        assert!(
+            playlist_popover.child_focus(gtk::DirectionType::Up),
+            "Up navigation must move through generated native menu items"
+        );
+        assert!(
+            playlist_items[0].has_focus(),
+            "Up must restore New Playlist focus"
+        );
+        assert!(
+            playlist_items[0].activate(),
+            "generated New Playlist item must activate its production action"
+        );
+        assert!(matches!(
+            playlist_rx.try_recv(),
+            Ok(super::super::sidebar::PlaylistAction::CreateRegular)
+        ));
+        super::super::playlist_actions::handle_create_regular(&window, runtime.handle(), &refresh);
+        pump_main_context();
+        let regular_dialog = window
+            .visible_dialog()
+            .expect("New Playlist action must present its real Libadwaita dialog");
+        regular_dialog.close();
+        pump_main_context();
+        close_and_assert_popover_released(playlist_popover);
+
+        let (smart_tx, smart_rx) = async_channel::unbounded();
+        let smart_popover = popover_from_menu_model(
+            &column_view,
+            &super::super::sidebar::playlist_creation_menu(),
+            "pl-add",
+            &super::super::sidebar::playlist_creation_action_group(&smart_tx),
+        );
+        smart_popover.popup();
+        pump_main_context();
+        let smart_items = descendant_menu_items(&smart_popover);
+        assert!(
+            smart_items[1].activate(),
+            "generated New Smart Playlist item must activate its production action"
+        );
+        assert!(matches!(
+            smart_rx.try_recv(),
+            Ok(super::super::sidebar::PlaylistAction::CreateSmart)
+        ));
+        super::super::playlist_actions::handle_create_smart(&window, runtime.handle(), &refresh);
+        pump_main_context();
+        let smart_dialog = window
+            .visible_dialog()
+            .expect("New Smart Playlist action must present its real Libadwaita dialog");
+        smart_dialog.close();
+        pump_main_context();
+        close_and_assert_popover_released(smart_popover);
+        window.close();
     }
 }

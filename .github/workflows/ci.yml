@@ -130,7 +130,7 @@ jobs:
     steps:
       - name: Install system dependencies (Fedora)
         run: |
-          dnf install -y binutils gcc gcc-c++ gtk4-devel libadwaita-devel \
+          dnf install -y binutils gcc gcc-c++ gtk4-devel libadwaita-devel xorg-x11-server-Xvfb \
             dbus-devel \
             gstreamer1-devel gstreamer1-plugins-base-devel \
             gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free gstreamer1-libav \
@@ -171,6 +171,13 @@ jobs:
 
       - name: Run tests
         run: cargo test --release
+
+      - name: Prove native GTK menu dialogs on a virtual display
+        run: >-
+          TRIBUTARY_REQUIRE_DISPLAY_TEST=1 xvfb-run -a
+          cargo test --bin tributary
+          ui::context_menu::tests::popover_menu_opens_production_dialogs_with_native_navigation
+          -- --exact --test-threads=1
 
       # Debug-profile tests catch what release-only testing ships past:
       # debug_assert! bodies and overflow checks are compiled out above.

@@ -193,7 +193,7 @@ pub fn setup_playlist_actions(
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Show a name dialog and create a new regular playlist.
-fn handle_create_regular(
+pub(super) fn handle_create_regular(
     win: &adw::ApplicationWindow,
     rt_handle: &tokio::runtime::Handle,
     playlist_sidebar_refresh: &crate::local::playlist_sidebar::PlaylistSidebarRefresh,
@@ -268,7 +268,7 @@ fn handle_create_regular(
 }
 
 /// Open the smart playlist editor and create a new smart playlist.
-fn handle_create_smart(
+pub(super) fn handle_create_smart(
     win: &adw::ApplicationWindow,
     rt_handle: &tokio::runtime::Handle,
     playlist_sidebar_refresh: &crate::local::playlist_sidebar::PlaylistSidebarRefresh,

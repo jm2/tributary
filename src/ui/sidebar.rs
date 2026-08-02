@@ -172,7 +172,7 @@ fn sidebar_row_action(
     action
 }
 
-fn playlist_creation_menu() -> gio::Menu {
+pub(super) fn playlist_creation_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     menu.append(
         Some(rust_i18n::t!("sidebar.new_playlist_menu").as_ref()),
@@ -193,7 +193,7 @@ fn playlist_creation_menu() -> gio::Menu {
     menu
 }
 
-fn playlist_creation_action_group(
+pub(super) fn playlist_creation_action_group(
     tx: &async_channel::Sender<PlaylistAction>,
 ) -> gio::SimpleActionGroup {
     let action_group = gio::SimpleActionGroup::new();
@@ -331,6 +331,7 @@ pub fn build_sidebar(
                     let popover = context_menu::popover_from_menu_model(
                         &button,
                         &playlist_creation_menu(),
+                        "pl-add",
                         &playlist_creation_action_group(&tx_source),
                     );
                     popover.popup();
@@ -386,7 +387,7 @@ pub fn build_sidebar(
                     action_group.add_action(&a);
                     menu.append(
                         Some(rust_i18n::t!("sidebar.new_playlist_menu").as_ref()),
-                        Some("new-playlist"),
+                        Some("sidebar-menu.new-playlist"),
                     );
 
                     let a = gio::SimpleAction::new("new-smart", None);
@@ -397,7 +398,7 @@ pub fn build_sidebar(
                     action_group.add_action(&a);
                     menu.append(
                         Some(rust_i18n::t!("sidebar.new_smart_playlist_menu").as_ref()),
-                        Some("new-smart"),
+                        Some("sidebar-menu.new-smart"),
                     );
 
                     let a = gio::SimpleAction::new("import", None);
@@ -408,7 +409,7 @@ pub fn build_sidebar(
                     action_group.add_action(&a);
                     menu.append(
                         Some(rust_i18n::t!("playlist_io.import_menu").as_ref()),
-                        Some("import"),
+                        Some("sidebar-menu.import"),
                     );
                 } else if matches!(
                     playlist_kind,
@@ -421,7 +422,10 @@ pub fn build_sidebar(
                         let _ = tx_c.try_send(PlaylistAction::Rename(pid_c.clone()));
                     });
                     action_group.add_action(&a);
-                    menu.append(Some(&rust_i18n::t!("sidebar.rename")), Some("rename"));
+                    menu.append(
+                        Some(&rust_i18n::t!("sidebar.rename")),
+                        Some("sidebar-menu.rename"),
+                    );
 
                     let a = gio::SimpleAction::new("export", None);
                     let tx_c = tx.clone();
@@ -432,7 +436,7 @@ pub fn build_sidebar(
                     action_group.add_action(&a);
                     menu.append(
                         Some(&rust_i18n::t!("playlist_io.export_menu")),
-                        Some("export"),
+                        Some("sidebar-menu.export"),
                     );
 
                     let a = gio::SimpleAction::new("delete", None);
@@ -442,7 +446,10 @@ pub fn build_sidebar(
                         let _ = tx_c.try_send(PlaylistAction::Delete(pid_c.clone()));
                     });
                     action_group.add_action(&a);
-                    menu.append(Some(&rust_i18n::t!("sidebar.delete")), Some("delete"));
+                    menu.append(
+                        Some(&rust_i18n::t!("sidebar.delete")),
+                        Some("sidebar-menu.delete"),
+                    );
 
                     if playlist_kind == Some(PlaylistSidebarKind::EditableSmart) {
                         let a = gio::SimpleAction::new("edit-smart", None);
@@ -454,7 +461,7 @@ pub fn build_sidebar(
                         action_group.add_action(&a);
                         menu.append(
                             Some(&rust_i18n::t!("sidebar.edit_smart_playlist")),
-                            Some("edit-smart"),
+                            Some("sidebar-menu.edit-smart"),
                         );
                     }
                 } else {
@@ -467,6 +474,7 @@ pub fn build_sidebar(
                 let popover = context_menu::popover_from_menu_model(
                     &row_box_for_gesture,
                     &menu,
+                    "sidebar-menu",
                     &action_group,
                 );
                 #[allow(clippy::cast_possible_truncation)]
