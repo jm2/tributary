@@ -2459,7 +2459,7 @@ pub(crate) fn build_window(
     let hwnd = extract_hwnd(&window);
 
     // ── Enable Windows 11 Snap Layout ───────────────────────────────
-    // Install a WM_NCHITTEST / WM_GETMINMAXINFO subclass on the
+    // Install the narrowly scoped hit-test and work-area subclass on the
     // top-level HWND.
     //
     // `window.present()` is supposed to allocate the native surface,
@@ -2471,18 +2471,14 @@ pub(crate) fn build_window(
     {
         if let Some(hwnd_ptr) = hwnd {
             tracing::info!("Installing Snap Layout subclass (HWND ready at present)");
-            super::win32_snap::enable_snap_layout(hwnd_ptr, (win_width - 92, 0, 46, 36));
-
-            window.connect_default_width_notify(move |win| {
-                let (w, _) = win.default_size();
-                super::win32_snap::update_maximize_rect((w - 92, 0, 46, 36));
-            });
+            super::win32_snap::enable_snap_layout(hwnd_ptr, &window, &hb.header);
         } else {
             tracing::warn!(
                 "HWND not available immediately after window.present() — deferring Snap Layout install to first notify::is-active"
             );
             let installed = std::rc::Rc::new(std::cell::Cell::new(false));
             let installed_for_handler = installed.clone();
+            let header_for_handler = hb.header.clone();
             window.connect_is_active_notify(move |w| {
                 if installed_for_handler.get() {
                     return;
@@ -2491,14 +2487,11 @@ pub(crate) fn build_window(
                     return;
                 };
                 tracing::info!("Installing Snap Layout subclass (deferred, HWND now ready)");
-                let (cw, _) = w.default_size();
-                super::win32_snap::enable_snap_layout(hwnd_ptr, (cw - 92, 0, 46, 36));
-                installed_for_handler.set(true);
-
-                w.connect_default_width_notify(move |win| {
-                    let (cw, _) = win.default_size();
-                    super::win32_snap::update_maximize_rect((cw - 92, 0, 46, 36));
-                });
+                installed_for_handler.set(super::win32_snap::enable_snap_layout(
+                    hwnd_ptr,
+                    w,
+                    &header_for_handler,
+                ));
             });
         }
     }
