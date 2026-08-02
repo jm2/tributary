@@ -1,6 +1,5 @@
-# The English locale is historically CRLF. Keep Git's whitespace checker
-# strict while treating the carriage return at its line ending as intentional.
-locales/en.yml whitespace=cr-at-eol
+# Keep repository text LF-only on every development host, including Windows.
+* text=auto eol=lf
 
 # The vendored Flatpak generator is verified byte-for-byte at build time.
 build-aux/flatpak/flatpak-cargo-generator.py text eol=lf
