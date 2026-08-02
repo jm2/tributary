@@ -745,7 +745,17 @@ pub fn show_preferences(
         });
     }
 
+    let import_rhythmbox_btn = adw::ButtonRow::builder()
+        .title(rust_i18n::t!("rhythmbox_migration.menu_action").as_ref())
+        .start_icon_name("document-open-symbolic")
+        // Reuse the window action so the Preferences entry follows the same
+        // admission, shutdown, and migration-dialog path as the former menu
+        // item.
+        .action_name("win.migrate-rhythmbox")
+        .build();
+
     library_group.add(&library_box);
+    library_group.add(&import_rhythmbox_btn);
     page.add(&library_group);
 
     // ── Browser Views group (dense horizontal checkboxes) ───────────

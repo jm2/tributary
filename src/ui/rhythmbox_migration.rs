@@ -1827,7 +1827,7 @@ mod tests {
         let prefix = concat!("rhythmbox", "_migration.");
         [
             include_str!("rhythmbox_migration.rs"),
-            include_str!("header_bar.rs"),
+            include_str!("preferences.rs"),
         ]
         .into_iter()
         .flat_map(|source| {
