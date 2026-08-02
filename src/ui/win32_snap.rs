@@ -451,49 +451,128 @@ fn apply_sizing_work_area(
     *rect != original
 }
 
-fn active_sizing_edges(current: Rect, proposed: Rect, cursor: Point) -> SizingEdges {
-    let mut edges = SizingEdges::default();
-    let current_width = current.right - current.left;
-    let proposed_width = proposed.right - proposed.left;
-    let current_height = current.bottom - current.top;
-    let proposed_height = proposed.bottom - proposed.top;
+fn active_axis_edge<T: Copy>(
+    current_start: i32,
+    current_end: i32,
+    proposed_start: i32,
+    proposed_end: i32,
+    cursor: i32,
+    start_edge: T,
+    end_edge: T,
+) -> Option<T> {
+    let current_size = current_end - current_start;
+    let proposed_size = proposed_end - proposed_start;
+    if current_size == proposed_size {
+        return None;
+    }
 
-    if current_width != proposed_width {
-        if proposed.left != current.left && proposed.right == current.right {
-            edges.horizontal = Some(HorizontalEdge::Left);
-        } else if proposed.left == current.left && proposed.right != current.right {
-            edges.horizontal = Some(HorizontalEdge::Right);
-        } else {
+    match (proposed_start != current_start, proposed_end != current_end) {
+        (true, false) => Some(start_edge),
+        (false, true) => Some(end_edge),
+        _ => {
             // Style/DPI bookkeeping can shift both outer bounds by a pixel.
             // In that ambiguous case, the pointer remains on the edge GTK is
             // actively dragging, so proximity identifies the intended side.
-            let left_distance = (i64::from(cursor.x) - i64::from(proposed.left)).abs();
-            let right_distance = (i64::from(cursor.x) - i64::from(proposed.right)).abs();
-            if left_distance <= right_distance {
-                edges.horizontal = Some(HorizontalEdge::Left);
+            let start_distance = (i64::from(cursor) - i64::from(proposed_start)).abs();
+            let end_distance = (i64::from(cursor) - i64::from(proposed_end)).abs();
+            Some(if start_distance <= end_distance {
+                start_edge
             } else {
-                edges.horizontal = Some(HorizontalEdge::Right);
-            }
+                end_edge
+            })
         }
     }
+}
 
-    if current_height != proposed_height {
-        if proposed.top != current.top && proposed.bottom == current.bottom {
-            edges.vertical = Some(VerticalEdge::Top);
-        } else if proposed.top == current.top && proposed.bottom != current.bottom {
-            edges.vertical = Some(VerticalEdge::Bottom);
-        } else {
-            let top_distance = (i64::from(cursor.y) - i64::from(proposed.top)).abs();
-            let bottom_distance = (i64::from(cursor.y) - i64::from(proposed.bottom)).abs();
-            if top_distance <= bottom_distance {
-                edges.vertical = Some(VerticalEdge::Top);
-            } else {
-                edges.vertical = Some(VerticalEdge::Bottom);
-            }
-        }
+fn active_sizing_edges(current: Rect, proposed: Rect, cursor: Point) -> SizingEdges {
+    SizingEdges {
+        horizontal: active_axis_edge(
+            current.left,
+            current.right,
+            proposed.left,
+            proposed.right,
+            cursor.x,
+            HorizontalEdge::Left,
+            HorizontalEdge::Right,
+        ),
+        vertical: active_axis_edge(
+            current.top,
+            current.bottom,
+            proposed.top,
+            proposed.bottom,
+            cursor.y,
+            VerticalEdge::Top,
+            VerticalEdge::Bottom,
+        ),
+    }
+}
+
+fn proposed_window_rect(current: Rect, position: &WindowPos) -> Rect {
+    let left = if position.flags & SWP_NOMOVE != 0 {
+        current.left
+    } else {
+        position.x
+    };
+    let top = if position.flags & SWP_NOMOVE != 0 {
+        current.top
+    } else {
+        position.y
+    };
+
+    Rect {
+        left,
+        top,
+        right: left.saturating_add(position.width),
+        bottom: top.saturating_add(position.height),
+    }
+}
+
+fn rect_size(rect: Rect) -> (i32, i32) {
+    (
+        rect.right.saturating_sub(rect.left),
+        rect.bottom.saturating_sub(rect.top),
+    )
+}
+
+fn apply_window_pos(position: &mut WindowPos, rect: Rect) {
+    if position.flags & SWP_NOMOVE == 0 {
+        position.x = rect.left;
+        position.y = rect.top;
+    }
+    position.width = rect.right.saturating_sub(rect.left);
+    position.height = rect.bottom.saturating_sub(rect.top);
+}
+
+unsafe fn window_rect(hwnd: *mut c_void) -> Option<Rect> {
+    let mut rect = Rect::default();
+    // SAFETY: hwnd is live and rect points to writable RECT storage.
+    (unsafe { GetWindowRect(hwnd, &raw mut rect) } != 0).then_some(rect)
+}
+
+unsafe fn cursor_monitor_info() -> Option<(Point, MonitorInfo)> {
+    let mut cursor = Point::default();
+    // SAFETY: cursor points to writable storage for a screen-space POINT.
+    if unsafe { GetCursorPos(&raw mut cursor) } == 0 {
+        return None;
     }
 
-    edges
+    // The sizing cursor identifies which monitor's taskbar matters when the
+    // proposed window spans monitors. These APIs all use physical screen
+    // coordinates, so no GTK scale or DPI conversion belongs here.
+    // SAFETY: MONITOR_DEFAULTTONEAREST guarantees a monitor for a valid point.
+    let monitor = unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) };
+    if monitor.is_null() {
+        return None;
+    }
+
+    let mut info = MonitorInfo {
+        size: std::mem::size_of::<MonitorInfo>() as u32,
+        monitor: Rect::default(),
+        work_area: Rect::default(),
+        flags: 0,
+    };
+    // SAFETY: monitor is valid and info has the documented size.
+    (unsafe { GetMonitorInfoW(monitor, &raw mut info) } != 0).then_some((cursor, info))
 }
 
 unsafe fn constrain_maximized_window_to_work_area(hwnd: *mut c_void, lparam: isize) {
@@ -551,61 +630,20 @@ unsafe fn constrain_interactive_window_pos_to_work_area(
         return false;
     }
 
-    let mut current = Rect::default();
-    // SAFETY: hwnd is live and current points to writable RECT storage.
-    if unsafe { GetWindowRect(hwnd, &raw mut current) } == 0 {
+    // SAFETY: hwnd is the live window whose placement is changing.
+    let Some(current) = (unsafe { window_rect(hwnd) }) else {
         return false;
-    }
-
-    let left = if position.flags & SWP_NOMOVE != 0 {
-        current.left
-    } else {
-        position.x
     };
-    let top = if position.flags & SWP_NOMOVE != 0 {
-        current.top
-    } else {
-        position.y
+    let mut proposed = proposed_window_rect(current, position);
+
+    if rect_size(proposed) == rect_size(current) {
+        return false;
+    }
+
+    // SAFETY: the cursor and monitor queries are stateless UI-thread calls.
+    let Some((cursor, monitor_info)) = (unsafe { cursor_monitor_info() }) else {
+        return false;
     };
-    let mut proposed = Rect {
-        left,
-        top,
-        right: left.saturating_add(position.width),
-        bottom: top.saturating_add(position.height),
-    };
-
-    if proposed.right - proposed.left == current.right - current.left
-        && proposed.bottom - proposed.top == current.bottom - current.top
-    {
-        return false;
-    }
-
-    let mut cursor = Point::default();
-    // SAFETY: cursor points to writable storage for a screen-space POINT.
-    if unsafe { GetCursorPos(&raw mut cursor) } == 0 {
-        return false;
-    }
-
-    // The active sizing cursor identifies which monitor's taskbar matters
-    // when the proposed window rectangle spans more than one monitor. All
-    // coordinates supplied by these APIs are in the same physical screen
-    // coordinate space, so no GTK scale or DPI conversion belongs here.
-    // SAFETY: MONITOR_DEFAULTTONEAREST guarantees a monitor for a valid point.
-    let monitor = unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) };
-    if monitor.is_null() {
-        return false;
-    }
-
-    let mut monitor_info = MonitorInfo {
-        size: std::mem::size_of::<MonitorInfo>() as u32,
-        monitor: Rect::default(),
-        work_area: Rect::default(),
-        flags: 0,
-    };
-    // SAFETY: monitor is valid and monitor_info has the documented size.
-    if unsafe { GetMonitorInfoW(monitor, &raw mut monitor_info) } == 0 {
-        return false;
-    }
 
     let edges = active_sizing_edges(current, proposed, cursor);
     if !apply_sizing_work_area(
@@ -618,12 +656,7 @@ unsafe fn constrain_interactive_window_pos_to_work_area(
         return false;
     }
 
-    if position.flags & SWP_NOMOVE == 0 {
-        position.x = proposed.left;
-        position.y = proposed.top;
-    }
-    position.width = proposed.right - proposed.left;
-    position.height = proposed.bottom - proposed.top;
+    apply_window_pos(position, proposed);
     true
 }
 
@@ -784,7 +817,9 @@ unsafe extern "system" fn subclass_proc(
             0
         }
         WM_NCDESTROY => {
-            // Clean up: remove our subclass before the window is destroyed.
+            // This is the only removal site, reached after WM_NCDESTROY has
+            // already entered our callback, so removal cannot bypass the raw
+            // Arc reclamation below.
             // SAFETY: RemoveWindowSubclass with the same fn + ID we registered.
             unsafe {
                 RemoveWindowSubclass(hwnd, subclass_proc, SUBCLASS_ID);
@@ -809,12 +844,32 @@ unsafe extern "system" fn subclass_proc(
 mod tests {
     use super::{
         active_sizing_edges, apply_monitor_work_area, apply_sizing_work_area, physical_csd_insets,
-        physical_hit_rect, point_from_lparam, CsdInsets, HitRect, HorizontalEdge, MinMaxInfo,
-        Point, Rect, SizingEdges, VerticalEdge,
+        physical_hit_rect, point_from_lparam, proposed_window_rect, CsdInsets, HitRect,
+        HorizontalEdge, MinMaxInfo, Point, Rect, SizingEdges, VerticalEdge, WindowPos, SWP_NOMOVE,
     };
+    use std::ptr;
 
     fn pack_point(x: i16, y: i16) -> isize {
         (((y as u16 as u32) << 16) | u32::from(x as u16)) as isize
+    }
+
+    fn window_pos(x: i32, y: i32, width: i32, height: i32, flags: u32) -> WindowPos {
+        WindowPos {
+            hwnd: ptr::null_mut(),
+            insert_after: ptr::null_mut(),
+            x,
+            y,
+            width,
+            height,
+            flags,
+        }
+    }
+
+    fn left_csd_inset(left: i32) -> CsdInsets {
+        CsdInsets {
+            left,
+            ..CsdInsets::default()
+        }
     }
 
     #[test]
@@ -975,10 +1030,7 @@ mod tests {
             },
             monitor,
             work_area,
-            CsdInsets {
-                left: 24,
-                ..CsdInsets::default()
-            },
+            left_csd_inset(24),
         ));
         assert_eq!(right_edge, proposed);
 
@@ -991,15 +1043,15 @@ mod tests {
             },
             monitor,
             work_area,
-            CsdInsets {
-                left: 24,
-                ..CsdInsets::default()
-            },
+            left_csd_inset(24),
         ));
-        assert_eq!(left_edge.left, -2_088);
-        assert_eq!(left_edge.right, proposed.right);
-        assert_eq!(left_edge.top, proposed.top);
-        assert_eq!(left_edge.bottom, proposed.bottom);
+        assert_eq!(
+            left_edge,
+            Rect {
+                left: -2_088,
+                ..proposed
+            }
+        );
     }
 
     #[test]
@@ -1022,6 +1074,92 @@ mod tests {
             SizingEdges {
                 horizontal: Some(HorizontalEdge::Right),
                 vertical: Some(VerticalEdge::Bottom),
+            }
+        );
+    }
+
+    #[test]
+    fn active_edges_use_cursor_proximity_when_both_bounds_shift() {
+        let current = Rect {
+            left: 100,
+            top: 200,
+            right: 1_100,
+            bottom: 1_000,
+        };
+        let proposed = Rect {
+            left: 99,
+            top: 201,
+            right: 1_400,
+            bottom: 1_301,
+        };
+
+        assert_eq!(
+            active_sizing_edges(current, proposed, Point { x: 100, y: 1_300 }),
+            SizingEdges {
+                horizontal: Some(HorizontalEdge::Left),
+                vertical: Some(VerticalEdge::Bottom),
+            }
+        );
+    }
+
+    #[test]
+    fn active_edges_break_equal_distance_ties_toward_start_edges() {
+        let current = Rect {
+            left: 100,
+            top: 200,
+            right: 1_100,
+            bottom: 1_000,
+        };
+        let proposed = Rect {
+            left: 0,
+            top: 100,
+            right: 1_200,
+            bottom: 1_100,
+        };
+
+        assert_eq!(
+            active_sizing_edges(current, proposed, Point { x: 600, y: 600 }),
+            SizingEdges {
+                horizontal: Some(HorizontalEdge::Left),
+                vertical: Some(VerticalEdge::Top),
+            }
+        );
+    }
+
+    #[test]
+    fn proposed_window_rect_uses_the_proposed_origin() {
+        let current = Rect {
+            left: -2_160,
+            top: 0,
+            right: 0,
+            bottom: 3_840,
+        };
+        assert_eq!(
+            proposed_window_rect(current, &window_pos(20, 40, 800, 600, 0)),
+            Rect {
+                left: 20,
+                top: 40,
+                right: 820,
+                bottom: 640,
+            }
+        );
+    }
+
+    #[test]
+    fn proposed_window_rect_preserves_origin_when_not_moving() {
+        let current = Rect {
+            left: -2_160,
+            top: 0,
+            right: 0,
+            bottom: 3_840,
+        };
+        assert_eq!(
+            proposed_window_rect(current, &window_pos(20, 40, 800, 600, SWP_NOMOVE)),
+            Rect {
+                left: -2_160,
+                top: 0,
+                right: -1_360,
+                bottom: 600,
             }
         );
     }

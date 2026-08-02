@@ -65,6 +65,17 @@ type PlaybackUiReset = Rc<dyn Fn()>;
 type SourcePlaybackInvalidator = Rc<dyn Fn(&str)>;
 type PlaylistPlaybackInvalidator = Rc<dyn Fn(crate::architecture::SourceId)>;
 
+#[cfg(target_os = "windows")]
+fn try_enable_snap_layout(
+    window: &adw::ApplicationWindow,
+    header: &adw::HeaderBar,
+    attempt: &'static str,
+) -> Option<bool> {
+    let hwnd = extract_hwnd(window)?;
+    tracing::info!(attempt, "Installing Windows Snap Layout subclass");
+    Some(super::win32_snap::enable_snap_layout(hwnd, window, header))
+}
+
 /// Keep coordinator ingress ahead of the history/UI reducers for one current
 /// player event.  The two callbacks make the ordering explicit and keep the
 /// rule independently testable without a GTK main loop.
@@ -2469,29 +2480,49 @@ pub(crate) fn build_window(
     // the window is mapped.
     #[cfg(target_os = "windows")]
     {
-        if let Some(hwnd_ptr) = hwnd {
-            tracing::info!("Installing Snap Layout subclass (HWND ready at present)");
-            super::win32_snap::enable_snap_layout(hwnd_ptr, &window, &hb.header);
-        } else {
-            tracing::warn!(
-                "HWND not available immediately after window.present() — deferring Snap Layout install to first notify::is-active"
+        let installed = Rc::new(Cell::new(false));
+        match try_enable_snap_layout(&window, &hb.header, "immediate") {
+            Some(result) => installed.set(result),
+            None => {
+                tracing::warn!(
+                    "HWND not available immediately after window.present() — scheduling Snap Layout retries"
             );
-            let installed = std::rc::Rc::new(std::cell::Cell::new(false));
+            }
+        }
+
+        if !installed.get() {
             let installed_for_handler = installed.clone();
-            let header_for_handler = hb.header.clone();
+            let header_for_handler = hb.header.downgrade();
             window.connect_is_active_notify(move |w| {
                 if installed_for_handler.get() {
                     return;
                 }
-                let Some(hwnd_ptr) = extract_hwnd(w) else {
+                let Some(header) = header_for_handler.upgrade() else {
                     return;
                 };
-                tracing::info!("Installing Snap Layout subclass (deferred, HWND now ready)");
-                installed_for_handler.set(super::win32_snap::enable_snap_layout(
-                    hwnd_ptr,
-                    w,
-                    &header_for_handler,
-                ));
+                if let Some(result) = try_enable_snap_layout(w, &header, "activation retry") {
+                    installed_for_handler.set(result);
+                }
+            });
+
+            // An already-active window might not emit another activation
+            // notification. Retry once at idle after GTK has finished mapping;
+            // later focus changes remain a fallback if this attempt also fails.
+            let installed_for_idle = installed.clone();
+            let window_for_idle = window.downgrade();
+            let header_for_idle = hb.header.downgrade();
+            glib::idle_add_local_once(move || {
+                if installed_for_idle.get() {
+                    return;
+                }
+                let Some((window, header)) =
+                    window_for_idle.upgrade().zip(header_for_idle.upgrade())
+                else {
+                    return;
+                };
+                if let Some(result) = try_enable_snap_layout(&window, &header, "idle retry") {
+                    installed_for_idle.set(result);
+                }
             });
         }
     }

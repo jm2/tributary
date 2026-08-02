@@ -338,6 +338,44 @@ fn bundle_policy_matches_relative_path(path: &str, tokens: &[&str]) -> bool {
 }
 
 #[test]
+fn windows_build_scopes_compiler_tools_to_the_rust_target() {
+    let compact_build_windows: String = BUILD_WINDOWS
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    assert!(
+        BUILD_WINDOWS
+            .contains(r#"$ToolEnvTarget = $RustTarget.Replace("-", "_").Replace(".", "_")"#),
+        "Windows tool variables must use Cargo's target-qualified spelling"
+    );
+
+    for (tool, clang_binary, gcc_binary) in [
+        ("DLLTOOL", "llvm-dlltool.exe", "dlltool.exe"),
+        ("CC", "clang.exe", "gcc.exe"),
+        ("CXX", "clang++.exe", "g++.exe"),
+        ("AR", "llvm-ar.exe", "ar.exe"),
+    ] {
+        for binary in [clang_binary, gcc_binary] {
+            let assignment = format!(
+                r#"[Environment]::SetEnvironmentVariable("{tool}_$ToolEnvTarget", (Join-Path $MsysPath "bin\{binary}"), "Process")"#
+            );
+            assert!(
+                BUILD_WINDOWS.contains(&assignment),
+                "Windows build is missing target-qualified {tool} mapping to {binary}"
+            );
+        }
+        let tool = tool.to_ascii_lowercase();
+        assert!(
+            !compact_build_windows.contains(&format!("$env:{tool}="))
+                && !compact_build_windows.contains(&format!(r#"setenvironmentvariable("{tool}","#))
+                && !compact_build_windows.contains(&format!("setenvironmentvariable('{tool}',")),
+            "generic {tool} assignment must not contaminate MSVC host build dependencies"
+        );
+    }
+}
+
+#[test]
 fn bundled_component_policy_blocks_disc_decryption_without_hiding_codecs() {
     let tokens = forbidden_bundle_tokens();
     assert!(

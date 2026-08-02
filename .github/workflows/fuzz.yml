@@ -27,6 +27,8 @@ jobs:
             gstreamer1-devel gstreamer1-plugins-base-devel \
             pkgconf-pkg-config git curl
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Cache Cargo registry
         uses: actions/cache@v6
         with:

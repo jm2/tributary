@@ -1395,7 +1395,7 @@ $env:PATH = "$MsysPath\bin;" + $env:PATH
 # compiler used by host build dependencies. Generic CC/CXX/AR variables also
 # apply to MSVC-hosted build scripts (for example `vswhom-sys`) and make them
 # invoke the MinGW compiler without the Visual Studio include environment.
-$ToolEnvTarget = $RustTarget.Replace("-", "_")
+$ToolEnvTarget = $RustTarget.Replace("-", "_").Replace(".", "_")
 if ($MsysEnv -match "clang") {
     [Environment]::SetEnvironmentVariable("DLLTOOL_$ToolEnvTarget", (Join-Path $MsysPath "bin\llvm-dlltool.exe"), "Process")
     [Environment]::SetEnvironmentVariable("CC_$ToolEnvTarget", (Join-Path $MsysPath "bin\clang.exe"), "Process")
