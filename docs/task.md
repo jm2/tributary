@@ -1121,7 +1121,8 @@ affected-hardware evidence. P2.1 remains the feature focus at **14/38 (36.8%)**.
 
 - [ ] Design the equalizer filter graph, band/preset/preamp/clipping contract, live-reconfiguration
   boundary, persistence, and capability matrix for local, AirPlay, Chromecast, and MPD outputs
-  ([#49](https://github.com/jm2/tributary/issues/49)).
+  ([#49](https://github.com/jm2/tributary/issues/49);
+  [contract in progress](equalizer.md)).
 - [ ] Implement the supported equalizer path and accessible settings UI, then test format changes,
   gapless navigation, disabled/bypass behavior, clipping policy, and each output's supported or
   explicitly unavailable state.
