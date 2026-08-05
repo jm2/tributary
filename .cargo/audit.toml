@@ -2,11 +2,12 @@
 # https://docs.rs/cargo-audit/latest/cargo_audit/config/
 
 [advisories]
-# rsa 0.9.10 — Marvin Attack (RUSTSEC-2023-0071)
-# Cargo.lock retains this advisory through sqlx-mysql even though Tributary enables only
-# sqlx-sqlite. Both `cargo tree --locked -i rsa` and
-# `cargo tree --locked -e features -i sqlx-mysql` are empty for the configured build, but
-# cargo-audit still checks locked optional packages. No fixed rsa release is available.
-# Review by 2026-10-10 or before the next release, whichever comes first, and immediately
-# before enabling MySQL support.
-ignore = ["RUSTSEC-2023-0071"]
+# rkyv 0.7.46 — out-of-bounds reads during archive access (RUSTSEC-2026-0235)
+# SeaORM's default Decimal support retains rust_decimal and its optional rkyv 0.7
+# integration in Cargo.lock, but Tributary enables neither rust_decimal's `rkyv` feature nor
+# any direct rkyv use. `cargo tree --locked -i rkyv` is empty for both the root and fuzz
+# workspaces; cargo-audit nevertheless checks every locked optional package. The advisory is
+# fixed only in rkyv 0.8.17+, while current rust_decimal still declares optional rkyv 0.7.
+# Review by 2026-09-01 or before the next release, whichever comes first, and immediately
+# before enabling rkyv serialization or exposing Decimal archive input.
+ignore = ["RUSTSEC-2026-0235"]

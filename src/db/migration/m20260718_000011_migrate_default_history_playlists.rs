@@ -117,7 +117,7 @@ async fn update_recently_played<C: ConnectionTrait>(
     to_rules: &str,
 ) -> Result<(), DbErr> {
     connection
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             connection.get_database_backend(),
             "UPDATE playlists
              SET smart_rules_json = ?
@@ -146,7 +146,7 @@ async fn update_top_25<C: ConnectionTrait>(
     to_rules: &str,
 ) -> Result<(), DbErr> {
     connection
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             connection.get_database_backend(),
             "UPDATE playlists
              SET smart_rules_json = ?

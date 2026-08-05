@@ -489,7 +489,7 @@ where
     C: ConnectionTrait,
 {
     let result = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO lastfm_scrobble_queue (
                  occurrence_id, account_binding, artist, track_title, album, album_artist,
@@ -645,7 +645,7 @@ pub async fn settle_terminal(
     values.push(receipt.account_binding.as_bytes().to_vec().into());
     values.extend(receipt.rows.iter().map(|row| row.id.into()));
     let result = transaction
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             format!(
                 "DELETE FROM lastfm_scrobble_queue
@@ -692,7 +692,7 @@ pub async fn reschedule_batch(
     values.push(receipt.account_binding.as_bytes().to_vec().into());
     values.extend(receipt.rows.iter().map(|row| row.id.into()));
     let result = transaction
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             format!(
                 "UPDATE lastfm_scrobble_queue
@@ -787,7 +787,7 @@ pub(super) async fn replace_exact_pause(
             return Ok(());
         }
         let replaced = transaction
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 format!(
                     "UPDATE {LASTFM_DELIVERY_PAUSE_TABLE}
@@ -825,7 +825,7 @@ pub(super) async fn clear_exact_pause(
             return Err(LastFmQueueError::AccountMismatch);
         }
         let deleted = transaction
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 format!(
                     "DELETE FROM {LASTFM_DELIVERY_PAUSE_TABLE}
@@ -877,7 +877,7 @@ pub async fn purge_account(
         return Err(LastFmQueueError::Storage);
     };
     let pause_marked = transaction
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             format!(
                 "INSERT INTO {LASTFM_DELIVERY_PAUSE_TABLE}
@@ -943,7 +943,7 @@ pub async fn purge_quarantined_after_admission_closed(
         None => 0,
     };
     let pause_deleted = transaction
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             DbBackend::Sqlite,
             format!("DELETE FROM {LASTFM_DELIVERY_PAUSE_TABLE}"),
         ))
@@ -1096,7 +1096,7 @@ pub(super) async fn clear_empty_cleanup_after_missing_vault(
             return Err(LastFmQueueError::CorruptStorage);
         }
         let deleted = transaction
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 format!(
                     "DELETE FROM {LASTFM_DELIVERY_PAUSE_TABLE}
@@ -1188,7 +1188,7 @@ async fn pause_has_other_binding<C>(
 where
     C: ConnectionTrait,
 {
-    db.query_one(Statement::from_sql_and_values(
+    db.query_one_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         format!(
             "SELECT 1 AS present FROM {LASTFM_DELIVERY_PAUSE_TABLE}
@@ -1219,7 +1219,7 @@ where
     C: ConnectionTrait,
 {
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             DbBackend::Sqlite,
             format!(
                 "SELECT slot, account_binding, pause_category
@@ -1255,7 +1255,7 @@ where
     C: ConnectionTrait,
 {
     let inserted = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             format!(
                 "INSERT INTO {LASTFM_DELIVERY_PAUSE_TABLE}
@@ -1596,7 +1596,7 @@ mod tests {
         db.execute_unprepared("PRAGMA ignore_check_constraints = ON")
             .await
             .unwrap();
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO lastfm_delivery_pause (slot, account_binding, pause_category)
              VALUES (1, ?, 5)",
@@ -1677,7 +1677,7 @@ mod tests {
         purge_account(&db, predecessor).await.unwrap();
         let inspected = has_empty_cleanup_tombstone(&db).await.unwrap().unwrap();
 
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE lastfm_delivery_pause SET account_binding = ? WHERE slot = 1",
             [successor.as_bytes().to_vec().into()],
@@ -1729,7 +1729,7 @@ mod tests {
         }
         let retained = models(&db).await;
         let corrupt_id = retained[MAX_LASTFM_BATCH_ROWS].id;
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE lastfm_scrobble_queue SET occurrence_id = ? WHERE id = ?",
             [Uuid::nil().as_bytes().to_vec().into(), corrupt_id.into()],
@@ -1896,7 +1896,7 @@ mod tests {
             let db = database().await;
             let account = binding("listener");
             let pending = input(account, "Corrupt retry");
-            db.execute(Statement::from_sql_and_values(
+            db.execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "INSERT INTO lastfm_scrobble_queue (
                      id, occurrence_id, account_binding, artist, track_title,
@@ -1989,7 +1989,7 @@ mod tests {
             enqueue(&db, &input(account, title)).await.unwrap();
         }
         let stored = models(&db).await;
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE lastfm_scrobble_queue SET next_attempt_at_ms = 500 WHERE id = ?",
             [stored[1].id.into()],
@@ -2130,7 +2130,7 @@ mod tests {
         // Recovery remains destructive for malformed private rows that normal
         // delivery correctly refuses, including an explicitly injected
         // non-positive SQLite row identity.
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO lastfm_scrobble_queue (
                  id, occurrence_id, account_binding, artist, track_title,
@@ -2158,7 +2158,7 @@ mod tests {
     async fn malformed_private_rows_fail_closed_without_content_diagnostics() {
         let db = database().await;
         let account = binding("listener");
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO lastfm_scrobble_queue (
                  occurrence_id, account_binding, artist, track_title, duration_secs,

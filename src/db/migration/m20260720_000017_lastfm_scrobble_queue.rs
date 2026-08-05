@@ -110,7 +110,7 @@ async fn drop_if_lossless(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 
     let row = manager
         .get_connection()
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("SELECT COUNT(*) AS count FROM {TABLE}"),
         ))
@@ -215,7 +215,7 @@ fn canonical_account_fifo_index_sql() -> String {
 async fn object_type(manager: &SchemaManager<'_>, name: &str) -> Result<Option<String>, DbErr> {
     manager
         .get_connection()
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             manager.get_database_backend(),
             "SELECT type FROM sqlite_master WHERE name = ?",
             [name.into()],
@@ -238,7 +238,7 @@ async fn validate_schema(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 async fn validate_columns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let columns = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA table_info('{TABLE}')"),
         ))
@@ -322,7 +322,7 @@ async fn validate_columns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 async fn validate_table_sql(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let row = manager
         .get_connection()
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             manager.get_database_backend(),
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
             [TABLE.into()],
@@ -341,7 +341,7 @@ async fn validate_table_sql(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 async fn validate_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let mut indexes = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA index_list('{TABLE}')"),
         ))
@@ -385,7 +385,7 @@ async fn validate_index(
 ) -> Result<(), DbErr> {
     let columns = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA index_info('{}')", index.replace('\'', "''")),
         ))
@@ -412,7 +412,7 @@ async fn validate_index_sql(
 ) -> Result<(), DbErr> {
     let row = manager
         .get_connection()
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             manager.get_database_backend(),
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
             [index.into()],
@@ -431,7 +431,7 @@ async fn validate_index_sql(
 async fn validate_no_foreign_keys(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let rows = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA foreign_key_list('{TABLE}')"),
         ))
@@ -448,7 +448,7 @@ async fn validate_no_foreign_keys(manager: &SchemaManager<'_>) -> Result<(), DbE
 async fn validate_no_triggers(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let row = manager
         .get_connection()
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             manager.get_database_backend(),
             "SELECT COUNT(*) AS count FROM sqlite_master
              WHERE type = 'trigger' AND tbl_name = ?",
@@ -731,7 +731,7 @@ mod tests {
             .expect_err("occurrence identity must be idempotent");
 
         let rows = db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "SELECT id FROM lastfm_scrobble_queue WHERE account_binding = ? ORDER BY id",
                 [first.account_binding.into()],

@@ -146,7 +146,7 @@ mod tests {
 
     async fn foreign_keys_enabled(conn: &impl ConnectionTrait) -> bool {
         let row = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DatabaseBackend::Sqlite,
                 "PRAGMA foreign_keys",
             ))

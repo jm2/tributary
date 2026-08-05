@@ -344,6 +344,56 @@ class FuzzLockPolicyTests(unittest.TestCase):
                 [sync_fuzz_lock.Transition("sha2", "0.10.9", "0.11.0")],
             )
 
+    def test_bounded_repair_allows_feature_edge_inside_target_closure(self):
+        base = lock(
+            ["facade 1.0.0"],
+            {
+                "facade": ["1.0.0"],
+                "shared": ["1.0.0"],
+                "old-edge": ["1.0.0"],
+            },
+        )
+        current = lock(
+            ["facade 1.1.0"],
+            {
+                "facade": ["1.1.0"],
+                "shared": ["1.0.0"],
+                "old-edge": ["1.0.0"],
+                "new-edge": ["1.0.0"],
+            },
+        )
+        stale_fuzz = lock(
+            ["facade 1.0.0"],
+            {
+                "facade": ["1.0.0"],
+                "shared": ["1.0.0"],
+                "old-edge": ["1.0.0"],
+            },
+        )
+        repaired_fuzz = lock(
+            ["facade 1.1.0"],
+            {
+                "facade": ["1.1.0"],
+                "shared": ["1.0.0"],
+                "old-edge": ["1.0.0"],
+                "new-edge": ["1.0.0"],
+            },
+        )
+        for fixture in (base, stale_fuzz):
+            fixture["package"][1]["dependencies"] = ["shared"]
+            fixture["package"][2]["dependencies"] = ["old-edge"]
+        for fixture in (current, repaired_fuzz):
+            fixture["package"][1]["dependencies"] = ["shared"]
+            fixture["package"][2]["dependencies"] = ["old-edge", "new-edge"]
+
+        sync_fuzz_lock.validate_bounded_package_changes(
+            base,
+            current,
+            stale_fuzz,
+            repaired_fuzz,
+            [sync_fuzz_lock.Transition("facade", "1.0.0", "1.1.0")],
+        )
+
     def test_bounded_repair_rejects_unrelated_existing_version_rebind(self):
         base = lock(
             ["sha2 0.10.9"],

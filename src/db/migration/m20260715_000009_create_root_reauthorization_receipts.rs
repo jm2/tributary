@@ -66,7 +66,7 @@ async fn validate_receipt_table(manager: &SchemaManager<'_>) -> Result<(), DbErr
     let backend = manager.get_database_backend();
 
     let object = connection
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT type FROM sqlite_master
              WHERE name = 'root_reauthorization_receipts'"
@@ -86,7 +86,7 @@ async fn validate_receipt_table(manager: &SchemaManager<'_>) -> Result<(), DbErr
     }
 
     let columns = connection
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             backend,
             "PRAGMA table_info('root_reauthorization_receipts')".to_string(),
         ))

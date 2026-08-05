@@ -86,7 +86,7 @@ policy matrix passes. The repository enforces consistency and prevents native
 auto-merge; GasCity must separately provide independent semantic review and
 the normal Refinery exact-SHA merge gate before merging it.
 
-Rust 1.92 is today's declared floor, not a permanent pin. Dependabot remains
+Rust 1.94 is today's declared floor, not a permanent pin. Dependabot remains
 enabled for `dtolnay/rust-toolchain`; each feasible release proposal goes
 through this dedicated coordinated, non-auto-merge lane.
 

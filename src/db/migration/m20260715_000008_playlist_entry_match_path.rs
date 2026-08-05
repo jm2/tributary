@@ -93,7 +93,7 @@ mod tests {
     }
 
     async fn match_path_nullable(db: &DatabaseConnection) -> Option<bool> {
-        db.query_all(Statement::from_string(
+        db.query_all_raw(Statement::from_string(
             DbBackend::Sqlite,
             "PRAGMA table_info('playlist_entries')".to_string(),
         ))
@@ -114,7 +114,7 @@ mod tests {
         db: &DatabaseConnection,
     ) -> (String, i32, String, String, String, Option<i32>) {
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT playlist_id, position, match_title, match_artist,
                         match_album, match_duration_secs
@@ -147,7 +147,7 @@ mod tests {
 
         assert_eq!(match_path_nullable(&db).await, Some(true));
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT match_file_path FROM playlist_entries WHERE id = 'entry-1'".to_string(),
             ))
@@ -187,7 +187,7 @@ mod tests {
         .await
         .expect("save imported path");
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT match_file_path FROM playlist_entries WHERE id = 'entry-1'".to_string(),
             ))

@@ -1267,7 +1267,7 @@ fn dependabot_automerge_inspection_and_metadata_stay_read_only_and_head_bound() 
     assert!(
         inspect_steps.iter().any(|step| {
             step.get("uses").and_then(serde_yaml::Value::as_str)
-                == Some("dependabot/fetch-metadata@d7267f607e9d3fb96fc2fbe83e0af444713e90b7")
+                == Some("dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98")
                 && step.get("if").and_then(serde_yaml::Value::as_str)
                     == Some("steps.pre_metadata_head.outputs.matches == 'true'")
         }),
@@ -1336,7 +1336,7 @@ fn dependabot_automerge_writer_is_action_free_concurrent_and_exact_head_guarded(
             && DEPENDABOT_AUTOMERGE.contains(".previous_filename")
             && DEPENDABOT_AUTOMERGE.contains("observed_changed_files")
             && DEPENDABOT_AUTOMERGE.contains(
-                "dependabot/fetch-metadata@d7267f607e9d3fb96fc2fbe83e0af444713e90b7"
+                "dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98"
             )
             && !DEPENDABOT_AUTOMERGE.contains("dependabot/fetch-metadata@v3")
             && DEPENDABOT_AUTOMERGE

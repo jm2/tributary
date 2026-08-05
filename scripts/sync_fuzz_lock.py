@@ -322,6 +322,25 @@ def validate_dependency_edges(
         before_names = sorted(before_edges)
         after_names = sorted(after_edges)
         if before_names != after_names:
+            # A direct-major graph refresh can activate a new optional feature
+            # on a same-version transitive already inside the exact target
+            # closure. Cargo records that feature unification as a changed
+            # dependency-name surface even though the package identity is
+            # unchanged. Every resulting edge is necessarily included in the
+            # independently materialized target closure, so this remains
+            # bounded; path-package and unrelated edge rewrites still fail.
+            changed_edge_surface = {
+                target
+                for edges in (before_edges, after_edges)
+                for targets in edges.values()
+                for target in targets
+            }
+            if (
+                identity[0] != "tributary"
+                and identity in authorized_identities
+                and changed_edge_surface <= authorized_identities
+            ):
+                continue
             raise PolicyError(
                 "fuzz lock repair rewrote the dependency-name surface of "
                 f"{identity[0]}@{identity[1]}: {before_names} -> {after_names}"

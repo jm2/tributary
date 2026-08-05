@@ -411,7 +411,7 @@ jobs:
     permissions:
       contents: read
     container:
-      image: fedora:41
+      image: fedora:44
     strategy:
       matrix:
         include:
@@ -634,7 +634,7 @@ jobs:
           merge-multiple: true
 
       - name: Publish assets to the validated release tag
-        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d # v3
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           fail_on_unmatched_files: true

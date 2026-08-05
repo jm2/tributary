@@ -107,7 +107,7 @@ async fn drop_if_lossless(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 
     let row = manager
         .get_connection()
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("SELECT COUNT(*) AS count FROM {TABLE}"),
         ))
@@ -159,7 +159,7 @@ fn canonical_table_sql() -> String {
 async fn object_type(manager: &SchemaManager<'_>, name: &str) -> Result<Option<String>, DbErr> {
     manager
         .get_connection()
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             manager.get_database_backend(),
             "SELECT type FROM sqlite_master WHERE name = ?",
             [name.into()],
@@ -182,7 +182,7 @@ async fn validate_schema(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 async fn validate_columns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let columns = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA table_info('{TABLE}')"),
         ))
@@ -236,7 +236,7 @@ async fn validate_columns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 async fn validate_table_sql(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let row = manager
         .get_connection()
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             manager.get_database_backend(),
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
             [TABLE.into()],
@@ -255,7 +255,7 @@ async fn validate_table_sql(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 async fn validate_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let rows = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA index_list('{TABLE}')"),
         ))
@@ -284,7 +284,7 @@ async fn validate_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 
     let columns = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA index_info('{}')", primary_name.replace('\'', "''")),
         ))
@@ -304,7 +304,7 @@ async fn validate_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 async fn validate_no_foreign_keys(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let rows = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA foreign_key_list('{TABLE}')"),
         ))
@@ -321,7 +321,7 @@ async fn validate_no_foreign_keys(manager: &SchemaManager<'_>) -> Result<(), DbE
 async fn validate_no_triggers(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let row = manager
         .get_connection()
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             manager.get_database_backend(),
             "SELECT COUNT(*) AS count FROM sqlite_master
              WHERE type = 'trigger' AND tbl_name = ?",
@@ -646,7 +646,7 @@ mod tests {
         }
 
         let result = db
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "INSERT INTO rhythmbox_import_receipts (
                      snapshot_digest, importer_version, policy_digest
@@ -699,7 +699,7 @@ mod tests {
             .expect("roll back failed import");
 
         let track = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT play_count FROM tracks WHERE id = 'local-track'".to_string(),
             ))
@@ -836,7 +836,7 @@ mod tests {
             .await
             .expect_err("down must not guess at a partial target");
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT opaque_data FROM rhythmbox_import_receipts".to_string(),
             ))

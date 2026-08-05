@@ -332,7 +332,7 @@ type ColumnSchema = (String, String, i32, Option<String>, i32);
 async fn table_columns(manager: &SchemaManager<'_>) -> Result<Vec<ColumnSchema>, DbErr> {
     manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             "PRAGMA table_info('playlist_entries')".to_string(),
         ))
@@ -399,7 +399,7 @@ fn column(
 async fn table_sql(manager: &SchemaManager<'_>) -> Result<String, DbErr> {
     let row = manager
         .get_connection()
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             manager.get_database_backend(),
             "SELECT sql FROM sqlite_master
              WHERE type = 'table' AND name = 'playlist_entries'"
@@ -536,7 +536,7 @@ async fn validate_foreign_keys(
 ) -> Result<(), DbErr> {
     let mut actual = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             "PRAGMA foreign_key_list('playlist_entries')".to_string(),
         ))
@@ -586,7 +586,7 @@ async fn validate_foreign_keys(
 async fn validate_foreign_key_rows(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let violations = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             "PRAGMA foreign_key_check('playlist_entries')".to_string(),
         ))
@@ -608,7 +608,7 @@ async fn capture_custom_indexes(
     let standard = standard_index_names(schema);
     manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             "SELECT name, sql FROM sqlite_master
              WHERE type = 'index'
@@ -727,7 +727,7 @@ async fn validate_index(
 ) -> Result<(), DbErr> {
     let row = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             "PRAGMA index_list('playlist_entries')".to_string(),
         ))
@@ -750,7 +750,7 @@ async fn validate_index(
 
     let actual_sql = manager
         .get_connection()
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             manager.get_database_backend(),
             "SELECT sql FROM sqlite_master
              WHERE type = 'index' AND name = ? AND tbl_name = 'playlist_entries'",
@@ -773,7 +773,7 @@ async fn validate_index(
     let quoted = name.replace('\'', "''");
     let mut columns = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA index_info('{quoted}')"),
         ))
@@ -803,7 +803,7 @@ async fn validate_index(
 async fn validate_primary_key_index(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let implicit = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             "PRAGMA index_list('playlist_entries')".to_string(),
         ))
@@ -835,7 +835,7 @@ async fn validate_primary_key_index(manager: &SchemaManager<'_>) -> Result<(), D
     let quoted = name.replace('\'', "''");
     let columns = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA index_info('{quoted}')"),
         ))
@@ -854,7 +854,7 @@ async fn validate_primary_key_index(manager: &SchemaManager<'_>) -> Result<(), D
 async fn require_lossless_legacy_downgrade(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let row = manager
         .get_connection()
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT COUNT(*) AS count
              FROM playlist_entries
@@ -896,7 +896,7 @@ mod tests {
     }
 
     async fn insert_playlist(db: &DatabaseConnection, id: &str) {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO playlists (id, name, created_at, updated_at)
              VALUES (?, ?, '2026-07-19T00:00:00Z', '2026-07-19T00:00:00Z')",
@@ -907,7 +907,7 @@ mod tests {
     }
 
     async fn insert_track(db: &DatabaseConnection, id: &str) {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO tracks (
                  id, file_path, title, artist_name, album_title,
@@ -933,7 +933,7 @@ mod tests {
         track_id: Option<&str>,
         path: Option<&str>,
     ) {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO playlist_entries (
                  id, playlist_id, position, track_id,
@@ -968,7 +968,7 @@ mod tests {
         local_track_id: Option<&str>,
         path: Option<&str>,
     ) -> Result<ExecResult, DbErr> {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO playlist_entries (
                  id, playlist_id, position, source_id, track_id, local_track_id,
@@ -1004,7 +1004,7 @@ mod tests {
     );
 
     async fn scoped_rows(db: &DatabaseConnection) -> Vec<ScopedRow> {
-        db.query_all(Statement::from_string(
+        db.query_all_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT id, playlist_id, position, source_id, track_id, local_track_id,
                     match_title, match_artist, match_album, match_duration_secs,
@@ -1036,7 +1036,7 @@ mod tests {
 
     async fn row_count(db: &DatabaseConnection, predicate: &str) -> i64 {
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 format!("SELECT COUNT(*) AS count FROM playlist_entries WHERE {predicate}"),
             ))
@@ -1047,7 +1047,7 @@ mod tests {
     }
 
     async fn has_index(db: &DatabaseConnection, name: &str) -> bool {
-        db.query_one(Statement::from_sql_and_values(
+        db.query_one_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT 1 AS present FROM sqlite_master
              WHERE type = 'index' AND name = ? AND tbl_name = 'playlist_entries'",
@@ -1059,7 +1059,7 @@ mod tests {
     }
 
     async fn migration_table_exists(db: &DatabaseConnection) -> bool {
-        db.query_one(Statement::from_sql_and_values(
+        db.query_one_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?",
             [REBUILD_TABLE.into()],
@@ -1327,7 +1327,7 @@ mod tests {
         .expect("nonblank title and artist retain a local orphan");
 
         assert!(db
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "INSERT INTO playlist_entries (
                      id, playlist_id, position, source_id, track_id, local_track_id,
@@ -1358,7 +1358,7 @@ mod tests {
             ] {
                 let id = format!("unicode-whitespace-{index}-{suffix}");
                 let result = db
-                    .execute(Statement::from_sql_and_values(
+                    .execute_raw(Statement::from_sql_and_values(
                         DbBackend::Sqlite,
                         "INSERT INTO playlist_entries (
                              id, playlist_id, position, source_id, track_id, local_track_id,
@@ -1496,7 +1496,7 @@ mod tests {
         let db = database_before_migration().await;
         insert_playlist(&db, "playlist").await;
         insert_legacy_entry(&db, "empty-orphan", "playlist", 0, None, None).await;
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE playlist_entries
              SET match_title = ?, match_artist = ?, match_file_path = ?
@@ -1790,7 +1790,7 @@ mod tests {
         assert!(has_index(&db, LEGACY_TRACK_INDEX).await);
         assert!(has_index(&db, "idx_playlist_entries_match_artist_custom").await);
         let rows = db
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT id, position, track_id, match_file_path
                  FROM playlist_entries ORDER BY position"

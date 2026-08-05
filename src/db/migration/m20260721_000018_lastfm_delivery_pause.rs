@@ -114,7 +114,7 @@ async fn drop_if_lossless(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     validate_schema(manager).await?;
     let pause_count = manager
         .get_connection()
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("SELECT COUNT(*) AS count FROM {TABLE}"),
         ))
@@ -123,7 +123,7 @@ async fn drop_if_lossless(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .try_get::<i64>("", "count")?;
     let queue_count = manager
         .get_connection()
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("SELECT COUNT(*) AS count FROM {QUEUE_TABLE}"),
         ))
@@ -178,7 +178,7 @@ async fn named_object_type(
 ) -> Result<Option<String>, DbErr> {
     manager
         .get_connection()
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             manager.get_database_backend(),
             "SELECT type FROM sqlite_master WHERE name = ?",
             [name.into()],
@@ -193,7 +193,7 @@ type ColumnSchema = (i32, String, String, i32, Option<String>, i32);
 async fn validate_schema(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let columns = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA table_info('{TABLE}')"),
         ))
@@ -237,7 +237,7 @@ async fn validate_schema(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 
     let row = manager
         .get_connection()
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             manager.get_database_backend(),
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
             [TABLE.into()],
@@ -257,7 +257,7 @@ async fn validate_schema(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     ] {
         let rows = manager
             .get_connection()
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 manager.get_database_backend(),
                 pragma,
             ))
@@ -270,7 +270,7 @@ async fn validate_schema(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     }
     let trigger_count = manager
         .get_connection()
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             manager.get_database_backend(),
             "SELECT COUNT(*) AS count FROM sqlite_master
              WHERE type = 'trigger' AND tbl_name = ?",
@@ -384,7 +384,7 @@ mod tests {
         i64,
     )> {
         database
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT id, occurrence_id, account_binding, artist, track_title,
                         album, album_artist, track_number, duration_secs,
@@ -439,7 +439,7 @@ mod tests {
         assert_eq!(queue_snapshot(&database).await, before);
         assert_eq!(
             database
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     DbBackend::Sqlite,
                     format!("SELECT COUNT(*) AS count FROM {TABLE}"),
                 ))
@@ -451,7 +451,7 @@ mod tests {
             0
         );
         let queue_type: String = database
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT type FROM sqlite_master WHERE name = 'lastfm_scrobble_queue'".to_owned(),
             ))
@@ -468,7 +468,7 @@ mod tests {
         let database = migrated_database().await;
         for category in 1..=4 {
             database
-                .execute(Statement::from_sql_and_values(
+                .execute_raw(Statement::from_sql_and_values(
                     DbBackend::Sqlite,
                     format!(
                         "INSERT INTO {TABLE} (slot, account_binding, pause_category)
@@ -495,7 +495,7 @@ mod tests {
         }
         assert_eq!(
             database
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     DbBackend::Sqlite,
                     format!("SELECT COUNT(*) AS count FROM {TABLE}"),
                 ))
@@ -542,7 +542,7 @@ mod tests {
         Migration.down(&SchemaManager::new(&empty)).await.unwrap();
         assert!(!target_exists(&empty).await);
         assert!(empty
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT type FROM sqlite_master WHERE name = 'lastfm_scrobble_queue'".to_owned(),
             ))

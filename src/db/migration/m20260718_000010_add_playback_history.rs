@@ -14,7 +14,11 @@ impl MigrationTrait for Migration {
                 .alter_table(
                     Table::alter()
                         .table(Tracks::Table)
-                        .add_column(ColumnDef::new(Tracks::LastPlayedAtMs).big_integer().null())
+                        .add_column(
+                            ColumnDef::new(Tracks::LastPlayedAtMs)
+                                .custom("bigint")
+                                .null(),
+                        )
                         .to_owned(),
                 )
                 .await?;
@@ -29,7 +33,7 @@ impl MigrationTrait for Migration {
         // legacy range; all existing nonnegative counts remain untouched.
         manager
             .get_connection()
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 manager.get_database_backend(),
                 "UPDATE tracks SET play_count = 0 WHERE play_count < 0".to_string(),
             ))
@@ -59,7 +63,7 @@ impl MigrationTrait for Migration {
 async fn validate_last_played_column(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let rows = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             "PRAGMA table_info('tracks')".to_string(),
         ))
@@ -121,7 +125,7 @@ mod tests {
     }
 
     async fn insert_track(db: &DatabaseConnection, id: &str, play_count: i32) {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO tracks (
                  id, file_path, title, artist_name, album_title, play_count,
@@ -138,7 +142,7 @@ mod tests {
     }
 
     async fn playback_column(db: &DatabaseConnection) -> Option<(String, i32, Option<String>)> {
-        db.query_all(Statement::from_string(
+        db.query_all_raw(Statement::from_string(
             DbBackend::Sqlite,
             "PRAGMA table_info('tracks')".to_string(),
         ))
@@ -161,7 +165,7 @@ mod tests {
 
     async fn track_history(db: &DatabaseConnection, id: &str) -> (i32, Option<i64>) {
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "SELECT play_count, last_played_at_ms FROM tracks WHERE id = ?",
                 [id.into()],
@@ -225,7 +229,7 @@ mod tests {
         assert!(!migration_is_applied(&db).await);
 
         let count: i32 = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT play_count FROM tracks WHERE id = 'negative'".to_string(),
             ))
@@ -305,7 +309,7 @@ mod tests {
         assert_eq!(playback_column(&db).await, None);
 
         let count: i32 = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT play_count FROM tracks WHERE id = 'round-trip'".to_string(),
             ))

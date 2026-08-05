@@ -3,4 +3,4 @@
 # resolves transitives, so this is not a complete or hash-locked environment.
 # PyYAML is optional upstream and omitted because Tributary never requests YAML.
 aiohttp==3.14.3
-tomlkit==0.15.0
+tomlkit==0.15.1

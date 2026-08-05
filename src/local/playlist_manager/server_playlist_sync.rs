@@ -1337,7 +1337,7 @@ mod tests {
     }
 
     async fn sidebar_revision(db: &DatabaseConnection) -> i64 {
-        db.query_one(Statement::from_string(
+        db.query_one_raw(Statement::from_string(
             db.get_database_backend(),
             "SELECT revision FROM playlist_sidebar_revision WHERE singleton = 1",
         ))

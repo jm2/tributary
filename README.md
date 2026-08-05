@@ -302,7 +302,7 @@ Pre-built packages for Linux (Flatpak, .deb, .rpm), macOS (.dmg), and Windows (.
 
 ### Prerequisites (all platforms)
 
-- [Rust 1.92+](https://rustup.rs) (stable toolchain) — this is the declared MSRV in `Cargo.toml`, set by the gtk-rs 0.11 release series and verified by a dedicated CI job
+- [Rust 1.94+](https://rustup.rs) (stable toolchain) — this is the declared MSRV in `Cargo.toml`, set by the gtk-rs 0.11 release series and verified by a dedicated CI job
 - **GTK 4.16+** and **libadwaita 1.6+** — the crate compiles against these API levels, so older
   runtimes will fail to build, not merely fail at startup
 - `pkg-config`
@@ -525,21 +525,21 @@ Clippy runs with `clippy::pedantic` and `clippy::nursery` enabled crate-wide (co
 cargo test --all-targets --all-features --locked
 
 # Install the exact compiler, LLVM tools, and coverage frontend used by CI:
-rustup toolchain install 1.92.0 --profile minimal --component llvm-tools-preview
-cargo +1.92.0 install cargo-llvm-cov --version 0.8.7 --locked
+rustup toolchain install 1.94.0 --profile minimal --component llvm-tools-preview
+cargo +1.94.0 install cargo-llvm-cov --version 0.8.7 --locked
 
 # Run the Linux x86_64 coverage gate and print its summary:
 minimum="$(tr -d '[:space:]' < coverage-baseline.txt)"
-cargo +1.92.0 llvm-cov clean --workspace
-cargo +1.92.0 llvm-cov --all-targets --all-features --locked --summary-only \
+cargo +1.94.0 llvm-cov clean --workspace
+cargo +1.94.0 llvm-cov --all-targets --all-features --locked --summary-only \
   --fail-under-lines "$minimum"
 
 # Or generate the complete HTML report:
-cargo +1.92.0 llvm-cov --all-targets --all-features --locked --html \
+cargo +1.94.0 llvm-cov --all-targets --all-features --locked --html \
   --output-dir coverage --fail-under-lines "$minimum"
 ```
 
-CI's comparable coverage metric is one aggregate Linux x86_64 run pinned to Rust 1.92.0,
+CI's comparable coverage metric is one aggregate Linux x86_64 run pinned to Rust 1.94.0,
 `llvm-tools-preview`, cargo-llvm-cov 0.8.7, the committed dependency lockfile, every host target,
 and every feature. It does not exclude UI, backend, migration, desktop-integration, or entry-point
 files. Every test suite still executes; cargo-llvm-cov's default omission of test-only source files

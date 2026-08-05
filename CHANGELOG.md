@@ -5,6 +5,26 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Dependency baseline** — Move to SeaORM 2.0.1 and Rust 1.94, refresh the production lockfile
+  and pinned build tooling, and advance Linux CI to Fedora 44 and the Flatpak runtime to GNOME 50.
+
+### Fixed
+
+- **Dependency-update CI** — Adapt raw database queries and transactions to SeaORM 2 while
+  preserving the existing SQLite schema, repair root/fuzz lock synchronization across Cargo
+  feature unification, and keep Dependabot action pins aligned with repository policy tests.
+
+### Security
+
+- **Advisory tracking** — Remove the obsolete inactive RSA path and document the temporary,
+  lockfile-only `rkyv` exception until its upstream dependency can move to a fixed release.
+
+---
+
 ## [0.6.1] — 2026-08-02
 
 ### Added

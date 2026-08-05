@@ -44,7 +44,7 @@ impl MigrationTrait for Migration {
 async fn validate_rating_column(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let columns = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             "PRAGMA table_info('tracks')".to_string(),
         ))
@@ -76,7 +76,7 @@ async fn validate_rating_column(manager: &SchemaManager<'_>) -> Result<(), DbErr
 
     let table_row = manager
         .get_connection()
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             manager.get_database_backend(),
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tracks'".to_string(),
         ))
@@ -135,7 +135,7 @@ mod tests {
     }
 
     async fn insert_legacy_track(db: &DatabaseConnection, id: &str) {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO tracks (
                  id, file_path, title, artist_name, album_title, play_count,
@@ -148,7 +148,7 @@ mod tests {
     }
 
     async fn rating_value(db: &DatabaseConnection, id: &str) -> Option<i32> {
-        db.query_one(Statement::from_sql_and_values(
+        db.query_one_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT rating FROM tracks WHERE id = ?",
             [id.into()],
@@ -183,7 +183,7 @@ mod tests {
         assert_eq!(rating_value(&db, "legacy-two").await, None);
 
         for valid in [1, 100] {
-            db.execute(Statement::from_sql_and_values(
+            db.execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "UPDATE tracks SET rating = ? WHERE id = 'legacy-one'",
                 [valid.into()],
@@ -223,7 +223,7 @@ mod tests {
             .await
             .expect("whole numeric input canonicalizes to INTEGER");
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT rating, typeof(rating) AS storage FROM tracks WHERE id = 'constrained'"
                     .to_string(),

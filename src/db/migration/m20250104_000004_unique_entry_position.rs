@@ -150,7 +150,7 @@ async fn existing_unique_position_index(
     let connection = manager.get_connection();
 
     let owner = connection
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             format!(
                 "SELECT tbl_name
@@ -172,7 +172,7 @@ async fn existing_unique_position_index(
     }
 
     let index_rows = connection
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             backend,
             "PRAGMA index_list('playlist_entries')".to_string(),
         ))
@@ -190,7 +190,7 @@ async fn existing_unique_position_index(
     let is_partial: i32 = index_row.try_get("", "partial").unwrap_or_default();
 
     let mut columns = connection
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             backend,
             format!("PRAGMA index_info('{UNIQUE_POSITION_INDEX}')"),
         ))
@@ -220,7 +220,7 @@ async fn existing_unique_position_index(
     }
 
     let invalid_positions = connection
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT 1 AS invalid
              FROM playlist_entries
@@ -269,7 +269,7 @@ mod tests {
     }
 
     async fn insert_playlist(db: &DatabaseConnection, id: &str) {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO playlists (id, name, created_at, updated_at)
              VALUES (?, ?, '2026-07-10T00:00:00Z', '2026-07-10T00:00:00Z')",
@@ -285,7 +285,7 @@ mod tests {
         id: &str,
         position: i32,
     ) -> Result<(), DbErr> {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO playlist_entries (id, playlist_id, position)
              VALUES (?, ?, ?)",
@@ -302,7 +302,7 @@ mod tests {
     }
 
     async fn positions(db: &DatabaseConnection, playlist_id: &str) -> Vec<(String, i32)> {
-        db.query_all(Statement::from_sql_and_values(
+        db.query_all_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT id, position
              FROM playlist_entries
@@ -516,7 +516,7 @@ mod tests {
         assert_eq!(positions(&db, "playlist-a").await, original_positions);
 
         let snapshot_count: i64 = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT COUNT(*) AS count
                  FROM sqlite_temp_master

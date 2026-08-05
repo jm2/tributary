@@ -1430,7 +1430,7 @@ mod tests {
     /// change drops the child assignment (e.g. by re-introducing
     /// `gtk::PopoverMenu::from_model`), this test will fail.
     ///
-    /// Headless CI (cargo test on fedora:41 with no X/Wayland socket)
+    /// Headless CI (cargo test in the Fedora container with no X/Wayland socket)
     /// cannot initialize GTK, so the test gates on `gtk::init()`'s
     /// non-panicking result and skips with a printed reason when GTK
     /// cannot acquire a display. macOS is excluded because GTK's Quartz

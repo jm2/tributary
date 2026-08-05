@@ -1038,7 +1038,7 @@ mod tests {
         let session = session();
         let binding = session.account_binding();
         database
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "INSERT INTO lastfm_scrobble_queue (
                      occurrence_id, account_binding, artist, track_title,
