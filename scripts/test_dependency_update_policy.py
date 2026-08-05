@@ -794,25 +794,36 @@ class FuzzLockPolicyTests(unittest.TestCase):
 
 class RustToolchainPolicyTests(unittest.TestCase):
     def test_candidate_requires_both_exact_action_refs_to_agree(self):
+        digest = "a" * 40
         source = """
-        uses: dtolnay/rust-toolchain@1.93.0
+        uses: dtolnay/rust-toolchain@DIGEST # 1.93.0
         uses: dtolnay/rust-toolchain@stable
-        uses: dtolnay/rust-toolchain@1.93.0
-"""
+        uses: dtolnay/rust-toolchain@DIGEST # 1.93.0
+""".replace("DIGEST", digest)
         self.assertEqual(
             sync_rust_toolchain.candidate_from_actions(source),
             "1.93",
         )
 
     def test_mixed_exact_action_refs_fail_closed(self):
+        digest = "a" * 40
         source = """
-        uses: dtolnay/rust-toolchain@1.92.0
-        uses: dtolnay/rust-toolchain@1.93.0
+        uses: dtolnay/rust-toolchain@DIGEST # 1.92.0
+        uses: dtolnay/rust-toolchain@DIGEST # 1.93.0
+""".replace("DIGEST", digest)
+        with self.assertRaises(sync_rust_toolchain.PolicyError):
+            sync_rust_toolchain.candidate_from_actions(source)
+
+    def test_mixed_exact_action_digests_fail_closed(self):
+        source = f"""
+        uses: dtolnay/rust-toolchain@{'a' * 40} # 1.93.0
+        uses: dtolnay/rust-toolchain@{'b' * 40} # 1.93.0
 """
         with self.assertRaises(sync_rust_toolchain.PolicyError):
             sync_rust_toolchain.candidate_from_actions(source)
 
     def test_dependabot_action_proposal_synchronizes_every_contract(self):
+        proposed_digest = "b" * 40
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             manifest = root / "Cargo.toml"
@@ -828,11 +839,11 @@ class RustToolchainPolicyTests(unittest.TestCase):
                 "    name: MSRV\n"
                 "  steps:\n"
                 "    - name: Install Rust toolchain (1.92)\n"
-                "      uses: dtolnay/rust-toolchain@1.93.0\n"
+                f"      uses: dtolnay/rust-toolchain@{proposed_digest} # 1.93.0\n"
                 "coverage:\n"
                 "  steps:\n"
                 "    - name: Install coverage toolchain\n"
-                "      uses: dtolnay/rust-toolchain@1.93.0\n"
+                f"      uses: dtolnay/rust-toolchain@{proposed_digest} # 1.93.0\n"
                 "  key: coverage-1.92.0-llvm-cov-fixture\n"
             )
             readme.write_text(
@@ -863,6 +874,7 @@ class RustToolchainPolicyTests(unittest.TestCase):
 
             self.assertIn('rust-version = "1.93"', manifest.read_text())
             self.assertIn("    name: MSRV\n", ci.read_text())
+            self.assertEqual(ci.read_text().count(proposed_digest), 2)
             self.assertNotIn("1.92", ci.read_text() + readme.read_text())
 
 

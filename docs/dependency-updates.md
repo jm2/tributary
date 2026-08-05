@@ -69,8 +69,9 @@ is not forced through a root-transition closure.
 
 ## Rust toolchain and MSRV repair
 
-The two numeric `dtolnay/rust-toolchain@X.Y.0` refs are the Dependabot signal
-for a Rust release proposal. On that PR, GasCity should run:
+The two immutable `dtolnay/rust-toolchain@SHA # X.Y.0` pins are the Dependabot
+signal for a Rust release proposal. Dependabot must update both the digest and
+release comment together. On that PR, GasCity should run:
 
 ```sh
 python3 scripts/sync_rust_toolchain.py --from-actions
@@ -89,6 +90,13 @@ the normal Refinery exact-SHA merge gate before merging it.
 Rust 1.94 is today's declared floor, not a permanent pin. Dependabot remains
 enabled for `dtolnay/rust-toolchain`; each feasible release proposal goes
 through this dedicated coordinated, non-auto-merge lane.
+
+For a maintainer-initiated bump rather than a Dependabot proposal, resolve the
+release branch to its exact upstream commit and provide both values explicitly:
+
+```sh
+python3 scripts/sync_rust_toolchain.py --set X.Y --action-sha FULL_40_CHARACTER_SHA
+```
 
 ## Deployment gate migration
 

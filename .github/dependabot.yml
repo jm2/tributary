@@ -89,11 +89,12 @@ updates:
     cooldown:
       default-days: 5
     groups:
-      # The exact dtolnay/rust-toolchain refs are also the trigger for a
-      # coordinated MSRV proposal. Do not ignore them: Dependabot should open
-      # the PR, then the repair lane synchronizes Cargo.toml, CI, and README and
-      # runs the complete matrix. The auto-merge workflow explicitly excludes
-      # this dependency at every update level.
+      # The exact digest-pinned dtolnay/rust-toolchain refs and their release
+      # comments are also the trigger for a coordinated MSRV proposal. Do not
+      # ignore them: Dependabot should open the PR, then the repair lane
+      # synchronizes Cargo.toml, CI, and README and runs the complete matrix.
+      # The auto-merge workflow explicitly excludes this dependency at every
+      # update level.
       rust-toolchain:
         applies-to: version-updates
         patterns:

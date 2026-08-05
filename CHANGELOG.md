@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Advisory tracking** — Remove the obsolete inactive RSA path and document the temporary,
   lockfile-only `rkyv` exception until its upstream dependency can move to a fixed release.
+- **Workflow action integrity** — Pin the exact Rust 1.94 toolchain installs to their immutable
+  upstream commit while retaining coordinated Dependabot release updates.
 
 ---
 

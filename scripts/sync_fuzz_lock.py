@@ -329,16 +329,14 @@ def validate_dependency_edges(
             # unchanged. Every resulting edge is necessarily included in the
             # independently materialized target closure, so this remains
             # bounded; path-package and unrelated edge rewrites still fail.
-            changed_edge_surface = {
-                target
-                for edges in (before_edges, after_edges)
-                for targets in edges.values()
-                for target in targets
-            }
+            changed_edge_targets = set()
+            for dependency_edges in (before_edges, after_edges):
+                for targets in dependency_edges.values():
+                    changed_edge_targets.update(targets)
             if (
                 identity[0] != "tributary"
                 and identity in authorized_identities
-                and changed_edge_surface <= authorized_identities
+                and changed_edge_targets <= authorized_identities
             ):
                 continue
             raise PolicyError(

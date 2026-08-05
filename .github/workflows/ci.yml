@@ -72,7 +72,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain (1.94)
-        uses: dtolnay/rust-toolchain@1.94.0
+        uses: dtolnay/rust-toolchain@35d8a35b823d6c20db516f5c35eb0a9640942c17 # 1.94.0
       - name: Cache Cargo registry
         uses: actions/cache@v6
         with:
@@ -217,7 +217,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install pinned coverage toolchain
-        uses: dtolnay/rust-toolchain@1.94.0
+        uses: dtolnay/rust-toolchain@35d8a35b823d6c20db516f5c35eb0a9640942c17 # 1.94.0
         with:
           components: llvm-tools-preview
 

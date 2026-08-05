@@ -23,6 +23,7 @@ const MACOS_AUDIO: &str = include_str!("../src/audio/macos_audio.rs");
 const MACOS_AUDIO_NATIVE: &str = include_str!("../src/audio/macos_audio_native.rs");
 const MACOS_AUDIO_TESTS: &str = include_str!("../src/audio/macos_audio_tests.rs");
 const PLATFORM_RUNTIME: &str = include_str!("../src/platform_runtime.rs");
+const RUST_TOOLCHAIN_ACTION_SHA: &str = "35d8a35b823d6c20db516f5c35eb0a9640942c17";
 const FORBIDDEN_BUNDLED_COMPONENTS: &str =
     include_str!("../build-aux/packaging/forbidden-bundled-components.txt");
 
@@ -1099,8 +1100,10 @@ fn ci_compile_proves_the_exact_declared_msrv() {
         "CI job name must remain stable for branch rules and GasCity"
     );
     assert!(
-        msrv_job.contains(&format!("uses: dtolnay/rust-toolchain@{rust_release}")),
-        "CI must install the exact declared Rust release"
+        msrv_job.contains(&format!(
+            "uses: dtolnay/rust-toolchain@{RUST_TOOLCHAIN_ACTION_SHA} # {rust_release}"
+        )),
+        "CI must install the exact declared Rust release from an immutable action commit"
     );
     assert!(
         msrv_job.contains("run: cargo check --all-targets --locked"),
@@ -1784,8 +1787,10 @@ fn ci_coverage_is_pinned_comprehensive_and_threshold_gated() {
         "CI must expose one comparable aggregate coverage gate"
     );
     assert!(
-        coverage_job.contains(&format!("uses: dtolnay/rust-toolchain@{rust_version}.0")),
-        "coverage must use the exact declared Rust release"
+        coverage_job.contains(&format!(
+            "uses: dtolnay/rust-toolchain@{RUST_TOOLCHAIN_ACTION_SHA} # {rust_version}.0"
+        )),
+        "coverage must use the exact declared Rust release from an immutable action commit"
     );
     assert!(
         coverage_job.contains("components: llvm-tools-preview"),

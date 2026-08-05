@@ -520,7 +520,7 @@ mod tests {
 
     async fn insert_playlist(db: &DatabaseConnection, id: &str) {
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+            db.get_database_backend(),
             "INSERT INTO playlists (id, name, created_at, updated_at)
              VALUES (?, ?, '2026-07-12T00:00:00Z', '2026-07-12T00:00:00Z')",
             [id.into(), format!("Playlist {id}").into()],
