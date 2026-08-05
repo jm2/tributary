@@ -2334,7 +2334,7 @@ mod tests {
         )
         .await
         .unwrap();
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             DbBackend::Sqlite,
             "CREATE TRIGGER reject_rhythmbox_receipt BEFORE INSERT ON rhythmbox_import_receipts BEGIN SELECT RAISE(ABORT, 'forced receipt failure'); END".to_string(),
         ))

@@ -286,6 +286,8 @@ def validate_dependency_edges(
     after_lock: dict[str, Any],
     transitions: list[Transition],
     authorized_identities: set[tuple[str, str]],
+    old_identities: set[tuple[str, str]],
+    target_identities: set[tuple[str, str]],
 ) -> None:
     """Reject semantic edge changes outside the reviewed dependency surface."""
     #lizard forgives
@@ -322,6 +324,44 @@ def validate_dependency_edges(
         before_names = sorted(before_edges)
         after_names = sorted(after_edges)
         if before_names != after_names:
+            # A direct-major graph refresh can activate a new optional feature
+            # on a same-version transitive already inside the exact target
+            # closure. Cargo records that feature unification as a changed
+            # dependency-name surface even though the package identity is
+            # unchanged. Every resulting edge is necessarily included in the
+            # independently materialized target closure, so this remains
+            # bounded; path-package and unrelated edge rewrites still fail.
+            resulting_edge_targets = {
+                target
+                for targets in after_edges.values()
+                for target in targets
+            }
+            removed_edge_targets = {
+                target
+                for name in set(before_names) - set(after_names)
+                for target in before_edges[name]
+            }
+            pure_prune = (
+                identity in old_identities
+                and set(after_names) < set(before_names)
+                and all(
+                    before_edges[name] == after_edges[name] for name in after_names
+                )
+                and removed_edge_targets <= old_identities
+                and resulting_edge_targets <= target_identities
+            )
+            if identity[0] != "tributary" and (
+                (
+                    identity in target_identities
+                    and resulting_edge_targets <= target_identities
+                )
+                # Cargo feature unification may also deactivate optional edges
+                # on an unchanged retained package outside the transitioned
+                # closure. Admit only a strict, non-rebinding edge removal;
+                # this cannot introduce authority into an unrelated graph.
+                or pure_prune
+            ):
+                continue
             raise PolicyError(
                 "fuzz lock repair rewrote the dependency-name surface of "
                 f"{identity[0]}@{identity[1]}: {before_names} -> {after_names}"
@@ -425,6 +465,8 @@ def validate_bounded_package_changes(
         after_fuzz_lock,
         transitions,
         authorized_identities,
+        old_identities,
+        after_identities,
     )
 
 

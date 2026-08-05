@@ -643,9 +643,9 @@ license, distribution, key-material provenance, and interoperability review.
 
 ### Engineering follow-ups
 
-- Re-evaluate the unmaintained `paste` and `proc-macro-error2` dependency paths and the inactive,
-  lockfile-only RSA advisory by 2026-10-10 or the next release, and immediately if MySQL support is
-  ever enabled.
+- Re-evaluate the unmaintained `paste` and fuzz-only `proc-macro-error2` dependency paths plus the
+  inactive, lockfile-only `rkyv` advisory by 2026-09-01 or the next release. Revisit immediately
+  before enabling `rkyv` serialization or accepting Decimal archive input.
 - Remove the app-owned macOS GStreamer channel-cap workaround only through an explicit reviewed
   change after an upstream fix is available in the supported runtime floor and has been validated
   on affected multi-channel hardware. Default-output following must not inherit or silently remove

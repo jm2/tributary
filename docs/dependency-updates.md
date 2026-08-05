@@ -10,9 +10,9 @@ changes which need coordinated repair:
   retain matching manifest requirements and resolved versions.
 - Cargo major updates remain reviewed changes and normally arrive
   individually; the coupled SeaORM pair is the intentional grouped exception.
-- Exact `dtolnay/rust-toolchain` updates remain enabled and have their own
-  group. They are never automatically merged, even when GitHub classifies the
-  Rust release bump as SemVer-minor.
+- Rust compiler updates are proposed through `.github/rust-toolchain.toml` and
+  never auto-merge. Updates to the digest-pinned `dtolnay/rust-toolchain`
+  action implementation are a separate, manually reviewed lane.
 - The fuzz crate has its own Dependabot entry because `fuzz/Cargo.toml`
   intentionally declares a separate workspace and owns `fuzz/Cargo.lock`.
 
@@ -69,26 +69,44 @@ is not forced through a root-transition closure.
 
 ## Rust toolchain and MSRV repair
 
-The two numeric `dtolnay/rust-toolchain@X.Y.0` refs are the Dependabot signal
-for a Rust release proposal. On that PR, GasCity should run:
+`.github/rust-toolchain.toml` is Dependabot's authoritative signal for a Rust
+compiler proposal. It lives below `.github` so it does not override a
+developer's selected toolchain merely by entering the repository. On a
+`rust-toolchain` ecosystem PR, GasCity should run:
 
 ```sh
-python3 scripts/sync_rust_toolchain.py --from-actions
+python3 scripts/sync_rust_toolchain.py --from-toolchain
 python3 scripts/sync_rust_toolchain.py --check
 ```
 
-This synchronizes the Cargo MSRV, exact MSRV and coverage toolchains, cache
-keys, versioned step labels, and current README commands. The CI job/check name
-remains the stable `MSRV` so future compiler bumps do not rename the hosted
-context. The bump is feasible only when
-the full Linux, macOS, Windows, Flatpak, fuzz, audit, coverage, and repository
-policy matrix passes. The repository enforces consistency and prevents native
+This synchronizes the Cargo MSRV, explicit MSRV and coverage compiler inputs,
+cache keys, versioned step labels, and current README commands. It never
+changes the action implementation. The CI job/check name remains the stable
+`MSRV` so future compiler bumps do not rename the hosted context. The bump is
+feasible only when the full Linux, macOS, Windows, Flatpak, fuzz, audit,
+coverage, and repository-policy matrix passes. The repository enforces
+consistency and excludes the entire `rust-toolchain` ecosystem from native
 auto-merge; GasCity must separately provide independent semantic review and
 the normal Refinery exact-SHA merge gate before merging it.
 
-Rust 1.92 is today's declared floor, not a permanent pin. Dependabot remains
-enabled for `dtolnay/rust-toolchain`; each feasible release proposal goes
+Rust 1.94 is today's declared floor, not a permanent pin. Dependabot remains
+enabled for `.github/rust-toolchain.toml`; each feasible compiler proposal goes
 through this dedicated coordinated, non-auto-merge lane.
+
+For a maintainer-initiated compiler bump rather than a Dependabot proposal:
+
+```sh
+python3 scripts/sync_rust_toolchain.py --set X.Y
+```
+
+The two `dtolnay/rust-toolchain@SHA # master` refs instead pin executable
+third-party action code. Their SHA must be a commit in the action's permanent
+`master` history, as required by that upstream action, and both jobs must use
+the same full 40-character commit. GitHub Actions Dependabot may propose a new
+master-history commit independently; the dependency-name guard prevents every
+such proposal from auto-merging. Review the action-code diff and run the full
+matrix, but do not run the compiler synchronizer unless the compiler manifest
+also changed through its own reviewed proposal.
 
 ## Deployment gate migration
 

@@ -193,7 +193,7 @@ async fn null_dangling_track_ids(manager: &SchemaManager<'_>) -> Result<(), DbEr
 async fn validate_playlist_entry_foreign_keys(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let violations = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             "PRAGMA foreign_key_check('playlist_entries')".to_string(),
         ))
@@ -214,7 +214,7 @@ async fn inspect_playlist_entries_schema(
     let connection = manager.get_connection();
     let backend = manager.get_database_backend();
     let columns = connection
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             backend,
             "PRAGMA table_info('playlist_entries')".to_string(),
         ))
@@ -271,7 +271,7 @@ async fn inspect_playlist_entries_schema(
     }
 
     let foreign_keys = connection
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             backend,
             "PRAGMA foreign_key_list('playlist_entries')".to_string(),
         ))
@@ -322,7 +322,7 @@ async fn capture_and_validate_indexes(
     let connection = manager.get_connection();
     let backend = manager.get_database_backend();
     let indexes = connection
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             backend,
             "SELECT name, sql
              FROM sqlite_master
@@ -383,7 +383,7 @@ where
     C: ConnectionTrait,
 {
     let implicit_indexes = connection
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             backend,
             "PRAGMA index_list('playlist_entries')".to_string(),
         ))
@@ -414,7 +414,7 @@ where
     }
 
     let columns = connection
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             backend,
             format!("PRAGMA index_info('{name}')"),
         ))
@@ -454,7 +454,7 @@ where
     }
 
     let index_row = connection
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             backend,
             "PRAGMA index_list('playlist_entries')".to_string(),
         ))
@@ -468,7 +468,7 @@ where
     let unique = index_row.try_get::<i32>("", "unique")? == 1;
     let partial = index_row.try_get::<i32>("", "partial").unwrap_or_default() == 1;
     let mut columns = connection
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             backend,
             format!("PRAGMA index_info('{name}')"),
         ))
@@ -519,8 +519,8 @@ mod tests {
     }
 
     async fn insert_playlist(db: &DatabaseConnection, id: &str) {
-        db.execute(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        db.execute_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
             "INSERT INTO playlists (id, name, created_at, updated_at)
              VALUES (?, ?, '2026-07-12T00:00:00Z', '2026-07-12T00:00:00Z')",
             [id.into(), format!("Playlist {id}").into()],
@@ -530,7 +530,7 @@ mod tests {
     }
 
     async fn insert_track(db: &DatabaseConnection, id: &str) {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO tracks (
                  id, file_path, title, artist_name, album_title,
@@ -555,7 +555,7 @@ mod tests {
         position: i32,
         track_id: Option<&str>,
     ) {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO playlist_entries (
                  id, playlist_id, position, track_id,
@@ -601,7 +601,7 @@ mod tests {
         String,
         Option<i32>,
     )> {
-        db.query_all(Statement::from_string(
+        db.query_all_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT id, position, track_id, match_title, match_artist,
                     match_album, match_duration_secs
@@ -628,7 +628,7 @@ mod tests {
     }
 
     async fn track_foreign_key(db: &DatabaseConnection) -> Option<(String, String, String)> {
-        db.query_all(Statement::from_string(
+        db.query_all_raw(Statement::from_string(
             DbBackend::Sqlite,
             "PRAGMA foreign_key_list('playlist_entries')".to_string(),
         ))
@@ -648,7 +648,7 @@ mod tests {
     }
 
     async fn playlist_foreign_key(db: &DatabaseConnection) -> Option<(String, String, String)> {
-        db.query_all(Statement::from_string(
+        db.query_all_raw(Statement::from_string(
             DbBackend::Sqlite,
             "PRAGMA foreign_key_list('playlist_entries')".to_string(),
         ))
@@ -669,7 +669,7 @@ mod tests {
 
     async fn index_definition(db: &DatabaseConnection, name: &str) -> Option<(bool, Vec<String>)> {
         let index_row = db
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "PRAGMA index_list('playlist_entries')".to_string(),
             ))
@@ -685,7 +685,7 @@ mod tests {
             .expect("index uniqueness")
             == 1;
         let mut columns = db
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 format!("PRAGMA index_info('{name}')"),
             ))
@@ -707,7 +707,7 @@ mod tests {
     }
 
     async fn index_sql(db: &DatabaseConnection, name: &str) -> Option<String> {
-        db.query_one(Statement::from_sql_and_values(
+        db.query_one_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
             [name.into()],
@@ -837,7 +837,7 @@ mod tests {
             .await
             .expect("delete referenced track");
         let track_id: Option<String> = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT track_id FROM playlist_entries WHERE id = 'entry-a'".to_string(),
             ))
@@ -852,7 +852,7 @@ mod tests {
             .await
             .expect("delete referenced playlist");
         let remaining: i64 = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT COUNT(*) AS count FROM playlist_entries".to_string(),
             ))

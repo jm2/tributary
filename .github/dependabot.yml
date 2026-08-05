@@ -80,6 +80,16 @@ updates:
           - "minor"
           - "patch"
 
+  # ── Rust compiler floor (.github/rust-toolchain.toml) ────────────────────
+  # Compiler proposals are isolated from action-implementation updates and
+  # never auto-merge. The repair lane synchronizes Cargo.toml, CI, and README
+  # before the full native and packaging matrix decides feasibility.
+  - package-ecosystem: "rust-toolchain"
+    directory: "/.github"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 1
+
   # ── GitHub Actions (the `uses:` pins in .github/workflows/*) ───────────────
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -89,11 +99,9 @@ updates:
     cooldown:
       default-days: 5
     groups:
-      # The exact dtolnay/rust-toolchain refs are also the trigger for a
-      # coordinated MSRV proposal. Do not ignore them: Dependabot should open
-      # the PR, then the repair lane synchronizes Cargo.toml, CI, and README and
-      # runs the complete matrix. The auto-merge workflow explicitly excludes
-      # this dependency at every update level.
+      # The exact digest-pinned refs track the action implementation on its
+      # permanent master history, independently from the compiler floor.
+      # Action-code proposals require manual review and never auto-merge.
       rust-toolchain:
         applies-to: version-updates
         patterns:

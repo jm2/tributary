@@ -4225,7 +4225,7 @@ mod tests {
     async fn fatal_enqueue_cannot_overwrite_a_disconnect_that_already_owns_the_gate() {
         let database = database().await;
         database
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "DROP TABLE lastfm_scrobble_queue".to_owned(),
             ))
@@ -5342,7 +5342,7 @@ mod tests {
         .await
         .unwrap();
         corrupt_database
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "UPDATE lastfm_scrobble_queue SET occurrence_id = ?",
                 [Uuid::nil().as_bytes().to_vec().into()],

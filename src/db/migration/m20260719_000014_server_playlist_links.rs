@@ -117,7 +117,7 @@ async fn drop_if_lossless(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 
     let row = manager
         .get_connection()
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("SELECT COUNT(*) AS count FROM {TABLE}"),
         ))
@@ -220,7 +220,7 @@ fn canonical_index_sql() -> String {
 async fn object_type(manager: &SchemaManager<'_>, name: &str) -> Result<Option<String>, DbErr> {
     manager
         .get_connection()
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             manager.get_database_backend(),
             "SELECT type FROM sqlite_master WHERE name = ?",
             [name.into()],
@@ -244,7 +244,7 @@ async fn validate_schema(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 async fn validate_columns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let columns = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA table_info('{TABLE}')"),
         ))
@@ -287,7 +287,7 @@ async fn validate_columns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 async fn validate_table_sql(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let row = manager
         .get_connection()
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '{TABLE}'"),
         ))
@@ -305,7 +305,7 @@ async fn validate_table_sql(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 async fn validate_foreign_key(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let rows = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA foreign_key_list('{TABLE}')"),
         ))
@@ -340,7 +340,7 @@ async fn validate_foreign_key(manager: &SchemaManager<'_>) -> Result<(), DbErr> 
 async fn validate_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let rows = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA index_list('{TABLE}')"),
         ))
@@ -393,7 +393,7 @@ async fn validate_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 
     let row = manager
         .get_connection()
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             manager.get_database_backend(),
             "SELECT sql FROM sqlite_master
              WHERE type = 'index' AND name = ? AND tbl_name = ?",
@@ -419,7 +419,7 @@ async fn validate_index_columns(
     let quoted = index.replace('\'', "''");
     let columns = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA index_info('{quoted}')"),
         ))
@@ -445,7 +445,7 @@ async fn validate_index_columns(
 async fn validate_index_collations(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let rows = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA index_xinfo('{SOURCE_NATIVE_INDEX}')"),
         ))
@@ -485,7 +485,7 @@ async fn validate_index_collations(manager: &SchemaManager<'_>) -> Result<(), Db
 async fn validate_foreign_key_rows(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let violations = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA foreign_key_check('{TABLE}')"),
         ))
@@ -502,7 +502,7 @@ async fn validate_foreign_key_rows(manager: &SchemaManager<'_>) -> Result<(), Db
 async fn validate_no_triggers(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let row = manager
         .get_connection()
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             manager.get_database_backend(),
             "SELECT COUNT(*) AS count FROM sqlite_master
              WHERE type = 'trigger' AND tbl_name = ?",
@@ -659,7 +659,7 @@ mod tests {
     }
 
     async fn insert_playlist(db: &DatabaseConnection, id: &str) {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO playlists (id, name, created_at, updated_at)
              VALUES (?, 'Playlist', '2026-07-19T00:00:00Z', '2026-07-19T00:00:00Z')",
@@ -784,7 +784,7 @@ mod tests {
     async fn up_preserves_every_predecessor_playlist_and_occurrence_field() {
         let db = database_before_migration().await;
         insert_playlist(&db, "preserved-playlist").await;
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO playlist_entries (
                  id, playlist_id, position, source_id, track_id, local_track_id,
@@ -800,7 +800,7 @@ mod tests {
 
         Migrator::up(&db, Some(1)).await.expect("migrate");
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT * FROM playlist_entries WHERE id = 'preserved-entry'".to_string(),
             ))
@@ -883,7 +883,7 @@ mod tests {
         assert!(!migration_is_applied(&partial).await);
         assert_eq!(
             partial
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     DbBackend::Sqlite,
                     "SELECT COUNT(*) AS count FROM server_playlist_links".to_string(),
                 ))
@@ -1139,7 +1139,7 @@ mod tests {
             .expect_err("link must name an existing playlist");
 
         insert_playlist(&db, "owned").await;
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO playlist_entries (
                  id, playlist_id, position, source_id, track_id, local_track_id,
@@ -1164,7 +1164,7 @@ mod tests {
             .unwrap()
             .is_none());
         let entries = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT COUNT(*) AS count FROM playlist_entries WHERE playlist_id = 'owned'"
                     .to_string(),
@@ -1255,7 +1255,7 @@ mod tests {
     async fn empty_downgrade_is_exact_repeatable_and_preserves_regular_data() {
         let db = migrated_database().await;
         insert_playlist(&db, "ordinary").await;
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO playlist_entries (
                  id, playlist_id, position, source_id, track_id, local_track_id,
@@ -1278,7 +1278,7 @@ mod tests {
             .await
             .expect("repeated direct down is idempotent");
         assert_eq!(
-            db.query_one(Statement::from_string(
+            db.query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT COUNT(*) AS count FROM playlist_entries WHERE id = 'ordinary-entry'"
                     .to_string(),
@@ -1296,7 +1296,7 @@ mod tests {
     async fn nonempty_downgrade_refuses_without_losing_link_playlist_or_entries() {
         let db = migrated_database().await;
         insert_playlist(&db, "mirror").await;
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO playlist_entries (
                  id, playlist_id, position, source_id, track_id, local_track_id,
@@ -1328,7 +1328,7 @@ mod tests {
             .unwrap()
             .is_some());
         assert_eq!(
-            db.query_one(Statement::from_string(
+            db.query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT COUNT(*) AS count FROM playlist_entries WHERE id = 'mirror-entry'"
                     .to_string(),
@@ -1350,7 +1350,7 @@ mod tests {
             .expect("downgrade after unlink");
         assert!(!target_exists(&db).await);
         assert_eq!(
-            db.query_one(Statement::from_string(
+            db.query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT COUNT(*) AS count FROM playlist_entries WHERE id = 'mirror-entry'"
                     .to_string(),
@@ -1386,7 +1386,7 @@ mod tests {
             .await
             .expect_err("down must not guess at a partial target");
         assert_eq!(
-            db.query_one(Statement::from_string(
+            db.query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT opaque_data FROM server_playlist_links WHERE playlist_id = 'do-not-drop'"
                     .to_string(),

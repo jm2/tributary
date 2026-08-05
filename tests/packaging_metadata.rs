@@ -7,6 +7,7 @@ const RPM_SPEC: &str = include_str!("../build-aux/rpm/tributary.spec");
 const ARCH_PKGBUILD: &str = include_str!("../build-aux/arch/PKGBUILD");
 const DESKTOP_ENTRY: &str = include_str!("../data/io.github.tributary.Tributary.desktop");
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
+const RUST_TOOLCHAIN_MANIFEST: &str = include_str!("../.github/rust-toolchain.toml");
 const DEPENDABOT_CONFIG: &str = include_str!("../.github/dependabot.yml");
 const DEPENDABOT_AUTOMERGE: &str = include_str!("../.github/workflows/dependabot-automerge.yml");
 const CLAUDE_REVIEW_WORKFLOW: &str = include_str!("../.github/workflows/claude-review.yml");
@@ -23,6 +24,7 @@ const MACOS_AUDIO: &str = include_str!("../src/audio/macos_audio.rs");
 const MACOS_AUDIO_NATIVE: &str = include_str!("../src/audio/macos_audio_native.rs");
 const MACOS_AUDIO_TESTS: &str = include_str!("../src/audio/macos_audio_tests.rs");
 const PLATFORM_RUNTIME: &str = include_str!("../src/platform_runtime.rs");
+const RUST_TOOLCHAIN_ACTION_SHA: &str = "6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772";
 const FORBIDDEN_BUNDLED_COMPONENTS: &str =
     include_str!("../build-aux/packaging/forbidden-bundled-components.txt");
 
@@ -1078,6 +1080,8 @@ fn ci_compile_proves_the_exact_declared_msrv() {
         .as_str()
         .expect("package.rust-version must be a string");
     let rust_release = format!("{rust_version}.0");
+    let toolchain_manifest: Value =
+        toml::from_str(RUST_TOOLCHAIN_MANIFEST).expect("rust-toolchain.toml must parse");
     let normalized_workflow = CI_WORKFLOW.replace("\r\n", "\n");
     let msrv_job = workflow_job(&normalized_workflow, "msrv");
     let crlf_workflow = normalized_workflow.lines().collect::<Vec<_>>().join("\r\n");
@@ -1099,8 +1103,12 @@ fn ci_compile_proves_the_exact_declared_msrv() {
         "CI job name must remain stable for branch rules and GasCity"
     );
     assert!(
-        msrv_job.contains(&format!("uses: dtolnay/rust-toolchain@{rust_release}")),
-        "CI must install the exact declared Rust release"
+        toolchain_manifest["toolchain"]["channel"].as_str() == Some(&rust_release)
+            && msrv_job.contains(&format!(
+                "uses: dtolnay/rust-toolchain@{RUST_TOOLCHAIN_ACTION_SHA} # master"
+            ))
+            && msrv_job.contains(&format!("toolchain: {rust_release}")),
+        "the compiler manifest and CI must install the declared release through one immutable action commit"
     );
     assert!(
         msrv_job.contains("run: cargo check --all-targets --locked"),
@@ -1195,6 +1203,9 @@ fn dependabot_groups_coupled_updates_and_excludes_toolchains_from_automerge() {
         ["minor", "patch"]
     );
 
+    let compiler = dependabot_update(&config, "rust-toolchain", "/.github");
+    assert_eq!(compiler["open-pull-requests-limit"].as_u64(), Some(1));
+
     let actions = dependabot_update(&config, "github-actions", "/");
     actions["groups"]
         .as_mapping()
@@ -1206,7 +1217,7 @@ fn dependabot_groups_coupled_updates_and_excludes_toolchains_from_automerge() {
     );
     assert!(
         toolchain.get("update-types").is_none() && actions.get("ignore").is_none(),
-        "Rust release updates must remain enabled at every SemVer level"
+        "rust-toolchain action-code updates must remain enabled at every level"
     );
     let routine_actions = &actions["groups"]["actions-minor-and-patch"];
     assert_eq!(
@@ -1267,7 +1278,7 @@ fn dependabot_automerge_inspection_and_metadata_stay_read_only_and_head_bound() 
     assert!(
         inspect_steps.iter().any(|step| {
             step.get("uses").and_then(serde_yaml::Value::as_str)
-                == Some("dependabot/fetch-metadata@d7267f607e9d3fb96fc2fbe83e0af444713e90b7")
+                == Some("dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98")
                 && step.get("if").and_then(serde_yaml::Value::as_str)
                     == Some("steps.pre_metadata_head.outputs.matches == 'true'")
         }),
@@ -1336,7 +1347,7 @@ fn dependabot_automerge_writer_is_action_free_concurrent_and_exact_head_guarded(
             && DEPENDABOT_AUTOMERGE.contains(".previous_filename")
             && DEPENDABOT_AUTOMERGE.contains("observed_changed_files")
             && DEPENDABOT_AUTOMERGE.contains(
-                "dependabot/fetch-metadata@d7267f607e9d3fb96fc2fbe83e0af444713e90b7"
+                "dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98"
             )
             && !DEPENDABOT_AUTOMERGE.contains("dependabot/fetch-metadata@v3")
             && DEPENDABOT_AUTOMERGE
@@ -1345,6 +1356,12 @@ fn dependabot_automerge_writer_is_action_free_concurrent_and_exact_head_guarded(
             && DEPENDABOT_AUTOMERGE
                 .contains("github.event.pull_request.user.login == 'dependabot[bot]'")
             && DEPENDABOT_AUTOMERGE.contains("github.repository == 'jm2/tributary'")
+            && DEPENDABOT_AUTOMERGE.contains(
+                "package_ecosystem: ${{ steps.meta.outputs.package-ecosystem }}"
+            )
+            && DEPENDABOT_AUTOMERGE.contains(
+                "needs.inspect_changed_files.outputs.package_ecosystem != 'rust-toolchain'"
+            )
             && DEPENDABOT_AUTOMERGE.contains(
                 "!contains(needs.inspect_changed_files.outputs.dependency_names, 'dtolnay/rust-toolchain')"
             )
@@ -1784,8 +1801,10 @@ fn ci_coverage_is_pinned_comprehensive_and_threshold_gated() {
         "CI must expose one comparable aggregate coverage gate"
     );
     assert!(
-        coverage_job.contains(&format!("uses: dtolnay/rust-toolchain@{rust_version}.0")),
-        "coverage must use the exact declared Rust release"
+        coverage_job.contains(&format!(
+            "uses: dtolnay/rust-toolchain@{RUST_TOOLCHAIN_ACTION_SHA} # master"
+        )) && coverage_job.contains(&format!("toolchain: {rust_version}.0")),
+        "coverage must use the declared Rust release through the immutable action commit"
     );
     assert!(
         coverage_job.contains("components: llvm-tools-preview"),

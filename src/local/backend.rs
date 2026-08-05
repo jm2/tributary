@@ -243,7 +243,7 @@ impl MediaBackend for LocalBackend {
             .await
             .map_err(|error| BackendError::Internal(error.into()))?;
         let update = transaction
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 transaction.get_database_backend(),
                 "UPDATE tracks SET rating = ? WHERE id = ?",
                 [
@@ -816,7 +816,7 @@ mod tests {
         let exact_text = Uuid::from_u128(1).to_string();
         backend
             .db
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 backend.db.get_database_backend(),
                 "UPDATE tracks SET rating = ? WHERE id = ?",
                 [35_i32.into(), exact_text.clone().into()],

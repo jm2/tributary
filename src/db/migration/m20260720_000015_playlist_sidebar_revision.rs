@@ -281,7 +281,7 @@ async fn objects_named(
 ) -> Result<Vec<SchemaObject>, DbErr> {
     manager
         .get_connection()
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             manager.get_database_backend(),
             "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ? ORDER BY type, tbl_name",
             [name.into()],
@@ -335,7 +335,7 @@ type ColumnSchema = (i32, String, String, i32, Option<String>, i32);
 async fn validate_columns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let columns = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA table_info('{TABLE}')"),
         ))
@@ -374,7 +374,7 @@ async fn validate_columns(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 async fn validate_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let indexes = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA index_list('{TABLE}')"),
         ))
@@ -402,7 +402,7 @@ async fn validate_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 
     let columns = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("PRAGMA index_info('{}')", index_name.replace('\'', "''")),
         ))
@@ -421,7 +421,7 @@ async fn validate_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 async fn validate_singleton_row(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let rows = manager
         .get_connection()
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             manager.get_database_backend(),
             format!("SELECT singleton, revision FROM {TABLE}"),
         ))
@@ -499,7 +499,7 @@ async fn validate_table_trigger_set(
 ) -> Result<(), DbErr> {
     let mut actual = manager
         .get_connection()
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             manager.get_database_backend(),
             "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
             [table.into()],
@@ -616,7 +616,7 @@ mod tests {
 
     async fn revision(connection: &impl ConnectionTrait) -> i64 {
         connection
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 format!("SELECT revision FROM {TABLE} WHERE singleton = {SINGLETON}"),
             ))
@@ -655,7 +655,7 @@ mod tests {
 
     async fn row_count(connection: &impl ConnectionTrait, table: &str) -> i64 {
         connection
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 format!("SELECT COUNT(*) AS count FROM {table}"),
             ))
@@ -693,7 +693,7 @@ mod tests {
         assert_eq!(revision(&db).await, 0);
 
         let trigger_rows = db
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT name, tbl_name FROM sqlite_master
                  WHERE type = 'trigger'
@@ -735,7 +735,7 @@ mod tests {
     async fn every_insert_effective_update_and_delete_advances_but_no_op_updates_do_not() {
         let db = migrated_database().await;
 
-        db.execute(playlist_insert_sql("playlist-1"))
+        db.execute_raw(playlist_insert_sql("playlist-1"))
             .await
             .expect("insert playlist");
         assert_eq!(revision(&db).await, 1);
@@ -758,7 +758,7 @@ mod tests {
         .expect("actual playlist no-op");
         assert_eq!(revision(&db).await, 2);
 
-        db.execute(link_insert_sql("playlist-1", "native-1"))
+        db.execute_raw(link_insert_sql("playlist-1", "native-1"))
             .await
             .expect("insert link");
         assert_eq!(revision(&db).await, 3);
@@ -822,7 +822,7 @@ mod tests {
             execute_effective_update(&db, sql, &mut expected).await;
         }
 
-        db.execute(link_insert_sql("playlist-renamed", "native-1"))
+        db.execute_raw(link_insert_sql("playlist-renamed", "native-1"))
             .await
             .expect("insert link");
         expected += 1;
@@ -926,11 +926,11 @@ mod tests {
         let transaction = db.begin().await.expect("begin transaction");
 
         transaction
-            .execute(playlist_insert_sql("rolled-back"))
+            .execute_raw(playlist_insert_sql("rolled-back"))
             .await
             .expect("insert in transaction");
         transaction
-            .execute(link_insert_sql("rolled-back", "native-rollback"))
+            .execute_raw(link_insert_sql("rolled-back", "native-rollback"))
             .await
             .expect("insert link in transaction");
         assert_eq!(revision(&transaction).await, 2);
@@ -944,10 +944,10 @@ mod tests {
     #[tokio::test]
     async fn missing_singleton_aborts_and_rolls_back_the_complete_mutation() {
         let db = migrated_database().await;
-        db.execute(playlist_insert_sql("survivor"))
+        db.execute_raw(playlist_insert_sql("survivor"))
             .await
             .expect("insert precondition playlist");
-        db.execute(link_insert_sql("survivor", "native-survivor"))
+        db.execute_raw(link_insert_sql("survivor", "native-survivor"))
             .await
             .expect("insert precondition link");
         db.execute_unprepared(&format!(
@@ -957,7 +957,7 @@ mod tests {
         .expect("simulate deleted singleton");
 
         let insert_error = db
-            .execute(playlist_insert_sql("must-not-exist"))
+            .execute_raw(playlist_insert_sql("must-not-exist"))
             .await
             .expect_err("missing singleton must abort insert");
         assert!(insert_error.to_string().contains("singleton missing"));
@@ -978,7 +978,7 @@ mod tests {
     #[tokio::test]
     async fn exhausted_revision_aborts_changes_but_still_allows_actual_no_op_updates() {
         let db = migrated_database().await;
-        db.execute(playlist_insert_sql("survivor"))
+        db.execute_raw(playlist_insert_sql("survivor"))
             .await
             .expect("insert precondition playlist");
         db.execute_unprepared(&format!(
@@ -1003,7 +1003,7 @@ mod tests {
             .expect_err("effective update must fail at maximum revision");
         assert!(update_error.to_string().contains("revision exhausted"));
         let name: String = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT name FROM playlists WHERE id = 'survivor'".to_string(),
             ))
@@ -1217,16 +1217,16 @@ mod tests {
     #[tokio::test]
     async fn down_then_up_is_lossless_for_playlists_and_links_and_resets_only_derived_state() {
         let db = migrated_database().await;
-        db.execute(playlist_insert_sql("preserved"))
+        db.execute_raw(playlist_insert_sql("preserved"))
             .await
             .expect("insert preserved playlist");
-        db.execute(link_insert_sql("preserved", "native-preserved"))
+        db.execute_raw(link_insert_sql("preserved", "native-preserved"))
             .await
             .expect("insert preserved link");
         assert_eq!(revision(&db).await, 2);
 
         let playlist_before = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT * FROM playlists WHERE id = 'preserved'".to_string(),
             ))
@@ -1234,7 +1234,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let link_before = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT * FROM server_playlist_links WHERE playlist_id = 'preserved'".to_string(),
             ))
@@ -1260,7 +1260,7 @@ mod tests {
             .expect("reinstall derived revision");
         assert_eq!(revision(&db).await, 0);
         let playlist_after = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT * FROM playlists WHERE id = 'preserved'".to_string(),
             ))
@@ -1268,7 +1268,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let link_after = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT * FROM server_playlist_links WHERE playlist_id = 'preserved'".to_string(),
             ))
@@ -1339,7 +1339,7 @@ mod tests {
     #[tokio::test]
     async fn down_refuses_partial_or_tampered_objects_atomically() {
         let db = migrated_database().await;
-        db.execute(playlist_insert_sql("preserved"))
+        db.execute_raw(playlist_insert_sql("preserved"))
             .await
             .expect("insert preserved playlist");
         db.execute_unprepared(&format!("DROP TRIGGER {LINK_DELETE_TRIGGER}"))

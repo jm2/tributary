@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DbErr, QueryResult, Statement, TransactionTrait,
-    TryGetable,
+    ConnectionTrait, DatabaseConnection, DbErr, QueryResult, Statement, TransactionSession,
+    TransactionTrait, TryGetable,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -220,7 +220,7 @@ where
     }
 
     let rows = transaction
-        .query_all(Statement::from_string(backend, SNAPSHOT_QUERY))
+        .query_all_raw(Statement::from_string(backend, SNAPSHOT_QUERY))
         .await?;
     let state = match decode_snapshot_rows(rows) {
         Ok(entries) => PlaylistSidebarState::Ready(entries),
@@ -235,7 +235,7 @@ where
     C: ConnectionTrait,
 {
     let mut rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             db.get_database_backend(),
             REVISION_QUERY,
         ))
@@ -577,7 +577,7 @@ mod tests {
     }
 
     async fn execute(db: &DatabaseConnection, sql: impl Into<String>) {
-        db.execute(Statement::from_string(DbBackend::Sqlite, sql.into()))
+        db.execute_raw(Statement::from_string(DbBackend::Sqlite, sql.into()))
             .await
             .expect("execute playlist sidebar fixture SQL");
     }

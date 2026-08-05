@@ -3214,7 +3214,7 @@ async fn record_playback_history(
 ) -> anyhow::Result<Option<Track>> {
     let transaction = db.begin().await?;
     let update = transaction
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             transaction.get_database_backend(),
             "UPDATE tracks
              SET play_count = CASE
