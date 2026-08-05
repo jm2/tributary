@@ -394,6 +394,75 @@ class FuzzLockPolicyTests(unittest.TestCase):
             [sync_fuzz_lock.Transition("facade", "1.0.0", "1.1.0")],
         )
 
+    def test_feature_edge_rewrite_rejects_source_only_in_old_closure(self):
+        base = lock(
+            ["facade 1.0.0"],
+            {
+                "facade": ["1.0.0"],
+                "shared": ["1.0.0"],
+                "old-edge": ["1.0.0"],
+                "new-edge": ["1.0.0"],
+            },
+        )
+        current = lock(
+            ["facade 1.1.0"],
+            {
+                "facade": ["1.1.0"],
+                "shared": ["1.0.0"],
+                "old-edge": ["1.0.0"],
+                "new-edge": ["1.0.0"],
+            },
+        )
+        stale_fuzz = lock(
+            ["facade 1.0.0", "shared"],
+            {
+                "facade": ["1.0.0"],
+                "shared": ["1.0.0"],
+                "old-edge": ["1.0.0"],
+                "new-edge": ["1.0.0"],
+            },
+        )
+        unsafe_fuzz = lock(
+            ["facade 1.1.0", "shared"],
+            {
+                "facade": ["1.1.0"],
+                "shared": ["1.0.0"],
+                "old-edge": ["1.0.0"],
+                "new-edge": ["1.0.0"],
+            },
+        )
+        for fixture in (base, stale_fuzz):
+            next(
+                package
+                for package in fixture["package"]
+                if package["name"] == "facade"
+            )["dependencies"] = ["shared"]
+            next(
+                package
+                for package in fixture["package"]
+                if package["name"] == "shared"
+            )["dependencies"] = ["old-edge"]
+        for fixture in (current, unsafe_fuzz):
+            next(
+                package
+                for package in fixture["package"]
+                if package["name"] == "facade"
+            )["dependencies"] = ["new-edge"]
+        next(
+            package
+            for package in unsafe_fuzz["package"]
+            if package["name"] == "shared"
+        )["dependencies"] = ["new-edge"]
+
+        with self.assertRaises(sync_fuzz_lock.PolicyError):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                current,
+                stale_fuzz,
+                unsafe_fuzz,
+                [sync_fuzz_lock.Transition("facade", "1.0.0", "1.1.0")],
+            )
+
     def test_bounded_repair_rejects_unrelated_existing_version_rebind(self):
         base = lock(
             ["sha2 0.10.9"],
@@ -793,45 +862,52 @@ class FuzzLockPolicyTests(unittest.TestCase):
 
 
 class RustToolchainPolicyTests(unittest.TestCase):
-    def test_candidate_requires_both_exact_action_refs_to_agree(self):
-        digest = "a" * 40
-        source = """
-        uses: dtolnay/rust-toolchain@DIGEST # 1.93.0
-        uses: dtolnay/rust-toolchain@stable
-        uses: dtolnay/rust-toolchain@DIGEST # 1.93.0
-""".replace("DIGEST", digest)
+    def test_candidate_comes_from_exact_toolchain_manifest_release(self):
         self.assertEqual(
-            sync_rust_toolchain.candidate_from_actions(source),
+            sync_rust_toolchain.candidate_from_toolchain(
+                '[toolchain]\nchannel = "1.93.0"\nprofile = "minimal"\n'
+            ),
             "1.93",
         )
 
-    def test_mixed_exact_action_refs_fail_closed(self):
-        digest = "a" * 40
-        source = """
-        uses: dtolnay/rust-toolchain@DIGEST # 1.92.0
-        uses: dtolnay/rust-toolchain@DIGEST # 1.93.0
-""".replace("DIGEST", digest)
-        with self.assertRaises(sync_rust_toolchain.PolicyError):
-            sync_rust_toolchain.candidate_from_actions(source)
+    def test_nonrelease_toolchain_channel_fails_closed(self):
+        for channel in ["stable", "1.93", "1.93.1"]:
+            with self.subTest(channel=channel):
+                with self.assertRaises(sync_rust_toolchain.PolicyError):
+                    sync_rust_toolchain.candidate_from_toolchain(
+                        f'[toolchain]\nchannel = "{channel}"\n'
+                    )
 
-    def test_mixed_exact_action_digests_fail_closed(self):
-        source = f"""
-        uses: dtolnay/rust-toolchain@{'a' * 40} # 1.93.0
-        uses: dtolnay/rust-toolchain@{'b' * 40} # 1.93.0
-"""
-        with self.assertRaises(sync_rust_toolchain.PolicyError):
-            sync_rust_toolchain.candidate_from_actions(source)
+    def test_action_pins_must_be_full_matching_master_commits(self):
+        valid = (
+            f"uses: dtolnay/rust-toolchain@{'a' * 40} # master\n"
+            f"uses: dtolnay/rust-toolchain@{'a' * 40} # master\n"
+        )
+        self.assertEqual(sync_rust_toolchain.exact_action_pins(valid), ["a" * 40] * 2)
+        invalid_sources = [
+            valid.replace("a" * 40, "a" * 12, 1),
+            valid.replace("a" * 40, "b" * 40, 1),
+            valid.replace("# master", "# 1.93.0", 1),
+        ]
+        for source in invalid_sources:
+            with self.subTest(source=source):
+                with self.assertRaises(sync_rust_toolchain.PolicyError):
+                    sync_rust_toolchain.exact_action_pins(source)
 
-    def test_dependabot_action_proposal_synchronizes_every_contract(self):
-        proposed_digest = "b" * 40
+    def test_toolchain_proposal_synchronizes_without_changing_action_commit(self):
+        action_sha = "b" * 40
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             manifest = root / "Cargo.toml"
+            toolchain_manifest = root / "rust-toolchain.toml"
             ci = root / "ci.yml"
             readme = root / "README.md"
             manifest.write_text(
                 '[package]\nname = "fixture"\nversion = "0.0.0"\n'
                 'rust-version = "1.92"\n'
+            )
+            toolchain_manifest.write_text(
+                '[toolchain]\nchannel = "1.93.0"\nprofile = "minimal"\n'
             )
             ci.write_text(
                 "# rustc 1.92 is the supported floor\n"
@@ -839,11 +915,15 @@ class RustToolchainPolicyTests(unittest.TestCase):
                 "    name: MSRV\n"
                 "  steps:\n"
                 "    - name: Install Rust toolchain (1.92)\n"
-                f"      uses: dtolnay/rust-toolchain@{proposed_digest} # 1.93.0\n"
+                f"      uses: dtolnay/rust-toolchain@{action_sha} # master\n"
+                "      with:\n"
+                "        toolchain: 1.92.0\n"
                 "coverage:\n"
                 "  steps:\n"
                 "    - name: Install coverage toolchain\n"
-                f"      uses: dtolnay/rust-toolchain@{proposed_digest} # 1.93.0\n"
+                f"      uses: dtolnay/rust-toolchain@{action_sha} # master\n"
+                "      with:\n"
+                "        toolchain: 1.92.0\n"
                 "  key: coverage-1.92.0-llvm-cov-fixture\n"
             )
             readme.write_text(
@@ -855,27 +935,86 @@ class RustToolchainPolicyTests(unittest.TestCase):
 
             original = (
                 sync_rust_toolchain.MANIFEST,
+                sync_rust_toolchain.TOOLCHAIN_MANIFEST,
                 sync_rust_toolchain.CI,
                 sync_rust_toolchain.README,
             )
             try:
                 sync_rust_toolchain.MANIFEST = manifest
+                sync_rust_toolchain.TOOLCHAIN_MANIFEST = toolchain_manifest
                 sync_rust_toolchain.CI = ci
                 sync_rust_toolchain.README = readme
-                target = sync_rust_toolchain.candidate_from_actions(ci.read_text())
+                target = sync_rust_toolchain.candidate_from_toolchain()
                 sync_rust_toolchain.synchronize(target)
                 sync_rust_toolchain.check_consistency()
             finally:
                 (
                     sync_rust_toolchain.MANIFEST,
+                    sync_rust_toolchain.TOOLCHAIN_MANIFEST,
                     sync_rust_toolchain.CI,
                     sync_rust_toolchain.README,
                 ) = original
 
             self.assertIn('rust-version = "1.93"', manifest.read_text())
             self.assertIn("    name: MSRV\n", ci.read_text())
-            self.assertEqual(ci.read_text().count(proposed_digest), 2)
+            self.assertEqual(ci.read_text().count(action_sha), 2)
+            self.assertEqual(
+                ci.read_text().count("toolchain: 1.93.0"),
+                2,
+            )
+            self.assertIn('channel = "1.93.0"', toolchain_manifest.read_text())
             self.assertNotIn("1.92", ci.read_text() + readme.read_text())
+
+    def test_manual_set_updates_the_toolchain_manifest_too(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "Cargo.toml"
+            toolchain_manifest = root / "rust-toolchain.toml"
+            ci = root / "ci.yml"
+            readme = root / "README.md"
+            action_sha = "c" * 40
+            manifest.write_text('[package]\nrust-version = "1.92"\n')
+            toolchain_manifest.write_text('[toolchain]\nchannel = "1.92.0"\n')
+            ci.write_text(
+                "# rustc 1.92 floor\n"
+                "    name: MSRV\n"
+                "- name: Install Rust toolchain (1.92)\n"
+                f"  uses: dtolnay/rust-toolchain@{action_sha} # master\n"
+                "  with:\n    toolchain: 1.92.0\n"
+                f"  uses: dtolnay/rust-toolchain@{action_sha} # master\n"
+                "  with:\n    toolchain: 1.92.0\n"
+                "key: coverage-1.92.0-llvm-cov-fixture\n"
+            )
+            readme.write_text(
+                "Rust 1.92+\n"
+                "rustup toolchain install 1.92.0\n"
+                "cargo +1.92.0 llvm-cov\n"
+                "coverage is pinned to Rust 1.92.0\n"
+            )
+            original = (
+                sync_rust_toolchain.MANIFEST,
+                sync_rust_toolchain.TOOLCHAIN_MANIFEST,
+                sync_rust_toolchain.CI,
+                sync_rust_toolchain.README,
+            )
+            try:
+                sync_rust_toolchain.MANIFEST = manifest
+                sync_rust_toolchain.TOOLCHAIN_MANIFEST = toolchain_manifest
+                sync_rust_toolchain.CI = ci
+                sync_rust_toolchain.README = readme
+                sync_rust_toolchain.synchronize(
+                    "1.93", update_toolchain_manifest=True
+                )
+            finally:
+                (
+                    sync_rust_toolchain.MANIFEST,
+                    sync_rust_toolchain.TOOLCHAIN_MANIFEST,
+                    sync_rust_toolchain.CI,
+                    sync_rust_toolchain.README,
+                ) = original
+
+            self.assertIn('channel = "1.93.0"', toolchain_manifest.read_text())
+            self.assertEqual(ci.read_text().count(action_sha), 2)
 
 
 if __name__ == "__main__":

@@ -11,9 +11,9 @@ name: Dependabot auto-merge
 #     configured set passes.
 #   * Majors are NOT auto-merged: they fall through the update-type guard below
 #     and wait for coordinated repair and review.
-#   * Rust toolchain/MSRV proposals are NOT auto-merged at any SemVer level.
-#     Dependabot still opens them; the repair lane synchronizes every
-#     authoritative pin and requires the complete CI matrix first.
+#   * Rust compiler/MSRV and rust-toolchain action-code proposals are NOT
+#     auto-merged. Dependabot still opens them; the compiler repair lane
+#     synchronizes every authoritative version and requires full CI first.
 #
 # Security: uses `pull_request` (NOT `pull_request_target`) and never checks out
 # the PR head. A read-only first job binds changed-file inspection and metadata
@@ -43,6 +43,7 @@ jobs:
       privileged_workflow_unchanged: ${{ steps.changed_files.outputs.safe }}
       inspected_head_sha: ${{ steps.metadata_head.outputs.head_sha }}
       dependency_names: ${{ steps.meta.outputs.dependency-names }}
+      package_ecosystem: ${{ steps.meta.outputs.package-ecosystem }}
       update_type: ${{ steps.meta.outputs.update-type }}
     steps:
       # Inline and API-only by design: no proposed third-party action executes
@@ -150,6 +151,7 @@ jobs:
       github.actor == 'dependabot[bot]' &&
       github.event.pull_request.user.login == 'dependabot[bot]' &&
       github.repository == 'jm2/tributary' &&
+      needs.inspect_changed_files.outputs.package_ecosystem != 'rust-toolchain' &&
       !contains(needs.inspect_changed_files.outputs.dependency_names, 'dtolnay/rust-toolchain') &&
       !contains(needs.inspect_changed_files.outputs.dependency_names, 'dependabot/fetch-metadata') &&
       (
@@ -160,8 +162,8 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      # Major bumps, every Rust/MSRV proposal, and metadata-action self-updates
-      # never reach this action-free write job.
+      # Major bumps, compiler/MSRV proposals, rust-toolchain action-code
+      # proposals, and metadata-action self-updates never reach this writer.
       - name: Enable exact-head auto-merge for patch & minor updates
         shell: bash
         run: |

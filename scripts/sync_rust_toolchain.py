@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""
-Validate or synchronize Tributary's authoritative Rust/MSRV declarations.
+"""Validate or synchronize Tributary's authoritative Rust/MSRV declarations.
 
-Dependabot is expected to propose coordinated digest updates to the two exact
-`dtolnay/rust-toolchain@SHA # X.Y.0` pins. Those proposals deliberately do not
-auto-merge. A trusted repairer runs this script to coordinate Cargo.toml, CI,
-cache keys, and developer documentation before the complete matrix is allowed
-to decide whether the new compiler is feasible.
+Dependabot proposes compiler updates through `.github/rust-toolchain.toml`.
+Those proposals deliberately do not auto-merge. A trusted repairer runs this
+script to coordinate Cargo.toml, CI, cache keys, and developer documentation
+before the complete matrix decides whether the new compiler is feasible.
+
+The two `dtolnay/rust-toolchain` action references are a separate supply-chain
+boundary: they remain immutable commits from the action's permanent master
+history and are never rewritten by a compiler-version synchronization.
 """
 
 from __future__ import annotations
@@ -20,15 +22,17 @@ from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 MANIFEST = REPOSITORY / "Cargo.toml"
+TOOLCHAIN_MANIFEST = REPOSITORY / ".github" / "rust-toolchain.toml"
 CI = REPOSITORY / ".github" / "workflows" / "ci.yml"
 README = REPOSITORY / "README.md"
 LINE_VERSION = re.compile(r"^[1-9][0-9]*\.[0-9]+$")
 RELEASE_VERSION = re.compile(r"^([1-9][0-9]*\.[0-9]+)\.0$")
-EXACT_TOOLCHAIN = re.compile(
-    r"(?m)^(\s*uses:\s*dtolnay/rust-toolchain@)([0-9a-f]{40})"
-    r"(\s+#\s*)([1-9][0-9]*\.[0-9]+\.0)\s*$"
+EXACT_TOOLCHAIN_ACTION = re.compile(
+    r"(?m)^\s*uses:\s*dtolnay/rust-toolchain@([0-9a-f]{40})\s+#\s*master\s*$"
 )
-ACTION_SHA = re.compile(r"^[0-9a-f]{40}$")
+EXACT_CI_TOOLCHAIN = re.compile(
+    r'(?m)^(\s*toolchain:\s*)([1-9][0-9]*\.[0-9]+\.0)\s*$'
+)
 STABLE_MSRV_CHECK = re.compile(r"(?m)^    name: MSRV\s*$")
 
 
@@ -47,42 +51,46 @@ def manifest_line_version() -> str:
     return value
 
 
-def exact_action_pins(ci_source: str) -> list[tuple[str, str]]:
-    pins = [
-        (match.group(2), match.group(4))
-        for match in EXACT_TOOLCHAIN.finditer(ci_source)
-    ]
+def candidate_from_toolchain(source: str | None = None) -> str:
+    if source is None:
+        with TOOLCHAIN_MANIFEST.open("rb") as manifest_source:
+            manifest = tomllib.load(manifest_source)
+    else:
+        manifest = tomllib.loads(source)
+    value = manifest.get("toolchain", {}).get("channel")
+    if not isinstance(value, str):
+        raise PolicyError("rust-toolchain.toml must define toolchain.channel")
+    match = RELEASE_VERSION.fullmatch(value)
+    if match is None:
+        raise PolicyError(
+            "rust-toolchain.toml toolchain.channel must be a canonical X.Y.0 release"
+        )
+    return match.group(1)
+
+
+def exact_action_pins(ci_source: str) -> list[str]:
+    pins = EXACT_TOOLCHAIN_ACTION.findall(ci_source)
     if len(pins) != 2:
         raise PolicyError(
-            "CI must contain exactly two digest-pinned dtolnay/rust-toolchain refs "
-            f"with release comments (MSRV and coverage); found {len(pins)}"
+            "CI must contain exactly two full-SHA dtolnay/rust-toolchain refs "
+            f"from permanent master history (MSRV and coverage); found {len(pins)}"
+        )
+    if len(set(pins)) != 1:
+        raise PolicyError(
+            "MSRV and coverage must use the same immutable toolchain action commit"
         )
     return pins
 
 
-def exact_action_releases(ci_source: str) -> list[str]:
-    return [release for _, release in exact_action_pins(ci_source)]
-
-
-def candidate_from_actions(ci_source: str) -> str:
-    pins = exact_action_pins(ci_source)
-    shas = {sha for sha, _ in pins}
-    if len(shas) != 1:
+def exact_ci_releases(ci_source: str) -> list[str]:
+    releases = EXACT_CI_TOOLCHAIN.findall(ci_source)
+    values = [release for _, release in releases]
+    if len(values) != 2:
         raise PolicyError(
-            "Dependabot must update both exact toolchain digests together; found "
-            + ", ".join(sorted(shas))
+            "CI must contain exactly two explicit X.Y.0 toolchain inputs "
+            f"(MSRV and coverage); found {len(values)}"
         )
-    releases = {release for _, release in pins}
-    if len(releases) != 1:
-        raise PolicyError(
-            "Dependabot must update both exact toolchain refs together; found "
-            + ", ".join(sorted(releases))
-        )
-    release = releases.pop()
-    match = RELEASE_VERSION.fullmatch(release)
-    if match is None:
-        raise PolicyError(f"unsupported Rust release tag {release!r}")
-    return match.group(1)
+    return values
 
 
 def require_occurrence(source: str, needle: str, description: str) -> None:
@@ -93,19 +101,21 @@ def require_occurrence(source: str, needle: str, description: str) -> None:
 def check_consistency() -> None:
     line = manifest_line_version()
     release = f"{line}.0"
-    ci_source = CI.read_text()
-    readme = README.read_text()
-    pins = exact_action_pins(ci_source)
-    releases = [release for _, release in pins]
-    if set(releases) != {release}:
+    toolchain_line = candidate_from_toolchain()
+    if toolchain_line != line:
         raise PolicyError(
-            f"pinned CI toolchain releases {sorted(set(releases))} do not match "
+            f"rust-toolchain.toml release {toolchain_line}.0 does not match "
             f"Cargo.toml rust-version {line}"
         )
-    shas = {sha for sha, _ in pins}
-    if len(shas) != 1:
+
+    ci_source = CI.read_text()
+    readme = README.read_text()
+    exact_action_pins(ci_source)
+    releases = exact_ci_releases(ci_source)
+    if set(releases) != {release}:
         raise PolicyError(
-            "MSRV and coverage must use the same immutable toolchain action digest"
+            f"explicit CI toolchains {sorted(set(releases))} do not match "
+            f"Cargo.toml rust-version {line}"
         )
     if STABLE_MSRV_CHECK.search(ci_source) is None:
         raise PolicyError(
@@ -135,13 +145,28 @@ def replace_exactly(source: str, old: str, new: str, description: str) -> str:
     return source.replace(old, new)
 
 
-def synchronize(target_line: str, action_sha: str | None = None) -> None:
+def synchronize(target_line: str, *, update_toolchain_manifest: bool = False) -> None:
     if LINE_VERSION.fullmatch(target_line) is None:
         raise PolicyError("target Rust version must use canonical X.Y form")
 
     old_line = manifest_line_version()
     old_release = f"{old_line}.0"
     target_release = f"{target_line}.0"
+
+    toolchain_source = TOOLCHAIN_MANIFEST.read_text()
+    proposed_line = candidate_from_toolchain(toolchain_source)
+    if update_toolchain_manifest:
+        toolchain_source = replace_exactly(
+            toolchain_source,
+            f'channel = "{proposed_line}.0"',
+            f'channel = "{target_release}"',
+            "toolchain manifest channel",
+        )
+    elif proposed_line != target_line:
+        raise PolicyError(
+            f"requested Rust {target_line} does not match the toolchain manifest "
+            f"proposal {proposed_line}"
+        )
 
     manifest = MANIFEST.read_text()
     manifest = replace_exactly(
@@ -152,29 +177,13 @@ def synchronize(target_line: str, action_sha: str | None = None) -> None:
     )
 
     ci_source = CI.read_text()
-    pins = exact_action_pins(ci_source)
-    if action_sha is None:
-        matching_shas = {
-            sha for sha, release in pins if release == target_release
-        }
-        if len(matching_shas) != 1 or any(
-            release != target_release for _, release in pins
-        ):
-            raise PolicyError(
-                "changing the Rust release with --set requires the immutable "
-                "dtolnay/rust-toolchain commit via --action-sha"
-            )
-        action_sha = matching_shas.pop()
-    elif ACTION_SHA.fullmatch(action_sha) is None:
-        raise PolicyError("toolchain action SHA must be 40 lowercase hexadecimal characters")
-
-    # Normalize both exact digest pins. Stable/nightly channels are
-    # intentionally untouched.
-    ci_source, count = EXACT_TOOLCHAIN.subn(
-        lambda match: f"{match.group(1)}{action_sha} # {target_release}", ci_source
+    exact_action_pins(ci_source)
+    exact_ci_releases(ci_source)
+    ci_source, count = EXACT_CI_TOOLCHAIN.subn(
+        lambda match: f"{match.group(1)}{target_release}", ci_source
     )
     if count != 2:
-        raise PolicyError("could not normalize both exact CI toolchain refs")
+        raise PolicyError("could not normalize both explicit CI toolchain inputs")
     for old, new, description in [
         (
             f"toolchain ({old_line})",
@@ -204,6 +213,7 @@ def synchronize(target_line: str, action_sha: str | None = None) -> None:
         "README exact Rust release",
     )
 
+    TOOLCHAIN_MANIFEST.write_text(toolchain_source)
     MANIFEST.write_text(manifest)
     CI.write_text(ci_source)
     README.write_text(readme)
@@ -215,29 +225,23 @@ def parse_args() -> argparse.Namespace:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--check", action="store_true")
     group.add_argument(
-        "--from-actions",
+        "--from-toolchain",
         action="store_true",
-        help="adopt the one exact Rust release proposed in both pinned CI action refs",
+        help="adopt the exact Rust release proposed in .github/rust-toolchain.toml",
     )
     group.add_argument("--set", metavar="X.Y", dest="target")
-    parser.add_argument(
-        "--action-sha",
-        help="40-character dtolnay/rust-toolchain commit required with a new --set release",
-    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     try:
-        if args.action_sha is not None and args.target is None:
-            raise PolicyError("--action-sha is valid only together with --set")
         if args.check:
             check_consistency()
-        elif args.from_actions:
-            synchronize(candidate_from_actions(CI.read_text()))
+        elif args.from_toolchain:
+            synchronize(candidate_from_toolchain())
         else:
-            synchronize(args.target, args.action_sha)
+            synchronize(args.target, update_toolchain_manifest=True)
         print("Rust toolchain declarations are synchronized")
         return 0
     except (OSError, PolicyError, tomllib.TOMLDecodeError) as error:
