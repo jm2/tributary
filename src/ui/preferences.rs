@@ -77,6 +77,61 @@ pub struct AppConfig {
     /// the track-level Artist tag. Default: false (group by Artist).
     #[serde(default)]
     pub group_by_album_artist: bool,
+    /// Whether the browser Album pane decorates each row with a thumbnail.
+    /// Default: false (text-only label) to match the pre-existing look.
+    #[serde(default)]
+    pub album_pane_artwork: bool,
+    /// Thumbnail side length for the browser Album pane, in device pixels.
+    /// Default: `Medium` (48 dp). Persisted across restarts.
+    #[serde(default)]
+    pub album_pane_artwork_size: AlbumArtSize,
+}
+
+/// Thumbnail side length for the browser Album pane.
+///
+/// Bounded at the source by the album-art worker's byte cap (32 MiB); the
+/// GTK side decodes whatever the worker returns into a square of the
+/// selected size, so this knob is layout (not transport) state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AlbumArtSize {
+    Small,
+    #[default]
+    Medium,
+    Large,
+}
+
+impl AlbumArtSize {
+    /// Side length in device pixels.
+    pub const fn pixel_size(self) -> i32 {
+        match self {
+            Self::Small => 32,
+            Self::Medium => 48,
+            Self::Large => 72,
+        }
+    }
+
+    /// Stable persistence token. New variants must keep older strings
+    /// recognized for in-place config migration.
+    #[allow(dead_code)]
+    pub const fn as_token(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+
+    /// Parse a previously-persisted token. Returns `None` for unknown
+    /// values so callers can fall back rather than reject a config file.
+    #[allow(dead_code)]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "small" => Some(Self::Small),
+            "medium" => Some(Self::Medium),
+            "large" => Some(Self::Large),
+            _ => None,
+        }
+    }
 }
 
 /// A user-confirmed old-to-new library-root reauthorization.
@@ -206,6 +261,8 @@ impl Default for AppConfig {
             pending_root_reauthorizations: Vec::new(),
             location_enabled: None,
             group_by_album_artist: false,
+            album_pane_artwork: false,
+            album_pane_artwork_size: AlbumArtSize::default(),
         }
     }
 }
@@ -600,12 +657,17 @@ pub fn save_config(config: &AppConfig) -> bool {
 /// * `column_view` — the tracklist `ColumnView` to toggle column visibility
 /// * `browser_box` — the browser container `Box` to toggle pane visibility
 /// * `config` — current configuration (will be mutated and saved on changes)
+/// * `on_album_artist_changed` — invoked when the artist grouping toggle flips
+/// * `on_album_pane_artwork_changed` — invoked when the album artwork toggle flips
+/// * `on_album_pane_artwork_size_changed` — invoked when the size dropdown changes
 pub fn show_preferences(
     parent: &adw::ApplicationWindow,
     column_view: &gtk::ColumnView,
     browser_box: &gtk::Box,
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
     on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
+    on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
+    on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
 ) {
     let prefs_dialog = adw::PreferencesDialog::builder()
         .title(rust_i18n::t!("preferences.title").as_ref())
@@ -802,12 +864,42 @@ pub fn show_preferences(
         .halign(gtk::Align::Start)
         .build();
 
+    let album_art_check = gtk::CheckButton::builder()
+        .label(rust_i18n::t!("browser.album_artwork").as_ref())
+        .active(cfg.album_pane_artwork)
+        .hexpand(true)
+        .halign(gtk::Align::Start)
+        .build();
+
+    // Three radio options matching the `AlbumArtSize` tokens.
+    let album_art_size_small = gtk::CheckButton::builder()
+        .label(rust_i18n::t!("browser.album_artwork_size_small").as_ref())
+        .active(cfg.album_pane_artwork_size == AlbumArtSize::Small)
+        .build();
+    let album_art_size_medium = gtk::CheckButton::builder()
+        .label(rust_i18n::t!("browser.album_artwork_size_medium").as_ref())
+        .group(&album_art_size_small)
+        .active(cfg.album_pane_artwork_size == AlbumArtSize::Medium)
+        .build();
+    let album_art_size_large = gtk::CheckButton::builder()
+        .label(rust_i18n::t!("browser.album_artwork_size_large").as_ref())
+        .group(&album_art_size_small)
+        .active(cfg.album_pane_artwork_size == AlbumArtSize::Large)
+        .build();
+
     // Row 0: the three browser panes (one per grid column).
     browser_grid.attach(&genre_check, 0, 0, 1, 1);
     browser_grid.attach(&artist_check, 1, 0, 1, 1);
     browser_grid.attach(&album_check, 2, 0, 1, 1);
     // Row 1: the grouping toggle spans the full width (its label is longer).
     browser_grid.attach(&album_artist_check, 0, 1, 3, 1);
+    // Row 2: album pane artwork toggle (full width).
+    browser_grid.attach(&album_art_check, 0, 2, 3, 1);
+    // Row 3: size triplet (one per grid column). Grouped radios so only
+    // one can be active at a time.
+    browser_grid.attach(&album_art_size_small, 0, 3, 1, 1);
+    browser_grid.attach(&album_art_size_medium, 1, 3, 1, 1);
+    browser_grid.attach(&album_art_size_large, 2, 3, 1, 1);
 
     // Wire album artist toggle
     {
@@ -853,6 +945,67 @@ pub fn show_preferences(
             cfg.browser_views.album = btn.is_active();
             update_browser_visibility(&browser_box, &cfg.browser_views);
             save_config(&cfg);
+        });
+    }
+
+    // Wire album pane artwork toggle. The pane rebuild is performed by
+    // the on-change callback so the browser owns the swap.
+    {
+        let config = config.clone();
+        let on_change = on_album_pane_artwork_changed.clone();
+        album_art_check.connect_toggled(move |btn| {
+            let active = btn.is_active();
+            {
+                let mut cfg = config.borrow_mut();
+                cfg.album_pane_artwork = active;
+                save_config(&cfg);
+            }
+            on_change(active);
+        });
+    }
+
+    // Wire album-pane artwork size radios. Same pattern as the toggle.
+    {
+        let cfg_for_small = config.clone();
+        let on_change_small = on_album_pane_artwork_size_changed.clone();
+        let cfg_for_medium = config.clone();
+        let on_change_medium = on_album_pane_artwork_size_changed.clone();
+        let cfg_for_large = config.clone();
+        let on_change_large = on_album_pane_artwork_size_changed.clone();
+        let medium = album_art_size_medium.clone();
+        let large = album_art_size_large.clone();
+        album_art_size_small.connect_toggled(move |btn| {
+            if !btn.is_active() {
+                return;
+            }
+            {
+                let mut cfg = cfg_for_small.borrow_mut();
+                cfg.album_pane_artwork_size = AlbumArtSize::Small;
+                save_config(&cfg);
+            }
+            on_change_small(AlbumArtSize::Small);
+        });
+        medium.connect_toggled(move |btn| {
+            if !btn.is_active() {
+                return;
+            }
+            {
+                let mut cfg = cfg_for_medium.borrow_mut();
+                cfg.album_pane_artwork_size = AlbumArtSize::Medium;
+                save_config(&cfg);
+            }
+            on_change_medium(AlbumArtSize::Medium);
+        });
+        large.connect_toggled(move |btn| {
+            if !btn.is_active() {
+                return;
+            }
+            {
+                let mut cfg = cfg_for_large.borrow_mut();
+                cfg.album_pane_artwork_size = AlbumArtSize::Large;
+                save_config(&cfg);
+            }
+            on_change_large(AlbumArtSize::Large);
         });
     }
 
