@@ -33,6 +33,41 @@ pub enum PlaylistAction {
     BrowseServerPlaylists,
     /// Export a playlist to an XSPF file (id).
     ExportPlaylist(String),
+    /// Reorder the playlist sidebar presentation order (full ordered id list).
+    Reorder(Vec<String>),
+}
+
+/// Compute the sidebar playlist order after a drag moves `dragged_id`
+/// next to `target_id`.
+///
+/// Returns `None` when the drop is a no-op (same row) or either id is
+/// unknown. `before` places the dragged playlist in front of the target.
+fn reorder_playlist_ids(
+    current: &[String],
+    dragged_id: &str,
+    target_id: &str,
+    before: bool,
+) -> Option<Vec<String>> {
+    if dragged_id == target_id {
+        return None;
+    }
+    let dragged_pos = current.iter().position(|id| id == dragged_id)?;
+    let mut ids = current.to_vec();
+    ids.remove(dragged_pos);
+    let target_pos = ids.iter().position(|id| id == target_id)?;
+    let insert_at = if before { target_pos } else { target_pos + 1 };
+    ids.insert(insert_at, dragged_id.to_string());
+    Some(ids)
+}
+
+/// The playlist ids in their current sidebar display order.
+fn playlist_ids_in_store_order(store: &gtk::gio::ListStore) -> Vec<String> {
+    (0..store.n_items())
+        .filter_map(|position| store.item(position))
+        .filter_map(|obj| obj.downcast::<SourceObject>().ok())
+        .filter(SourceObject::is_playlist)
+        .map(|src| src.playlist_id())
+        .collect()
 }
 
 /// Action represented by the recycled row's trailing button.
@@ -474,6 +509,78 @@ pub fn build_sidebar(
                 popover.popup();
             });
             row_box.add_controller(gesture);
+
+            // ── Playlist drag & drop reorder ──────────────────────────────
+            //
+            // Only playlist rows initiate a drag; the payload is the playlist
+            // id carried as a string value. The drop target is per-row so it
+            // resolves the exact target position via `list_item.position()`
+            // (the same mechanism as the context-menu gesture above).
+            let drag_source = gtk::DragSource::new();
+            drag_source.set_actions(gtk::gdk::DragAction::MOVE);
+            {
+                let store_for_drag = store_for_setup.clone();
+                let list_item_for_drag = list_item.clone();
+                drag_source.connect_prepare(move |_, _x, _y| {
+                    let item = store_for_drag.item(list_item_for_drag.position())?;
+                    let src = item.downcast_ref::<SourceObject>()?;
+                    if !src.is_playlist() {
+                        return None;
+                    }
+                    let value = glib::Value::from(src.playlist_id());
+                    Some(gtk::gdk::ContentProvider::for_value(&value))
+                });
+            }
+            row_box.add_controller(drag_source);
+
+            let drop_target = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
+            {
+                let store_for_enter = store_for_setup.clone();
+                let list_item_for_enter = list_item.clone();
+                drop_target.connect_enter(move |_, _x, _y| {
+                    let pos = list_item_for_enter.position();
+                    let Some(item) = store_for_enter.item(pos) else {
+                        return gtk::gdk::DragAction::empty();
+                    };
+                    let Some(src) = item.downcast_ref::<SourceObject>() else {
+                        return gtk::gdk::DragAction::empty();
+                    };
+                    if src.is_playlist() {
+                        gtk::gdk::DragAction::MOVE
+                    } else {
+                        gtk::gdk::DragAction::empty()
+                    }
+                });
+                let store_for_drop = store_for_setup.clone();
+                let tx_for_drop = tx_for_setup.clone();
+                let list_item_for_drop = list_item.clone();
+                let row_box_for_drop = row_box.clone();
+                drop_target.connect_drop(move |_, value, _x, y| {
+                    let Ok(dragged_id) = value.get_owned::<String>() else {
+                        return false;
+                    };
+                    let pos = list_item_for_drop.position();
+                    let Some(item) = store_for_drop.item(pos) else {
+                        return false;
+                    };
+                    let Some(src) = item.downcast_ref::<SourceObject>() else {
+                        return false;
+                    };
+                    if !src.is_playlist() {
+                        return false;
+                    }
+                    let current = playlist_ids_in_store_order(&store_for_drop);
+                    let before = y < (row_box_for_drop.height() as f64) / 2.0;
+                    let Some(ordered) =
+                        reorder_playlist_ids(&current, &dragged_id, &src.playlist_id(), before)
+                    else {
+                        return false;
+                    };
+                    let _ = tx_for_drop.try_send(PlaylistAction::Reorder(ordered));
+                    true
+                });
+            }
+            row_box.add_controller(drop_target);
         });
     }
 
@@ -824,6 +931,83 @@ mod tests {
         assert_eq!(
             label.str(),
             Some(rust_i18n::t!("server_playlists.browse_menu").as_ref())
+        );
+    }
+
+    #[test]
+    fn reorder_playlist_ids_places_dragged_next_to_target() {
+        let current = ["a", "b", "c", "d"].map(str::to_string).to_vec();
+
+        // Move "a" before "c" (downward).
+        assert_eq!(
+            reorder_playlist_ids(&current, "a", "c", true).unwrap(),
+            ["b", "a", "c", "d"]
+        );
+        // Move "a" after "c" (downward).
+        assert_eq!(
+            reorder_playlist_ids(&current, "a", "c", false).unwrap(),
+            ["b", "c", "a", "d"]
+        );
+        // Move "d" before "b" (upward).
+        assert_eq!(
+            reorder_playlist_ids(&current, "d", "b", true).unwrap(),
+            ["a", "d", "b", "c"]
+        );
+        // Move "d" after "b" (upward).
+        assert_eq!(
+            reorder_playlist_ids(&current, "d", "b", false).unwrap(),
+            ["a", "b", "d", "c"]
+        );
+        // Dragging a row onto itself is a no-op.
+        assert!(reorder_playlist_ids(&current, "b", "b", true).is_none());
+        assert!(reorder_playlist_ids(&current, "b", "b", false).is_none());
+        // Unknown ids are rejected.
+        assert!(reorder_playlist_ids(&current, "nope", "b", true).is_none());
+        assert!(reorder_playlist_ids(&current, "b", "nope", true).is_none());
+    }
+
+    #[test]
+    fn reorder_playlist_ids_keeps_permutation_intact() {
+        let current = ["a", "b", "c", "d", "e"].map(str::to_string).to_vec();
+        let reordered = reorder_playlist_ids(&current, "e", "a", true).unwrap();
+        assert_eq!(reordered, ["e", "a", "b", "c", "d"]);
+
+        let mut sorted: Vec<String> = reordered.clone();
+        sorted.sort();
+        let mut original: Vec<String> = current.clone();
+        original.sort();
+        assert_eq!(sorted, original, "reorder must be a pure permutation");
+
+        let reordered = reorder_playlist_ids(&current, "a", "e", false).unwrap();
+        assert_eq!(reordered, ["b", "c", "d", "e", "a"]);
+    }
+
+    #[test]
+    fn playlist_ids_in_store_order_skips_non_playlist_rows() {
+        use crate::local::playlist_sidebar::PlaylistSidebarEntry;
+        use crate::ui::objects::HeaderKind;
+
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        store.append(&SourceObject::header("Local", HeaderKind::Local));
+        store.append(&SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "p1",
+            "First",
+            PlaylistSidebarKind::EditableRegular,
+        )));
+        store.append(&SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "p2",
+            "Second",
+            PlaylistSidebarKind::EditableSmart,
+        )));
+        store.append(&SourceObject::discovered(
+            "DAAP",
+            "daap",
+            "http://b.example:3689",
+        ));
+
+        assert_eq!(
+            playlist_ids_in_store_order(&store),
+            ["p1", "p2"].map(str::to_string).to_vec()
         );
     }
 }

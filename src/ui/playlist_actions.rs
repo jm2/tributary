@@ -182,6 +182,15 @@ pub fn setup_playlist_actions(
                         debug!(id = %playlist_id, "ExportPlaylist: playlist_allows_ordinary_actions rejected");
                     }
                 }
+
+                sidebar::PlaylistAction::Reorder(ordered_ids) => {
+                    debug!(count = ordered_ids.len(), "dispatching Reorder");
+                    if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
+                        handle_reorder(&win, &rt_handle, &playlist_sidebar_refresh, &ordered_ids);
+                    })) {
+                        error!("Reorder handler panicked: {e:?}");
+                    }
+                }
             }
         }
         info!("setup_playlist_actions: async task finished (channel closed or loop exited)");
@@ -456,6 +465,54 @@ fn handle_delete(
                 request_playlist_sidebar_refresh(&playlist_sidebar_refresh);
             }
             Ok(_) | Err(_) => show_playlist_mutation_failed(&win),
+        }
+    });
+}
+
+/// Persist the user-defined playlist sidebar order.
+fn handle_reorder(
+    win: &adw::ApplicationWindow,
+    rt_handle: &tokio::runtime::Handle,
+    playlist_sidebar_refresh: &crate::local::playlist_sidebar::PlaylistSidebarRefresh,
+    ordered_ids: &[String],
+) {
+    info!(count = ordered_ids.len(), "Reordering playlist sidebar");
+    let rt_handle = rt_handle.clone();
+    let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
+    let ordered_ids = ordered_ids.to_vec();
+    let win_for_result = win.clone();
+
+    let (result_tx, result_rx) = async_channel::bounded::<PlaylistCrudOutcome<()>>(1);
+
+    rt_handle.spawn(async move {
+        let outcome = match crate::db::connection::init_db().await {
+            Ok(db) => {
+                let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
+                match mgr.set_sidebar_order(&ordered_ids).await {
+                    Ok(()) => PlaylistCrudOutcome::Committed(()),
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to reorder playlists");
+                        PlaylistCrudOutcome::Failed
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to open DB");
+                PlaylistCrudOutcome::Failed
+            }
+        };
+        let _ = result_tx.send(outcome).await;
+    });
+
+    glib::MainContext::default().spawn_local(async move {
+        match result_rx.recv().await {
+            Ok(outcome)
+                if playlist_sidebar_publication_effect(&outcome)
+                    == PlaylistSidebarPublicationEffect::RequestFullSnapshot =>
+            {
+                request_playlist_sidebar_refresh(&playlist_sidebar_refresh);
+            }
+            Ok(_) | Err(_) => show_playlist_mutation_failed(&win_for_result),
         }
     });
 }
