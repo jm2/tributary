@@ -41,7 +41,8 @@ SELECT
     l.state_revision AS link_state_revision
 FROM playlists AS p
 LEFT JOIN server_playlist_links AS l ON l.playlist_id = p.id
-ORDER BY p.created_at ASC, p.id ASC
+LEFT JOIN playlist_sidebar_order AS o ON o.playlist_id = p.id
+ORDER BY o.position IS NULL ASC, o.position ASC, p.created_at ASC, p.id ASC
 ";
 
 /// Fallback cadence for direct SQL mutations or a lost refresh hint.
@@ -621,6 +622,18 @@ mod tests {
         .await;
     }
 
+    async fn insert_order(db: &DatabaseConnection, playlist_id: &str, position: i64) {
+        execute(
+            db,
+            format!(
+                "INSERT INTO playlist_sidebar_order (playlist_id, position) VALUES ({},{})",
+                sql_string(playlist_id),
+                position,
+            ),
+        )
+        .await;
+    }
+
     #[test]
     fn revision_validation_is_closed_and_nonnegative() {
         assert_eq!(PlaylistSidebarRevision::new(0).unwrap().value(), 0);
@@ -681,6 +694,29 @@ mod tests {
         );
         assert_eq!(entries[0].kind(), PlaylistSidebarKind::EditableRegular);
         assert_eq!(entries[1].kind(), PlaylistSidebarKind::EditableSmart);
+    }
+
+    #[tokio::test]
+    async fn explicit_order_rows_sort_before_unordered_created_at_fallbacks() {
+        let db = migrated_database().await;
+        insert_playlist(&db, "u1", "Unordered one", 0, "2026-07-20T00:00:00Z").await;
+        insert_playlist(&db, "p1", "Positioned one", 0, "2026-07-20T00:00:01Z").await;
+        insert_playlist(&db, "u2", "Unordered two", 0, "2026-07-20T00:00:02Z").await;
+        insert_playlist(&db, "p2", "Positioned two", 0, "2026-07-20T00:00:03Z").await;
+        insert_order(&db, "p2", 1).await;
+        insert_order(&db, "p1", 0).await;
+
+        let snapshot = load_playlist_sidebar_snapshot(&db).await.unwrap();
+        let PlaylistSidebarState::Ready(entries) = snapshot.state() else {
+            panic!("expected ready sidebar projection");
+        };
+        assert_eq!(
+            entries
+                .iter()
+                .map(PlaylistSidebarEntry::playlist_id)
+                .collect::<Vec<_>>(),
+            ["p1", "p2", "u1", "u2"]
+        );
     }
 
     #[tokio::test]

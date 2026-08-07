@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 
 use sea_orm::prelude::*;
 use sea_orm::sea_query::Query;
-use sea_orm::{ActiveValue::Set, DatabaseTransaction, QueryOrder, TransactionTrait};
+use sea_orm::{
+    ActiveValue::Set, ConnectionTrait, DatabaseTransaction, QueryOrder, Statement, TransactionTrait,
+};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -17,6 +19,11 @@ use super::smart_rules::{self, SmartRules};
 use crate::architecture::{MediaKey, SourceId, TrackId};
 use crate::db::entities::server_playlist_link::StoredServerPlaylistLink;
 use crate::db::entities::{playlist, playlist_entry, server_playlist_link, track};
+
+/// Durable playlist-sidebar presentation order. Rows are contiguous
+/// positions; a missing playlist falls back to the historical `created_at`
+/// snapshot ordering.
+const SIDEBAR_ORDER_TABLE: &str = "playlist_sidebar_order";
 
 mod server_playlist_sync;
 
@@ -828,6 +835,56 @@ impl PlaylistManager {
         Ok(())
     }
 
+    /// Persist the playlist-sidebar presentation order.
+    ///
+    /// `ordered_ids` must be one exact, duplicate-free permutation of every
+    /// current playlist ID. Regular, smart, and linked-mirror playlists all
+    /// participate: sidebar order is presentation state, never a content edit.
+    /// Rows are stored as contiguous positions; a playlist without an order
+    /// row keeps the historical `created_at` fallback ordering.
+    pub async fn set_sidebar_order(&self, ordered_ids: &[String]) -> Result<(), DbErr> {
+        let txn = self.db.begin().await?;
+        let current = playlist::Entity::find().all(&txn).await?;
+        let requested: HashSet<&str> = ordered_ids.iter().map(String::as_str).collect();
+        let current_ids: HashSet<&str> = current
+            .iter()
+            .map(|playlist| playlist.id.as_str())
+            .collect();
+        if requested.len() != ordered_ids.len() || requested != current_ids {
+            return Err(DbErr::Custom(
+                "Playlist sidebar reorder must contain each playlist exactly once".to_string(),
+            ));
+        }
+
+        let stored = stored_sidebar_order(&txn).await?;
+        if stored == ordered_ids {
+            txn.commit().await?;
+            return Ok(());
+        }
+
+        txn.execute_raw(Statement::from_string(
+            txn.get_database_backend(),
+            format!("DELETE FROM {SIDEBAR_ORDER_TABLE}"),
+        ))
+        .await?;
+        for (position, playlist_id) in ordered_ids.iter().enumerate() {
+            let position = i64::try_from(position)
+                .map_err(|_| DbErr::Custom("Playlist sidebar has too many rows".to_string()))?;
+            txn.execute_raw(Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                format!("INSERT INTO {SIDEBAR_ORDER_TABLE} (playlist_id, position) VALUES (?, ?)"),
+                [playlist_id.as_str().into(), position.into()],
+            ))
+            .await?;
+        }
+        txn.commit().await?;
+        info!(
+            count = ordered_ids.len(),
+            "Playlist sidebar order persisted"
+        );
+        Ok(())
+    }
+
     /// Load every durable regular-playlist occurrence in stored order.
     /// Unmatched and currently unavailable entries are retained.
     pub async fn get_playlist_entries(
@@ -1188,6 +1245,28 @@ where
     Ok(loaded)
 }
 
+/// Read the persisted playlist-sidebar order, position ascending.
+///
+/// A playlist without a row has never been explicitly positioned and keeps
+/// the historical `created_at` fallback ordering.
+async fn stored_sidebar_order<C>(db: &C) -> Result<Vec<String>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            db.get_database_backend(),
+            format!("SELECT playlist_id FROM {SIDEBAR_ORDER_TABLE} ORDER BY position"),
+        ))
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            row.try_get::<String>("", "playlist_id")
+                .map_err(|_| DbErr::Custom("Playlist sidebar order row is malformed".to_string()))
+        })
+        .collect()
+}
+
 fn orphan_reconciliation_query() -> sea_orm::Select<playlist_entry::Entity> {
     playlist_entry::Entity::find()
         .filter(playlist_entry::Column::SourceId.eq(SourceId::local().to_string()))
@@ -1481,11 +1560,12 @@ mod tests {
     use sea_orm::{
         ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, Database,
         DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, QueryTrait,
+        Statement,
     };
     use sea_orm_migration::MigratorTrait;
 
     use super::{
-        orphan_reconciliation_query, recently_played_default_rules,
+        orphan_reconciliation_query, recently_played_default_rules, stored_sidebar_order,
         top_25_most_played_default_rules, LocalPlaylistExport, PlaylistEntryAddOutcome,
         PlaylistEntryInput, PlaylistManager, StoredPlaylistEntry,
     };
@@ -2912,6 +2992,95 @@ mod tests {
         // ...and the entries must follow the requested order.
         let ordered_ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
         assert_eq!(ordered_ids, new_order);
+    }
+
+    #[tokio::test]
+    async fn set_sidebar_order_persists_and_short_circuits_noop_permutations() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+
+        let first = manager
+            .create_regular_playlist("First")
+            .await
+            .expect("create first playlist");
+        let second = manager
+            .create_regular_playlist("Second")
+            .await
+            .expect("create second playlist");
+        let mirror = manager
+            .create_regular_playlist("Mirror")
+            .await
+            .expect("create mirror playlist");
+
+        let reordered = vec![second.id.clone(), mirror.id.clone(), first.id.clone()];
+        manager
+            .set_sidebar_order(&reordered)
+            .await
+            .expect("persist reorder");
+
+        let stored = stored_sidebar_order(&db).await.expect("read stored order");
+        assert_eq!(stored, reordered);
+        let revision: i64 = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT revision FROM playlist_sidebar_revision WHERE singleton = 1".to_string(),
+            ))
+            .await
+            .expect("query revision")
+            .expect("revision exists")
+            .try_get("", "revision")
+            .expect("revision is integer");
+        // Two playlist inserts plus the reorder's delete/insert rows bump it.
+        assert!(revision > 3);
+
+        manager
+            .set_sidebar_order(&reordered)
+            .await
+            .expect("identical reorder short-circuits");
+        assert_eq!(
+            stored_sidebar_order(&db).await.expect("unchanged order"),
+            reordered
+        );
+        let revision_after: i64 = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT revision FROM playlist_sidebar_revision WHERE singleton = 1".to_string(),
+            ))
+            .await
+            .expect("query revision")
+            .expect("revision exists")
+            .try_get("", "revision")
+            .expect("revision is integer");
+        assert_eq!(
+            revision_after, revision,
+            "no-op reorder must not bump revision"
+        );
+
+        let missing = vec![first.id.clone(), second.id.clone()];
+        let rejected = manager
+            .set_sidebar_order(&missing)
+            .await
+            .expect_err("subset reorder must be rejected");
+        assert!(rejected.to_string().contains("exactly once"));
+        assert_eq!(
+            stored_sidebar_order(&db)
+                .await
+                .expect("rejected write is rolled back"),
+            reordered,
+            "rejected reorder must not alter the persisted order"
+        );
+        let duplicate = vec![
+            mirror.id.clone(),
+            mirror.id.clone(),
+            first.id.clone(),
+            second.id.clone(),
+        ];
+        assert!(manager
+            .set_sidebar_order(&duplicate)
+            .await
+            .expect_err("duplicate reorder must be rejected")
+            .to_string()
+            .contains("exactly once"));
     }
 
     #[tokio::test]
