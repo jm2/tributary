@@ -50,6 +50,52 @@ fn request_playlist_sidebar_refresh(
     }
 }
 
+/// A queued sidebar reorder: the order to persist and the channel that
+/// receives the persistence outcome.
+struct SidebarReorderRequest {
+    ordered_ids: Vec<String>,
+    result_tx: async_channel::Sender<PlaylistCrudOutcome<()>>,
+}
+
+/// Serialize sidebar reorder persistence so writes commit in receipt order.
+///
+/// A single worker consumes requests FIFO and awaits each write before the
+/// next, so a later reorder can never be overtaken by an earlier, slower
+/// database task. Closing the queue (window teardown) fails every receiver,
+/// matching the documented "dropped worker is treated as failure" contract.
+async fn run_sidebar_reorder_worker<F, Fut>(
+    rx: async_channel::Receiver<SidebarReorderRequest>,
+    mut persist: F,
+) where
+    F: FnMut(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = PlaylistCrudOutcome<()>>,
+{
+    while let Ok(request) = rx.recv().await {
+        let outcome = persist(request.ordered_ids).await;
+        let _ = request.result_tx.send(outcome).await;
+    }
+}
+
+/// Persist a sidebar reorder, mapping database failures to `Failed`.
+async fn persist_sidebar_reorder(ordered_ids: Vec<String>) -> PlaylistCrudOutcome<()> {
+    match crate::db::connection::init_db().await {
+        Ok(db) => {
+            let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
+            match mgr.set_sidebar_order(&ordered_ids).await {
+                Ok(()) => PlaylistCrudOutcome::Committed(()),
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to reorder playlists");
+                    PlaylistCrudOutcome::Failed
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to open DB");
+            PlaylistCrudOutcome::Failed
+        }
+    }
+}
+
 /// Wire the playlist action receiver to the sidebar store.
 ///
 /// Spawns an async task on the GTK main context that listens for
@@ -65,6 +111,15 @@ pub fn setup_playlist_actions(
     let rt_handle = state.rt_handle.clone();
     let win = state.window.clone();
     let playlist_sidebar_refresh = state.playlist_sidebar_refresh.clone();
+
+    // Serialize sidebar reorder persistence: one worker applies reorder
+    // writes in receipt order, so a later reorder is never overtaken by an
+    // earlier, slower database task.
+    let (reorder_tx, reorder_rx) = async_channel::unbounded::<SidebarReorderRequest>();
+    rt_handle.spawn(run_sidebar_reorder_worker(
+        reorder_rx,
+        persist_sidebar_reorder,
+    ));
 
     debug!("setup_playlist_actions: async task spawned");
     glib::MainContext::default().spawn_local(async move {
@@ -186,7 +241,7 @@ pub fn setup_playlist_actions(
                 sidebar::PlaylistAction::Reorder(ordered_ids) => {
                     debug!(count = ordered_ids.len(), "dispatching Reorder");
                     if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
-                        handle_reorder(&win, &rt_handle, &playlist_sidebar_refresh, &ordered_ids);
+                        handle_reorder(&win, &reorder_tx, &playlist_sidebar_refresh, &ordered_ids);
                     })) {
                         error!("Reorder handler panicked: {e:?}");
                     }
@@ -472,37 +527,30 @@ fn handle_delete(
 /// Persist the user-defined playlist sidebar order.
 fn handle_reorder(
     win: &adw::ApplicationWindow,
-    rt_handle: &tokio::runtime::Handle,
+    reorder_tx: &async_channel::Sender<SidebarReorderRequest>,
     playlist_sidebar_refresh: &crate::local::playlist_sidebar::PlaylistSidebarRefresh,
     ordered_ids: &[String],
 ) {
     info!(count = ordered_ids.len(), "Reordering playlist sidebar");
-    let rt_handle = rt_handle.clone();
     let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
     let ordered_ids = ordered_ids.to_vec();
     let win_for_result = win.clone();
 
     let (result_tx, result_rx) = async_channel::bounded::<PlaylistCrudOutcome<()>>(1);
 
-    rt_handle.spawn(async move {
-        let outcome = match crate::db::connection::init_db().await {
-            Ok(db) => {
-                let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
-                match mgr.set_sidebar_order(&ordered_ids).await {
-                    Ok(()) => PlaylistCrudOutcome::Committed(()),
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to reorder playlists");
-                        PlaylistCrudOutcome::Failed
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to open DB");
-                PlaylistCrudOutcome::Failed
-            }
-        };
-        let _ = result_tx.send(outcome).await;
-    });
+    // Queue the write behind any earlier reorder so the final stored order
+    // matches the last received action. If the worker is gone (window
+    // teardown) the queue is closed and the dropped result channel is
+    // treated as a failure by the receiver below.
+    if reorder_tx
+        .try_send(SidebarReorderRequest {
+            ordered_ids,
+            result_tx,
+        })
+        .is_err()
+    {
+        return;
+    }
 
     glib::MainContext::default().spawn_local(async move {
         match result_rx.recv().await {
@@ -1124,5 +1172,107 @@ mod tests {
                 assert_ne!(localized, english, "{locale} must not fall back to English");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn reorder_writes_commit_in_receipt_order_when_first_is_slow() {
+        use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+        use sea_orm_migration::MigratorTrait;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use crate::db::migration::Migrator;
+        use crate::local::playlist_manager::PlaylistManager;
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let manager = PlaylistManager::new(db.clone());
+
+        let first = manager
+            .create_regular_playlist("First")
+            .await
+            .expect("create first playlist");
+        let second = manager
+            .create_regular_playlist("Second")
+            .await
+            .expect("create second playlist");
+        let third = manager
+            .create_regular_playlist("Third")
+            .await
+            .expect("create third playlist");
+
+        let earlier = vec![second.id.clone(), third.id.clone(), first.id.clone()];
+        let later = vec![third.id.clone(), first.id.clone(), second.id.clone()];
+
+        let (tx, rx) = async_channel::unbounded::<SidebarReorderRequest>();
+        let slow_first = Arc::new(AtomicBool::new(true));
+
+        let worker = {
+            let db = db.clone();
+            let slow_first = slow_first.clone();
+            tokio::spawn(run_sidebar_reorder_worker(rx, move |ordered_ids| {
+                let db = db.clone();
+                let slow_first = slow_first.clone();
+                async move {
+                    if slow_first.swap(false, Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    let manager = PlaylistManager::new(db);
+                    match manager.set_sidebar_order(&ordered_ids).await {
+                        Ok(()) => PlaylistCrudOutcome::Committed(()),
+                        Err(e) => {
+                            tracing::error!(error = %e, "test reorder failed");
+                            PlaylistCrudOutcome::Failed
+                        }
+                    }
+                }
+            }))
+        };
+
+        let (first_tx, first_rx) = async_channel::bounded::<PlaylistCrudOutcome<()>>(1);
+        let (later_tx, later_rx) = async_channel::bounded::<PlaylistCrudOutcome<()>>(1);
+
+        tx.send(SidebarReorderRequest {
+            ordered_ids: earlier.clone(),
+            result_tx: first_tx,
+        })
+        .await
+        .expect("queue first reorder");
+        tx.send(SidebarReorderRequest {
+            ordered_ids: later.clone(),
+            result_tx: later_tx,
+        })
+        .await
+        .expect("queue second reorder");
+
+        assert_eq!(
+            first_rx.recv().await,
+            Ok(PlaylistCrudOutcome::Committed(()))
+        );
+        assert_eq!(
+            later_rx.recv().await,
+            Ok(PlaylistCrudOutcome::Committed(()))
+        );
+        drop(tx);
+        worker.await.expect("worker exits cleanly");
+
+        let stored = db
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT playlist_id FROM playlist_sidebar_order ORDER BY position".to_string(),
+            ))
+            .await
+            .expect("read stored order")
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "playlist_id").expect("stored id"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            stored, later,
+            "second reorder must be the final stored order"
+        );
     }
 }

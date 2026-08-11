@@ -626,7 +626,7 @@ mod tests {
         execute(
             db,
             format!(
-                "INSERT INTO playlist_sidebar_order (playlist_id, position) VALUES ({},{})",
+                "INSERT INTO playlist_sidebar_order (playlist_id, position) VALUES ({}, {})",
                 sql_string(playlist_id),
                 position,
             ),
