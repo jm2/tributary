@@ -42,7 +42,7 @@ jobs:
         # OBJECT (c96dd0a84e0232ab86947fca5fe34f1caae8792f). That is NOT usable
         # here -- `uses:` needs the COMMIT the tag dereferences to. Re-pin with
         # `gh api repos/anthropics/claude-code-action/git/tags/<tag-object-sha>`.
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        uses: anthropics/claude-code-action@6b082c41935b4c8a3b8b0ef85ba4ba4d9eeb8975 # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
@@ -167,7 +167,7 @@ jobs:
       - name: Generate tool-free Claude bot review
         id: bot-review
         if: steps.bot-input.outputs.current == 'true'
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        uses: anthropics/claude-code-action@6b082c41935b4c8a3b8b0ef85ba4ba4d9eeb8975 # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
