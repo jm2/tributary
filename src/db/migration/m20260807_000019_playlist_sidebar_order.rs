@@ -193,8 +193,6 @@ fn canonical_trigger_sql(trigger: TriggerDefinition) -> String {
          END",
         name = trigger.name,
         operation = trigger.operation,
-        TABLE = TABLE,
-        when = when,
         revision_table = REVISION_TABLE,
         singleton = REVISION_SINGLETON,
         max_revision = i64::MAX,
