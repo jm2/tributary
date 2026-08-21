@@ -723,12 +723,7 @@ impl LastFmAuthorizationHandle {
 
 impl fmt::Debug for LastFmAuthorizationHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let open = self
-            .inner
-            .ingress
-            .lock()
-            .ok()
-            .is_some_and(|ingress| ingress.open);
+        let open = self.inner.ingress.lock().is_ok_and(|ingress| ingress.open);
         formatter
             .debug_struct("LastFmAuthorizationHandle")
             .field("open", &open)
