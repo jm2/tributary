@@ -540,8 +540,10 @@ fn handle_reorder(
 
     // Queue the write behind any earlier reorder so the final stored order
     // matches the last received action. If the worker is gone (window
-    // teardown) the queue is closed and the dropped result channel is
-    // treated as a failure by the receiver below.
+    // teardown) the queue is closed and the reorder is dropped without an
+    // alert, because the window is already going away. A worker that is
+    // dropped mid-write closes `result_tx` instead, and the receiver below
+    // reports that as a failure.
     if reorder_tx
         .try_send(SidebarReorderRequest {
             ordered_ids,
@@ -549,6 +551,7 @@ fn handle_reorder(
         })
         .is_err()
     {
+        warn!("Sidebar reorder queue closed; dropping reorder request");
         return;
     }
 
