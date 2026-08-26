@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OwnTone DAAP reconnects** — Decode gzip-compressed catalogue responses produced by OwnTone's
+  slow-query cache while continuing to enforce the catalogue limit on decoded bytes.
 - **Dependency-update CI** — Adapt raw database queries and transactions to SeaORM 2 while
   preserving the existing SQLite schema, repair root/fuzz lock synchronization across Cargo
   feature unification, and keep Dependabot action pins aligned with repository policy tests.
