@@ -6,6 +6,7 @@
 //! logout for every session that reached server-side ownership.
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,6 +27,19 @@ const MOCK_REQUEST_HEADER_CAP: usize = 16 * 1024;
 // Smaller than every real request line so header assembly is always
 // fragmented, even on loopback.
 const MOCK_READ_CHUNK_BYTES: usize = 7;
+
+// Deterministic gzip (mtime=0) of one `adbs`/`mlcl`/`mlit` response containing
+// track 9, "Gzip Song" by "Mock Artist". Keeping the wire bytes fixed makes
+// this a protocol regression rather than a second compression implementation.
+const GZIP_ITEMS_RESPONSE: &[u8] = &[
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x4b, 0x4c, 0x49, 0x2a, 0x66, 0x60,
+    0x60, 0xc8, 0xcc, 0x2d, 0x2e, 0x29, 0x01, 0xd2, 0x2c, 0x40, 0x7c, 0x22, 0x37, 0x27, 0x39, 0x07,
+    0x48, 0x87, 0xe6, 0xe6, 0x64, 0x82, 0xc4, 0x7c, 0x73, 0x33, 0x33, 0x53, 0xa0, 0x72, 0x9c, 0xb9,
+    0x99, 0x79, 0xb9, 0x20, 0xda, 0xbd, 0x2a, 0xb3, 0x40, 0x21, 0x38, 0x3f, 0x2f, 0x3d, 0xb1, 0x38,
+    0xb1, 0x08, 0x28, 0xc0, 0xed, 0x9b, 0x9f, 0x9c, 0xad, 0xe0, 0x58, 0x54, 0x92, 0x59, 0x5c, 0x02,
+    0x14, 0x02, 0xe9, 0xe7, 0x82, 0x08, 0xe5, 0x24, 0x95, 0xe6, 0x26, 0x16, 0xa7, 0x81, 0x74, 0x31,
+    0xe7, 0x16, 0x18, 0x03, 0x00, 0x05, 0x72, 0x16, 0x92, 0x71, 0x00, 0x00, 0x00,
+];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum MockEndpoint {
@@ -68,6 +82,7 @@ impl MockEndpoint {
 struct MockResponse {
     status: &'static str,
     content_type: &'static str,
+    content_encoding: Option<&'static str>,
     body: Vec<u8>,
 }
 
@@ -76,7 +91,17 @@ impl MockResponse {
         Self {
             status: "200 OK",
             content_type: "application/x-dmap-tagged",
+            content_encoding: None,
             body,
+        }
+    }
+
+    fn gzip_dmap(body: &[u8]) -> Self {
+        Self {
+            status: "200 OK",
+            content_type: "application/x-dmap-tagged",
+            content_encoding: Some("gzip"),
+            body: body.to_vec(),
         }
     }
 }
@@ -238,12 +263,20 @@ async fn serve_mock_connection(state: Arc<MockDaapState>, mut stream: TcpStream)
     }
 
     let response = response_for(&state, endpoint);
-    let headers = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        response.status,
-        response.content_type,
-        response.body.len()
+    let mut headers = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\n",
+        response.status, response.content_type
     );
+    if let Some(encoding) = response.content_encoding {
+        write!(&mut headers, "Content-Encoding: {encoding}\r\n")
+            .expect("writing response header to String cannot fail");
+    }
+    write!(
+        &mut headers,
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        response.body.len()
+    )
+    .expect("writing response header to String cannot fail");
     let write_result = tokio::time::timeout(MOCK_DEADLINE, async {
         stream.write_all(headers.as_bytes()).await?;
         stream.write_all(&response.body).await
@@ -352,17 +385,20 @@ fn response_for(state: &MockDaapState, endpoint: MockEndpoint) -> MockResponse {
         MockEndpoint::Stream => MockResponse {
             status: "200 OK",
             content_type: "audio/mpeg",
+            content_encoding: None,
             body: b"mock audio".to_vec(),
         },
         MockEndpoint::Artwork => MockResponse {
             status: "200 OK",
             content_type: "image/png",
+            content_encoding: None,
             body: b"mock artwork".to_vec(),
         },
         MockEndpoint::Logout => MockResponse::dmap(Vec::new()),
         MockEndpoint::Other => MockResponse {
             status: "404 Not Found",
             content_type: "text/plain",
+            content_encoding: None,
             body: b"not found".to_vec(),
         },
     }
@@ -646,6 +682,38 @@ async fn malformed_post_login_routes_fail_and_logout_exactly_once() {
         );
         server.assert_healthy();
     }
+}
+
+#[tokio::test]
+async fn gzip_encoded_items_publish_the_catalogue_and_logout_exactly_once() {
+    let server = MockDaapServer::start().await;
+    server.enqueue(
+        MockEndpoint::Items,
+        MockResponse::gzip_dmap(GZIP_ITEMS_RESPONSE),
+    );
+    let registry = registry();
+    let source_id = SourceId::random();
+    claim_saved(&registry, source_id);
+
+    let generation = connect_daap(
+        &registry,
+        source_id,
+        "Gzip catalogue",
+        server.base_url.clone(),
+    );
+    let (_, tracks) = wait_for_catalogue(&registry, source_id, generation).await;
+    assert_eq!(tracks.len(), 1);
+    assert_eq!(tracks[0].title, "Gzip Song");
+    assert_eq!(tracks[0].artist_name, "Mock Artist");
+
+    let barrier = registry.shutdown();
+    tokio::time::timeout(MOCK_DEADLINE, barrier.wait())
+        .await
+        .expect("gzip-backed DAAP shutdown must finish");
+    server.wait_for_requests(MockEndpoint::Logout, 1).await;
+    assert_eq!(server.request_count(MockEndpoint::Items), 1);
+    assert_eq!(server.request_count(MockEndpoint::Logout), 1);
+    server.assert_healthy();
 }
 
 #[tokio::test]

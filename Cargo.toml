@@ -74,7 +74,8 @@ sys-locale = "0.3"
 # Subsonic / Jellyfin / Plex API client
 # `stream` is required to relay a remote media stream to a Cast receiver
 # without buffering it in memory (see `audio::cast_http_server`).
-reqwest = { version = "0.13", features = ["json", "rustls", "blocking", "stream"], default-features = false }
+# `gzip` is required for OwnTone's cached DAAP catalogue responses.
+reqwest = { version = "0.13", features = ["json", "rustls", "blocking", "stream", "gzip"], default-features = false }
 
 # URL percent-encoding (Plex auth form body)
 urlencoding = "2"

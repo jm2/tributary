@@ -224,7 +224,9 @@ impl TrackId {
                 return Err(IdentityError::Track);
             }
             let units: Vec<u16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
                 .collect();
             if units.contains(&0) {
@@ -330,7 +332,9 @@ fn decode_hex(encoded: &str) -> Result<Vec<u8>, IdentityError> {
     }
     encoded
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = decode_hex_nibble(pair[0])?;
             let low = decode_hex_nibble(pair[1])?;
