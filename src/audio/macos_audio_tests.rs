@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(not(target_os = "macos"))]
+use gst::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
