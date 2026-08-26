@@ -1765,7 +1765,7 @@ mod tests {
             );
 
             let mut bindings = std::collections::BTreeMap::new();
-            for pair in tokens[1..].chunks_exact(2) {
+            for pair in tokens[1..].as_chunks::<2>().0 {
                 assert!(
                     pair[0].starts_with('-'),
                     "invocation {invocation_index} contains a positional argument: {invocation}"

@@ -330,7 +330,9 @@ fn decode_hex(encoded: &str) -> Result<Vec<u8>, IdentityError> {
     }
     encoded
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = decode_hex_nibble(pair[0])?;
             let low = decode_hex_nibble(pair[1])?;
