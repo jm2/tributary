@@ -99,6 +99,13 @@ const CATEGORY_DEADLINE: &str = "deadline";
 const CATEGORY_TRANSPORT: &str = "transport";
 const CATEGORY_HTTP_FAILURE: &str = "http_failure";
 
+fn upstream_media_client_builder() -> reqwest::ClientBuilder {
+    // The Cast relay must preserve the exact ranged representation together
+    // with its Content-Length/Content-Range metadata. Gzip is available for
+    // DAAP catalogue decoding, but automatic decoding would rewrite both.
+    crate::http_security::authenticated_client_builder().no_gzip()
+}
+
 fn elapsed_millis(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -154,7 +161,7 @@ impl UpstreamMediaClient {
         // Deliberately do not set a total request timeout or reqwest read
         // timeout. Header establishment and each body read are bounded at the
         // call sites below, so an active media stream has no total lifetime.
-        let http = crate::http_security::authenticated_client_builder()
+        let http = upstream_media_client_builder()
             .connect_timeout(connect_timeout)
             .build()
             .map_err(|_| anyhow::anyhow!("Failed to build the upstream media client"))?;
@@ -181,8 +188,7 @@ impl UpstreamMediaClient {
             return Ok(client.clone());
         }
 
-        let builder = crate::http_security::authenticated_client_builder()
-            .connect_timeout(self.connect_timeout);
+        let builder = upstream_media_client_builder().connect_timeout(self.connect_timeout);
         let builder = crate::http_security::apply_advertised_http_route(
             builder,
             resolved.endpoint(),
@@ -784,6 +790,7 @@ async fn proxy_upstream(
     let mut response = Response::builder().status(status);
     for name in [
         header::CONTENT_TYPE,
+        header::CONTENT_ENCODING,
         header::CONTENT_LENGTH,
         header::CONTENT_RANGE,
         header::ACCEPT_RANGES,
@@ -1128,7 +1135,8 @@ mod tests {
     use axum::http::Uri;
     use futures::StreamExt;
     use reqwest::header::{
-        HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, COOKIE, REFERER, USER_AGENT,
+        HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, COOKIE, REFERER,
+        USER_AGENT,
     };
 
     use crate::architecture::media::MediaLease;
@@ -1664,6 +1672,28 @@ mod tests {
             .expect("capture response")
     }
 
+    const GZIP_MEDIA_BODY: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcb, 0x4d, 0x4d, 0xc9, 0x4c,
+        0x04, 0x00, 0x0c, 0xa1, 0x2c, 0x6a, 0x05, 0x00, 0x00, 0x00,
+    ];
+
+    async fn capture_compressed_range(
+        State(tx): State<tokio::sync::mpsc::UnboundedSender<(Uri, HeaderMap)>>,
+        OriginalUri(uri): OriginalUri,
+        headers: HeaderMap,
+    ) -> Response {
+        let _ = tx.send((uri, headers));
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_TYPE, "audio/mpeg")
+            .header(header::CONTENT_ENCODING, "gzip")
+            .header(header::CONTENT_LENGTH, GZIP_MEDIA_BODY.len())
+            .header(header::CONTENT_RANGE, "bytes 7-31/100")
+            .header(header::ACCEPT_RANGES, "bytes")
+            .body(Body::from(GZIP_MEDIA_BODY))
+            .expect("compressed range response")
+    }
+
     async fn start_capture_server() -> (
         SocketAddr,
         tokio::sync::mpsc::UnboundedReceiver<(Uri, HeaderMap)>,
@@ -1673,6 +1703,7 @@ mod tests {
         let app = Router::new()
             .route("/reverse-proxy/library/stream", get(capture_request))
             .route("/explicit-proxy/stream", get(capture_request))
+            .route("/compressed/stream", get(capture_compressed_range))
             .with_state(tx);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1682,6 +1713,80 @@ mod tests {
             axum::serve(listener, app).await.expect("capture server");
         });
         (addr, rx, task.abort_handle())
+    }
+
+    fn compressed_range_requests(upstream_addr: SocketAddr) -> [UpstreamRequest; 2] {
+        const ADVERTISED_HOST: &str = "cast-compressed-range.invalid";
+
+        let advertised_endpoint = Url::parse(&format!(
+            "http://{ADVERTISED_HOST}:{}/compressed/stream",
+            upstream_addr.port()
+        ))
+        .expect("advertised compressed endpoint");
+        let route_origin = Url::parse(&format!(
+            "http://{ADVERTISED_HOST}:{}/",
+            upstream_addr.port()
+        ))
+        .expect("advertised compressed origin");
+        let route = AdvertisedHttpRoute::new(&route_origin, [upstream_addr])
+            .expect("exact-origin compressed route");
+        let resolved = ResolvedHttpRequest::new(advertised_endpoint)
+            .expect("resolved compressed request")
+            .with_advertised_route(route)
+            .expect("matching compressed route");
+        [
+            legacy(&format!("http://{upstream_addr}/compressed/stream")),
+            UpstreamRequest::Resolved(Box::new(resolved)),
+        ]
+    }
+
+    async fn assert_encoded_range_preserved(
+        client: &UpstreamMediaClient,
+        request: &UpstreamRequest,
+        captures: &mut tokio::sync::mpsc::UnboundedReceiver<(Uri, HeaderMap)>,
+    ) {
+        let mut receiver_headers = HeaderMap::new();
+        receiver_headers.insert(header::RANGE, HeaderValue::from_static("bytes=7-31"));
+        let response = proxy_upstream(client, request, &receiver_headers).await;
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        for (name, expected) in [
+            (header::CONTENT_ENCODING, "gzip"),
+            (header::CONTENT_LENGTH, "25"),
+            (header::CONTENT_RANGE, "bytes 7-31/100"),
+            (header::ACCEPT_RANGES, "bytes"),
+        ] {
+            assert_eq!(
+                response.headers().get(name),
+                Some(&HeaderValue::from_static(expected))
+            );
+        }
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("encoded proxy body");
+        assert_eq!(body.as_ref(), GZIP_MEDIA_BODY);
+
+        let (_, captured_headers) = tokio::time::timeout(Duration::from_secs(2), captures.recv())
+            .await
+            .expect("compressed capture timeout")
+            .expect("captured compressed request");
+        assert_eq!(
+            captured_headers.get(header::RANGE),
+            Some(&HeaderValue::from_static("bytes=7-31"))
+        );
+        assert!(captured_headers.get(ACCEPT_ENCODING).is_none());
+    }
+
+    #[tokio::test]
+    async fn media_proxy_preserves_encoded_ranges_on_direct_and_advertised_routes() {
+        let (upstream_addr, mut captures, upstream_abort) = start_capture_server().await;
+        let client = UpstreamMediaClient::new().expect("production upstream media client");
+
+        for request in compressed_range_requests(upstream_addr) {
+            assert_encoded_range_preserved(&client, &request, &mut captures).await;
+        }
+
+        upstream_abort.abort();
     }
 
     #[tokio::test]

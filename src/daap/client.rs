@@ -535,6 +535,10 @@ fn build_http_client(
     let headers = daap_required_headers().clone();
 
     let builder = authenticated_client_builder()
+        // OwnTone stores slow DAAP catalogue queries gzip-compressed and can
+        // serve that cached representation even when the client did not
+        // advertise an Accept-Encoding preference.
+        .gzip(true)
         .default_headers(headers)
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT);
