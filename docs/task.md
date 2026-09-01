@@ -1,6 +1,6 @@
 # Tributary active implementation backlog
 
-Last audited: 2026-08-02
+Last audited: 2026-09-01
 
 This is the executable backlog for feature fixes and additions. It replaces the completed
 holistic-review tracker, which is preserved as
@@ -23,23 +23,23 @@ state.
 - Do not treat the order below as a release promise. It is a dependency-aware starting order and
   can change as issues receive product decisions and milestones.
 
-Current status: **14/38 (36.8%)** active implementation records complete. This percentage measures
+Current status: **15/39 (38.5%)** active implementation records complete. This percentage measures
 checklist completion, not equal engineering effort: several P3 records are deliberately large
 epics. The archived remediation remains **220/223 (98.7%)** complete; its three open records are
 real-environment validation, not missing implementation.
 
-Release checkpoint: v0.6.1 (2026-08-02) packages the Windows portrait-monitor resizing, taskbar
-work-area, Snap Layout, developer-build, Rhythmbox action-placement, and release-checksum fixes
-summarized in the [`CHANGELOG.md`](../CHANGELOG.md). Cutting this release does not change the
-**14/38 (36.8%)** feature numerator; P2.1 Last.fm remains the next implementation focus after
-release publication.
+Release checkpoint: v0.6.2 (2026-09-01) packages OwnTone compressed-cache compatibility together
+with dependency, toolchain, security-policy, and CI maintenance summarized in the
+[`CHANGELOG.md`](../CHANGELOG.md). Its due dependency review completes one maintenance record and
+advances the active-backlog count to **15/39 (38.5%)**; P2.1 Last.fm remains the next
+implementation focus after release publication.
 
 Post-publication verification downloaded and validated all 12 v0.6.0 package payloads, then
 replaced a checksum manifest that repeated the two Flatpak records with a canonical 12-entry
 manifest. The follow-up workflow correction disables Flatpak's pre-validation automatic upload,
 retains the explicit post-validation upload, and rejects missing, unexpected, or duplicate release
-asset filenames before generating future manifests. This distribution correction does not change
-the **14/38 (36.8%)** feature numerator.
+asset filenames before generating future manifests. This distribution correction did not advance
+the feature numerator.
 
 ## Current focus
 
@@ -133,7 +133,7 @@ while the status gate remains usable. This removes the cross-worker race that ca
 runs to receive the expected command error and then observe the stale `Starting` phase. A poisoned
 status gate cannot publish a snapshot; that fallback preserves the original fixed command error
 before propagating terminal shutdown failure. The correction does not complete a new feature
-record, so the **14/38 (36.8%)** numerator is unchanged.
+record, so the **15/39 (38.5%)** active-backlog count is unchanged.
 
 Production now constructs exactly one application owner after the first-window coordinator bind and
 before asynchronous database initialization. When database initialization succeeds before
@@ -163,7 +163,7 @@ XSPF import/export remain local-only, while mixed-source metadata export still r
 no-locator policy.
 
 The independent Linux watcher correctness fix tracked in
-[#103](https://github.com/jm2/tributary/pull/103) does not change the **14/38** feature total.
+[#103](https://github.com/jm2/tributary/pull/103) does not change the **15/39** active-backlog total.
 The salvaged scope rejects explicitly classified access/access-time noise before the bounded watcher
 queue without filtering real bootstrap mutations or backend errors, while retaining overflow
 evidence for authoritative reconciliation. It intentionally omits the original persistent
@@ -200,7 +200,7 @@ plist-to-ICNS reference, the parsed ICNS representations, and the added 1024×10
 This addresses the recurring root cause across otherwise separate Explorer/shortcut, Finder/Dock,
 installer, and GTK/About delivery paths: packaging success alone was not an assertion about the
 finished artifact's icon identity. P2.1 Last.fm remains the feature focus and the total remains
-**14/38 (36.8%)**.
+**15/39 (38.5%)**.
 
 The 2026-07-28 Claude-review admission correction also remains outside the feature numerator.
 Dependabot PRs were entering the automatic workflow but failing before review because the pinned
@@ -223,7 +223,7 @@ pins the actor-consistent direct/trusted split, exact-revision input, graceful c
 random prompt boundary, environment-safe cap, sole trusted-default checkout, wildcard, tool and
 output containment, stale/blank-result checks, idempotent actor-owned publication, and absence of
 the broader non-write-user bypass.
-P2.1 remains the feature focus at **14/38 (36.8%)**.
+P2.1 remains the feature focus at **15/39 (38.5%)**.
 
 The 2026-07-28 audio-output stability correction likewise remains outside the feature numerator.
 No existing issue, pull request, roadmap entry, or archived task recorded the reported Windows
@@ -245,7 +245,7 @@ successful-probe receipt binds installer-only reuse to the exact application and
 hashes, preventing a stale pre-1.28 DLL from passing by filename and PE shape alone. Windows CI
 covers the platform integration and bundle policy. A physical Windows switch/unplug/replug smoke
 check remains useful release acceptance, but is not missing implementation. P2.1 remains the
-feature focus and the total remains **14/38 (36.8%)**.
+feature focus and the total remains **15/39 (38.5%)**.
 
 The 2026-07-28 macOS half of that audio-output correction also remains outside the feature
 numerator. Rather than vendoring GStreamer or automatically inheriting a future upstream change,
@@ -282,7 +282,7 @@ complete separately guarded route wrappers before open. Physical switch/unplug/r
 playing and paused—including a multi-channel/spatial endpoint and verification that negotiated raw
 channels remain at most two before and after switching—remains useful release acceptance, not
 missing implementation. Removing the cap still requires the existing explicit P3.4 review and
-affected-hardware evidence. P2.1 remains the feature focus at **14/38 (36.8%)**.
+affected-hardware evidence. P2.1 remains the feature focus at **15/39 (38.5%)**.
 
 ## P1 — Correctness and shared feature foundations
 
@@ -1171,9 +1171,21 @@ affected-hardware evidence. P2.1 remains the feature focus at **14/38 (36.8%)**.
 
 ### P3.4 — Maintenance and coverage
 
-- [ ] Re-evaluate `paste`, the fuzz-only `proc-macro-error2` path, and the inactive lockfile-only
+- [x] Re-evaluate `paste`, the fuzz-only `proc-macro-error2` path, and the inactive lockfile-only
   `rkyv` advisory by 2026-09-01 or the next release. Revisit immediately before enabling `rkyv`
-  serialization or accepting Decimal archive input.
+  serialization or accepting Decimal archive input
+  ([#218](https://github.com/jm2/tributary/pull/218)).
+
+  The 2026-09-01 release review removed `proc-macro-error2` from the independent fuzz lock by
+  selecting `sea-bae` 0.2.2, matching production. `paste` 1.0.15 remains an active compile-time
+  edge through Lofty 0.24; the latest Lofty 0.25.1 still declares the same dependency, and its
+  unmaintained advisory has no patched version. `rkyv` 0.7.46 remains inactive and lock-only in
+  both workspaces through `rust_decimal` 1.42.1's optional feature, so the narrowly scoped
+  `RUSTSEC-2026-0235` exception remains valid without exposing archive input. Re-review both
+  retained edges by 2026-12-01 or before the next release, whichever comes first.
+- [ ] Re-evaluate the retained compile-time `paste` edge and inactive lock-only `rkyv` exception
+  by 2026-12-01 or before the next release, whichever comes first. Revisit immediately before
+  enabling `rkyv` serialization or accepting Decimal archive input.
 - [ ] Remove the macOS GStreamer channel-cap workaround only after the upstream fix is in the
   supported runtime floor and passes affected multi-channel hardware testing.
 - [ ] Add a direct end-to-end watcher-backlog/root-confirmation ordering harness if its incremental
@@ -1199,6 +1211,7 @@ affected-hardware evidence. P2.1 remains the feature focus at **14/38 (36.8%)**.
 
 | Date | Task | PR | Result |
 |---|---|---|---|
+| 2026-09-01 | P3.4 dependency-advisory re-evaluation | [#218](https://github.com/jm2/tributary/pull/218) | Removed the active fuzz-only `proc-macro-error2` path by synchronizing `sea-bae` 0.2.2, confirmed that `paste` remains an unavoidable compile-time Lofty dependency with no patched release, and confirmed that vulnerable `rkyv` remains inactive and lock-only behind an unenabled `rust_decimal` feature. Renewed only the exact `RUSTSEC-2026-0235` exception through 2026-12-01 or the next release, with an immediate gate before any archive input. This completes P3.4's dated review record and advances the active backlog to 15/39 (38.5%). |
 | 2026-08-26 | OwnTone cached-catalogue interoperability | [#215](https://github.com/jm2/tributary/pull/215) | Reproduced the next-day connection failure against OwnTone 29.3 on Fedora: the first slow 12,541-track query populated OwnTone's DAAP cache, and later sessions immediately received a 462,894-byte gzip representation of the valid 2,517,508-byte DMAP catalogue. Tributary had compiled reqwest without gzip support, so it passed the gzip framing to the DMAP parser, classified the result as an invalid response, and correctly retired and logged out the staged session. Enabled and explicitly selected bounded gzip decoding for DAAP, synchronized the production and independent fuzz locks, and added an actual-wire lifecycle regression whose compressed item response must publish the expected catalogue and log out exactly once. Kept Cast upstream transports decode-disabled and covered exact ranged representation preservation on direct and advertised routes. The existing 256 MiB streaming body limit applies after reqwest decoding. This compatibility fix does not advance the 14/38 feature numerator. |
 | 2026-08-05 | Dependency-update and CI recovery | [#206](https://github.com/jm2/tributary/pull/206) | Migrated all raw database operations and transaction commits to SeaORM 2.0.1 without changing the frozen SQLite schema; established Rust 1.94 as the exact compile-proven MSRV; pinned Rust setup to one immutable commit in the action's permanent history and separated future compiler proposals into a dedicated manifest and non-auto-merge Dependabot lane; refreshed the production lockfile, Python generator pin, release action, Fedora CI containers, and GNOME Flatpak runtime; synchronized direct root transitions into the fuzz lock; and extended the bounded lock-repair policy for Cargo feature unification. The obsolete inactive RSA path is gone. The remaining `rkyv` advisory is an inactive optional lock-only edge with a documented 2026-09-01/next-release review gate, while the full compatible fuzz-only transitive refresh is intentionally isolated into the immediate follow-up dependency PR required by the lock-drift policy. Local validation passes the Rust 1.94 locked all-target check, 20 library + 1,713 application + 26 repository-metadata tests (1,759 total), debug/release strict Clippy, 100 debug and release migration tests, fuzz strict Clippy, security audit, formatting, dependency policy, package compliance, desktop/AppStream, Flatpak policy/generator, and workflow/manifest parsing. This maintenance repair does not advance the 14/38 feature numerator. |
 | 2026-07-28 | macOS default-output stability without multi-channel regression | [#188](https://github.com/jm2/tributary/pull/188) | Added a Tributary-owned CoreAudio default-output listener and a stable `identity → capsfilter → osxaudiosink` route around one retained native sink. Route notifications are bounded, validated, generation-coalesced, and replayed without rebuilding playbin, seeking, replacing the queue occurrence, or forcing pause/play; transient native reopen failures receive three total attempts at 50 ms intervals, yield to a newer generation, and cannot spin indefinitely. A combined idle/downstream-blocking probe holds buffers, events, and queries until main-context reopen completes, and shutdown retires the listener and any pending probe before pipeline teardown. Reopen uses `osxaudiosink`'s zero/current-default sentinel rather than narrowing CoreAudio's opaque UInt32 ID into the signed explicit-device property, so the latest default wins races. The persistent filter is derived from native template caps and intersects only raw channels with 1–2, preserving mono-only limits, device-specific format/rate discovery, caps features, and compressed pass-through; the degraded automatic-sink fallback narrows the completed native query result instead of bypassing it. macOS packaging requires both `libgstcoreelements` and `libgstosxaudio`, and the signed-bundle probe must discover the `identity`, `capsfilter`, and `osxaudiosink` factories. Portable regressions cover cap preservation/non-widening, single-flight/repeated reconnect replay, bounded failure retry, and a live flow-blocking gate; native macOS CI covers CoreAudio compilation plus repeated construction and pre-open caps for the complete route wrapper, and physical route/multi-channel negotiated-channel checks remain release acceptance. This correctness fix does not advance the 14/38 feature numerator. |

@@ -5,12 +5,13 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.2] — 2026-09-01
 
 ### Changed
 
 - **Dependency baseline** — Move to SeaORM 2.0.1 and Rust 1.94, refresh the production lockfile
   and pinned build tooling, and advance Linux CI to Fedora 44 and the Flatpak runtime to GNOME 50.
+- **CI review automation** — Retire the flaky hosted AI reviewer and its obsolete policy hooks.
 
 ### Fixed
 
@@ -22,8 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **Advisory tracking** — Remove the obsolete inactive RSA path and document the temporary,
-  lockfile-only `rkyv` exception until its upstream dependency can move to a fixed release.
+- **Advisory tracking** — Remove obsolete inactive RSA and fuzz-only `proc-macro-error2` paths,
+  and renew bounded review of the unavoidable compile-time `paste` and inactive lock-only `rkyv`
+  edges.
 - **Workflow action integrity** — Pin Rust setup to one immutable commit in the action's permanent
   history, track compiler releases independently through a dedicated manifest, and keep both
   update classes behind manual review and the full CI matrix.
@@ -512,6 +514,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.desktop` file and AppStream metainfo for Linux desktop integration.
 - Windows resource file with icon embedding.
 
+[0.6.2]: https://github.com/jm2/tributary/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/jm2/tributary/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/jm2/tributary/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/jm2/tributary/compare/v0.5.0...v0.5.1

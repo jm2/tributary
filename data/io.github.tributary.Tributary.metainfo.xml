@@ -44,6 +44,16 @@
   </screenshots>
 
   <releases>
+    <release version="0.6.2" date="2026-09-01">
+      <description>
+        <p>Compatibility and maintenance release:</p>
+        <ul>
+          <li>Restore DAAP library loading when OwnTone serves gzip-compressed cached catalogues</li>
+          <li>Move to SeaORM 2.0.1 and Rust 1.94 while preserving the SQLite schema and synchronized build locks</li>
+          <li>Harden dependency-update, security-advisory, and workflow-action maintenance</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.1" date="2026-08-02">
       <description>
         <p>Windows integration and reliability release:</p>

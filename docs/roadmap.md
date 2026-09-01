@@ -1,12 +1,12 @@
 # Tributary implementation roadmap
 
-Last audited: 2026-07-22
+Last audited: 2026-09-01
 
 This document explains the product and engineering work that remains **after** the holistic-review
 remediation. [`task.md`](task.md) is the countable active implementation backlog; the completed
 remediation record is preserved separately in
 [`task-remediation-2026-07.md`](task-remediation-2026-07.md) at **220/223 (98.7%)**, with only three
-real-environment validation records left. The feature backlog is now **14/38 (36.8%)** complete.
+real-environment validation records left. The active backlog is now **15/39 (38.5%)** complete.
 Neither percentage estimates equal engineering effort, and the historical percentage is not a
 claim that Tributary has implemented every requested product feature.
 
@@ -643,9 +643,11 @@ license, distribution, key-material provenance, and interoperability review.
 
 ### Engineering follow-ups
 
-- Re-evaluate the unmaintained `paste` and fuzz-only `proc-macro-error2` dependency paths plus the
-  inactive, lockfile-only `rkyv` advisory by 2026-09-01 or the next release. Revisit immediately
-  before enabling `rkyv` serialization or accepting Decimal archive input.
+- The 2026-09-01 release review removed the fuzz-only `proc-macro-error2` path through `sea-bae`
+  0.2.2. `paste` remains an active compile-time Lofty dependency with no patched release, while
+  `rkyv` 0.7.46 remains inactive and lock-only through an unenabled `rust_decimal` feature. Review
+  both retained edges again by 2026-12-01 or before the next release, whichever comes first, and
+  immediately before enabling `rkyv` serialization or accepting Decimal archive input.
 - Remove the app-owned macOS GStreamer channel-cap workaround only through an explicit reviewed
   change after an upstream fix is available in the supported runtime floor and has been validated
   on affected multi-channel hardware. Default-output following must not inherit or silently remove
