@@ -8,6 +8,8 @@
 # any direct rkyv use. `cargo tree --locked -i rkyv` is empty for both the root and fuzz
 # workspaces; cargo-audit nevertheless checks every locked optional package. The advisory is
 # fixed only in rkyv 0.8.17+, while current rust_decimal still declares optional rkyv 0.7.
-# Review by 2026-09-01 or before the next release, whichever comes first, and immediately
-# before enabling rkyv serialization or exposing Decimal archive input.
+# Re-reviewed for v0.6.2 on 2026-09-01: current rust_decimal 1.42.1 still declares optional
+# rkyv 0.7.46, and neither workspace activates it. Review again by 2026-12-01 or before the
+# next release, whichever comes first, and immediately before enabling rkyv serialization
+# or exposing Decimal archive input.
 ignore = ["RUSTSEC-2026-0235"]

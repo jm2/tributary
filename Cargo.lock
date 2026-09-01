@@ -5501,7 +5501,7 @@ dependencies = [
 
 [[package]]
 name = "tributary"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
