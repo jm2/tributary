@@ -93,8 +93,14 @@ pub fn parse_audio_file_from_file(mut file: File, path: &Path) -> Result<ParsedT
         .or_else(|| tagged_file.first_tag());
     let props = tagged_file.properties();
 
-    // Extract tag fields
-    let tagged_title = tag.and_then(|t| t.title().map(|s| s.to_string()));
+    // Extract tag fields.
+    //
+    // Every tag-derived text value is trimmed of *trailing* whitespace only.
+    // Legacy ID3v1 fields are fixed-width and space-padded to the end of the
+    // field, and some other taggers write sloppy trailing whitespace; those
+    // padding spaces must not be imported as part of the value. Leading and
+    // internal whitespace are preserved, since they can be meaningful.
+    let tagged_title = tag.and_then(|t| t.title().map(|s| s.trim_end().to_string()));
     let title_from_tag = tagged_title.is_some();
     let title = tagged_title.unwrap_or_else(|| {
         path.file_stem()
@@ -103,30 +109,37 @@ pub fn parse_audio_file_from_file(mut file: File, path: &Path) -> Result<ParsedT
             .to_string()
     });
 
-    let tagged_artist = tag.and_then(|t| t.artist().map(|s| s.to_string()));
+    let tagged_artist = tag.and_then(|t| t.artist().map(|s| s.trim_end().to_string()));
     let artist_from_tag = tagged_artist.is_some();
     let artist_name = tagged_artist.unwrap_or_else(|| "Unknown Artist".to_string());
 
     let album_artist_name = tag.and_then(|t| {
         use lofty::tag::ItemKey;
-        t.get_string(ItemKey::AlbumArtist).map(str::to_string)
+        t.get_string(ItemKey::AlbumArtist)
+            .map(|s| s.trim_end().to_string())
     });
 
     let composer = tag.and_then(|t| {
         use lofty::tag::ItemKey;
-        t.get_string(ItemKey::Composer).map(str::to_string)
+        t.get_string(ItemKey::Composer)
+            .map(|s| s.trim_end().to_string())
     });
 
-    let tagged_album = tag.and_then(|t| t.album().map(|s| s.to_string()));
+    let tagged_album = tag.and_then(|t| t.album().map(|s| s.trim_end().to_string()));
     let album_from_tag = tagged_album.is_some();
     let album_title = tagged_album.unwrap_or_else(|| "Unknown Album".to_string());
 
-    let genre = tag.and_then(|t| t.genre().map(|s| s.to_string()));
-    let year = tag.and_then(|t| {
-        use lofty::tag::ItemKey;
-        t.get_string(ItemKey::Year)
-            .and_then(|s| s.parse::<i32>().ok())
-    });
+    let genre = tag.and_then(|t| t.genre().map(|s| s.trim_end().to_string()));
+    // The year is not always exposed under `ItemKey::Year`. Vorbis-comment
+    // formats (FLAC, Ogg, Opus) conventionally store it as the Xiph-standard
+    // `DATE` field, and ID3v2 tags carry it as TYER/TDRC — lofty unifies all
+    // of those under `ItemKey::RecordingDate`, while the non-standard vorbis
+    // `YEAR` field and ID3v1's year land under `ItemKey::Year`. Reading only
+    // `ItemKey::Year` silently dropped the year for Ogg/FLAC files tagged
+    // with `DATE`. lofty's `Accessor::date()` reads `RecordingDate` first and
+    // falls back to `Year`, and parses either as a relaxed timestamp (so a
+    // full `2007-05-03` date also yields the year).
+    let year = tag.and_then(|t| t.date().map(|date| i32::from(date.year)));
     let track_number = tag.and_then(|t| t.track());
     let disc_number = tag.and_then(|t| t.disk());
 
@@ -304,5 +317,127 @@ mod tests {
         assert!(AUDIO_EXTENSIONS.contains(&"wma"));
         assert!(AUDIO_EXTENSIONS.contains(&"aiff"));
         assert!(AUDIO_EXTENSIONS.contains(&"aif"));
+    }
+
+    /// Write fixture bytes to a uniquely named temp file with the right
+    /// extension so `FileType::from_path` selects the intended parser.
+    fn fixture_path(name: &str, contents: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "tributary-tag-parser-fixture-{}-{}",
+            uuid::Uuid::new_v4(),
+            name
+        ));
+        std::fs::write(&path, contents).expect("write audio fixture");
+        path
+    }
+
+    const FLAC_DATE_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/audio/flac_date_2007.flac"
+    ));
+    const OGG_DATE_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/audio/ogg_date_2007.ogg"
+    ));
+    const ID3V1_PADDED_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/audio/id3v1_padded.mp3"
+    ));
+
+    fn parse_fixture(name: &str, contents: &[u8]) -> ParsedTrack {
+        let path = fixture_path(name, contents);
+        let file = File::open(&path).expect("open fixture");
+        let parsed = parse_audio_file_from_file(file, &path).expect("parse fixture");
+        std::fs::remove_file(path).expect("remove fixture");
+        parsed
+    }
+
+    /// Vorbis-comment formats (FLAC, Ogg, Opus) conventionally store the year
+    /// in the Xiph-standard `DATE` field. lofty exposes that under
+    /// `ItemKey::RecordingDate`, not `ItemKey::Year` — importing must still
+    /// recognize it (issue #207).
+    #[test]
+    fn flac_date_field_year_is_recognized() {
+        let parsed = parse_fixture("date.flac", FLAC_DATE_FIXTURE);
+
+        assert_eq!(parsed.year, Some(2007));
+        assert_eq!(parsed.format, "FLAC");
+        assert!(parsed.title_from_tag);
+        assert!(parsed.artist_from_tag);
+        assert!(parsed.album_from_tag);
+    }
+
+    #[test]
+    fn ogg_date_field_year_is_recognized() {
+        let parsed = parse_fixture("date.ogg", OGG_DATE_FIXTURE);
+
+        assert_eq!(parsed.year, Some(2007));
+        assert_eq!(parsed.format, "OGG");
+    }
+
+    /// Trailing padding — including the space-padded fixed-width ID3v1 fields
+    /// that legacy taggers wrote — must not be imported as part of the value,
+    /// while leading and internal whitespace stay meaningful (issue #207).
+    #[test]
+    fn trailing_whitespace_is_trimmed_but_leading_and_internal_are_kept() {
+        let parsed = parse_fixture("trim.flac", FLAC_DATE_FIXTURE);
+
+        assert_eq!(parsed.title, "Two  Spaces  Trailing");
+        assert_eq!(parsed.artist_name, "  Flac Artist");
+        assert_eq!(parsed.album_title, "Pad Album");
+        assert_eq!(parsed.genre.as_deref(), Some("Rock"));
+        assert_eq!(parsed.composer.as_deref(), Some("Pad Composer"));
+        assert_eq!(parsed.album_artist_name.as_deref(), Some("Pad AlbumArtist"));
+    }
+
+    #[test]
+    fn trailing_whitespace_is_trimmed_for_ogg() {
+        let parsed = parse_fixture("trim.ogg", OGG_DATE_FIXTURE);
+
+        assert_eq!(parsed.title, "Two  Spaces  Trailing");
+        assert_eq!(parsed.artist_name, "  Ogg Artist");
+    }
+
+    /// Legacy ID3v1 tags pad every fixed-width field with spaces to the end of
+    /// the field (no NUL terminator). lofty decodes those bytes verbatim, so
+    /// the importer must trim the trailing spaces — this is the exact case
+    /// reported in issue #207.
+    #[test]
+    fn id3v1_space_padded_fields_are_trimmed() {
+        let parsed = parse_fixture("legacy.mp3", ID3V1_PADDED_FIXTURE);
+
+        assert_eq!(parsed.format, "MP3");
+        assert_eq!(parsed.title, "Pad Title");
+        assert_eq!(parsed.artist_name, "Pad Artist");
+        assert_eq!(parsed.album_title, "Pad Album");
+        // ID3v1 stores a fixed 4-digit year; it must still be recognized.
+        assert_eq!(parsed.year, Some(2007));
+    }
+
+    /// A `DATE` value may carry a full date (e.g. `2007-05-03`); the relaxed
+    /// timestamp parse used for the year must still yield the year.
+    #[test]
+    fn full_date_in_date_field_yields_the_year() {
+        // Reuse the FLAC fixture through lofty's writer to set a full date,
+        // then parse the result with the production entry point.
+        let source = fixture_path("full.flac", FLAC_DATE_FIXTURE);
+        {
+            use lofty::config::WriteOptions;
+            use lofty::tag::{ItemKey, TagExt};
+
+            let mut tagged = lofty::read_from_path(&source).expect("reopen fixture");
+            let tag = tagged
+                .primary_tag_mut()
+                .expect("fixture carries a vorbis comment");
+            tag.insert_text(ItemKey::RecordingDate, "2007-05-03".to_string());
+            tag.save_to_path(&source, WriteOptions::default())
+                .expect("rewrite fixture with full date");
+        }
+
+        let file = File::open(&source).expect("open rewritten fixture");
+        let parsed = parse_audio_file_from_file(file, &source).expect("parse rewritten fixture");
+        std::fs::remove_file(source).expect("remove rewritten fixture");
+
+        assert_eq!(parsed.year, Some(2007));
     }
 }
