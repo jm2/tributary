@@ -39,16 +39,43 @@ The deterministic ordering properties are pinned by focused tests inside
 
 ### 2.1 Watcher-backlog discard ordering
 
-| Test | Property pinned |
-|------|-----------------|
-| `watcher_ingress_filters_access_noise_before_the_bounded_queue` | `Access` events and atime-only `Modify(Metadata(AccessTime))` events never enter the bounded queue; real mutations after the storm remain queueable; backend `Rescan` survives filtering; backend errors survive filtering. Other `Metadata` kinds (write, permissions, ownership) are **not** filtered — they are potentially mutating and stay fail-closed in the queue. |
-| `watcher_ingress_overflow_is_nonblocking_and_marks_stream_unreliable` | `try_send` `Full` does not block; `ingress_overflowed` flag is authoritative; the event admitted before overflow remains queued. |
-| `watcher_error_and_rescan_notice_make_debounce_unreliable` | Backend error and `Rescan` flag both make `WatcherDebounceBatch::finish` return `None`, forcing reconciliation. |
-| `watcher_error_discards_mixed_incremental_batch_and_backlog` | Mixed incremental + `notify::Error` + stale queued event: the incremental batch is discarded, the queue is drained, no event is applied. |
-| `watcher_reconciliation_preserves_racing_overflow_and_new_events` | After a stale backlog is drained, an event arriving during the reconciliation scan remains queued for the next loop iteration; the overflow signal is not cleared at the end of the scan. |
-| `pending_root_trust_boundary_suppresses_backlog_and_keeps_racing_events` | The pending-root-trust boundary in `process_directory_events` (the `pending_trust_scan.take()` branch): watcher evidence queued before the distinct ordinary authority scan is suppressed **even though the stream is healthy** (no error, no overflow); the suppressed evidence is demonstrably actionable (an identical event yields a non-empty incremental upsert batch); a track whose evidence was suppressed is still delivered — by the authority scan, not the incremental; evidence racing the authority scan remains queued for the next boundary; the real completion runs (`finish_pending_root_trust_scan` records an `Active` outcome); the overflow signal is neither consulted nor cleared. |
-| `watcher_retries_a_root_that_appears_during_bootstrap` | `install_directory_watcher` + `watch_available_directories` retain old registrations and close new gaps when a missing root appears mid-bootstrap. |
-| `discard_watcher_backlog` (helper, invoked at two production sites and in two unit tests) | Drain of `mpsc::Receiver<notify::Result<notify::Event>>` is best-effort and total; events arriving after the drain remain queued. |
+- `watcher_ingress_filters_access_noise_before_the_bounded_queue` — `Access`
+  events and atime-only `Modify(Metadata(AccessTime))` events never enter the
+  bounded queue; real mutations after the storm remain queueable; backend
+  `Rescan` survives filtering; backend errors survive filtering. Other
+  `Metadata` kinds (write, permissions, ownership) are **not** filtered — they
+  are potentially mutating and stay fail-closed in the queue.
+- `watcher_ingress_overflow_is_nonblocking_and_marks_stream_unreliable` —
+  `try_send` `Full` does not block; `ingress_overflowed` flag is
+  authoritative; the event admitted before overflow remains queued.
+- `watcher_error_and_rescan_notice_make_debounce_unreliable` — backend error
+  and `Rescan` flag both make `WatcherDebounceBatch::finish` return `None`,
+  forcing reconciliation.
+- `watcher_error_discards_mixed_incremental_batch_and_backlog` — mixed
+  incremental + `notify::Error` + stale queued event: the incremental batch
+  is discarded, the queue is drained, no event is applied.
+- `watcher_reconciliation_preserves_racing_overflow_and_new_events` — after a
+  stale backlog is drained, an event arriving during the reconciliation scan
+  remains queued for the next loop iteration; the overflow signal is not
+  cleared at the end of the scan.
+- `pending_root_trust_boundary_suppresses_backlog_and_keeps_racing_events` —
+  the pending-root-trust boundary in `process_directory_events` (the
+  `pending_trust_scan.take()` branch): watcher evidence queued before the
+  distinct ordinary authority scan is suppressed **even though the stream is
+  healthy** (no error, no overflow); the suppressed evidence is demonstrably
+  actionable (an identical event yields a non-empty incremental upsert
+  batch); a track whose evidence was suppressed is still delivered — by the
+  authority scan, not the incremental; evidence racing the authority scan
+  remains queued for the next boundary; the real completion runs
+  (`finish_pending_root_trust_scan` records an `Active` outcome); the
+  overflow signal is neither consulted nor cleared.
+- `watcher_retries_a_root_that_appears_during_bootstrap` —
+  `install_directory_watcher` + `watch_available_directories` retain old
+  registrations and close new gaps when a missing root appears mid-bootstrap.
+- `discard_watcher_backlog` (helper, invoked at two production sites and in
+  two unit tests) — drain of
+  `mpsc::Receiver<notify::Result<notify::Event>>` is best-effort and total;
+  events arriving after the drain remain queued.
 
 The four invocations of `discard_watcher_backlog` are:
 
@@ -69,13 +96,21 @@ including the pending-root-trust boundary itself.
 The root-trust slice is exercised through `RootTrustReason` decisions,
 `build_root_trust_request`, and `root_trust_request_id`:
 
-| Test | Property pinned |
-|------|-----------------|
-| `root_trust_reasons_cover_legacy_replacement_and_empty_evidence` | `LegacyEnrollment`, `EmptyRoot`, `Replacement` reasons each map to the right scan evidence; `EmptyRoot` request requires acknowledgement. |
-| `root_trust_requires_complete_exact_configured_evidence` | A nested-discovered root cannot be confirmed; an incomplete traversal cannot be confirmed. |
-| `root_trust_request_id_ignores_timestamps_but_binds_security_state` | Two scans of the same path with only `last_checked_at` differ produce identical `request_id`; changing `is_available` changes `request_id`. |
-| `root_trust_request_debug_redacts_private_evidence` | `Debug` redact excludes secret-bearing evidence. |
-| `forced_trust_conversion_preserves_all_tracks_until_ordinary_scan` | The conversion scan writes no track rows; the distinct ordinary authority scan delivered by `complete_root_trust_scan` is what confirms identity and applies content. |
+- `root_trust_reasons_cover_legacy_replacement_and_empty_evidence` —
+  `LegacyEnrollment`, `EmptyRoot`, `Replacement` reasons each map to the
+  right scan evidence; `EmptyRoot` request requires acknowledgement.
+- `root_trust_requires_complete_exact_configured_evidence` — a
+  nested-discovered root cannot be confirmed; an incomplete traversal cannot
+  be confirmed.
+- `root_trust_request_id_ignores_timestamps_but_binds_security_state` — two
+  scans of the same path with only `last_checked_at` differ produce identical
+  `request_id`; changing `is_available` changes `request_id`.
+- `root_trust_request_debug_redacts_private_evidence` — `Debug` redact
+  excludes secret-bearing evidence.
+- `forced_trust_conversion_preserves_all_tracks_until_ordinary_scan` — the
+  conversion scan writes no track rows; the distinct ordinary authority scan
+  delivered by `complete_root_trust_scan` is what confirms identity and
+  applies content.
 
 The ordering between root-trust evidence and watcher events is pinned at the
 boundary by `pending_root_trust_boundary_suppresses_backlog_and_keeps_racing_events`
@@ -84,19 +119,42 @@ request are both unit-covered.
 
 ### 2.3 Debounce → batch ordering
 
-| Test | Property pinned |
-|------|-----------------|
-| `watcher_batch_normalizes_both_rename_without_fallback_paths` | `RenameMode::Both` produces exactly one `rename_pair`; no fallback `remove`+`upsert`. |
-| `watcher_batch_deduplicates_linux_from_to_and_both_events` | `From`+`To`+`Both` with matching tracker collapses to a single `rename_pair`. |
-| `watcher_batch_pairs_only_adjacent_untracked_windows_halves` | A non-adjacent pair promotes to `remove_paths` + `upsert_paths`. |
-| `watcher_batch_name_any_alone_demands_reconciliation_without_identity` | A **standalone** `RenameMode::Any` event — no folder removal or other event that could mask the routing — forces `reconciliation_required`, and alone produces no rename pair, no upsert, no remove, no deferred path, no dirty directory scope: identity is never inferred from an unpaired `Name::Any`. |
-| `watcher_batch_routes_unpairable_and_directory_events_to_reconciliation` | `RenameMode::Any` combined with `RemoveKind::Folder` forces reconciliation; the folder path remains deferred as a dirty scope for a paired parent rename. Note this combined test alone could not attribute `reconciliation_required` to the `Name::Any` half — the standalone test above removes that ambiguity. |
-| `watcher_batch_queues_regular_and_missing_audio_paths_only` | Both a present file and a vanished file reach `upsert_paths`; only a vanished file is held for the guarded removal backstop. |
-| `watcher_batch_defers_directory_rename_halves_until_the_pair_is_known` | A directory `From` alone is not promoted to reconciliation; the `To` completes the pair without rescan. |
-| `watcher_batch_promotes_an_unclaimed_directory_removal_to_reconciliation` | A directory `From` without a paired `To` forces reconciliation. |
-| `watcher_batch_rejects_rename_pairs_nested_in_a_renamed_directory` | A nested pair inside a renamed directory forces reconciliation (tracker ordering cannot decide). |
-| `marker_mutation_requires_reconciliation_before_incrementals` | A batch containing both a marker file and a regular upsert requires reconciliation before any incremental is applied; the marker root is recorded in `identity_changed_roots`. |
-| `watcher_ignores_tag_siblings_and_refreshes_the_replaced_track` | A private `.tributary-tag-*.flac` sibling does not produce a real change; the public track is refreshed. |
+- `watcher_batch_normalizes_both_rename_without_fallback_paths` —
+  `RenameMode::Both` produces exactly one `rename_pair`; no fallback
+  `remove`+`upsert`.
+- `watcher_batch_deduplicates_linux_from_to_and_both_events` — `From`+`To`+
+  `Both` with matching tracker collapses to a single `rename_pair`.
+- `watcher_batch_pairs_only_adjacent_untracked_windows_halves` — a
+  non-adjacent pair promotes to `remove_paths` + `upsert_paths`.
+- `watcher_batch_name_any_alone_demands_reconciliation_without_identity` — a
+  **standalone** `RenameMode::Any` event — no folder removal or other event
+  that could mask the routing — forces `reconciliation_required`, and alone
+  produces no rename pair, no upsert, no remove, no deferred path, no dirty
+  directory scope: identity is never inferred from an unpaired `Name::Any`.
+- `watcher_batch_routes_unpairable_and_directory_events_to_reconciliation` —
+  `RenameMode::Any` combined with `RemoveKind::Folder` forces reconciliation;
+  the folder path remains deferred as a dirty scope for a paired parent
+  rename. Note this combined test alone could not attribute
+  `reconciliation_required` to the `Name::Any` half — the standalone test
+  above removes that ambiguity.
+- `watcher_batch_queues_regular_and_missing_audio_paths_only` — both a
+  present file and a vanished file reach `upsert_paths`; only a vanished file
+  is held for the guarded removal backstop.
+- `watcher_batch_defers_directory_rename_halves_until_the_pair_is_known` — a
+  directory `From` alone is not promoted to reconciliation; the `To` completes
+  the pair without rescan.
+- `watcher_batch_promotes_an_unclaimed_directory_removal_to_reconciliation` —
+  a directory `From` without a paired `To` forces reconciliation.
+- `watcher_batch_rejects_rename_pairs_nested_in_a_renamed_directory` — a
+  nested pair inside a renamed directory forces reconciliation (tracker
+  ordering cannot decide).
+- `marker_mutation_requires_reconciliation_before_incrementals` — a batch
+  containing both a marker file and a regular upsert requires reconciliation
+  before any incremental is applied; the marker root is recorded in
+  `identity_changed_roots`.
+- `watcher_ignores_tag_siblings_and_refreshes_the_replaced_track` — a private
+  `.tributary-tag-*.flac` sibling does not produce a real change; the public
+  track is refreshed.
 
 These tests pin the ordering properties of `WatcherBatch::collect`,
 `WatcherBatch::finish`, `WatcherDebounceBatch::finish`, and the
