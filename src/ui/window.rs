@@ -3548,6 +3548,7 @@ pub(crate) fn build_window(
         let cfg = app_config.clone();
         let bs = browser_state.clone();
         let master_for_pref = master_tracks.clone();
+        let output_for_prefs = active_output.clone();
         let prefs_action = gtk::gio::SimpleAction::new("show-preferences", None);
         prefs_action.connect_activate(move |_, _| {
             let bw_for_cb = bw.clone();
@@ -3562,7 +3563,7 @@ pub(crate) fn build_window(
                 browser::rebuild_browser_data(&bw_for_cb, &bs_for_cb, &tracks);
                 browser::set_album_artist_grouping(&bw_for_cb, &bs_for_cb, enabled);
             });
-            preferences::show_preferences(&win, &cv, &bw, &cfg, on_aa_change);
+            preferences::show_preferences(&win, &cv, &bw, &cfg, on_aa_change, &output_for_prefs);
         });
         window.add_action(&prefs_action);
     }
