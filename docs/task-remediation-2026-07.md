@@ -528,9 +528,18 @@ and cannot access a repository write credential.
 - [x] Pass the ref to every checkout in the release workflow.
 - [x] Derive every package version from the checked-out source/tag.
 - [x] Reject a missing or malformed requested tag.
-- [ ] Add a dry-run/manual workflow test demonstrating that tag X builds tag X.
-- [ ] Record implementation: workflow contract implemented in PR #68; live
-  manual-dispatch verification pending after push.
+- [x] Add a dry-run/manual workflow test demonstrating that tag X builds tag X.
+- [x] Record implementation: workflow contract implemented in PR #68; the
+  `release.yml` `workflow_dispatch` input `dry_run` (default `false`) runs
+  only the `prepare` tag-resolution contract plus a `dry-run-verify` job
+  that asserts `build_ref` equals the remote commit of the requested tag
+  and `version` equals the tag's `Cargo.toml` version; every build job and
+  `checksums` skip in dry-run and `publish` remains release-only, so a
+  dry-run can never publish. Live manual-dispatch verification: run
+  [33781875201](https://github.com/jm2/tributary/actions/runs/33781875201)
+  (2026-09-03, dispatch of `v0.6.2` with `dry_run=true`) resolved
+  `build_ref` to `74b4279` — the immutable commit of `v0.6.2` — at version
+  `0.6.2`, with all artifact jobs skipped.
 
 Acceptance criteria: all artifacts in a run are built from the same requested immutable ref
 and carry the same version.
