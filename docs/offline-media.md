@@ -48,10 +48,10 @@ the download/cache engine must satisfy.
 | Area | What this document decides | What is explicitly reserved |
 |---|---|---|
 | Identity | Cache entries use the same `SourceId` + `TrackId` shape as live playback. The download engine mints or adopts a per-source `MediaKey`; it never invents a new identity kind. | New persisted identifier types, new schema migrations, on-disk naming conventions beyond `task.md` and the credential-boundary section. |
-| Authority | Every cached media entry remains owned by its source. The source registry's exact-snapshot capability gates both download admission and offline catalogue rendering. No offline bypass of the registry. | Concurrent access contracts for the registry's offline catalogue; specific read-side materialisation policies. |
-| Download jobs | A bounded resumable job model keyed by exact `(SourceId, TrackId)` with monotonic local progress, opaque server caps, deterministic cancellation, and structured redacted failures. | Concrete worker pool scheduling, threading model, runtime selection, telemetry. |
-| Storage | Atomic temp-then-rename with pre-rename `fsync`. Per-source directory, per-track file. A `tracks` row may link to a cache path only when integrity passes and the file is current. | Database migrations, schema, table layout, index choice, cache placement, encryption. |
-| Integrity | SHA-256 over the bytes the server returned, computed post-write and re-verified on resume. No fallback heuristic; mismatched bytes are terminal. | Hashing algorithm extension, content-defined chunking, content-addressable stores. |
+| Authority | Every cached media entry remains owned by its source. The source registry's exact-snapshot capability gates download admission, reconciliation, and retirement. A committed snapshot renders offline without a live registry round-trip; disconnect and refresh never gate playback of committed bytes. No offline bypass of the registry for admission. | Concurrent access contracts for the registry's offline catalogue; specific read-side materialisation policies. |
+| Download jobs | A bounded resumable job model keyed by exact `(SourceId, TrackId)` with a durable, `fsync`'d progress journal, entity validators (`If-Range`) on every range request, opaque server caps, deterministic cancellation, and structured redacted failures. Job state survives restart; it is never memory-only. | Concrete worker pool scheduling, threading model, runtime selection, telemetry. |
+| Storage | Verify-then-publish: the temp file lives in the same directory (same filesystem) as its final cache path, integrity is verified on the temp file before any rename, and publish is an atomic rename with a parent-directory `fsync`. Cross-filesystem publish is refused at admission, never emulated with copy+sync+delete. A `tracks` row may link to a cache path only when integrity passed and the file is current. | Database migrations, schema, table layout, index choice, cache placement, encryption. |
+| Integrity | SHA-256 is computed over the bytes on disk and compared against an expected digest whose provenance is declared per backend (capability matrix below). A backend that advertises no digest is verified by independent double-fetch; the absence of any verification path is terminal, never a silent pass. Verification completes before publish. | Hashing algorithm extension, content-defined chunking, content-addressable stores. |
 | Capabilities | The remote source owns a default-deny `OfflineSnapshot` capability. Only the same set of backends that opt into live `ServerPlaylist`-style read authority may opt in. Radio-Browser, removable, external-file, and built-in local sources cannot. | Adapter-specific download strategies beyond HTTP(S) `Range` and Subsonic/Jellyfin/Plex/DAAP download endpoints. |
 | Credentials | Cached media may carry no credential, password, signed URL, or session cookie in metadata, file name, sidecar, log, or GTK-visible row. Bearer URLs are minted only by the existing exact-origin proxy and consumed through the same opaque revocable ticket used by live playback. | New credential storage paths, new vault tables, package or build-credential integration, distribution-time-key loading. |
 | Licensing | `OperationalLicence` is a per-source opt-in declared before any download is admitted. Default is `Denied`. The source emits a structured reason when licence is denied. The catalogue carries the licence label for every offline row but never the licence text itself. | Bundle-bundled music, automatic licensing negotiation, third-party licence clearing, payment integration. |
@@ -117,7 +117,13 @@ existing media row. As a consequence:
    operations, but the source retains its existing identity, audit, and
    redaction behaviour.
 3. A track ID is opaque and bounded exactly as it is in `task.md:78-83`. The
-   download engine does not parse, normalise, or hash a `TrackId`.
+   download engine does not parse or normalise a `TrackId`. The only
+   transformation it ever applies is the one-way cache-key derivation defined
+   in [Per-source layout](#per-source-layout), which feeds the exact,
+   unmodified byte sequence of the ID to SHA-256 and uses a fixed-width hex
+   prefix as a directory name. That derivation is not parsing: the identifier
+   is never interpreted, the derived key never feeds back into identity, and
+   the persisted `MediaKey` remains the original opaque pair.
 
 ### Each source owns its offline decision
 
@@ -146,6 +152,18 @@ ticket and may only persist the resulting `Vec<u8>`. This mirrors the receiver
 ticket vocabulary in `chromecast_output.rs` and the proxy ticket vocabulary in
 `http_security.rs` without re-implementing either.
 
+### Committed snapshots play without a live authority
+
+The registry's accepted generation is consulted at exactly two points:
+download admission and reconciliation/retirement. It is never a playback
+precondition. A committed snapshot — one whose row was published after
+integrity verification — plays from local bytes while its source is
+disconnected, refreshing, mid-reauthentication, or retired pending cleanup.
+A disconnect or logout revokes in-flight leases only; it never unplays a
+committed row. Licence state is the persisted label recorded at commit,
+re-checked at the next reconciliation when the source is reachable again —
+not on each offline play.
+
 ## Authenticated, resumable download jobs
 
 A download is a one-shot operation owned by an exact accepted generation. The
@@ -156,8 +174,9 @@ job model is:
 | `media_key` | `MediaKey` | Bounded `(SourceId, TrackId)`; a malformed pair is terminal before any network work. |
 | `capability_epoch` | `u64` | The source registry's exact accepted generation. Stale jobs retire early. |
 | `requested_bytes` | `Option<u64>` | Optional hint from `Content-Length`; missing means unknown total. |
-| `current_bytes` | `u64` | Monotonic committed byte count. |
-| `current_sha256` | `Option<[u8; 32]>` | Progressively trusted only after the full file is received and re-checked post-write. |
+| `resume_validator` | `Option<EntityValidator>` | Strong `ETag` (preferred) or `Last-Modified` captured from the first successful response. `Some` is required for any resumption; `None` disables resume and restricts the job to full restart. |
+| `current_bytes` | `u64` | Monotonic committed byte count. Durable: journaled and `fsync`'d before it is trusted as a resume point. |
+| `current_sha256` | `Option<[u8; 32]>` | Engine-computed SHA-256 over the received bytes. Not trusted on its own: it is compared against the expected digest per provenance on the temp file before publish. |
 | `state` | `JobState` | `Queued`, `Connecting`, `Receiving`, `Verifying`, `Committing`, `Committed`, `Failed`, `Cancelled`. |
 | `last_lease` | `Option<LeaseId>` | Opaque lease reference of the in-flight HTTP request. Owned by the source registry. |
 | `failure` | `Option<OfflineError>` | Redacted, structured, terminal cause when `state = Failed`. |
@@ -170,22 +189,35 @@ The rules:
    worker or a headless application owner on the same model as the Last.fm
    application owner composed in [#165](https://github.com/jm2/tributary/pull/165);
    it is never a GTK thread.
-2. **Resumption is exact and bounded.** A retried range request uses the
-   `Range` bytes the previous job last committed. Out-of-order or duplicate
-   ranges are rejected; ranges past `Content-Length` are rejected; the previous
-   temporary file is reused only after byte-level equality check.
+2. **Resumption is exact, validated, and bounded.** The durable journal —
+   the job row plus an `fsync`'d sidecar recording `current_bytes` and a
+   SHA-256 per committed segment — is the only trusted resume state; the
+   temp file's raw on-disk length is never trusted. A resumed job truncates
+   the temp file back to the journaled offset (discarding torn tail bytes
+   from an interrupted write), re-verifies the last journaled segment
+   digest, and re-requests the remainder with `Range` **and** `If-Range`
+   carrying the captured `resume_validator`. A `206` continues the job. A
+   `200` or `412` response means the entity changed or was never validated:
+   the partial bytes are discarded and the job restarts from zero under the
+   same job ID. Out-of-order or duplicate ranges are rejected; ranges past
+   `Content-Length` are rejected. A job that captured no validator resumes
+   by full restart only.
 3. **Cancellation is decisive.** A user-driven cancel, lifecycle supersession,
    or shutdown cancels the in-flight lease promptly. A cancelled job leaves no
    half-promoted GTK row and no committed cache entry.
 4. **Failure is structured.** `OfflineError` is a typed enum with redacted
    variants (`Network`, `AuthExpired`, `LeaseRevoked`, `IntegrityMismatch`,
-   `LicenceDenied`, `QuotaExceeded`, `StorageUnavailable`,
-   `UnsupportedSource`). No raw HTTP status, redirect path, body excerpt,
-   header value, or URL parameter appears in the failure.
+   `IntegrityUnverifiable`, `LicenceDenied`, `QuotaExceeded`,
+   `StorageUnavailable`, `UnsupportedSource`). No raw HTTP status, redirect
+   path, body excerpt, header value, or URL parameter appears in the failure.
 5. **One job per `(media_key, capability_epoch)`.** A newer request that wants
    to replace an in-flight predecessor waits for its terminal state. Replacing
    is not a separate operation; it is a new job after the predecessor reaches
    a terminal state or supersedes its capability_epoch.
+6. **Job state is durable.** Jobs are persisted rows, not memory objects. A
+   process restart re-derives `Queued`/`Receiving`/`Verifying` state from
+   the journal and either resumes (validator present) or restarts cleanly.
+   No offline job exists only in RAM.
 
 The download engine and the source registry both treat the lease as opaque
 identity. The lease is acquired exactly once per job, and the same opaque
@@ -194,70 +226,138 @@ download reuses.
 
 ## Atomic storage
 
-A cached file moves from request admission to playable media through five
-explicit steps:
+A cached file moves from request admission to playable media through six
+explicit steps. The order is normative: **verification always completes
+before the rename**, and the temp file always lives in the destination
+directory.
 
-1. **Temp reservation.** The job writes to a per-source temp directory whose
-   path is **not** derived from the cache path. The temp path is generated by
-   the cache engine and is short-lived.
-2. **Truncate-then-stream.** The job opens the temp file with
-   `OpenOptions::new().create(true).truncate(true).write(true)` and never
-   re-opens it for append; the file is committed only after the full byte
-   range has been received.
-3. **Pre-rename `fsync`.** Before the rename the file is `fsync`'d; the parent
-   directory is `fsync`'d on Unix afterwards. Windows uses `FlushFileBuffers`
-   followed by a transactional move or `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`.
-4. **Atomic rename.** The temp file is renamed into its cache path. The rename
-   is atomic on the source filesystem; on cross-filesystem cache placements,
-   the job must verify the rename is single-step or fall back to copy + sync
-   + delete, never a partial overwrite.
-5. **Post-write integrity check.** The job's `current_sha256` is re-computed
-   from the bytes on disk; only equality with the server-advertised digest
-   enables the next step.
+1. **Cache-key derivation and temp reservation.** The job derives the
+   bounded, filesystem-safe cache key (see
+   [Per-source layout](#per-source-layout)) and creates the temp file
+   **in the same directory as the final cache path** —
+   `<final_name>.part-<job-id>` — so that publish is a same-filesystem
+   rename. The temp name is generated by the cache engine, is short-lived,
+   and is never derived from a URL or credential. If the engine cannot
+   create the temp beside the final path (different filesystem, read-only
+   parent), the job fails `StorageUnavailable` at admission. There is no
+   cross-filesystem publish path: copy + sync + delete is explicitly
+   **not** an acceptable substitute for `rename`, because it is neither
+   atomic nor crash-safe.
+2. **Receive.** The first reception opens the temp file with
+   `truncate(true)`. A resume opens the existing temp **without** truncate,
+   and only after journal validation per the resumption rules above. Every
+   committed segment is hashed into the journal before its bytes count as
+   progress.
+3. **Finalize.** When the last byte is received, the file is `fsync`'d.
+   Nothing is visible at the cache path yet.
+4. **Verify on the temp file.** The engine re-computes SHA-256 from the
+   bytes actually on disk and evaluates it against the expected digest per
+   the provenance rules of the capability matrix: a backend-advertised
+   digest must match exactly; when the backend advertises none, an
+   independent second fetch (fresh authenticated request, full re-read)
+   must produce an identical digest. A mismatch — or the inability to
+   obtain any verification path — unlinks the temp file and fails the job
+   terminally (`IntegrityMismatch`, or `IntegrityUnverifiable` when no
+   digest source exists at all). No rename has occurred at this point.
+5. **Publish by atomic rename.** The verified temp file is renamed onto the
+   cache path — atomic because temp and final path share a directory and
+   therefore a filesystem. On Unix, the parent directory is `fsync`'d after
+   the rename so the published name survives power loss. Windows uses
+   `FlushFileBuffers` followed by `MoveFileEx` with
+   `MOVEFILE_REPLACE_EXISTING`.
+6. **Commit.** Only after a successful rename does the cache row exist.
+   The row records the `MediaKey` → cache-path mapping, the engine-computed
+   digest, the digest provenance used, and the licence label at commit.
 
 Failure at any step:
 
 - Temp reservation: the previous temp is unlinked, no cache row created.
-- Truncate-then-stream: `OfflineError::StorageUnavailable` if the filesystem
-  refuses the temp.
-- Pre-rename `fsync` or rename: `OfflineError::StorageUnavailable`.
-- Post-write integrity mismatch: `OfflineError::IntegrityMismatch`. The temp
-  file is unlinked; no cache row is created.
+- Receive: `OfflineError::StorageUnavailable` if the filesystem refuses the
+  temp or the append.
+- Finalize `fsync`: `OfflineError::StorageUnavailable`.
+- Verify: `OfflineError::IntegrityMismatch` on digest mismatch;
+  `OfflineError::IntegrityUnverifiable` when no provenance tier can supply
+  an expected digest. The temp file is unlinked; no cache row is created;
+  nothing was ever renamed.
+- Publish: `OfflineError::StorageUnavailable`. A failed rename leaves the
+  temp in place for cleanup and the cache path untouched.
 
 A half-promoted cache row that points at a missing or partial file is a bug
 that the contract forbids; downstream layers must never observe it. The
-`tracks` row remains untouched until step 5 succeeds, and the lookup path
-between step 1 and step 5 returns the live endpoint only.
+`tracks` row remains untouched until step 6 succeeds, and the lookup path
+between admission and publish returns the live endpoint only.
 
 ### Per-source layout
 
 The cache is split by exact `SourceId`, never by backend string or base URL:
 
-- `<cache_root>/<source_id_hex>/<track_id_within_source>/`
+- `<cache_root>/<source_key>/<track_key>/`
 
-The exact layout extends the per-track identity policy in
-[`source-scoped-playlists.md`](source-scoped-playlists.md) and mirrors the
-archival rule that no URL or path may be reconstructed from a track's location.
+`source_key` and `track_key` are **derived cache keys**, not the raw
+identifiers: each is the first 32 hex characters (128 bits) of
+`SHA-256(identifier_bytes)`. The identifiers are fed to the hash as their
+exact, unmodified byte sequences — the engine still never parses,
+normalises, or interprets them. The result is bounded (fixed length),
+fixed-charset (`[0-9a-f]`), free of path separators, incapable of `..`
+traversal, stable across runtimes, and reveals nothing about the identifier
+it was derived from. Raw `TrackId` bytes — which may contain `/`, `..`,
+unicode, or control characters — never appear in a path.
+
+The durable `MediaKey` → cache-path mapping is recorded in the cache row at
+commit; lookups are table-driven. No code path reconstructs a cache path
+from an identifier except through this recorded mapping, and no URL or
+credential is recoverable from a location.
+
+The file name inside `<track_key>/` is an implementation-chosen,
+credential-free constant — the directory is the per-track scope, so the
+name carries no identity beyond the recorded mapping. Temp files in that
+directory follow the `<final_name>.part-<job-id>` shape required by
+[Atomic storage](#atomic-storage).
+
+This layout extends the per-track identity policy in
+[`source-scoped-playlists.md`](source-scoped-playlists.md) and strengthens
+the archival rule that no URL or path may be reconstructed from a track's
+location.
 
 ## Server capability matrix
 
 Adapters opt in by returning `Some(OfflineSnapshot)` from
 `offline_snapshot`. Each adapter documents which download path it provides:
 
-| Backend | Download path | Snapshot cap | Restrictions |
-|---|---|---|---|
-| Subsonic | `GET .../download?view=...&id=<trackId>` authenticated through the exact-origin proxy. | Per-source byte total bounded at the source-adapter-declared cap; offline rows are still capped by the per-track quota. | Bearer URL handling per `task-remediation-2026-07.md` P1.6 — only the proxy ticket ever reaches GTK. |
-| Jellyfin | `GET /Items/<id>/Download` authenticated through the exact-origin proxy. | Identical. | Same. |
-| Plex | `GET /library/parts/<partId>` authenticated through the exact-origin proxy; uses `X-Plex-Token` only inside the proxy boundary. | Identical. | Same. |
-| DAAP | `DAAP.song` request, authenticated through the DAAP protocol-specific lane already retired to the source lifecycle. | Identical. | DAAP connection still has exactly-once logout; cache rows must retire on disconnect. |
-| Radio-Browser | Disallowed. | — | Streams are public and not licensable for offline by default; deny hard. |
-| Built-in local | Disallowed. | — | Local files are already local; the cache is the filesystem. |
-| Removable | Disallowed. | — | Lifecycle-bound, not credentialed; the mount is the offline storage. |
-| External-file | Disallowed. | — | One-shot ephemeral session; no persistence. |
+| Backend | Download path | Snapshot cap | Expected-digest provenance | Restrictions |
+|---|---|---|---|---|
+| Subsonic | `GET .../download?view=...&id=<trackId>` authenticated through the exact-origin proxy. | Per-source byte total bounded at the source-adapter-declared cap; offline rows are still capped by the per-track quota. | None advertised by the API — double-fetch verification. | Bearer URL handling per `task-remediation-2026-07.md` P1.6 — only the proxy ticket ever reaches GTK. |
+| Jellyfin | `GET /Items/<id>/Download` authenticated through the exact-origin proxy. | Identical. | None guaranteed by the API — double-fetch verification. | Same. |
+| Plex | `GET /library/parts/<partId>` authenticated through the exact-origin proxy; uses `X-Plex-Token` only inside the proxy boundary. | Identical. | None advertised by the API — double-fetch verification. | Same. |
+| DAAP | `DAAP.song` request, authenticated through the DAAP protocol-specific lane already retired to the source lifecycle. | Identical. | None advertised by the protocol — double-fetch verification. | DAAP connection still has exactly-once logout; committed cache rows survive disconnect — logout revokes only the in-flight lease. |
+| Radio-Browser | Disallowed. | — | — | Streams are public and not licensable for offline by default; deny hard. |
+| Built-in local | Disallowed. | — | — | Local files are already local; the cache is the filesystem. |
+| Removable | Disallowed. | — | — | Lifecycle-bound, not credentialed; the mount is the offline storage. |
+| External-file | Disallowed. | — | — | One-shot ephemeral session; no persistence. |
 
 The matrix above is normative. A new adapter that wants to opt in files a
 follow-up ADR that adds a row, defines its path, and explains why the
 credential-isolation argument holds for that path.
+
+**Digest provenance tiers.** An expected digest may come from exactly two
+places, in this order:
+
+1. **Advertised digest.** A digest whose field, header, or API property is
+   named in this matrix and documented in the adapter. When present it is
+   compared exactly against the engine-computed SHA-256; a mismatch is
+   terminal.
+2. **Double-fetch verification.** When no digest is advertised, the engine
+   issues a fresh authenticated request for the same resource after the
+   first transfer completes and requires the SHA-256 of both transfers to
+   be identical. A disagreement, or a second transfer that cannot complete,
+   is terminal. The re-read is bounded by the same admission caps as the
+   first transfer, and the offline quota is charged once — for the
+   committed bytes, not per fetch.
+
+A backend with neither tier cannot be downloaded from: the job fails
+`IntegrityUnverifiable` before any byte is promoted. "Probably an ETag" is
+not provenance; an adapter that wants to promote an `ETag` to a content
+digest must name that contract in an ADR row of this matrix first.
 
 ## Credential handling
 
@@ -300,10 +400,15 @@ is small and absolute:
 
 Rules:
 
-1. The cache layer reads the current `OperationalLicence` at download admission
-   and again at offline rendering. A `Revoked` row is retired without deleting
-   the file; the file is the user's, but the row is no longer a playable
-   offline row.
+1. The cache layer reads the current `OperationalLicence` at download
+   admission and again at each reconciliation in which the source is
+   reachable. Offline playback of a committed row relies on the persisted
+   licence state recorded at commit and never blocks on a live read (see
+   [Committed snapshots play without a live
+   authority](#committed-snapshots-play-without-a-live-authority)). A
+   `Revoked` row is retired at the reconciliation that observes the
+   revocation, without deleting the file; the file is the user's, but the
+   row is no longer a playable offline row.
 2. The licence label is a short, bounded identifier supplied by the source —
    e.g. `subsonic-streaming-self`. Never a free-form text field, never the
    full licence, never the URL of the licence page.
@@ -375,30 +480,41 @@ This contract fixes the following failure cases:
 | Situation | Behavior |
 |---|---|
 | Authenticated remote HTTP returns 401/403 mid-download | Lease revokes; job enters `Failed(AuthExpired)`. Cache row not promoted. |
-| Bytes received but integrity check fails | `Failed(IntegrityMismatch)`. Temp file unlinked. |
+| Bytes received but integrity check fails | `Failed(IntegrityMismatch)`. Temp file unlinked; nothing was renamed. |
+| No digest provenance tier available for a backend | `Failed(IntegrityUnverifiable)` before publish; terminal. |
+| Second transfer disagrees with the first (double-fetch) | `Failed(IntegrityMismatch)`. Temp file unlinked. |
 | `OperationalLicence = Denied` or `Revoked` at admission | Job refused before network work. |
 | Source retired mid-download | Job cancels; lease revokes; cache row not promoted. |
 | Quota exceeded before commit | Job fails terminally with `QuotaExceeded`. |
 | Filesystem refuses temp reservation | `Failed(StorageUnavailable)`. |
 | User cancels a download | `Cancelled`. Temp unlinked. |
 | Two requests for the same `MediaKey` race | Newest waits for terminal state of predecessor; admission is one-at-a-time. |
-| Network dies between two byte ranges | Resumable; range request continues from `current_bytes`. |
+| Network dies between two byte ranges | Resumable; the resumed range request revalidates the entity with `If-Range` and continues from the journaled offset. A `200`/`412` answer discards partial bytes and restarts from zero. |
 | Radio-Browser adapter receives an offline request | `Err(Denied)` from the capability; no network work. |
 | Local file is requested for offline | `None` from the capability; no offline layer is created; the file is already local. |
 
 ## Migration plan
 
-The implementation of this contract adds **one** migration: an offline cache
-table whose schema mirrors the existing playlist_entry shape, replacing
-`tracks.local_track_id` semantics with a typed cache reference. The exact
-schema, indexes, and triggers are deliberately left for the implementation
-record. The migration:
+The implementation of this contract adds **one** migration introducing two
+tables: the offline cache table and the durable download-job table. The
+exact schema, indexes, and triggers are deliberately left for the
+implementation record. The migration:
 
-1. Creates the cache table with bounded columns, default-deny triggers, and
-   strict foreign-key references to `tracks(id)` and the source registry.
-2. Persists no row that points at a missing or partial file. Promotion to a
-   cached row is exactly the moment the post-write integrity check passes.
-3. Is reversible in the same way as migration 13: any error restores the
+1. Creates the cache table keyed by the derived cache key
+   (`source_key`, `track_key`) — an identity in its own right, **not** a
+   strict foreign key on `tracks(id)`. A nullable advisory link to
+   `tracks(id)` may exist for UI join convenience, but the cache row must
+   remain valid when the track's catalogue row is absent, replaced by a
+   refresh, or never materialised: a remote track's offline snapshot exists
+   independent of any local `tracks` row.
+2. Creates the download-job table carrying the full job model — including
+   the journaled offset, the captured `resume_validator`, and the digest
+   provenance in use — so that job state is durable across process
+   restarts. No offline job is memory-only.
+3. Persists no row that points at a missing or partial file. Promotion to a
+   cached row is exactly the moment the verified rename (step 6 of Atomic
+   storage) succeeds.
+4. Is reversible in the same way as migration 13: any error restores the
    complete predecessor schema and data so the upgrade remains retryable.
 
 A successful migration raises the application schema version by exactly one.
@@ -409,10 +525,11 @@ Each slice lands with its own focused regression suite. The slices are:
 
 | Slice | Coverage |
 |---|---|
-| Identity | Same `SourceId` + `TrackId` semantics as live; no second identity kind minted. |
+| Identity | Same `SourceId` + `TrackId` semantics as live; no second identity kind minted. Derived cache keys: fixed hex charset and width, no separators or traversal, byte-exact identifier input. |
 | Capability | Default-deny behaviour for adapters that opt out; Subsonic/Jellyfin/Plex/DAAP opt in. |
-| Resumable job | Bounded range requests; out-of-order rejection; cap-bytes mismatch; checksum guard. |
-| Atomic storage | `fsync` + rename; Windows transactional move; cross-filesystem fallback. |
+| Resumable job | Bounded, `If-Range`-validated range requests; `200`/`412` restarts from zero; journal survives crash (offset truncation, last-segment digest re-check); no-validator jobs restart only. |
+| Atomic storage | Same-directory temp reservation; verify-before-publish ordering; same-filesystem rename with parent-directory `fsync`; cross-filesystem publish refused. |
+| Digest provenance | Advertised digest compared exactly; double-fetch fallback equality; no-tier backends fail `IntegrityUnverifiable` before publish. |
 | Credential boundary | No credential in metadata, file name, sidecar, log, or GTK row. Same regex-style coverage as `task-remediation-2026-07.md` P1.4. |
 | Redirect policy | Per `task-remediation-2026-07.md` P1.4 matrix; HTTPS-only, no `Referer`, no HTTPS→HTTP downgrade. |
 | Licensing | Default-deny; revocation retires rows but preserves files. |
