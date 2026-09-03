@@ -550,15 +550,25 @@ and carry the same version.
   justified and time-bounded below rather than removed based on active-tree output: the
   affected package remains in `Cargo.lock` even though it is inactive in Tributary's
   configured feature graph.
+- [x] Apply the P0.8 re-evaluation triggered by the v0.6.2 release (due "2026-10-10 or next
+  release, whichever is first"). The inactive lockfile-only `rsa` path was eliminated outright:
+  the 2026-08-05 SeaORM group bump moved `sqlx-mysql` to 0.9.0, which no longer depends on
+  `rsa` (PR #196), the independent fuzz-lock copy fell with the same day's dependency repair
+  (PR #206), and the `.cargo/audit.toml` `RUSTSEC-2023-0071` ignore was dropped. The
+  production-lock `proc-macro-error2` path left in that same repair (PR #206), and the
+  fuzz-lock copy left at the release review by synchronizing `sea-bae` 0.2.2 (PR #218).
+  `paste` was revalidated as an unavoidable compile-time Lofty edge with no patched release
+  (details in `docs/task.md` P3.4).
 
-Audit disposition recorded 2026-07-10, amended and revalidated 2026-07-13:
+Audit disposition recorded 2026-07-10, amended and revalidated 2026-07-13, and re-evaluated at
+the 2026-09-01 v0.6.2 release review:
 
 | Advisory | Dependency path | Disposition | Revisit by |
 |---|---|---|---|
 | [`RUSTSEC-2026-0190`](https://rustsec.org/advisories/RUSTSEC-2026-0190) (`anyhow`) | direct and transitive | Fixed by locking and requiring `anyhow >= 1.0.103`. | Closed |
-| [`RUSTSEC-2024-0436`](https://rustsec.org/advisories/RUSTSEC-2024-0436) (`paste`) | `lofty 0.24.0 -> paste 1.0.15` | Informational/unmaintained, with no patched `paste` release. Track Lofty migration to a maintained replacement; no direct Tributary use. | 2026-10-10 or next release, whichever comes first |
-| [`RUSTSEC-2026-0173`](https://rustsec.org/advisories/RUSTSEC-2026-0173) (`proc-macro-error2`) | `sea-orm 1.1.20 -> sea-bae 0.2.1` | Informational/unmaintained compile-time macro dependency. Track SeaORM's removal or evaluate the SeaORM 2 migration. | 2026-10-10 or next release, whichever comes first |
-| [`RUSTSEC-2023-0071`](https://rustsec.org/advisories/RUSTSEC-2023-0071) (`rsa`, Marvin Attack) | Lockfile-only optional graph: `sqlx 0.8.6` and `sqlx-macros-core 0.8.6` retain `sqlx-mysql 0.8.6 -> rsa 0.9.10`; `sqlx-mysql` and `rsa` are inactive under Tributary's `sqlx-sqlite` feature set. | Retain the narrowly documented `.cargo/audit.toml` ignore. `cargo tree --locked -i rsa` and `cargo tree --locked -e features -i sqlx-mysql` are empty, but `cargo-audit` checks every locked package and fails on this advisory without the ignore. No fixed upgrade exists. Re-review immediately before enabling MySQL support. | 2026-10-10 or next release, whichever comes first; immediately if MySQL is enabled |
+| [`RUSTSEC-2024-0436`](https://rustsec.org/advisories/RUSTSEC-2024-0436) (`paste`) | `lofty 0.24.0 -> paste 1.0.15` | Informational/unmaintained, with no patched `paste` release. Re-evaluated 2026-09-01: still an unavoidable compile-time edge through Lofty (the latest Lofty 0.25.1 declares the same dependency); no direct Tributary use. Track Lofty migration to a maintained replacement. | 2026-12-01 or next release, whichever comes first |
+| [`RUSTSEC-2026-0173`](https://rustsec.org/advisories/RUSTSEC-2026-0173) (`proc-macro-error2`) | was `sea-orm 1.1.20 -> sea-bae 0.2.1`; removed from the production lock (PR #206) and from the independent fuzz lock via `sea-bae` 0.2.2 (PR #218) | Informational/unmaintained compile-time macro dependency. Closed 2026-09-01: absent from both lockfiles at the v0.6.2 release. | Closed |
+| [`RUSTSEC-2023-0071`](https://rustsec.org/advisories/RUSTSEC-2023-0071) (`rsa`, Marvin Attack) | was a lockfile-only optional graph: `sqlx 0.8.6` and `sqlx-macros-core 0.8.6` retained `sqlx-mysql 0.8.6 -> rsa 0.9.10`, inactive under Tributary's `sqlx-sqlite` feature set | Closed: the 2026-08-05 SeaORM group bump moved `sqlx-mysql` to 0.9.0, which no longer depends on `rsa` (PR #196), and the fuzz-lock copy fell with the same day's dependency repair (PR #206). `rsa` is absent from both lockfiles and the `.cargo/audit.toml` ignore was removed; `cargo audit --no-fetch` passes without it. Re-review immediately before enabling MySQL support. | Closed; immediately if MySQL is enabled |
 
 Acceptance criteria: the CI security-audit job passes with every remaining ignored advisory
 explicitly justified and time-bounded.
