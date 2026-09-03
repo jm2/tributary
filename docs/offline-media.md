@@ -46,7 +46,7 @@ deliberately-resolved-but-unimplemented items below establish the contract that
 the download/cache engine must satisfy.
 
 | Area | What this document decides | What is explicitly reserved |
-|---|---|---|
+| --- | --- | --- |
 | Identity | Cache entries use the same `SourceId` + `TrackId` shape as live playback. The download engine mints or adopts a per-source `MediaKey`; it never invents a new identity kind. | New persisted identifier types, new schema migrations, on-disk naming conventions beyond `task.md` and the credential-boundary section. |
 | Authority | Every cached media entry remains owned by its source. The source registry's exact-snapshot capability gates download admission, reconciliation, and retirement. A committed snapshot renders offline without a live registry round-trip; disconnect and refresh never gate playback of committed bytes. No offline bypass of the registry for admission. | Concurrent access contracts for the registry's offline catalogue; specific read-side materialisation policies. |
 | Download jobs | A bounded resumable job model keyed by exact `(SourceId, TrackId)` with a durable, `fsync`'d progress journal, entity validators (`If-Range`) on every range request, opaque server caps, deterministic cancellation, and structured redacted failures. Job state survives restart; it is never memory-only. | Concrete worker pool scheduling, threading model, runtime selection, telemetry. |
@@ -81,12 +81,13 @@ The non-negotiable rules are:
    signed requests are minted only by the exact-origin proxy and consumed only
    through its revocable opaque ticket.
 2. **The redirect policy is the one recorded 2026-07-13.** Authenticated
-   download clients share the `task-remediation-2026-07.md` P1.4 exact-origin + HTTPS-only redirect policy:
-   they must follow the redirect matrix that the existing redirect tests
-   enforce, must refuse HTTPS→HTTP downgrades, must not forward `Referer`, and
-   must never let a redirect re-route a request onto a third-party host. The
-   radio/geolocation public redirect policy is **not** sufficient; offline must
-   reuse the authenticated one.
+   download clients share the `task-remediation-2026-07.md` P1.4
+   exact-origin + HTTPS-only redirect policy: they must follow the redirect
+   matrix that the existing redirect tests enforce, must refuse HTTPS→HTTP
+   downgrades, must not forward `Referer`, and must never let a redirect
+   re-route a request onto a third-party host. The radio/geolocation public
+   redirect policy is **not** sufficient; offline must reuse the
+   authenticated one.
 3. **No off-disk identifier survives log redaction.** Path-like logging is
    forbidden for in-flight bytes. Persisted display labels are the structured
    metadata (`title`, `artist`, `album`), never the URL or the lease.
@@ -170,7 +171,7 @@ A download is a one-shot operation owned by an exact accepted generation. The
 job model is:
 
 | Field | Type | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `media_key` | `MediaKey` | Bounded `(SourceId, TrackId)`; a malformed pair is terminal before any network work. |
 | `capability_epoch` | `u64` | The source registry's exact accepted generation. Stale jobs retire early. |
 | `requested_bytes` | `Option<u64>` | Optional hint from `Content-Length`; missing means unknown total. |
@@ -325,7 +326,7 @@ Adapters opt in by returning `Some(OfflineSnapshot)` from
 `offline_snapshot`. Each adapter documents which download path it provides:
 
 | Backend | Download path | Snapshot cap | Expected-digest provenance | Restrictions |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | Subsonic | `GET .../download?view=...&id=<trackId>` authenticated through the exact-origin proxy. | Per-source byte total bounded at the source-adapter-declared cap; offline rows are still capped by the per-track quota. | None advertised by the API — double-fetch verification. | Bearer URL handling per `task-remediation-2026-07.md` P1.6 — only the proxy ticket ever reaches GTK. |
 | Jellyfin | `GET /Items/<id>/Download` authenticated through the exact-origin proxy. | Identical. | None guaranteed by the API — double-fetch verification. | Same. |
 | Plex | `GET /library/parts/<partId>` authenticated through the exact-origin proxy; uses `X-Plex-Token` only inside the proxy boundary. | Identical. | None advertised by the API — double-fetch verification. | Same. |
@@ -393,7 +394,7 @@ Cached media is licensed only when the source declares it. The licence model
 is small and absolute:
 
 | OperationalLicence | Meaning | Visible to GTK | Persistent |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `Denied` | Default. The cached row exists structurally but cannot become playable. | "Offline unavailable" for that source. | No |
 | `SourceDeclared` | The source declares a contract that allows offline replay of its content for the user. | The licence label only. | No stored text |
 | `Revoked` | The source or backend has changed the licence after a row was committed. | "Licence revoked" for that row. | Row retired |
@@ -478,7 +479,7 @@ that the source itself published.
 This contract fixes the following failure cases:
 
 | Situation | Behavior |
-|---|---|
+| --- | --- |
 | Authenticated remote HTTP returns 401/403 mid-download | Lease revokes; job enters `Failed(AuthExpired)`. Cache row not promoted. |
 | Bytes received but integrity check fails | `Failed(IntegrityMismatch)`. Temp file unlinked; nothing was renamed. |
 | No digest provenance tier available for a backend | `Failed(IntegrityUnverifiable)` before publish; terminal. |
@@ -524,7 +525,7 @@ A successful migration raises the application schema version by exactly one.
 Each slice lands with its own focused regression suite. The slices are:
 
 | Slice | Coverage |
-|---|---|
+| --- | --- |
 | Identity | Same `SourceId` + `TrackId` semantics as live; no second identity kind minted. Derived cache keys: fixed hex charset and width, no separators or traversal, byte-exact identifier input. |
 | Capability | Default-deny behaviour for adapters that opt out; Subsonic/Jellyfin/Plex/DAAP opt in. |
 | Resumable job | Bounded, `If-Range`-validated range requests; `200`/`412` restarts from zero; journal survives crash (offset truncation, last-segment digest re-check); no-validator jobs restart only. |
