@@ -3598,6 +3598,7 @@ pub(crate) fn build_window(
         let cfg = app_config.clone();
         let bs = browser_state.clone();
         let master_for_pref = master_tracks.clone();
+        let output_for_prefs = active_output.clone();
         let prefs_action = gtk::gio::SimpleAction::new("show-preferences", None);
         prefs_action.connect_activate(move |_, _| {
             let bw_for_aa = bw.clone();
@@ -3643,6 +3644,7 @@ pub(crate) fn build_window(
                 on_aa_change,
                 on_art_change,
                 on_art_size_change,
+                &output_for_prefs,
             );
         });
         window.add_action(&prefs_action);
