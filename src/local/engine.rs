@@ -7822,6 +7822,176 @@ mod tests {
         assert!(batch.upsert_paths.contains(Path::new("/music/mixed.flac")));
     }
 
+    /// End-to-end watcher-backlog/root-confirmation ordering harness
+    /// (docs/task.md P3.4). Drives the real `process_directory_events` loop
+    /// with a synthetic event channel: a genuine `RecommendedWatcher` backend
+    /// with zero installed watches contributes no platform event timing, so
+    /// the ordering contract is exercised deterministically without the cost
+    /// of a live inotify/FSEvents/ReadDirectoryChangesW fixture.
+    ///
+    /// A marker mutation mixed with an incremental upsert in one debounced
+    /// batch must be consumed entirely by root confirmation: the confirmation
+    /// scan publishes `FullSync` + `ScanComplete`, and no per-track
+    /// incremental event may precede that boundary. A further event queued
+    /// behind the batch (the watcher backlog) applies only after the root is
+    /// re-confirmed.
+    #[tokio::test]
+    async fn marker_mutation_confirms_root_before_backlog_incrementals_end_to_end() {
+        let db = Arc::new(rename_test_database().await);
+        let fixture = TestDirectory::new("watcher-backlog-root-confirmation-ordering");
+        let root = fixture.path().to_path_buf();
+        let marker = create_root_marker(&root)
+            .expect("create durable root marker")
+            .identity;
+        insert_reauthorization_root(&db, &root, &marker, true).await;
+
+        let audio = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/audio/silence.flac"
+        ));
+        let in_batch_path = root.join("in-batch.flac");
+        let victim_path = root.join("victim.flac");
+        std::fs::write(&in_batch_path, audio).expect("write in-batch audio fixture");
+        std::fs::write(&victim_path, audio).expect("write victim audio fixture");
+        insert_rename_test_track(
+            &db,
+            "backlog-victim",
+            victim_path.to_string_lossy().as_ref(),
+            "Backlog Victim",
+            3,
+        )
+        .await;
+
+        // Synthetic watcher: a real backend with zero installed watches, fed
+        // by a deterministic channel the harness controls.
+        let (event_tx, event_rx) = mpsc::channel(WATCHER_EVENT_CAPACITY);
+        let idle_backend = RecommendedWatcher::new(
+            |_: notify::Result<notify::Event>| {},
+            notify::Config::default(),
+        )
+        .expect("construct idle watcher backend");
+        let watcher = DirectoryWatcher {
+            watcher: idle_backend,
+            rx: event_rx,
+            ingress_overflowed: Arc::new(AtomicBool::new(false)),
+            watched_directories: HashSet::new(),
+        };
+
+        let (library_events, library_event_rx) = async_channel::unbounded();
+        let (_command_tx, command_rx) = async_channel::unbounded::<LibraryCommand>();
+        let playlist_sidebar_refresh = test_playlist_sidebar_refresh();
+        let mut completed_commands = HashMap::new();
+
+        // Debounced batch 1: a marker mutation mixed with an incremental
+        // upsert. The whole batch must be consumed by root confirmation.
+        event_tx
+            .send(Ok(notify::Event::new(notify::EventKind::Create(
+                notify::event::CreateKind::File,
+            ))
+            .add_path(root_identity_path(&root))))
+            .await
+            .expect("queue marker mutation");
+        event_tx
+            .send(Ok(notify::Event::new(notify::EventKind::Create(
+                notify::event::CreateKind::File,
+            ))
+            .add_path(in_batch_path.clone())))
+            .await
+            .expect("queue in-batch upsert");
+
+        // Land the backlog event only after batch 1's debounce deadline
+        // (WATCHER_DEBOUNCE_MS) has passed with margin, so it queues behind
+        // the root-confirmation scan instead of joining the marker batch.
+        let driver = async {
+            tokio::time::sleep(Duration::from_millis(2_500)).await;
+            std::fs::remove_file(&victim_path).expect("delete victim file for backlog remove");
+            event_tx
+                .send(Ok(notify::Event::new(notify::EventKind::Remove(
+                    notify::event::RemoveKind::File,
+                ))
+                .add_path(victim_path.clone())))
+                .await
+                .expect("queue backlog remove");
+            drop(event_tx);
+        };
+
+        let (loop_result, ()) = tokio::join!(
+            process_directory_events(
+                &db,
+                std::slice::from_ref(&root),
+                &library_events,
+                &command_rx,
+                &mut completed_commands,
+                watcher,
+                &playlist_sidebar_refresh,
+            ),
+            driver,
+        );
+        loop_result.expect("watcher loop exits cleanly");
+
+        let events: Vec<LibraryEvent> =
+            std::iter::from_fn(|| library_event_rx.try_recv().ok()).collect();
+
+        // Root confirmation is the scan boundary: no per-track incremental
+        // event may precede the confirmation scan's ScanComplete.
+        let scan_complete = events
+            .iter()
+            .position(|event| matches!(event, LibraryEvent::ScanComplete))
+            .expect("confirmation scan completes");
+        for event in &events[..scan_complete] {
+            assert!(
+                !matches!(event, LibraryEvent::TrackUpserted(_)),
+                "incremental upsert applied before root confirmation: {event:?}"
+            );
+        }
+
+        // The confirmation scan — not the discarded marker batch — indexed
+        // both on-disk files through the authoritative snapshot.
+        let full_sync = events[..scan_complete]
+            .iter()
+            .find_map(|event| match event {
+                LibraryEvent::FullSync(tracks) => Some(tracks),
+                _ => None,
+            })
+            .expect("confirmation scan publishes FullSync");
+        assert!(full_sync.iter().any(|track| {
+            track.file_path.as_deref() == Some(in_batch_path.to_string_lossy().as_ref())
+        }));
+        assert!(full_sync.iter().any(|track| {
+            track.file_path.as_deref() == Some(victim_path.to_string_lossy().as_ref())
+        }));
+
+        // The queued backlog remove applied only after the confirmation
+        // boundary, against the re-confirmed root.
+        assert!(events[scan_complete + 1..].iter().any(|event| matches!(
+            event,
+            LibraryEvent::TrackRemoved(path)
+                if path == victim_path.to_string_lossy().as_ref()
+        )));
+
+        let root_state = library_root::Entity::find_by_id(root.to_string_lossy().as_ref())
+            .one(db.as_ref())
+            .await
+            .expect("query root state")
+            .expect("root row survives");
+        assert!(root_state.identity_confirmed);
+        assert!(root_state.is_available);
+        assert!(root_state.last_scan_complete);
+
+        assert!(track::Entity::find()
+            .filter(track::Column::FilePath.eq(victim_path.to_string_lossy().as_ref()))
+            .one(db.as_ref())
+            .await
+            .expect("query removed victim")
+            .is_none());
+        assert!(track::Entity::find()
+            .filter(track::Column::FilePath.eq(in_batch_path.to_string_lossy().as_ref()))
+            .one(db.as_ref())
+            .await
+            .expect("query scan-indexed file")
+            .is_some());
+    }
+
     #[test]
     fn watcher_batch_normalizes_both_rename_without_fallback_paths() {
         let mut batch = WatcherBatch::default();

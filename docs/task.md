@@ -1188,8 +1188,11 @@ affected-hardware evidence. P2.1 remains the feature focus at **15/39 (38.5%)**.
   enabling `rkyv` serialization or accepting Decimal archive input.
 - [ ] Remove the macOS GStreamer channel-cap workaround only after the upstream fix is in the
   supported runtime floor and passes affected multi-channel hardware testing.
-- [ ] Add a direct end-to-end watcher-backlog/root-confirmation ordering harness if its incremental
-  coverage remains worth the platform-fixture cost.
+- [x] Add a direct end-to-end watcher-backlog/root-confirmation ordering harness if its incremental
+  coverage remains worth the platform-fixture cost. The
+  `marker_mutation_confirms_root_before_backlog_incrementals_end_to_end` harness drives the real
+  watcher loop through a deterministic synthetic event channel, so the ordering contract is covered
+  without a live platform watcher fixture.
 
 ## Explicitly outside this backlog
 
