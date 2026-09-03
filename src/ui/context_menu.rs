@@ -179,10 +179,13 @@ impl PlaylistMutationContext {
     }
 
     fn show_added(&self, count: usize, playlist_name: &str) {
+        // `AdwToast` titles are Pango markup by default; escape the
+        // user-controlled playlist name so `&`/`<` in it render literally
+        // instead of being parsed as markup.
         let message = rust_i18n::t!(
             "context.playlist_add_success",
             count = count,
-            playlist = playlist_name
+            playlist = gtk::glib::markup_escape_text(playlist_name)
         );
         self.toast_overlay
             .add_toast(adw::Toast::new(message.as_ref()));

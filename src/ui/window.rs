@@ -1641,7 +1641,6 @@ pub(crate) fn build_window(
         sidebar_widget,
         sidebar_store,
         sidebar_selection,
-        sidebar_view,
         disconnect_rx,
         delete_rx,
         add_button,
@@ -2276,7 +2275,6 @@ pub(crate) fn build_window(
             near_me_consent_request: near_me_consent_request.clone(),
             sidebar_store: sidebar_store.clone(),
             sidebar_selection: sidebar_selection.clone(),
-            sidebar_view: sidebar_view.clone(),
             playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
             browser_widget: browser_widget.clone(),
             browser_state: browser_state.clone(),
@@ -2400,7 +2398,6 @@ pub(crate) fn build_window(
         near_me_consent_request: near_me_consent_request.clone(),
         sidebar_store: sidebar_store.clone(),
         sidebar_selection: sidebar_selection.clone(),
-        sidebar_view: sidebar_view.clone(),
         playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
         browser_widget: browser_widget.clone(),
         browser_state: browser_state.clone(),
@@ -2463,6 +2460,10 @@ pub(crate) fn build_window(
     // Present the window EARLY so that the native OS surface is
     // allocated.  On Windows, souvlaki needs the HWND which only
     // exists after the window has been realized and mapped.
+    // Sidebar rows are not realized until the main loop pumps after
+    // `present()`, and `setup_context_menu` (later in this function)
+    // populates `playlist_row_drop` before build_window returns — see
+    // the ordering note at the `playlist_row_drop` declaration above.
     window.present();
     info!("Main window presented");
 
@@ -3001,7 +3002,6 @@ pub(crate) fn build_window(
             near_me_consent_request: near_me_consent_request.clone(),
             sidebar_store: sidebar_store_for_events.clone(),
             sidebar_selection: sidebar_sel_for_events.clone(),
-            sidebar_view: sidebar_view.clone(),
             playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
             browser_widget: browser_widget.clone(),
             browser_state: browser_state.clone(),

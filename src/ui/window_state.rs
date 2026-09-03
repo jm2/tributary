@@ -89,10 +89,6 @@ pub struct WindowState {
     /// Used by: discovery_handler, source_connect, window.
     pub sidebar_selection: gtk::SingleSelection,
 
-    /// Sidebar list view used for playlist drop targeting.
-    #[allow(dead_code)]
-    pub sidebar_view: gtk::ListView,
-
     /// True only while the authoritative playlist snapshot is replacing
     /// model rows. Source navigation ignores the intermediate GTK selection
     /// signals; the replacement publishes its one final target afterward.
