@@ -201,26 +201,31 @@ Through the PR #175 planner and executor, not a bespoke copy loop:
 ### Availability and implementation gate
 
 The target UI seam exists on `main` (device rows already carry mount points, and the removable
-controller owns their lifecycle events), but the transfer machinery lives in the still-open PR
-#175. A `main`-only implementation would have to grow a private copy path outside the retained
-lease model — exactly the duplication the backlog forbids. **Implementation is gated on #175
-landing**: a per-row drop target on device rows, candidate grouping per source root, planning
-with the layout/capacity/conflict policy above, execution with progress and the lifecycle-wired
-cancellation, plus focused tests (Preserve conflicts never overwrite, capacity rejection is
-pre-write, unmount mid-transfer rolls back committed stages in reverse order, and a rejected
-transfer emits no success event).
+controller owns their lifecycle events), but the transfer machinery lives in the still-open
+PR #175. A `main`-only implementation would have to grow a private copy path outside the
+retained lease model — exactly the duplication the backlog forbids. **Implementation is gated
+on #175 landing**: a per-row drop target on device rows, candidate grouping per source root,
+planning with the layout/capacity/conflict policy above, execution with progress and the
+lifecycle-wired cancellation, plus focused tests (Preserve conflicts never overwrite, capacity
+rejection is pre-write, unmount mid-transfer rolls back committed stages in reverse order, and
+a rejected transfer emits no success event).
 
 ## Availability matrix (normative)
 
-| Policy | Target semantics today | Implementation prerequisite | Disposition |
-| --- | --- | --- | --- |
-| E — file-manager export | Available for local candidates (files exist; resolvable through retained authority) | PR #182 (the drag surface it must extend) | Deferred — implement the thin union-provider slice when #182 lands |
-| R — remote-row | Not available on any backend (no server write authority; read-only playlist lane; MPD is output-only) | A refined server playlist-write authority record | Out of scope — policy recorded; revisit via a new refined issue |
-| D — device-copy | Not on `main` (planner exists only in PR #175) | PR #175 (planner + write authority) | Deferred — implement the wiring slice when #175 lands |
+- **E — file-manager export.** Target semantics today: available for local candidates (files
+  exist; resolvable through retained authority). Prerequisite: PR #182, the drag surface it must
+  extend. Disposition: deferred — implement the thin union-provider slice when #182 lands.
+- **R — remote-row.** Target semantics today: not available on any backend (no server write
+  authority; read-only playlist lane; MPD is output-only). Prerequisite: a refined server
+  playlist-write authority record. Disposition: out of scope — policy recorded; revisit via a new
+  refined issue.
+- **D — device-copy.** Target semantics today: not on `main` (planner exists only in PR #175).
+  Prerequisite: PR #175 (planner + write authority). Disposition: deferred — implement the
+  wiring slice when #175 lands.
 
 No implementation ships with this document. Shipping a parallel drag source or a private copy
 loop on `main` would create guaranteed conflicts with the in-flight prerequisite PRs and would
-duplicate authority models this city has already paid to get right. Each deferred slice above is
+duplicate authority models this project has already paid to get right. Each deferred slice above is
 small by construction precisely because this document fixes its policy decisions now.
 
 ## Non-goals
