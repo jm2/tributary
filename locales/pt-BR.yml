@@ -447,3 +447,26 @@ rhythmbox_migration:
       automatic_rating_semantics: "a regra de avaliação da playlist automática não pode ser representada com exatidão"
       invalid_occurrence: "o item não tem um local de arquivo válido"
       unmatched_occurrence: "o item é preservado como caminho sem correspondência"
+
+# ── Equalizer ──────────────────────────────────────────────────────
+equalizer:
+  title: "Equalizador"
+  description: "Equalizador de dez faixas com pré-amplificação e proteção contra clipagem para a saída de áudio local."
+  enabled: "Ativar equalizador"
+  preset: "Predefinição"
+  preset_flat: "Plano"
+  preset_pop: "Pop"
+  preset_rock: "Rock"
+  preset_jazz: "Jazz"
+  preset_classical: "Clássica"
+  preset_custom: "Personalizado"
+  preamp: "Pré-amplificação"
+  clip_protection: "Proteção contra clipagem"
+  reset_flat: "Redefinir para plano"
+  reload: "Recarregar do disco"
+  band_a11y: "Faixa do equalizador em %{frequency} hertz, ajustada em decibéis"
+  unsupported:
+    local: "O equalizador é executado dentro do pipeline de áudio local do Tributary."
+    airplay: "Receptores AirPlay processam o áudio de ponta a ponta, então o equalizador do Tributary não chega ao alto-falante."
+    chromecast: "Dispositivos Chromecast processam o áudio no receptor, então o equalizador do Tributary não chega ao alto-falante."
+    mpd: "O MPD processa o áudio no servidor, então o equalizador do Tributary não chega aos reprodutores remotos."
