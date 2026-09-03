@@ -2707,8 +2707,10 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
     /// Resolve an adapter-owned capability through one exact session and
     /// return the lease captured by that same atomic adapter/epoch snapshot.
     /// Typed boundary helpers attach the lease only after the post-resolution
-    /// current-session recheck succeeds.
-    async fn resolve_exact_session<R, F, Fut>(
+    /// current-session recheck succeeds. Crate-visible so the source registry
+    /// can retain the lease itself as an independent revocation handle over
+    /// retained mutation authority.
+    pub(crate) async fn resolve_exact_session<R, F, Fut>(
         &self,
         source_id: SourceId,
         expected_session_epoch: u64,

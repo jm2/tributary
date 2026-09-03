@@ -21,7 +21,7 @@ use crate::architecture::backend::{
 };
 use crate::architecture::error::BackendError;
 use crate::architecture::media::{
-    MediaRequest, PublicHttpAuthority, PublicHttpEndpoint, RemoteMediaResolver,
+    MediaLease, MediaRequest, PublicHttpAuthority, PublicHttpEndpoint, RemoteMediaResolver,
     ResolvedHttpRequest, ResolvedPublicHttpRequest,
 };
 use crate::architecture::models::{RatingCapability, Track};
@@ -30,7 +30,7 @@ use crate::architecture::{
     ViewOrigin,
 };
 use crate::external_file::{ExternalFileCandidate, ExternalFileHint};
-use crate::local::resolver::ResolvedFileMedia;
+use crate::local::resolver::{MountedMutationTarget, ResolvedFileMedia};
 use crate::source_lifecycle::{
     AdapterCloseFuture, AdapterStream, AdapterTaskResult, CatalogueCommitAuthority,
     CatalogueCommitRequest, CloseAuthority, ConstructionCancellationPolicy, FailureCategory,
@@ -47,6 +47,9 @@ pub type StreamFuture =
     Pin<Box<dyn Future<Output = BackendResult<AdapterStream>> + Send + 'static>>;
 type ArtworkFuture =
     Pin<Box<dyn Future<Output = BackendResult<Option<ResolvedHttpRequest>>> + Send + 'static>>;
+/// One retained mutation target resolved through a live managed adapter.
+pub type MutationTargetFuture =
+    Pin<Box<dyn Future<Output = BackendResult<MountedMutationTarget>> + Send + 'static>>;
 // Record C intentionally stops at an internally tested authority foundation;
 // Record D is the first non-test caller of the server-playlist surface.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -64,6 +67,93 @@ pub type ServerPlaylistSnapshotFuture =
 pub enum ResolvedSourceStream {
     Http(MediaRequest),
     File(ResolvedFileMedia),
+}
+
+/// Typed retained mutation authority over one exact accepted removable file.
+///
+/// The value carries the live mount authority, the exact retained file
+/// object, and the owning session's media lease. A tag write through
+/// [`Self::write_tags`] revalidates the mount, ancestry, exact file, write
+/// rights, and replacement target through commit, and is refused once the
+/// owning session is no longer active. The native mount location is
+/// deliberately absent from errors and debug output.
+#[derive(Clone)]
+pub struct RemovableMutationTarget {
+    inner: Arc<MountedMutationTarget>,
+    lease: MediaLease,
+    source_id: SourceId,
+    track_id: TrackId,
+}
+
+impl RemovableMutationTarget {
+    /// The mount-relative identity this target was admitted under.
+    pub fn relative_path(&self) -> &std::path::Path {
+        self.inner.relative_path()
+    }
+
+    /// The exact source session this target belongs to.
+    pub fn source_id(&self) -> SourceId {
+        self.source_id
+    }
+
+    /// The exact accepted track identity this target may replace.
+    pub fn track_id(&self) -> &TrackId {
+        &self.track_id
+    }
+
+    /// Whether the owning source session is still the live one.
+    ///
+    /// A retirement (device removal, pre-unmount, disconnect, or same-source
+    /// replacement) revokes this immediately; a revoked lease can never
+    /// authorize a commit.
+    pub fn is_active(&self) -> bool {
+        self.lease.is_active()
+    }
+
+    /// Point-in-time write-capability probe for the properties dialog.
+    ///
+    /// Revalidates the owning session, the retained authority, then
+    /// rehearses the complete atomic replacement shape beside the exact
+    /// target. Advisory only: the commit revalidates everything fail-closed.
+    /// Blocking — worker threads only.
+    pub fn preflight_write_capability(
+        &self,
+    ) -> Result<(), crate::local::tag_writer::TagWritePreflightError> {
+        use crate::local::tag_writer::TagWritePreflightError;
+
+        // A retirement (device removal, pre-unmount, disconnect, or
+        // same-source replacement) revokes this immediately; a revoked
+        // lease can never authorize a commit, so the probe reports it
+        // before any filesystem rehearsal runs.
+        if !self.is_active() {
+            return Err(TagWritePreflightError::Unavailable);
+        }
+        self.inner
+            .validate()
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
+        crate::local::tag_writer::preflight_tag_write(self.inner.replacement_path())
+    }
+
+    /// Write tag edits through the retained authority.
+    ///
+    /// Fails closed when the owning session was retired, when the mount or
+    /// retained evidence changed, or when the exact pathname no longer names
+    /// the admitted file at commit time. Blocking — worker threads only.
+    pub fn write_tags(&self, edits: &crate::local::tag_writer::TagEdits) -> anyhow::Result<()> {
+        if !self.lease.is_active() {
+            anyhow::bail!("The removable media source is no longer active");
+        }
+        crate::local::tag_writer::write_tags_with_mutation_target(&self.inner, edits)
+    }
+}
+
+impl std::fmt::Debug for RemovableMutationTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemovableMutationTarget")
+            .field("source_id", &self.source_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Whether one managed adapter permits Tributary-owned regular-playlist
@@ -1012,6 +1102,23 @@ pub trait ManagedSourceAdapter: LifecycleAdapter + Send + Sync {
 
     fn resolve_artwork(self: Arc<Self>, _track_id: TrackId) -> ArtworkFuture {
         Box::pin(async { Ok(None) })
+    }
+
+    /// Resolve a typed retained mutation authority for one exact accepted
+    /// file.
+    ///
+    /// The returned target must retain the adapter's own live filesystem
+    /// authority and the exact admitted file object; a commit section through
+    /// it revalidates the mount, ancestry, exact file, and replacement target
+    /// fail-closed. The default and every adapter without a reviewed
+    /// retained-mutation design return unsupported, so pathless rows of
+    /// unreviewed sources stay write-protected.
+    fn resolve_mutation_target(self: Arc<Self>, _track_id: TrackId) -> MutationTargetFuture {
+        Box::pin(async {
+            Err(BackendError::Unsupported {
+                operation: "retained mutation authority".to_string(),
+            })
+        })
     }
 }
 
@@ -2533,6 +2640,40 @@ impl SourceRegistry {
                 move |adapter| async move { adapter.resolve_artwork(track_id).await },
             )
             .await
+    }
+
+    /// Resolve a typed retained mutation authority for one exact accepted
+    /// track through the source's current live session.
+    ///
+    /// The caller's captured session epoch must still be current, the exact
+    /// track must be accepted by the live adapter, and the adapter must opt
+    /// in to retained mutation authority. The returned target keeps the
+    /// session's media lease, so a retirement revokes the ability to commit
+    /// even while the target object itself is still held.
+    pub async fn resolve_mutation_target(
+        &self,
+        source_id: SourceId,
+        expected_session_epoch: u64,
+        track_id: TrackId,
+    ) -> BackendResult<RemovableMutationTarget> {
+        let binding_track_id = track_id.clone();
+        let (inner, lease) =
+            self.inner
+                .lifecycle
+                .resolve_exact_session(
+                    source_id,
+                    expected_session_epoch,
+                    move |adapter| async move {
+                        adapter.resolve_mutation_target(binding_track_id).await
+                    },
+                )
+                .await?;
+        Ok(RemovableMutationTarget {
+            inner: Arc::new(inner),
+            lease,
+            source_id,
+            track_id,
+        })
     }
 }
 
