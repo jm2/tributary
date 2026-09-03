@@ -22,6 +22,15 @@ pub struct SavedOutput {
     /// MPD playback partition. Legacy entries deliberately default to false.
     #[serde(default)]
     pub exclusive_control: bool,
+    /// Whether the user opted in to automatic detection of exclusive control
+    /// before automatic orphan cleanup. Independent of
+    /// `exclusive_control`: a user can confirm exclusive control without
+    /// opting in to detection, or opt in to detection without an explicit
+    /// confirmation. Legacy entries (and the default for new entries) are
+    /// `false` so the conservative "retain orphan unless confirmed" path
+    /// is the default.
+    #[serde(default)]
+    pub detection_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,16 +72,26 @@ fn upsert_saved_output(
     host: &str,
     port: u16,
     exclusive_control: bool,
+    detection_enabled: bool,
 ) -> SavedOutputUpsert {
     if let Some(existing) = outputs
         .iter_mut()
         .find(|output| output.host == host && output.port == port)
     {
         // Re-adding a legacy endpoint is the explicit migration path. Preserve
-        // its existing type and display name so the already-rendered selector
-        // row remains an exact representation of the saved entry.
+        // its existing type, display name, and detection opt-in so the
+        // already-rendered selector row remains an exact representation of
+        // the saved entry. Detection is opt-in per entry, so flipping it
+        // off is not a default migration.
         if exclusive_control && !existing.exclusive_control {
             existing.exclusive_control = true;
+            if detection_enabled {
+                existing.detection_enabled = true;
+            }
+            return SavedOutputUpsert::Upgraded;
+        }
+        if detection_enabled && !existing.detection_enabled {
+            existing.detection_enabled = true;
             return SavedOutputUpsert::Upgraded;
         }
         return SavedOutputUpsert::Unchanged;
@@ -84,6 +103,7 @@ fn upsert_saved_output(
         host: host.to_string(),
         port,
         exclusive_control,
+        detection_enabled,
     });
     SavedOutputUpsert::Added
 }
@@ -95,6 +115,7 @@ pub fn add_saved_output(
     host: &str,
     port: u16,
     exclusive_control: bool,
+    detection_enabled: bool,
 ) -> SavedOutputUpsert {
     let mut outputs = load_saved_outputs();
     let outcome = upsert_saved_output(
@@ -104,6 +125,7 @@ pub fn add_saved_output(
         host,
         port,
         exclusive_control,
+        detection_enabled,
     );
     if !matches!(outcome, SavedOutputUpsert::Unchanged) {
         save_outputs(&outputs);
@@ -122,6 +144,14 @@ fn exclusive_control_confirmation(locale: &str) -> String {
         locale = locale
     )
     .into_owned()
+}
+
+fn detection_warning(locale: &str) -> String {
+    rust_i18n::t!("dialogs.output_detection_warning", locale = locale).into_owned()
+}
+
+fn detection_confirmation(locale: &str) -> String {
+    rust_i18n::t!("dialogs.output_detection_confirmation", locale = locale).into_owned()
 }
 
 /// Remove an output from `outputs.json` by host:port.
@@ -193,6 +223,24 @@ pub fn show_add_output_dialog(window: &adw::ApplicationWindow, output_list: &gtk
         .halign(gtk::Align::Start)
         .build();
 
+    let detection_warning = gtk::Label::builder()
+        .label(detection_warning(&rust_i18n::locale()))
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .max_width_chars(52)
+        .build();
+    let detection_confirmation_label = gtk::Label::builder()
+        .label(detection_confirmation(&rust_i18n::locale()))
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .max_width_chars(52)
+        .xalign(0.0)
+        .build();
+    let detection_confirmation = gtk::CheckButton::builder()
+        .child(&detection_confirmation_label)
+        .halign(gtk::Align::Start)
+        .build();
+
     // Use a GtkGrid for consistent label alignment.
     let grid = gtk::Grid::builder()
         .row_spacing(12)
@@ -224,6 +272,8 @@ pub fn show_add_output_dialog(window: &adw::ApplicationWindow, output_list: &gtk
     grid.attach(&port_spin, 1, 2, 1, 1);
     grid.attach(&exclusive_warning, 0, 3, 2, 1);
     grid.attach(&exclusive_confirmation, 0, 4, 2, 1);
+    grid.attach(&detection_warning, 0, 5, 2, 1);
+    grid.attach(&detection_confirmation, 0, 6, 2, 1);
 
     dialog.set_extra_child(Some(&grid));
     dialog.set_response_enabled("add", false);
@@ -237,6 +287,7 @@ pub fn show_add_output_dialog(window: &adw::ApplicationWindow, output_list: &gtk
     let host_entry_c = host_entry.clone();
     let port_spin_c = port_spin.clone();
     let exclusive_confirmation_c = exclusive_confirmation.clone();
+    let detection_confirmation_c = detection_confirmation.clone();
 
     dialog.connect_response(None, move |_dialog, response| {
         if response != "add" || !exclusive_confirmation_c.is_active() {
@@ -246,6 +297,7 @@ pub fn show_add_output_dialog(window: &adw::ApplicationWindow, output_list: &gtk
         let name = name_entry_c.text().to_string().trim().to_string();
         let host = host_entry_c.text().to_string().trim().to_string();
         let port = port_spin_c.value() as u16;
+        let detection_enabled = detection_confirmation_c.is_active();
 
         if name.is_empty() || host.is_empty() {
             return;
@@ -271,9 +323,11 @@ pub fn show_add_output_dialog(window: &adw::ApplicationWindow, output_list: &gtk
                             host = %host,
                             port,
                             version = %version,
+                            detection_enabled,
                             "MPD output added successfully"
                         );
-                        let outcome = add_saved_output("mpd", &name, &host, port, true);
+                        let outcome =
+                            add_saved_output("mpd", &name, &host, port, true, detection_enabled);
 
                         // A legacy endpoint is upgraded in place; its row is
                         // already present and retains its saved display name.
@@ -311,13 +365,49 @@ mod tests {
         let legacy = r#"[{"type":"mpd","name":"Legacy","host":"mpd.local","port":6600}]"#;
         let mut outputs: Vec<SavedOutput> = serde_json::from_str(legacy).expect("legacy JSON");
         assert!(!outputs[0].exclusive_control);
+        assert!(!outputs[0].detection_enabled);
 
         assert_eq!(
-            upsert_saved_output(&mut outputs, "mpd", "Replacement", "mpd.local", 6600, true),
+            upsert_saved_output(
+                &mut outputs,
+                "mpd",
+                "Replacement",
+                "mpd.local",
+                6600,
+                true,
+                true
+            ),
             SavedOutputUpsert::Upgraded
         );
         let serialized = serde_json::to_string(&outputs).expect("approved JSON");
         assert!(serialized.contains(r#""exclusive_control":true"#));
+        assert!(serialized.contains(r#""detection_enabled":true"#));
+    }
+
+    #[test]
+    fn detection_only_opt_in_upgrades_without_changing_exclusive_confirmation() {
+        let mut outputs = vec![SavedOutput {
+            output_type: "mpd".to_string(),
+            name: "Living Room".to_string(),
+            host: "mpd.local".to_string(),
+            port: 6600,
+            exclusive_control: false,
+            detection_enabled: false,
+        }];
+        assert_eq!(
+            upsert_saved_output(
+                &mut outputs,
+                "mpd",
+                "Living Room",
+                "mpd.local",
+                6600,
+                false,
+                true
+            ),
+            SavedOutputUpsert::Upgraded
+        );
+        assert!(outputs[0].detection_enabled);
+        assert!(!outputs[0].exclusive_control);
     }
 
     #[test]
@@ -329,6 +419,7 @@ mod tests {
                 host: "mpd.local".to_string(),
                 port: 6600,
                 exclusive_control: false,
+                detection_enabled: false,
             },
             SavedOutput {
                 output_type: "mpd".to_string(),
@@ -336,20 +427,38 @@ mod tests {
                 host: "office.local".to_string(),
                 port: 6601,
                 exclusive_control: true,
+                detection_enabled: false,
             },
         ];
         let sibling = outputs[1].clone();
 
         assert_eq!(
-            upsert_saved_output(&mut outputs, "mpd", "Renamed", "mpd.local", 6600, true),
+            upsert_saved_output(
+                &mut outputs,
+                "mpd",
+                "Renamed",
+                "mpd.local",
+                6600,
+                true,
+                false
+            ),
             SavedOutputUpsert::Upgraded
         );
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].name, "Living Room");
         assert!(outputs[0].exclusive_control);
+        assert!(!outputs[0].detection_enabled);
         assert_eq!(outputs[1], sibling);
         assert_eq!(
-            upsert_saved_output(&mut outputs, "mpd", "Renamed", "mpd.local", 6600, true),
+            upsert_saved_output(
+                &mut outputs,
+                "mpd",
+                "Renamed",
+                "mpd.local",
+                6600,
+                true,
+                false
+            ),
             SavedOutputUpsert::Unchanged
         );
         assert_eq!(outputs.len(), 2);
@@ -362,6 +471,25 @@ mod tests {
         for locale in rust_i18n::available_locales!() {
             let warning = exclusive_control_warning(&locale);
             let confirmation = exclusive_control_confirmation(&locale);
+            assert!(!warning.is_empty(), "{locale} warning");
+            assert!(!confirmation.is_empty(), "{locale} confirmation");
+            if locale != "en" {
+                assert_ne!(warning, english_warning, "{locale} warning fallback");
+                assert_ne!(
+                    confirmation, english_confirmation,
+                    "{locale} confirmation fallback"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn detection_warning_and_confirmation_are_localized_everywhere() {
+        let english_warning = detection_warning("en");
+        let english_confirmation = detection_confirmation("en");
+        for locale in rust_i18n::available_locales!() {
+            let warning = detection_warning(&locale);
+            let confirmation = detection_confirmation(&locale);
             assert!(!warning.is_empty(), "{locale} warning");
             assert!(!confirmation.is_empty(), "{locale} confirmation");
             if locale != "en" {

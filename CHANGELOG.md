@@ -19,6 +19,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Build and run helpers** — Add `--run` on Linux and macOS to build with locked
   dependencies, validate the native binary, and launch it with logs in the terminal.
   The macOS development route uses Homebrew libraries and skips app packaging.
+- **MPD outputs can now be supervised while under the user's explicit exclusive-control
+  confirmation** (`src/audio/mpd_output.rs`, `src/ui/output_dialogs.rs`,
+  `src/ui/output_switch.rs`, `locales/*.yml`). The user's explicit confirmation remains the
+  ONLY grant of partition authority: automatic authority is declared infeasible because MPD
+  offers no ownership lock, lease, token, or atomic conditional partition mutation. The
+  `detection_enabled` persisted field now opts an exclusive output into a revoke-only
+  supervisor: a foreign current song, any of `repeat`/`random`/`single`/`consume` flipped away
+  from the enforced defaults, or an observation gap beyond `MAX_SUPERVISION_GAP = 2 s` lapses
+  the supervisor, which revokes playback control — loads and partition-global playback
+  controls are refused with the exclusive-control-required error and orphan cleanup retains
+  the queue entry — until the user explicitly reconfirms by re-selecting the output. Quiet
+  status polling never grants or restores authority, and a lapsed supervisor is terminal for
+  the output instance. The `exclusive_control: false` default, the fail-closed load gate, the
+  refuse-before-Buffering/epoch/enqueue ordering, and the relinquish-without-racy-stop rule
+  for a foreign current song are all preserved; legacy `outputs.json` entries continue to
+  deserialize with `detection_enabled: false`, and a legacy `detection_enabled: true` entry
+  without the exclusive confirmation fails closed to `Unconfirmed`. The Add Output dialog
+  saves supervision only together with the exclusive confirmation, paired with a localized
+  warning/confirmation message in every supported catalog (13 locales).
 
 ### Changed
 
