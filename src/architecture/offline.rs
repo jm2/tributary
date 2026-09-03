@@ -183,6 +183,11 @@ pub enum OfflineError {
     /// The post-write SHA-256 of the bytes on disk did not match the
     /// server-advertised digest. Terminal; the temp file is unlinked.
     IntegrityMismatch,
+    /// No digest provenance tier could supply an expected digest: the
+    /// backend advertises none and double-fetch verification could not
+    /// produce one. Terminal before publish; the temp file is unlinked
+    /// and nothing was renamed (`docs/offline-media.md:358-361`).
+    IntegrityUnverifiable,
     /// The source declared `OperationalLicence::Denied` or `Revoked` at
     /// admission. The job is refused before any network work.
     LicenceDenied,
@@ -191,14 +196,12 @@ pub enum OfflineError {
     QuotaExceeded,
     /// The filesystem refused the temp reservation or the rename.
     StorageUnavailable,
-    /// The source does not support offline; the engine refused
-    /// admission. A backend that returns [`OfflineCapability::None`]
-    /// from `offline_capability` never enters this state — only a
-    /// backend that explicitly opted in and later declined does.
+    /// The source explicitly refuses offline. A backend returns
+    /// `Err(OfflineError::UnsupportedSource)` from `offline_snapshot` —
+    /// structurally distinct from `Ok(None)`, which means the source has
+    /// not declared a position (`docs/offline-media.md:134-142`). The
+    /// engine refuses admission before any network work.
     UnsupportedSource,
-    /// User-driven cancel, lifecycle supersession, or shutdown. The temp
-    /// file is unlinked; no cache row is created.
-    Cancelled,
 }
 
 impl fmt::Display for OfflineError {
@@ -208,14 +211,47 @@ impl fmt::Display for OfflineError {
             Self::AuthExpired => "auth-expired",
             Self::LeaseRevoked => "lease-revoked",
             Self::IntegrityMismatch => "integrity-mismatch",
+            Self::IntegrityUnverifiable => "integrity-unverifiable",
             Self::LicenceDenied => "licence-denied",
             Self::QuotaExceeded => "quota-exceeded",
             Self::StorageUnavailable => "storage-unavailable",
             Self::UnsupportedSource => "unsupported-source",
-            Self::Cancelled => "cancelled",
         };
         formatter.write_str(label)
     }
+}
+
+/// Entity validator captured from the first successful response of a
+/// download job (`docs/offline-media.md:178`). A strong `ETag` is
+/// preferred; `Last-Modified` is the fallback when no strong entity tag
+/// exists. `Some(validator)` is required for any resumption — the
+/// engine re-requests the remainder with `Range` **and** `If-Range`
+/// carrying the captured value; `None` disables resume and restricts
+/// the job to a full restart (`docs/offline-media.md:193-205`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum EntityValidator {
+    /// Strong entity tag captured from the first successful response.
+    ETag(String),
+    /// `Last-Modified` timestamp captured when no strong ETag exists.
+    LastModified(String),
+}
+
+/// Which provenance tier supplied the expected digest a committed
+/// snapshot was verified against (`docs/offline-media.md:343-361`).
+/// An expected digest may come from exactly these two places; a backend
+/// with neither tier cannot be downloaded from and fails
+/// [`OfflineError::IntegrityUnverifiable`] before any byte is promoted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DigestProvenance {
+    /// A digest whose field, header, or API property is named in the
+    /// contract's capability matrix and documented in the adapter. It
+    /// is compared exactly against the engine-computed SHA-256.
+    Advertised,
+    /// No digest is advertised: the engine issued a fresh authenticated
+    /// second transfer for the same resource and required the SHA-256
+    /// of both transfers to be identical. The offline quota is charged
+    /// once, for the committed bytes.
+    DoubleFetch,
 }
 
 /// One immutable result of one admitted download job at one version.
@@ -234,6 +270,11 @@ pub struct CommittedSnapshot {
     /// SHA-256 of the bytes on disk, computed post-write and re-checked
     /// on resume. Hex-encoded, lowercase.
     pub sha256_hex: String,
+    /// Which provenance tier supplied the expected digest this snapshot
+    /// was verified against. The commit row records the digest provenance
+    /// used, alongside the mapping and the engine-computed digest
+    /// (`docs/offline-media.md:269-271`).
+    pub digest_provenance: DigestProvenance,
     /// The storage-engine-minted path inside the cache root. Opaque; no
     /// URL, credential, or credential-bearing parameter appears here.
     pub cache_path: String,
@@ -246,11 +287,18 @@ pub struct CommittedSnapshot {
 /// A live, in-flight download job. The engine owns one `JobRecord` per
 /// `(media_key, capability_epoch)` and never admits a second while the
 /// first is non-terminal.
+///
+/// The field set and types mirror the contract's job-model table at
+/// `docs/offline-media.md:173-183`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JobRecord {
     pub media_key: MediaKey,
     pub capability_epoch: u64,
     pub requested_bytes: Option<u64>,
+    /// Entity validator captured from the first successful response.
+    /// `Some` is required for any resumption; `None` disables resume
+    /// and restricts the job to a full restart.
+    pub resume_validator: Option<EntityValidator>,
     pub current_bytes: u64,
     /// Progressively trusted only after the full file is received and
     /// re-checked post-write. `None` until the engine reaches `Verifying`;
@@ -271,6 +319,7 @@ impl JobRecord {
             media_key,
             capability_epoch,
             requested_bytes: None,
+            resume_validator: None,
             current_bytes: 0,
             current_sha256: None,
             state: JobState::Queued,
@@ -316,40 +365,6 @@ pub enum OfflineCatalogueEntry {
     /// A committed snapshot exists but its licence has been revoked.
     /// The file is preserved on disk; the row is not playable.
     Revoked(CommittedSnapshot),
-}
-
-/// A single source's offline capability decision. Default-deny at every
-/// layer — a source that does not declare returns [`OfflineCapability::None`]
-/// from [`MediaBackend::offline_capability`](super::backend::MediaBackend::offline_capability),
-/// and the engine never opens a job for it. A source that explicitly
-/// refuses offline returns [`OfflineCapability::Denied`], which is
-/// structurally distinct from `None` so the engine can surface
-/// [`OfflineError::UnsupportedSource`] to GTK. Only the same set of
-/// backends that opt into live `ServerPlaylist`-style read authority
-/// (Subsonic, Jellyfin, Plex, DAAP) may opt in here; Radio-Browser,
-/// removable, external-file, and the built-in local source must remain
-/// `None` because they are not credentialed, are already local, or are
-/// lifecycle-bound without a credential lane.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OfflineCapability {
-    /// The source has not declared any offline capability. Local files,
-    /// removable volumes, external-file sessions, and Radio-Browser
-    /// return this and never enter the offline cache.
-    None,
-    /// The source has explicitly declined offline. Distinct from `None`
-    /// so the engine can emit a structured `UnsupportedSource` reason.
-    Denied,
-    /// The source has admitted an offline capability with the supplied
-    /// snapshot.
-    Allowed(OfflineSnapshot),
-}
-
-impl OfflineCapability {
-    /// Default-deny constructor. Backends that do not implement
-    /// `offline_capability` return this.
-    pub fn default_deny() -> Self {
-        Self::None
-    }
 }
 
 /// Well-known licence labels. The application never invents licence
@@ -402,11 +417,11 @@ mod tests {
             OfflineError::AuthExpired,
             OfflineError::LeaseRevoked,
             OfflineError::IntegrityMismatch,
+            OfflineError::IntegrityUnverifiable,
             OfflineError::LicenceDenied,
             OfflineError::QuotaExceeded,
             OfflineError::StorageUnavailable,
             OfflineError::UnsupportedSource,
-            OfflineError::Cancelled,
         ] {
             let rendered = variant.to_string();
             for forbidden in ["http://", "https://", "token=", "password=", "Bearer "] {
@@ -419,11 +434,6 @@ mod tests {
     }
 
     #[test]
-    fn offline_capability_default_is_none() {
-        assert_eq!(OfflineCapability::default_deny(), OfflineCapability::None);
-    }
-
-    #[test]
     fn media_key_round_trip_via_source_and_track_ids() {
         let key = MediaKey::new(SourceId::local(), TrackId::new("track-1").unwrap());
         let record = JobRecord::new(key.clone(), 1);
@@ -433,6 +443,7 @@ mod tests {
         assert!(record.failure.is_none());
         assert_eq!(record.current_bytes, 0);
         assert!(record.requested_bytes.is_none());
+        assert!(record.resume_validator.is_none());
         assert!(record.current_sha256.is_none());
         assert!(record.last_lease.is_none());
     }

@@ -15,7 +15,7 @@ use super::models::{
     Album, Artist, LibraryStats, Rating, RatingCapability, SearchResults, SortField, SortOrder,
     Track,
 };
-use super::offline::OfflineCapability;
+use super::offline::{OfflineError, OfflineSnapshot};
 
 /// The result type used throughout backend operations.
 pub type BackendResult<T> = Result<T, BackendError>;
@@ -154,23 +154,25 @@ pub trait MediaBackend: Send + Sync {
     async fn get_stats(&self) -> BackendResult<LibraryStats>;
 
     // -------------------------------------------------------------------
-    // Offline capability
+    // Offline snapshot capability
     // -------------------------------------------------------------------
 
-    /// Default-deny offline capability declaration.
+    /// Default-deny offline snapshot capability declaration.
     ///
-    /// The contract in `docs/offline-media.md` requires every backend to
-    /// declare its offline position explicitly. The fail-closed default
-    /// returns [`OfflineCapability::None`], which the engine treats as
-    /// "this source has not declared offline capability and is therefore
-    /// not eligible for the cache". The same set of backends that opt
-    /// into live `ServerPlaylist`-style read authority (Subsonic,
-    /// Jellyfin, Plex, DAAP) may opt in here; Radio-Browser, removable,
-    /// external-file, and the built-in local source must remain
-    /// `None` because they are not credentialed, are already local, or
-    /// are lifecycle-bound without a credential lane.
-    fn offline_capability(&self) -> OfflineCapability {
-        OfflineCapability::default_deny()
+    /// The contract at `docs/offline-media.md:134-142` requires every
+    /// backend to declare its offline position explicitly through
+    /// `offline_snapshot() -> Result<Option<OfflineSnapshot>, OfflineError>`:
+    /// `Ok(None)` means the source has not declared and is therefore
+    /// not eligible for the cache; `Err(OfflineError::UnsupportedSource)`
+    /// means it explicitly refuses; `Ok(Some(snapshot))` admits
+    /// downloads bounded by the snapshot's per-source byte cap. The
+    /// same set of backends that opt into live `ServerPlaylist`-style
+    /// read authority (Subsonic, Jellyfin, Plex, DAAP) may opt in here;
+    /// Radio-Browser, removable, external-file, and the built-in local
+    /// source must not opt in because they are not credentialed, are
+    /// already local, or are lifecycle-bound without a credential lane.
+    fn offline_snapshot(&self) -> Result<Option<OfflineSnapshot>, OfflineError> {
+        Ok(None)
     }
 }
 
@@ -254,6 +256,19 @@ mod tests {
 
         assert!(tracks.is_empty());
         assert_eq!(spy.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn offline_snapshot_defaults_to_not_declared() {
+        let spy = CatalogSpy {
+            calls: AtomicUsize::new(0),
+            tracks: Vec::new(),
+            rating_capability: RatingCapability::Unsupported,
+        };
+        // The fail-closed default is `Ok(None)`: the source has not
+        // declared, so the engine never opens a job for it. Explicit
+        // refusal is a separate, structured `Err` variant.
+        assert_eq!(spy.offline_snapshot(), Ok(None));
     }
 
     #[tokio::test]
