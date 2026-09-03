@@ -26,8 +26,8 @@ pub use media::{
 // lib-level surface unchanged.
 #[allow(unused_imports)]
 pub use offline::{
-    licence_labels, CommittedSnapshot, JobRecord, JobState, LeaseId, OfflineCapability,
-    OfflineCatalogueEntry, OfflineError, OfflineSnapshot, OperationalLicence,
+    licence_labels, CommittedSnapshot, DigestProvenance, EntityValidator, JobRecord, JobState,
+    LeaseId, OfflineCatalogueEntry, OfflineError, OfflineSnapshot, OperationalLicence,
     MAX_OFFLINE_BYTE_HINT, MAX_OFFLINE_SNAPSHOT_PATH_BYTES,
 };
 pub use server_playlist::{
