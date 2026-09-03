@@ -40,10 +40,31 @@ hasn't already been applied out-of-band.
 ## Reviewer policy
 
 Repository-owned AI review workflows are deliberately absent from both forks.
-Refinery does not wait on an AI-review workflow, vendor bot status, or reviewer
-credential stored by the repository. The only repo-owned admission gate is the
-normal hosted CI gate above. Third-party status integrations configured outside
-the repository are not accepted as refinery-review evidence.
+That describes what these repositories run themselves; it is not an exemption
+from review. Third-party GitHub App integrations (Codacy, CodeQL, CodeRabbit,
+and any other bot) post genuine checks and reviews on every pull request, and
+those checks and reviews count.
+
+**Operator policy (2026-09-03): a pull request is merge-ready only when every
+check and every bot review is green.** That includes the hosted CI jobs above
+(test/lint/clippy, Coverage, the cross-compiled aarch64 matrix), Codacy Static
+Code Analysis, CodeQL, Coverage, CodeRabbit, and any other bot or status
+integration that posts on the pull request — regardless of whether branch
+protection marks the check "required". A pending or failing bot check blocks
+merge exactly like a red CI job; "not required" is not an exemption.
+
+### Addressing Codacy/CodeRabbit findings
+
+When a bot leaves findings on your pull request:
+
+1. Read the bot's review comments on the PR (the Reviews tab and the inline
+   comments).
+2. Fix the valid findings in your worktree.
+3. Push the fixes to the same `polecat/<bead-id>` branch — never a side
+   branch or a second PR. The bots re-review the new head automatically.
+4. Repeat until every bot check and review is green. The refinery gate is
+   fail-closed ("pending is never green"), so a re-review still running at
+   poll time simply keeps the merge waiting.
 
 Operational review is performed out of band by Gas City's locally configured
 GLM 5.3 reviewer. Its admission and evidence belong to the rollout manifests,
