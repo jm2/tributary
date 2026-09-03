@@ -46,9 +46,12 @@
 
 /* Subtle separator between browser panes (HIG: rely on background
  * contrast rather than a hard rule; tone the line down so it reads
- * as a gutter, not a divider). */
+ * as a gutter, not a divider). Standard CSS only: the opaque theme
+ * border color scaled down by element opacity — the web-CSS-safe
+ * equivalent of GTK's alpha(@borders, 0.15). */
 .browser-separator {
-    background-color: alpha(@borders, 0.15);
+    background-color: @borders;
+    opacity: 0.15;
     min-width: 1px;
 }
 
