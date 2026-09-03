@@ -28,6 +28,7 @@
 //! (local, Subsonic, Jellyfin, Plex, DAAP, radio) are managed by the
 //! sidebar and are completely independent of the active output.
 
+use super::equalizer::EqSettings;
 use super::{PlayerEventGeneration, PlayerState};
 use crate::architecture::media::ResolvedHttpRequest;
 use crate::local::resolver::ResolvedLocalMedia;
@@ -68,6 +69,35 @@ pub trait AudioOutput {
     /// When `false`, the header bar volume slider should be disabled
     /// (greyed out).  MPD manages its own volume independently.
     fn supports_volume(&self) -> bool;
+
+    /// Whether this output can render the application-side equalizer
+    /// (docs/equalizer.md capability matrix). Only the local pipeline
+    /// owns a decoder-to-sink chain in process; AirPlay, Chromecast, and
+    /// MPD receivers render audio end-to-end, so the honest answer there
+    /// is `false`. The settings UI renders the controls disabled with a
+    /// closed-form explanation whenever this returns `false`.
+    fn supports_equalizer(&self) -> bool {
+        false
+    }
+
+    /// The current equalizer state this output holds. Defaults to the
+    /// fresh-install contract state for outputs without an equalizer.
+    fn equalizer_settings(&self) -> EqSettings {
+        EqSettings::default()
+    }
+
+    /// Apply a new equalizer state. A no-op for outputs that report
+    /// [`supports_equalizer`](Self::supports_equalizer) as `false`: no
+    /// DSP runs, and the persisted settings stay untouched by the
+    /// receiving side (the local pipeline owns the state file).
+    fn apply_equalizer_settings(&self, _settings: EqSettings) {}
+
+    /// Force a re-read of the persisted equalizer state and return what
+    /// is now in effect. A no-op default returning the current state for
+    /// outputs without an equalizer.
+    fn reload_equalizer_settings(&self) -> EqSettings {
+        self.equalizer_settings()
+    }
 
     // ── Playback controls ───────────────────────────────────────────
 
