@@ -144,6 +144,8 @@ dialogs:
   output_port: "Porta"
   output_exclusive_control_warning: "Os comandos MPD de pausar, parar, repetir, aleatório, único e consumir afetam toda a partição de reprodução. Não a compartilhe com outro controlador ou outra instância do Tributary."
   output_exclusive_control_confirmation: "Confirmo que o Tributary tem controle exclusivo desta partição de reprodução MPD."
+  output_detection_warning: "With supervision enabled, Tributary keeps observing the partition while it plays: a foreign current song, a foreign option change, or a lost observation window revokes playback control and keeps any orphaned queue entry. Supervision can only revoke, never grant: after such evidence the output refuses commands until you re-select it to confirm again."
+  output_detection_confirmation: "Supervise this exclusive output and revoke its control on evidence of another controller."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:

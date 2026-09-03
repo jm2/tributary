@@ -144,6 +144,8 @@ dialogs:
   output_port: "포트"
   output_exclusive_control_warning: "MPD의 일시 정지, 정지, 반복, 무작위, 단일 및 consume 명령은 전체 재생 파티션에 영향을 줍니다. 다른 컨트롤러나 Tributary 인스턴스와 공유하지 마세요."
   output_exclusive_control_confirmation: "Tributary가 이 MPD 재생 파티션을 독점 제어함을 확인합니다."
+  output_detection_warning: "With supervision enabled, Tributary keeps observing the partition while it plays: a foreign current song, a foreign option change, or a lost observation window revokes playback control and keeps any orphaned queue entry. Supervision can only revoke, never grant: after such evidence the output refuses commands until you re-select it to confirm again."
+  output_detection_confirmation: "Supervise this exclusive output and revoke its control on evidence of another controller."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
