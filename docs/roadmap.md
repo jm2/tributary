@@ -669,8 +669,9 @@ license, distribution, key-material provenance, and interoperability review.
 - Direct Apple/iTunes XML, Google Takeout CSV, M3U, and service-specific playlist imports are not
   implemented. The documented conversion to XSPF is the current interoperability path, and fuzzy
   “similar name” matching is intentionally avoided.
-- OS-open delivery admits the first valid playable candidate. A multi-file ephemeral queue is a
-  possible future extension, not a committed feature.
+- OS-open delivery admits the first valid playable candidate; the remaining candidates in the same
+  delivery are discarded rather than queued. A multi-file occurrence-preserving ephemeral queue is
+  a possible future extension gated on product approval, not a committed feature.
 - A stronger platform-native removable file identifier and explicit saved-server endpoint rebind
   are possible future schema extensions, not scheduled work.
 - Proper Apple code signing/notarization and the intentionally deferred release-workflow exercise
