@@ -5,7 +5,7 @@
 //! groups: Library Location, Browser Views, and Visible Columns.
 
 use adw::prelude::*;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tracing::{info, warn};
 
 // ── Default column visibility ───────────────────────────────────────────
@@ -92,7 +92,12 @@ pub struct AppConfig {
 /// Bounded at the source by the album-art worker's byte cap (32 MiB); the
 /// GTK side decodes whatever the worker returns into a square of the
 /// selected size, so this knob is layout (not transport) state.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Persistence uses the stable lowercase tokens from [`AlbumArtSize::as_token`]
+/// via the custom `Serialize`/`Deserialize` impls below — not the derived
+/// variant names — so a config file written by an older build stays
+/// loadable across variant renames and additions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AlbumArtSize {
     Small,
     #[default]
@@ -110,9 +115,9 @@ impl AlbumArtSize {
         }
     }
 
-    /// Stable persistence token. New variants must keep older strings
-    /// recognized for in-place config migration.
-    #[allow(dead_code)]
+    /// Stable persistence token. This is the string written to
+    /// `config.json`; new variants must keep older strings recognized
+    /// for in-place config migration.
     pub const fn as_token(self) -> &'static str {
         match self {
             Self::Small => "small",
@@ -121,16 +126,37 @@ impl AlbumArtSize {
         }
     }
 
-    /// Parse a previously-persisted token. Returns `None` for unknown
-    /// values so callers can fall back rather than reject a config file.
-    #[allow(dead_code)]
+    /// Parse a previously-persisted token. Also accepts the bare Rust
+    /// variant names older builds wrote before the token format existed
+    /// (serde's default enum representation), so an in-place upgrade
+    /// migrates them instead of dropping the setting. Returns `None`
+    /// for unknown values so callers can fall back rather than reject
+    /// a config file.
     pub fn from_token(token: &str) -> Option<Self> {
         match token {
-            "small" => Some(Self::Small),
-            "medium" => Some(Self::Medium),
-            "large" => Some(Self::Large),
+            "small" | "Small" => Some(Self::Small),
+            "medium" | "Medium" => Some(Self::Medium),
+            "large" | "Large" => Some(Self::Large),
             _ => None,
         }
+    }
+}
+
+impl Serialize for AlbumArtSize {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_token())
+    }
+}
+
+impl<'de> Deserialize<'de> for AlbumArtSize {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let token = String::deserialize(deserializer)?;
+        // An unknown token falls back to the default size instead of
+        // failing the whole `AppConfig` load: `load_config` treats a
+        // deserialize error as "no usable config" and resets every
+        // user preference, which is far more destructive than losing
+        // one layout knob.
+        Ok(Self::from_token(&token).unwrap_or_default())
     }
 }
 

@@ -506,10 +506,11 @@ impl AlbumArtController {
         }
     }
 
-    /// Build the bind factory pair (`setup` + `bind`) for the album pane.
+    /// Build the bind factory closures for the album pane, additionally
+    /// wiring the controller to the supplied size knob.
     ///
-    /// `unbind` is exposed through the returned [`AlbumArtBinder`] so
-    /// callers can wire it to the factory. The bind factory:
+    /// `unbind` and `teardown` are exposed alongside `setup` + `bind` so
+    /// callers can wire them to the factory. The bind factory:
     /// * Snapshots the `BrowserItem`'s artwork candidate.
     /// * Stamps the cell with a fresh `BindGeneration` so any in-flight
     ///   fetch for the prior row is invalidated.
@@ -521,29 +522,17 @@ impl AlbumArtController {
     /// `gtk::Box` per `ListItem`, holding an `Image` and a `Label`). The
     /// bind phase updates those existing widgets in place; `unbind`
     /// disconnects the artwork-paintable notify handler so the next bind
-    /// can install a fresh one without leaking observers.
-    #[allow(clippy::type_complexity, dead_code)]
-    pub fn build_binder(
-        &self,
-    ) -> (
-        impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
-        impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
-        impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
-        AlbumArtBinder,
-    ) {
-        self.build_binder_with_size_internal(None)
-    }
-
-    /// Build the bind factory pair, additionally wiring the controller
-    /// to the supplied size knob. Equivalent to `build_binder` followed
-    /// by `attach_pixel_size`, but folded into a single call so the
-    /// browser's pane-rebuild path doesn't have to plumb the cell
-    /// through a second setter.
+    /// can install a fresh one without leaking observers; `teardown`
+    /// removes the cell state entirely when GTK discards the list item
+    /// (row recycled out of the view, view destroyed, or the factory
+    /// swapped), releasing the widget tree and stopping any fetch still
+    /// attached to it.
     #[allow(clippy::type_complexity)]
     pub fn build_binder_with_size(
         &self,
         pixel_size: Rc<Cell<i32>>,
     ) -> (
+        impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
         impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
         impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
         impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
@@ -560,6 +549,7 @@ impl AlbumArtController {
         impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
         impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
         impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
+        impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static,
         AlbumArtBinder,
     ) {
         if let Some(cell) = pixel_size {
@@ -568,7 +558,6 @@ impl AlbumArtController {
         let placeholder_icon = self.placeholder_icon;
         let binder = AlbumArtBinder::new(self.clone());
         let cell_states = binder.cell_states.clone();
-        let controller = self.clone();
 
         let setup = move |_factory: &gtk::SignalListItemFactory, list_item: &glib::Object| {
             let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
@@ -582,8 +571,8 @@ impl AlbumArtController {
 
         let bind = binder.bind_fn();
         let unbind = binder.unbind_fn();
-        let _ = controller;
-        (setup, bind, unbind, binder)
+        let teardown = binder.teardown_fn();
+        (setup, bind, unbind, teardown, binder)
     }
 }
 
@@ -697,6 +686,27 @@ impl AlbumArtBinder {
                 state.generation.set(state.generation.get().next());
                 *state.bound_album_key.borrow_mut() = None;
                 *state.bound_source.borrow_mut() = None;
+                if let Some(handler_id) = state.paintable_notify_id.borrow_mut().take() {
+                    state.cell.image.disconnect(handler_id);
+                }
+            }
+        }
+    }
+
+    fn teardown_fn(&self) -> impl Fn(&gtk::SignalListItemFactory, &glib::Object) + 'static {
+        let cell_states = self.cell_states.clone();
+        move |_factory: &gtk::SignalListItemFactory, list_item: &glib::Object| {
+            let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
+            let key = list_item.as_ptr() as usize;
+            if let Some(state) = cell_states.borrow_mut().remove(&key) {
+                // The row widget leaves the tree for good here. Revoke
+                // any in-flight fetch and drop the paintable listener,
+                // then drop the state itself — without this, every
+                // discarded row's `AlbumArtCellState` (and the widget
+                // tree it holds) survived until the next pane rebuild,
+                // so artwork toggles and size changes accumulated dead
+                // entries in `cell_states`.
+                state.revoke();
                 if let Some(handler_id) = state.paintable_notify_id.borrow_mut().take() {
                     state.cell.image.disconnect(handler_id);
                 }
@@ -1189,6 +1199,31 @@ mod tests {
         }
         assert!(AlbumArtSize::from_token("nope").is_none());
         assert!(AlbumArtSize::from_token("").is_none());
+    }
+
+    #[test]
+    fn album_art_size_persists_as_stable_token() {
+        // The persisted form is the lowercase token, not the serde
+        // default variant name — that's the migration guarantee the
+        // custom Serialize/Deserialize impls exist to provide.
+        assert_eq!(
+            serde_json::to_value(AlbumArtSize::Medium).expect("serialize"),
+            serde_json::Value::String("medium".into())
+        );
+        // Older builds wrote the bare variant names (derived enum
+        // representation); they must keep loading.
+        assert_eq!(
+            serde_json::from_value::<AlbumArtSize>(serde_json::Value::String("Small".into()))
+                .expect("legacy variant name"),
+            AlbumArtSize::Small
+        );
+        // An unknown token falls back to the default instead of failing
+        // the whole AppConfig load.
+        assert_eq!(
+            serde_json::from_value::<AlbumArtSize>(serde_json::Value::String("huge".into()))
+                .expect("unknown token falls back"),
+            AlbumArtSize::default()
+        );
     }
 
     #[test]
