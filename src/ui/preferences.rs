@@ -620,6 +620,7 @@ pub fn show_preferences(
     browser_box: &gtk::Box,
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
     on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
+    active_output: &super::equalizer::SharedAudioOutput,
 ) {
     let prefs_dialog = adw::PreferencesDialog::builder()
         .title(rust_i18n::t!("preferences.title").as_ref())
@@ -995,6 +996,11 @@ pub fn show_preferences(
     columns_group.add(&columns_grid);
     columns_group.add(&reset_btn);
     page.add(&columns_group);
+
+    // Equalizer group — capability-aware: disabled with a closed-form
+    // explanation whenever the active output cannot render EQ DSP.
+    let equalizer_group = super::equalizer::build_equalizer_group(active_output);
+    page.add(&equalizer_group);
 
     prefs_dialog.add(&page);
     drop(cfg);
