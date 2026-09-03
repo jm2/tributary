@@ -1430,6 +1430,17 @@ pub(crate) fn build_window(
     let lastfm_playback = lastfm_playback_owner
         .bind_window(source_registry.clone())
         .expect("the unique process playback coordinator binds one window epoch");
+    // The durable Last.fm policy generation starts closed and is replaced
+    // wholesale once the migrated database becomes available. Playback queue
+    // capture reads it synchronously; no shipping path mutates policy yet,
+    // so the feature stays fail-closed until the consent/settings slice
+    // lands. The database-init task publishes successors from off the GTK
+    // thread, so the slot is a `Send` mutex rather than a `RefCell`.
+    let lastfm_policy: std::sync::Arc<
+        std::sync::Mutex<crate::lastfm::policy::LastFmPolicyGeneration>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::lastfm::policy::LastFmPolicyGeneration::default(),
+    ));
     // Compose the process application owner before asynchronous database
     // initialization. It remains Dormant until a future consent/policy layer
     // issues the move-only activation authority; ordinary builds without
@@ -2050,9 +2061,25 @@ pub(crate) fn build_window(
     let engine_server_playlist_coordinator = server_playlist_coordinator.clone();
     let engine_source_registry = source_registry.clone();
     let engine_lastfm_application = lastfm_application.clone();
+    let engine_lastfm_policy = lastfm_policy.clone();
     rt_handle.spawn(async move {
         match crate::db::connection::init_db().await {
             Ok(db) => {
+                // Publish the persisted policy generation before anything can
+                // capture a playback queue. A load failure keeps the closed
+                // default: the feature stays off rather than guessing at a
+                // malformed record.
+                match crate::lastfm::policy::load_policy_generation(&db).await {
+                    Ok(policy) => {
+                        *engine_lastfm_policy.lock().unwrap() = policy;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            category = %error,
+                            "Last.fm policy remained closed after a load failure"
+                        );
+                    }
+                }
                 let lastfm_phase = engine_lastfm_application.subscribe_status().borrow().phase;
                 let lastfm_database_outcome = compose_lastfm_database(lastfm_phase, || {
                     engine_lastfm_application
@@ -2595,6 +2622,7 @@ pub(crate) fn build_window(
             let playback_config = app_config.clone();
             let playback_source_registry = source_registry.clone();
             let playback_lastfm = lastfm_playback.clone();
+            let playback_lastfm_policy = lastfm_policy.clone();
             let media_playback_admission = library_commands.clone();
 
             glib::MainContext::default().spawn_local(async move {
@@ -2618,6 +2646,7 @@ pub(crate) fn build_window(
                         column_view: column_view_for_keys.clone(),
                         source_registry: playback_source_registry.clone(),
                         lastfm_playback: playback_lastfm.clone(),
+                        lastfm_policy: playback_lastfm_policy.clone(),
                     };
                     match action {
                         MediaAction::Play => {
@@ -2691,6 +2720,7 @@ pub(crate) fn build_window(
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
         let playback_lastfm = lastfm_playback.clone();
+        let playback_lastfm_policy = lastfm_policy.clone();
         let playback_admission = library_commands.clone();
 
         hb.play_button.connect_clicked(move |_| {
@@ -2712,6 +2742,7 @@ pub(crate) fn build_window(
                     column_view: column_view_c.clone(),
                     source_registry: playback_source_registry.clone(),
                     lastfm_playback: playback_lastfm.clone(),
+                    lastfm_policy: playback_lastfm_policy.clone(),
                 },
                 shuffle.is_active(),
             );
@@ -2889,6 +2920,7 @@ pub(crate) fn build_window(
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
         let playback_lastfm = lastfm_playback.clone();
+        let playback_lastfm_policy = lastfm_policy.clone();
         let playback_admission = library_commands.clone();
 
         column_view.connect_activate(move |_view, position| {
@@ -2911,6 +2943,7 @@ pub(crate) fn build_window(
                     column_view: cv.clone(),
                     source_registry: playback_source_registry.clone(),
                     lastfm_playback: playback_lastfm.clone(),
+                    lastfm_policy: playback_lastfm_policy.clone(),
                 },
             );
         });
@@ -2960,6 +2993,7 @@ pub(crate) fn build_window(
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
         let playback_lastfm = lastfm_playback.clone();
+        let playback_lastfm_policy = lastfm_policy.clone();
         let playback_admission = library_commands.clone();
 
         hb.next_button.connect_clicked(move |_| {
@@ -2981,6 +3015,7 @@ pub(crate) fn build_window(
                     column_view: cv.clone(),
                     source_registry: playback_source_registry.clone(),
                     lastfm_playback: playback_lastfm.clone(),
+                    lastfm_policy: playback_lastfm_policy.clone(),
                 },
                 repeat_mode.get(),
                 shuffle.is_active(),
@@ -3005,6 +3040,7 @@ pub(crate) fn build_window(
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
         let playback_lastfm = lastfm_playback.clone();
+        let playback_lastfm_policy = lastfm_policy.clone();
         let playback_admission = library_commands.clone();
 
         hb.prev_button.connect_clicked(move |_| {
@@ -3026,6 +3062,7 @@ pub(crate) fn build_window(
                     column_view: cv.clone(),
                     source_registry: playback_source_registry.clone(),
                     lastfm_playback: playback_lastfm.clone(),
+                    lastfm_policy: playback_lastfm_policy.clone(),
                 },
                 repeat_mode.get(),
                 shuffle.is_active(),
@@ -3058,6 +3095,7 @@ pub(crate) fn build_window(
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
         let playback_lastfm = lastfm_playback.clone();
+        let playback_lastfm_policy = lastfm_policy.clone();
         let playback_history_commands = library_commands.clone();
         let playback_shutdown_started = shutdown_started.clone();
 
@@ -3223,6 +3261,7 @@ pub(crate) fn build_window(
                                 column_view: cv.clone(),
                                 source_registry: playback_source_registry.clone(),
                                 lastfm_playback: playback_lastfm.clone(),
+                                lastfm_policy: playback_lastfm_policy.clone(),
                             })
                         {
                             continue;
@@ -3244,6 +3283,7 @@ pub(crate) fn build_window(
                                 column_view: cv.clone(),
                                 source_registry: playback_source_registry.clone(),
                                 lastfm_playback: playback_lastfm.clone(),
+                                lastfm_policy: playback_lastfm_policy.clone(),
                             },
                             mode,
                             shuffle.is_active(),
@@ -3409,6 +3449,7 @@ pub(crate) fn build_window(
         let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
         let playback_lastfm = lastfm_playback.clone();
+        let playback_lastfm_policy = lastfm_policy.clone();
         let playback_admission = library_commands.clone();
 
         let play_pending = gtk::gio::SimpleAction::new("play-pending-files", None);
@@ -3442,6 +3483,7 @@ pub(crate) fn build_window(
             let playback_config = playback_config.clone();
             let playback_source_registry = playback_source_registry.clone();
             let playback_lastfm = playback_lastfm.clone();
+            let playback_lastfm_policy = playback_lastfm_policy.clone();
             let playback_admission = playback_admission.clone();
             glib::MainContext::default().spawn_local(async move {
                 match admission.await {
@@ -3463,6 +3505,7 @@ pub(crate) fn build_window(
                             column_view: cv,
                             source_registry: playback_source_registry,
                             lastfm_playback: playback_lastfm,
+                            lastfm_policy: playback_lastfm_policy,
                         };
                         if super::playback::play_external_session(pending.session(), &ctx) {
                             pending.commit();

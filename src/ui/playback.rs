@@ -1673,15 +1673,15 @@ fn capture_visible_queue(
     source_key: &str,
     selected_position: u32,
     source_registry: &SourceRegistry,
+    enabled_remote_sources: &HashSet<SourceId>,
 ) -> Option<CapturedQueue> {
     let view = queue_view(source_key)?;
     let mut selected_index = None;
     let mut items = Vec::with_capacity(model.n_items() as usize);
     let mut occurrences: HashMap<MediaKey, usize> = HashMap::new();
-    // Persisted per-remote consent is intentionally not part of this slice.
-    // The registry's closed policy therefore admits only intrinsically
-    // eligible managed sources (currently removable media for visible rows).
-    let enabled_remote_sources = HashSet::new();
+    // The caller supplies the exact remote-source opt-in set from the current
+    // immutable Last.fm policy generation. The registry's closed policy still
+    // admits only intrinsically eligible managed sources on top of that set.
 
     for model_index in 0..model.n_items() {
         let Some(track) = model.item(model_index).and_downcast::<TrackObject>() else {
@@ -1697,13 +1697,13 @@ fn capture_visible_queue(
             Some(guard) => source_registry.mint_regular_playlist_playback_source(
                 identity.media_key.clone(),
                 guard,
-                &enabled_remote_sources,
+                enabled_remote_sources,
             ),
             None => track.source_session_epoch().and_then(|session_epoch| {
                 source_registry.mint_session_playback_source(
                     identity.media_key.clone(),
                     session_epoch,
-                    &enabled_remote_sources,
+                    enabled_remote_sources,
                 )
             }),
         };
@@ -1793,6 +1793,13 @@ pub struct PlaybackContext {
     /// Cloneable window binding to the single process-lifetime Last.fm
     /// playback coordinator. It remains inert while the feature is dormant.
     pub lastfm_playback: LastFmPlaybackCoordinatorBinding,
+    /// Shared current Last.fm policy generation. It starts closed and is
+    /// replaced wholesale after the migrated database loads the persisted
+    /// policy; queue capture freezes its remote-source opt-in set. The
+    /// database-init task publishes successor generations from off the GTK
+    /// thread, so the slot is a `Send` mutex rather than a `RefCell`.
+    pub lastfm_policy:
+        std::sync::Arc<std::sync::Mutex<crate::lastfm::policy::LastFmPolicyGeneration>>,
     /// The tracklist `ColumnView` — used to scroll the currently
     /// playing row into view on track change so the user doesn't lose
     /// their place when sequential / shuffled playback advances.
@@ -1871,11 +1878,17 @@ fn control_current_output(ctx: &PlaybackContext, control: impl FnOnce(&dyn Audio
 /// starts the selected item. Later view mutations do not alter that queue.
 pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     let source_key = ctx.active_source_key.borrow().clone();
-    let Some(captured) =
-        capture_visible_queue(&ctx.model, &source_key, position, &ctx.source_registry)
-    else {
+    let policy = ctx.lastfm_policy.lock().unwrap();
+    let Some(captured) = capture_visible_queue(
+        &ctx.model,
+        &source_key,
+        position,
+        &ctx.source_registry,
+        policy.queue_capture_remote_sources(),
+    ) else {
         return false;
     };
+    drop(policy);
     let selected = &captured.items[captured.selected_index];
     if selected.uri.is_empty()
         && !is_library_source(selected.identity.media_key.source_id)
@@ -2837,7 +2850,13 @@ mod tests {
             source_key: &str,
             selected_position: u32,
         ) -> Option<CapturedQueue> {
-            capture_visible_queue(model, source_key, selected_position, &self.registry)
+            capture_visible_queue(
+                model,
+                source_key,
+                selected_position,
+                &self.registry,
+                &HashSet::new(),
+            )
         }
 
         fn wait_for_catalogue(

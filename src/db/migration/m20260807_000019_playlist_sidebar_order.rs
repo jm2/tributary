@@ -630,7 +630,11 @@ mod tests {
             .await
             .expect("insert order row");
 
-        Migrator::down(&db, Some(1))
+        // Downgrade this migration directly: a positional Migrator::down
+        // step would target whatever migration is currently last as later
+        // migrations land.
+        Migration
+            .down(&SchemaManager::new(&db))
             .await
             .expect("downgrade playlist-sidebar order");
         assert!(target_objects_absent(&SchemaManager::new(&db))
