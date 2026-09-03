@@ -645,6 +645,12 @@ pub fn write_tags_with_mutation_target(
     // follow-up commit (a batch retry, or a second edit) is authorized for
     // the file that exists now. Failure is advisory: the next commit section
     // revalidates fail-closed regardless.
+    //
+    // The commit section's guard must be released before rebind: rebind
+    // serializes on the same target lock this section is still holding, and
+    // a std Mutex is not reentrant — relocking it here would deadlock the
+    // writer thread forever.
+    drop(commit);
     let _ = target.rebind();
     Ok(())
 }
