@@ -8100,6 +8100,34 @@ mod tests {
     }
 
     #[test]
+    fn watcher_batch_name_any_alone_demands_reconciliation_without_identity() {
+        // Standalone coverage for the backend rename shape FSEvents and kqueue
+        // emit: one unpaired Name::Any event, with no folder removal or other
+        // event that could mask the routing decision under test.
+        let mut batch = WatcherBatch::default();
+        batch.collect(rename_event(
+            notify::event::RenameMode::Any,
+            &["/music/unknown"],
+            None,
+        ));
+        batch.finish();
+
+        assert!(
+            batch.reconciliation_required,
+            "an unpaired Name::Any rename must request the guarded reconciliation scan"
+        );
+        assert!(
+            batch.rename_pairs.is_empty()
+                && batch.upsert_paths.is_empty()
+                && batch.remove_paths.is_empty()
+                && batch.deferred_paths.is_empty()
+                && batch.dirty_directory_scopes.is_empty(),
+            "Name::Any alone must never infer identity, defer, or dirty a scope"
+        );
+        assert!(!batch.requires_reconciliation_before_incrementals());
+    }
+
+    #[test]
     fn watcher_batch_queues_regular_and_missing_audio_paths_only() {
         let library = TestDirectory::new("watcher-upsert-paths");
         let regular = library.path().join("regular.flac");
@@ -10822,6 +10850,129 @@ mod tests {
             .await
             .expect("query new row after ordinary scan")
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn pending_root_trust_boundary_suppresses_backlog_and_keeps_racing_events() {
+        let db = rename_test_database().await;
+        let target = TestDirectory::new("trust-boundary-backlog");
+        let scan = scan_root(target.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
+            .await
+            .expect("persist empty target root");
+        let request = build_root_trust_request(&scan, &stored, RootTrustReason::EmptyRoot, 0)
+            .expect("build empty-root request");
+
+        let music_dirs = vec![target.path().to_path_buf()];
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let RootTrustCommandStart::Pending(pending) = begin_root_trust_command(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+            &request,
+        )
+        .await
+        .expect("run forced conversion") else {
+            panic!("conversion must queue the ordinary follow-up scan");
+        };
+        let request_id = pending.request_id;
+        let boundary_path = pending.path.clone();
+
+        // The conversion scan intentionally wrote no track rows. A track now
+        // appears on disk, and a healthy watcher stream queues evidence for it
+        // before the pending-root-trust boundary.
+        let boundary_audio = target.path().join("boundary.wav");
+        write_minimal_wav(&boundary_audio);
+        let (watcher_tx, mut watcher_rx) = mpsc::channel(WATCHER_EVENT_CAPACITY);
+        let ingress_overflowed = Arc::new(AtomicBool::new(false));
+        enqueue_watcher_result(
+            &watcher_tx,
+            ingress_overflowed.as_ref(),
+            Ok(
+                notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                    .add_path(boundary_audio.clone()),
+            ),
+        );
+        assert!(!ingress_overflowed.load(Ordering::Acquire));
+
+        // That evidence is actionable: processed normally it would upsert the
+        // track incrementally. The boundary must still suppress it, because
+        // the distinct ordinary authority scan — not the stale incremental —
+        // is what converts the pending trust decision into applied content.
+        let mut suppressed = WatcherDebounceBatch::default();
+        suppressed.collect(Ok(notify::Event::new(notify::EventKind::Create(
+            notify::event::CreateKind::File,
+        ))
+        .add_path(boundary_audio.clone())));
+        let suppressed_batch = suppressed.finish().expect("healthy stream stays reliable");
+        assert!(
+            suppressed_batch
+                .upsert_paths
+                .contains(boundary_audio.as_path()),
+            "the suppressed backlog is real incremental evidence, not access noise"
+        );
+
+        // The boundary: suppress the pre-authority backlog even though the
+        // stream is healthy, then run the real pending-root-trust completion.
+        discard_watcher_backlog(&mut watcher_rx);
+        assert!(
+            watcher_rx.try_recv().is_err(),
+            "watcher evidence queued before the authority scan is suppressed"
+        );
+
+        // Evidence racing the authority scan remains queued: the scan itself
+        // never consumes the watcher queue, so it stays available for the
+        // following loop boundary.
+        let racing_audio = target.path().join("racing.wav");
+        enqueue_watcher_result(
+            &watcher_tx,
+            ingress_overflowed.as_ref(),
+            Ok(
+                notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                    .add_path(racing_audio.clone()),
+            ),
+        );
+        drop(watcher_tx);
+
+        let mut completed_commands = HashMap::new();
+        finish_pending_root_trust_scan(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+            &mut completed_commands,
+            pending,
+        )
+        .await;
+
+        let completion = completed_commands
+            .get(&request_id)
+            .expect("boundary completes the pending root-trust command");
+        assert_eq!(completion.path, boundary_path);
+        assert_eq!(completion.reason, RootTrustReason::EmptyRoot);
+        assert_eq!(completion.outcome, RootTrustOutcome::Active);
+        assert!(
+            track::Entity::find()
+                .filter(track::Column::FilePath.eq(boundary_audio.to_string_lossy().as_ref()))
+                .one(&db)
+                .await
+                .expect("query boundary audio after authority scan")
+                .is_some(),
+            "suppression loses no content: the authority scan delivers the track"
+        );
+        assert_eq!(
+            watcher_rx
+                .try_recv()
+                .expect("racing evidence survives the boundary")
+                .expect("queued notify event")
+                .paths,
+            [racing_audio]
+        );
+        assert!(
+            !ingress_overflowed.load(Ordering::Acquire),
+            "the trust boundary never consults or clears the overflow signal"
+        );
     }
 
     #[tokio::test]
