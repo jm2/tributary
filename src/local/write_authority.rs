@@ -16,10 +16,13 @@
 //! File writes are staged: a sibling temporary file is created with
 //! `O_CREAT | O_EXCL | O_NOFOLLOW` (Unix) or with the reparse-point attribute
 //! rejected (Windows), then renamed atomically once
-//! [`PreparedWriteTarget::commit`] is called. A rollback drops the staged
-//! file. The destination filesystem is observed through the same retained
-//! boundary, so a binder swap or remount between staging and commit is
-//! detected and refused without surfacing a partial publish.
+//! [`PreparedWriteTarget::commit`] is called. The staged handle is closed
+//! before the rename or removal — Windows refuses to rename or delete a file
+//! while a handle without `FILE_SHARE_DELETE` is open, so the handle never
+//! outlives the write phase. A rollback drops the staged file. The
+//! destination filesystem is observed through the same retained boundary, so
+//! a binder swap or remount between staging and commit is detected and
+//! refused without surfacing a partial publish.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -77,7 +80,12 @@ pub struct PreparedWriteTarget {
     /// Absolute path of the staged temporary file. Sibling of the destination
     /// so the rename is atomic on the same filesystem.
     staged_path: PathBuf,
-    staged_file: File,
+    /// Handle on the staged temporary file. Taken and closed before the
+    /// staged path is renamed or removed: on Windows a rename/delete of a
+    /// file fails with a sharing violation while any handle opened without
+    /// `FILE_SHARE_DELETE` is still open, so the handle must never outlive
+    /// the write phase. `None` only inside commit/rollback/drop.
+    staged_file: Option<File>,
     resolution: ConflictResolution,
     committed: bool,
 }
@@ -105,15 +113,24 @@ impl PreparedWriteTarget {
     }
 
     /// Borrow the staged file for reads (e.g. computing a digest).
+    ///
+    /// The handle is closed when [`commit`](Self::commit) or
+    /// [`rollback`](Self::rollback) runs; a borrow must not outlive either.
     pub fn staged_file(&self) -> &File {
-        &self.staged_file
+        self.staged_file
+            .as_ref()
+            .expect("staged handle is open until commit or rollback")
     }
 
     /// Append `bytes` to the staged file.
     pub fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.authority.validate()?;
-        self.staged_file.write_all(bytes)?;
-        self.staged_file.flush()?;
+        let staged = self
+            .staged_file
+            .as_mut()
+            .expect("staged handle is open until commit or rollback");
+        staged.write_all(bytes)?;
+        staged.flush()?;
         self.authority.validate()?;
         Ok(())
     }
@@ -121,12 +138,22 @@ impl PreparedWriteTarget {
     /// Commit the staged file atomically to its destination.
     ///
     /// On Unix this is a single `rename(2)`; on Windows a `MoveFileExW`
-    /// replacement. The mount boundary is revalidated immediately before and
-    /// after the rename so a binder swap or remount between staging and
-    /// commit cannot authorise a partial publish.
+    /// replacement. The staged handle is flushed to disk and closed before
+    /// the rename: Windows refuses to rename or delete a file while a
+    /// handle without `FILE_SHARE_DELETE` is open, and a publish must not
+    /// depend on handle sharing modes anyway. The mount boundary is
+    /// revalidated immediately before and after the rename so a binder swap
+    /// or remount between staging and commit cannot authorise a partial
+    /// publish.
     pub fn commit(mut self) -> io::Result<CommitOutcome> {
         let final_path = self.authority.root().join(&self.final_relative_path);
         self.authority.validate()?;
+        let staged_file = self
+            .staged_file
+            .take()
+            .expect("staged handle is open until commit");
+        staged_file.sync_all()?;
+        drop(staged_file);
         publish_atomic(&self.staged_path, &final_path)?;
         self.authority.validate()?;
         self.committed = true;
@@ -137,10 +164,11 @@ impl PreparedWriteTarget {
     }
 
     /// Discard the staged file and any partial writes.
-    pub fn rollback(self) -> io::Result<()> {
+    pub fn rollback(mut self) -> io::Result<()> {
         if self.committed {
             return Ok(());
         }
+        drop(self.staged_file.take());
         let outcome = rollback_staged(&self.staged_path);
         let _ = self.authority.validate();
         outcome
@@ -152,6 +180,9 @@ impl Drop for PreparedWriteTarget {
         if self.committed {
             return;
         }
+        // Close the staged handle before removal: Windows refuses to delete
+        // a file while a handle without FILE_SHARE_DELETE is open.
+        drop(self.staged_file.take());
         // Best-effort cleanup if the caller forgets to roll back explicitly.
         let _ = rollback_staged(&self.staged_path);
     }
@@ -280,7 +311,7 @@ impl MountedWriteAuthority {
             authority: Arc::clone(&self.mounted),
             final_relative_path: final_relative,
             staged_path: staged_path_abs,
-            staged_file,
+            staged_file: Some(staged_file),
             resolution,
             committed: false,
         })
@@ -554,13 +585,17 @@ fn create_exclusive_staged_file(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
 
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
     };
 
+    // Share everything, including delete: the staged file is a private
+    // temporary that must never pin against a concurrent observer, and
+    // commit/rollback close the handle before renaming or removing it.
     OpenOptions::new()
         .write(true)
         .create_new(true)
-        .share_mode(FILE_SHARE_READ)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
 }
@@ -697,6 +732,27 @@ mod tests {
         // Sanity: the staged file actually exists before rollback.
         assert!(staged_path.exists());
         staged.rollback().expect("rollback staged");
+        assert!(!staged_path.exists());
+        assert!(!root.join("song.flac").exists());
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn dropped_target_removes_staged_file() {
+        let root = unique_root("drop");
+        let authority = MountedWriteAuthority::acquire(&root).expect("acquire write authority");
+
+        let staged_path = {
+            let mut staged = authority
+                .prepare_write_relative_file(Path::new("song.flac"), ConflictPolicy::Fail)
+                .expect("prepare staged");
+            staged.write_all(b"partial").expect("write partial");
+            staged.staged_path.clone()
+            // Dropped without an explicit rollback: the staged handle must be
+            // closed before the staged file is removed, or Windows refuses
+            // the delete with a sharing violation and the temp file leaks.
+        };
         assert!(!staged_path.exists());
         assert!(!root.join("song.flac").exists());
 
