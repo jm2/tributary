@@ -12,6 +12,7 @@ use std::rc::Rc;
 use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
+use gtk::subclass::prelude::ObjectSubclassIsExt;
 
 use super::objects::{BrowserItem, TrackObject};
 use crate::ui::folder_browser::{FolderBrowser, RootBrowseError};
@@ -489,16 +490,88 @@ impl TrackSnapshot {
     }
 }
 
-/// Widgets owned by a single browser-pane [`gtk::ListItem`]. Held by the
-/// ListItem via `set_data` so bind / unbind can address them by name
-/// instead of relying on insertion order (`first_child` / `last_child`).
-struct RowWidgets {
-    label: gtk::Label,
-    count: gtk::Label,
-    row: gtk::Box,
+/// One browser-pane row: the primary label plus the dimmed trailing
+/// count, owned by a dedicated [`gtk::Box`] subclass so bind / unbind
+/// can address the labels by name — without GObject data pointers
+/// (`set_data` / `data`, which require `unsafe`) and without
+/// insertion-order traversal (`first_child` / `last_child`).
+mod imp {
+    use super::*;
+    use gtk::subclass::prelude::*;
+
+    #[derive(Debug)]
+    pub struct BrowserRow {
+        pub label: gtk::Label,
+        pub count: gtk::Label,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for BrowserRow {
+        const NAME: &'static str = "TributaryBrowserRow";
+        type Type = super::BrowserRow;
+        type ParentType = gtk::Box;
+
+        fn new() -> Self {
+            let label = gtk::Label::builder()
+                .halign(gtk::Align::Start)
+                .valign(gtk::Align::Center)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .hexpand(true)
+                .single_line_mode(true)
+                .build();
+            // Presentational: the row's combined accessible label is
+            // set in bind, so the screen reader announces the row as
+            // one utterance rather than two separate labels.
+            label.set_accessible_role(gtk::AccessibleRole::Presentation);
+            let count = gtk::Label::builder()
+                .halign(gtk::Align::End)
+                .valign(gtk::Align::Center)
+                .css_classes(["dim-label", "caption", "numeric", "browser-count"])
+                .build();
+            count.set_accessible_role(gtk::AccessibleRole::Presentation);
+            Self { label, count }
+        }
+    }
+
+    impl ObjectImpl for BrowserRow {
+        fn constructed(&self) {
+            self.parent_constructed();
+            let row = self.obj();
+            row.set_orientation(gtk::Orientation::Horizontal);
+            row.set_spacing(6);
+            row.set_margin_start(8);
+            row.set_margin_end(8);
+            row.set_margin_top(2);
+            row.set_margin_bottom(2);
+            row.append(&self.label);
+            row.append(&self.count);
+        }
+    }
+
+    impl BoxImpl for BrowserRow {}
+    impl WidgetImpl for BrowserRow {}
 }
 
-const ROW_WIDGETS_KEY: &str = "tributary-browser-row-widgets";
+glib::wrapper! {
+    pub struct BrowserRow(ObjectSubclass<imp::BrowserRow>)
+        @extends gtk::Box, gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget,
+                    gtk::Orientable;
+}
+
+impl BrowserRow {
+    fn new() -> Self {
+        glib::Object::builder().build()
+    }
+
+    fn label(&self) -> &gtk::Label {
+        &self.imp().label
+    }
+
+    fn count(&self) -> &gtk::Label {
+        &self.imp().count
+    }
+}
 
 fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
     let header = gtk::Label::builder()
@@ -517,46 +590,10 @@ fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
 
     factory.connect_setup(|_, list_item| {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
-        let label = gtk::Label::builder()
-            .halign(gtk::Align::Start)
-            .valign(gtk::Align::Center)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .hexpand(true)
-            .single_line_mode(true)
-            .build();
-        let count = gtk::Label::builder()
-            .halign(gtk::Align::End)
-            .valign(gtk::Align::Center)
-            .css_classes(["dim-label", "caption", "numeric", "browser-count"])
-            .build();
-        let row = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(6)
-            .margin_start(8)
-            .margin_end(8)
-            .margin_top(2)
-            .margin_bottom(2)
-            .build();
-        row.append(&label);
-        row.append(&count);
-        // Mark the child labels as presentational so the screen reader
-        // does not announce them as separate items; the combined text
-        // is announced from the row's accessible label set in bind.
-        label.set_accessible_role(gtk::AccessibleRole::Presentation);
-        count.set_accessible_role(gtk::AccessibleRole::Presentation);
-        // Stable ownership: hold the labels and the row as a wrapper
-        // attached to the ListItem so bind / unbind can address them by
-        // name instead of by first_child / last_child (which depends on
-        // insertion order).
-        let widgets = RowWidgets {
-            label: label.clone(),
-            count: count.clone(),
-            row: row.clone(),
-        };
-        unsafe {
-            list_item.set_data(ROW_WIDGETS_KEY, widgets);
-        }
-        list_item.set_child(Some(&row));
+        // The BrowserRow subclass owns the label / count widgets as
+        // named children, so bind / unbind can reach them by downcasting
+        // the ListItem's child — no GObject data storage needed.
+        list_item.set_child(Some(&BrowserRow::new()));
     });
 
     factory.connect_bind(|_, list_item| {
@@ -565,32 +602,30 @@ fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
             .item()
             .and_downcast::<BrowserItem>()
             .expect("BrowserItem");
-        let widgets = unsafe { list_item.data::<RowWidgets>(ROW_WIDGETS_KEY) }
-            .expect("RowWidgets attached in setup");
-        let widgets = unsafe { widgets.as_ref() };
-        widgets.label.set_text(&item.label());
+        let row = list_item
+            .child()
+            .and_downcast::<BrowserRow>()
+            .expect("BrowserRow attached in setup");
         let count_text = format!("({})", item.count());
-        widgets.count.set_text(&count_text);
+        row.label().set_text(&item.label());
+        row.count().set_text(&count_text);
         // Combine the label and parenthesized count into a single
         // accessible label so a screen reader announces the row as one
         // utterance ("Artist Name, 123") rather than two adjacent
         // separate labels. The child labels are marked Presentation in
         // setup so they are not announced individually.
         let accessible = format!("{}, {}", item.label(), count_text);
-        widgets
-            .row
-            .update_property(&[gtk::accessible::Property::Label(&accessible)]);
+        row.update_property(&[gtk::accessible::Property::Label(&accessible)]);
     });
 
     factory.connect_unbind(|_, list_item| {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
-        let Some(widgets) = (unsafe { list_item.data::<RowWidgets>(ROW_WIDGETS_KEY) }) else {
+        let Some(row) = list_item.child().and_downcast::<BrowserRow>() else {
             return;
         };
-        let widgets = unsafe { widgets.as_ref() };
-        widgets.label.set_text("");
-        widgets.count.set_text("");
-        widgets.row.reset_property(gtk::AccessibleProperty::Label);
+        row.label().set_text("");
+        row.count().set_text("");
+        row.reset_property(gtk::AccessibleProperty::Label);
     });
 
     let list_view = gtk::ListView::builder()
