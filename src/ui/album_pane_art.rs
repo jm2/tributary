@@ -261,20 +261,15 @@ impl AlbumArtCache {
                 inner.order.remove(position);
             }
         }
-        inner.entries.insert(
-            key.clone(),
-            CacheEntry {
-                texture,
-                bytes,
-            },
-        );
+        inner
+            .entries
+            .insert(key.clone(), CacheEntry { texture, bytes });
         inner.order.push_back(key.clone());
         inner.total_bytes = inner.total_bytes.saturating_add(bytes);
         // Evict until both bounds hold. Stop early only if the cache is
         // already empty — at that point the incoming entry itself is the
         // largest single resident.
-        while (inner.entries.len() > MAX_CACHED_ALBUM_ARTS
-            || inner.total_bytes > MAX_CACHE_BYTES)
+        while (inner.entries.len() > MAX_CACHED_ALBUM_ARTS || inner.total_bytes > MAX_CACHE_BYTES)
             && inner.entries.len() > 1
         {
             let Some(oldest) = inner.order.pop_front() else {
@@ -383,8 +378,10 @@ pub struct AlbumArtCellState {
     /// `true` while a fetch for this cell should be aborted. The bind
     /// factory flips it before scheduling a new fetch; the spawned
     /// future checks it after every `.await` and exits silently when
-    /// set. The flag is reset to `false` after each `unbind` so a
-    /// freshly-bound row starts with a clean slate.
+    /// set. [`AlbumArtCellState::clear`] resets it when the controller
+    /// schedules the cell's NEXT fetch, so the fresh fetch runs with a
+    /// clean slate while the fetch it replaces stays gated by its stale
+    /// generation token.
     revoked: Rc<Cell<bool>>,
     /// Active `paintable`-notify listener for the underlying `Image`,
     /// if any. A new bind replaces this with a new listener; the
@@ -414,14 +411,6 @@ impl AlbumArtCellState {
         self.generation.get()
     }
 
-    /// Test/inspection accessor for the revoke flag. Production code
-    /// uses [`AlbumArtCellState::is_revoked`] inline so the read is
-    /// obviously a cancellation check.
-    #[cfg(test)]
-    fn revocation_flag(&self) -> bool {
-        self.revoked.get()
-    }
-
     /// `true` while a fetch for this cell should be aborted. The bind
     /// factory sets the flag to `true` before scheduling a new fetch;
     /// the spawned future checks this between every `.await` point.
@@ -435,29 +424,18 @@ impl AlbumArtCellState {
         self.revoked.set(true);
     }
 
-    /// Clear the revocation flag and disconnect the paintable listener.
-    /// Called from `unbind` so the next bind starts from a clean state.
+    /// Clear the revocation flag and disconnect any paintable listener
+    /// left over from the cell's previous fetch cycle. Called by
+    /// [`AlbumArtController::spawn_fetch`] so the fetch it is about to
+    /// schedule starts from a clean slate. Race-free: the reset runs
+    /// synchronously on the main loop before the new future is polled,
+    /// and the fetch it replaces is still blocked by its stale
+    /// generation token even if it resumes after the reset.
     fn clear(&self) {
         self.revoked.set(false);
         if let Some(handler_id) = self.paintable_notify_id.borrow_mut().take() {
             self.cell.image.disconnect(handler_id);
         }
-    }
-
-    /// Snapshot of the album key the bind factory most recently bound to
-    /// this cell. Used by tests; production code reads the live
-    /// `Cell<BindGeneration>` instead.
-    #[cfg(test)]
-    fn bound_album_key(&self) -> Option<String> {
-        self.bound_album_key.borrow().clone()
-    }
-
-    /// Snapshot of the source identity the bind factory most recently
-    /// bound to this cell. `None` means the row's resolution is not
-    /// source-qualified (local-only row or synthetic "All" row).
-    #[cfg(test)]
-    fn bound_source(&self) -> Option<SourceId> {
-        *self.bound_source.borrow()
     }
 }
 
@@ -676,8 +654,7 @@ impl AlbumArtBinder {
                     cell_state
                         .cell
                         .show_texture(&texture, &label_text, Some(&accessible_label));
-                    *cell_state.bound_album_key.borrow_mut() =
-                        Some(candidate.track_id.clone());
+                    *cell_state.bound_album_key.borrow_mut() = Some(candidate.track_id.clone());
                     *cell_state.bound_source.borrow_mut() = candidate.source_id;
                     return;
                 }
@@ -765,6 +742,15 @@ impl AlbumArtController {
         let uri = candidate.uri.clone();
         let source_id = candidate.source_id;
         let source_epoch = candidate.source_session_epoch;
+
+        // The bind factory revoked this cell's PREVIOUS fetch before
+        // handing it to us; clear the latch (and any leftover paintable
+        // listener) so THIS fetch runs un-revoked. This is race-free:
+        // everything up to this point ran synchronously on the main
+        // loop, so the previous fetch can only resume after this reset
+        // — where its stale generation token still blocks it from
+        // painting or caching (checked at every resume point below).
+        cell_state.clear();
 
         glib::MainContext::default().spawn_local(async move {
             // Step 1: resolve the artwork path. The decision tree mirrors
@@ -1077,21 +1063,23 @@ mod tests {
     }
 
     /// The byte budget must bound the cache even when the count cap is
-    /// well under its limit. A 256×256 thumbnail costs ~256 KiB; the
-    /// 32 MiB cap holds ~128 of those. The 129th insert must evict the
-    /// oldest.
+    /// well under its limit. A 1024×1024 thumbnail costs 4 MiB under
+    /// the `pixel_size² × 4` approximation; the 32 MiB cap holds
+    /// exactly 8 of those, while the count cap (512) is nowhere near
+    /// reached. Entry 9 must evict entry 1, and so on: a FIFO driven
+    /// purely by the byte budget.
     #[test]
     fn cache_memory_budget_evicts_before_count_cap() {
         let cache = AlbumArtCache::new();
         let texture = fake_texture();
-        // 64×64 = 16 KiB per entry. 2 MiB / 16 KiB = 128 entries
-        // before the budget would be reached.
-        let pixel_size: i32 = 64;
-        for i in 0..256 {
+        let pixel_size: i32 = 1024;
+        for i in 0..64 {
             cache.insert(None, &format!("album-{i}"), pixel_size, texture.clone());
         }
         // The count cap is 512, so we are nowhere near it; the byte
-        // budget is what bounds the cache here.
+        // budget is what bounds the cache here. 64 inserts × 4 MiB = a
+        // 256 MiB demand against a 32 MiB budget: only the most
+        // recent 8 survive.
         assert!(
             cache.len() <= MAX_CACHED_ALBUM_ARTS,
             "count cap must not be exceeded"
@@ -1101,9 +1089,19 @@ mod tests {
             "byte budget must be enforced: got {}",
             cache.approximate_byte_total()
         );
+        assert_eq!(
+            cache.len(),
+            8,
+            "byte budget must hold exactly 8 4-MiB entries"
+        );
         // Earliest entries must be gone — they were the first ones
-        // evicted to honour the budget.
+        // evicted to honour the budget — and the most recent must
+        // survive.
         assert!(cache.get(None, "album-0", pixel_size).is_none());
+        assert!(cache.get(None, "album-7", pixel_size).is_none());
+        assert!(cache.get(None, "album-55", pixel_size).is_none());
+        assert!(cache.get(None, "album-56", pixel_size).is_some());
+        assert!(cache.get(None, "album-63", pixel_size).is_some());
     }
 
     /// `clear` drops every entry and resets the byte counter. The
@@ -1275,7 +1273,6 @@ mod tests {
     /// primitive without involving GTK or an async runtime.
     #[test]
     fn cell_state_revocation_flag_toggles_on_revoke() {
-        use crate::ui::album_pane_art::AlbumArtCellState;
         // We can't construct an AlbumArtCell without GTK, but the
         // revocation flag is the only field we need to exercise here.
         // Build a parallel `Cell<bool>` to model the flag's behaviour
