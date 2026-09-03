@@ -144,8 +144,8 @@ dialogs:
   output_port: "端口"
   output_exclusive_control_warning: "MPD 的暂停、停止、重复、随机、单曲和 consume 命令会影响整个播放分区。请勿与其他控制器或 Tributary 实例共享。"
   output_exclusive_control_confirmation: "我确认 Tributary 独占控制此 MPD 播放分区。"
-  output_detection_warning: "With supervision enabled, Tributary keeps observing the partition while it plays: a foreign current song, a foreign option change, or a lost observation window revokes playback control and keeps any orphaned queue entry. Supervision can only revoke, never grant: after such evidence the output refuses commands until you re-select it to confirm again."
-  output_detection_confirmation: "Supervise this exclusive output and revoke its control on evidence of another controller."
+  output_detection_warning: "启用监督后，Tributary 会在播放期间持续观察分区：外部当前歌曲、外部选项更改或观察窗口丢失都会撤销播放控制并保留任何孤立队列条目。监督只能撤销，绝不能授予：出现此类证据后，输出将拒绝命令，直到你重新选择它以再次确认。"
+  output_detection_confirmation: "监督此独占输出，并在检测到其他控制器的证据时撤销其控制。"
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
