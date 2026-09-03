@@ -35,7 +35,7 @@ the settings UI must reject them at the boundary; runtime code must not be able 
 them.
 
 | Control | Type | Range / values | Precision | Default |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | Enabled | bool | `true` / `false` (global bypass) | — | `false` |
 | Preset | enum | `Flat`/`Pop`/`Rock`/`Jazz`/`Classical`/`Custom` (write-only) | — | `Flat` |
 | Preamp | linear dB | `−24.0` … `0.0` … `+12.0` dB; integer or half-step | 0.5 dB | `0.0` dB |
@@ -58,7 +58,7 @@ name transitions to `Custom` (see *Band and preamp mechanics* below); the named 
 longer the source of truth and is over-written by `Custom` in storage.
 
 | Preset | Recommended preamp | Description |
-|---|---|---|
+| --- | --- | --- |
 | Flat | 0.0 dB | All bands at 0.0 dB (the default state and the empty baseline) |
 | Pop | −2.0 dB | Bass shelf + slight mid cut + presence lift |
 | Rock | −1.0 dB | Bass + treble lift, mid dip |
@@ -231,7 +231,7 @@ The contract intentionally limits which knobs can change mid-playback and at whi
 the changes take effect. The boundary is:
 
 | Knob | Mid-playback? | Mechanism |
-|---|---|---|
+| --- | --- | --- |
 | `Enabled` | yes | Pause → bin install/remove → resume |
 | `Preset` | yes | Buffer-boundary property-write transaction on the bin |
 | `Preamp` | yes | Buffer-boundary property-write transaction on the bin |
@@ -331,7 +331,7 @@ Where:
 The fifteen keys, in six logical groups:
 
 | Key | Type | Range / values |
-|---|---|---|
+| --- | --- | --- |
 | `schema_version` | quoted integer literal | `"1"` (the only supported value at this revision) |
 | `enabled` | quoted boolean literal | `"true"` / `"false"` |
 | `preset` | quoted preset name | `"flat"`/`"pop"`/`"rock"`/`"jazz"`/`"classical"`/`"custom"` |
@@ -412,7 +412,7 @@ shipped output cannot claim an unsupported status, and a future implementation t
 status must ship the matching UI rendering at the same time.
 
 | Output | Equalizer DSP |
-|---|---|
+| --- | --- |
 | Local | supported |
 | AirPlay (RAOP) | unsupported |
 | Chromecast | unsupported |
@@ -596,7 +596,7 @@ The exact band gain vectors for the four non-Flat presets are written against th
 centres (29, 59, 119, 237, 474, 947, 1889, 3770, 7523, 15011 Hz):
 
 | Preset | Preamp | 29 | 59 | 119 | 237 | 474 | 947 | 1889 | 3770 | 7523 | 15011 |
-|---|---|---|---|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Flat | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
 | Pop | −2.0 | +1.0 | +2.0 | +3.0 | +2.0 | 0.0 | −1.0 | −1.0 | 0.0 | +1.0 | +2.0 |
 | Rock | −1.0 | +3.0 | +2.0 | 0.0 | −1.0 | −1.0 | +0.0 | +2.0 | +3.0 | +3.0 | +2.0 |
