@@ -13,7 +13,9 @@ use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 
-use super::album_pane_art::{AlbumArtBinder, AlbumArtCache, AlbumArtController};
+use super::album_pane_art::{
+    AlbumArtBinder, AlbumArtCache, AlbumArtController, FALLBACK_PLACEHOLDER_ICON,
+};
 use super::objects::{AlbumArtCandidate, BrowserItem, TrackObject};
 use crate::ui::folder_browser::{FolderBrowser, RootBrowseError};
 use tracing::debug;
@@ -75,6 +77,17 @@ pub struct BrowserState {
     album_art_binder: Rc<RefCell<Option<AlbumArtBinder>>>,
 }
 
+/// Where the folder pane currently points.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+enum FolderLocation {
+    /// The top level: rows are the configured library roots.
+    #[default]
+    Roots,
+    /// Inside one root, at a root-relative directory (empty string = the
+    /// root itself).
+    Inside { root_id: String, dir: String },
+}
+
 /// Build the 3-pane browser.
 ///
 /// Returns `(gtk::Box, BrowserState)`.  The caller must keep the
@@ -105,7 +118,7 @@ pub fn build_browser(
     // the album pane's per-row thumbnails. The source registry is wired
     // in later by the window so the controller can resolve credential-
     // isolated remote artwork without exposing endpoints here.
-    let album_art_controller = Rc::new(AlbumArtController::new("audio-x-generic-symbolic"));
+    let album_art_controller = Rc::new(AlbumArtController::new(FALLBACK_PLACEHOLDER_ICON));
 
     // Stores for each pane
     let genre_store = gio::ListStore::new::<BrowserItem>();
@@ -591,27 +604,24 @@ fn rebuild_album_pane(browser_box: &gtk::Box, state: &BrowserState) {
     let use_aa = state.use_album_artist.get();
     populate_albums(&album_store, &borrowed, &None, &None, use_aa);
 
-    // Restore the visual selection on the freshly-built pane. The
-    // BrowserState's `selected_album` survives this rebuild; only the
-    // widget highlight on the new ListView has to be re-installed,
-    // because the SingleSelection model is a fresh instance that did
-    // not inherit the previous selection state. Without this restore,
-    // a toggle from off→on or a resize would silently drop the album
-    // the user was looking at.
-    restore_album_selection(&new_pane, &state);
+    // Restore a deterministic selection on the freshly-built pane.
+    // Rebuild keeps the pane's DATA (same `gio::ListStore`, repopulated
+    // from the live snapshot), but the new `SingleSelection` starts on
+    // the "All" row; set it explicitly so the highlight state is
+    // defined rather than whatever the fresh model happened to pick.
+    restore_album_selection(&new_pane);
 }
 
-/// Walk the freshly-built album pane's `SingleSelection` and set the
-/// selected index to the previously-selected album's row, or to the
-/// synthetic "All" row when nothing was selected before.
+/// Reset the freshly-built album pane's `SingleSelection` to the
+/// synthetic "All" row (index 0).
 ///
-/// The BrowserState's `selected_album` is preserved across a layout
-/// rebuild; only the GTK widget tree is replaced. The new
-/// `SingleSelection` starts on the "All" row (index 0), so without this
-/// restore a user who had narrowed the pane to a specific album would
-/// see the highlight jump back to "All" the moment they toggled the
-/// artwork preference or changed the thumbnail size.
-fn restore_album_selection(pane: &gtk::Box, state: &BrowserState) {
+/// The BrowserState's cross-filter chain holds the selection strings;
+/// they are NOT threaded through a layout rebuild, so the pane's
+/// highlight is deliberately reset to "All" — deterministic, and the
+/// filters the user had active remain in effect in the shared
+/// snapshot. Without this reset a rebuilt pane's highlight would be
+/// whatever the fresh `SingleSelection` initialized to.
+fn restore_album_selection(pane: &gtk::Box) {
     let Some(selection) = pane_selection(pane) else {
         return;
     };
@@ -622,11 +632,11 @@ fn restore_album_selection(pane: &gtk::Box, state: &BrowserState) {
     if n_items <= 1 {
         return;
     }
-    // We don't store the selected_album in BrowserState directly (the
-    // cross-filter chain keeps its own refs); for now, default the
-    // selection back to "All" so the highlight is deterministic. A
-    // follow-up that threads selected_album through BrowserState can
-    // promote this to a label match without touching the bind path.
+    // The selection strings live in build_browser's cross-filter chain,
+    // not in BrowserState, so index 0 ("All") is the only reset that
+    // needs no extra state. A follow-up that threads the selected album
+    // through BrowserState can promote this to a label match without
+    // touching the bind path.
     selection.set_selected(0);
 }
 
