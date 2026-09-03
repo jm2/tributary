@@ -3345,25 +3345,45 @@ pub(crate) fn build_window(
     }
 
     // ── Persist column order on drag-and-drop reorder ────────────────
+    // GTK commits a header drag in two synchronous steps — the dragged
+    // column is removed from the model and then re-inserted at its drop
+    // position — and the columns model emits `items-changed` for each.
+    // Saving on the first emission would write a truncated order that is
+    // missing the column still in flight (issue #208). Defer the save to
+    // an idle callback so it always observes the stable post-drag column
+    // list, and coalesce the two emissions into one disk write.
     {
         let config = app_config.clone();
         let cv = column_view.clone();
         let active_source_key = active_source_key.clone();
+        let save_queued = Rc::new(Cell::new(false));
         column_view
             .columns()
             .connect_items_changed(move |_list, _pos, _removed, _added| {
-                // Skip persistence while in radio mode — the renamed
-                // Artist→Country / Album→State-Province columns would
-                // corrupt the saved column order (issue #38).
-                if super::radio::is_radio_backend(&active_source_key.borrow()) {
+                // Coalesce the remove + insert pair of a drag commit (and
+                // any burst of programmatic moves) into a single save.
+                if save_queued.replace(true) {
                     return;
                 }
-                let order = preferences::read_column_order(&cv);
-                if !order.is_empty() {
-                    let mut cfg = config.borrow_mut();
-                    cfg.column_order = order;
-                    preferences::save_config(&cfg);
-                }
+                let config = config.clone();
+                let cv = cv.clone();
+                let active_source_key = active_source_key.clone();
+                let save_queued = save_queued.clone();
+                glib::idle_add_local_once(move || {
+                    save_queued.set(false);
+                    // Skip persistence while in radio mode — the renamed
+                    // Artist→Country / Album→State-Province columns would
+                    // corrupt the saved column order (issue #38).
+                    if super::radio::is_radio_backend(&active_source_key.borrow()) {
+                        return;
+                    }
+                    let order = preferences::read_column_order(&cv);
+                    if !order.is_empty() {
+                        let mut cfg = config.borrow_mut();
+                        cfg.column_order = order;
+                        preferences::save_config(&cfg);
+                    }
+                });
             });
     }
 
