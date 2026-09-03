@@ -449,3 +449,26 @@ rhythmbox_migration:
       automatic_rating_semantics: "reguły ocen automatycznej listy nie można dokładnie odwzorować"
       invalid_occurrence: "wpis nie ma użytecznej lokalizacji pliku lokalnego"
       unmatched_occurrence: "wpis zostanie zachowany jako niedopasowana ścieżka"
+
+# ── Equalizer ──────────────────────────────────────────────────────
+equalizer:
+  title: "Korektor"
+  description: "Dziesięciopasmowy korektor z przedwzmacniaczem i ochroną przed przesterowaniem dla lokalnego wyjścia dźwięku."
+  enabled: "Włącz korektor"
+  preset: "Presety"
+  preset_flat: "Płaski"
+  preset_pop: "Pop"
+  preset_rock: "Rock"
+  preset_jazz: "Jazz"
+  preset_classical: "Klasyczna"
+  preset_custom: "Własny"
+  preamp: "Przedwzmacniacz"
+  clip_protection: "Ochrona przed przesterowaniem"
+  reset_flat: "Przywróć płaski"
+  reload: "Wczytaj ponownie z dysku"
+  band_a11y: "Pasmo korektora %{frequency} herców, regulowane w decybelach"
+  unsupported:
+    local: "Korektor działa w lokalnym potoku dźwiękowym programu Tributary."
+    airplay: "Odbiorniki AirPlay przetwarzają dźwięk w całości samodzielnie, więc korektor Tributary nie dociera do głośnika."
+    chromecast: "Urządzenia Chromecast przetwarzają dźwięk po stronie odbiornika, więc korektor Tributary nie dociera do głośnika."
+    mpd: "MPD przetwarza dźwięk po stronie serwera, więc korektor Tributary nie dociera do zdalnych odtwarzaczy."

@@ -447,3 +447,26 @@ rhythmbox_migration:
       automatic_rating_semantics: "Bewertungsregel der automatischen Wiedergabeliste kann nicht exakt dargestellt werden"
       invalid_occurrence: "Eintrag hat keinen verwendbaren lokalen Dateispeicherort"
       unmatched_occurrence: "Eintrag wird als nicht zugeordneter Pfad beibehalten"
+
+# ── Equalizer ──────────────────────────────────────────────────────
+equalizer:
+  title: "Equalizer"
+  description: "Zehnband-Equalizer mit Vorverstärker und Clip-Schutz für die lokale Audioausgabe."
+  enabled: "Equalizer aktivieren"
+  preset: "Voreinstellung"
+  preset_flat: "Flach"
+  preset_pop: "Pop"
+  preset_rock: "Rock"
+  preset_jazz: "Jazz"
+  preset_classical: "Klassik"
+  preset_custom: "Eigenes"
+  preamp: "Vorverstärkung"
+  clip_protection: "Übersteuerungsschutz"
+  reset_flat: "Auf Flach zurücksetzen"
+  reload: "Von Festplatte neu laden"
+  band_a11y: "Equalizer-Band bei %{frequency} Hertz, Einstellung in Dezibel"
+  unsupported:
+    local: "Der Equalizer läuft innerhalb der lokalen Audio-Pipeline von Tributary."
+    airplay: "AirPlay-Empfänger rendern das Audio komplett selbst, sodass der Tributary-Equalizer den Lautsprecher nicht erreicht."
+    chromecast: "Chromecast-Geräte geben das Audio am Empfänger wieder, sodass der Tributary-Equalizer den Lautsprecher nicht erreicht."
+    mpd: "MPD gibt das Audio auf dem Server wieder, sodass der Tributary-Equalizer die entfernten Player nicht erreicht."

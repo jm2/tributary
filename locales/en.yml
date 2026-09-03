@@ -480,3 +480,26 @@ rhythmbox_migration:
       automatic_rating_semantics: "automatic playlist rating rule cannot be represented exactly"
       invalid_occurrence: "entry has no usable local file location"
       unmatched_occurrence: "entry is preserved as an unmatched path"
+
+# ── Equalizer ──────────────────────────────────────────────────────
+equalizer:
+  title: "Equalizer"
+  description: "Ten-band equalizer with preamp and clip protection for the local audio output."
+  enabled: "Enable equalizer"
+  preset: "Preset"
+  preset_flat: "Flat"
+  preset_pop: "Pop"
+  preset_rock: "Rock"
+  preset_jazz: "Jazz"
+  preset_classical: "Classical"
+  preset_custom: "Custom"
+  preamp: "Preamp"
+  clip_protection: "Clip protection"
+  reset_flat: "Reset to Flat"
+  reload: "Reload from disk"
+  band_a11y: "Equalizer band at %{frequency} hertz, adjusted in decibels"
+  unsupported:
+    local: "The equalizer runs inside Tributary's local audio pipeline."
+    airplay: "AirPlay receivers render audio end-to-end, so Tributary's equalizer cannot reach the speaker."
+    chromecast: "Chromecast devices render audio on the receiver, so Tributary's equalizer cannot reach the speaker."
+    mpd: "MPD renders audio on the server, so Tributary's equalizer cannot reach the remote players."
