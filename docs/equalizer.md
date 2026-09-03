@@ -217,11 +217,13 @@ element behaves as a soft-knee compressor with a −6 dBFS threshold and an asym
 output ceiling. Limiter attack, release, threshold, and ceiling are fixed by the element; no
 user-visible controls are exposed.
 
-Pre-LP clip behavior is what clip protection actually guards against: the EQ can elevate peaks
+Post-EQ clipping is what clip protection actually guards against: the EQ can elevate peaks
 above 0 dBFS even with a sane-looking preamp, especially on already-mastered pop/rock material.
 When `Clip protection = Off`, the contract explicitly permits clipping and the application must
-not pretend it was prevented. The `Soft` option is therefore the recommended default for fresh
-installs starting with enabled EQ.
+not pretend it was prevented. `Soft` is opt-in: the shipped default remains `Off` (per the
+bounded user-surface table and the fresh-install state in *Persistence*), and the UI may
+describe `Soft` as the suggested choice when the user first enables the equalizer, but it never
+changes the persisted default.
 
 ## Live-reconfiguration boundary
 
@@ -306,7 +308,8 @@ the chain degrades to the no-limiter layout and the user-visible status becomes 
 
 ## Persistence
 
-Persisted equalizer state is six keys in a single file. The on-disk grammar is:
+Persisted equalizer state is fifteen keys in six logical groups, in a single file. The on-disk
+grammar is:
 
 ```ini
 key="value"
@@ -316,16 +319,16 @@ key="value"
 
 Where:
 
-- Every key is one of the six listed below, in the listed order (the parser is order-insensitive
-  on read but the writer always emits them in the canonical order so diffs and bugs are
-  reproducible).
+- Every key is one of the fifteen listed below, in the listed order (the parser is
+  order-insensitive on read but the writer always emits them in the canonical order so diffs and
+  bugs are reproducible).
 - Every value is a double-quoted UTF-8 string. Quotes inside a value are escaped as `\"`; the
   backslash is escaped as `\\`; newlines are not permitted in values. Floats are emitted with
   one decimal place (e.g. `"-24.0"`, `"0.0"`, `"+12.0"`) so that precision is bounded by the
   schema, not by the writer's locale or precision settings. The parser requires the value to be
   double-quoted; an unquoted value is a malformed file and triggers the validation rule below.
 
-The six keys:
+The fifteen keys, in six logical groups:
 
 | Key | Type | Range / values |
 |---|---|---|
@@ -349,10 +352,14 @@ file or the new file, never a partial one. The temp file is opened with `O_EXCL`
 concurrent writer cannot race the rename.
 
 Persistence uses a debounced single-writer pattern: a 750 ms idle interval coalesces slider-drag
-changes into one write per change-spell. The save runs on the GTK main loop and is suppressed
-entirely when the state matches the fresh-install default (Enabled `false`, preset `Flat`, all
-bands zero, preamp zero, clip protection `Off`). The debounce timer is reset on every change so
-drag-induced writes are flushed on the trailing edge of the gesture.
+changes into one write per change-spell, and the save runs on the GTK main loop. Every
+change-spell writes, including one whose result is exactly the fresh-install default state
+(Enabled `false`, preset `Flat`, all bands zero, preamp zero, clip protection `Off`). There is
+no default-state suppression: suppressing that write would leave an older non-default file on
+disk, and the next application start would resurrect settings the user visibly reset (for
+example, a user moving `Clip protection` from `Soft` back to `Off` must see `Off` after a
+restart). The debounce timer is reset on every change so drag-induced writes are flushed on the
+trailing edge of the gesture.
 
 In addition to the debounce, the equalizer module installs a *shutdown flush* hook: on
 `gtk::main_quit` (and on `SIGTERM`/`SIGINT` via the application's main-loop signal hook), the
@@ -382,6 +389,10 @@ Validation rules on read:
 - `schema_version` must equal `"1"`; any other value replaces the file with defaults.
 - Each line must match the `key="value"` grammar; a malformed line replaces the file with
   defaults and the parser remembers which line failed for the diagnostic below.
+- A file that parses but omits any of the fifteen keys is malformed: it is replaced with the
+  defaults as a whole under the rule below. There are no per-key defaults for missing keys —
+  partial files are not merged with defaults, because silently filling gaps would combine
+  stale band values with fresh ones.
 - `bandN_db` values outside `[-24.0, +12.0]` are clamped to the boundary.
 - `preamp_db` outside `[-24.0, +12.0]` is clamped to the boundary.
 - `preset` outside the named set (including unknown legacy values) becomes `"flat"`; the band
@@ -414,14 +425,19 @@ Reasoning, per output:
   proprietary and not exposed by the deployed receiver APIs.
 - Chromecast: The receiving speaker renders audio; the Cast V2 protocol does not expose a public
   equalizer channel.
-- MPD: MPD exposes server-side EQ commands (`eq`, `setvol`) that require server cooperation and
-  vary by `libmpdclient` build; the canonical contracted behavior is host-side rendering, so
-  host EQ does not reach the receiver.
+- MPD: The MPD protocol exposes no native equalizer command (`setvol` controls playback volume,
+  not equalization), and server-side equalization would require editing MPD's own filter
+  configuration on the server host, which the protocol does not let a client do. The canonical
+  contracted behavior is host-side rendering, so host EQ does not reach the receiver.
 
 For each `unsupported` output, the user-visible settings UI renders the equalizer controls as
-disabled with a tool-tip explaining the limitation (e.g. "AirPlay receivers render audio
-end-to-end, so Tributary's equalizer cannot reach the speaker.") Disabled controls preserve the
-last-saved values locally.
+disabled, and the limitation is explained by visible text rendered inside the panel (e.g.
+"AirPlay receivers render audio end-to-end, so Tributary's equalizer cannot reach the
+speaker."). The same sentence is additionally attached to the disabled controls as their
+accessible description (the toolkit's `aria-describedby`-equivalent relation). A tool-tip alone
+is not sufficient: disabled controls are frequently not focusable, so a tooltip-only
+explanation makes the limitation undiscoverable by keyboard and screen-reader users. Disabled
+controls preserve the last-saved values locally.
 
 The contract states one unambiguous output-activation rule: when the active output is
 `unsupported`, the equalizer bin is *not* installed in any pipeline, no equalizer DSP runs, and
@@ -450,9 +466,11 @@ The settings UI exposes two affordances that affect the persisted state directly
   keeps `Enabled` at its current value, and keeps `Clip protection` at its current value.
   Selecting `Flat` from the preset menu is a distinguishable UI action that also performs the
   same write but additionally flips the preset name to `Flat`.
-- **Reload defaults from disk.** Forces the EQ module to re-read `equalizer.cfg`; this is the
-  only way to remove a malformed file from disk. The debounced single-writer still applies
-  on the next change-spell.
+- **Reload defaults from disk.** Forces the EQ module to re-read `equalizer.cfg` immediately,
+  applying the same validation rules as on load — including the automatic atomic-replace repair
+  of a malformed file, which is therefore not something the user must remove by hand. The
+  reload is synchronous and does not wait for a change-spell; the debounced single-writer still
+  applies on the next change-spell.
 
 The UI must not offer "save preset", "rename preset", "delete preset", "export preset", or
 "import preset" affordances. Naming a custom combination of band values as a new preset is
@@ -487,6 +505,11 @@ files under `locales/`). The five named preset names are translated, but the key
 `equalizer.cfg` remain English (`flat`, `pop`, `rock`, `jazz`, `classical`, `custom`). The
 migration of older non-English keys is not expected; an unknown preset value is treated as
 `flat`.
+
+When the active output does not support the equalizer, the panel's explanation of that
+limitation is rendered as visible, localizable text associated with the disabled controls via
+the toolkit's accessible-description relation, as specified in *Capability matrix*; the
+explanation is never tool-tip-only.
 
 ## Acceptance matrix
 
@@ -527,8 +550,9 @@ for this contract; new conditions require a new revision.
     valid.
 14. **Preset name not in the named set on disk.** Coerced to `flat`; band vector remains as
     written on disk.
-15. **Hardware sink with 8-channel layout (macOS).** Pre-EQ `audioconvert` caps remain `[1, 2]`;
-    EQ runs in stereo; same cap fix as existing module.
+15. **Hardware sink with 8-channel layout (macOS).** Pre-EQ `capsfilter` caps remain
+    `channels=2`; `audioconvert` performs the downmix conversion work; EQ runs in stereo; same
+    cap fix as existing module.
 16. **Gapless album transition.** Bin persists across URI transitions; equalizer state is not
     re-applied automatically on each new URI; no audible discontinuity.
 17. **Preamp `0.0 dB` selected.** Preamp `volume` element is in the chain with `volume=1.0`;
