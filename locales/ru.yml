@@ -47,6 +47,7 @@ browser:
   genre: "Жанр"
   artist: "Исполнитель"
   album: "Альбом"
+  folder: "Папка"
   all: "Все"
 
 # ── Tracklist columns ──────────────────────────────────────────────

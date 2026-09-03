@@ -47,6 +47,7 @@ browser:
   genre: "Gênero"
   artist: "Artista"
   album: "Álbum"
+  folder: "Pasta"
   all: "Todos"
 
 # ── Tracklist columns ──────────────────────────────────────────────

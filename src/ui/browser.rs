@@ -14,11 +14,14 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use super::objects::{BrowserItem, TrackObject};
+use crate::ui::folder_browser::{FolderBrowser, RootBrowseError};
 use tracing::debug;
 
 /// Callback invoked when the browser selection changes.
-/// Receives (selected_genre, selected_artist, selected_album, search_text) — `None` = "All".
-pub type FilterCallback = Box<dyn Fn(Option<String>, Option<String>, Option<String>, String)>;
+/// Receives (selected_genre, selected_artist, selected_album, folder_prefix, search_text) —
+/// `None` = "All" / no folder filter.
+pub type FilterCallback =
+    Box<dyn Fn(Option<String>, Option<String>, Option<String>, Option<String>, String)>;
 
 /// Opaque handle to the browser's internal track snapshot.
 /// Passed back to [`rebuild_browser_data`] when the library changes.
@@ -30,6 +33,35 @@ pub struct BrowserState {
     /// When true, the Artist pane groups by album artist (with fallback
     /// to track artist for tracks that don't carry an album-artist tag).
     use_album_artist: Rc<Cell<bool>>,
+    /// Lazy folder-browsing model for the local library, attached by the
+    /// window when local library tracks are displayed. `None` while a
+    /// pathless source is active or no library roots are configured — the
+    /// folder pane then shows the explicit omission notice instead.
+    folder_model: Rc<RefCell<Option<FolderBrowser>>>,
+    /// Where the folder pane currently points.
+    folder_location: Rc<RefCell<FolderLocation>>,
+    /// The file-path prefix the folder pane currently filters by
+    /// (`None` at the roots level or while no model is attached).
+    folder_prefix: Rc<RefCell<Option<String>>>,
+    /// The folder pane's store, so attach/clear/navigation can repopulate.
+    folder_store: gio::ListStore,
+    /// The folder pane's selection model, so navigation can reset selection
+    /// without re-triggering the handler.
+    folder_selection: gtk::SingleSelection,
+    /// Re-entrancy guard shared with the pane handlers (attach/clear also
+    /// repopulate the folder store programmatically).
+    updating: Rc<Cell<bool>>,
+}
+
+/// Where the folder pane currently points.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+enum FolderLocation {
+    /// The top level: rows are the configured library roots.
+    #[default]
+    Roots,
+    /// Inside one root, at a root-relative directory (empty string = the
+    /// root itself).
+    Inside { root_id: String, dir: String },
 }
 
 /// Build the 3-pane browser.
@@ -57,6 +89,14 @@ pub fn build_browser(
     let genre_store = gio::ListStore::new::<BrowserItem>();
     let artist_store = gio::ListStore::new::<BrowserItem>();
     let album_store = gio::ListStore::new::<BrowserItem>();
+    let folder_store = gio::ListStore::new::<BrowserItem>();
+
+    // Folder-browsing state. The model is attached later by the window
+    // (once the local library is known); until then the pane shows the
+    // explicit omission notice.
+    let folder_model: Rc<RefCell<Option<FolderBrowser>>> = Rc::new(RefCell::new(None));
+    let folder_location: Rc<RefCell<FolderLocation>> = Rc::new(RefCell::new(FolderLocation::Roots));
+    let folder_prefix: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
     // Shared mutable track snapshot — updated by rebuild_browser_data.
     let tracks: Rc<RefCell<Vec<TrackSnapshot>>> = Rc::new(RefCell::new(
@@ -68,6 +108,9 @@ pub fn build_browser(
     populate_genres(&genre_store, &tracks.borrow(), &None, &None, use_aa);
     populate_artists(&artist_store, &tracks.borrow(), &None, &None, use_aa);
     populate_albums(&album_store, &tracks.borrow(), &None, &None, use_aa);
+    // Folder pane starts detached: the notice row explains the policy
+    // until the window attaches the local-library model.
+    populate_folder_pane(&folder_store, None, &FolderLocation::Roots);
 
     // Wrap callback in Rc for sharing across closures
     let on_filter_changed = Rc::new(on_filter_changed);
@@ -86,6 +129,7 @@ pub fn build_browser(
     let genre_pane = build_pane("Genre", &genre_store);
     let artist_pane = build_pane("Artist", &artist_store);
     let album_pane = build_pane("Album", &album_store);
+    let folder_pane = build_pane("Folder", &folder_store);
 
     // ── Genre selection ──────────────────────────────────────────────
     // User picks a genre → repopulate artist + album (downstream).
@@ -102,6 +146,7 @@ pub fn build_browser(
         let updating = updating.clone();
         let search_text = search_text.clone();
         let use_aa = use_album_artist.clone();
+        let fp = folder_prefix.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
             if updating.get() {
@@ -120,7 +165,13 @@ pub fn build_browser(
             populate_albums(&album_store, &borrowed, &genre, &None, flag);
             updating.set(false);
 
-            cb(genre, None, None, search_text.borrow().clone());
+            cb(
+                genre,
+                None,
+                None,
+                fp.borrow().clone(),
+                search_text.borrow().clone(),
+            );
         });
     }
 
@@ -141,6 +192,7 @@ pub fn build_browser(
         let updating = updating.clone();
         let search_text = search_text.clone();
         let use_aa = use_album_artist.clone();
+        let fp = folder_prefix.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
             if updating.get() {
@@ -170,7 +222,13 @@ pub fn build_browser(
             populate_albums(&album_store, &borrowed, &genre, &artist, flag);
             updating.set(false);
 
-            cb(genre, artist, None, search_text.borrow().clone());
+            cb(
+                genre,
+                artist,
+                None,
+                fp.borrow().clone(),
+                search_text.borrow().clone(),
+            );
         });
     }
 
@@ -180,7 +238,7 @@ pub fn build_browser(
         let sel = get_selection(&album_pane);
         let sg = selected_genre.clone();
         let sa = selected_artist.clone();
-        let sl = selected_album;
+        let sl = selected_album.clone();
         let genre_store = genre_store.clone();
         let genre_pane = genre_pane.clone();
         let artist_store = artist_store.clone();
@@ -190,6 +248,7 @@ pub fn build_browser(
         let updating = updating.clone();
         let search_text = search_text.clone();
         let use_aa = use_album_artist.clone();
+        let fp = folder_prefix.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
             if updating.get() {
@@ -210,7 +269,112 @@ pub fn build_browser(
             restore_selection(&artist_pane, &artist);
             updating.set(false);
 
-            cb(genre, artist, album, search_text.borrow().clone());
+            cb(
+                genre,
+                artist,
+                album,
+                fp.borrow().clone(),
+                search_text.borrow().clone(),
+            );
+        });
+    }
+
+    // ── Folder selection / navigation ────────────────────────────────
+    // Selecting a row navigates (roots → folders) and applies a path
+    // filter to the tracklist. The pane's tree is derived lazily from the
+    // attached model: nothing is walked until a level is displayed.
+    {
+        let sel = get_selection(&folder_pane);
+        let selection = sel.clone();
+        let sg = selected_genre.clone();
+        let sa = selected_artist.clone();
+        let sl = selected_album.clone();
+        let model = folder_model.clone();
+        let location = folder_location.clone();
+        let prefix = folder_prefix.clone();
+        let store = folder_store.clone();
+        let cb = on_filter_changed.clone();
+        let updating = updating.clone();
+        let search_text = search_text.clone();
+
+        sel.connect_selection_changed(move |sel, _, _| {
+            if updating.get() {
+                return;
+            }
+            let Some(item) = sel.selected_item().and_downcast::<BrowserItem>() else {
+                return;
+            };
+            let label = item.label();
+
+            // Interpret the row by the current location.
+            let current = location.borrow().clone();
+            let next = match &current {
+                FolderLocation::Roots => {
+                    let model_ref = model.borrow();
+                    let Some(browser) = model_ref.as_ref() else {
+                        return;
+                    };
+                    let labels = browser.disambiguated_root_labels();
+                    let Some(pos) = labels.iter().position(|l| l == &label) else {
+                        return;
+                    };
+                    let root = &browser.roots()[pos];
+                    if !root.browsable() {
+                        // Listed for visibility, but navigation is refused.
+                        return;
+                    }
+                    Some(FolderLocation::Inside {
+                        root_id: root.root_id.clone(),
+                        dir: String::new(),
+                    })
+                }
+                FolderLocation::Inside { root_id, dir } => {
+                    if label == FOLDER_UP_LABEL {
+                        if dir.is_empty() {
+                            Some(FolderLocation::Roots)
+                        } else {
+                            let parent = match dir.rsplit_once('/') {
+                                Some((parent, _)) => parent.to_string(),
+                                None => String::new(),
+                            };
+                            Some(FolderLocation::Inside {
+                                root_id: root_id.clone(),
+                                dir: parent,
+                            })
+                        }
+                    } else {
+                        let child_dir = if dir.is_empty() {
+                            label.clone()
+                        } else {
+                            format!("{dir}/{label}")
+                        };
+                        Some(FolderLocation::Inside {
+                            root_id: root_id.clone(),
+                            dir: child_dir,
+                        })
+                    }
+                }
+            };
+            let Some(next) = next else { return };
+
+            *location.borrow_mut() = next.clone();
+            updating.set(true);
+            let new_prefix =
+                populate_folder_pane(&store, model.borrow().as_ref(), &location.borrow());
+            selection.set_selected(0);
+            updating.set(false);
+            *prefix.borrow_mut() = new_prefix.clone();
+
+            let genre = sg.borrow().clone();
+            let artist = sa.borrow().clone();
+            let album = sl.borrow().clone();
+            cb(
+                genre,
+                artist,
+                album,
+                new_prefix,
+                search_text.borrow().clone(),
+            );
         });
     }
 
@@ -219,6 +383,7 @@ pub fn build_browser(
         let sg = selected_genre.clone();
         let sa = selected_artist.clone();
         let search_text = search_text.clone();
+        let fp = folder_prefix.clone();
         let cb = on_filter_changed;
         let debounce_gen: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
@@ -236,6 +401,7 @@ pub fn build_browser(
 
             let sg = sg.clone();
             let sa = sa.clone();
+            let fp = fp.clone();
             let cb = cb.clone();
             let gen_rc = debounce_gen.clone();
 
@@ -245,7 +411,7 @@ pub fn build_browser(
                 }
                 let genre = sg.borrow().clone();
                 let artist = sa.borrow().clone();
-                cb(genre, artist, None, text);
+                cb(genre, artist, None, fp.borrow().clone(), text);
             });
         });
     }
@@ -260,6 +426,7 @@ pub fn build_browser(
     panes_box.append(&genre_pane);
     panes_box.append(&artist_pane);
     panes_box.append(&album_pane);
+    panes_box.append(&folder_pane);
 
     let browser_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -272,6 +439,12 @@ pub fn build_browser(
         tracks,
         search_text,
         use_album_artist,
+        folder_model,
+        folder_location,
+        folder_prefix,
+        folder_store,
+        folder_selection: get_selection(&folder_pane),
+        updating,
     };
     (browser_box, state)
 }
@@ -572,6 +745,107 @@ pub fn rebuild_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks
                 populate_albums(&album_store, &borrowed, &None, &None, use_aa);
             }
         }
+    }
+}
+
+/// Label of the pane row that ascends one folder level.
+const FOLDER_UP_LABEL: &str = "…";
+
+/// Attach the lazy folder-browsing model for the local library and reset
+/// the folder pane to its roots level. Called by the window when local
+/// library tracks are displayed.
+pub fn attach_folder_model(state: &BrowserState, model: FolderBrowser) {
+    *state.folder_model.borrow_mut() = Some(model);
+    reset_folder_navigation(state);
+}
+
+/// Detach the folder model (a pathless source became active): the pane
+/// shows the explicit omission notice instead of stale local folders.
+pub fn clear_folder_model(state: &BrowserState) {
+    *state.folder_model.borrow_mut() = None;
+    reset_folder_navigation(state);
+}
+
+fn reset_folder_navigation(state: &BrowserState) {
+    *state.folder_location.borrow_mut() = FolderLocation::Roots;
+    *state.folder_prefix.borrow_mut() = None;
+    state.updating.set(true);
+    populate_folder_pane(
+        &state.folder_store,
+        state.folder_model.borrow().as_ref(),
+        &FolderLocation::Roots,
+    );
+    state.folder_selection.set_selected(0);
+    state.updating.set(false);
+}
+
+/// Repopulate the folder pane for `location`, returning the track-filter
+/// prefix it selects (`None` = no folder filter at the roots level or while
+/// detached). This is the lazy navigation step: exactly one level is
+/// derived from the model per call.
+fn populate_folder_pane(
+    store: &gio::ListStore,
+    model: Option<&FolderBrowser>,
+    location: &FolderLocation,
+) -> Option<String> {
+    let mut rows: Vec<(String, u32)> = Vec::new();
+    let mut prefix: Option<String> = None;
+    match (model, location) {
+        (None, _) => {
+            rows.push((
+                "Folder browsing follows the local library sources".to_string(),
+                0,
+            ));
+        }
+        (Some(browser), FolderLocation::Roots) => {
+            let labels = browser.disambiguated_root_labels();
+            for (root, label) in browser.roots().iter().zip(labels) {
+                let label = match root.availability_suffix() {
+                    Some(suffix) => format!("{label}{suffix}"),
+                    None => label,
+                };
+                rows.push((label, 0));
+            }
+            if rows.is_empty() {
+                rows.push(("No library folders configured".to_string(), 0));
+            }
+        }
+        (Some(browser), FolderLocation::Inside { root_id, dir }) => {
+            rows.push((FOLDER_UP_LABEL.to_string(), 0));
+            match browser.children(root_id, dir) {
+                Ok(children) => {
+                    for child in children {
+                        rows.push((child.name, child.track_count as u32));
+                    }
+                }
+                Err(RootBrowseError::Unavailable { reason }) => {
+                    rows.push((format!("(unavailable: {reason})"), 0));
+                }
+                Err(RootBrowseError::Renamed { previous_path }) => {
+                    rows.push((format!("(renamed from {previous_path})"), 0));
+                }
+                Err(RootBrowseError::UnknownRoot) => {}
+            }
+            if let Some(root) = browser.roots().iter().find(|r| &r.root_id == root_id) {
+                prefix = Some(join_root_prefix(&root.root_path.to_string_lossy(), dir));
+            }
+        }
+    }
+    let items: Vec<BrowserItem> = rows
+        .iter()
+        .map(|(label, count)| BrowserItem::new(label, *count))
+        .collect();
+    store.splice(0, store.n_items(), &items);
+    prefix
+}
+
+/// Join a root path and a root-relative directory into the filter prefix
+/// (no trailing separator; the window's URI comparison appends one).
+fn join_root_prefix(root: &str, dir: &str) -> String {
+    if dir.is_empty() {
+        root.to_string()
+    } else {
+        format!("{root}/{dir}")
     }
 }
 

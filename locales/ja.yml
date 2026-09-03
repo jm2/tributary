@@ -47,6 +47,7 @@ browser:
   genre: "ジャンル"
   artist: "アーティスト"
   album: "アルバム"
+  folder: "フォルダー"
   all: "すべて"
 
 # ── Tracklist columns ──────────────────────────────────────────────

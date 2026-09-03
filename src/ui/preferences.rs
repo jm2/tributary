@@ -169,20 +169,33 @@ where
 }
 
 /// Browser pane visibility toggles.
+// Four independent persisted view toggles; a bitmask/enum set would not
+// simplify the config-file shape.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserViewsConfig {
     pub genre: bool,
     pub artist: bool,
     pub album: bool,
+    /// Root-relative folder browsing pane (#14). Defaults to visible for
+    /// fresh configs; the field-level serde default keeps older configs
+    /// (written before this pane existed) loading unchanged.
+    #[serde(default = "default_folder_view")]
+    pub folder: bool,
+}
+
+fn default_folder_view() -> bool {
+    true
 }
 
 impl Default for BrowserViewsConfig {
     fn default() -> Self {
-        // All three panes visible by default (matches `AppConfig::default`).
+        // All panes visible by default (matches `AppConfig::default`).
         Self {
             genre: true,
             artist: true,
             album: true,
+            folder: true,
         }
     }
 }
@@ -194,6 +207,7 @@ impl Default for AppConfig {
                 genre: true,
                 artist: true,
                 album: true,
+                folder: true,
             },
             visible_columns: DEFAULT_VISIBLE
                 .iter()
@@ -802,12 +816,21 @@ pub fn show_preferences(
         .halign(gtk::Align::Start)
         .build();
 
+    let folder_check = gtk::CheckButton::builder()
+        .label(rust_i18n::t!("browser.folder").as_ref())
+        .active(cfg.browser_views.folder)
+        .hexpand(true)
+        .halign(gtk::Align::Start)
+        .build();
+
     // Row 0: the three browser panes (one per grid column).
     browser_grid.attach(&genre_check, 0, 0, 1, 1);
     browser_grid.attach(&artist_check, 1, 0, 1, 1);
     browser_grid.attach(&album_check, 2, 0, 1, 1);
-    // Row 1: the grouping toggle spans the full width (its label is longer).
-    browser_grid.attach(&album_artist_check, 0, 1, 3, 1);
+    // Row 1: the folder pane toggle (fourth browser pane).
+    browser_grid.attach(&folder_check, 0, 1, 1, 1);
+    // Row 2: the grouping toggle spans the full width (its label is longer).
+    browser_grid.attach(&album_artist_check, 0, 2, 3, 1);
 
     // Wire album artist toggle
     {
@@ -851,6 +874,16 @@ pub fn show_preferences(
         album_check.connect_toggled(move |btn| {
             let mut cfg = config.borrow_mut();
             cfg.browser_views.album = btn.is_active();
+            update_browser_visibility(&browser_box, &cfg.browser_views);
+            save_config(&cfg);
+        });
+    }
+    {
+        let config = config.clone();
+        let browser_box = browser_box.clone();
+        folder_check.connect_toggled(move |btn| {
+            let mut cfg = config.borrow_mut();
+            cfg.browser_views.folder = btn.is_active();
             update_browser_visibility(&browser_box, &cfg.browser_views);
             save_config(&cfg);
         });
@@ -1059,6 +1092,7 @@ pub fn update_browser_visibility(browser_box: &gtk::Box, views: &BrowserViewsCon
                 0 => views.genre,
                 1 => views.artist,
                 2 => views.album,
+                3 => views.folder,
                 _ => true,
             };
             widget.set_visible(visible);
@@ -1067,7 +1101,7 @@ pub fn update_browser_visibility(browser_box: &gtk::Box, views: &BrowserViewsCon
         }
     }
 
-    let any_visible = views.genre || views.artist || views.album;
+    let any_visible = views.genre || views.artist || views.album || views.folder;
     browser_box.set_visible(any_visible);
 }
 

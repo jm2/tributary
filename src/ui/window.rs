@@ -27,6 +27,7 @@ use crate::local::playlist_sidebar::{
 use crate::ui::header_bar::RepeatMode;
 
 use super::browser;
+use super::folder_browser;
 use super::header_bar;
 use super::objects::{HeaderKind, SourceObject, TrackObject};
 use super::output_dialogs::{load_saved_outputs, show_add_output_dialog};
@@ -1775,13 +1776,33 @@ pub(crate) fn build_window(
         move |genre: Option<String>,
               artist: Option<String>,
               album: Option<String>,
+              folder_prefix: Option<String>,
               search_text: String| {
             let master = master_for_filter.borrow();
             let search_lower = search_text.to_lowercase();
             let use_album_artist = app_config_for_filter.borrow().group_by_album_artist;
+            // Folder browsing filters by filesystem prefix. The prefix is a
+            // plain directory path; convert it to its canonical file:// URI
+            // form once, with a trailing separator so `/a/b` cannot match
+            // `/a/bc` (a track directly in `/a/b` also ends with `/file`).
+            let folder_uri_prefix: Option<String> = folder_prefix
+                .as_ref()
+                .and_then(|p| url::Url::from_file_path(p).ok())
+                .map(|u| {
+                    let mut text = u.to_string();
+                    if !text.ends_with('/') {
+                        text.push('/');
+                    }
+                    text
+                });
             let filtered: Vec<TrackObject> = master
                 .iter()
                 .filter(|t| {
+                    if let Some(ref prefix) = folder_uri_prefix {
+                        if !t.uri().starts_with(prefix.as_str()) {
+                            return false;
+                        }
+                    }
                     if let Some(ref g) = genre {
                         if &t.genre() != g {
                             return false;
@@ -3623,6 +3644,10 @@ pub fn display_tracks(
 
     tracklist::update_status(status_label, objects);
     browser::rebuild_browser_data(browser_widget, browser_state, objects);
+    // A source switch resets the folder pane: only the local library
+    // carries browsable filesystem roots (the explicit omission policy).
+    // The local-display paths re-attach the model right after this call.
+    browser::clear_folder_model(browser_state);
     *master_tracks.borrow_mut() = objects.to_vec();
     column_view.scroll_to(0, None, gtk::ListScrollFlags::NONE, None);
 }
@@ -3841,6 +3866,43 @@ fn invalidate_playlist_projections(
     }
 }
 
+/// Build the folder-browsing model for the local library: configured roots
+/// (with availability/renamed state observed from the filesystem) plus the
+/// placed local catalog. The report is dropped by callers that surface
+/// omissions through the pane's policy rows instead.
+fn build_folder_model(
+    app_config: &Rc<RefCell<preferences::AppConfig>>,
+    objects: &[TrackObject],
+) -> (
+    folder_browser::FolderBrowser,
+    folder_browser::BrowsingReport,
+) {
+    let roots: Vec<folder_browser::BrowsableRoot> = app_config
+        .borrow()
+        .library_paths
+        .iter()
+        .map(|path| folder_browser::BrowsableRoot::from_configured(path, None))
+        .collect();
+    let inputs: Vec<folder_browser::TrackPathInput> = objects
+        .iter()
+        .map(|t| folder_browser::TrackPathInput {
+            source_label: "local".to_string(),
+            path: uri_to_path(&t.uri()),
+        })
+        .collect();
+    let (placed, report) = folder_browser::place_tracks(&roots, &inputs);
+    (folder_browser::FolderBrowser::new(roots, placed), report)
+}
+
+/// Convert a `file://` URI back to a filesystem path. Remote and stream
+/// URIs have no filesystem path and return `None` — those tracks are the
+/// pathless inputs the folder browser's omission policy reports.
+fn uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    url::Url::parse(uri)
+        .ok()
+        .and_then(|u| u.to_file_path().ok())
+}
+
 /// Spawn the library event receiver loop on the GTK main thread.
 #[allow(clippy::too_many_arguments)]
 fn setup_library_events(
@@ -3872,6 +3934,7 @@ fn setup_library_events(
     let window = window.clone();
     let browser_widget = browser_widget.clone();
     let column_view = column_view.clone();
+    let app_config_for_events = app_config.clone();
 
     // ── Debounce browser rebuilds for TrackUpserted / TrackRemoved ──
     // During initial scan, dozens of upsert events fire in quick
@@ -3920,6 +3983,12 @@ fn setup_library_events(
                             &status_label,
                             &column_view,
                         );
+                        // Rebuild the folder pane from the current library
+                        // roots and the synced catalog (root-relative
+                        // browsing, lazy navigation, explicit omissions).
+                        let (folder_model, _) =
+                            build_folder_model(&app_config_for_events, &objects);
+                        browser::attach_folder_model(&browser_state, folder_model);
                     }
                 }
 

@@ -47,6 +47,7 @@ browser:
   genre: "流派"
   artist: "艺术家"
   album: "专辑"
+  folder: "文件夹"
   all: "全部"
 
 # ── Tracklist columns ──────────────────────────────────────────────
