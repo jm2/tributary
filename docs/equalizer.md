@@ -34,13 +34,13 @@ range, a fixed precision, and a fixed default. Settings outside these bounds are
 the settings UI must reject them at the boundary; runtime code must not be able to materialize
 them.
 
-| Control         | Type       | Range / values                                     | Precision | Default    |
-|-----------------|------------|----------------------------------------------------|-----------|------------|
-| Enabled         | bool       | `true` / `false` (global bypass)                   | —         | `false`    |
-| Preset          | enum       | `Flat` / `Pop` / `Rock` / `Jazz` / `Classical` / `Custom` (write-only) | —         | `Flat`     |
-| Preamp          | linear dB  | `−24.0` … `0.0` … `+12.0` dB; integer or half-step | 0.5 dB    | `0.0` dB   |
-| Bands 1..10     | linear dB  | `−24.0` … `0.0` … `+12.0` dB                       | 0.5 dB    | `0.0` dB   |
-| Clip protection | enum       | `Off` / `Soft` (soft-knee compressor, 0 dBFS asymptotic ceiling, −6 dBFS threshold) | —         | `Off`      |
+| Control | Type | Range / values | Precision | Default |
+|---|---|---|---|---|
+| Enabled | bool | `true` / `false` (global bypass) | — | `false` |
+| Preset | enum | `Flat`/`Pop`/`Rock`/`Jazz`/`Classical`/`Custom` (write-only) | — | `Flat` |
+| Preamp | linear dB | `−24.0` … `0.0` … `+12.0` dB; integer or half-step | 0.5 dB | `0.0` dB |
+| Bands 1..10 | linear dB | `−24.0` … `0.0` … `+12.0` dB | 0.5 dB | `0.0` dB |
+| Clip protection | enum | `Off` / `Soft` (see the clip-protection paragraph below) | — | `Off` |
 
 Ten band center frequencies are taken from the canonical `equalizer-10bands` element
 (`gst-plugins-good` 1.28.5, verified with `gst-inspect-1.0`): **29 Hz, 59 Hz, 119 Hz, 237 Hz,
@@ -57,13 +57,13 @@ recommended value. Once the user manually edits any band or the preamp, the pers
 name transitions to `Custom` (see *Band and preamp mechanics* below); the named preset is no
 longer the source of truth and is over-written by `Custom` in storage.
 
-| Preset      | Recommended preamp | Description                                                       |
-|-------------|--------------------|-------------------------------------------------------------------|
-| Flat        | 0.0 dB             | All bands at 0.0 dB (the default state and the empty baseline)    |
-| Pop         | −2.0 dB            | Bass shelf + slight mid cut + presence lift                       |
-| Rock        | −1.0 dB            | Bass + treble lift, mid dip                                       |
-| Jazz        | −1.0 dB            | Bass + mid lift                                                    |
-| Classical   | −2.0 dB            | Slight treble lift, flat low end                                   |
+| Preset | Recommended preamp | Description |
+|---|---|---|
+| Flat | 0.0 dB | All bands at 0.0 dB (the default state and the empty baseline) |
+| Pop | −2.0 dB | Bass shelf + slight mid cut + presence lift |
+| Rock | −1.0 dB | Bass + treble lift, mid dip |
+| Jazz | −1.0 dB | Bass + mid lift |
+| Classical | −2.0 dB | Slight treble lift, flat low end |
 
 Pop/Rock/Jazz/Classical gain vectors are documented in the appendix of this contract and are not
 free-form; reviewers must reject any PR that introduces a new band value without the matching
@@ -111,7 +111,7 @@ spec's only rollback path: there is no element-by-element fallback inside the bi
 
 The chain layout for the *enabled, clip-protection-on* state is:
 
-```
+```text
 playbin3.audio-filter (bin "eq-bin") {
     audioresample !
     audioconvert !
@@ -228,15 +228,15 @@ installs starting with enabled EQ.
 The contract intentionally limits which knobs can change mid-playback and at which pipeline stage
 the changes take effect. The boundary is:
 
-| Knob                   | Mid-playback? | Mechanism                                                |
-|------------------------|---------------|----------------------------------------------------------|
-| `Enabled`              | yes           | Pause → bin install/remove → resume                       |
-| `Preset`               | yes           | Buffer-boundary property-write transaction on the bin    |
-| `Preamp`               | yes           | Buffer-boundary property-write transaction on the bin    |
-| Single band `bandN`    | yes           | Buffer-boundary property-write transaction on the bin    |
-| Multiple bands at once | yes           | Buffer-boundary property-write transaction on the bin    |
-| `Clip protection`      | yes           | Pause → `rglimiter` insert/remove inside the bin → resume |
-| Band centres / Q       | NO            | Frozen by the spec; changing requires a new contract     |
+| Knob | Mid-playback? | Mechanism |
+|---|---|---|
+| `Enabled` | yes | Pause → bin install/remove → resume |
+| `Preset` | yes | Buffer-boundary property-write transaction on the bin |
+| `Preamp` | yes | Buffer-boundary property-write transaction on the bin |
+| Single band `bandN` | yes | Buffer-boundary property-write transaction on the bin |
+| Multiple bands at once | yes | Buffer-boundary property-write transaction on the bin |
+| `Clip protection` | yes | Pause → `rglimiter` insert/remove inside the bin → resume |
+| Band centres / Q | NO | Frozen by the spec; changing requires a new contract |
 
 Live reconfiguration of `Enabled` installs or removes the equalizer bin at the
 `playbin3.audio-filter` slot using the pause/relink seam:
@@ -308,7 +308,7 @@ the chain degrades to the no-limiter layout and the user-visible status becomes 
 
 Persisted equalizer state is six keys in a single file. The on-disk grammar is:
 
-```
+```ini
 key="value"
 key="value"
 ...
@@ -327,14 +327,14 @@ Where:
 
 The six keys:
 
-| Key              | Type                       | Range / values                                          |
-|------------------|----------------------------|---------------------------------------------------------|
-| `schema_version` | quoted integer literal     | `"1"` (the only supported value at this revision)       |
-| `enabled`        | quoted boolean literal     | `"true"` / `"false"`                                    |
-| `preset`         | quoted preset name         | `"flat"` / `"pop"` / `"rock"` / `"jazz"` / `"classical"` / `"custom"` |
-| `preamp_db`      | quoted float (one decimal) | `"-24.0"` … `"0.0"` … `"+12.0"`                         |
-| `band0_db`…`band9_db` | quoted float (one decimal) | `"-24.0"` … `"0.0"` … `"+12.0"`                    |
-| `clip_protect`   | quoted enum                | `"off"` / `"soft"`                                      |
+| Key | Type | Range / values |
+|---|---|---|
+| `schema_version` | quoted integer literal | `"1"` (the only supported value at this revision) |
+| `enabled` | quoted boolean literal | `"true"` / `"false"` |
+| `preset` | quoted preset name | `"flat"`/`"pop"`/`"rock"`/`"jazz"`/`"classical"`/`"custom"` |
+| `preamp_db` | quoted float (one decimal) | `"-24.0"` … `"0.0"` … `"+12.0"` |
+| `band0_db`…`band9_db` | quoted float (one decimal) | `"-24.0"` … `"0.0"` … `"+12.0"` |
+| `clip_protect` | quoted enum | `"off"` / `"soft"` |
 
 `equalizer.cfg` lives in the existing `dirs::data_dir()/tributary/` directory beside
 `volume`. The file is owned by the equalizer module; no other module reads or writes it.
@@ -400,12 +400,23 @@ is communicated to the UI through a new trait method, and the rendering is fixed
 shipped output cannot claim an unsupported status, and a future implementation that adds a
 status must ship the matching UI rendering at the same time.
 
-| Output           | Equalizer DSP | Reasoning                                                                                                                  |
-|------------------|---------------|----------------------------------------------------------------------------------------------------------------------------|
-| Local            | supported     | Pipeline owns the decoder-to-sink chain; the equalizer chain runs in process.                                              |
-| AirPlay (RAOP)   | unsupported   | The receiving speaker renders audio; in-band equalizer protocol is proprietary and not exposed by the deployed receiver APIs. |
-| Chromecast       | unsupported   | The receiving speaker renders audio; the Cast V2 protocol does not expose a public equalizer channel.                       |
-| MPD              | unsupported   | MPD exposes server-side EQ commands (`eq`, `setvol`) that require server cooperation and vary by `libmpdclient` build; the canonical contracted behavior is host-side rendering, so host EQ does not reach the receiver. |
+| Output | Equalizer DSP |
+|---|---|
+| Local | supported |
+| AirPlay (RAOP) | unsupported |
+| Chromecast | unsupported |
+| MPD | unsupported |
+
+Reasoning, per output:
+
+- Local: Pipeline owns the decoder-to-sink chain; the equalizer chain runs in process.
+- AirPlay (RAOP): The receiving speaker renders audio; in-band equalizer protocol is
+  proprietary and not exposed by the deployed receiver APIs.
+- Chromecast: The receiving speaker renders audio; the Cast V2 protocol does not expose a public
+  equalizer channel.
+- MPD: MPD exposes server-side EQ commands (`eq`, `setvol`) that require server cooperation and
+  vary by `libmpdclient` build; the canonical contracted behavior is host-side rendering, so
+  host EQ does not reach the receiver.
 
 For each `unsupported` output, the user-visible settings UI renders the equalizer controls as
 disabled with a tool-tip explaining the limitation (e.g. "AirPlay receivers render audio
@@ -482,25 +493,46 @@ migration of older non-English keys is not expected; an unknown preset value is 
 Implementation acceptance requires the exact conditions listed below. The matrix is exhaustive
 for this contract; new conditions require a new revision.
 
-| Scenario                                                | Expected outcome                                                          |
-|---------------------------------------------------------|---------------------------------------------------------------------------|
-| Fresh install, EQ disabled                              | Persisted state matches the default; `playbin3.audio-filter` is `NULL`; no equalizer bin is constructed |
-| Enable EQ on local output                               | Equalizer bin is constructed and installed at `playbin3.audio-filter` via the pause/relink seam; `audio-filter-caps` is `audio/x-raw, format=F32LE, channels=2, layout=interleaved`; pipeline returns to `Playing`; total swap ≤ 100 ms |
-| Change a single band mid-playback                       | Single-property write reaches `equalizer-10bands`; buffer passes; no gapless discontinuity; new value reaches the filter on the next buffer |
-| Select Pop preset mid-playback                          | `EqSettings` struct captures ten bands + preamp; one `g_object_freeze_notify`/`thaw_notify` pair on `equalizer-10bands` writes all ten bands; one on `volume` writes the preamp; bus sees one `properties-changed` per element; preset combo displays `Pop` |
-| Manual band edit mid-playback                           | Single property write on `bandN`; persisted `preset` field becomes `custom`; UI combo displays `Custom` |
-| Cycle clip protection Off → Soft → Off                   | Pause/resume swap each time; `rglimiter` inserts inside the bin; total swap ≤ 100 ms per toggle |
-| Sine input above +6 dBFS with clip protection = Soft    | Output peak converges asymptotically to 0 dBFS without exceeding it; soft-knee compression engages at the −6 dBFS threshold; a 0 dBFS input is attenuated by approximately 1.1 dB; reflects the `rglimiter` element's own description "Apply signal compression to raw audio data" |
-| Switch active output to AirPlay                         | EQ module renders disabled in UI; `playbin3.audio-filter` becomes `NULL`; no equalizer DSP runs |
-| Switch active output back to Local                      | EQ module renders enabled in UI if previously enabled; bin re-installs at `playbin3.audio-filter` with persisted bands and preamp |
-| Quit while a slider drag is in progress                 | Shutdown flush hook writes the current state to disk via atomic replace before `gtk::main_quit` returns; no partial writes |
-| Malformed `equalizer.cfg` on disk                       | Defaults re-written via atomic replace; single warn-level diagnostic published (file path, byte count, bad key) |
-| Preamp outside bounds in saved file                     | Value clamped to range; preset and bands remain valid                     |
-| Band value outside bounds in saved file                 | Value clamped to range; other bands remain valid                          |
-| Preset name not in the named set on disk                | Coerced to `flat`; band vector remains as written on disk                |
-| Hardware sink with 8-channel layout (macOS)             | Pre-EQ `audioconvert` caps remain `[1, 2]`; EQ runs in stereo; same cap fix as existing module |
-| Gapless album transition                                | Bin persists across URI transitions; equalizer state is not re-applied automatically on each new URI; no audible discontinuity |
-| Preamp `0.0 dB` selected                                | Preamp `volume` element is in the chain with `volume=1.0`; gain flat       |
+1. **Fresh install, EQ disabled.** Persisted state matches the default; `playbin3.audio-filter`
+   is `NULL`; no equalizer bin is constructed.
+2. **Enable EQ on local output.** Equalizer bin is constructed and installed at
+   `playbin3.audio-filter` via the pause/relink seam; `audio-filter-caps` is
+   `audio/x-raw, format=F32LE, channels=2, layout=interleaved`; pipeline returns to `Playing`;
+   total swap ≤ 100 ms.
+3. **Change a single band mid-playback.** Single-property write reaches `equalizer-10bands`;
+   buffer passes; no gapless discontinuity; new value reaches the filter on the next buffer.
+4. **Select Pop preset mid-playback.** `EqSettings` struct captures ten bands + preamp; one
+   `g_object_freeze_notify`/`thaw_notify` pair on `equalizer-10bands` writes all ten bands; one
+   on `volume` writes the preamp; bus sees one `properties-changed` per element; preset combo
+   displays `Pop`.
+5. **Manual band edit mid-playback.** Single property write on `bandN`; persisted `preset` field
+   becomes `custom`; UI combo displays `Custom`.
+6. **Cycle clip protection Off → Soft → Off.** Pause/resume swap each time; `rglimiter` inserts
+   inside the bin; total swap ≤ 100 ms per toggle.
+7. **Sine input above +6 dBFS with clip protection = Soft.** Output peak converges
+   asymptotically to 0 dBFS without exceeding it; soft-knee compression engages at the −6 dBFS
+   threshold; a 0 dBFS input is attenuated by approximately 1.1 dB; reflects the `rglimiter`
+   element's own description "Apply signal compression to raw audio data".
+8. **Switch active output to AirPlay.** EQ module renders disabled in UI;
+   `playbin3.audio-filter` becomes `NULL`; no equalizer DSP runs.
+9. **Switch active output back to Local.** EQ module renders enabled in UI if previously
+   enabled; bin re-installs at `playbin3.audio-filter` with persisted bands and preamp.
+10. **Quit while a slider drag is in progress.** Shutdown flush hook writes the current state to
+    disk via atomic replace before `gtk::main_quit` returns; no partial writes.
+11. **Malformed `equalizer.cfg` on disk.** Defaults re-written via atomic replace; single
+    warn-level diagnostic published (file path, byte count, bad key).
+12. **Preamp outside bounds in saved file.** Value clamped to range; preset and bands remain
+    valid.
+13. **Band value outside bounds in saved file.** Value clamped to range; other bands remain
+    valid.
+14. **Preset name not in the named set on disk.** Coerced to `flat`; band vector remains as
+    written on disk.
+15. **Hardware sink with 8-channel layout (macOS).** Pre-EQ `audioconvert` caps remain `[1, 2]`;
+    EQ runs in stereo; same cap fix as existing module.
+16. **Gapless album transition.** Bin persists across URI transitions; equalizer state is not
+    re-applied automatically on each new URI; no audible discontinuity.
+17. **Preamp `0.0 dB` selected.** Preamp `volume` element is in the chain with `volume=1.0`;
+    gain flat.
 
 ## Implementation boundary
 
@@ -513,7 +545,8 @@ The implementation record:
 
 - Adds the equalizer bin (per the layout in *Filter graph*) to the local pipeline as
   `playbin3.audio-filter`, with the elements' spellings inside the bin
-  (`audioresample ! audioconvert ! capsfilter caps="audio/x-raw,format=F32LE,channels=2,layout=interleaved" !
+  (`audioresample ! audioconvert ! capsfilter
+  caps="audio/x-raw,format=F32LE,channels=2,layout=interleaved" !
   volume name=eq-preamp volume=<factor> !
   equalizer-10bands name=eq band0=<gain> ... band9=<gain> !
   rglimiter name=clipper enabled=true !
@@ -538,13 +571,14 @@ date of this design. Future entries to this section will mirror the format used 
 The exact band gain vectors for the four non-Flat presets are written against the canonical ten
 centres (29, 59, 119, 237, 474, 947, 1889, 3770, 7523, 15011 Hz):
 
-| Preset    | Preamp  | 29 Hz | 59 Hz | 119 Hz | 237 Hz | 474 Hz | 947 Hz | 1889 Hz | 3770 Hz | 7523 Hz | 15011 Hz |
-|-----------|---------|-------|-------|--------|--------|--------|--------|---------|---------|---------|----------|
-| Flat      |  0.0    | 0.0   | 0.0   | 0.0    | 0.0    | 0.0    | 0.0    | 0.0     | 0.0     | 0.0     | 0.0      |
-| Pop       | −2.0    | +1.0  | +2.0  | +3.0   | +2.0   | 0.0    | −1.0   | −1.0    | 0.0     | +1.0    | +2.0     |
-| Rock      | −1.0    | +3.0  | +2.0  | 0.0    | −1.0   | −1.0   | +0.0   | +2.0    | +3.0    | +3.0    | +2.0     |
-| Jazz      | −1.0    | +2.0  | +1.0  | 0.0    | +1.0   | +1.0   | +0.0   | +1.0    | +2.0    | +2.0    | +1.0     |
-| Classical | −2.0    | 0.0   | 0.0   | 0.0    | 0.0    | 0.0    | 0.0    | 0.0     | +1.0    | +2.0    | +3.0     |
+| Preset | Preamp | 29 | 59 | 119 | 237 | 474 | 947 | 1889 | 3770 | 7523 | 15011 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Flat | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| Pop | −2.0 | +1.0 | +2.0 | +3.0 | +2.0 | 0.0 | −1.0 | −1.0 | 0.0 | +1.0 | +2.0 |
+| Rock | −1.0 | +3.0 | +2.0 | 0.0 | −1.0 | −1.0 | +0.0 | +2.0 | +3.0 | +3.0 | +2.0 |
+| Jazz | −1.0 | +2.0 | +1.0 | 0.0 | +1.0 | +1.0 | +0.0 | +1.0 | +2.0 | +2.0 | +1.0 |
+| Classical | −2.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | +1.0 | +2.0 | +3.0 |
 
-All values are linear dB and rounded to one decimal. Any deviation from this table is a contract
-change and must be reflected in the appendix before the matching code lands.
+Column headers above are the band centre frequencies in Hz. All values are linear dB and rounded
+to one decimal. Any deviation from this table is a contract change and must be reflected in the
+appendix before the matching code lands.
