@@ -203,34 +203,14 @@ impl PlaylistMutationContext {
             return;
         };
 
-        let worker_pid = playlist_id.clone();
-        let registry = self.source_registry.clone();
         let (result_tx, result_rx) = async_channel::bounded(1);
-        self.rt_handle.spawn(async move {
-            let outcome = match crate::db::connection::init_db().await {
-                Ok(db) => {
-                    let manager = crate::local::playlist_manager::PlaylistManager::new(db);
-                    match manager
-                        .add_entries_if_authorized(&worker_pid, &plan.inputs, || {
-                            registry.acquire_regular_playlist_commit_authority(&plan.authority)
-                        })
-                        .await
-                    {
-                        Ok(PlaylistEntryAddOutcome::Committed(_)) => PlaylistMutationOutcome::Committed,
-                        Ok(PlaylistEntryAddOutcome::Rejected) => PlaylistMutationOutcome::Rejected,
-                        Err(error) => {
-                            tracing::error!(%error, playlist = %worker_pid, "Failed to add exact playlist occurrences");
-                            PlaylistMutationOutcome::Failed
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(%error, "Failed to open DB for playlist add");
-                    PlaylistMutationOutcome::Failed
-                }
-            };
-            let _ = result_tx.send(outcome).await;
-        });
+        spawn_playlist_add_worker(
+            &self.rt_handle,
+            self.source_registry.clone(),
+            playlist_id.clone(),
+            plan,
+            result_tx,
+        );
 
         let context = self.clone();
         let count = candidates.len();
@@ -389,6 +369,10 @@ fn expose_context_menu_accessibility(column_view: &gtk::ColumnView) {
     ]);
 }
 
+/// Shared closure type for one-shot context-menu popups. Returns whether a
+/// non-empty menu was opened; keyboard consumers decide propagation from it.
+type ContextMenuPopupFn = Rc<dyn Fn(&gtk::ColumnView, Option<gtk::gdk::Rectangle>) -> bool>;
+
 /// Wire pointer and keyboard context-menu access on the tracklist.
 ///
 /// Right-click retains its exact pointer anchor. The Menu key and Shift+F10
@@ -404,81 +388,133 @@ pub fn setup_context_menu(
     let active_source_key = state.active_source_key.clone();
     let mutation_context = PlaylistMutationContext::from_window(state);
 
-    let popup_menu = Rc::new(
+    let popup_menu: ContextMenuPopupFn = Rc::new(
         move |cv: &gtk::ColumnView, anchor: Option<gtk::gdk::Rectangle>| {
-            let active_key = active_source_key.borrow().clone();
-            let is_playlist_view = active_key.starts_with("playlist:");
-
-            // Freeze exact selected row identities while constructing this
-            // one-shot popover. No later mutation consults a URI, source label,
-            // or whatever rows happen to occupy these GTK positions.
-            let selection_model = cv.model();
-            let Some(sel) = selection_model.and_then(|m| m.downcast::<gtk::MultiSelection>().ok())
-            else {
-                return false;
+            let session = ContextMenuPopupSession {
+                mutation_context: &mutation_context,
+                sidebar_store: &sidebar_store,
+                sm: &sm,
+                column_view: cv,
             };
-
-            let selected = sel.selection();
-            let Some(popup_plan) = ContextMenuPopupPlan::from_positions(
-                (0..sm.n_items()).filter(|position| selected.contains(*position)),
-            ) else {
-                return false;
-            };
-
-            let menu = gtk::gio::Menu::new();
-            let action_group = gtk::gio::SimpleActionGroup::new();
-            let interaction_request = mutation_context.current_request(&active_key);
-
-            if is_playlist_view {
-                build_remove_from_playlist_action(
-                    &menu,
-                    &action_group,
-                    &active_key,
-                    &sm,
-                    &popup_plan.selection,
-                    interaction_request.as_ref(),
-                    &mutation_context,
-                );
-            } else {
-                build_add_to_playlist_actions(
-                    &menu,
-                    &action_group,
-                    &sidebar_store,
-                    &sm,
-                    &popup_plan.selection,
-                    interaction_request.as_ref(),
-                    &mutation_context,
-                );
-            }
-
-            // ── Properties… ──────────────────────────────────────────
-            let automatic_device = active_source_is_automatic_device(&sidebar_store, &active_key);
-            build_properties_action(
-                &menu,
-                &action_group,
-                cv,
-                &sm,
-                &popup_plan.selection,
-                automatic_device,
-            );
-
-            if menu.n_items() == 0 {
-                return false;
-            }
-
-            let popover = popover_from_menu_model(cv, &menu, &action_group);
-            if let Some(anchor) = anchor {
-                popover.set_pointing_to(Some(&anchor));
-            }
-            popover.popup();
-            true
+            open_context_menu_popup(&session, &active_source_key, anchor)
         },
     );
+    attach_pointer_context_menu(state, &popup_menu);
+    attach_keyboard_context_menu(state, popup_menu);
+    expose_context_menu_accessibility(&state.column_view);
+}
 
+/// Immutable view of everything a one-shot context-menu popup renders against.
+struct ContextMenuPopupSession<'a> {
+    mutation_context: &'a PlaylistMutationContext,
+    sidebar_store: &'a gtk::gio::ListStore,
+    sm: &'a gtk::SortListModel,
+    column_view: &'a gtk::ColumnView,
+}
+
+/// Freeze exact selected row identities for a one-shot popup.
+///
+/// No later mutation consults a URI, source label, or whatever rows happen
+/// to occupy these GTK positions.
+fn snapshot_popup_plan(session: &ContextMenuPopupSession<'_>) -> Option<ContextMenuPopupPlan> {
+    let sel = session
+        .column_view
+        .model()
+        .and_then(|m| m.downcast::<gtk::MultiSelection>().ok())?;
+    let selected = sel.selection();
+    ContextMenuPopupPlan::from_positions(
+        (0..session.sm.n_items()).filter(|position| selected.contains(*position)),
+    )
+}
+
+/// Populate a fresh menu model with the selection-scoped actions.
+fn append_context_menu_actions(
+    session: &ContextMenuPopupSession<'_>,
+    menu: &gtk::gio::Menu,
+    action_group: &gtk::gio::SimpleActionGroup,
+    active_key: &str,
+    is_playlist_view: bool,
+    popup_plan: &ContextMenuPopupPlan,
+    interaction_request: Option<&super::source_navigation::SourceRequest>,
+) {
+    if is_playlist_view {
+        build_remove_from_playlist_action(
+            menu,
+            action_group,
+            active_key,
+            session.sm,
+            &popup_plan.selection,
+            interaction_request,
+            session.mutation_context,
+        );
+    } else {
+        build_add_to_playlist_actions(
+            menu,
+            action_group,
+            session.sidebar_store,
+            session.sm,
+            &popup_plan.selection,
+            interaction_request,
+            session.mutation_context,
+        );
+    }
+
+    // ── Properties… ──────────────────────────────────────────
+    let automatic_device = active_source_is_automatic_device(session.sidebar_store, active_key);
+    build_properties_action(
+        menu,
+        action_group,
+        session.column_view,
+        session.sm,
+        &popup_plan.selection,
+        automatic_device,
+    );
+}
+
+/// Open the selection-snapshotted context-menu popover on the session's
+/// column view. Returns `true` only when a non-empty menu was presented.
+fn open_context_menu_popup(
+    session: &ContextMenuPopupSession<'_>,
+    active_source_key: &Rc<RefCell<String>>,
+    anchor: Option<gtk::gdk::Rectangle>,
+) -> bool {
+    let active_key = active_source_key.borrow().clone();
+    let is_playlist_view = active_key.starts_with("playlist:");
+    let Some(popup_plan) = snapshot_popup_plan(session) else {
+        return false;
+    };
+
+    let menu = gtk::gio::Menu::new();
+    let action_group = gtk::gio::SimpleActionGroup::new();
+    let interaction_request = session.mutation_context.current_request(&active_key);
+
+    append_context_menu_actions(
+        session,
+        &menu,
+        &action_group,
+        &active_key,
+        is_playlist_view,
+        &popup_plan,
+        interaction_request.as_ref(),
+    );
+
+    if menu.n_items() == 0 {
+        return false;
+    }
+
+    let popover = popover_from_menu_model(session.column_view, &menu, &action_group);
+    if let Some(anchor) = anchor {
+        popover.set_pointing_to(Some(&anchor));
+    }
+    popover.popup();
+    true
+}
+
+fn attach_pointer_context_menu(state: &WindowState, popup_menu: &ContextMenuPopupFn) {
     let gesture = gtk::GestureClick::new();
     gesture.set_button(3); // right-click
     {
-        let popup_menu = Rc::clone(&popup_menu);
+        let popup_menu = Rc::clone(popup_menu);
         gesture.connect_pressed(move |gesture, _n_press, x, y| {
             let Some(cv) = gesture
                 .widget()
@@ -491,7 +527,9 @@ pub fn setup_context_menu(
         });
     }
     state.column_view.add_controller(gesture);
+}
 
+fn attach_keyboard_context_menu(state: &WindowState, popup_menu: ContextMenuPopupFn) {
     let key_controller = match CONTEXT_MENU_INTERACTION.keyboard_controller {
         ContextMenuControllerPlan::EventControllerKeyBubble => {
             let controller = gtk::EventControllerKey::new();
@@ -514,7 +552,6 @@ pub fn setup_context_menu(
         keyboard_context_menu_propagation(true, popup_menu(&cv, None)).into_gtk()
     });
     state.column_view.add_controller(key_controller);
-    expose_context_menu_accessibility(&state.column_view);
 }
 
 /// Per-row drop-target payload used by the sidebar factory to install the
@@ -586,6 +623,46 @@ pub fn attach_playlist_drop_target(
 fn position_source(store: &gtk::gio::ListStore, list_item: &gtk::ListItem) -> Option<SourceObject> {
     let pos = list_item.position();
     store.item(pos).and_downcast::<SourceObject>()
+}
+
+/// Run the DB-backed playlist add on the blocking runtime and report the
+/// outcome through `result_tx`.
+///
+/// Authorization revalidation (`acquire_regular_playlist_commit_authority`)
+/// happens inside the write transaction, so a stale menu snapshot can never
+/// commit against a playlist that lost editability between click and commit.
+fn spawn_playlist_add_worker(
+    rt_handle: &tokio::runtime::Handle,
+    registry: SourceRegistry,
+    playlist_id: String,
+    plan: PlaylistAddPlan,
+    result_tx: async_channel::Sender<PlaylistMutationOutcome>,
+) {
+    rt_handle.spawn(async move {
+        let outcome = match crate::db::connection::init_db().await {
+            Ok(db) => {
+                let manager = crate::local::playlist_manager::PlaylistManager::new(db);
+                match manager
+                    .add_entries_if_authorized(&playlist_id, &plan.inputs, || {
+                        registry.acquire_regular_playlist_commit_authority(&plan.authority)
+                    })
+                    .await
+                {
+                    Ok(PlaylistEntryAddOutcome::Committed(_)) => PlaylistMutationOutcome::Committed,
+                    Ok(PlaylistEntryAddOutcome::Rejected) => PlaylistMutationOutcome::Rejected,
+                    Err(error) => {
+                        tracing::error!(%error, playlist = %playlist_id, "Failed to add exact playlist occurrences");
+                        PlaylistMutationOutcome::Failed
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "Failed to open DB for playlist add");
+                PlaylistMutationOutcome::Failed
+            }
+        };
+        let _ = result_tx.send(outcome).await;
+    });
 }
 
 fn setup_playlist_transfer(
