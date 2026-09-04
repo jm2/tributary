@@ -697,7 +697,7 @@ fn display_local_fallback(context: &SourceReducerContext, retired_key: &str) {
         .get("local")
         .cloned()
         .unwrap_or_default();
-    display_tracks(
+    display_local_tracks(
         &local_tracks,
         &context.track_store,
         &context.master_tracks,
@@ -705,6 +705,7 @@ fn display_local_fallback(context: &SourceReducerContext, retired_key: &str) {
         &context.browser_state,
         &context.status_label,
         &context.column_view,
+        &context.app_config,
     );
 }
 
@@ -2381,7 +2382,6 @@ pub(crate) fn build_window(
     let sidebar_store_for_events = sidebar_store.clone();
     let sidebar_sel_for_events = sidebar_selection.clone();
     let pending_connection_for_events = pending_connection.clone();
-    let pre_connect_selection_for_events = pre_connect_selection.clone();
     let source_connection_state = WindowState {
         window: window.clone(),
         toast_overlay: toast_overlay.clone(),
@@ -2408,6 +2408,13 @@ pub(crate) fn build_window(
         pending_connection: pending_connection.clone(),
         pre_connect_selection: pre_connect_selection.clone(),
     };
+
+    // Context-menu playlist mutations and track-to-playlist drag/drop are
+    // library interactions, so they must survive audio construction failure.
+    // Install them exactly once before `present()` can realize sidebar rows
+    // and before the fallible player constructor can take its early return.
+    super::context_menu::setup_context_menu(&source_connection_state, playlist_row_drop);
+
     super::source_connect::setup_source_connect(&source_connection_state);
     setup_source_lifecycle_reducer(
         &source_connection_state,
@@ -2460,10 +2467,9 @@ pub(crate) fn build_window(
     // Present the window EARLY so that the native OS surface is
     // allocated.  On Windows, souvlaki needs the HWND which only
     // exists after the window has been realized and mapped.
-    // Sidebar rows are not realized until the main loop pumps after
-    // `present()`, and `setup_context_menu` (later in this function)
-    // populates `playlist_row_drop` before build_window returns — see
-    // the ordering note at the `playlist_row_drop` declaration above.
+    // `setup_context_menu` above has already populated `playlist_row_drop`
+    // before `present()` can realize sidebar rows — see the ordering note at
+    // the `playlist_row_drop` declaration above.
     window.present();
     info!("Main window presented");
 
@@ -2983,37 +2989,6 @@ pub(crate) fn build_window(
             );
         });
     }
-
-    // ── Right-click context menu on tracklist ────────────────────────
-    super::context_menu::setup_context_menu(
-        &WindowState {
-            window: window.clone(),
-            toast_overlay: toast_overlay.clone(),
-            rt_handle: rt_handle.clone(),
-            engine_tx: engine_tx.clone(),
-            playlist_sidebar_refresh: playlist_sidebar_refresh.clone(),
-            source_registry: source_registry.clone(),
-            remote_provenance: remote_provenance.clone(),
-            track_store: track_store.clone(),
-            master_tracks: master_tracks.clone(),
-            source_tracks: source_tracks.clone(),
-            active_source_key: active_source_key.clone(),
-            source_navigation: source_navigation.clone(),
-            near_me_consent_request: near_me_consent_request.clone(),
-            sidebar_store: sidebar_store_for_events.clone(),
-            sidebar_selection: sidebar_sel_for_events.clone(),
-            playlist_sidebar_replacing: playlist_sidebar_replacing.clone(),
-            browser_widget: browser_widget.clone(),
-            browser_state: browser_state.clone(),
-            status_label: status_label.clone(),
-            column_view: column_view.clone(),
-            sort_model: sort_model.clone(),
-            app_config: app_config.clone(),
-            pending_connection: pending_connection_for_events.clone(),
-            pre_connect_selection: pre_connect_selection_for_events.clone(),
-        },
-        playlist_row_drop,
-    );
 
     // ── Wire Next button ────────────────────────────────────────────
     {
@@ -3670,6 +3645,34 @@ pub fn display_tracks(
     column_view.scroll_to(0, None, gtk::ListScrollFlags::NONE, None);
 }
 
+/// Display the built-in local-library projection and restore its filesystem
+/// folder model after [`display_tracks`] clears source-specific browsing state.
+/// Every full local display goes through this helper so returning from a
+/// playlist, radio, or remote source cannot leave the folder pane detached.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn display_local_tracks(
+    objects: &[TrackObject],
+    track_store: &gtk::gio::ListStore,
+    master_tracks: &RefCell<Vec<TrackObject>>,
+    browser_widget: &gtk::Box,
+    browser_state: &browser::BrowserState,
+    status_label: &gtk::Label,
+    column_view: &gtk::ColumnView,
+    app_config: &Rc<RefCell<preferences::AppConfig>>,
+) {
+    display_tracks(
+        objects,
+        track_store,
+        master_tracks,
+        browser_widget,
+        browser_state,
+        status_label,
+        column_view,
+    );
+    let (folder_model, _) = build_folder_model(app_config, objects);
+    browser::attach_folder_model(browser_state, folder_model);
+}
+
 /// Re-resolve queued library items from committed library state.
 ///
 /// The playback queue is an immutable snapshot of identities, so it survives
@@ -3952,8 +3955,6 @@ fn setup_library_events(
     let window = window.clone();
     let browser_widget = browser_widget.clone();
     let column_view = column_view.clone();
-    let app_config_for_events = app_config.clone();
-
     // ── Debounce browser rebuilds for TrackUpserted / TrackRemoved ──
     // During initial scan, dozens of upsert events fire in quick
     // succession.  Instead of rebuilding the 3-pane browser on every
@@ -3992,7 +3993,7 @@ fn setup_library_events(
 
                     // Display only if local is the active source.
                     if *active_source_key.borrow() == "local" {
-                        display_tracks(
+                        display_local_tracks(
                             &objects,
                             &track_store,
                             &master_tracks,
@@ -4000,13 +4001,8 @@ fn setup_library_events(
                             &browser_state,
                             &status_label,
                             &column_view,
+                            &app_config,
                         );
-                        // Rebuild the folder pane from the current library
-                        // roots and the synced catalog (root-relative
-                        // browsing, lazy navigation, explicit omissions).
-                        let (folder_model, _) =
-                            build_folder_model(&app_config_for_events, &objects);
-                        browser::attach_folder_model(&browser_state, folder_model);
                     }
                 }
 
@@ -4967,6 +4963,91 @@ mod identity_tests {
         LastFmApplicationAdmissionError, LastFmApplicationCommandError, LastFmApplicationPhase,
     };
     use crate::local::playlist_sidebar::{PlaylistSidebarEntry, PlaylistSidebarKind};
+
+    #[test]
+    fn library_interaction_wiring_precedes_window_realization_and_audio_setup() {
+        let source = include_str!("window.rs");
+        let setup_marker = ["super::context_menu::setup_", "context_menu("].concat();
+        let present_marker = ["window.", "present();"].concat();
+        let player_marker = ["crate::audio::Player::", "new(rt_handle.clone())"].concat();
+        let setup_positions = source
+            .match_indices(&setup_marker)
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            setup_positions.len(),
+            1,
+            "context-menu and playlist-transfer controllers must be installed exactly once"
+        );
+        let present = source.find(&present_marker).expect("window presentation");
+        let player = source.find(&player_marker).expect("fallible player setup");
+        assert!(
+            setup_positions[0] < present,
+            "playlist drop context must exist before sidebar rows can realize"
+        );
+        assert!(
+            setup_positions[0] < player,
+            "library interactions must survive player construction failure"
+        );
+    }
+
+    #[test]
+    fn every_full_local_display_restores_the_folder_model_through_one_helper() {
+        let window_source = include_str!("window.rs");
+        let source_connect = include_str!("source_connect.rs");
+        let radio_source = include_str!("radio.rs");
+        let helper_marker = ["display_local_", "tracks("].concat();
+
+        let fallback = window_source
+            .split_once("fn display_local_fallback(")
+            .and_then(|(_, rest)| rest.split_once("\nfn clear_remote_projection("))
+            .map(|(body, _)| body)
+            .expect("local fallback body");
+        let full_sync = window_source
+            .split_once("LibraryEvent::FullSync(tracks) => {")
+            .and_then(|(_, rest)| rest.split_once("LibraryEvent::TrackUpserted(track) => {"))
+            .map(|(body, _)| body)
+            .expect("full-sync body");
+        let local_selection = source_connect
+            .split_once("if playlist_id.is_none() && key == \"local\" {")
+            .and_then(|(_, rest)| rest.split_once("// ── Playlist source:"))
+            .map(|(body, _)| body)
+            .expect("local-selection body");
+        let radio_fallback = radio_source
+            .split_once("fn fall_back_to_local(")
+            .and_then(|(_, rest)| rest.split_once("/// Enforce the Near Me consent prerequisite"))
+            .map(|(body, _)| body)
+            .expect("radio local-fallback body");
+
+        for (path, body) in [
+            ("lifecycle fallback", fallback),
+            ("full sync", full_sync),
+            ("sidebar selection", local_selection),
+            ("radio consent fallback", radio_fallback),
+        ] {
+            assert!(
+                body.contains(&helper_marker),
+                "{path} must restore local folder browsing"
+            );
+        }
+
+        assert_eq!(
+            window_source.match_indices(&helper_marker).count(),
+            3,
+            "window.rs must contain the helper plus its fallback and FullSync calls"
+        );
+        assert_eq!(
+            source_connect.match_indices(&helper_marker).count(),
+            1,
+            "the local sidebar branch must use the shared helper exactly once"
+        );
+        assert_eq!(
+            radio_source.match_indices(&helper_marker).count(),
+            1,
+            "the radio consent fallback must use the shared helper exactly once"
+        );
+    }
 
     #[test]
     fn coordinator_observes_current_event_before_history_and_ui_mutation() {

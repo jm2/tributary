@@ -385,6 +385,10 @@ fn expose_context_menu_accessibility(column_view: &gtk::ColumnView) {
 /// non-empty menu was opened; keyboard consumers decide propagation from it.
 type ContextMenuPopupFn = Rc<dyn Fn(&gtk::ColumnView, Option<gtk::gdk::Rectangle>) -> bool>;
 
+/// Maximum natural height of a custom context-menu viewport before its
+/// vertical scrollbar takes over.
+const CONTEXT_MENU_MAX_CONTENT_HEIGHT: i32 = 480;
+
 /// Wire pointer and keyboard context-menu access on the tracklist.
 ///
 /// Right-click retains its exact pointer anchor. The Menu key and Shift+F10
@@ -1162,8 +1166,9 @@ fn active_source_is_automatic_device(
 /// invisible popover (no widget tree attached), which manifested as
 /// Track Properties / New Playlist / New Smart Playlist dialogs failing
 /// to open after the user clicked their menu entries. Hosting plain
-/// buttons in a generic `gtk::Popover` keeps the same one-shot popover
-/// lifecycle without relying on the broken binding.
+/// buttons in a bounded `gtk::ScrolledWindow` inside a generic `gtk::Popover`
+/// keeps the same one-shot lifecycle without relying on the broken binding or
+/// making later playlist actions unreachable on a short display.
 pub fn popover_from_menu_model(
     parent: &impl IsA<gtk::Widget>,
     menu: &gtk::gio::Menu,
@@ -1223,7 +1228,15 @@ pub fn popover_from_menu_model(
         }
     }
 
-    popover.set_child(Some(&vbox));
+    let viewport = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_width(true)
+        .propagate_natural_height(true)
+        .max_content_height(CONTEXT_MENU_MAX_CONTENT_HEIGHT)
+        .child(&vbox)
+        .build();
+    popover.set_child(Some(&viewport));
     popover.connect_closed(|popover| popover.unparent());
     popover
 }
@@ -1692,9 +1705,10 @@ mod tests {
     ///
     /// This test exercises that contract end-to-end: with a populated
     /// menu and matching action group, the resulting popover MUST have a
-    /// child widget containing one button per enabled action. If a future
-    /// change drops the child assignment (e.g. by re-introducing
-    /// `gtk::PopoverMenu::from_model`), this test will fail.
+    /// bounded scrolling child containing one button per enabled action. If a
+    /// future change drops the child assignment or scrolling constraint (e.g.
+    /// by re-introducing `gtk::PopoverMenu::from_model` or attaching the menu
+    /// box directly), this test will fail.
     ///
     /// Headless CI (cargo test in the Fedora container with no X/Wayland socket)
     /// cannot initialize GTK, so the test gates on `gtk::init()`'s
@@ -1740,9 +1754,21 @@ mod tests {
         let child = popover
             .child()
             .expect("popover must have a non-null child after construction");
-        let vbox = child
-            .downcast::<gtk::Box>()
-            .expect("popover child must be the menu's Box");
+        let viewport = child
+            .downcast::<gtk::ScrolledWindow>()
+            .expect("popover child must be a scrolling viewport");
+        assert_eq!(viewport.hscrollbar_policy(), gtk::PolicyType::Never);
+        assert_eq!(viewport.vscrollbar_policy(), gtk::PolicyType::Automatic);
+        assert!(viewport.propagates_natural_width());
+        assert!(viewport.propagates_natural_height());
+        assert_eq!(
+            viewport.max_content_height(),
+            CONTEXT_MENU_MAX_CONTENT_HEIGHT
+        );
+        let vbox = viewport
+            .child()
+            .and_then(|child| child.downcast::<gtk::Box>().ok())
+            .expect("scrolling viewport must contain the menu's Box");
         assert_eq!(
             vbox.observe_children().n_items(),
             2,

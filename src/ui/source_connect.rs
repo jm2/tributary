@@ -27,7 +27,7 @@ use super::source_navigation::{
     CompletionDisposition, ConnectionIntentKind, PendingConnection, SourceNavigation, SourceRequest,
 };
 use super::tracklist;
-use super::window::{arch_track_to_object, display_tracks};
+use super::window::{arch_track_to_object, display_local_tracks, display_tracks};
 use super::window_state::WindowState;
 
 enum PlaylistLoadOutcome {
@@ -770,7 +770,7 @@ pub fn setup_source_connect(state: &WindowState) {
 
             let st = source_tracks.borrow();
             let local_tracks = st.get("local").cloned().unwrap_or_default();
-            display_tracks(
+            display_local_tracks(
                 &local_tracks,
                 &track_store,
                 &master_tracks,
@@ -778,6 +778,7 @@ pub fn setup_source_connect(state: &WindowState) {
                 &browser_state,
                 &status_label,
                 &column_view,
+                &app_config,
             );
             return;
         }
