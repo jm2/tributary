@@ -341,12 +341,19 @@ impl CacheLayout {
 
     /// `fsync` the temp file (the "Finalize" step: nothing is visible at
     /// the cache path yet).
+    ///
+    /// The temp is reopened with write access: `FlushFileBuffers` (the
+    /// Windows backing of `sync_all`) requires a write handle, so a
+    /// read-only open would refuse the sync on Windows while succeeding
+    /// on Unix.
     pub fn sync_temp(
         &self,
         media_key: &MediaKey,
         capability_epoch: u64,
     ) -> Result<(), OfflineError> {
-        File::open(self.temp_path(media_key, capability_epoch))
+        OpenOptions::new()
+            .write(true)
+            .open(self.temp_path(media_key, capability_epoch))
             .map_err(|_| OfflineError::StorageUnavailable)?
             .sync_all()
             .map_err(|_| OfflineError::StorageUnavailable)
@@ -523,39 +530,9 @@ impl CacheLayout {
             };
             for track_entry in source_dirs.flatten() {
                 let track_dir = track_entry.path();
-                if !track_dir.is_dir() {
-                    continue;
+                if track_dir.is_dir() {
+                    tracks.push(scan_track_dir(track_dir));
                 }
-                let mut journal_paths = Vec::new();
-                let mut temp_paths = Vec::new();
-                let mut final_present = false;
-                let Ok(files) = fs::read_dir(&track_dir) else {
-                    continue;
-                };
-                for file_entry in files.flatten() {
-                    let path = file_entry.path();
-                    if !path.is_file() {
-                        continue;
-                    }
-                    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                        continue;
-                    };
-                    if name == CACHE_FILE_NAME {
-                        final_present = true;
-                    } else if let Some(stem) = name.strip_suffix(".journal") {
-                        if stem.contains(".part-") {
-                            journal_paths.push(path);
-                        }
-                    } else if name.contains(".part-") {
-                        temp_paths.push(path);
-                    }
-                }
-                tracks.push(TrackArtifacts {
-                    track_dir,
-                    journal_paths,
-                    temp_paths,
-                    final_present,
-                });
             }
         }
         tracks
@@ -579,6 +556,45 @@ fn write_record_line(file: &mut File, record: &JournalRecord) -> Result<(), Offl
     line.push(b'\n');
     file.write_all(&line)
         .map_err(|_| OfflineError::StorageUnavailable)
+}
+
+/// Classify one file entry of a track directory and record it in the
+/// artifact set: the final cache name, a `.part-` journal sidecar, or a
+/// `.part-` temp file.
+fn scan_track_file(artifacts: &mut TrackArtifacts, path: &Path, name: &str) {
+    if name == CACHE_FILE_NAME {
+        artifacts.final_present = true;
+    } else if let Some(stem) = name.strip_suffix(".journal") {
+        if stem.contains(".part-") {
+            artifacts.journal_paths.push(path.to_path_buf());
+        }
+    } else if name.contains(".part-") {
+        artifacts.temp_paths.push(path.to_path_buf());
+    }
+}
+
+/// Collect the artifacts of one `<source_key>/<track_key>` directory.
+/// An unreadable directory yields an empty artifact set.
+fn scan_track_dir(track_dir: PathBuf) -> TrackArtifacts {
+    let mut artifacts = TrackArtifacts {
+        track_dir,
+        journal_paths: Vec::new(),
+        temp_paths: Vec::new(),
+        final_present: false,
+    };
+    let Ok(files) = fs::read_dir(&artifacts.track_dir) else {
+        return artifacts;
+    };
+    for file_entry in files.flatten() {
+        let path = file_entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            scan_track_file(&mut artifacts, &path, name);
+        }
+    }
+    artifacts
 }
 
 /// Hash `[from, to)` of an already-open file, leaving the running hasher
@@ -612,23 +628,118 @@ fn write_journal_record(path: &Path, record: &JournalRecord) -> Result<(), Offli
         .map_err(|_| OfflineError::StorageUnavailable)
 }
 
-/// Parse and validate one journal file. Segments must be contiguous and in
-/// order: the first violation rejects the whole progress (never trusted).
-/// A torn final line — an interrupted append — is discarded; a corrupt
-/// mid-file line makes the journal unusable.
+/// Mutable parse state accumulated across one journal file's records.
+struct JournalParse {
+    head: Option<(MediaKey, u64, Option<EntityValidator>)>,
+    segments: Vec<JournalSegment>,
+    progress_trusted: bool,
+    committed: Option<CommittedSnapshot>,
+    terminal: Option<(TerminalState, Option<OfflineError>)>,
+    retired: Option<RetirementReason>,
+}
+
+impl Default for JournalParse {
+    fn default() -> Self {
+        Self {
+            head: None,
+            segments: Vec::new(),
+            progress_trusted: true,
+            committed: None,
+            terminal: None,
+            retired: None,
+        }
+    }
+}
+
+/// Outcome of folding one parsed record into [`JournalParse`].
+enum FoldOutcome {
+    /// Record accepted; continue with the next line.
+    Continue,
+    /// The journal is structurally invalid (duplicate head, or a
+    /// segment with no head): the whole file is unusable.
+    Unusable,
+}
+
+/// Fold one validated record into the parse state. Segment ranges must
+/// be contiguous and in order: the first violation rejects the whole
+/// progress (never trusted) but keeps the file loadable.
+fn fold_record(parse: &mut JournalParse, record: JournalRecord) -> FoldOutcome {
+    match record {
+        JournalRecord::Head {
+            media_key,
+            capability_epoch,
+            validator,
+        } => {
+            if parse.head.is_some() {
+                return FoldOutcome::Unusable;
+            }
+            parse.head = Some((media_key, capability_epoch, validator));
+        }
+        JournalRecord::Segment {
+            offset,
+            len,
+            sha256_hex,
+        } => {
+            let Some(_) = parse.head else {
+                return FoldOutcome::Unusable;
+            };
+            let expected_offset = parse
+                .segments
+                .last()
+                .map(|segment| segment.offset + segment.len)
+                .unwrap_or(0);
+            if len == 0 || offset != expected_offset {
+                // Out-of-order or duplicate ranges are rejected: the
+                // journaled progress is untrusted and the job restarts
+                // from zero.
+                parse.progress_trusted = false;
+                parse.segments.clear();
+            } else {
+                parse.segments.push(JournalSegment {
+                    offset,
+                    len,
+                    sha256_hex,
+                });
+            }
+        }
+        JournalRecord::Committed { snapshot } => parse.committed = Some(snapshot),
+        JournalRecord::Terminal { state, failure } => parse.terminal = Some((state, failure)),
+        JournalRecord::Retired { reason } => parse.retired = Some(reason),
+    }
+    FoldOutcome::Continue
+}
+
+/// Build the [`LoadedJournal`] from the folded state. A file with no
+/// parseable head has no identity: unusable.
+fn finish_journal(parse: JournalParse) -> LoadedJournalFile {
+    let Some((media_key, capability_epoch, validator)) = parse.head else {
+        return LoadedJournalFile::Unusable;
+    };
+    LoadedJournalFile::Valid(Box::new(LoadedJournal {
+        media_key,
+        capability_epoch,
+        validator: if parse.progress_trusted {
+            validator
+        } else {
+            None
+        },
+        segments: parse.segments,
+        committed: parse.committed,
+        terminal: parse.terminal,
+        retired: parse.retired,
+    }))
+}
+
+/// Parse and validate one journal file. A torn final line — an
+/// interrupted append — is discarded; a corrupt mid-file line makes the
+/// journal unusable.
 pub fn load_journal(path: &Path) -> LoadedJournalFile {
     let Ok(bytes) = fs::read(path) else {
         return LoadedJournalFile::Unusable;
     };
     let chunks: Vec<&[u8]> = bytes.split(|&byte| byte == b'\n').collect();
     let last = chunks.len().saturating_sub(1);
-    let mut head: Option<(MediaKey, u64, Option<EntityValidator>)> = None;
-    let mut segments: Vec<JournalSegment> = Vec::new();
-    let mut progress_trusted = true;
-    let mut committed: Option<CommittedSnapshot> = None;
-    let mut terminal: Option<(TerminalState, Option<OfflineError>)> = None;
-    let mut retired: Option<RetirementReason> = None;
-
+    let mut parse = JournalParse::default();
     for (index, chunk) in chunks.iter().enumerate() {
         if chunk.is_empty() && index == last {
             break;
@@ -648,67 +759,11 @@ pub fn load_journal(path: &Path) -> LoadedJournalFile {
                 return LoadedJournalFile::Unusable;
             }
         };
-        match record {
-            JournalRecord::Head {
-                media_key,
-                capability_epoch,
-                validator,
-            } => {
-                if head.is_some() {
-                    return LoadedJournalFile::Unusable;
-                }
-                head = Some((media_key, capability_epoch, validator));
-            }
-            JournalRecord::Segment {
-                offset,
-                len,
-                sha256_hex,
-            } => {
-                if head.is_none() {
-                    return LoadedJournalFile::Unusable;
-                }
-                let expected_offset = segments
-                    .last()
-                    .map(|segment| segment.offset + segment.len)
-                    .unwrap_or(0);
-                if len == 0 || offset != expected_offset {
-                    // Out-of-order or duplicate ranges are rejected: the
-                    // journaled progress is untrusted and the job restarts
-                    // from zero.
-                    progress_trusted = false;
-                    segments.clear();
-                } else {
-                    segments.push(JournalSegment {
-                        offset,
-                        len,
-                        sha256_hex,
-                    });
-                }
-            }
-            JournalRecord::Committed { snapshot } => {
-                committed = Some(snapshot);
-            }
-            JournalRecord::Terminal { state, failure } => {
-                terminal = Some((state, failure));
-            }
-            JournalRecord::Retired { reason } => {
-                retired = Some(reason);
-            }
+        if matches!(fold_record(&mut parse, record), FoldOutcome::Unusable) {
+            return LoadedJournalFile::Unusable;
         }
     }
-
-    let Some((media_key, capability_epoch, validator)) = head else {
-        return LoadedJournalFile::Unusable;
-    };
-    LoadedJournalFile::Valid(Box::new(LoadedJournal {
-        media_key,
-        capability_epoch,
-        validator: if progress_trusted { validator } else { None },
-        segments,
-        committed,
-        terminal,
-        retired,
-    }))
+    finish_journal(parse)
 }
 
 #[cfg(test)]

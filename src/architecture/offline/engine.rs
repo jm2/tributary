@@ -16,15 +16,18 @@
 //! `Queued`/`Receiving` state from the journals on restart.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
 use super::catalog::CatalogueIndex;
 use super::quota::{self, AdmissionVerdict};
-use super::storage::{self, CacheLayout, JournalRecord, LoadedJournalFile, RetirementReason};
+use super::storage::{
+    self, CacheLayout, JournalRecord, LoadedJournalFile, RetirementReason, TrackArtifacts,
+};
 use super::{
     validate_byte_hint, CommittedSnapshot, DigestProvenance, EntityValidator, JobRecord, JobState,
     LeaseId, OfflineCatalogueEntry, OfflineError, OfflineSnapshot, OperationalLicence,
@@ -100,7 +103,8 @@ pub struct TransferHead {
     /// (`412`) — both discard partial bytes and restart from zero.
     pub outcome: TransferOutcome,
     /// Full-entity length when the source advertises one. Validated
-    /// against the 4 KiB byte-hint ceiling before any byte is received.
+    /// against the [`super::MAX_OFFLINE_BYTE_HINT`] per-file media
+    /// ceiling before any byte is received.
     pub total_length: Option<u64>,
     /// Entity validator captured from this response. `None` disables
     /// resume for the job.
@@ -176,6 +180,54 @@ fn job_key(media_key: &MediaKey) -> JobKey {
     JobKey(media_key.source_id, media_key.track_id.clone())
 }
 
+/// State carried out of [`OfflineEngine::open_transfer`] into the
+/// receive loop: the running full-file digest, the trusted received
+/// offset, the advertised length, and the advertised digest.
+struct OpenTransfer {
+    hasher: Sha256,
+    received: u64,
+    total_length: Option<u64>,
+    advertised: Option<[u8; 32]>,
+}
+
+/// Receive-loop bookkeeping for the segment currently being
+/// accumulated: its running digest and its `[start, start + len)`
+/// byte range within the temp file.
+struct SegmentProgress {
+    hasher: Sha256,
+    start: u64,
+    len: u64,
+}
+
+impl SegmentProgress {
+    /// Begin a new segment at the current received offset.
+    fn new(received: u64) -> Self {
+        Self {
+            hasher: Sha256::new(),
+            start: received,
+            len: 0,
+        }
+    }
+
+    /// Close the finished segment and begin the next one at `received`.
+    fn reset(&mut self, received: u64) {
+        self.start = received;
+        self.len = 0;
+        self.hasher = Sha256::new();
+    }
+}
+
+/// One journal file recovered from disk during restart recovery, with
+/// the facts recovery needs to rebuild rows and the live job.
+struct RecoveredJob {
+    record: JobRecord,
+    committed: Option<CommittedSnapshot>,
+    retired: Option<RetirementReason>,
+    validator: Option<EntityValidator>,
+    journaled_offset: u64,
+    has_segments: bool,
+}
+
 /// The download/cache engine. Not `Clone`: it owns the durable cache
 /// state under its root. Re-open the same root to recover.
 pub struct OfflineEngine {
@@ -240,6 +292,33 @@ impl OfflineEngine {
         self.index.total_committed_bytes()
     }
 
+    /// The admission decisions that need no network and no quota: a
+    /// non-terminal job for the key waits (`InFlight`), and an already
+    /// committed exact capability epoch short-circuits (`Current`).
+    fn admission_short_circuit(
+        &self,
+        media_key: &MediaKey,
+        key: &JobKey,
+        capability_epoch: u64,
+    ) -> Option<Admission> {
+        let job = self.jobs.get(key)?;
+        if !job.state.is_terminal() {
+            return Some(Admission::InFlight);
+        }
+        if job.capability_epoch == capability_epoch
+            && job.state == JobState::Committed
+            && !matches!(
+                self.index.resolve(media_key),
+                OfflineCatalogueEntry::LiveOnly
+            )
+        {
+            // This exact version is already committed: same epoch
+            // means identical content, so re-downloading is refused.
+            return Some(Admission::Current);
+        }
+        None
+    }
+
     /// Admit one download job. All gates run before any network work:
     /// capability declaration, operational licence, one-job-per-key, the
     /// advisory per-source cap, and global quota headroom (with a
@@ -252,21 +331,8 @@ impl OfflineEngine {
         licence: OperationalLicence,
     ) -> Result<Admission, OfflineError> {
         let key = job_key(media_key);
-        if let Some(job) = self.jobs.get(&key) {
-            if !job.state.is_terminal() {
-                return Ok(Admission::InFlight);
-            }
-            if job.capability_epoch == capability_epoch
-                && job.state == JobState::Committed
-                && !matches!(
-                    self.index.resolve(media_key),
-                    OfflineCatalogueEntry::LiveOnly
-                )
-            {
-                // This exact version is already committed: same epoch
-                // means identical content, so re-downloading is refused.
-                return Ok(Admission::Current);
-            }
+        if let Some(short) = self.admission_short_circuit(media_key, &key, capability_epoch) {
+            return Ok(short);
         }
 
         // Restore headroom first so a full quota evicts instead of
@@ -327,37 +393,34 @@ impl OfflineEngine {
             return Some(job.state);
         }
         let epoch = job.capability_epoch;
+        let open = match self.open_transfer(transport, &media_key, epoch) {
+            Ok(open) => open,
+            Err(state) => return Some(state),
+        };
+        let advertised = open.advertised;
+        let (_, received) = match self.receive(transport, &media_key, epoch, open) {
+            Ok(done) => done,
+            Err(state) => return Some(state),
+        };
+        let (on_disk, provenance) =
+            match self.verify_transfer(transport, &media_key, epoch, received, advertised) {
+                Ok(verified) => verified,
+                Err(state) => return Some(state),
+            };
+        Some(self.commit_snapshot(transport, &media_key, epoch, received, on_disk, provenance))
+    }
 
-        // Phase 1: validate the resume basis, open the transfer, and
-        // decide whether this drive continues or restarts.
-        let mut journaled = job.current_bytes;
-        if journaled > 0 {
-            match self.verify_resume_basis(&media_key, epoch, journaled) {
-                Ok(true) => {}
-                Ok(false) => {
-                    // Untrusted progress (no segments, no validator, or a
-                    // last-segment digest that does not match the bytes on
-                    // disk): discard it and restart from zero.
-                    self.restart_from_zero(&media_key, epoch);
-                    journaled = 0;
-                }
-                Err(error) => {
-                    self.finalize_failed(&media_key, epoch, error, true);
-                    transport.close();
-                    return Some(JobState::Failed);
-                }
-            }
-        }
-        if journaled == 0 {
-            // Fresh receive: reserve the temp beside the final path —
-            // same-directory by construction, so a refusal here is the
-            // cross-filesystem/read-only admission failure.
-            if self.layout.reserve_temp(&media_key, epoch).is_err() {
-                self.finalize_failed(&media_key, epoch, OfflineError::StorageUnavailable, true);
-                transport.close();
-                return Some(JobState::Failed);
-            }
-        }
+    /// Phase 1: validate the resume basis, open the transfer, and decide
+    /// whether this drive continues from the journaled offset or
+    /// restarts from zero. `Err` carries the job's terminal state.
+    fn open_transfer(
+        &mut self,
+        transport: &mut dyn OfflineTransport,
+        media_key: &MediaKey,
+        epoch: u64,
+    ) -> Result<OpenTransfer, JobState> {
+        let key = job_key(media_key);
+        let mut journaled = self.prepare_resume(transport, media_key, epoch)?;
         let validator = self
             .jobs
             .get(&key)
@@ -365,99 +428,176 @@ impl OfflineEngine {
         if journaled > 0 && validator.is_none() {
             // `Some` validator is required for any resumption: a job that
             // captured none restarts fully.
-            self.restart_from_zero(&media_key, epoch);
+            self.restart_from_zero(media_key, epoch);
             journaled = 0;
         }
         if let Some(job) = self.jobs.get_mut(&key) {
             job.state = JobState::Connecting;
         }
         let opened = transport.open(TransferRequest {
-            media_key: &media_key,
+            media_key,
             resume_from: (journaled > 0).then_some(journaled),
             if_range: (journaled > 0).then_some(validator.as_ref()).flatten(),
         });
         let head = match opened {
             Ok(head) => head,
             Err(error) => {
-                let state = self.on_transport_error(transport, &media_key, error);
-                return Some(state);
+                let state = self.on_transport_error(transport, media_key, error);
+                return Err(state);
             }
         };
         if let Some(job) = self.jobs.get_mut(&key) {
             job.last_lease = head.lease;
             job.requested_bytes = head.total_length;
         }
+        let (hasher, received) =
+            self.seed_receive_basis(transport, media_key, epoch, journaled, &head)?;
+        if let Some(job) = self.jobs.get_mut(&key) {
+            job.state = JobState::Receiving;
+        }
+        Ok(OpenTransfer {
+            hasher,
+            received,
+            total_length: head.total_length,
+            advertised: head.advertised_sha256,
+        })
+    }
 
-        let mut hasher;
-        let mut received;
+    /// Phase 1a: validate the resume basis and prepare the temp for
+    /// this drive. Returns the trusted journaled offset — `0` for a
+    /// fresh receive or when untrusted progress was discarded. `Err`
+    /// carries the job's terminal state.
+    fn prepare_resume(
+        &mut self,
+        transport: &mut dyn OfflineTransport,
+        media_key: &MediaKey,
+        epoch: u64,
+    ) -> Result<u64, JobState> {
+        let key = job_key(media_key);
+        let mut journaled = self
+            .jobs
+            .get(&key)
+            .map(|job| job.current_bytes)
+            .unwrap_or(0);
+        if journaled > 0 {
+            match self.verify_resume_basis(media_key, epoch, journaled) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Untrusted progress (no segments, no validator, or a
+                    // last-segment digest that does not match the bytes on
+                    // disk): discard it and restart from zero.
+                    self.restart_from_zero(media_key, epoch);
+                    journaled = 0;
+                }
+                Err(error) => {
+                    self.finalize_failed(media_key, epoch, error, true);
+                    transport.close();
+                    return Err(JobState::Failed);
+                }
+            }
+        }
+        if journaled == 0 {
+            // Fresh receive: reserve the temp beside the final path —
+            // same-directory by construction, so a refusal here is the
+            // cross-filesystem/read-only admission failure.
+            if self.layout.reserve_temp(media_key, epoch).is_err() {
+                self.finalize_failed(media_key, epoch, OfflineError::StorageUnavailable, true);
+                transport.close();
+                return Err(JobState::Failed);
+            }
+        }
+        Ok(journaled)
+    }
+
+    /// Phase 1b: decide from the opened transfer whether this drive
+    /// continues from the journaled offset (a held `206` validator) or
+    /// restarts from zero (a fresh or stale `200`/`412` entity), seeding
+    /// the running digest from the bytes on disk in the continuing case
+    /// and capturing the fresh entity validator otherwise. The
+    /// advertised length is validated against the byte-hint ceiling
+    /// before any byte is received. `Err` carries the terminal state.
+    fn seed_receive_basis(
+        &mut self,
+        transport: &mut dyn OfflineTransport,
+        media_key: &MediaKey,
+        epoch: u64,
+        journaled: u64,
+        head: &TransferHead,
+    ) -> Result<(Sha256, u64), JobState> {
         let continuing = journaled > 0 && head.outcome == TransferOutcome::Partial;
         if continuing {
             // 206: the validator held — continue from the journaled
             // offset. The running digest is seeded from the bytes on
             // disk, never from bookkeeping.
-            match self.layout.hash_temp_prefix(&media_key, epoch, journaled) {
-                Ok((running, _)) => hasher = running,
+            match self.layout.hash_temp_prefix(media_key, epoch, journaled) {
+                Ok((running, _)) => return Ok((running, journaled)),
                 Err(_) => {
-                    self.finalize_failed(&media_key, epoch, OfflineError::StorageUnavailable, true);
+                    self.finalize_failed(media_key, epoch, OfflineError::StorageUnavailable, true);
                     transport.close();
-                    return Some(JobState::Failed);
+                    return Err(JobState::Failed);
                 }
             }
-            received = journaled;
-        } else {
-            // 200/412 on a resume (entity changed or never validated), or
-            // a plain fresh fetch: partial bytes are discarded and the
-            // job restarts from zero under the same job ID, on this
-            // transfer.
-            if journaled > 0 {
-                self.restart_from_zero(&media_key, epoch);
-            }
-            self.capture_validator(&media_key, epoch, head.validator.clone());
-            if let Some(total) = head.total_length {
-                if validate_byte_hint(total).is_err() {
-                    // A hint the cache layer cannot trust is malformed
-                    // input, not a quota overrun.
-                    self.finalize_failed(&media_key, epoch, OfflineError::StorageUnavailable, true);
-                    transport.close();
-                    return Some(JobState::Failed);
-                }
-            }
-            hasher = Sha256::new();
-            received = 0;
         }
-        if let Some(job) = self.jobs.get_mut(&key) {
-            job.state = JobState::Receiving;
+        // 200/412 on a resume (entity changed or never validated), or
+        // a plain fresh fetch: partial bytes are discarded and the
+        // job restarts from zero under the same job ID, on this
+        // transfer.
+        if journaled > 0 {
+            self.restart_from_zero(media_key, epoch);
         }
+        self.capture_validator(media_key, epoch, head.validator.clone());
+        if let Some(total) = head.total_length {
+            if validate_byte_hint(total).is_err() {
+                // A hint the cache layer cannot trust is malformed
+                // input, not a quota overrun.
+                self.finalize_failed(media_key, epoch, OfflineError::StorageUnavailable, true);
+                transport.close();
+                return Err(JobState::Failed);
+            }
+        }
+        Ok((Sha256::new(), 0))
+    }
 
-        // Phase 2: receive, journaling every committed segment before its
-        // bytes count as progress.
-        let total_length = head.total_length;
-        let advertised = head.advertised_sha256;
-        let Ok(mut file) = self.layout.open_temp_append(&media_key, epoch) else {
-            self.finalize_failed(&media_key, epoch, OfflineError::StorageUnavailable, true);
+    /// Phase 2: receive the open transfer, journaling every committed
+    /// segment before its bytes count as progress. `Ok` carries the
+    /// final running digest and the trusted received total; `Err`
+    /// carries the job's terminal state (`Cancelled`, or `Failed` after
+    /// a storage or quota refusal).
+    fn receive(
+        &mut self,
+        transport: &mut dyn OfflineTransport,
+        media_key: &MediaKey,
+        epoch: u64,
+        open: OpenTransfer,
+    ) -> Result<(Sha256, u64), JobState> {
+        let key = job_key(media_key);
+        let OpenTransfer {
+            mut hasher,
+            mut received,
+            total_length,
+            advertised: _,
+        } = open;
+        let Ok(mut file) = self.layout.open_temp_append(media_key, epoch) else {
+            self.finalize_failed(media_key, epoch, OfflineError::StorageUnavailable, true);
             transport.close();
-            return Some(JobState::Failed);
+            return Err(JobState::Failed);
         };
         let chunk = self.config.segment_bytes.clamp(1, 64 * 1024);
         let mut buffer = vec![0u8; chunk];
-        let mut segment_hasher = Sha256::new();
-        let mut segment_start = received;
-        let mut segment_len = 0u64;
-        let committed;
+        let mut segment = SegmentProgress::new(received);
         loop {
             if self.cancel_requested.contains(&key) {
                 // Cancellation is decisive: revoke the in-flight lease
                 // promptly, then record the terminal state.
                 transport.close();
-                self.finalize_cancelled(&media_key, epoch);
-                committed = false;
-                break;
+                self.finalize_cancelled(media_key, epoch);
+                return Err(self.current_job_state(&key));
             }
             let read = match transport.read(&mut buffer) {
                 Ok(read) => read,
                 Err(error) => {
-                    let state = self.on_transport_error(transport, &media_key, error);
-                    return Some(state);
+                    let state = self.on_transport_error(transport, media_key, error);
+                    return Err(state);
                 }
             };
             let end_of_stream = read == 0;
@@ -467,98 +607,115 @@ impl OfflineEngine {
                         // The source sent beyond its advertised length: a
                         // byte count the cache layer cannot trust.
                         self.finalize_failed(
-                            &media_key,
+                            media_key,
                             epoch,
                             OfflineError::StorageUnavailable,
                             true,
                         );
                         transport.close();
-                        return Some(JobState::Failed);
+                        return Err(JobState::Failed);
                     }
                 }
                 let used = self.global_used_excluding(&key) + received;
                 if quota::receive_overruns_quota(used, read as u64, self.config.global_quota_bytes)
                 {
-                    self.finalize_failed(&media_key, epoch, OfflineError::QuotaExceeded, true);
+                    self.finalize_failed(media_key, epoch, OfflineError::QuotaExceeded, true);
                     transport.close();
-                    return Some(JobState::Failed);
+                    return Err(JobState::Failed);
                 }
                 if file.write_all(&buffer[..read]).is_err() {
-                    self.finalize_failed(&media_key, epoch, OfflineError::StorageUnavailable, true);
+                    self.finalize_failed(media_key, epoch, OfflineError::StorageUnavailable, true);
                     transport.close();
-                    return Some(JobState::Failed);
+                    return Err(JobState::Failed);
                 }
                 hasher.update(&buffer[..read]);
-                segment_hasher.update(&buffer[..read]);
+                segment.hasher.update(&buffer[..read]);
                 received += read as u64;
-                segment_len += read as u64;
+                segment.len += read as u64;
             }
 
             // Commit a segment at the configured boundary or at end of
             // stream — durably: fsync the temp bytes, journal the segment,
             // and only then advance the trusted offset.
-            let boundary = segment_len >= self.config.segment_bytes as u64;
+            let boundary = segment.len >= self.config.segment_bytes as u64;
             if end_of_stream || boundary {
-                if segment_len > 0 {
-                    if file.sync_all().is_err() {
-                        self.finalize_failed(
-                            &media_key,
-                            epoch,
-                            OfflineError::StorageUnavailable,
-                            true,
-                        );
+                if segment.len > 0 {
+                    if let Err(state) = self.journal_receive_segment(
+                        media_key,
+                        epoch,
+                        &file,
+                        &mut segment,
+                        received,
+                    ) {
                         transport.close();
-                        return Some(JobState::Failed);
+                        return Err(state);
                     }
-                    let segment_digest: [u8; 32] = segment_hasher.clone().finalize().into();
-                    let record = JournalRecord::Segment {
-                        offset: segment_start,
-                        len: segment_len,
-                        sha256_hex: hex(&segment_digest),
-                    };
-                    if self
-                        .layout
-                        .append_journal(&media_key, epoch, &record)
-                        .is_err()
-                    {
-                        self.finalize_failed(
-                            &media_key,
-                            epoch,
-                            OfflineError::StorageUnavailable,
-                            true,
-                        );
-                        transport.close();
-                        return Some(JobState::Failed);
-                    }
-                    if let Some(job) = self.jobs.get_mut(&key) {
-                        job.current_bytes = received;
-                    }
-                    segment_start = received;
-                    segment_len = 0;
-                    segment_hasher = Sha256::new();
                 }
                 if end_of_stream {
-                    committed = true;
-                    break;
+                    return Ok((hasher, received));
                 }
             }
         }
-        if !committed {
-            return Some(
-                self.jobs
-                    .get(&key)
-                    .map(|job| job.state)
-                    .unwrap_or(JobState::Failed),
-            );
+    }
+
+    /// Durably commit one received segment: `fsync` the temp bytes,
+    /// journal the segment, advance the job's trusted offset, and reset
+    /// the segment accumulator. `Err` carries the terminal state; the
+    /// caller closes the transport.
+    fn journal_receive_segment(
+        &mut self,
+        media_key: &MediaKey,
+        epoch: u64,
+        file: &File,
+        segment: &mut SegmentProgress,
+        received: u64,
+    ) -> Result<(), JobState> {
+        if file.sync_all().is_err() {
+            self.finalize_failed(media_key, epoch, OfflineError::StorageUnavailable, true);
+            return Err(JobState::Failed);
         }
+        let segment_digest: [u8; 32] = segment.hasher.clone().finalize().into();
+        let record = JournalRecord::Segment {
+            offset: segment.start,
+            len: segment.len,
+            sha256_hex: hex(&segment_digest),
+        };
+        if self
+            .layout
+            .append_journal(media_key, epoch, &record)
+            .is_err()
+        {
+            self.finalize_failed(media_key, epoch, OfflineError::StorageUnavailable, true);
+            return Err(JobState::Failed);
+        }
+        let key = job_key(media_key);
+        if let Some(job) = self.jobs.get_mut(&key) {
+            job.current_bytes = received;
+        }
+        segment.reset(received);
+        Ok(())
+    }
+
+    /// Phases 3 and 4: `fsync` the fully received temp file, then verify
+    /// it — the SHA-256 is recomputed from the bytes actually on disk,
+    /// never from bookkeeping. Verification always completes before the
+    /// rename. `Err` carries the job's terminal state.
+    fn verify_transfer(
+        &mut self,
+        transport: &mut dyn OfflineTransport,
+        media_key: &MediaKey,
+        epoch: u64,
+        received: u64,
+        advertised: Option<[u8; 32]>,
+    ) -> Result<([u8; 32], DigestProvenance), JobState> {
+        let key = job_key(media_key);
 
         // Phase 3: finalize — fsync the full file. Nothing is visible at
         // the cache path yet.
-        drop(file);
-        if self.layout.sync_temp(&media_key, epoch).is_err() {
-            self.finalize_failed(&media_key, epoch, OfflineError::StorageUnavailable, true);
+        if self.layout.sync_temp(media_key, epoch).is_err() {
+            self.finalize_failed(media_key, epoch, OfflineError::StorageUnavailable, true);
             transport.close();
-            return Some(JobState::Failed);
+            return Err(JobState::Failed);
         }
         if let Some(job) = self.jobs.get_mut(&key) {
             job.state = JobState::Verifying;
@@ -567,65 +724,88 @@ impl OfflineEngine {
         // Phase 4: verify on the temp file — recompute SHA-256 from the
         // bytes actually on disk, never from bookkeeping. Verification
         // always completes before the rename.
-        let on_disk: [u8; 32] = match self.layout.hash_temp_prefix(&media_key, epoch, received) {
+        let on_disk: [u8; 32] = match self.layout.hash_temp_prefix(media_key, epoch, received) {
             Ok((_, digest)) => digest,
             Err(_) => {
-                self.finalize_failed(&media_key, epoch, OfflineError::StorageUnavailable, true);
+                self.finalize_failed(media_key, epoch, OfflineError::StorageUnavailable, true);
                 transport.close();
-                return Some(JobState::Failed);
+                return Err(JobState::Failed);
             }
         };
-        let provenance;
         if let Some(expected) = advertised {
             if on_disk != expected {
-                self.finalize_failed(&media_key, epoch, OfflineError::IntegrityMismatch, true);
+                self.finalize_failed(media_key, epoch, OfflineError::IntegrityMismatch, true);
                 transport.close();
-                return Some(JobState::Failed);
+                return Err(JobState::Failed);
             }
-            provenance = DigestProvenance::Advertised;
-        } else if transport.double_fetch_supported() {
-            // Tier 2: a fresh authenticated second transfer must produce
-            // the identical digest. The re-read is bounded by the first
-            // transfer's length, and the offline quota is charged once —
-            // for the committed bytes, not per fetch.
-            transport.close();
-            match Self::double_fetch_digest(transport, &media_key, received) {
-                Ok(second) if second == on_disk => provenance = DigestProvenance::DoubleFetch,
-                Ok(_) => {
-                    self.finalize_failed(&media_key, epoch, OfflineError::IntegrityMismatch, true);
-                    transport.close();
-                    return Some(JobState::Failed);
-                }
-                Err(_) => {
-                    // A second transfer that cannot complete leaves no
-                    // verification path: terminal before publish.
-                    self.finalize_failed(
-                        &media_key,
-                        epoch,
-                        OfflineError::IntegrityUnverifiable,
-                        true,
-                    );
-                    transport.close();
-                    return Some(JobState::Failed);
-                }
-            }
+            return Ok((on_disk, DigestProvenance::Advertised));
+        }
+        let verified = if transport.double_fetch_supported() {
+            self.verify_by_double_fetch(transport, media_key, epoch, received, on_disk)
         } else {
             // Neither provenance tier can supply an expected digest:
             // terminal, nothing was renamed.
-            self.finalize_failed(&media_key, epoch, OfflineError::IntegrityUnverifiable, true);
-            transport.close();
-            return Some(JobState::Failed);
+            self.finalize_failed(media_key, epoch, OfflineError::IntegrityUnverifiable, true);
+            Err(())
+        };
+        match verified {
+            Ok(provenance) => Ok((on_disk, provenance)),
+            Err(()) => {
+                transport.close();
+                Err(JobState::Failed)
+            }
         }
+    }
 
-        // Phase 5: publish by atomic rename (verify has completed); a
-        // failed rename leaves the temp in place for cleanup.
+    /// Tier-2 verification: a fresh authenticated second transfer must
+    /// produce the identical digest. The re-read is bounded by the first
+    /// transfer's length, and the offline quota is charged once — for
+    /// the committed bytes, not per fetch. `Err(())` marks the job
+    /// terminal-failed with the redacted cause already recorded.
+    fn verify_by_double_fetch(
+        &mut self,
+        transport: &mut dyn OfflineTransport,
+        media_key: &MediaKey,
+        epoch: u64,
+        received: u64,
+        on_disk: [u8; 32],
+    ) -> Result<DigestProvenance, ()> {
+        transport.close();
+        match Self::double_fetch_digest(transport, media_key, received) {
+            Ok(second) if second == on_disk => Ok(DigestProvenance::DoubleFetch),
+            Ok(_) => {
+                self.finalize_failed(media_key, epoch, OfflineError::IntegrityMismatch, true);
+                Err(())
+            }
+            Err(_) => {
+                // A second transfer that cannot complete leaves no
+                // verification path: terminal before publish.
+                self.finalize_failed(media_key, epoch, OfflineError::IntegrityUnverifiable, true);
+                Err(())
+            }
+        }
+    }
+
+    /// Phases 5 and 6: publish the verified temp by atomic rename, then
+    /// commit the cache row. A failed rename leaves the temp in place
+    /// for cleanup and the cache path untouched.
+    fn commit_snapshot(
+        &mut self,
+        transport: &mut dyn OfflineTransport,
+        media_key: &MediaKey,
+        epoch: u64,
+        received: u64,
+        on_disk: [u8; 32],
+        provenance: DigestProvenance,
+    ) -> JobState {
+        let key = job_key(media_key);
         if let Some(job) = self.jobs.get_mut(&key) {
             job.state = JobState::Committing;
         }
-        let Ok(recorded) = self.layout.publish(&media_key, epoch) else {
-            self.finalize_failed(&media_key, epoch, OfflineError::StorageUnavailable, false);
+        let Ok(recorded) = self.layout.publish(media_key, epoch) else {
+            self.finalize_failed(media_key, epoch, OfflineError::StorageUnavailable, false);
             transport.close();
-            return Some(JobState::Failed);
+            return JobState::Failed;
         };
 
         // Phase 6: commit — the cache row exists only from here on.
@@ -644,10 +824,10 @@ impl OfflineEngine {
         // epoch owns a different journal: retire it there. A predecessor
         // at the same epoch shares this journal, which now records the
         // fresh commit — nothing to retire.
-        if let Some(predecessor) = self.index.resolve(&media_key).committed_snapshot() {
+        if let Some(predecessor) = self.index.resolve(media_key).committed_snapshot() {
             if predecessor.capability_epoch != epoch {
                 let _ = self.layout.append_journal(
-                    &media_key,
+                    media_key,
                     predecessor.capability_epoch,
                     &JournalRecord::Retired {
                         reason: RetirementReason::Superseded,
@@ -656,7 +836,7 @@ impl OfflineEngine {
             }
         }
         let _ = self.layout.append_journal(
-            &media_key,
+            media_key,
             epoch,
             &JournalRecord::Committed {
                 snapshot: snapshot.clone(),
@@ -675,7 +855,15 @@ impl OfflineEngine {
         if self.index.total_committed_bytes() > self.config.global_quota_bytes {
             let _ = self.evict_to_quota();
         }
-        Some(JobState::Committed)
+        JobState::Committed
+    }
+
+    /// The recorded state of one job, `Failed` when no record exists.
+    fn current_job_state(&self, key: &JobKey) -> JobState {
+        self.jobs
+            .get(key)
+            .map(|job| job.state)
+            .unwrap_or(JobState::Failed)
     }
 
     /// Request cancellation of one job. The job observes the request at
@@ -794,156 +982,136 @@ impl OfflineEngine {
     /// (`Queued`), and artifacts no recorded mapping owns are unlinked.
     fn recover(&mut self) {
         for track in self.layout.scan() {
-            struct Parsed {
-                record: JobRecord,
-                committed: Option<CommittedSnapshot>,
-                retired: Option<RetirementReason>,
-                validator: Option<EntityValidator>,
-                journaled_offset: u64,
-                has_segments: bool,
-            }
-            let mut parsed: Vec<Parsed> = Vec::new();
-
-            for journal_path in &track.journal_paths {
-                match storage::load_journal(journal_path) {
-                    LoadedJournalFile::Unusable => {
-                        // No parseable head: the journal and its temp are
-                        // orphans.
-                        let _ = std::fs::remove_file(journal_path);
-                    }
-                    LoadedJournalFile::Valid(journal) => {
-                        let mut record =
-                            JobRecord::new(journal.media_key.clone(), journal.capability_epoch);
-                        record.resume_validator = journal.validator.clone();
-                        let committed = journal.committed.clone();
-                        let retired = journal.retired;
-                        match (&committed, &journal.terminal) {
-                            (Some(_), _) => {
-                                record.state = JobState::Committed;
-                                record.current_bytes = committed
-                                    .as_ref()
-                                    .map(|snapshot| snapshot.byte_size)
-                                    .unwrap_or(0);
-                            }
-                            (None, Some((storage::TerminalState::Failed, failure))) => {
-                                record.state = JobState::Failed;
-                                record.failure = *failure;
-                            }
-                            (None, Some((storage::TerminalState::Cancelled, _))) => {
-                                record.state = JobState::Cancelled;
-                            }
-                            (None, None) => record.state = JobState::Queued,
-                        }
-                        parsed.push(Parsed {
-                            record,
-                            committed,
-                            retired,
-                            validator: journal.validator.clone(),
-                            journaled_offset: journal.journaled_offset(),
-                            has_segments: !journal.segments.is_empty(),
-                        });
-                    }
-                }
-            }
+            let parsed = parse_track_journals(&track);
             if parsed.is_empty() {
-                // No surviving journal: every temp in this directory is an
-                // orphan, and a final file here has no recorded mapping.
-                for temp in &track.temp_paths {
-                    let _ = std::fs::remove_file(temp);
-                }
-                if track.final_present {
-                    let _ =
-                        std::fs::remove_file(self.layout.root().join(track.recorded_cache_path()));
-                }
+                // No surviving journal: every temp in this directory is
+                // an orphan, and a final file here has no recorded
+                // mapping.
+                self.remove_unowned_artifacts(&track);
                 continue;
             }
+            self.rebuild_committed_rows(&parsed);
+            let (media_key, kept_slot) = self.restore_live_job(&parsed);
+            self.clean_track_orphans(&track, &media_key, &kept_slot, &parsed);
+        }
+    }
 
-            // Committed rows: highest epoch wins per media key (one
-            // journal per slot, so epochs never collide within a key).
-            // Evicted and superseded rows drop; licence-revoked rows stay
-            // (the file is preserved, the row is not playable).
-            let mut committed_sorted = parsed
-                .iter()
-                .filter_map(|entry| {
-                    entry
-                        .committed
-                        .as_ref()
-                        .map(|snapshot| (entry.retired, snapshot))
-                })
-                .collect::<Vec<_>>();
-            committed_sorted.sort_by_key(|(_, snapshot)| snapshot.capability_epoch);
-            for (retired, snapshot) in committed_sorted {
-                match retired {
-                    Some(RetirementReason::Evicted | RetirementReason::Superseded) => {}
-                    Some(RetirementReason::LicenceRevoked) => {
-                        self.index.insert(snapshot.clone());
-                        self.index.revoke(&snapshot.media_key);
-                    }
-                    None => self.index.insert(snapshot.clone()),
+    /// Rebuild the committed-row index for one track directory: the
+    /// highest epoch wins per media key (one journal per slot, so
+    /// epochs never collide within a key). Evicted and superseded rows
+    /// drop; licence-revoked rows stay (the file is preserved, the row
+    /// is not playable).
+    fn rebuild_committed_rows(&mut self, parsed: &[RecoveredJob]) {
+        let mut committed_sorted = parsed
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .committed
+                    .as_ref()
+                    .map(|snapshot| (entry.retired, snapshot))
+            })
+            .collect::<Vec<_>>();
+        committed_sorted.sort_by_key(|(_, snapshot)| snapshot.capability_epoch);
+        for (retired, snapshot) in committed_sorted {
+            match retired {
+                Some(RetirementReason::Evicted | RetirementReason::Superseded) => {}
+                Some(RetirementReason::LicenceRevoked) => {
+                    self.index.insert(snapshot.clone());
+                    self.index.revoke(&snapshot.media_key);
                 }
+                None => self.index.insert(snapshot.clone()),
             }
+        }
+    }
 
-            // The live job for this directory: the highest-epoch journal
-            // wins; older epochs are history.
-            parsed.sort_by_key(|entry| entry.record.capability_epoch);
-            let latest = parsed.last().expect("non-empty parsed");
-            let media_key = latest.record.media_key.clone();
-            let epoch = latest.record.capability_epoch;
-            let mut record = latest.record.clone();
-            if !record.state.is_terminal() {
-                // Re-derive Receiving/Queued. Trusted progress plus a
-                // validator plus existing temp bytes resumes; anything
-                // else restarts cleanly with a fresh journal.
-                let temp_len = self.layout.temp_len(&media_key, epoch);
-                let mut resumable = latest.journaled_offset > 0
-                    && latest.validator.is_some()
-                    && latest.has_segments
-                    && temp_len.is_some();
-                if resumable {
-                    resumable = self
-                        .verify_resume_basis(&media_key, epoch, latest.journaled_offset)
-                        .unwrap_or(false);
-                }
-                if resumable {
-                    record.state = JobState::Receiving;
-                    record.current_bytes = latest.journaled_offset;
-                } else {
-                    let _ = self.layout.reset_journal(&media_key, epoch, None);
-                    self.layout.remove_temp(&media_key, epoch);
-                    record.state = JobState::Queued;
-                    record.current_bytes = 0;
-                    record.resume_validator = None;
-                }
+    /// Re-derive the live job for one track directory: the
+    /// highest-epoch journal wins; older epochs are history. Trusted
+    /// progress plus a validator plus existing temp bytes resumes as
+    /// `Receiving`; anything else restarts cleanly as `Queued` with a
+    /// fresh journal. Returns the job's media key and its kept temp
+    /// slot.
+    fn restore_live_job(&mut self, parsed: &[RecoveredJob]) -> (MediaKey, PathBuf) {
+        let latest = parsed
+            .iter()
+            .max_by_key(|entry| entry.record.capability_epoch)
+            .expect("non-empty parsed");
+        let media_key = latest.record.media_key.clone();
+        let epoch = latest.record.capability_epoch;
+        let mut record = latest.record.clone();
+        if !record.state.is_terminal() {
+            if self.live_job_resumable(&media_key, epoch, latest) {
+                record.state = JobState::Receiving;
+                record.current_bytes = latest.journaled_offset;
+            } else {
+                let _ = self.layout.reset_journal(&media_key, epoch, None);
+                self.layout.remove_temp(&media_key, epoch);
+                record.state = JobState::Queued;
+                record.current_bytes = 0;
+                record.resume_validator = None;
             }
-            let kept_slot = self.layout.temp_path(&media_key, epoch);
-            self.jobs.insert(job_key(&media_key), record);
+        }
+        let kept_slot = self.layout.temp_path(&media_key, epoch);
+        self.jobs.insert(job_key(&media_key), record);
+        (media_key, kept_slot)
+    }
 
-            // Orphan temps: any temp outside the kept job's slot is
-            // unlinked. For a terminal kept job there is no live temp —
-            // a failed publish's leftover is cleaned up here.
-            for temp in &track.temp_paths {
-                if temp != &kept_slot
-                    || self
-                        .jobs
-                        .get(&job_key(&media_key))
-                        .is_some_and(|job| job.state.is_terminal())
-                {
-                    let _ = std::fs::remove_file(temp);
-                }
-            }
+    /// Whether the recovered job's journaled progress can be trusted to
+    /// resume: journaled segments, a captured validator, existing temp
+    /// bytes, and a re-verified last segment on disk.
+    fn live_job_resumable(&self, media_key: &MediaKey, epoch: u64, latest: &RecoveredJob) -> bool {
+        let temp_len = self.layout.temp_len(media_key, epoch);
+        let resumable = latest.journaled_offset > 0
+            && latest.validator.is_some()
+            && latest.has_segments
+            && temp_len.is_some();
+        if resumable {
+            return self
+                .verify_resume_basis(media_key, epoch, latest.journaled_offset)
+                .unwrap_or(false);
+        }
+        false
+    }
 
-            // Orphan final file: a cache path no surviving committed row
-            // maps to is unreachable through the recorded mapping.
-            let row_survives = parsed.iter().any(|entry| {
-                entry.committed.is_some()
-                    && !matches!(
-                        entry.retired,
-                        Some(RetirementReason::Evicted | RetirementReason::Superseded)
-                    )
-            });
-            if track.final_present && !row_survives {
-                let _ = std::fs::remove_file(self.layout.root().join(track.recorded_cache_path()));
+    /// Remove orphan temps (any temp outside the kept job's slot, and
+    /// the kept slot itself when the kept job is terminal — a failed
+    /// publish's leftover) and the orphan final file (a cache path no
+    /// surviving committed row maps to).
+    fn clean_track_orphans(
+        &self,
+        track: &TrackArtifacts,
+        media_key: &MediaKey,
+        kept_slot: &Path,
+        parsed: &[RecoveredJob],
+    ) {
+        let kept_is_terminal = self
+            .jobs
+            .get(&job_key(media_key))
+            .is_some_and(|job| job.state.is_terminal());
+        for temp in &track.temp_paths {
+            if temp.as_path() != kept_slot || kept_is_terminal {
+                let _ = std::fs::remove_file(temp);
             }
+        }
+        let row_survives = parsed.iter().any(|entry| {
+            entry.committed.is_some()
+                && !matches!(
+                    entry.retired,
+                    Some(RetirementReason::Evicted | RetirementReason::Superseded)
+                )
+        });
+        if track.final_present && !row_survives {
+            let _ = std::fs::remove_file(self.layout.root().join(track.recorded_cache_path()));
+        }
+    }
+
+    /// Remove every artifact of a track directory with no surviving
+    /// journal: temps, and the final file (no recorded mapping owns it).
+    fn remove_unowned_artifacts(&self, track: &TrackArtifacts) {
+        for temp in &track.temp_paths {
+            let _ = std::fs::remove_file(temp);
+        }
+        if track.final_present {
+            let _ = std::fs::remove_file(self.layout.root().join(track.recorded_cache_path()));
         }
     }
 
@@ -977,6 +1145,9 @@ impl OfflineEngine {
         Ok(true)
     }
 
+    /// Record the entity validator captured from the first successful
+    /// response and rewrite the journal head to carry it. No segments
+    /// exist yet on a fresh capture.
     fn capture_validator(
         &mut self,
         media_key: &MediaKey,
@@ -995,6 +1166,9 @@ impl OfflineEngine {
         }
     }
 
+    /// Discard all journaled progress for one job and prepare a clean
+    /// restart from zero under the same `(media_key, capability_epoch)`
+    /// slot: fresh journal, recreated temp, cleared in-memory progress.
     fn restart_from_zero(&mut self, media_key: &MediaKey, epoch: u64) {
         let _ = self.layout.reset_journal(media_key, epoch, None);
         if self.layout.reserve_temp(media_key, epoch).is_err() {
@@ -1009,6 +1183,10 @@ impl OfflineEngine {
         self.network_pauses.remove(&key);
     }
 
+    /// Record the terminal `Failed` state on the job and its journal.
+    /// `unlink_temp` is set everywhere a half-promoted temp must leave
+    /// no state; it is cleared only for a failed publish, where the
+    /// temp is the restart-recovery cleanup's to claim.
     fn finalize_failed(
         &mut self,
         media_key: &MediaKey,
@@ -1035,6 +1213,9 @@ impl OfflineEngine {
         self.network_pauses.remove(&key);
     }
 
+    /// Record the terminal `Cancelled` state on the job and its
+    /// journal, unlink the temp, and clear any pending cancellation
+    /// request.
     fn finalize_cancelled(&mut self, media_key: &MediaKey, epoch: u64) {
         let key = job_key(media_key);
         if let Some(job) = self.jobs.get_mut(&key) {
@@ -1154,6 +1335,55 @@ fn hex(bytes: &[u8]) -> String {
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     encoded
+}
+
+/// Load every journal of one track directory into recovery facts.
+/// Journals with no parseable head are removed as orphans; valid
+/// journals become one [`RecoveredJob`] each.
+fn parse_track_journals(track: &TrackArtifacts) -> Vec<RecoveredJob> {
+    let mut parsed: Vec<RecoveredJob> = Vec::new();
+    for journal_path in &track.journal_paths {
+        match storage::load_journal(journal_path) {
+            LoadedJournalFile::Unusable => {
+                // No parseable head: the journal and its temp are
+                // orphans.
+                let _ = std::fs::remove_file(journal_path);
+            }
+            LoadedJournalFile::Valid(journal) => {
+                let mut record =
+                    JobRecord::new(journal.media_key.clone(), journal.capability_epoch);
+                record.resume_validator = journal.validator.clone();
+                let committed = journal.committed.clone();
+                let retired = journal.retired;
+                match (&committed, &journal.terminal) {
+                    (Some(_), _) => {
+                        record.state = JobState::Committed;
+                        record.current_bytes = committed
+                            .as_ref()
+                            .map(|snapshot| snapshot.byte_size)
+                            .unwrap_or(0);
+                    }
+                    (None, Some((storage::TerminalState::Failed, failure))) => {
+                        record.state = JobState::Failed;
+                        record.failure = *failure;
+                    }
+                    (None, Some((storage::TerminalState::Cancelled, _))) => {
+                        record.state = JobState::Cancelled;
+                    }
+                    (None, None) => record.state = JobState::Queued,
+                }
+                parsed.push(RecoveredJob {
+                    record,
+                    committed,
+                    retired,
+                    validator: journal.validator.clone(),
+                    journaled_offset: journal.journaled_offset(),
+                    has_segments: !journal.segments.is_empty(),
+                });
+            }
+        }
+    }
+    parsed
 }
 
 trait CommittedSnapshotExt {
@@ -1574,7 +1804,11 @@ mod tests {
             .admit(&key, 1, &declared(), OperationalLicence::SourceDeclared)
             .expect("admit");
         let mut transport = FakeTransport::new().push(
-            FakeTransport::fresh_head(etag("\"v1\""), None, Some(8192)),
+            FakeTransport::fresh_head(
+                etag("\"v1\""),
+                None,
+                Some(crate::architecture::MAX_OFFLINE_BYTE_HINT + 1),
+            ),
             body(40, 1),
         );
         assert_eq!(engine.drive(&mut transport, &key), Some(JobState::Failed));
@@ -1587,6 +1821,41 @@ mod tests {
             "no byte received after hostile hint"
         );
         assert!(!engine.layout().temp_path(&key, 1).exists());
+    }
+
+    #[test]
+    fn an_advertised_media_length_above_the_legacy_four_kib_hint_commits() {
+        let dir = tempfile::tempdir().expect("root");
+        let config = EngineConfig {
+            segment_bytes: 4096,
+            ..test_config(1024 * 1024)
+        };
+        let mut engine = OfflineEngine::open(dir.path(), config).expect("engine");
+        let key = media_key("track-1");
+        engine
+            .admit(&key, 1, &declared(), OperationalLicence::SourceDeclared)
+            .expect("admit");
+        // A real media payload: its advertised length sits far above the
+        // legacy 4 KiB hint ceiling and far below the per-file media
+        // limit, so the fresh transfer must commit.
+        let payload = body(64 * 1024, 3);
+        let mut transport = FakeTransport::new().push(
+            FakeTransport::fresh_head(
+                etag("\"v1\""),
+                Some(sha(&payload)),
+                Some(payload.len() as u64),
+            ),
+            payload,
+        );
+        assert_eq!(
+            engine.drive(&mut transport, &key),
+            Some(JobState::Committed)
+        );
+        assert_eq!(
+            engine.job(&key).map(|job| job.current_bytes),
+            Some(64 * 1024)
+        );
+        assert!(engine.layout().final_path(&key).exists());
     }
 
     #[test]
