@@ -98,16 +98,28 @@ to its audio stream exactly once during the pause/relink seam and unwinds the li
 is removed. None of the elements inside the bin is substituted for a different one without a
 contract change.
 
-The bin carries a `caps` property pinned to
-`audio/x-raw, format=F32LE, channels=2, layout=interleaved, rate=<samplerate>` (where
-`<samplerate>` is the rate `playbin3` negotiated with the decoder on the bin's sink pad at
-chain-construction time). `playbin3` uses this caps property to negotiate the upstream format;
-if the upstream decoder cannot deliver that caps — typically only on a malformed or non-PCM
-source — the bin's sink pad `activate` mode returns `FALSE`, `playbin3` propagates the error to
-the bus, the implementation does **not** insert the bin, and the pipeline falls back to the
-existing passthrough layout (a single info-level diagnostic names the source URI). This is the
-spec's only rollback path: there is no element-by-element fallback inside the bin, and a failed
-`audio-filter-caps` negotiation does not leave the chain half-inserted.
+The bin exposes two ghost pads, `audio-filter-sink` (into the leading `audioresample`) and
+`audio-filter-src` (out of the trailing `audioresample`); `playbin3` links them like any other
+element's pads. The format boundary is the *internal pre-EQ `capsfilter`*, not a property of
+the bin: a plain `GstBin` has no `caps` property, and this contract does not pretend otherwise.
+The `capsfilter` pins `audio/x-raw, format=F32LE, channels=2, layout=interleaved` with the
+sample rate left free — the rate is fixed once, by ordinary pad negotiation across the ghost
+pads at chain-construction time, and that one rate then holds end-to-end inside the bin.
+Because the leading `audioresample` and `audioconvert` accept any raw PCM, negotiation
+succeeds for every PCM source regardless of its native rate, channel count, or format; the
+only negotiation failure that reaches the rollback path is non-PCM upstream (typically a
+malformed source): the bin's ghost pads never agree on caps, `playbin3` posts the error on the
+bus, the implementation removes the bin, and the pipeline falls back to the existing
+passthrough layout (a single info-level diagnostic names the source URI). This is the spec's
+only rollback path: there is no element-by-element fallback inside the bin, and a failed
+negotiation does not leave the chain half-inserted.
+
+Only equalizer-originated GStreamer failures retire the equalizer chain. A bus error whose
+message source lies inside `eq-bin` — or a negotiation failure of the bin's ghost pads —
+triggers the passthrough fallback above; errors originating anywhere else (decoder, demuxer,
+network, or audio sink) leave the bin installed and the equalizer state untouched. The
+equalizer module must not interpret unrelated playback failures as equalizer failures and must
+not remove the chain in reaction to them.
 
 The chain layout for the *enabled, clip-protection-on* state is:
 
@@ -116,35 +128,38 @@ playbin3.audio-filter (bin "eq-bin") {
     audioresample !
     audioconvert !
     capsfilter caps="audio/x-raw,format=F32LE,channels=2,layout=interleaved" !
-    volume       name=eq-preamp    volume=<factor> !
+    volume            name=eq-preamp  volume=<factor> !
     equalizer-10bands name=eq
         band0=<gain> band1=<gain> ... band9=<gain> !
-    rglimiter   name=clipper       enabled=true !
+    rglimiter         name=clipper    enabled=true !
     audioconvert !
-    audioresample !
-    capsfilter  caps=<sink-caps>
+    audioresample
 } !
 playbin3.audio-sink
 ```
 
+The `rglimiter` row is present only in the clip-protection-on state (see below).
+
 Where:
 
-- `audioresample` (`gst-plugins-base`) is the sample-rate converter. It resamples the upstream
-  decoder's negotiated rate to the rate the bin's caps property pins (above). Two instances live
-  in the chain: one before the EQ stage (to set the rate the biquad and limiter operate on) and
-  one after (to bring the rate back in line with the audio sink's negotiated rate on the way out
-  in case the limiter has shifted it).
+- `audioresample` (`gst-plugins-base`) is the sample-rate converter. Two instances live in the
+  chain, one at each edge of the bin. The leading instance converts the upstream decoder's
+  native rate to the bin's single negotiated rate; the trailing instance exists only so the
+  bin's src ghost pad can negotiate freely against the audio sink — if the sink requires a
+  rate different from the one pinned inside the bin, the trailing instance converts on the
+  way out. Neither `equalizer-10bands` nor `rglimiter` changes rate, channel count, or format:
+  the rate that enters the EQ stage is the rate that leaves it. The
+  trailing pair adapts to the sink side; it compensates for nothing inside the bin.
 - `audioconvert` (`gst-plugins-base`) is the format/channel converter. Two instances flank the
-  EQ stage: one before the EQ (to convert to the format/channel layout the biquad and limiter
-  expect) and one after (to convert back to whatever the sink accepts). `audioconvert` does *not*
-  change sample rate, so it cannot satisfy the limiter's F32LE requirement on its own; the
-  `capsfilter` does the format pinning.
-- `capsfilter` (`gst-plugins-base`) pins audio caps on a pad. The pre-EQ `capsfilter` pins the
-  format the biquad and limiter both accept (`audio/x-raw, format=F32LE, channels=2,
-  layout=interleaved`). The post-EQ `capsfilter` pins to `<sink-caps>`, the audio sink's
-  negotiated caps filled in by `playbin3` at chain-construction time. This is the only element
-  in the chain that *negotiates* a format; `audioconvert` does conversion work, `capsfilter`
-  enforces the boundary.
+  EQ stage: one before the EQ (to bring arbitrary decoder output to the format/channel layout
+  the `capsfilter` pins) and one after (to convert to whatever the audio sink accepts on the
+  way out). `audioconvert` performs conversion work; it pins nothing.
+- `capsfilter` (`gst-plugins-base`) pins audio caps on a pad. The single instance sits pre-EQ
+  and pins the format the biquad cascade and the limiter are both verified against
+  (`audio/x-raw, format=F32LE, channels=2, layout=interleaved`, rate free). There is no
+  post-EQ `capsfilter`: the trailing `audioconvert`/`audioresample` pair negotiates the sink
+  side freely. This is the only element in the chain that *pins* a format; it is the format
+  boundary of the whole feature.
 - `volume` (`gst-plugins-base`, plugin `volume`) provides the preamp. `volume` is a multiplicative
   gain element whose `volume` property ranges `0.0` to `10.0`, with `1.0` meaning unity (0 dB).
   The preamp dB value is converted to a factor at write time as `factor = 10^(dB/20)`, so the
@@ -171,13 +186,13 @@ Where:
   amplifier with hard-clip / wrap / none options, no envelope follower, and no `max-amplitude`
   property).
 
-`equalizer-10bands` runs at 32-bit floating-point internally. The pre-EQ capsfilter pins
-`audio/x-raw, format=F32LE, channels=2, layout=interleaved` so the biquad and the limiter's F32LE
-requirement are both satisfied by the format the bin negotiates upstream of `equalizer-10bands`.
-The post-EQ `capsfilter` (with `<sink-caps>` filled in at chain-construction time) re-pins to the
-audio sink's negotiated caps, which may be a different rate, channel count, or signedness but is
-not constrained to F32LE. `playbin3`'s gapless navigation keeps the same bin installed across URI
-transitions; the equalizer state is not re-applied automatically on each new URI (see
+`equalizer-10bands` runs at 32-bit floating-point internally. The pre-EQ `capsfilter` pins
+`audio/x-raw, format=F32LE, channels=2, layout=interleaved` so the biquad cascade and the
+limiter both see the format they are verified against. Downstream of the limiter, the trailing
+`audioconvert`/`audioresample` pair negotiates freely with whatever the audio sink requires —
+a different signedness, channel count, or rate — so the sink side is never constrained to
+F32LE. `playbin3`'s gapless navigation keeps the same bin installed across URI transitions;
+the equalizer state is not re-applied automatically on each new URI (see
 *Live-reconfiguration boundary* below).
 
 The chain layout for the *enabled, clip-protection-off* state is the bin without the
@@ -237,7 +252,7 @@ the changes take effect. The boundary is:
 | `Preamp` | yes | Buffer-boundary property-write transaction on the bin |
 | Single band `bandN` | yes | Buffer-boundary property-write transaction on the bin |
 | Multiple bands at once | yes | Buffer-boundary property-write transaction on the bin |
-| `Clip protection` | yes | Pause → `rglimiter` insert/remove inside the bin → resume |
+| `Clip protection` | yes | Dynamic in-bin `rglimiter` insert/remove with state sync |
 | Band centres / Q | NO | Frozen by the spec; changing requires a new contract |
 
 Live reconfiguration of `Enabled` installs or removes the equalizer bin at the
@@ -255,56 +270,65 @@ The persisted bands, preamp, and clip-protection setting are not touched on eith
 transition.
 
 Live reconfiguration of band gains, the preamp, and the preset is delivered through property
-writes (`g_object_set`) on the running elements inside the bin so that coefficients update on
-the next audio buffer without a pipeline state transition. No re-link, no re-instantiate, no
-seek, no EOS-resending.
+writes (`g_object_set`) on the running elements inside the bin so that coefficients update
+during playback without a pipeline state transition. No re-link, no re-instantiate, no seek, no
+EOS-resending. `g_object_set` is atomic per property with respect to the streaming thread — the
+element's object lock serializes the write against buffer processing — so a single write takes
+effect on the first buffer that element processes after the write returns.
 
-The *buffer-boundary transaction* the spec requires is a three-step sequence on the application
-side:
+The contract does **not** claim cross-element atomicity from `g_object_freeze_notify` /
+`g_object_thaw_notify`. That pair only batches GObject `notify` signal emission, so the UI
+observes one update per transaction instead of eleven; it is a notification-batching tool, it
+provides no audio-buffer ordering guarantee, and this contract uses it only for the batching
+purpose.
+
+The *buffer-boundary transaction* required for multi-property updates (preamp changes, preset
+loads, multi-band batched edits) is an **idle pad probe** on the bin's sink ghost pad — the
+mechanism GStreamer actually provides for running code between buffers:
 
 1. Capture the new band vector and preamp into a single typed struct (`EqSettings`).
-2. Wrap the property writes in `g_object_freeze_notify` / `g_object_thaw_notify` on each
-   affected element (`equalizer-10bands` for the ten bands, `volume` for the preamp). Inside
-   the freeze, each `g_object_set` only mutates the element's internal state; the
-   `properties-changed` notification is suppressed until `thaw_notify` returns. The bus sees
-   **one** `properties-changed` notification per element per transaction, not eleven.
-3. Wait for the next `GST_MESSAGE_ELEMENT` carrying a `GST_EVENT_CAPS` or `GST_EVENT_SEGMENT`
-   on the bus from `equalizer-10bands` or `volume`. That message marks the buffer boundary at
-   which the new coefficients are picked up by the audio thread; `thaw_notify` returning
-   *before* the buffer-boundary message is published does not mean the new coefficients have
-   yet been read by the audio thread — it only means the property state is now visible to
-   readers. Single-band writes skip the freeze/thaw wrapper and skip the boundary wait; only
-   multi-property transactions (preamp changes, preset loads, multi-band batched edits)
-   require it.
+2. `gst_pad_add_probe` on `audio-filter-sink` with `GST_PAD_PROBE_TYPE_IDLE`. When the
+   streaming thread next finds the bin boundary idle, the probe callback performs every write
+   in the batch (ten `bandN` writes on `equalizer-10bands`, one `volume` write on the preamp
+   element) and returns `GST_PAD_PROBE_REMOVE`, uninstalling itself.
+3. The batch is thereby serialized against buffer flow at the bin boundary: no buffer crosses
+   the bin boundary while the batch is mid-write.
 
-Because `g_object_set` is a GObject state mutation and produces no GStreamer pipeline event,
-**no `Buffering` event is produced by configuration updates.** A `Buffering` event observed on
-the bus during normal playback originates from the upstream decoder (network radio underrun,
-file EOF, decoder flush) and is unrelated to the equalizer update; the UI must not show a
-configuration-update spinner based on a `Buffering` event.
+The probe bounds, but does not eliminate, transient mixing of old and new values: a buffer
+already past the boundary inside the chain renders with the old coefficients while the batch
+lands. The contract accepts exactly one buffer of intermediate gain combination (≈ 21 ms at
+the default 1024-sample buffer and 48 kHz) as the defined transient; it is strictly bounded
+and inaudible in practice. Single-property writes (one band, or the preamp alone) skip the
+probe and write directly.
 
-`Clip protection` toggles the `rglimiter` element's *presence* inside the bin (insert or
-remove) using the same pause/relink seam applied at the element level (the surrounding bin
-itself remains installed):
+No configuration write produces, waits for, or requires any bus message. `GST_EVENT_CAPS` and
+`GST_EVENT_SEGMENT` are pad events serialized with the stream; they are not acknowledgements,
+and an equalizer update never generates one. Because `g_object_set` is a GObject state
+mutation and produces no GStreamer pipeline event, **no `Buffering` message is produced by
+configuration updates.** A `Buffering` message observed on the bus during normal playback
+originates from the upstream decoder (network radio underrun, file EOF, decoder flush) and is
+unrelated to the equalizer update; the UI must not show a configuration-update spinner based
+on a `Buffering` message.
 
-1. Pause the pipeline (`gst::State::Paused`),
-2. Insert or remove the `rglimiter` element inside the bin (unlink, add, link),
-3. Re-link the chain (`equalizer-10bands` ↔ `rglimiter` ↔ post-EQ `audioconvert`, or directly
+`Clip protection` toggles the `rglimiter` element's *presence* inside the installed bin as a
+dynamic topology change while the pipeline stays in `Playing` — an in-bin element
+insert/remove requires no pipeline pause:
+
+1. Unlink `equalizer-10bands` from its downstream neighbor,
+2. add or remove `rglimiter` inside the bin (on add: link it, then
+   `gst_element_sync_state_with_parent` so the element's state follows the running bin; on
+   remove: unlink it, then set it to `NULL` before dropping the reference),
+3. re-link the chain (`equalizer-10bands` ↔ `rglimiter` ↔ post-EQ `audioconvert`, or directly
    `equalizer-10bands` ↔ post-EQ `audioconvert` when the limiter is removed),
-4. Re-enter `Playing`,
-5. Mark the change in metrics as a brief swap (≤ 100 ms by spec).
+4. mark the change in metrics as a brief swap (≤ 100 ms by spec).
 
-A pause/resume swap is undesirable but is the only correct option for a topology change of
-either kind. The contract accepts this cost because it is paid only on user-initiated
-`Enabled` or `Clip protection` toggles, neither of which the user is expected to perform
-frequently.
-
-When the playing track is a live stream with no `gapless` table (e.g. a remote radio URL),
-element insert/remove must not disturb the upstream decoder's buffering; the same
-pause/insert/resume seam is used and a one-time metadata-free "reconfiguring audio output"
-diagnostic is published. A failure to re-attach the limiter is treated as a recoverable error:
-the chain degrades to the no-limiter layout and the user-visible status becomes the same as
-`Clip protection = Off`.
+If the dynamic re-link fails, the implementation falls back to the pause/relink seam (pause
+the pipeline, add/remove and link, resume). If the limiter cannot be attached by either path,
+the failure is a recoverable error: the chain degrades to the no-limiter layout and the
+user-visible status becomes the same as `Clip protection = Off`. When the playing track is a
+live stream with no `gapless` table (e.g. a remote radio URL), the same dynamic seam is used,
+a one-time metadata-free "reconfiguring audio output" diagnostic is published, and element
+insert/remove at the bin boundary does not disturb the upstream decoder's buffering.
 
 ## Persistence
 
@@ -323,10 +347,12 @@ Where:
   order-insensitive on read but the writer always emits them in the canonical order so diffs and
   bugs are reproducible).
 - Every value is a double-quoted UTF-8 string. Quotes inside a value are escaped as `\"`; the
-  backslash is escaped as `\\`; newlines are not permitted in values. Floats are emitted with
-  one decimal place (e.g. `"-24.0"`, `"0.0"`, `"+12.0"`) so that precision is bounded by the
-  schema, not by the writer's locale or precision settings. The parser requires the value to be
-  double-quoted; an unquoted value is a malformed file and triggers the validation rule below.
+  backslash is escaped as `\\`; newline characters (LF or CR) are not permitted in values.
+  Floats are emitted with one decimal place and no explicit `+` sign (e.g. `"-24.0"`, `"0.0"`,
+  `"12.0"`) so that precision is bounded by the schema, not by the writer's locale or precision
+  settings; a leading `+` is accepted on read as an equivalent value. The parser requires the
+  value to be double-quoted; an unquoted value is a malformed file and triggers the validation
+  rule below.
 
 The fifteen keys, in six logical groups:
 
@@ -335,8 +361,8 @@ The fifteen keys, in six logical groups:
 | `schema_version` | quoted integer literal | `"1"` (the only supported value at this revision) |
 | `enabled` | quoted boolean literal | `"true"` / `"false"` |
 | `preset` | quoted preset name | `"flat"`/`"pop"`/`"rock"`/`"jazz"`/`"classical"`/`"custom"` |
-| `preamp_db` | quoted float (one decimal) | `"-24.0"` … `"0.0"` … `"+12.0"` |
-| `band0_db`…`band9_db` | quoted float (one decimal) | `"-24.0"` … `"0.0"` … `"+12.0"` |
+| `preamp_db` | quoted float (one decimal) | `"-24.0"` … `"0.0"` … `"12.0"` |
+| `band0_db`…`band9_db` | quoted float (one decimal) | `"-24.0"` … `"0.0"` … `"12.0"` |
 | `clip_protect` | quoted enum | `"off"` / `"soft"` |
 
 `equalizer.cfg` lives in the existing `dirs::data_dir()/tributary/` directory beside
@@ -403,6 +429,15 @@ Validation rules on read:
 A malformed file is replaced with the default state via the same atomic-replace protocol above,
 the user's prior preferences are recorded in a typed diagnostic with file path, byte count, and
 the bad key, and the change is not silent.
+
+A *transient read failure* is not a malformed file. If `equalizer.cfg` exists but cannot be
+opened or read (for example `EACCES`, `EBUSY`, or `EIO`), the module runs with in-memory
+defaults for the session and publishes the same warn-level diagnostic — and it does **not**
+schedule any write. The debounced writer and the shutdown flush are both suppressed until a
+subsequent read of the file succeeds and reconciles the in-memory state with disk. A transient
+unreadable file must never cause a valid on-disk file to be overwritten with defaults: the
+defaults-overwrite path above is reserved for files whose *content* is malformed, which is
+established only by a read that succeeds.
 
 ## Capability matrix
 
@@ -519,19 +554,20 @@ for this contract; new conditions require a new revision.
 1. **Fresh install, EQ disabled.** Persisted state matches the default; `playbin3.audio-filter`
    is `NULL`; no equalizer bin is constructed.
 2. **Enable EQ on local output.** Equalizer bin is constructed and installed at
-   `playbin3.audio-filter` via the pause/relink seam; `audio-filter-caps` is
-   `audio/x-raw, format=F32LE, channels=2, layout=interleaved`; pipeline returns to `Playing`;
-   total swap ≤ 100 ms.
+   `playbin3.audio-filter` via the pause/relink seam; the pre-EQ `capsfilter` pins
+   `audio/x-raw, format=F32LE, channels=2, layout=interleaved` (rate negotiated across the
+   ghost pads); pipeline returns to `Playing`; total swap ≤ 100 ms.
 3. **Change a single band mid-playback.** Single-property write reaches `equalizer-10bands`;
    buffer passes; no gapless discontinuity; new value reaches the filter on the next buffer.
 4. **Select Pop preset mid-playback.** `EqSettings` struct captures ten bands + preamp; one
-   `g_object_freeze_notify`/`thaw_notify` pair on `equalizer-10bands` writes all ten bands; one
-   on `volume` writes the preamp; bus sees one `properties-changed` per element; preset combo
-   displays `Pop`.
-5. **Manual band edit mid-playback.** Single property write on `bandN`; persisted `preset` field
-   becomes `custom`; UI combo displays `Custom`.
-6. **Cycle clip protection Off → Soft → Off.** Pause/resume swap each time; `rglimiter` inserts
-   inside the bin; total swap ≤ 100 ms per toggle.
+   idle-pad-probe transaction on `audio-filter-sink` writes all ten bands and the preamp
+   between buffers; the UI observes one update per transaction (`notify` batching); preset
+   combo displays `Pop`.
+5. **Manual band edit mid-playback.** Single property write on `bandN`; persisted `preset`
+   field becomes `custom`; UI combo displays `Custom`.
+6. **Cycle clip protection Off → Soft → Off.** Dynamic in-bin insert/remove with state sync
+   each time; no pipeline pause; total swap ≤ 100 ms per toggle; pause/relink fallback
+   exercised if the dynamic re-link is forced to fail.
 7. **Sine input above +6 dBFS with clip protection = Soft.** Output peak converges
    asymptotically to 0 dBFS without exceeding it; soft-knee compression engages at the −6 dBFS
    threshold; a 0 dBFS input is attenuated by approximately 1.1 dB; reflects the `rglimiter`
@@ -557,6 +593,12 @@ for this contract; new conditions require a new revision.
     re-applied automatically on each new URI; no audible discontinuity.
 17. **Preamp `0.0 dB` selected.** Preamp `volume` element is in the chain with `volume=1.0`;
     gain flat.
+18. **Transient unreadable `equalizer.cfg` (open/read error, file exists).** No write is
+    scheduled; the on-disk file is untouched; warn diagnostic published; the session runs with
+    in-memory defaults; a later successful read reconciles state with disk.
+19. **Unrelated playback error with EQ installed (decoder/network/sink failure).** The
+    equalizer bin remains installed; equalizer state is untouched; the passthrough fallback is
+    not triggered by a non-equalizer failure.
 
 ## Implementation boundary
 
@@ -574,9 +616,9 @@ The implementation record:
   volume name=eq-preamp volume=<factor> !
   equalizer-10bands name=eq band0=<gain> ... band9=<gain> !
   rglimiter name=clipper enabled=true !
-  audioconvert ! audioresample ! capsfilter caps=<sink-caps>`) as specified in *Filter graph*
-  above.
-- Adds the `rglimiter` insert/remove inside the bin behind the single `Clip protection` boolean.
+  audioconvert ! audioresample`) as specified in *Filter graph* above.
+- Adds the `rglimiter` insert/remove inside the bin behind the single `Clip protection`
+  boolean, as a dynamic state-synced topology change with the pause/relink fallback.
 - Adds the `equalizer.cfg` reader and writer.
 - Adds the trait method `AudioOutput::supports_equalizer` and implements it honestly per row
   of the capability matrix.
