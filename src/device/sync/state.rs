@@ -14,6 +14,9 @@
 //! Invariants:
 //! * A track that is recorded as `Synced` always has a non-empty
 //!   fingerprint and a recorded sync instant.
+//! * A recorded device-relative path always uses forward slashes, so a
+//!   state file written by one host platform matches planning output on
+//!   every other platform.
 //! * A track that is recorded as `Modified` has a fingerprint but no
 //!   sync instant — the planner has decided the device copy is stale.
 //! * A track that is recorded as `Pending` has no fingerprint; the
@@ -111,6 +114,14 @@ impl IncrementalSyncState {
 
     /// Record a successful sync. The status becomes
     /// [`TrackSyncStatus::Synced`].
+    ///
+    /// The device-relative path is canonicalized to forward slashes
+    /// before it is stored (see [`normalize_device_path`]): a Windows
+    /// host stringifies `PathBuf`s with `\`, and without this
+    /// canonicalization a state file written on Windows would never
+    /// match paths planned on any other host — every synced track would
+    /// re-plan as `Modified` forever and `Removed` deltas would target
+    /// the wrong path.
     pub fn record_synced(
         &mut self,
         track_id: impl Into<String>,
@@ -119,7 +130,7 @@ impl IncrementalSyncState {
         instant_seconds: u64,
     ) {
         let fingerprint = fingerprint.into();
-        let device_relative_path = device_relative_path.into();
+        let device_relative_path = normalize_device_path(device_relative_path.into());
         debug_assert!(!fingerprint.is_empty(), "fingerprint must be non-empty");
         debug_assert!(
             !device_relative_path.is_empty(),
@@ -175,6 +186,22 @@ impl IncrementalSyncState {
     }
 }
 
+/// Canonicalize a device-relative path for storage.
+///
+/// Device-side paths (MTP object paths in particular) conventionally use
+/// forward slashes, and the recorded state must be portable between host
+/// platforms: a Windows host stringifies planned `PathBuf`s with `\`
+/// separators, so the raw form would be platform-specific. Storing every
+/// path in `/` form makes a state file written on any host compare equal
+/// to planning output on every host. Idempotent.
+fn normalize_device_path(path: String) -> String {
+    if path.contains('\\') {
+        path.replace('\\', "/")
+    } else {
+        path
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +248,32 @@ mod tests {
         let status = TrackSyncStatus::Pending;
         assert!(status.fingerprint().is_none());
         assert!(status.is_pending());
+    }
+
+    #[test]
+    fn record_synced_canonicalizes_path_separators() {
+        // A Windows host stringifies planned PathBufs with `\`; the
+        // recorded state must be platform-independent, so the stored
+        // path is canonicalized to forward slashes.
+        let mut state = IncrementalSyncState::new();
+        state.record_synced("a", "fp1", "Music\\Artist\\Song.flac", 100);
+        let Some(TrackSyncStatus::Synced {
+            device_relative_path,
+            ..
+        }) = state.status("a")
+        else {
+            panic!("expected a synced entry");
+        };
+        assert_eq!(device_relative_path, "Music/Artist/Song.flac");
+        // Already-canonical paths round-trip unchanged.
+        state.record_synced("b", "fp1", "Music/song.flac", 100);
+        let Some(TrackSyncStatus::Synced {
+            device_relative_path,
+            ..
+        }) = state.status("b")
+        else {
+            panic!("expected a synced entry");
+        };
+        assert_eq!(device_relative_path, "Music/song.flac");
     }
 }
