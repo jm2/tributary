@@ -537,8 +537,8 @@ ANNOUNCE SDP (`a=rsaaeskey`/`a=aesiv`), 352-sample ALAC framing
 there), RTP audio/control/timing, retransmission, volume
 SET_PARAMETER, MD5 password auth, and the verification-PIN flow.
 Runs as a `SenderSession` behind the §4.1 contract (in-process or
-subprocess — the seam supports both; §7 proposes in-process first
-behind the trait).
+subprocess — the seam supports both; §10.4 defers this path until the
+daemon recommendation fails validation).
 
 - **Cost drivers:** the embedded well-known RSA public modulus
   (§2.2) triggers the dedicated release-component review
