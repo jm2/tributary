@@ -197,6 +197,8 @@ context:
   playlist_add_success:
     one: "Dodano %{count} utwór do %{playlist}."
     other: "Dodano %{count} utworów do %{playlist}."
+    few: "Dodano %{count} utwory do %{playlist}."
+    many: "Dodano %{count} utworów do %{playlist}."
 
 # ── Zwykłe listy odtwarzania ───────────────────────────────────────
 regular_playlist:

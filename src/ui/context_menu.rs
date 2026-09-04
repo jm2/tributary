@@ -279,16 +279,56 @@ struct PlaylistMutationFailedCopy {
     body: String,
 }
 
+/// CLDR plural category for the whole-number counts the playlist toast carries.
+///
+/// `rust-i18n` interpolates `count` but does not choose plural forms, so the
+/// form is selected here. Only the categories the shipped catalogs use are
+/// modelled: every catalog carries `one`/`other`, and Polish and Russian add
+/// `few`/`many`. Counts are integers, so the fractional `other` branch of
+/// those two languages never applies.
+fn plural_category(locale: &str, count: usize) -> &'static str {
+    let language = locale.split(['-', '_']).next().unwrap_or(locale);
+    let tens = count % 10;
+    let hundreds = count % 100;
+    let few = (2..=4).contains(&tens) && !(12..=14).contains(&hundreds);
+    match language {
+        "pl" => {
+            if count == 1 {
+                "one"
+            } else if few {
+                "few"
+            } else {
+                "many"
+            }
+        }
+        "ru" => {
+            if tens == 1 && hundreds != 11 {
+                "one"
+            } else if few {
+                "few"
+            } else {
+                "many"
+            }
+        }
+        _ => {
+            if count == 1 {
+                "one"
+            } else {
+                "other"
+            }
+        }
+    }
+}
+
 fn playlist_add_success_message(locale: &str, count: usize, playlist_name: &str) -> String {
-    let key = if count == 1 {
-        "context.playlist_add_success.one"
-    } else {
-        "context.playlist_add_success.other"
-    };
+    let key = format!(
+        "context.playlist_add_success.{}",
+        plural_category(locale, count)
+    );
     // `AdwToast` titles are Pango markup by default. Keep the user-controlled
     // name escaped on the same path that selects and renders the translation.
     rust_i18n::t!(
-        key,
+        key.as_str(),
         locale = locale,
         count = count,
         playlist = gtk::glib::markup_escape_text(playlist_name)
@@ -725,7 +765,14 @@ fn setup_playlist_transfer(
         .build();
     let sort_model = state.sort_model.clone();
     let column_view = state.column_view.clone();
-    drag_source.connect_prepare(move |_, _, _| {
+    drag_source.connect_prepare(move |_, x, y| {
+        // The source is installed on the whole `ColumnView`, whose header
+        // owns GTK's column reorder and resize gestures. Only a press inside
+        // the data-row area may become a track drag.
+        let picked = column_view.pick(x, y, gtk::PickFlags::DEFAULT);
+        if !drag_origin_is_data_row(&column_view, picked) {
+            return None;
+        }
         let selection = column_view
             .model()?
             .downcast::<gtk::MultiSelection>()
@@ -740,6 +787,30 @@ fn setup_playlist_transfer(
         ),
         gtk::accessible::Property::KeyShortcuts("Shift+F10 ContextMenu"),
     ]);
+}
+
+/// Whether a drag starting at `picked`, the widget under the pointer as
+/// resolved by [`gtk::prelude::WidgetExt::pick`] on `column_view`, begins in
+/// the data-row area.
+///
+/// `GtkColumnView` parents two children directly: a header row widget, which
+/// hosts the column reorder and resize gestures, and an internal
+/// `GtkListView` subclass holding the data rows. A track drag may only start
+/// from a widget inside that list view; the header, empty space, and the
+/// column view itself refuse.
+fn drag_origin_is_data_row(column_view: &gtk::ColumnView, picked: Option<gtk::Widget>) -> bool {
+    let column_view = column_view.upcast_ref::<gtk::Widget>();
+    let mut widget = picked;
+    while let Some(current) = widget {
+        if &current == column_view {
+            return false;
+        }
+        if current.is::<gtk::ListView>() {
+            return true;
+        }
+        widget = current.parent();
+    }
+    false
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1574,8 +1645,14 @@ mod tests {
                 count = 1,
                 playlist = "R&amp;B &lt;Mix&gt;"
             );
+            // Count 2 is `other` in most catalogs but `few` in Polish and
+            // Russian; the catalog form must match whatever the selector picks.
+            let other_key = format!(
+                "context.playlist_add_success.{}",
+                plural_category(&locale, 2)
+            );
             let expected_other = rust_i18n::t!(
-                "context.playlist_add_success.other",
+                other_key.as_str(),
                 locale = locale,
                 count = 2,
                 playlist = "R&amp;B &lt;Mix&gt;"
@@ -1593,6 +1670,60 @@ mod tests {
                 other.contains("R&amp;B &lt;Mix&gt;"),
                 "{locale}: escaped name"
             );
+        }
+    }
+
+    #[test]
+    fn playlist_add_success_uses_locale_plural_categories() {
+        assert_eq!(plural_category("pl", 1), "one");
+        assert_eq!(plural_category("pl", 2), "few");
+        assert_eq!(plural_category("pl", 5), "many");
+        assert_eq!(plural_category("pl", 12), "many");
+        assert_eq!(plural_category("pl", 22), "few");
+        assert_eq!(plural_category("ru", 1), "one");
+        assert_eq!(plural_category("ru", 21), "one");
+        assert_eq!(plural_category("ru", 11), "many");
+        assert_eq!(plural_category("ru", 3), "few");
+        assert_eq!(plural_category("ru", 5), "many");
+        assert_eq!(plural_category("en", 21), "other");
+        assert_eq!(plural_category("pt-BR", 1), "one");
+        assert_eq!(plural_category("zh-CN", 2), "other");
+
+        assert_eq!(
+            playlist_add_success_message("pl", 3, "Mix"),
+            "Dodano 3 utwory do Mix."
+        );
+        assert_eq!(
+            playlist_add_success_message("pl", 5, "Mix"),
+            "Dodano 5 utworów do Mix."
+        );
+        assert_eq!(
+            playlist_add_success_message("ru", 21, "Mix"),
+            "Добавлена 21 композиция в Mix."
+        );
+        assert_eq!(
+            playlist_add_success_message("ru", 3, "Mix"),
+            "Добавлено 3 композиции в Mix."
+        );
+        assert_eq!(
+            playlist_add_success_message("ru", 5, "Mix"),
+            "Добавлено 5 композиций в Mix."
+        );
+
+        // Every category the selector can pick must resolve in every catalog;
+        // a missing form would surface the raw key in the toast.
+        for locale in rust_i18n::available_locales!() {
+            for count in 1..=25 {
+                let message = playlist_add_success_message(&locale, count, "Mix");
+                assert!(
+                    !message.contains("playlist_add_success"),
+                    "{locale}: no catalog form for count {count}"
+                );
+                assert!(
+                    message.contains(&count.to_string()),
+                    "{locale}: count {count} missing"
+                );
+            }
         }
     }
 
@@ -1755,6 +1886,7 @@ mod tests {
             );
             return;
         }
+        assert_track_drags_start_only_from_the_data_row_area();
 
         let menu = gtk::gio::Menu::new();
         menu.append(Some("Open Properties"), Some("ctx.properties"));
@@ -1882,6 +2014,47 @@ mod tests {
         assert!(!pull_mirror.is_editable_regular_playlist());
         assert!(!server.is_editable_regular_playlist());
         assert!(!header.is_editable_regular_playlist());
+    }
+
+    /// Widget-constructing contract for the tracklist drag origin. Called from
+    /// [`popover_from_menu_model_attaches_a_visible_child_widget`] rather than
+    /// being its own `#[test]`: gtk-rs allows GTK to be initialized on exactly
+    /// one thread per process, and the test harness runs tests on a pool of
+    /// threads, so a second GTK-initializing test panics whenever it lands on
+    /// a different thread from the first.
+    fn assert_track_drags_start_only_from_the_data_row_area() {
+        let store = gtk::gio::ListStore::new::<gtk::StringObject>();
+        store.append(&gtk::StringObject::new("a"));
+        let selection = gtk::MultiSelection::new(Some(store));
+        let factory = gtk::SignalListItemFactory::new();
+        let column_view = gtk::ColumnView::new(Some(selection));
+        column_view.append_column(&gtk::ColumnViewColumn::new(Some("Title"), Some(factory)));
+
+        // GTK parents the header row widget first and the internal list view
+        // last; the header owns column reordering and resizing.
+        let header = column_view.first_child().expect("header row widget");
+        let rows = column_view.last_child().expect("internal list view");
+        assert!(
+            !header.is::<gtk::ListView>(),
+            "first child must be the header"
+        );
+        assert!(
+            rows.is::<gtk::ListView>(),
+            "last child must be the list view"
+        );
+
+        assert!(drag_origin_is_data_row(&column_view, Some(rows.clone())));
+        assert!(!drag_origin_is_data_row(&column_view, Some(header)));
+        assert!(!drag_origin_is_data_row(
+            &column_view,
+            Some(column_view.clone().upcast())
+        ));
+        assert!(!drag_origin_is_data_row(&column_view, None));
+        // A widget outside the column view never qualifies.
+        assert!(!drag_origin_is_data_row(
+            &column_view,
+            Some(gtk::Label::new(None).upcast())
+        ));
     }
 
     #[test]

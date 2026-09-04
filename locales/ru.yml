@@ -197,6 +197,8 @@ context:
   playlist_add_success:
     one: "Добавлена %{count} композиция в %{playlist}."
     other: "Добавлено композиций: %{count} в %{playlist}."
+    few: "Добавлено %{count} композиции в %{playlist}."
+    many: "Добавлено %{count} композиций в %{playlist}."
 
 # ── Обычные плейлисты ───────────────────────────────────────────
 regular_playlist:
