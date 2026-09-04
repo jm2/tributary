@@ -1,0 +1,562 @@
+//! Equalizer persistence: the `equalizer.cfg` grammar, strict parsing,
+//! and the atomic-replace writer (contract: *Persistence format*).
+
+use std::path::PathBuf;
+
+use super::{ClipProtection, EqSettings, Preset};
+
+/// The only supported on-disk schema version.
+const SCHEMA_VERSION: &str = "1";
+
+/// Path to the equalizer state file: `<data_dir>/tributary/equalizer.cfg`,
+/// beside the `volume` file. Owned exclusively by this module.
+fn equalizer_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("tributary").join("equalizer.cfg"))
+}
+
+/// Whether an `equalizer.cfg` currently exists on disk. The player uses
+/// this to keep the fresh-install shape (no file) until a real state
+/// change is persisted for the first time; once a file exists, even a
+/// reset to the default state is written back so a stale non-default
+/// file can never resurrect discarded settings.
+pub fn config_file_exists() -> bool {
+    equalizer_path().is_some_and(|path| path.exists())
+}
+
+// ── Render ──────────────────────────────────────────────────────────────
+
+/// Append one `key="value"` line with the contract's escaping (`\"`,
+/// `\\`) and no trailing newline skipping — every value is quoted.
+fn push_quoted_line(out: &mut String, key: &str, value: &str) {
+    out.push_str(key);
+    out.push_str("=\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(ch),
+        }
+    }
+    out.push_str("\"\n");
+}
+
+/// Render the canonical on-disk content: six keys in contract order, each
+/// value double-quoted, floats with exactly one decimal place.
+pub fn render_equalizer_file(settings: &EqSettings) -> String {
+    let mut out = String::with_capacity(256);
+    push_quoted_line(&mut out, "schema_version", SCHEMA_VERSION);
+    push_quoted_line(&mut out, "enabled", &settings.enabled.to_string());
+    push_quoted_line(&mut out, "preset", Preset::key(settings.preset));
+    push_quoted_line(&mut out, "preamp_db", &format!("{:.1}", settings.preamp_db));
+    for (index, gain) in settings.bands_db.iter().enumerate() {
+        push_quoted_line(
+            &mut out,
+            &format!("band{index}_db"),
+            &format!("{:.1}", gain),
+        );
+    }
+    push_quoted_line(
+        &mut out,
+        "clip_protect",
+        ClipProtection::key(settings.clip_protection),
+    );
+    out
+}
+
+// ── Load ────────────────────────────────────────────────────────────────
+
+/// What happened when the on-disk state was read.
+#[derive(Debug)]
+pub enum EqLoadOutcome {
+    /// The file was valid (coercions and clamps may still have been
+    /// applied per the validation rules).
+    Loaded(EqSettings),
+    /// The file was malformed or carried an unsupported schema version.
+    /// Defaults are returned and have been re-written to disk via the
+    /// same atomic-replace protocol.
+    ReplacedWithDefaults {
+        settings: EqSettings,
+        diagnostic: EqFileDiagnostic,
+    },
+}
+
+/// Bounded diagnostic for a replaced malformed file: file path, byte
+/// count, and the offending key only — never the file content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EqFileDiagnostic {
+    pub path: String,
+    pub byte_count: u64,
+    pub bad_key: String,
+}
+
+/// Shared reader for startup and the settings UI's reload escape hatch:
+/// load the persisted state, replace a malformed file, and report
+/// exactly one bounded diagnostic per replacement. Both callers must
+/// share this path so the diagnostic wording cannot drift.
+pub fn load_settings_with_diagnostic() -> EqSettings {
+    match load_equalizer_settings_from_disk() {
+        EqLoadOutcome::Loaded(settings) => settings,
+        EqLoadOutcome::ReplacedWithDefaults {
+            settings,
+            diagnostic,
+        } => {
+            tracing::warn!(
+                path = %diagnostic.path,
+                byte_count = diagnostic.byte_count,
+                bad_key = %diagnostic.bad_key,
+                "Malformed equalizer.cfg replaced with default state"
+            );
+            settings
+        }
+    }
+}
+
+/// Read `equalizer.cfg`, validate, clamp, and coerce per the contract.
+pub fn load_equalizer_settings_from_disk() -> EqLoadOutcome {
+    let Some(path) = equalizer_path() else {
+        return EqLoadOutcome::Loaded(EqSettings::default());
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        // Missing file is the fresh-install shape: defaults, no write.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return EqLoadOutcome::Loaded(EqSettings::default());
+        }
+        Err(_) => {
+            // Unreadable (permissions, transient I/O): run with defaults
+            // in memory but keep the on-disk state — one failed read must
+            // never discard valid persisted state the parser cannot see.
+            return EqLoadOutcome::Loaded(EqSettings::default());
+        }
+    };
+    match parse_equalizer_file(&bytes) {
+        Ok(settings) => EqLoadOutcome::Loaded(settings),
+        Err(bad_key) => replace_with_defaults(&path, bytes.len() as u64, &bad_key),
+    }
+}
+
+fn replace_with_defaults(path: &std::path::Path, byte_count: u64, bad_key: &str) -> EqLoadOutcome {
+    let settings = EqSettings::default();
+    let diagnostic = EqFileDiagnostic {
+        path: path.display().to_string(),
+        byte_count,
+        bad_key: bad_key.to_string(),
+    };
+    let _ = write_equalizer_file_atomic(path, &render_equalizer_file(&settings));
+    EqLoadOutcome::ReplacedWithDefaults {
+        settings,
+        diagnostic,
+    }
+}
+
+// ── Parse ───────────────────────────────────────────────────────────────
+
+/// Line-scan accumulator for the config parser.
+#[derive(Default)]
+struct RawEqConfig {
+    schema_version: Option<String>,
+    enabled: Option<bool>,
+    preset: Option<Preset>,
+    preamp_db: Option<f64>,
+    bands_db: [f64; 10],
+    clip_protection: ClipProtection,
+}
+
+impl RawEqConfig {
+    /// Fold one parsed `key="value"` pair into the accumulator.
+    fn absorb(&mut self, key: &str, value: &str) -> Result<(), String> {
+        match key {
+            "schema_version" => self.schema_version = Some(value.to_string()),
+            "enabled" => self.enabled = Some(value == "true"),
+            "preset" => self.preset = Some(Preset::from_key(value)),
+            "preamp_db" => {
+                self.preamp_db = Some(parse_gain(value).ok_or_else(|| "preamp_db".to_string())?);
+            }
+            "clip_protect" => self.clip_protection = ClipProtection::from_key(value),
+            _ => self.absorb_band(key, value)?,
+        }
+        Ok(())
+    }
+
+    /// Fold one `band<N>_db` key. Unknown keys are ignored so a future
+    /// minor schema can add keys without discarding user state.
+    fn absorb_band(&mut self, key: &str, value: &str) -> Result<(), String> {
+        if let Some(band) = band_index(key) {
+            self.bands_db[band] = parse_gain(value).ok_or_else(|| format!("band{band}_db"))?;
+        }
+        Ok(())
+    }
+
+    /// Finish the scan: require the schema version, apply defaults for
+    /// absent optional keys, and clamp gains to the contract bounds.
+    fn into_settings(self) -> Result<EqSettings, String> {
+        let schema_version = self
+            .schema_version
+            .ok_or_else(|| "schema_version".to_string())?;
+        if schema_version != SCHEMA_VERSION {
+            return Err("schema_version".to_string());
+        }
+        let mut settings = EqSettings {
+            enabled: self.enabled.unwrap_or(false),
+            preset: self.preset.unwrap_or(Preset::Flat),
+            preamp_db: self.preamp_db.unwrap_or(0.0),
+            bands_db: self.bands_db,
+            clip_protection: self.clip_protection,
+        };
+        settings.preamp_db = EqSettings::clamp_gain_db(settings.preamp_db);
+        for gain in &mut settings.bands_db {
+            *gain = EqSettings::clamp_gain_db(*gain);
+        }
+        Ok(settings)
+    }
+}
+
+/// Parse the strict `key="value"` grammar. Returns `Err(bad_key)` for a
+/// malformed line, a bad schema version, or an unparseable mandatory key.
+fn parse_equalizer_file(bytes: &[u8]) -> Result<EqSettings, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "schema_version".to_string())?;
+    let mut config = RawEqConfig::default();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (key, value) = parse_line(line).ok_or_else(|| bad_key_of(line))?;
+        config.absorb(&key, &value)?;
+    }
+    config.into_settings()
+}
+
+fn bad_key_of(line: &str) -> String {
+    line.split('=')
+        .next()
+        .unwrap_or("(unknown)")
+        .trim()
+        .to_string()
+}
+
+fn band_index(key: &str) -> Option<usize> {
+    let rest = key.strip_prefix("band")?;
+    let index = rest.strip_suffix("_db")?;
+    index.parse::<usize>().ok().filter(|i| *i < 10)
+}
+
+/// Parse one gain value: finite float, clamped by the caller.
+fn parse_gain(value: &str) -> Option<f64> {
+    let gain = value.trim().parse::<f64>().ok()?;
+    gain.is_finite().then_some(gain)
+}
+
+/// Parse a single `key="value"` line with `\"` / `\\` escapes. A bare
+/// (unquoted) value or an unknown escape is malformed.
+fn parse_line(line: &str) -> Option<(String, String)> {
+    let (key, rest) = line.split_once('=')?;
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let value = quoted_value(rest)?;
+    Some((key.to_string(), unescape(value)?))
+}
+
+/// Strip the mandatory double quotes around a raw value.
+fn quoted_value(rest: &str) -> Option<&str> {
+    if rest.len() < 2 {
+        return None;
+    }
+    let value = rest.strip_prefix('"')?.strip_suffix('"')?;
+    Some(value)
+}
+
+/// Decode `\"` and `\\` escapes. Any other escape, an embedded quote,
+/// or an embedded newline is malformed.
+fn unescape(value: &str) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                _ => return None,
+            },
+            '"' => return None,
+            '\n' | '\r' => return None,
+            _ => out.push(ch),
+        }
+    }
+    Some(out)
+}
+
+// ── Save ────────────────────────────────────────────────────────────────
+
+/// Persist settings with the atomic-replace protocol: temp file
+/// (`O_EXCL`, single write, fsync), `rename(2)`, then directory fsync.
+/// A concurrent or failed writer never leaves a partial file visible.
+pub fn save_equalizer_settings_to_disk(settings: &EqSettings) -> bool {
+    let Some(path) = equalizer_path() else {
+        return false;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    write_equalizer_file_atomic(&path, &render_equalizer_file(settings)).is_ok()
+}
+
+fn write_equalizer_file_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let temp_path = temp_sibling(path);
+    let write_result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp_path, path)?;
+        // The rename alone is not durable until the directory entry is.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+fn temp_sibling(path: &std::path::Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::float_cmp)] // contract-fixed gains (±0.0/0.5-steps) are exact in f64
+mod tests {
+    use super::super::{MAX_GAIN_DB, MIN_GAIN_DB};
+    use super::*;
+
+    // ── Render grammar ──────────────────────────────────────────────
+
+    #[test]
+    fn rendered_default_file_matches_the_contract_block() {
+        let rendered = render_equalizer_file(&EqSettings::default());
+        let expected = "\
+schema_version=\"1\"
+enabled=\"false\"
+preset=\"flat\"
+preamp_db=\"0.0\"
+band0_db=\"0.0\"
+band1_db=\"0.0\"
+band2_db=\"0.0\"
+band3_db=\"0.0\"
+band4_db=\"0.0\"
+band5_db=\"0.0\"
+band6_db=\"0.0\"
+band7_db=\"0.0\"
+band8_db=\"0.0\"
+band9_db=\"0.0\"
+clip_protect=\"off\"
+";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn rendered_values_carry_one_decimal_and_canonical_order() {
+        let settings = EqSettings {
+            enabled: true,
+            preset: Preset::Pop,
+            preamp_db: -2.0,
+            bands_db: [1.0, 2.0, 3.0, 2.0, 0.0, -1.0, -1.0, 0.0, 1.0, 12.0],
+            clip_protection: ClipProtection::Soft,
+        };
+        let rendered = render_equalizer_file(&settings);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 15);
+        assert_eq!(lines[0], "schema_version=\"1\"");
+        assert_eq!(lines[1], "enabled=\"true\"");
+        assert_eq!(lines[2], "preset=\"pop\"");
+        assert_eq!(lines[3], "preamp_db=\"-2.0\"");
+        assert_eq!(lines[4], "band0_db=\"1.0\"");
+        assert_eq!(lines[13], "band9_db=\"12.0\"");
+        assert_eq!(lines[14], "clip_protect=\"soft\"");
+    }
+
+    #[test]
+    fn values_are_escaped_like_contract_values() {
+        let mut out = String::new();
+        push_quoted_line(&mut out, "preset", "sa\"fe\\path");
+        assert_eq!(out, "preset=\"sa\\\"fe\\\\path\"\n");
+    }
+
+    // ── Parse: round-trip, coercions, clamps ────────────────────────
+
+    #[test]
+    fn parse_round_trips_a_written_file() {
+        let settings = EqSettings {
+            enabled: true,
+            preset: Preset::Rock,
+            preamp_db: -1.0,
+            bands_db: [3.0, 2.0, 0.0, -1.0, -1.0, 0.0, 2.0, 3.0, 3.0, 2.0],
+            clip_protection: ClipProtection::Soft,
+        };
+        let parsed = parse_equalizer_file(render_equalizer_file(&settings).as_bytes())
+            .expect("round trip parse");
+        assert_eq!(parsed, settings);
+    }
+
+    #[test]
+    fn parser_is_order_insensitive_but_strict_about_quoting() {
+        let reordered = "\
+clip_protect=\"soft\"
+band9_db=\"+12.0\"
+schema_version=\"1\"
+preamp_db=\"-24.0\"
+preset=\"jazz\"
+band0_db=\"-24.0\"
+enabled=\"true\"
+";
+        let parsed = parse_equalizer_file(reordered.as_bytes()).expect("reordered parse");
+        assert!(parsed.enabled);
+        assert_eq!(parsed.preset, Preset::Jazz);
+        assert_eq!(parsed.preamp_db, -24.0);
+        assert_eq!(parsed.bands_db[9], 12.0);
+        assert_eq!(parsed.clip_protection, ClipProtection::Soft);
+
+        for malformed in ["preset=flat\n", "preset=flat\r\n", "preset=\"\n"] {
+            assert!(
+                parse_equalizer_file(malformed.as_bytes()).is_err(),
+                "unquoted or empty value must be malformed: {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_gains_clamp_to_the_boundary() {
+        let mut content = render_equalizer_file(&EqSettings::default());
+        content = content.replace("preamp_db=\"0.0\"", "preamp_db=\"-99.0\"");
+        content = content.replace("band0_db=\"0.0\"", "band0_db=\"+99.0\"");
+        content = content.replace("band9_db=\"0.0\"", "band9_db=\"13.5\"");
+        let parsed = parse_equalizer_file(content.as_bytes()).expect("clamped parse");
+        assert_eq!(parsed.preamp_db, MIN_GAIN_DB);
+        assert_eq!(parsed.bands_db[0], MAX_GAIN_DB);
+        assert_eq!(parsed.bands_db[9], MAX_GAIN_DB);
+        // Other bands remain valid.
+        assert_eq!(parsed.bands_db[5], 0.0);
+    }
+
+    #[test]
+    fn unknown_preset_coerces_to_flat_and_keeps_the_band_vector() {
+        let content = render_equalizer_file(&EqSettings {
+            preset: Preset::Rock,
+            bands_db: [3.0, 2.0, 0.0, -1.0, -1.0, 0.0, 2.0, 3.0, 3.0, 2.0],
+            ..EqSettings::default()
+        })
+        .replace("preset=\"rock\"", "preset=\"loudness2001\"");
+        let parsed = parse_equalizer_file(content.as_bytes()).expect("coerced parse");
+        assert_eq!(parsed.preset, Preset::Flat);
+        assert_eq!(parsed.bands_db[0], 3.0);
+    }
+
+    #[test]
+    fn bad_boolean_and_clip_values_fall_back_to_off_states() {
+        let content = render_equalizer_file(&EqSettings {
+            enabled: true,
+            clip_protection: ClipProtection::Soft,
+            ..EqSettings::default()
+        })
+        .replace("enabled=\"true\"", "enabled=\"maybe\"")
+        .replace("clip_protect=\"soft\"", "clip_protect=\"turbo\"");
+        let parsed = parse_equalizer_file(content.as_bytes()).expect("fallback parse");
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.clip_protection, ClipProtection::Off);
+    }
+
+    #[test]
+    fn malformed_line_reports_the_bad_key() {
+        let content = render_equalizer_file(&EqSettings::default())
+            .replace("band3_db=\"0.0\"", "band3_db=\"0.0\" trailing");
+        let error = parse_equalizer_file(content.as_bytes()).expect_err("malformed");
+        assert_eq!(error, "band3_db");
+    }
+
+    #[test]
+    fn unsupported_schema_version_is_rejected() {
+        let content = render_equalizer_file(&EqSettings::default())
+            .replace("schema_version=\"1\"", "schema_version=\"2\"");
+        let error = parse_equalizer_file(content.as_bytes()).expect_err("schema");
+        assert_eq!(error, "schema_version");
+    }
+
+    #[test]
+    fn missing_enabled_key_defaults_to_disabled() {
+        // A missing optional key is tolerated with its default; only a
+        // malformed line or a bad schema version replaces the file.
+        let content = render_equalizer_file(&EqSettings {
+            enabled: true,
+            ..EqSettings::default()
+        })
+        .lines()
+        .filter(|line| !line.starts_with("enabled="))
+        .collect::<Vec<_>>()
+        .join("\n");
+        let parsed = parse_equalizer_file(content.as_bytes()).expect("missing enabled tolerated");
+        assert!(!parsed.enabled);
+    }
+
+    #[test]
+    fn missing_schema_version_is_rejected() {
+        let content = render_equalizer_file(&EqSettings::default())
+            .lines()
+            .filter(|line| !line.starts_with("schema_version="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = parse_equalizer_file(content.as_bytes()).expect_err("missing schema");
+        assert_eq!(error, "schema_version");
+    }
+
+    #[test]
+    fn non_finite_gain_is_malformed() {
+        let content = render_equalizer_file(&EqSettings::default())
+            .replace("band0_db=\"0.0\"", "band0_db=\"nan\"");
+        assert!(parse_equalizer_file(content.as_bytes()).is_err());
+    }
+
+    // ── Atomic writer ───────────────────────────────────────────────
+
+    #[test]
+    fn atomic_write_replaces_and_leaves_no_temp_sibling() {
+        let base = tempfile::tempdir().expect("temporary config root");
+        let path = base.path().join("equalizer.cfg");
+
+        assert!(write_equalizer_file_atomic(&path, "first=\"1\"\n").is_ok());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first=\"1\"\n");
+        assert!(!temp_sibling(&path).exists());
+
+        assert!(write_equalizer_file_atomic(&path, "second=\"2\"\n").is_ok());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second=\"2\"\n");
+        assert!(!temp_sibling(&path).exists());
+    }
+
+    #[test]
+    fn temp_sibling_sits_beside_the_destination() {
+        let path = std::path::Path::new("state/tributary/equalizer.cfg");
+        assert_eq!(
+            temp_sibling(path),
+            std::path::Path::new("state/tributary/equalizer.cfg.tmp")
+        );
+    }
+}
