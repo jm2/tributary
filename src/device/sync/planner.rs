@@ -42,17 +42,39 @@ pub struct HostTrackEntry {
     /// Where the track should land on the device, relative to the
     /// playlist pair's destination root.
     pub device_relative_path: PathBuf,
+    /// Size of the host track in bytes. The planner sums this for every
+    /// track it marks for transfer so the caller can budget device
+    /// capacity before the run.
+    pub size_bytes: u64,
 }
 
 /// What the planner learned about one track for one playlist pair.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SyncDeltaKind {
     /// The host track has never been written to the device.
-    New,
+    New {
+        /// The host's current fingerprint. The executor records this once
+        /// the write completes so the next run can detect a no-op.
+        fingerprint: String,
+        /// Where the executor should write the file, relative to the
+        /// device root. The planner validated this path.
+        device_relative_path: PathBuf,
+    },
     /// The host track has been edited since the last sync.
-    Modified,
+    Modified {
+        /// The host's current fingerprint. The executor records this once
+        /// the write completes so the next run can detect a no-op.
+        fingerprint: String,
+        /// Where the executor should write the file, relative to the
+        /// device root. The planner validated this path.
+        device_relative_path: PathBuf,
+    },
     /// The host track was previously synced and is unchanged.
-    Unchanged,
+    Unchanged {
+        /// Where the track already lives on the device, relative to the
+        /// device root. The planner validated this path.
+        device_relative_path: PathBuf,
+    },
     /// The track was on the device but the host playlist no longer has it.
     Removed {
         /// Where the executor should remove the file from if the policy
@@ -104,6 +126,26 @@ pub struct SyncPlan {
     pub remove_count: u32,
 }
 
+impl SyncPlan {
+    /// Record one planned write: push the delta, bump the write count,
+    /// and add the track's size to the capacity budget.
+    fn push_write(
+        &mut self,
+        host: &HostPlaylistId,
+        track_id: &str,
+        size_bytes: u64,
+        kind: SyncDeltaKind,
+    ) {
+        self.expected_write_bytes = self.expected_write_bytes.saturating_add(size_bytes);
+        self.write_count = self.write_count.saturating_add(1);
+        self.deltas.push(SyncDelta {
+            host: host.clone(),
+            track_id: track_id.to_string(),
+            kind,
+        });
+    }
+}
+
 /// The sync planner. Stateless and `Clone` so the same planner can serve
 /// multiple requests in sequence.
 #[derive(Clone, Debug, Default)]
@@ -133,9 +175,7 @@ impl SyncPlanner {
             });
         }
 
-        let mut deltas: Vec<SyncDelta> = Vec::new();
-        let mut write_count: u32 = 0;
-        let mut remove_count: u32 = 0;
+        let mut plan = SyncPlan::default();
 
         for (index, pair) in request.pairs.iter().enumerate() {
             let tracks = &request.tracks_by_pair[index];
@@ -160,121 +200,145 @@ impl SyncPlanner {
                 .map(|entry| entry.track_id.as_str())
                 .collect();
 
-            // Walk the host tracks.
-            for entry in &tracks.tracks {
-                if entry.fingerprint.is_empty() {
-                    return Err(PlannerError::EmptyFingerprint {
-                        host: tracks.host.clone(),
-                        track_id: entry.track_id.clone(),
-                    });
-                }
-                let status = tracks.state.status(&entry.track_id);
-                let destination_relative =
-                    pair.destination_root().join(&entry.device_relative_path);
-                validate_relative_path(&destination_relative, "destination")
-                    .map_err(|source| PlannerError::Policy { source })?;
+            Self::plan_pair_tracks(pair, tracks, &mut plan)?;
+            Self::plan_removed_tracks(tracks, &host_track_ids, &mut plan);
+        }
 
-                match status {
-                    None => {
-                        // The state has no entry for this track. It is brand
-                        // new from the planner's perspective.
-                        deltas.push(SyncDelta {
-                            host: tracks.host.clone(),
-                            track_id: entry.track_id.clone(),
-                            kind: SyncDeltaKind::New,
-                        });
-                        write_count = write_count.saturating_add(1);
-                    }
-                    Some(TrackSyncStatus::Pending) => {
-                        deltas.push(SyncDelta {
-                            host: tracks.host.clone(),
-                            track_id: entry.track_id.clone(),
-                            kind: SyncDeltaKind::New,
-                        });
-                        write_count = write_count.saturating_add(1);
-                    }
-                    Some(TrackSyncStatus::Synced { fingerprint, .. }) => {
-                        if fingerprint == &entry.fingerprint {
-                            deltas.push(SyncDelta {
-                                host: tracks.host.clone(),
-                                track_id: entry.track_id.clone(),
-                                kind: SyncDeltaKind::Unchanged,
-                            });
-                        } else {
-                            deltas.push(SyncDelta {
-                                host: tracks.host.clone(),
-                                track_id: entry.track_id.clone(),
-                                kind: SyncDeltaKind::Modified,
-                            });
-                            write_count = write_count.saturating_add(1);
-                        }
-                    }
-                    Some(TrackSyncStatus::Modified { fingerprint: _ }) => {
-                        // The recorded modification matches (or is older
-                        // than) what the host is currently serving; treat
-                        // as modified so the executor still tries to push.
-                        deltas.push(SyncDelta {
-                            host: tracks.host.clone(),
-                            track_id: entry.track_id.clone(),
-                            kind: SyncDeltaKind::Modified,
-                        });
-                        write_count = write_count.saturating_add(1);
-                    }
-                    Some(TrackSyncStatus::Missing { .. }) => {
-                        // The track was previously recorded as missing. If
-                        // the host has re-added it, treat as new.
-                        deltas.push(SyncDelta {
-                            host: tracks.host.clone(),
-                            track_id: entry.track_id.clone(),
-                            kind: SyncDeltaKind::New,
-                        });
-                        write_count = write_count.saturating_add(1);
-                    }
-                }
+        Ok(plan)
+    }
+
+    /// Walk one pair's host tracks and push a delta per track.
+    ///
+    /// Every emitted delta carries the fingerprint the executor must
+    /// record on completion and the planner-validated device-relative
+    /// path it must write to, so the executor never fabricates either.
+    fn plan_pair_tracks(
+        pair: &PlaylistPair,
+        tracks: &HostTrackSet,
+        plan: &mut SyncPlan,
+    ) -> Result<(), PlannerError> {
+        for entry in &tracks.tracks {
+            if entry.fingerprint.is_empty() {
+                return Err(PlannerError::EmptyFingerprint {
+                    host: tracks.host.clone(),
+                    track_id: entry.track_id.clone(),
+                });
             }
+            let destination_relative = pair.destination_root().join(&entry.device_relative_path);
+            validate_relative_path(&destination_relative, "destination")
+                .map_err(|source| PlannerError::Policy { source })?;
 
-            // Walk tracks that were previously synced but no longer appear
-            // on the host.
-            for (track_id, status) in tracks.state.iter() {
-                if host_track_ids.contains(track_id) {
-                    continue;
+            let status = tracks.state.status(&entry.track_id);
+            match status {
+                None => {
+                    // The state has no entry for this track. It is brand
+                    // new from the planner's perspective.
+                    plan.push_write(
+                        &tracks.host,
+                        &entry.track_id,
+                        entry.size_bytes,
+                        SyncDeltaKind::New {
+                            fingerprint: entry.fingerprint.clone(),
+                            device_relative_path: destination_relative.clone(),
+                        },
+                    );
                 }
-                match status {
-                    TrackSyncStatus::Synced {
-                        device_relative_path,
-                        last_synced_at,
-                        ..
-                    } => {
-                        deltas.push(SyncDelta {
+                Some(TrackSyncStatus::Pending) => {
+                    plan.push_write(
+                        &tracks.host,
+                        &entry.track_id,
+                        entry.size_bytes,
+                        SyncDeltaKind::New {
+                            fingerprint: entry.fingerprint.clone(),
+                            device_relative_path: destination_relative.clone(),
+                        },
+                    );
+                }
+                Some(TrackSyncStatus::Synced { fingerprint, .. }) => {
+                    if fingerprint == &entry.fingerprint {
+                        plan.deltas.push(SyncDelta {
                             host: tracks.host.clone(),
-                            track_id: track_id.to_string(),
-                            kind: SyncDeltaKind::Removed {
-                                device_relative_path: PathBuf::from(device_relative_path),
-                                last_known_fingerprint: status
-                                    .fingerprint()
-                                    .unwrap_or_default()
-                                    .to_string(),
+                            track_id: entry.track_id.clone(),
+                            kind: SyncDeltaKind::Unchanged {
+                                device_relative_path: destination_relative.clone(),
                             },
                         });
-                        let _ = last_synced_at;
-                        remove_count = remove_count.saturating_add(1);
+                    } else {
+                        plan.push_write(
+                            &tracks.host,
+                            &entry.track_id,
+                            entry.size_bytes,
+                            SyncDeltaKind::Modified {
+                                fingerprint: entry.fingerprint.clone(),
+                                device_relative_path: destination_relative.clone(),
+                            },
+                        );
                     }
-                    TrackSyncStatus::Missing { .. } => {
-                        // Already missing; nothing to do.
-                    }
-                    TrackSyncStatus::Modified { .. } | TrackSyncStatus::Pending => {
-                        // Never written; nothing on the device to remove.
-                    }
+                }
+                Some(TrackSyncStatus::Modified { .. }) => {
+                    // The recorded modification matches (or is older
+                    // than) what the host is currently serving; treat
+                    // as modified so the executor still tries to push.
+                    plan.push_write(
+                        &tracks.host,
+                        &entry.track_id,
+                        entry.size_bytes,
+                        SyncDeltaKind::Modified {
+                            fingerprint: entry.fingerprint.clone(),
+                            device_relative_path: destination_relative.clone(),
+                        },
+                    );
+                }
+                Some(TrackSyncStatus::Missing { .. }) => {
+                    // The track was previously recorded as missing. If
+                    // the host has re-added it, treat as new.
+                    plan.push_write(
+                        &tracks.host,
+                        &entry.track_id,
+                        entry.size_bytes,
+                        SyncDeltaKind::New {
+                            fingerprint: entry.fingerprint.clone(),
+                            device_relative_path: destination_relative.clone(),
+                        },
+                    );
                 }
             }
         }
+        Ok(())
+    }
 
-        Ok(SyncPlan {
-            deltas,
-            expected_write_bytes: 0,
-            write_count,
-            remove_count,
-        })
+    /// Walk tracks that were previously synced but no longer appear on
+    /// the host, pushing a removed delta per track.
+    fn plan_removed_tracks(
+        tracks: &HostTrackSet,
+        host_track_ids: &BTreeSet<&str>,
+        plan: &mut SyncPlan,
+    ) {
+        for (track_id, status) in tracks.state.iter() {
+            if host_track_ids.contains(track_id) {
+                continue;
+            }
+            if let TrackSyncStatus::Synced {
+                device_relative_path,
+                ..
+            } = status
+            {
+                plan.deltas.push(SyncDelta {
+                    host: tracks.host.clone(),
+                    track_id: track_id.to_string(),
+                    kind: SyncDeltaKind::Removed {
+                        device_relative_path: PathBuf::from(device_relative_path),
+                        last_known_fingerprint: status
+                            .fingerprint()
+                            .unwrap_or_default()
+                            .to_string(),
+                    },
+                });
+                plan.remove_count = plan.remove_count.saturating_add(1);
+            }
+            // Missing entries are already gone; Pending/Modified were
+            // never written, so there is nothing on the device to remove.
+        }
     }
 }
 
@@ -344,6 +408,7 @@ mod tests {
                         track_id: "track-1".into(),
                         fingerprint: "fp1".into(),
                         device_relative_path: PathBuf::from("a.flac"),
+                        size_bytes: 100,
                     }],
                     state: IncrementalSyncState::new(),
                 }],
@@ -353,7 +418,74 @@ mod tests {
         assert_eq!(plan.write_count, 1);
         assert_eq!(plan.remove_count, 0);
         assert_eq!(plan.deltas.len(), 1);
-        assert!(matches!(plan.deltas[0].kind, SyncDeltaKind::New));
+        assert!(matches!(plan.deltas[0].kind, SyncDeltaKind::New { .. }));
+    }
+
+    #[test]
+    fn plan_carries_fingerprint_and_validated_path_on_write_deltas() {
+        let mut state = IncrementalSyncState::new();
+        state.record_synced("track-1", "fp1", "Music/a.flac", 100);
+        let stored = state.clone();
+        let plan = SyncPlanner::new()
+            .plan(&SyncRequest {
+                pairs: vec![pair("a", "Music")],
+                tracks_by_pair: vec![HostTrackSet {
+                    host: host("a"),
+                    tracks: vec![HostTrackEntry {
+                        track_id: "track-1".into(),
+                        fingerprint: "fp2".into(),
+                        device_relative_path: PathBuf::from("a.flac"),
+                        size_bytes: 100,
+                    }],
+                    state: stored.clone(),
+                }],
+                state_by_pair: vec![stored],
+            })
+            .expect("plan");
+        let SyncDeltaKind::Modified {
+            fingerprint,
+            device_relative_path,
+        } = &plan.deltas[0].kind
+        else {
+            panic!("expected a modified delta, got {:?}", plan.deltas[0].kind);
+        };
+        assert_eq!(fingerprint, "fp2");
+        assert_eq!(device_relative_path, &PathBuf::from("Music/a.flac"));
+    }
+
+    #[test]
+    fn plan_sums_expected_write_bytes_for_transfers_only() {
+        let mut state = IncrementalSyncState::new();
+        state.record_synced("kept", "fp-kept", "Music/kept.flac", 100);
+        let stored = state.clone();
+        let plan = SyncPlanner::new()
+            .plan(&SyncRequest {
+                pairs: vec![pair("a", "Music")],
+                tracks_by_pair: vec![HostTrackSet {
+                    host: host("a"),
+                    tracks: vec![
+                        HostTrackEntry {
+                            track_id: "fresh".into(),
+                            fingerprint: "fp-new".into(),
+                            device_relative_path: PathBuf::from("fresh.flac"),
+                            size_bytes: 100,
+                        },
+                        HostTrackEntry {
+                            track_id: "kept".into(),
+                            fingerprint: "fp-kept".into(),
+                            device_relative_path: PathBuf::from("kept.flac"),
+                            size_bytes: 999,
+                        },
+                    ],
+                    state: stored.clone(),
+                }],
+                state_by_pair: vec![stored],
+            })
+            .expect("plan");
+        // Only the new track is written; the unchanged track must not
+        // count against the capacity budget.
+        assert_eq!(plan.write_count, 1);
+        assert_eq!(plan.expected_write_bytes, 100);
     }
 
     #[test]
@@ -370,6 +502,7 @@ mod tests {
                         track_id: "track-1".into(),
                         fingerprint: "fp1".into(),
                         device_relative_path: PathBuf::from("a.flac"),
+                        size_bytes: 100,
                     }],
                     state: stored.clone(),
                 }],
@@ -378,7 +511,10 @@ mod tests {
             .expect("plan");
         assert_eq!(plan.write_count, 0);
         assert_eq!(plan.remove_count, 0);
-        assert!(matches!(plan.deltas[0].kind, SyncDeltaKind::Unchanged));
+        assert!(matches!(
+            plan.deltas[0].kind,
+            SyncDeltaKind::Unchanged { .. }
+        ));
     }
 
     #[test]
@@ -395,6 +531,7 @@ mod tests {
                         track_id: "track-1".into(),
                         fingerprint: "fp2".into(),
                         device_relative_path: PathBuf::from("a.flac"),
+                        size_bytes: 100,
                     }],
                     state: stored.clone(),
                 }],
@@ -402,7 +539,10 @@ mod tests {
             })
             .expect("plan");
         assert_eq!(plan.write_count, 1);
-        assert!(matches!(plan.deltas[0].kind, SyncDeltaKind::Modified));
+        assert!(matches!(
+            plan.deltas[0].kind,
+            SyncDeltaKind::Modified { .. }
+        ));
     }
 
     #[test]
@@ -449,6 +589,7 @@ mod tests {
                         track_id: "track-1".into(),
                         fingerprint: String::new(),
                         device_relative_path: PathBuf::from("a.flac"),
+                        size_bytes: 100,
                     }],
                     state: IncrementalSyncState::new(),
                 }],

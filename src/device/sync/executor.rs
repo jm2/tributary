@@ -27,15 +27,34 @@
 //! ## Recording the run
 //!
 //! On a clean completion, every fetched track's recorded state moves to
-//! [`TrackSyncStatus::Synced`](super::state::TrackSyncStatus::Synced) and
+//! [`TrackSyncStatus::Synced`](super::state::TrackSyncStatus::Synced) with
+//! the fingerprint and device-relative path the planner validated, and
 //! every removed track's recorded state moves to
 //! [`TrackSyncStatus::Missing`](super::state::TrackSyncStatus::Missing).
 //! The playlist map's [`last_synced_at`](super::mapping::PlaylistPair::last_synced_at)
-//! is updated.
+//! is updated. The run borrows the executor mutably and mutates the
+//! recorded state in place, so nothing is lost when the run finishes; the
+//! caller reads the results back through
+//! [`state_by_pair`](SyncExecutor::state_by_pair) and
+//! [`map`](SyncExecutor::map).
+//!
+//! ## Conflict strategies
+//!
+//! A write delta can conflict with an existing device copy. For a
+//! `Modified` delta the policy's
+//! [`SyncConflictResolution`](super::SyncConflictResolution) decides the
+//! outcome: `HostWins` overwrites the device copy, `DeviceWins` keeps the
+//! device copy and records the host copy as stale, `Skip` drops the write
+//! without touching the recorded state, and `Fail` reports the conflict
+//! and lets the rest of the run complete. A `New` delta has no device
+//! copy to conflict with, so every strategy writes it. A playlist whose
+//! policy is missing or disabled is never written: opt-in gates every
+//! write.
 //!
 //! On a detach, the executor stops immediately, leaves the recorded state
 //! untouched, and the [`AttachDetachRecovery`] verdict tells the caller
-//! which stage to resume from.
+//! which stage to resume from. Deltas that already executed are dropped
+//! from the plan, so a re-attached retry only replays the remaining work.
 
 use std::collections::BTreeMap;
 
@@ -46,7 +65,7 @@ use super::planner::{SyncDelta, SyncDeltaKind, SyncPlan};
 use super::policy::SyncPolicy;
 use super::recovery::SyncSessionGuard;
 use super::state::{IncrementalSyncState, TrackSyncStatus};
-use super::SyncConflictResolution;
+use super::{HostPlaylistId, SyncConflictResolution};
 
 /// What one stage of a sync run actually did.
 ///
@@ -65,7 +84,12 @@ pub enum SyncStage {
 pub struct SyncRunSummary {
     pub written: u32,
     pub removed: u32,
+    /// Writes the policy's conflict strategy declined (`DeviceWins` or
+    /// `Skip`).
     pub skipped_conflicts: u32,
+    /// Writes the policy's `Fail` strategy refused. The run still
+    /// completes the rest of the playlist.
+    pub failed_conflicts: u32,
     pub completed: bool,
 }
 
@@ -116,10 +140,11 @@ impl SyncExecutor {
         }
     }
 
-    /// Run the plan. The returned summary reports what happened; the
-    /// caller reads the session guard through the recovery API to
-    /// decide whether to retry.
-    pub fn run(mut self) -> SyncRunSummary {
+    /// Run the plan. The executor borrows `self` mutably and updates the
+    /// recorded state in place; the returned summary reports what
+    /// happened, and the caller reads the session guard through the
+    /// recovery API to decide whether to retry.
+    pub fn run(&mut self) -> SyncRunSummary {
         let mut summary = SyncRunSummary::default();
         if !self.guard.is_attached() {
             self.guard
@@ -133,13 +158,43 @@ impl SyncExecutor {
         }
         self.guard.record_stage_completed(SyncStage::BrowseStorage);
 
-        for delta in std::mem::take(&mut self.plan.deltas) {
+        self.execute_deltas(&mut summary);
+        if self.guard.is_attached() {
+            self.finalize_sync_instants();
+        }
+        summary.completed = self.guard.is_attached();
+        summary
+    }
+
+    /// Walk every remaining delta, executing one at a time. Stops at the
+    /// first detach; deltas that already executed are dropped from the
+    /// plan so a re-attached retry only replays the remaining work.
+    fn execute_deltas(&mut self, summary: &mut SyncRunSummary) {
+        while !self.plan.deltas.is_empty() {
+            let delta = self.plan.deltas[0].clone();
             if !self.guard.is_attached() {
                 self.guard.record_detach(stage_for(&delta));
-                return summary;
+                return;
             }
             match &delta.kind {
-                SyncDeltaKind::New | SyncDeltaKind::Modified | SyncDeltaKind::Unchanged => {
+                SyncDeltaKind::New { .. } | SyncDeltaKind::Modified { .. } => {
+                    let stage = SyncStage::FetchTrack {
+                        track_id: delta.track_id.clone(),
+                    };
+                    let strategy = match self.policies.get(&delta.host) {
+                        Some(policy) if policy.is_enabled() => policy.conflict_strategy(),
+                        // Sync is not opted in for this playlist; the
+                        // planned write is dropped without touching the
+                        // recorded state.
+                        _ => {
+                            self.guard.record_stage_completed(stage);
+                            self.plan.deltas.remove(0);
+                            continue;
+                        }
+                    };
+                    self.execute_write(&delta, strategy, summary);
+                }
+                SyncDeltaKind::Unchanged { .. } => {
                     // Unchanged tracks produce no work but still need a
                     // stage entry so the recovery can quote the last
                     // completed stage.
@@ -147,25 +202,19 @@ impl SyncExecutor {
                         track_id: delta.track_id.clone(),
                     };
                     self.guard.record_stage_completed(stage);
-                    if matches!(delta.kind, SyncDeltaKind::New | SyncDeltaKind::Modified) {
-                        summary.written = summary.written.saturating_add(1);
-                        self.apply_written(&delta);
-                    }
                 }
                 SyncDeltaKind::Removed { .. } => {
-                    let host = delta.host.clone();
                     let stage = SyncStage::RemoveTrack {
                         track_id: delta.track_id.clone(),
                     };
-                    let Some(policy) = self.policies.get(&host) else {
-                        // Without a policy, removals are skipped.
+                    let policy = self.policies.get(&delta.host);
+                    let allowed = policy.map(|p| p.deletes_missing()).unwrap_or(false);
+                    if !allowed {
+                        // Without an opted-in delete-missing policy,
+                        // removals are skipped.
                         self.guard.record_stage_completed(stage);
                         summary.skipped_conflicts = summary.skipped_conflicts.saturating_add(1);
-                        continue;
-                    };
-                    if !policy.deletes_missing() {
-                        self.guard.record_stage_completed(stage);
-                        summary.skipped_conflicts = summary.skipped_conflicts.saturating_add(1);
+                        self.plan.deltas.remove(0);
                         continue;
                     }
                     self.guard.record_stage_completed(stage);
@@ -173,37 +222,73 @@ impl SyncExecutor {
                     self.apply_removed(&delta);
                 }
             }
+            self.plan.deltas.remove(0);
         }
+    }
 
-        for (host, pair) in self.map.iter() {
-            if !self
-                .policies
-                .get(host)
-                .map(|p| p.is_enabled())
-                .unwrap_or(false)
-            {
-                continue;
+    /// Apply the policy's conflict strategy to one planned write.
+    fn execute_write(
+        &mut self,
+        delta: &SyncDelta,
+        strategy: SyncConflictResolution,
+        summary: &mut SyncRunSummary,
+    ) {
+        let stage = SyncStage::FetchTrack {
+            track_id: delta.track_id.clone(),
+        };
+        // A brand-new track has no device copy for a DeviceWins strategy
+        // to preserve; every strategy writes a New delta. Only a
+        // Modified delta can conflict with an existing device copy.
+        match strategy {
+            SyncConflictResolution::HostWins => {
+                self.guard.record_stage_completed(stage);
+                summary.written = summary.written.saturating_add(1);
+                self.apply_written(delta);
             }
-            // We need a mutable borrow of the map to record the sync
-            // instant. Take a clone of the host id and look it up
-            // again.
-            let _ = pair;
-        }
-        // Update the map's recorded sync instants.
-        for host in self.policies.keys() {
-            if self
-                .policies
-                .get(host)
-                .map(|p| p.is_enabled())
-                .unwrap_or(false)
+            SyncConflictResolution::DeviceWins
+                if matches!(delta.kind, SyncDeltaKind::New { .. }) =>
             {
-                if let Some(pair) = self.map.get_by_host_mut(host) {
-                    pair.record_synced(self.now_seconds);
+                self.guard.record_stage_completed(stage);
+                summary.written = summary.written.saturating_add(1);
+                self.apply_written(delta);
+            }
+            // The device copy wins: leave it in place and record the host
+            // copy as stale so the next run still sees the divergence.
+            SyncConflictResolution::DeviceWins => {
+                self.guard.record_stage_completed(stage);
+                summary.skipped_conflicts = summary.skipped_conflicts.saturating_add(1);
+                if let Some((fingerprint, _)) = write_details(delta) {
+                    self.record_stale(&delta.host, &delta.track_id, fingerprint);
                 }
             }
+            // Skip: no write, no state change.
+            SyncConflictResolution::Skip => {
+                self.guard.record_stage_completed(stage);
+                summary.skipped_conflicts = summary.skipped_conflicts.saturating_add(1);
+            }
+            // Fail: report the conflict but let the rest of the playlist
+            // complete.
+            SyncConflictResolution::Fail => {
+                self.guard.record_stage_completed(stage);
+                summary.failed_conflicts = summary.failed_conflicts.saturating_add(1);
+            }
         }
-        summary.completed = self.guard.is_attached();
-        summary
+    }
+
+    /// Record the playlist pair's sync instant for every opted-in
+    /// policy after a completed run.
+    fn finalize_sync_instants(&mut self) {
+        let opted_in: Vec<HostPlaylistId> = self
+            .policies
+            .iter()
+            .filter(|(_, policy)| policy.is_enabled())
+            .map(|(host, _)| host.clone())
+            .collect();
+        for host in opted_in {
+            if let Some(pair) = self.map.get_by_host_mut(&host) {
+                pair.record_synced(self.now_seconds);
+            }
+        }
     }
 
     fn guard_open_session(&self) {
@@ -215,35 +300,27 @@ impl SyncExecutor {
     }
 
     fn apply_written(&mut self, delta: &SyncDelta) {
-        if matches!(delta.kind, SyncDeltaKind::Removed { .. }) {
+        let Some((fingerprint, device_relative_path)) = write_details(delta) else {
             return;
-        }
-        let host = &delta.host;
-        let track_id = delta.track_id.clone();
-        let destination_root = match self.map.get_by_host(host) {
-            Some(pair) => pair.destination_root().to_path_buf(),
-            None => return,
         };
-        let recorded_fingerprint = self
-            .state_by_pair
-            .get(host)
-            .and_then(|state| state.status(&track_id))
-            .and_then(|status| status.fingerprint())
-            .unwrap_or("")
-            .to_string();
-        let device_path = destination_root
-            .join(format!("{track_id}.bin"))
-            .to_string_lossy()
-            .into_owned();
-        let Some(state) = self.state_by_pair.get_mut(host) else {
+        let Some(state) = self.state_by_pair.get_mut(&delta.host) else {
             return;
         };
         state.record_synced(
-            track_id,
-            recorded_fingerprint,
-            device_path,
+            delta.track_id.clone(),
+            fingerprint,
+            device_relative_path,
             self.now_seconds,
         );
+    }
+
+    /// Record a host track as stale (`Modified`) after a DeviceWins
+    /// resolution so the next run still sees the divergence.
+    fn record_stale(&mut self, host: &HostPlaylistId, track_id: &str, fingerprint: String) {
+        let Some(state) = self.state_by_pair.get_mut(host) else {
+            return;
+        };
+        state.record_modified(track_id, fingerprint);
     }
 
     fn apply_removed(&mut self, delta: &SyncDelta) {
@@ -293,12 +370,25 @@ fn stage_for(delta: &SyncDelta) -> SyncStage {
     }
 }
 
-// `SyncConflictResolution` is exposed at the module root and re-exported
-// here so a future method that consults it does not need a separate
-// import. It is currently unreferenced; the warning suppression keeps the
-// unused-import check quiet.
-#[allow(dead_code)]
-fn _conflict_strategy_marker(_: SyncConflictResolution) {}
+/// The planner-validated fingerprint and device-relative path for a
+/// write delta. Write deltas always carry both; the executor records
+/// exactly what the planner computed instead of deriving its own values.
+fn write_details(delta: &SyncDelta) -> Option<(String, String)> {
+    match &delta.kind {
+        SyncDeltaKind::New {
+            fingerprint,
+            device_relative_path,
+        }
+        | SyncDeltaKind::Modified {
+            fingerprint,
+            device_relative_path,
+        } => Some((
+            fingerprint.clone(),
+            device_relative_path.to_string_lossy().into_owned(),
+        )),
+        _ => None,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -354,7 +444,7 @@ mod tests {
         let mut policies = BTreeMap::new();
         policies.insert(host("a"), disabled_policy());
         let guard = SyncSessionGuard::attached();
-        let executor = SyncExecutor::new(plan, policies, map, state_by_pair, guard.clone(), 1);
+        let mut executor = SyncExecutor::new(plan, policies, map, state_by_pair, guard.clone(), 1);
         let summary = executor.run();
         assert!(summary.completed);
         let events = guard.snapshot_events();
@@ -376,7 +466,7 @@ mod tests {
         let mut policies = BTreeMap::new();
         policies.insert(host("a"), enabled_policy());
         let guard = SyncSessionGuard::attached();
-        let executor = SyncExecutor::new(plan, policies, map, state_by_pair, guard, 200);
+        let mut executor = SyncExecutor::new(plan, policies, map, state_by_pair, guard, 200);
         let summary = executor.run();
         assert_eq!(summary.skipped_conflicts, 1);
         assert_eq!(summary.removed, 0);
@@ -393,7 +483,7 @@ mod tests {
         policies.insert(host("a"), disabled_policy());
         let guard = SyncSessionGuard::attached();
         guard.mark_detached();
-        let executor = SyncExecutor::new(plan, policies, map, state_by_pair, guard.clone(), 1);
+        let mut executor = SyncExecutor::new(plan, policies, map, state_by_pair, guard.clone(), 1);
         let summary = executor.run();
         assert!(!summary.completed);
         let verdict = super::super::recovery::AttachDetachRecovery::verdict(&guard);
@@ -401,5 +491,211 @@ mod tests {
             verdict,
             super::super::recovery::RecoveryVerdict::Failed { .. }
         ));
+    }
+
+    /// Build an executor for one pair with one policy and one recorded
+    /// state, planning the given host tracks.
+    fn make_executor(
+        tracks: Vec<HostTrackEntry>,
+        state: IncrementalSyncState,
+        policy: SyncPolicy,
+    ) -> SyncExecutor {
+        let pair = make_pair();
+        let mut map = PlaylistMap::new();
+        map.insert(pair.clone()).expect("insert");
+        let mut policies = BTreeMap::new();
+        policies.insert(host("a"), policy);
+        let mut state_by_pair = BTreeMap::new();
+        state_by_pair.insert(host("a"), state.clone());
+        let plan = SyncPlanner::new()
+            .plan(&SyncRequest {
+                pairs: vec![pair],
+                tracks_by_pair: vec![HostTrackSet {
+                    host: host("a"),
+                    tracks,
+                    state: state.clone(),
+                }],
+                state_by_pair: vec![state],
+            })
+            .expect("plan");
+        SyncExecutor::new(
+            plan,
+            policies,
+            map,
+            state_by_pair,
+            SyncSessionGuard::attached(),
+            200,
+        )
+    }
+
+    fn track(id: &str, fingerprint: &str, path: &str, size_bytes: u64) -> HostTrackEntry {
+        HostTrackEntry {
+            track_id: id.into(),
+            fingerprint: fingerprint.into(),
+            device_relative_path: PathBuf::from(path),
+            size_bytes,
+        }
+    }
+
+    #[test]
+    fn executor_records_planner_fingerprint_and_path() {
+        let mut executor = make_executor(
+            vec![track("t1", "fp-new", "Artist/Song.flac", 100)],
+            IncrementalSyncState::new(),
+            enabled_policy(),
+        );
+        let summary = executor.run();
+        assert_eq!(summary.written, 1);
+        assert!(summary.completed);
+        let state = executor.state_by_pair().get(&host("a")).expect("state");
+        let Some(TrackSyncStatus::Synced {
+            fingerprint,
+            device_relative_path,
+            last_synced_at,
+        }) = state.status("t1")
+        else {
+            panic!("expected a synced entry, got {:?}", state.status("t1"));
+        };
+        // The recorded fingerprint is the host's current value, not a
+        // stale or empty one, and the path is the planner-validated one.
+        assert_eq!(fingerprint, "fp-new");
+        assert_eq!(device_relative_path, "Music/Artist/Song.flac");
+        assert_eq!(*last_synced_at, 200);
+    }
+
+    #[test]
+    fn executor_write_makes_next_plan_unchanged() {
+        let track = track("t1", "fp1", "song.flac", 100);
+        let mut executor = make_executor(
+            vec![track.clone()],
+            IncrementalSyncState::new(),
+            enabled_policy(),
+        );
+        executor.run();
+        let recorded = executor.state_by_pair().get(&host("a")).expect("state");
+        // A second plan over the same inputs must now see the track as
+        // unchanged — proof the run recorded the new fingerprint.
+        let plan = SyncPlanner::new()
+            .plan(&SyncRequest {
+                pairs: vec![make_pair()],
+                tracks_by_pair: vec![HostTrackSet {
+                    host: host("a"),
+                    tracks: vec![track],
+                    state: recorded.clone(),
+                }],
+                state_by_pair: vec![recorded.clone()],
+            })
+            .expect("plan");
+        assert_eq!(plan.write_count, 0);
+        assert!(matches!(
+            plan.deltas[0].kind,
+            SyncDeltaKind::Unchanged { .. }
+        ));
+    }
+
+    #[test]
+    fn executor_device_wins_writes_new_and_marks_modified_stale() {
+        let mut state = IncrementalSyncState::new();
+        state.record_synced("t1", "fp1", "Music/song.flac", 100);
+        let device_wins =
+            SyncPolicy::enable(PathBuf::from("Music"), ConflictResolution::DeviceWins)
+                .expect("policy");
+        let mut executor = make_executor(
+            vec![
+                track("t1", "fp2", "song.flac", 100),
+                track("t2", "fp-new", "other.flac", 100),
+            ],
+            state,
+            device_wins,
+        );
+        let summary = executor.run();
+        // The new track writes (no device copy to preserve); the
+        // modified track is declined and the host copy is marked stale.
+        assert_eq!(summary.written, 1);
+        assert_eq!(summary.skipped_conflicts, 1);
+        assert!(summary.completed);
+        let state = executor.state_by_pair().get(&host("a")).expect("state");
+        let Some(TrackSyncStatus::Modified { fingerprint }) = state.status("t1") else {
+            panic!("expected a stale entry, got {:?}", state.status("t1"));
+        };
+        assert_eq!(fingerprint, "fp2");
+        assert!(matches!(
+            state.status("t2"),
+            Some(TrackSyncStatus::Synced { .. })
+        ));
+    }
+
+    #[test]
+    fn executor_skip_strategy_leaves_state_untouched() {
+        let mut state = IncrementalSyncState::new();
+        state.record_synced("t1", "fp1", "Music/song.flac", 100);
+        let skip =
+            SyncPolicy::enable(PathBuf::from("Music"), ConflictResolution::Skip).expect("policy");
+        let mut executor = make_executor(vec![track("t1", "fp2", "song.flac", 100)], state, skip);
+        let summary = executor.run();
+        assert_eq!(summary.written, 0);
+        assert_eq!(summary.skipped_conflicts, 1);
+        assert!(summary.completed);
+        let state = executor.state_by_pair().get(&host("a")).expect("state");
+        assert_eq!(
+            state.status("t1"),
+            Some(&TrackSyncStatus::Synced {
+                fingerprint: "fp1".into(),
+                device_relative_path: "Music/song.flac".into(),
+                last_synced_at: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn executor_fail_strategy_reports_conflict_but_completes() {
+        let mut state = IncrementalSyncState::new();
+        state.record_synced("t1", "fp1", "Music/song.flac", 100);
+        let fail =
+            SyncPolicy::enable(PathBuf::from("Music"), ConflictResolution::Fail).expect("policy");
+        let mut executor = make_executor(vec![track("t1", "fp2", "song.flac", 100)], state, fail);
+        let summary = executor.run();
+        assert_eq!(summary.failed_conflicts, 1);
+        assert_eq!(summary.written, 0);
+        assert!(summary.completed);
+    }
+
+    #[test]
+    fn executor_disabled_policy_never_writes() {
+        let mut executor = make_executor(
+            vec![track("t1", "fp1", "song.flac", 100)],
+            IncrementalSyncState::new(),
+            disabled_policy(),
+        );
+        let summary = executor.run();
+        assert_eq!(summary.written, 0);
+        assert!(summary.completed);
+        let state = executor.state_by_pair().get(&host("a")).expect("state");
+        assert!(state.status("t1").is_none());
+    }
+
+    #[test]
+    fn executor_run_consumes_each_delta_once() {
+        let mut executor = make_executor(
+            vec![track("t1", "fp1", "song.flac", 100)],
+            IncrementalSyncState::new(),
+            enabled_policy(),
+        );
+        let first = executor.run();
+        assert_eq!(first.written, 1);
+        // A second run over the same executor must not replay the
+        // executed deltas.
+        let second = executor.run();
+        assert_eq!(second.written, 0);
+        assert!(second.completed);
+    }
+
+    #[test]
+    fn executor_records_pair_sync_instant_for_opted_in_policy() {
+        let mut executor = make_executor(vec![], IncrementalSyncState::new(), enabled_policy());
+        let summary = executor.run();
+        assert!(summary.completed);
+        let pair = executor.map().get_by_host(&host("a")).expect("pair");
+        assert_eq!(pair.last_synced_at(), Some(200));
     }
 }
