@@ -820,6 +820,7 @@ fn usable_chromecast_control_address(address: &SocketAddr) -> bool {
             let ip = *v4.ip();
             !ip.is_unspecified()
                 && !ip.is_loopback()
+                && !ip.is_link_local()
                 && !ip.is_multicast()
                 && ip != Ipv4Addr::BROADCAST
         }
@@ -1125,6 +1126,7 @@ mod tests {
             &[
                 "0.0.0.0",
                 "127.0.0.1",
+                "169.254.42.1",
                 "224.0.0.1",
                 "255.255.255.255",
                 "192.0.2.45",
@@ -1137,6 +1139,16 @@ mod tests {
         assert!(!usable_chromecast_control_address(
             &"192.0.2.45:0".parse().expect("port-zero endpoint")
         ));
+    }
+
+    #[test]
+    fn chromecast_control_address_rejects_ipv4_link_local_endpoints() {
+        for address in ["169.254.0.1:8009", "169.254.255.254:8009"] {
+            assert!(
+                !usable_chromecast_control_address(&address.parse().expect("IPv4 endpoint")),
+                "IPv4 link-local endpoint {address} must not be published"
+            );
+        }
     }
 
     #[test]

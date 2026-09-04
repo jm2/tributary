@@ -1740,8 +1740,10 @@ mod tests {
         // and that the family matches the target's family, since the bind
         // listener must speak the same family as the receiver it serves.
         let target: SocketAddr = "192.0.2.42:8009".parse().unwrap();
-        let local = routing_aware_lan_bind_address_for_target(target)
-            .expect("host must have a routable LAN IPv4 reachable to 192.0.2.42");
+        let Some(local) = routing_aware_lan_bind_address_for_target(target) else {
+            // Offline and IPv6-only hosts legitimately have no IPv4 route.
+            return;
+        };
         match local {
             IpAddr::V4(v4) => {
                 assert!(
