@@ -718,6 +718,8 @@ impl EqChain {
 #[cfg(test)]
 #[allow(clippy::float_cmp)] // contract-fixed gains (±0.0/0.5-steps) are exact in f64
 mod tests {
+    use std::sync::OnceLock;
+
     use super::*;
 
     // ── Defaults ────────────────────────────────────────────────────
@@ -1002,12 +1004,30 @@ enabled=\"true\"
 
     // ── GStreamer bin structure ─────────────────────────────────────
 
+    /// Reports whether the host provides the plugins the EQ bin needs,
+    /// loading them exactly once per process, single-threaded.
+    ///
+    /// GStreamer loads a plugin's `.so` lazily on first use, and that load
+    /// runs the plugin's `plugin_init`, which registers its GObject types.
+    /// The parallel test harness must therefore keep this first touch off
+    /// the fast path: four threads racing `plugin_init` on a cold registry
+    /// hit duplicate type registration ("cannot register existing type
+    /// 'GstIirEqualizerBand'") and segfault. `OnceLock` funnels the whole
+    /// load into one initializer while every other thread blocks; after it
+    /// completes, element creation is ordinary thread-safe registry access.
+    /// Minimal development hosts may omit gst-plugins-good entirely, in
+    /// which case this reports `false` and the bin tests skip. Packaged
+    /// builds require the plugins, and CI's package jobs exercise that
+    /// contract.
     fn bin_requires_plugins() -> bool {
-        gst::init().is_ok()
-            && gst::ElementFactory::make("equalizer-10bands")
-                .build()
-                .is_ok()
-            && gst::ElementFactory::make("rglimiter").build().is_ok()
+        static EQ_BIN_PLUGINS: OnceLock<bool> = OnceLock::new();
+        *EQ_BIN_PLUGINS.get_or_init(|| {
+            gst::init().is_ok()
+                && gst::ElementFactory::make("equalizer-10bands")
+                    .build()
+                    .is_ok()
+                && gst::ElementFactory::make("rglimiter").build().is_ok()
+        })
     }
 
     #[test]
