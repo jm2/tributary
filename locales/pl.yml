@@ -464,6 +464,8 @@ equalizer:
   preset_custom: "Własny"
   preamp: "Przedwzmacniacz"
   clip_protection: "Ochrona przed przesterowaniem"
+  clip_off: "Wyłączona"
+  clip_soft: "Łagodna"
   reset_flat: "Przywróć płaski"
   reload: "Wczytaj ponownie z dysku"
   band_a11y: "Pasmo korektora %{frequency} herców, regulowane w decybelach"

@@ -462,6 +462,8 @@ equalizer:
   preset_custom: "사용자 지정"
   preamp: "프리앰프"
   clip_protection: "클립 방지"
+  clip_off: "끄기"
+  clip_soft: "소프트"
   reset_flat: "평탄으로 초기화"
   reload: "디스크에서 다시 불러오기"
   band_a11y: "%{frequency}헤르츠 이퀄라이저 밴드, 데시벨 단위로 조절합니다"
