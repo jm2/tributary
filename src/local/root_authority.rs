@@ -13,6 +13,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use uuid::Uuid;
 
@@ -470,6 +471,169 @@ impl MountedRootAuthority {
     pub(crate) fn validate(&self) -> io::Result<()> {
         validate_root_binding(self)
     }
+
+    /// Open and retain one exact accepted descendant as a mutation target.
+    ///
+    /// The descendant must be a real regular file named by strict mount-
+    /// relative components. The retained mount authority, its ancestor chain,
+    /// and the exact file handle stay bound for the target's entire lifetime;
+    /// a commit section revalidates all of them immediately before the atomic
+    /// replacement is allowed to proceed.
+    pub(crate) fn open_mutation_target(
+        self: &Arc<Self>,
+        relative: &Path,
+    ) -> io::Result<MountedMutationTarget> {
+        let bound = self.open_relative_regular_file(relative)?;
+        Ok(MountedMutationTarget {
+            authority: Arc::clone(self),
+            relative_path: bound
+                .path
+                .strip_prefix(&self.root)
+                .map_err(|_| {
+                    invalid_input("mutation target path must descend from its mounted root")
+                })?
+                .to_path_buf(),
+            path: bound.path.clone(),
+            file: Mutex::new(bound),
+        })
+    }
+}
+
+/// Typed retained authority to atomically replace one exact regular file
+/// beneath a live mounted root.
+///
+/// A path alone cannot prove that the file a user selected is still the file
+/// a later write would replace. A [`MountedMutationTarget`] retains the
+/// mounted root authority and the exact accepted file object, serializes its
+/// commit sections, and requires — immediately before each replacement — that
+/// the mount, the retained ancestry, and the exact pathname still name the
+/// file the authority admitted. Any uncertainty fails the commit closed and
+/// leaves the filesystem untouched.
+pub struct MountedMutationTarget {
+    authority: Arc<MountedRootAuthority>,
+    relative_path: PathBuf,
+    path: PathBuf,
+    file: Mutex<BoundFile>,
+}
+
+impl fmt::Debug for MountedMutationTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MountedMutationTarget")
+            .finish_non_exhaustive()
+    }
+}
+
+impl MountedMutationTarget {
+    /// Return the mount-relative pathname this target was admitted under.
+    ///
+    /// The native mount location is deliberately absent: only the mount-
+    /// relative identity the source catalogue published may cross a boundary.
+    pub(crate) fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+
+    /// Return the exact native pathname an authorized replacement renames
+    /// over. This is private machinery for the local tag writer and must not
+    /// be logged or formatted.
+    pub(crate) fn replacement_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Re-bind the retained exact file to the object now admitted at this
+    /// target's accepted mount-relative path.
+    ///
+    /// A successful atomic replacement deliberately retires the object the
+    /// commit section copied from: the pathname names the replacement. A
+    /// follow-up commit (a batch retry, or a second edit) must anchor to that
+    /// exact current object instead of failing against the displaced one.
+    /// Failure here is not a commit failure; the next commit section
+    /// revalidates fail-closed regardless.
+    pub(crate) fn rebind(&self) -> io::Result<()> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("mutation target commit section is unavailable"))?;
+        let rebound = self
+            .authority
+            .open_relative_regular_file(&self.relative_path)?;
+        *file = rebound;
+        Ok(())
+    }
+
+    /// Revalidate the retained mount binding and exact file object.
+    ///
+    /// Every error is a loss of authority. This reopens the mount path and
+    /// compares it against the retained root, boundary, ancestor chain, mount
+    /// generation, and exact file identity; it never falls back to looser
+    /// evidence such as canonical-path equality.
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        let file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("mutation target commit section is unavailable"))?;
+        validate_mounted_bound(self.authority.as_ref(), &file)
+    }
+
+    /// Begin one serialized commit section over this exact target.
+    ///
+    /// The retained mount binding and exact file object are revalidated
+    /// before the section starts and the section holds the target's commit
+    /// lock until the guard is dropped, so overlapping commits observe either
+    /// the pre-commit or post-rebind object — never a mixed one.
+    pub(crate) fn begin_commit(&self) -> io::Result<MountedMutationCommit<'_>> {
+        let file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("mutation target commit section is unavailable"))?;
+        validate_mounted_bound(self.authority.as_ref(), &file)?;
+        Ok(MountedMutationCommit { target: self, file })
+    }
+}
+
+/// One serialized commit section over a [`MountedMutationTarget`].
+pub struct MountedMutationCommit<'a> {
+    target: &'a MountedMutationTarget,
+    file: MutexGuard<'a, BoundFile>,
+}
+
+impl MountedMutationCommit<'_> {
+    /// Clone the exact admitted file object as the mutation's read source.
+    ///
+    /// The clone is taken from the retained handle, never from the pathname,
+    /// so the copied bytes are the bytes the authority admitted even if the
+    /// pathname was disturbed while the section was preparing.
+    pub(crate) fn source_file(&self) -> io::Result<File> {
+        self.file.object.validate_live()?;
+        self.file.object.file.try_clone()
+    }
+
+    /// Prove the replacement target immediately before an atomic rename.
+    ///
+    /// The mounted root is revalidated against its retained identity, and the
+    /// exact pathname must still name the retained object. A file that was
+    /// renamed away, replaced, or removed refuses the replacement: the write
+    /// is authorized for the file the user selected, not for whatever now
+    /// occupies its old name.
+    pub(crate) fn confirm_replacement_target(&self) -> io::Result<()> {
+        self.target.authority.validate()?;
+        self.file.object.validate_live()?;
+        let current = File::open(&self.target.path)?;
+        if object_identity(&current)? != self.file.object.identity {
+            return Err(authority_changed(
+                "mutation target no longer names the retained file",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Verify a mounted bound against its retained mount authority.
+fn validate_mounted_bound(authority: &MountedRootAuthority, bound: &BoundFile) -> io::Result<()> {
+    validate_bound_token(authority, bound.lease_token)?;
+    bound.object.validate_live()?;
+    validate_retained_objects(&bound.parent_guards)?;
+    authority.validate()
 }
 
 impl RootAuthorityLease {
@@ -1642,6 +1806,94 @@ mod tests {
         assert!(bound
             .try_clone_for_mounted_consumption(&second_authority)
             .is_err());
+    }
+
+    #[test]
+    fn mutation_target_retains_the_exact_file_through_a_commit_section() {
+        let directory = TestDirectory::new("mutation-commit");
+        let album = directory.path().join("album");
+        fs::create_dir(&album).expect("create album");
+        fs::write(album.join("song.flac"), b"mounted audio").expect("write song");
+
+        let authority =
+            Arc::new(MountedRootAuthority::acquire(directory.path()).expect("acquire authority"));
+        let target = authority
+            .open_mutation_target(Path::new("album/song.flac"))
+            .expect("open mutation target");
+        assert_eq!(target.relative_path(), Path::new("album/song.flac"));
+        target.validate().expect("validate retained target");
+
+        // The commit section reads from the retained handle — never a path
+        // lookup — and proves the pathname still names the admitted object.
+        let commit = target.begin_commit().expect("begin commit section");
+        let mut source = commit.source_file().expect("clone retained source");
+        let mut contents = Vec::new();
+        source.read_to_end(&mut contents).expect("read source");
+        assert_eq!(contents, b"mounted audio");
+        commit
+            .confirm_replacement_target()
+            .expect("confirm untouched replacement target");
+    }
+
+    #[test]
+    fn mutation_target_refuses_replacement_after_the_path_names_another_file() {
+        let directory = TestDirectory::new("mutation-swap");
+        let song = directory.path().join("song.flac");
+        fs::write(&song, b"original audio").expect("write song");
+
+        let authority =
+            Arc::new(MountedRootAuthority::acquire(directory.path()).expect("acquire authority"));
+        let target = authority
+            .open_mutation_target(Path::new("song.flac"))
+            .expect("open mutation target");
+
+        // Swap the pathname between selection and commit, as an outside
+        // writer could. The retained object stays live and still reads its
+        // admitted bytes, but the pathname no longer names it — so the
+        // commit must refuse rather than replace whatever took its place.
+        let displaced = directory.path().join("displaced.flac");
+        fs::rename(&song, &displaced).expect("displace the admitted file");
+        fs::write(&song, b"replacement audio").expect("install different bytes");
+
+        target.validate().expect("retained object is still live");
+        let commit = target.begin_commit().expect("commit section opens");
+        let mut source = commit.source_file().expect("clone retained source");
+        let mut contents = Vec::new();
+        source.read_to_end(&mut contents).expect("read source");
+        assert_eq!(contents, b"original audio");
+        commit
+            .confirm_replacement_target()
+            .expect_err("the pathname no longer names the admitted file");
+    }
+
+    #[test]
+    fn mutation_target_rebind_anchors_to_the_object_now_at_its_path() {
+        let directory = TestDirectory::new("mutation-rebind");
+        let song = directory.path().join("song.flac");
+        fs::write(&song, b"original audio").expect("write song");
+
+        let authority =
+            Arc::new(MountedRootAuthority::acquire(directory.path()).expect("acquire authority"));
+        let target = authority
+            .open_mutation_target(Path::new("song.flac"))
+            .expect("open mutation target");
+
+        let displaced = directory.path().join("displaced.flac");
+        fs::rename(&song, &displaced).expect("displace the admitted file");
+        fs::write(&song, b"replacement audio").expect("install different bytes");
+
+        // A successful replacement retires the object the section copied
+        // from; rebind anchors the evidence to the object now at the path so
+        // a follow-up commit is authorized for the file that exists now.
+        target.rebind().expect("rebind to the replacement");
+        let commit = target.begin_commit().expect("begin section after rebind");
+        commit
+            .confirm_replacement_target()
+            .expect("the rebound object is the admitted one");
+        let mut source = commit.source_file().expect("clone rebound source");
+        let mut contents = Vec::new();
+        source.read_to_end(&mut contents).expect("read source");
+        assert_eq!(contents, b"replacement audio");
     }
 
     #[cfg(unix)]

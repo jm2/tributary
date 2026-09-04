@@ -16,8 +16,8 @@ use thiserror::Error;
 use crate::architecture::media::MediaLease;
 use crate::db::entities::{library_root, track};
 
-pub use super::root_authority::MountedRootAuthority;
 use super::root_authority::{BoundFile, RootAuthorityLease};
+pub use super::root_authority::{MountedMutationTarget, MountedRootAuthority};
 
 /// A dead or remote filesystem must not leave GTK waiting indefinitely for a
 /// local load decision. SQLite has its own five-second busy timeout; use the

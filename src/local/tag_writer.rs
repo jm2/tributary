@@ -26,6 +26,7 @@
 //! - **The replacement is durable**: the tagged copy is `fsync`ed before the
 //!   rename, so a crash cannot leave a truncated file in place of the original.
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -33,6 +34,8 @@ use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
 use lofty::tag::{Accessor, ItemKey, ItemValue, TagExt, TagItem};
 use uuid::Uuid;
+
+use super::root_authority::MountedMutationTarget;
 
 /// Reserved filename prefix for the private sibling used by atomic tag writes.
 const TAG_WRITE_TEMP_PREFIX: &str = ".tributary-tag-";
@@ -586,68 +589,188 @@ pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
         }
     }
 
-    // Copy the file to an exclusively created sibling, tag the copy, then
-    // atomically rename it back, so a power loss, panic, or full disk
-    // mid-write leaves the original audio file untouched. The cost is one full
-    // file copy per save, which is fine for interactive tag editing.
-    //
-    // `temp` removes itself on every early return below.
-    let mut source = std::fs::File::open(path)
+    let source = std::fs::File::open(path)
         .with_context(|| format!("Failed to open {} for tag writing", path.display()))?;
-    #[cfg(target_os = "windows")]
-    let source_dacl = WindowsDacl::read_from(&source)
-        .with_context(|| format!("Failed to read the Windows DACL of {}", path.display()))?;
+    atomic_tag_replacement(source, path, edits, || Ok(()))
+}
 
-    let (temp, destination) = TempFile::create_beside(path)?;
+/// Write tag edits to one exact file beneath a retained mounted authority.
+///
+/// This is the removable-media form of [`write_tags`]. The read source is the
+/// retained exact file object — never a pathname lookup — and the atomic
+/// replacement is refused unless the mounted root, the retained ancestry, and
+/// the exact pathname still name the file the authority admitted, revalidated
+/// immediately before the rename. Every failure leaves the target untouched.
+/// This is a blocking operation — call from a background thread.
+pub fn write_tags_with_mutation_target(
+    target: &MountedMutationTarget,
+    edits: &TagEdits,
+) -> Result<()> {
+    if edits.is_empty() {
+        return Ok(());
+    }
+
+    // Reject the whole edit before touching the authority. A file must never
+    // be rewritten for an edit we are going to silently discard.
+    edits.validate()?;
+
+    if !supports_tag_writes(target.replacement_path()) {
+        anyhow::bail!(
+            "Unsupported format for tag writing: {}",
+            target
+                .replacement_path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("unknown")
+        );
+    }
+
+    // Open the serialized commit section first: it revalidates the mount,
+    // the retained ancestry, and the exact retained file before any byte is
+    // read, and holds the target's commit lock through the replacement.
+    let commit = target.begin_commit().map_err(|error| {
+        anyhow::anyhow!("The retained mutation authority is no longer valid: {error}")
+    })?;
+    let source = commit
+        .source_file()
+        .with_context(|| "Failed to read the exact retained mutation target".to_string())?;
+    atomic_tag_replacement(source, target.replacement_path(), edits, || {
+        commit
+            .confirm_replacement_target()
+            .context("The exact file to replace changed before the tagged copy was committed")
+    })?;
+
+    // A successful replacement retired the object this section copied from.
+    // Re-anchor the retained evidence to the exact current object so a
+    // follow-up commit (a batch retry, or a second edit) is authorized for
+    // the file that exists now. Failure is advisory: the next commit section
+    // revalidates fail-closed regardless.
+    //
+    // The commit section's guard must be released before rebind: rebind
+    // serializes on the same target lock this section is still holding, and
+    // a std Mutex is not reentrant — relocking it here would deadlock the
+    // writer thread forever.
+    drop(commit);
+    let _ = target.rebind();
+    Ok(())
+}
+
+/// Copy `source` to an exclusively created sibling of `target_path`, tag the
+/// copy, flush it, and atomically rename it over `target_path`.
+///
+/// `confirm_replacement` runs between the flush and the rename and must
+/// prove — for authority-checked callers — that `target_path` still names
+/// the exact file `source` was cloned from. Path-based callers have no
+/// retained identity to compare and pass a no-op; the rename itself is their
+/// point-in-time replacement.
+fn atomic_tag_replacement(
+    source: File,
+    target_path: &Path,
+    edits: &TagEdits,
+    confirm_replacement: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let mut source = source;
     #[cfg(target_os = "windows")]
-    let mut destination = {
-        let security_result = source_dacl.apply_to(&destination).with_context(|| {
-            format!(
-                "Failed to protect the tagged copy of {} with its original Windows DACL",
-                path.display()
-            )
-        });
-        drop(destination);
-        security_result?;
-        temp.reopen_exclusive_for_tagging().with_context(|| {
-            format!(
-                "The original Windows DACL of {} does not permit writing the tagged copy",
-                path.display()
-            )
-        })?
-    };
+    let source_dacl = WindowsDacl::read_from(&source).with_context(|| {
+        format!(
+            "Failed to read the Windows DACL of {}",
+            target_path.display()
+        )
+    })?;
+
+    let (temp, destination) = TempFile::create_beside(target_path)?;
+    #[cfg(target_os = "windows")]
+    let mut destination = open_tag_copy_destination(source_dacl, destination, &temp, target_path)?;
     #[cfg(not(target_os = "windows"))]
     let mut destination = destination;
-    let copy_result = std::io::copy(&mut source, &mut destination)
-        .map(|_| ())
-        .with_context(|| format!("Failed to copy {} for tag writing", path.display()));
+    let copy_result = copy_source_into_destination(&mut source, &mut destination, target_path);
     drop(source);
     drop(destination);
     copy_result?;
 
     write_tags_to(temp.path(), edits)?;
+    flush_and_confirm_tagged_copy(&temp, target_path, confirm_replacement)?;
 
+    temp.persist_to(target_path)?;
+    tracing::debug!("Tags written successfully");
+    Ok(())
+}
+
+/// Protect the tagged copy with the source file's original DACL and reopen it
+/// exclusively for tagging.
+///
+/// Windows attribute inheritance applies at creation: the complete DACL must
+/// be installed before the first copied byte, and installing it can strip the
+/// creation handle's write access, so tagging reopens a fresh exclusive
+/// handle afterwards.
+#[cfg(target_os = "windows")]
+fn open_tag_copy_destination(
+    source_dacl: WindowsDacl,
+    destination: File,
+    temp: &TempFile,
+    target_path: &Path,
+) -> Result<File> {
+    let security_result = source_dacl.apply_to(&destination).with_context(|| {
+        format!(
+            "Failed to protect the tagged copy of {} with its original Windows DACL",
+            target_path.display()
+        )
+    });
+    drop(destination);
+    security_result?;
+    temp.reopen_exclusive_for_tagging().with_context(|| {
+        format!(
+            "The original Windows DACL of {} does not permit writing the tagged copy",
+            target_path.display()
+        )
+    })
+}
+
+/// Copy the source bytes into the tagged copy, reporting but not raising a
+/// copy failure so the caller can release both handles before surfacing it.
+fn copy_source_into_destination(
+    source: &mut File,
+    destination: &mut File,
+    target_path: &Path,
+) -> Result<()> {
+    std::io::copy(source, destination)
+        .map(|_| ())
+        .with_context(|| format!("Failed to copy {} for tag writing", target_path.display()))
+}
+
+/// Flush the tagged copy, carry over the replaced file's Unix permissions,
+/// and run the caller's final replacement gate.
+///
+/// The flush happens *before* the permission copy: replacing a read-only file
+/// would otherwise make the temp read-only too, and a read-only file cannot
+/// be flushed. Windows installs the complete DACL before the first copied
+/// byte; its std Permissions value represents only the DOS read-only
+/// attribute, so the permission carry-over is Unix-only.
+fn flush_and_confirm_tagged_copy(
+    temp: &TempFile,
+    target_path: &Path,
+    confirm_replacement: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     // Flush the tagged copy before it becomes the user's file. Without this a
     // crash between rename and writeback can leave a truncated file where the
     // original used to be.
-    //
-    // This happens *before* the permission copy below: replacing a read-only
-    // file would otherwise make the temp read-only too, and a read-only file
-    // cannot be flushed.
-    flush_to_disk(temp.path())
-        .with_context(|| format!("Failed to flush the tagged copy of {}", path.display()))?;
+    flush_to_disk(temp.path()).with_context(|| {
+        format!(
+            "Failed to flush the tagged copy of {}",
+            target_path.display()
+        )
+    })?;
 
     // Best-effort: match the Unix permissions of the file being replaced.
-    // Windows installs the complete DACL before the first copied byte above;
-    // its std Permissions value represents only the DOS read-only attribute.
     #[cfg(unix)]
-    if let Ok(metadata) = std::fs::metadata(path) {
+    if let Ok(metadata) = std::fs::metadata(target_path) {
         let _ = std::fs::set_permissions(temp.path(), metadata.permissions());
     }
 
-    temp.persist_to(path)?;
-    tracing::debug!("Tags written successfully");
-    Ok(())
+    // Last gate before the replacement becomes visible: an authority-checked
+    // caller refuses here if the pathname no longer names the exact file it
+    // copied from.
+    confirm_replacement()
 }
 
 /// Flush a file's contents to disk.
@@ -1142,6 +1265,96 @@ mod tests {
         assert_eq!(tag.track(), Some(7));
         assert_eq!(tag.disk(), Some(2));
         assert_eq!(tag.comment().as_deref(), Some("Fixture comment"));
+    }
+
+    /// A removable-media write through a retained mutation target must
+    /// succeed exactly like the path-based happy path, and the rebind after
+    /// the atomic rename must authorize a follow-up write through the same
+    /// target object.
+    #[test]
+    fn a_mutation_target_write_round_trips_and_reanchors_for_a_follow_up() {
+        let directory = TestDirectory::new("mutation-write");
+        let track = directory.audio_file(
+            "silence.flac",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        );
+        let authority = std::sync::Arc::new(
+            crate::local::root_authority::MountedRootAuthority::acquire(&directory.path)
+                .expect("acquire mounted authority"),
+        );
+        let target = authority
+            .open_mutation_target(Path::new("silence.flac"))
+            .expect("open mutation target");
+
+        write_tags_with_mutation_target(&target, &year("2026"))
+            .expect("write through the retained authority");
+        assert!(
+            directory.temp_files().is_empty(),
+            "a successful write must not leave its sibling temp file behind"
+        );
+
+        // The replacement retired the copied-from object; the rebind in the
+        // write must have re-anchored the target, so a second edit through
+        // the same retained authority is still authorized.
+        write_tags_with_mutation_target(&target, &year("2027"))
+            .expect("follow-up write after the re-anchor");
+
+        let tagged_file = lofty::read_from_path(&track).expect("reopen tagged FLAC");
+        let tag = tagged_file
+            .primary_tag()
+            .expect("tagged FLAC must have a primary tag");
+        assert_eq!(tag.get_string(ItemKey::Year), Some("2027"));
+    }
+
+    /// The bug this authority exists for: if the pathname is swapped between
+    /// selection and commit, the write must fail closed — the swap stays
+    /// untouched, the admitted file keeps its exact bytes, and no private
+    /// sibling is left behind.
+    #[test]
+    fn a_mutation_target_write_refuses_a_swapped_file_and_leaves_both_untouched() {
+        let directory = TestDirectory::new("mutation-refuse");
+        let track = directory.audio_file(
+            "silence.flac",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        );
+        let original = std::fs::read(&track).expect("read fixture bytes");
+
+        let authority = std::sync::Arc::new(
+            crate::local::root_authority::MountedRootAuthority::acquire(&directory.path)
+                .expect("acquire mounted authority"),
+        );
+        let target = authority
+            .open_mutation_target(Path::new("silence.flac"))
+            .expect("open mutation target");
+
+        // Swap the pathname after the authority admitted the exact file.
+        let displaced = directory.path.join("displaced.flac");
+        std::fs::rename(&track, &displaced).expect("displace the admitted file");
+        std::fs::write(&track, b"not the admitted file").expect("install different bytes");
+
+        write_tags_with_mutation_target(&target, &year("2026"))
+            .expect_err("the pathname no longer names the admitted file; the commit must refuse");
+
+        assert_eq!(
+            std::fs::read(&track).expect("read swapped path back"),
+            b"not the admitted file",
+            "the refused write must not replace whatever took the name"
+        );
+        assert_eq!(
+            std::fs::read(&displaced).expect("read displaced file back"),
+            original,
+            "the admitted file must be byte-for-byte untouched"
+        );
+        assert!(
+            directory.temp_files().is_empty(),
+            "a refused commit leaves no private sibling behind"
+        );
     }
 
     #[test]

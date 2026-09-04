@@ -22,7 +22,7 @@ use crate::source_lifecycle::{
     AdapterCloseFuture, AdapterStream, CancellationObserver, CloseAuthority, LifecycleAdapter,
 };
 use crate::source_registry::{
-    CatalogueFuture, ManagedSourceAdapter, PlaybackAttributionCapability,
+    CatalogueFuture, ManagedSourceAdapter, MutationTargetFuture, PlaybackAttributionCapability,
     PlaybackAttributionProfile, StreamFuture,
 };
 
@@ -231,6 +231,28 @@ impl ManagedSourceAdapter for RemovableMediaAdapter {
                 .map_err(|_| resolution_failed())?
                 .map(AdapterStream::File)
                 .map_err(|_| resolution_failed())
+        })
+    }
+
+    fn resolve_mutation_target(self: Arc<Self>, track_id: TrackId) -> MutationTargetFuture {
+        Box::pin(async move {
+            // The same exact-membership gate as stream resolution: only an
+            // identity the accepted scan admitted may become a write target,
+            // and only through this session's retained mount authority.
+            if !self.accepted_track_ids.contains(&track_id) {
+                return Err(resolution_failed());
+            }
+            let relative_path = track_id
+                .removable_relative_path()
+                .map_err(|_| resolution_failed())?;
+            let authority = Arc::clone(&self.authority);
+            let task = self.runtime.spawn_blocking(move || {
+                authority
+                    .open_mutation_target(&relative_path)
+                    .map_err(|_| resolution_failed())
+            });
+
+            task.await.map_err(|_| resolution_failed())?
         })
     }
 }

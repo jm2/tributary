@@ -10,6 +10,7 @@ use gtk::glib;
 use std::rc::Rc;
 
 use super::objects::{SourceObject, TrackObject};
+use super::properties_dialog::SaveTarget;
 use super::window_state::WindowState;
 use crate::architecture::{MediaKey, SourceId, TrackId};
 use crate::local::playlist_manager::{PlaylistEntryAddOutcome, PlaylistEntryInput};
@@ -363,10 +364,10 @@ pub fn setup_context_menu(state: &WindowState) {
             build_properties_action(
                 &menu,
                 &action_group,
-                cv,
                 &sm,
                 &popup_plan.selection,
                 automatic_device,
+                &mutation_context,
             );
 
             if menu.n_items() == 0 {
@@ -809,16 +810,26 @@ fn exact_playlist_entry_ids(
 fn build_properties_action(
     menu: &gtk::gio::Menu,
     action_group: &gtk::gio::SimpleActionGroup,
-    column_view: &gtk::ColumnView,
     sm: &gtk::SortListModel,
     selection: &SelectionSnapshot,
     automatic_device: bool,
+    mutation_context: &PlaylistMutationContext,
 ) {
+    // The one removable source that can own rows of this view, if the active
+    // view is a removable device. Opaque logical GIO keys and mount-path
+    // spellings are not navigation identities, so the sidebar's exact
+    // SourceId decides — the same match `active_source_is_automatic_device`
+    // uses.
+    let active_source_key = mutation_context.active_source_key.borrow().clone();
+    let removable_source =
+        active_removable_source(&mutation_context.sidebar_store, &active_source_key);
+
     // Snapshot the exact selection while building the menu. Properties is an
-    // all-or-none path-authorized local-file operation: silently dropping a
-    // malformed, remote, or pathless lifecycle row would let a batch edit
-    // only an unexpected subset. Removable rows deliberately remain absent
-    // until a typed mutation target can revalidate their exact live epoch.
+    // all-or-none operation: silently dropping a malformed, remote, or
+    // pathless lifecycle row would let a batch edit only an unexpected
+    // subset. Local rows snapshot their validated native path; rows of the
+    // active removable device snapshot their exact source-scoped identity
+    // for resolution through the live session when the action fires.
     let mut track_infos = Vec::new();
     for &position in &selection.positions {
         let Some(item) = sm.item(position) else {
@@ -827,11 +838,11 @@ fn build_properties_action(
         let Some(track) = item.downcast_ref::<TrackObject>() else {
             return;
         };
-        let Some(path) = local_file_path(&track.uri()) else {
+        let Some(target) = properties_save_target(track, removable_source) else {
             return;
         };
         track_infos.push(super::properties_dialog::TrackInfo {
-            path,
+            target,
             title: track.title(),
             artist: track.artist(),
             album: track.album(),
@@ -859,21 +870,99 @@ fn build_properties_action(
     }
 
     let props_action = gtk::gio::SimpleAction::new("properties", None);
-    let win_for_props: Option<adw::ApplicationWindow> = column_view
+    let win_for_props: Option<adw::ApplicationWindow> = mutation_context
+        .column_view
         .root()
         .and_then(|root| root.downcast::<adw::ApplicationWindow>().ok());
     tracing::debug!(
         has_win = win_for_props.is_some(),
         track_count = track_infos.len(),
+        removable = removable_source.is_some(),
         "build_properties_action"
     );
+    let registry_for_props = mutation_context.source_registry.clone();
+    let rt_handle_for_props = mutation_context.rt_handle.clone();
 
     props_action.connect_activate(move |_, _| {
         let Some(ref win) = win_for_props else {
             tracing::warn!("properties action: win_for_props is None, cannot show dialog");
             return;
         };
-        super::properties_dialog::show_properties_dialog(win, &track_infos, automatic_device);
+        if track_infos
+            .iter()
+            .all(|info| matches!(info.target, SaveTarget::LocalPath(_)))
+        {
+            super::properties_dialog::show_properties_dialog(win, &track_infos, automatic_device);
+            return;
+        }
+
+        // Exchange every distinct pending removable identity for a retained
+        // mutation authority through its exact live session. The action is
+        // all-or-none: one unavailable device, retired session, or changed
+        // epoch cancels the dialog entirely rather than editing a subset,
+        // and a native mount location is never surfaced.
+        let pending = distinct_pending_mutations(&track_infos);
+        let registry = registry_for_props.clone();
+        let rt_handle = rt_handle_for_props.clone();
+        let win = win.clone();
+        let track_infos_for_resolve = track_infos.clone();
+        let (tx, rx) = async_channel::bounded::<
+            Option<
+                std::collections::HashMap<String, crate::source_registry::RemovableMutationTarget>,
+            >,
+        >(1);
+        rt_handle.spawn(async move {
+            let mut resolved = std::collections::HashMap::new();
+            for mutation in &pending {
+                match registry
+                    .resolve_mutation_target(
+                        mutation.source_id,
+                        mutation.session_epoch,
+                        mutation.track_id.clone(),
+                    )
+                    .await
+                {
+                    Ok(target) => {
+                        resolved.insert(mutation.track_id.as_str().to_owned(), target);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            source = %mutation.source_id,
+                            track = mutation.track_id.as_str(),
+                            "removable properties resolution failed; skipping dialog"
+                        );
+                        let _ = tx.send_blocking(None);
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send_blocking(Some(resolved));
+        });
+        glib::MainContext::default().spawn_local(async move {
+            let Ok(Some(resolved)) = rx.recv().await else {
+                return;
+            };
+            let mut infos = track_infos_for_resolve;
+            for info in &mut infos {
+                if let SaveTarget::PendingRemovable(pending) = &info.target {
+                    if let Some(target) = resolved.get(pending.track_id.as_str()) {
+                        info.target = SaveTarget::Removable(target.clone());
+                    }
+                }
+            }
+            if infos
+                .iter()
+                .any(|info| matches!(info.target, SaveTarget::PendingRemovable(_)))
+            {
+                // Unreachable: every pending identity in `infos` came from
+                // the same resolved set. A retry-resolution must be exact,
+                // never partial.
+                tracing::warn!("removable properties resolution left an identity unresolved");
+                return;
+            }
+            super::properties_dialog::show_properties_dialog(&win, &infos, automatic_device);
+        });
     });
 
     action_group.add_action(&props_action);
@@ -903,6 +992,77 @@ fn local_file_path(uri: &str) -> Option<std::path::PathBuf> {
     (url.scheme() == "file")
         .then(|| url.to_file_path().ok())
         .flatten()
+}
+
+/// The removable source that owns the active view, if any.
+///
+/// Mirrors `active_source_is_automatic_device`: an opaque logical GIO key or
+/// mount-path spelling is not a navigation identity, so the sidebar's exact
+/// SourceId for the active key decides.
+fn active_removable_source(
+    sidebar_store: &gtk::gio::ListStore,
+    active_source_key: &str,
+) -> Option<SourceId> {
+    (0..sidebar_store.n_items())
+        .filter_map(|position| sidebar_store.item(position).and_downcast::<SourceObject>())
+        .find(|source| {
+            source.backend_type() == "usb-device"
+                && source
+                    .source_id()
+                    .is_some_and(|source_id| source_id.to_string() == active_source_key)
+        })
+        .and_then(|source| source.source_id())
+}
+
+/// The exact save target one selected row will be written through.
+///
+/// `None` means the row cannot be authorized for a Properties edit at all;
+/// the whole action is dropped rather than editing an unexpected subset.
+fn properties_save_target(
+    track: &TrackObject,
+    removable_source: Option<SourceId>,
+) -> Option<super::properties_dialog::SaveTarget> {
+    match removable_source {
+        Some(source_id) if track.source_id() == Some(source_id) => {
+            // A removable row is pathless by design: its edit authorization
+            // is the exact source-scoped identity, exchanged for a retained
+            // mutation authority through the live session when the action
+            // fires. A row without a session epoch is a wiring fault and
+            // aborts the whole selection.
+            let track_id = TrackId::new(track.track_id()).ok()?;
+            Some(SaveTarget::PendingRemovable(
+                super::properties_dialog::PendingRemovableMutation {
+                    source_id,
+                    session_epoch: track.source_session_epoch()?,
+                    track_id,
+                },
+            ))
+        }
+        _ => {
+            // Every other view remains a path-authorized local-file edit.
+            let path = local_file_path(&track.uri())?;
+            Some(SaveTarget::LocalPath(path))
+        }
+    }
+}
+
+/// One pending mutation per distinct removable identity, in selection order.
+///
+/// Repeated playlist rows may refer to the same removable file; resolving
+/// the identity twice would retain two authorities over one exact object.
+fn distinct_pending_mutations(
+    track_infos: &[super::properties_dialog::TrackInfo],
+) -> Vec<super::properties_dialog::PendingRemovableMutation> {
+    let mut seen = std::collections::HashSet::new();
+    let mut pending = Vec::new();
+    for info in track_infos {
+        if let SaveTarget::PendingRemovable(mutation) = &info.target {
+            if seen.insert(mutation.track_id.as_str().to_owned()) {
+                pending.push(mutation.clone());
+            }
+        }
+    }
+    pending
 }
 
 /// Match the active lifecycle source against exact sidebar metadata. Opaque

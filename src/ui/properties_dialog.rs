@@ -27,12 +27,91 @@ use crate::local::tag_writer::preflight_tag_write_target_access;
 use crate::local::tag_writer::{
     preflight_tag_write_directory, validate_tag_write_target, TagEdits, TagWritePreflightError,
 };
+use crate::source_registry::RemovableMutationTarget;
+
+/// Exactly what one selected row is saved through.
+#[derive(Clone, Debug)]
+pub enum SaveTarget {
+    /// Validated native path for a local-library track.
+    LocalPath(PathBuf),
+    /// A removable row's identity awaiting resolution through its exact live
+    /// source session. The context menu replaces this with
+    /// [`SaveTarget::Removable`] before the dialog can open; an unresolved
+    /// value never reaches a preflight or a write.
+    PendingRemovable(PendingRemovableMutation),
+    /// Retained mutation authority over one exact removable file.
+    Removable(RemovableMutationTarget),
+}
+
+impl PartialEq for SaveTarget {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::LocalPath(left), Self::LocalPath(right)) => left == right,
+            (Self::PendingRemovable(left), Self::PendingRemovable(right)) => left == right,
+            // Retained authorities are equal when they name the same exact
+            // source-scoped file, never when they merely hold equal evidence.
+            (Self::Removable(left), Self::Removable(right)) => {
+                left.source_id() == right.source_id() && left.track_id() == right.track_id()
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SaveTarget {}
+
+/// The removable identity a dialog save must resolve before it may commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRemovableMutation {
+    pub source_id: crate::architecture::SourceId,
+    pub session_epoch: u64,
+    pub track_id: crate::architecture::TrackId,
+}
+
+/// Deduplication identity for one save target. Repeated playlist rows may
+/// refer to the same file or the same removable identity; each exact target
+/// is probed and written once.
+#[derive(PartialEq, Eq, Hash)]
+enum SaveTargetKey {
+    LocalPath(PathBuf),
+    Removable(crate::architecture::SourceId, String),
+}
+
+fn save_target_key(target: &SaveTarget) -> Option<SaveTargetKey> {
+    match target {
+        SaveTarget::LocalPath(path) => Some(SaveTargetKey::LocalPath(path.clone())),
+        SaveTarget::Removable(authority) => Some(SaveTargetKey::Removable(
+            authority.source_id(),
+            authority.track_id().as_str().to_owned(),
+        )),
+        // An unresolved pending value has no identity to deduplicate and must
+        // never reach the probe or write phase.
+        SaveTarget::PendingRemovable(_) => None,
+    }
+}
+
+/// One exactly-deduplicated save target per distinct file or removable
+/// identity, in selection order.
+fn unique_save_targets(tracks: &[TrackInfo]) -> Vec<SaveTarget> {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+    for track in tracks {
+        let Some(key) = save_target_key(&track.target) else {
+            continue;
+        };
+        if seen.insert(key) {
+            targets.push(track.target.clone());
+        }
+    }
+    targets
+}
 
 /// Information about a track passed into the dialog.
 #[derive(Debug, Clone)]
 pub struct TrackInfo {
-    /// Validated native path for this local track.
-    pub path: PathBuf,
+    /// Exact save target for this row: a validated local path or a retained
+    /// removable mutation authority.
+    pub target: SaveTarget,
     /// Current metadata values (for pre-populating the form).
     pub title: String,
     pub artist: String,
@@ -99,15 +178,6 @@ enum SaveOutcome {
     },
 }
 
-fn unique_track_paths(tracks: &[TrackInfo]) -> Vec<PathBuf> {
-    let mut seen = HashSet::new();
-    tracks
-        .iter()
-        .filter(|track| seen.insert(track.path.clone()))
-        .map(|track| track.path.clone())
-        .collect()
-}
-
 fn merge_preflight_failure(
     current: TagEditingAvailability,
     failure: TagWritePreflightError,
@@ -171,19 +241,51 @@ fn preflight_each_target(
     TagEditingAvailability::Ready
 }
 
+/// The exact local paths in `targets`, preserving selection order, for
+/// path-scoped rehearsal. Removable targets carry no path-scoped mechanics:
+/// their rehearsal is authority-based and already complete at this point.
+fn local_paths_of(targets: &[SaveTarget]) -> Vec<PathBuf> {
+    targets
+        .iter()
+        .filter_map(|target| match target {
+            SaveTarget::LocalPath(path) => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Probe a complete, exact-deduplicated selection on a worker thread.
-fn preflight_paths(paths: &[PathBuf]) -> TagEditingAvailability {
-    if paths.is_empty() {
+///
+/// Local paths are probed per file and per distinct parent directory.
+/// Removable targets revalidate their retained authority and rehearse the
+/// complete atomic replacement beside the exact file in one check, so no
+/// path-based directory rehearsal runs for them.
+fn preflight_save_targets(targets: &[SaveTarget]) -> TagEditingAvailability {
+    if targets.is_empty() {
         return TagEditingAvailability::InvalidFile;
     }
-
-    let validation = paths
+    if targets
         .iter()
-        .fold(
+        .any(|target| matches!(target, SaveTarget::PendingRemovable(_)))
+    {
+        // Unresolved removable identities are a wiring fault: the context
+        // menu must resolve them through their live session first.
+        return TagEditingAvailability::Unavailable;
+    }
+
+    let validation =
+        targets.iter().fold(
             TagEditingAvailability::Ready,
-            |result, path| match validate_tag_write_target(path) {
-                Ok(()) => result,
-                Err(failure) => merge_preflight_failure(result, failure),
+            |result, target| match target {
+                SaveTarget::LocalPath(path) => match validate_tag_write_target(path) {
+                    Ok(()) => result,
+                    Err(failure) => merge_preflight_failure(result, failure),
+                },
+                SaveTarget::Removable(authority) => match authority.preflight_write_capability() {
+                    Ok(()) => result,
+                    Err(failure) => merge_preflight_failure(result, failure),
+                },
+                SaveTarget::PendingRemovable(_) => TagEditingAvailability::Unavailable,
             },
         );
     if validation != TagEditingAvailability::Ready {
@@ -193,18 +295,20 @@ fn preflight_paths(paths: &[PathBuf]) -> TagEditingAvailability {
     #[cfg(target_os = "windows")]
     {
         // Windows DACLs are file-specific even inside one directory. Rehearse
-        // the post-DACL read/write/delete reopen for every exact target before
-        // any Save can begin.
-        let target_access = preflight_each_target(paths, preflight_tag_write_target_access);
+        // the post-DACL read/write/delete reopen for every exact local target
+        // before any Save can begin. Removable targets rehearsed their
+        // complete replacement shape in `preflight_write_capability` above.
+        let target_access =
+            preflight_each_target(&local_paths_of(targets), preflight_tag_write_target_access);
         if target_access != TagEditingAvailability::Ready {
             return target_access;
         }
     }
 
     // Directory mechanics are parent-scoped. Rehearse the flushed atomic
-    // replacement once per exact parent while retaining the per-file checks
-    // above (including Windows read-only attributes).
-    preflight_distinct_parents(paths, preflight_tag_write_directory)
+    // replacement once per exact local parent while retaining the per-file
+    // checks above (including Windows read-only attributes).
+    preflight_distinct_parents(&local_paths_of(targets), preflight_tag_write_directory)
 }
 
 fn apply_tag_editing_availability(
@@ -304,10 +408,16 @@ pub fn show_properties_dialog(
         .margin_bottom(12)
         .build();
 
-    // Repeated playlist entries may refer to the same file. Probe and write
-    // each exact path once while retaining every selected row for batch-field
-    // presentation.
-    let file_paths = unique_track_paths(tracks);
+    // Repeated playlist rows may refer to the same file or the same
+    // removable identity. Probe and write each exact save target once while
+    // retaining every selected row for batch-field presentation.
+    let save_targets = unique_save_targets(tracks);
+    debug_assert!(
+        !tracks
+            .iter()
+            .any(|track| matches!(track.target, SaveTarget::PendingRemovable(_))),
+        "the caller must resolve removable identities before showing the dialog"
+    );
 
     // ── Helper to compute initial value for a field ──────────────────
     let field_value = |getter: fn(&TrackInfo) -> &str| -> String {
@@ -417,9 +527,22 @@ pub fn show_properties_dialog(
         add_info_row(&info_group, "Sample Rate", &t.sample_rate);
         add_info_row(&info_group, "Duration", &t.duration);
 
-        // Show file path
-        if let Some(path) = file_paths.first() {
-            add_info_row(&info_group, "File", &path.to_string_lossy());
+        // Show the native file path only for a local-library target. A
+        // removable row shows its mount-relative identity — the one pathname
+        // that may cross the source boundary; its native mount location
+        // never enters the UI.
+        match save_targets.first() {
+            Some(SaveTarget::LocalPath(path)) => {
+                add_info_row(&info_group, "File", &path.to_string_lossy());
+            }
+            Some(SaveTarget::Removable(authority)) => {
+                add_info_row(
+                    &info_group,
+                    "File",
+                    &authority.relative_path().to_string_lossy(),
+                );
+            }
+            _ => {}
         }
 
         form.append(&info_group);
@@ -581,7 +704,7 @@ pub fn show_properties_dialog(
         .map(|(name, entry)| ((*name).to_string(), entry.clone()))
         .collect();
 
-    let file_paths_for_save = file_paths.clone();
+    let save_targets_for_save = save_targets.clone();
     let entries_for_save_state = entries_for_save.clone();
     let musicbrainz_for_save = musicbrainz_button.clone();
     let capability_for_save = capability_label.clone();
@@ -656,7 +779,7 @@ pub fn show_properties_dialog(
             automatic_device,
         );
 
-        let paths = file_paths_for_save.clone();
+        let targets = save_targets_for_save.clone();
 
         // Re-probe the entire selection before the first write, then track
         // both the files that were written and the ones that failed.
@@ -664,7 +787,7 @@ pub fn show_properties_dialog(
         let edits = edits.clone();
 
         std::thread::spawn(move || {
-            let availability = preflight_paths(&paths);
+            let availability = preflight_save_targets(&targets);
             if availability != TagEditingAvailability::Ready {
                 let _ = tx.send_blocking(SaveOutcome::Blocked(availability));
                 return;
@@ -672,17 +795,40 @@ pub fn show_properties_dialog(
 
             let mut modified = 0usize;
             let mut failed = 0usize;
-            for path in &paths {
-                match crate::local::tag_writer::write_tags(path, &edits) {
+            for target in &targets {
+                // An unresolved pending identity cannot reach the write loop:
+                // the preflight above refuses the whole selection first.
+                let outcome = match target {
+                    SaveTarget::LocalPath(path) => {
+                        crate::local::tag_writer::write_tags(path, &edits)
+                    }
+                    SaveTarget::Removable(authority) => authority.write_tags(&edits),
+                    SaveTarget::PendingRemovable(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                };
+                match outcome {
                     Ok(()) => {
                         modified += 1;
                     }
                     Err(e) => {
-                        warn!(
-                            path = %path.display(),
-                            error = %e,
-                            "Failed to write tags"
-                        );
+                        // Removable failures must never log their native mount
+                        // location; identity is the source-scoped pair.
+                        match target {
+                            SaveTarget::LocalPath(path) => {
+                                warn!(path = %path.display(), error = %e, "Failed to write tags");
+                            }
+                            SaveTarget::Removable(authority) => {
+                                warn!(
+                                    source = %authority.source_id(),
+                                    track = authority.track_id().as_str(),
+                                    error = %e,
+                                    "Failed to write tags to removable target"
+                                );
+                            }
+                            SaveTarget::PendingRemovable(_) => {}
+                        }
                         failed += 1;
                     }
                 }
@@ -690,7 +836,7 @@ pub fn show_properties_dialog(
             let current_availability = if failed == 0 {
                 TagEditingAvailability::Ready
             } else {
-                preflight_paths(&paths)
+                preflight_save_targets(&targets)
             };
             let _ = tx.send_blocking(SaveOutcome::Finished {
                 modified,
@@ -790,9 +936,9 @@ pub fn show_properties_dialog(
     // dialog starts fail-closed and the complete selection is checked on a
     // worker. The result is advisory and is rechecked in the Save worker.
     let (preflight_tx, preflight_rx) = async_channel::bounded(1);
-    let paths_for_preflight = file_paths;
+    let targets_for_preflight = save_targets;
     std::thread::spawn(move || {
-        let _ = preflight_tx.send_blocking(preflight_paths(&paths_for_preflight));
+        let _ = preflight_tx.send_blocking(preflight_save_targets(&targets_for_preflight));
     });
 
     let entries_for_preflight = entries_for_save;
@@ -999,9 +1145,9 @@ fn musicbrainz_lookup(title: &str, artist: &str) -> Option<MusicBrainzResult> {
 mod tests {
     use super::*;
 
-    fn track(path: PathBuf) -> TrackInfo {
+    fn track(target: SaveTarget) -> TrackInfo {
         TrackInfo {
-            path,
+            target,
             title: "Title".to_string(),
             artist: "Artist".to_string(),
             album: "Album".to_string(),
@@ -1017,17 +1163,57 @@ mod tests {
         }
     }
 
+    fn local_track(path: PathBuf) -> TrackInfo {
+        track(SaveTarget::LocalPath(path))
+    }
+
     #[test]
-    fn repeated_playlist_rows_probe_and_write_one_exact_path() {
+    fn repeated_playlist_rows_probe_and_write_one_exact_target() {
         let first = PathBuf::from("/music/album/song.flac");
         let second = PathBuf::from("/music/other.flac");
         let tracks = vec![
-            track(first.clone()),
-            track(first.clone()),
-            track(second.clone()),
+            local_track(first.clone()),
+            local_track(first.clone()),
+            local_track(second.clone()),
         ];
 
-        assert_eq!(unique_track_paths(&tracks), vec![first, second]);
+        assert_eq!(
+            unique_save_targets(&tracks),
+            vec![SaveTarget::LocalPath(first), SaveTarget::LocalPath(second),]
+        );
+    }
+
+    #[test]
+    fn unresolved_removable_identities_never_reach_the_probe_or_write_set() {
+        let pending = PendingRemovableMutation {
+            source_id: crate::architecture::SourceId::local(),
+            session_epoch: 3,
+            track_id: crate::architecture::TrackId::new("unix:616c62756d").expect("track id"),
+        };
+        let local = PathBuf::from("/music/album/song.flac");
+        let tracks = vec![
+            track(SaveTarget::PendingRemovable(pending.clone())),
+            track(SaveTarget::PendingRemovable(pending)),
+            local_track(local.clone()),
+        ];
+
+        // A pending identity has no deduplication identity: it is skipped
+        // entirely rather than silently folded into another row's target.
+        assert_eq!(
+            unique_save_targets(&tracks),
+            vec![SaveTarget::LocalPath(local)]
+        );
+
+        // Defense in depth: the preflight refuses any unresolved identity
+        // that reaches it, so a wiring fault can never authorize a write.
+        assert_eq!(
+            preflight_save_targets(&[SaveTarget::PendingRemovable(PendingRemovableMutation {
+                source_id: crate::architecture::SourceId::local(),
+                session_epoch: 1,
+                track_id: crate::architecture::TrackId::new("unix:01").expect("track id"),
+            })]),
+            TagEditingAvailability::Unavailable
+        );
     }
 
     #[test]
@@ -1128,7 +1314,10 @@ mod tests {
 
     #[test]
     fn empty_and_mixed_preflight_selections_fail_closed() {
-        assert_eq!(preflight_paths(&[]), TagEditingAvailability::InvalidFile);
+        assert_eq!(
+            preflight_save_targets(&[]),
+            TagEditingAvailability::InvalidFile
+        );
 
         let directory = tempfile::tempdir().expect("create preflight fixture");
         let supported = directory.path().join("song.flac");
@@ -1137,7 +1326,10 @@ mod tests {
         std::fs::write(&unsupported, b"audio").expect("write unsupported fixture");
 
         assert_eq!(
-            preflight_paths(&[supported, unsupported]),
+            preflight_save_targets(&[
+                SaveTarget::LocalPath(supported),
+                SaveTarget::LocalPath(unsupported),
+            ]),
             TagEditingAvailability::UnsupportedFormat
         );
         assert!(

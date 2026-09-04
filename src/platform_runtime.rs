@@ -1990,11 +1990,26 @@ Assert-TargetFailure $newlineTarget "target #1 contains an unsupported quote or 
             Err(error) => panic!("could not run {program} PE target regression: {error}"),
         };
 
+        // A managed entry point that never started never ran the script.
+        // Hosted macOS runners have been observed to crash pwsh at startup
+        // under load ("Call to 'procargs' failed with errno 5" followed by a
+        // ManagedPSEntry StartupException, with empty stdout). That is a host
+        // defect this script-level regression cannot observe, so it is the
+        // same class of environmental skip as a missing pwsh above.
+        // Script-level failures always carry script output instead.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !cfg!(target_os = "windows")
+            && output.stdout.is_empty()
+            && stderr.contains("ManagedPSEntry")
+        {
+            return;
+        }
+
         assert!(
             output.status.success(),
             "PowerShell PE target regression failed:\nstdout: {}\nstderr: {}",
             String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            stderr
         );
     }
 

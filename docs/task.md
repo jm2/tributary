@@ -1163,9 +1163,12 @@ affected-hardware evidence. P2.1 remains the feature focus at **15/39 (38.5%)**.
 
 ### P3.3 — Authority and queue extensions
 
-- [ ] Add typed retained mutation authority before enabling Properties/tag writes for pathless
+- [x] Add typed retained mutation authority before enabling Properties/tag writes for pathless
   removable rows; revalidate the mount, ancestry, exact file, write rights, and replacement target
-  through commit.
+  through commit. `MountedRootAuthority::open_mutation_target` binds the mount, ancestry, and exact
+  accepted file into a retained target whose commit sections revalidate everything before any byte
+  moves, and removable Properties edits flow through it — so a remount, rename, or swapped file
+  fails closed instead of retargeting the overwrite.
 - [ ] If product-approved, turn multi-file OS-open deliveries into an occurrence-preserving
   ephemeral queue; keep the current first-valid-file behavior documented until then.
 
