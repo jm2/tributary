@@ -573,19 +573,51 @@ impl BrowserRow {
     }
 }
 
-fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
-    let header = gtk::Label::builder()
-        .label(title)
-        .css_classes(["heading"])
-        .halign(gtk::Align::Start)
-        .margin_start(8)
-        .margin_top(4)
-        .margin_bottom(2)
-        .build();
+/// Bind one browser row to its item: populate the visible texts and
+/// publish the combined accessible label on the [`gtk::ListItem`].
+///
+/// The label and parenthesized count are combined into a single
+/// utterance ("Artist Name, (123)") and exposed on the GtkListItem
+/// itself — the list-row boundary assistive technology actually
+/// navigates — via the dedicated GtkListItem:accessible-label property
+/// (GTK 4.12), which GTK uses as the row's accessible name. The child
+/// labels are marked Presentation in setup so they are not announced
+/// individually.
+///
+/// Split out from the factory closure so tests can drive the exact
+/// production bind on a standalone `GtkListItem` (`ListItem:item` is
+/// read-only and set by the ListView, so a factory-driven bind cannot
+/// be exercised outside a realized list).
+fn bind_browser_row(list_item: &gtk::ListItem, item: &BrowserItem) {
+    let row = list_item
+        .child()
+        .and_downcast::<BrowserRow>()
+        .expect("BrowserRow attached in setup");
+    let count_text = format!("({})", item.count());
+    row.label().set_text(&item.label());
+    row.count().set_text(&count_text);
+    let accessible = format!("{}, {}", item.label(), count_text);
+    list_item.set_accessible_label(&accessible);
+}
 
-    let selection = gtk::SingleSelection::new(Some(store.clone()));
-    selection.set_autoselect(true);
+/// Unbind one browser row: reset the row's accessible name so a
+/// recycled list item never announces a stale label while waiting for
+/// its next bind, and clear the visible texts.
+fn unbind_browser_row(list_item: &gtk::ListItem) {
+    list_item.set_accessible_label("");
+    let Some(row) = list_item.child().and_downcast::<BrowserRow>() else {
+        return;
+    };
+    row.label().set_text("");
+    row.count().set_text("");
+}
 
+/// Row factory shared by every browser pane: each [`gtk::ListItem`]
+/// hosts a [`BrowserRow`], and bind / unbind keep the visible texts and
+/// the combined accessible label in sync with the item. Exposed as a
+/// function so tests can drive the setup / bind / unbind contract
+/// directly on a standalone [`gtk::ListItem`].
+fn browser_row_factory() -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
 
     factory.connect_setup(|_, list_item| {
@@ -602,31 +634,31 @@ fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
             .item()
             .and_downcast::<BrowserItem>()
             .expect("BrowserItem");
-        let row = list_item
-            .child()
-            .and_downcast::<BrowserRow>()
-            .expect("BrowserRow attached in setup");
-        let count_text = format!("({})", item.count());
-        row.label().set_text(&item.label());
-        row.count().set_text(&count_text);
-        // Combine the label and parenthesized count into a single
-        // accessible label so a screen reader announces the row as one
-        // utterance ("Artist Name, 123") rather than two adjacent
-        // separate labels. The child labels are marked Presentation in
-        // setup so they are not announced individually.
-        let accessible = format!("{}, {}", item.label(), count_text);
-        row.update_property(&[gtk::accessible::Property::Label(&accessible)]);
+        bind_browser_row(list_item, &item);
     });
 
     factory.connect_unbind(|_, list_item| {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
-        let Some(row) = list_item.child().and_downcast::<BrowserRow>() else {
-            return;
-        };
-        row.label().set_text("");
-        row.count().set_text("");
-        row.reset_property(gtk::AccessibleProperty::Label);
+        unbind_browser_row(list_item);
     });
+
+    factory
+}
+
+fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
+    let header = gtk::Label::builder()
+        .label(title)
+        .css_classes(["heading"])
+        .halign(gtk::Align::Start)
+        .margin_start(8)
+        .margin_top(4)
+        .margin_bottom(2)
+        .build();
+
+    let selection = gtk::SingleSelection::new(Some(store.clone()));
+    selection.set_autoselect(true);
+
+    let factory = browser_row_factory();
 
     let list_view = gtk::ListView::builder()
         .model(&selection)
@@ -992,4 +1024,90 @@ fn get_store_from_pane(pane: &gtk::Box) -> Option<gio::ListStore> {
     selection
         .model()
         .and_then(|m| m.downcast::<gio::ListStore>().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The combined row label ("Label, (Count)") must be exposed on the
+    /// `GtkListItem` — the list-row boundary assistive technology
+    /// actually navigates — not on an inner widget, and the child labels
+    /// must be presentational so the row is announced as a single
+    /// utterance ("Artist Name, (123)").
+    ///
+    /// This drives the real factory setup signal, then the exact
+    /// production bind / unbind helpers on a standalone `GtkListItem`,
+    /// and asserts on the `GtkListItem:accessible-label` property
+    /// (GTK 4.12), which GTK uses as the row's accessible name — the
+    /// widget-level equivalent of an Orca row-announcement smoke test.
+    /// (`ListItem:item` is read-only and set by the ListView, so the
+    /// bind closure itself cannot be exercised outside a realized
+    /// list; `bind_browser_row` / `unbind_browser_row` are the exact
+    /// functions the closure calls.)
+    ///
+    /// Headless CI (cargo test in a container with no X/Wayland socket)
+    /// cannot initialize GTK, so the test gates on `gtk::init()`'s
+    /// non-panicking result and skips with a printed reason. macOS is
+    /// excluded because GTK's Quartz backend panics when initialized
+    /// from the test harness worker thread. The contract still holds on
+    /// any machine with a display (or a Broadway headless server) — run
+    /// there to exercise it.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn browser_row_accessible_label_exposed_on_list_item_boundary() {
+        if let Err(e) = gtk::init() {
+            eprintln!(
+                "browser_row_accessible_label_exposed_on_list_item_boundary: \
+                 GTK unavailable ({e}); skipping. Re-run on a box with a display \
+                 session (or under a Broadway headless server) to exercise the \
+                 contract."
+            );
+            return;
+        }
+
+        let factory = browser_row_factory();
+        let list_item: gtk::ListItem = glib::Object::new();
+
+        // Setup attaches the BrowserRow; its child labels must be
+        // presentational so they are not announced individually.
+        factory.emit_by_name::<()>("setup", &[&list_item]);
+        let row = list_item
+            .child()
+            .and_downcast::<BrowserRow>()
+            .expect("setup must attach a BrowserRow child");
+        assert_eq!(
+            row.label().accessible_role(),
+            gtk::AccessibleRole::Presentation,
+            "primary label must be presentational"
+        );
+        assert_eq!(
+            row.count().accessible_role(),
+            gtk::AccessibleRole::Presentation,
+            "count label must be presentational"
+        );
+
+        // Bind must publish the combined utterance on the GtkListItem
+        // itself — the row boundary — and populate the visible texts.
+        let item = BrowserItem::new("Miles Davis", 12);
+        bind_browser_row(&list_item, &item);
+        assert_eq!(
+            list_item.accessible_label(),
+            "Miles Davis, (12)",
+            "combined accessible label must be set on the GtkListItem boundary"
+        );
+        assert_eq!(row.label().text(), "Miles Davis");
+        assert_eq!(row.count().text(), "(12)");
+
+        // Unbind must clear the accessible name and visible texts so a
+        // recycled list item never announces a stale label.
+        unbind_browser_row(&list_item);
+        assert_eq!(
+            list_item.accessible_label(),
+            "",
+            "unbind must reset the accessible label"
+        );
+        assert_eq!(row.label().text(), "");
+        assert_eq!(row.count().text(), "");
+    }
 }
