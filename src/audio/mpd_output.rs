@@ -127,15 +127,6 @@ pub fn control_plan(exclusive_control: bool, detection_enabled: bool) -> MpdCont
     }
 }
 
-/// Whether `plan` currently authorises an authority-requiring command
-/// (loads, playback controls, orphan cleanup), given the supervisor's
-/// current `lapsed` state. The user's explicit `Exclusive` confirmation is
-/// the only grant; a supervised output whose supervisor has lapsed refuses
-/// until explicit reconfirmation.
-fn authority_allowed(plan: MpdControlPlan, lapsed: bool) -> bool {
-    plan.mode == MpdControlMode::Exclusive && !lapsed
-}
-
 /// Lifecycle of the revoke-only foreign-controller supervisor for a
 /// supervised `Exclusive` output. The supervisor NEVER grants authority —
 /// the user's explicit `Exclusive` confirmation is the only grant — and a
@@ -188,7 +179,12 @@ impl SupervisionState {
     fn new() -> Self {
         Self {
             phase: SupervisionPhase::Armed,
-            last_observation: None,
+            // The construction instant is the fresh explicit user
+            // confirmation that armed this supervisor: re-selecting the
+            // output IS the reconfirmation, so authority starts live and
+            // stays live only while clean observations keep it within
+            // [`MAX_SUPERVISION_GAP`].
+            last_observation: Some(Instant::now()),
         }
     }
 
@@ -209,6 +205,46 @@ impl SupervisionState {
 
     fn is_lapsed(&self) -> bool {
         self.phase == SupervisionPhase::Lapsed
+    }
+
+    /// The eager authority gate: whether this supervisor authorises an
+    /// authority-requiring action RIGHT NOW — `Armed` with a clean
+    /// observation (or the construction-time confirmation) no older than
+    /// [`MAX_SUPERVISION_GAP`]. An armed supervisor whose evidence has gone
+    /// stale lapses permanently — the unsupervised window is itself
+    /// disqualifying evidence — and returns `false`. Authority-requiring
+    /// paths call this BEFORE acting instead of waiting for the next status
+    /// poll to observe the gap, so a stale confirmation can never exercise
+    /// or renew itself.
+    fn authority_current(&mut self, now: Instant) -> bool {
+        if self.phase == SupervisionPhase::Lapsed {
+            return false;
+        }
+        if observation_gap_exceeded(self.last_observation, now) {
+            self.lapse();
+            return false;
+        }
+        true
+    }
+}
+
+/// Whether `plan` currently authorises an authority-requiring command
+/// (loads, playback controls, orphan cleanup). The user's explicit
+/// `Exclusive` confirmation is the only grant; an unsupervised `Exclusive`
+/// output proceeds on that confirmation alone, while a supervised output is
+/// authorised only while its supervisor is armed AND fresh — the eager
+/// [`SupervisionState::authority_current`] check, not the result of the
+/// last poll.
+fn supervision_authorizes(plan: MpdControlPlan, supervision: &Mutex<SupervisionState>) -> bool {
+    match plan.mode {
+        MpdControlMode::Unconfirmed => false,
+        MpdControlMode::Exclusive if !plan.supervised => true,
+        MpdControlMode::Exclusive => {
+            let mut supervisor = supervision
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            supervisor.authority_current(Instant::now())
+        }
     }
 }
 
@@ -1006,16 +1042,20 @@ struct MpdStatus {
     /// `false` means `repeat 0`, the value Tributary enforces on every load.
     /// A true value means another controller flipped the option without our
     /// knowledge, which lapses the supervisor and forces retention on
-    /// cleanup.
+    /// cleanup. Required in every status reply: an omission fails the poll
+    /// rather than reading as `false`.
     repeat: bool,
     /// `random` option as observed by the partition-wide status command.
     /// Tributary enforces `random 0` so a true value is a foreign mutation.
+    /// Required in every status reply.
     random: bool,
     /// `single` option as observed by the partition-wide status command.
     /// Tributary enforces `single 0` so a true value is a foreign mutation.
+    /// Required in every status reply.
     single: bool,
     /// `consume` option as observed by the partition-wide status command.
     /// Tributary enforces `consume 0` so a true value is a foreign mutation.
+    /// Required in every status reply.
     consume: bool,
 }
 
@@ -1493,16 +1533,26 @@ impl RawStatus {
         {
             return Err(MpdFailure::new("status poll"));
         }
+        // The four partition-wide options are REQUIRED observations: a
+        // status reply that omits any of them is incomplete evidence about
+        // the partition, and defaulting an omission to `false` would let a
+        // truncated, tampered, or foreign-shaped response read as a clean
+        // poll. Fail the poll instead — the supervisor's freshness window
+        // then revokes authority if complete evidence does not resume.
+        let repeat = self.repeat.ok_or_else(|| MpdFailure::new("status poll"))?;
+        let random = self.random.ok_or_else(|| MpdFailure::new("status poll"))?;
+        let single = self.single.ok_or_else(|| MpdFailure::new("status poll"))?;
+        let consume = self.consume.ok_or_else(|| MpdFailure::new("status poll"))?;
         Ok(MpdStatus {
             state,
             song_id: self.song_id,
             position_ms: self.elapsed_ms.or(self.fallback_elapsed_ms),
             duration_ms: self.duration_ms.or(self.fallback_duration_ms).unwrap_or(0),
             has_error: self.has_error,
-            repeat: self.repeat.unwrap_or(false),
-            random: self.random.unwrap_or(false),
-            single: self.single.unwrap_or(false),
-            consume: self.consume.unwrap_or(false),
+            repeat,
+            random,
+            single,
+            consume,
         })
     }
 }
@@ -2067,26 +2117,23 @@ fn run_mpd_worker<C>(
                 // playback controls — before any connection, MPD, or proxy
                 // action. This precedes cleanup as well. The user's explicit
                 // `Exclusive` confirmation is the only grant; a supervised
-                // output whose supervisor has lapsed refuses every
-                // authority-requiring command with the
+                // output whose supervisor has lapsed — or whose supervision
+                // evidence has gone stale, checked eagerly here rather than
+                // waiting for the next poll to observe the gap — refuses
+                // every authority-requiring command with the
                 // exclusive-control-required error until the user
                 // reconfirms by re-selecting the output. Quiet polling
                 // never re-arms the supervisor.
-                if command.kind.requires_authority() {
-                    let lapsed = supervision
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        .is_lapsed();
-                    if !authority_allowed(plan, lapsed) {
-                        fail_current(
-                            command.owner,
-                            MpdFailure::exclusive_control_required(),
-                            &intent_epoch,
-                            &cache,
-                            &event_tx,
-                        );
-                        continue;
-                    }
+                if command.kind.requires_authority() && !supervision_authorizes(plan, &supervision)
+                {
+                    fail_current(
+                        command.owner,
+                        MpdFailure::exclusive_control_required(),
+                        &intent_epoch,
+                        &cache,
+                        &event_tx,
+                    );
+                    continue;
                 }
                 let poll_after = match command.kind {
                     CommandKind::Load { uri } => {
@@ -3342,13 +3389,11 @@ where
     // whose supervisor has lapsed — foreign current song, partition-option
     // drift, or an observation gap — also retains: stale confirmation must
     // never authorise cleanup, and only an explicit user reconfirmation
-    // restores the authority. Unsupervised `Exclusive` proceeds on the
-    // user's confirmation alone.
-    let lapsed = supervision
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .is_lapsed();
-    if !authority_allowed(plan, lapsed) {
+    // restores the authority. The staleness check is eager: a supervised
+    // output whose supervision evidence is older than `MAX_SUPERVISION_GAP`
+    // retains too, without waiting for the next poll. Unsupervised
+    // `Exclusive` proceeds on the user's confirmation alone.
+    if !supervision_authorizes(plan, supervision) {
         return CleanupOutcome::Completed;
     }
     let removed = session.connection.delete_id(song_id, deadline);
@@ -3399,15 +3444,16 @@ fn cleanup_unconditionally<C>(
             Err(failure) => failure.connection_usable,
         };
         // Mirror the cleanup_session gate: only an `Exclusive` output whose
-        // supervisor has not lapsed may issue a targeted delete. The
+        // supervision is armed and fresh may issue a targeted delete. The
         // failure class of the call (shutdown, disconnect) is irrelevant —
-        // the orphan-retention guarantee applies in every cleanup path.
-        let lapsed = supervision
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .is_lapsed();
-        let allowed = authority_allowed(plan, lapsed);
-        if can_delete && allowed {
+        // the orphan-retention guarantee applies in every cleanup path, and
+        // the freshness check is eager: supervision evidence older than
+        // `MAX_SUPERVISION_GAP` retains the orphan instead of awaiting a
+        // poll that will never come during shutdown.
+        if !supervision_authorizes(plan, supervision) {
+            return;
+        }
+        if can_delete {
             let _ = session.connection.delete_id(song_id, deadline);
         }
     }
@@ -3598,20 +3644,17 @@ impl MpdOutput {
         owner
     }
 
-    fn ensure_load_allowed(&self) -> bool {
-        let lapsed = self
-            .supervision
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .is_lapsed();
-        if authority_allowed(self.plan, lapsed) {
+    /// The public authority gate shared by loads AND playback controls.
+    /// Runs BEFORE any local mutation (epoch advance, ticket revocation,
+    /// optimistic state publication) and before the command is enqueued:
+    /// a refused command must leave the output exactly as it was. The
+    /// worker repeats the check as defense in depth for any future or
+    /// internal caller that bypasses this boundary.
+    fn ensure_authority_allowed(&self) -> bool {
+        if supervision_authorizes(self.plan, &self.supervision) {
             return true;
         }
 
-        // Reject at the public output boundary before begin_load can advance
-        // the epoch or publish optimistic Buffering state. The worker repeats
-        // the check as defense in depth for any future/internal caller that
-        // bypasses this boundary.
         fail_current(
             self.current_owner(),
             MpdFailure::exclusive_control_required(),
@@ -3637,7 +3680,7 @@ impl AudioOutput for MpdOutput {
     }
 
     fn load_uri(&self, uri: &str) -> bool {
-        if !self.ensure_load_allowed() {
+        if !self.ensure_authority_allowed() {
             return false;
         }
         let owner = self.begin_load();
@@ -3658,7 +3701,7 @@ impl AudioOutput for MpdOutput {
     }
 
     fn load_resolved(&self, request: ResolvedHttpRequest) -> bool {
-        if !self.ensure_load_allowed() {
+        if !self.ensure_authority_allowed() {
             return false;
         }
         let owner = self.begin_load();
@@ -3676,7 +3719,7 @@ impl AudioOutput for MpdOutput {
     }
 
     fn load_local(&self, media: ResolvedLocalMedia) -> bool {
-        if !self.ensure_load_allowed() {
+        if !self.ensure_authority_allowed() {
             return false;
         }
         let owner = self.begin_load();
@@ -3690,14 +3733,26 @@ impl AudioOutput for MpdOutput {
     }
 
     fn play(&self) {
+        if !self.ensure_authority_allowed() {
+            return;
+        }
         self.enqueue(self.current_owner(), CommandKind::Play);
     }
 
     fn pause(&self) {
+        if !self.ensure_authority_allowed() {
+            return;
+        }
         self.enqueue(self.current_owner(), CommandKind::Pause);
     }
 
     fn stop(&self) {
+        // Preflight before ANY local mutation: a refused stop must not burn
+        // the intent epoch, revoke media tickets, or rewrite the cached
+        // player state — the gate's failure event is the only effect.
+        if !self.ensure_authority_allowed() {
+            return;
+        }
         let owner = self.next_owner();
         self.proxy.revoke_before(owner.epoch);
         {
@@ -3712,10 +3767,16 @@ impl AudioOutput for MpdOutput {
     }
 
     fn toggle_play_pause(&self) {
+        if !self.ensure_authority_allowed() {
+            return;
+        }
         self.enqueue(self.current_owner(), CommandKind::Toggle);
     }
 
     fn seek_to(&self, position_ms: u64) {
+        if !self.ensure_authority_allowed() {
+            return;
+        }
         self.enqueue(self.current_owner(), CommandKind::Seek(position_ms));
     }
 
@@ -4452,6 +4513,68 @@ mod tests {
     }
 
     #[test]
+    fn supervision_eager_gate_refuses_and_lapses_stale_evidence_without_waiting_for_a_poll() {
+        // Stale-between-polls: no poll has observed the observation gap
+        // yet, but an authority-requiring command arrives NOW. The eager
+        // gate must refuse immediately — the unsupervised window is itself
+        // disqualifying evidence, so the lapse is permanent — instead of
+        // letting the stale confirmation through until a later poll
+        // happens to notice the gap.
+        let mut state = SupervisionState::new();
+        let t0 = Instant::now();
+        let stale = t0
+            .checked_sub(MAX_SUPERVISION_GAP + Duration::from_millis(1))
+            .expect("backdated observation instant");
+        state.last_observation = Some(stale);
+        assert!(
+            !state.authority_current(t0),
+            "a stale confirmation must not authorise a command between polls"
+        );
+        assert!(
+            state.is_lapsed(),
+            "the eager gate itself revokes the stale authority"
+        );
+        // The lapse is terminal even though no poll has observed the gap:
+        // later clean observations never re-arm this instance.
+        state.observe(t0 + Duration::from_secs(3600));
+        assert!(
+            !state.authority_current(t0 + Duration::from_secs(3600)),
+            "observations after an eager lapse never restore authority"
+        );
+    }
+
+    #[test]
+    fn supervision_eager_gate_keeps_fresh_confirmation_authoritative() {
+        // The construction instant IS the explicit user confirmation, so a
+        // freshly re-selected output is authoritative immediately — no poll
+        // is needed to prove what the user just confirmed — and it stays
+        // authoritative up to and including the exact gap boundary.
+        let mut state = SupervisionState::new();
+        assert!(
+            state.authority_current(Instant::now()),
+            "a fresh confirmation authorises without a prior poll"
+        );
+        let t0 = Instant::now();
+        let mut state = SupervisionState::new();
+        state.last_observation = Some(t0);
+        assert!(state.authority_current(t0 + MAX_SUPERVISION_GAP));
+        assert!(
+            !state.is_lapsed(),
+            "the gap boundary itself is still fresh evidence"
+        );
+        // Reconfirmation is exactly this: constructing a fresh supervisor —
+        // what re-selecting the output does — re-arms authority that any
+        // lapse revoked. Observations on the lapsed instance never do.
+        state.lapse();
+        assert!(!state.authority_current(Instant::now()));
+        let mut reconfirmed = SupervisionState::new();
+        assert!(
+            reconfirmed.authority_current(Instant::now()),
+            "only an explicit reconfirmation re-arms a lapsed supervisor"
+        );
+    }
+
+    #[test]
     fn supervised_status_drift_lapses_the_supervisor() {
         let mut status = playing_status(0, 10_000);
         assert!(!status.observes_options_drift());
@@ -4759,6 +4882,125 @@ mod tests {
                 .count(),
             0,
             "post-lapse partition-global controls are refused"
+        );
+        harness.shutdown();
+    }
+
+    #[test]
+    fn supervised_worker_refuses_commands_whose_evidence_went_stale_between_polls() {
+        // The audit's stale-between-polls case at the worker gate: no poll
+        // has yet observed the observation gap (the harness polls only on
+        // demand), but the supervision evidence is already older than
+        // MAX_SUPERVISION_GAP when commands arrive. The worker must enforce
+        // the supervision age eagerly — refuse the command AND lapse the
+        // supervisor — instead of waving the stale confirmation through
+        // until some later poll happens to notice the gap.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(playing_status(0, 10_000));
+        let owner = harness.next_owner(3);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/clean".to_string(),
+            },
+        );
+        harness.fence(owner);
+        assert_eq!(
+            shared
+                .added_uris()
+                .iter()
+                .filter(|uri| *uri == "https://music.test/clean")
+                .count(),
+            1,
+            "the clean load executed exactly once"
+        );
+
+        // Evidence goes stale WITHOUT any poll observing it: the harness
+        // polls on demand only, so nothing refreshes the observation. The
+        // fence guarantees the load's synchronous follow-up poll already
+        // ran, so the backdate below cannot be raced by the worker.
+        let stale = Instant::now()
+            .checked_sub(MAX_SUPERVISION_GAP + Duration::from_secs(1))
+            .expect("backdated observation instant");
+        harness
+            .supervision
+            .lock()
+            .expect("supervision lock")
+            .last_observation = Some(stale);
+
+        // A partition-global playback control arrives between polls:
+        // refused before any MPD action.
+        harness.send(owner, CommandKind::Pause);
+        harness.fence(owner);
+        // A load arrives between polls: refused too.
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/stale".to_string(),
+            },
+        );
+        harness.fence(owner);
+
+        assert_eq!(
+            shared
+                .actions()
+                .iter()
+                .filter(|action| matches!(action, Action::Pause(_)))
+                .count(),
+            0,
+            "a stale-between-polls playback control is refused at the worker gate"
+        );
+        assert!(
+            !shared
+                .added_uris()
+                .iter()
+                .any(|uri| uri == "https://music.test/stale"),
+            "a stale-between-polls load is refused at the worker gate"
+        );
+        assert_eq!(
+            shared
+                .added_uris()
+                .iter()
+                .filter(|uri| *uri == "https://music.test/clean")
+                .count(),
+            1,
+            "no additional load reached MPD"
+        );
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the worker gate lapses stale evidence eagerly"
+        );
+        let exclusive_errors = harness
+            .events()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    PlayerEvent::Error { message, .. }
+                        if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+                )
+            })
+            .count();
+        assert_eq!(
+            exclusive_errors, 2,
+            "both stale-between-polls commands report the exclusive-control error"
         );
         harness.shutdown();
     }
@@ -6910,6 +7152,108 @@ mod tests {
     }
 
     #[test]
+    fn supervised_public_controls_reject_before_any_local_mutation_when_stale() {
+        // Rejected-control contract at the public boundary: on a supervised
+        // output whose supervision evidence has gone stale between polls,
+        // EVERY partition-global playback control is refused eagerly — and
+        // the refusal happens BEFORE any local mutation: no intent-epoch
+        // advance, no media-ticket revocation, no cached-state rewrite, no
+        // worker command. The gate's failure event is the only effect, and
+        // the first refusal lapses the supervisor (the stale window is
+        // itself disqualifying evidence).
+        let shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let intent_epoch = Arc::new(AtomicU64::new(0));
+        let cache = Arc::new(Mutex::new(MpdCache::default()));
+        let (worker_tx, worker_rx) = worker_command_channel(MAX_PENDING_WORKER_COMMANDS);
+        let output = MpdOutput {
+            display_name: "supervised".to_string(),
+            event_tx,
+            event_generation: AtomicU64::new(11),
+            volume: 1.0,
+            plan: control_plan(true, true),
+            intent_epoch: Arc::clone(&intent_epoch),
+            cache: Arc::clone(&cache),
+            proxy: fake_proxy_services(Arc::clone(&shared), &runtime),
+            worker_tx,
+            supervision: Arc::new(Mutex::new(SupervisionState::new())),
+        };
+        // Stale-between-polls: backdate the supervision evidence past the
+        // gap without any poll having observed it.
+        let stale = Instant::now()
+            .checked_sub(MAX_SUPERVISION_GAP + Duration::from_secs(1))
+            .expect("backdated observation instant");
+        output
+            .supervision
+            .lock()
+            .expect("supervision lock")
+            .last_observation = Some(stale);
+
+        output.play();
+        assert!(
+            output
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the first refused control lapses the stale supervisor eagerly"
+        );
+        output.pause();
+        output.toggle_play_pause();
+        output.seek_to(7_000);
+        output.stop();
+
+        assert_eq!(
+            intent_epoch.load(Ordering::SeqCst),
+            0,
+            "refused controls never advance the intent epoch"
+        );
+        assert!(
+            worker_rx.pop_pending().is_none(),
+            "refused controls never reach the worker"
+        );
+        let snapshot = *cache.lock().expect("cache lock");
+        assert_eq!(snapshot.state, PlayerState::Stopped);
+        assert_eq!(snapshot.position_ms, None);
+        assert!(
+            shared.starts.lock().expect("proxy starts lock").is_empty(),
+            "refused controls never register a media ticket"
+        );
+        // Exactly one Stopped publication plus one exclusive-control error
+        // per refused control — no other events.
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        let refused = ["play", "pause", "toggle", "seek", "stop"].len();
+        assert_eq!(
+            events.len(),
+            refused * 2,
+            "each refused control emits exactly its Stopped publication and error"
+        );
+        for event in &events {
+            match event {
+                PlayerEvent::StateChanged {
+                    generation,
+                    state: PlayerState::Stopped,
+                } => assert_eq!(generation.as_raw(), 11),
+                PlayerEvent::Error {
+                    generation,
+                    message,
+                } => {
+                    assert_eq!(generation.as_raw(), 11);
+                    assert_eq!(
+                        message,
+                        &mpd_exclusive_control_required_message(&rust_i18n::locale())
+                    );
+                }
+                other => panic!("unexpected event from a refused control: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn load_resets_cached_track_before_the_worker_receives_it() {
         let (event_tx, _event_rx) = async_channel::unbounded();
         let intent_epoch = Arc::new(AtomicU64::new(0));
@@ -7031,24 +7375,78 @@ mod tests {
         }
     }
 
+    /// Parse a full, valid status reply. Every line of a real MPD `status`
+    /// response that Tributary requires is present, so `finish()` succeeds.
+    fn parse_status_lines(lines: &[&str]) -> MpdResult<MpdStatus> {
+        let mut status = RawStatus::default();
+        for line in lines {
+            status.parse_line(line)?;
+        }
+        status.finish()
+    }
+
     #[test]
     fn status_parses_fractional_and_legacy_time() {
-        let mut status = RawStatus::default();
-        status.parse_line("state: play").expect("state");
-        status.parse_line("songid: 42").expect("song id");
-        status.parse_line("elapsed: 1.250").expect("elapsed");
-        status.parse_line("duration: 9.750").expect("duration");
-        let status = status.finish().expect("valid status");
+        let status = parse_status_lines(&[
+            "state: play",
+            "songid: 42",
+            "elapsed: 1.250",
+            "duration: 9.750",
+            "repeat: 0",
+            "random: 0",
+            "single: 0",
+            "consume: 0",
+        ])
+        .expect("valid status");
         assert_eq!(status.position_ms, Some(1_250));
         assert_eq!(status.duration_ms, 9_750);
 
-        let mut fallback = RawStatus::default();
-        fallback.parse_line("state: pause").expect("state");
-        fallback.parse_line("songid: 7").expect("song id");
-        fallback.parse_line("time: 2:11").expect("legacy time");
-        let fallback = fallback.finish().expect("valid fallback");
+        let fallback = parse_status_lines(&[
+            "state: pause",
+            "songid: 7",
+            "time: 2:11",
+            "repeat: 0",
+            "random: 0",
+            "single: 0",
+            "consume: 0",
+        ])
+        .expect("valid fallback");
         assert_eq!(fallback.position_ms, Some(2_000));
         assert_eq!(fallback.duration_ms, 11_000);
+    }
+
+    #[test]
+    fn status_requires_every_partition_option_field() {
+        // A status reply that omits any of repeat/random/single/consume is
+        // incomplete evidence about the partition: defaulting the omission
+        // to `false` would let a truncated or foreign-shaped response read
+        // as a clean poll, so `finish()` must reject it. Each field is
+        // required independently — the reply stays invalid until the last
+        // one arrives, and `0`/`1` values parse as false/true.
+        let base = ["state: play", "songid: 42", "elapsed: 1.0"];
+        for missing in ["repeat", "random", "single", "consume"] {
+            let mut lines: Vec<&str> = base.to_vec();
+            lines.extend(["repeat: 0", "random: 0", "single: 0", "consume: 0"]);
+            lines.retain(|line| !line.starts_with(missing));
+            assert!(
+                parse_status_lines(&lines).is_err(),
+                "a status reply without `{missing}` must fail the poll"
+            );
+        }
+        let complete = parse_status_lines(&[
+            "state: play",
+            "songid: 42",
+            "elapsed: 1.0",
+            "repeat: 1",
+            "random: 0",
+            "single: 0",
+            "consume: 1",
+        ])
+        .expect("all four option fields present");
+        assert!(complete.repeat);
+        assert!(complete.consume);
+        assert!(!complete.random);
+        assert!(!complete.single);
     }
 
     #[test]
@@ -7102,6 +7500,9 @@ mod tests {
         status
             .parse_line("error: https://music.test/a?token=secret")
             .expect("error marker");
+        for option in ["repeat: 0", "random: 0", "single: 0", "consume: 0"] {
+            status.parse_line(option).expect("required option field");
+        }
         let status = status.finish().expect("typed status retained");
         assert!(status.has_error);
         let message = mpd_failure_message(MpdFailure::new("remote playback"));
@@ -7608,13 +8009,13 @@ mod tests {
             read_test_command(&mut reader, "status");
             write_test_response(
                 &mut stream,
-                b"songid: 42\nelapsed: 0.000\nduration: 10.000\nstate: play\nOK\n",
+                b"songid: 42\nelapsed: 0.000\nduration: 10.000\nrepeat: 0\nrandom: 0\nsingle: 0\nconsume: 0\nstate: play\nOK\n",
             );
 
             read_test_command(&mut reader, "status");
             write_test_response(
                 &mut stream,
-                b"songid: 42\nelapsed: 0.000\nduration: 10.000\nstate: play\nOK\n",
+                b"songid: 42\nelapsed: 0.000\nduration: 10.000\nrepeat: 0\nrandom: 0\nsingle: 0\nconsume: 0\nstate: play\nOK\n",
             );
             read_test_command(&mut reader, "pause 1");
             pause_seen_tx.send(()).expect("pause observed");
@@ -7648,31 +8049,31 @@ mod tests {
             read_test_command(&mut reader, "status");
             write_test_response(
                 &mut stream,
-                b"songid: 42\nelapsed: 0.000\nduration: 10.000\nstate: pause\nOK\n",
+                b"songid: 42\nelapsed: 0.000\nduration: 10.000\nrepeat: 0\nrandom: 0\nsingle: 0\nconsume: 0\nstate: pause\nOK\n",
             );
             read_test_command(&mut reader, "status");
             write_test_response(
                 &mut stream,
-                b"songid: 42\nelapsed: 0.000\nduration: 10.000\nstate: pause\nOK\n",
+                b"songid: 42\nelapsed: 0.000\nduration: 10.000\nrepeat: 0\nrandom: 0\nsingle: 0\nconsume: 0\nstate: pause\nOK\n",
             );
             read_test_command(&mut reader, "seekid 42 7.000");
             write_test_response(&mut stream, b"OK\n");
             read_test_command(&mut reader, "status");
             write_test_response(
                 &mut stream,
-                b"songid: 42\nelapsed: 7.000\nduration: 10.000\nstate: pause\nOK\n",
+                b"songid: 42\nelapsed: 7.000\nduration: 10.000\nrepeat: 0\nrandom: 0\nsingle: 0\nconsume: 0\nstate: pause\nOK\n",
             );
             read_test_command(&mut reader, "status");
             write_test_response(
                 &mut stream,
-                b"songid: 42\nelapsed: 7.000\nduration: 10.000\nstate: pause\nOK\n",
+                b"songid: 42\nelapsed: 7.000\nduration: 10.000\nrepeat: 0\nrandom: 0\nsingle: 0\nconsume: 0\nstate: pause\nOK\n",
             );
             read_test_command(&mut reader, "pause 0");
             write_test_response(&mut stream, b"OK\n");
             read_test_command(&mut reader, "status");
             write_test_response(
                 &mut stream,
-                b"songid: 42\nelapsed: 7.000\nduration: 10.000\nstate: play\nOK\n",
+                b"songid: 42\nelapsed: 7.000\nduration: 10.000\nrepeat: 0\nrandom: 0\nsingle: 0\nconsume: 0\nstate: play\nOK\n",
             );
 
             // Shutdown revalidates once. A foreign current id deliberately
@@ -7680,7 +8081,7 @@ mod tests {
             read_test_command(&mut reader, "status");
             write_test_response(
                 &mut stream,
-                b"songid: 99\nelapsed: 0.000\nduration: 10.000\nstate: play\nOK\n",
+                b"songid: 99\nelapsed: 0.000\nduration: 10.000\nrepeat: 0\nrandom: 0\nsingle: 0\nconsume: 0\nstate: play\nOK\n",
             );
         });
 
@@ -7812,7 +8213,7 @@ mod tests {
             ("playid 42".to_string(), b"OK\n".to_vec()),
             (
                 "status".to_string(),
-                b"duration: 125.750\nsongid: 42\nelapsed: 1.250\nstate: play\nOK\n".to_vec(),
+                b"duration: 125.750\nsongid: 42\nelapsed: 1.250\nrepeat: 0\nrandom: 0\nsingle: 0\nconsume: 0\nstate: play\nOK\n".to_vec(),
             ),
             ("deleteid 42".to_string(), b"OK\n".to_vec()),
         ]);
