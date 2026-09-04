@@ -29,7 +29,8 @@ The central rules are:
 > terminal failure states that never become playable rows.
 
 This contract is the precursor to the bounded download/cache engine and the
-download/progress/storage UI listed in `task.md:1030-1033`. It is also a
+download/progress/storage UI listed under
+[P3.1](task.md#p31--offline-remote-media) in `task.md`. It is also a
 companion to the
 [source-scoped regular-playlist storage](source-scoped-playlists.md) contract,
 the [Subsonic playlist](subsonic-playlist-sync.md) contract, the
@@ -69,7 +70,8 @@ authenticated HTTP endpoint whose URL, query string, or response header carries
 the user's token — and under Subsonic's plaintext auth mode, the user's actual
 *password*. Publishing that data through GTK, through the file system, or
 through a downstream process without a boundary is the failure mode the existing
-`task-remediation-2026-07.md` P1.4 work closed for live playback, and offline
+`task-remediation-2026-07.md` P1.6 work closed for live playback — with P1.4's
+exact-origin proxy as the only credential-bearing fetch path — and offline
 extends the same boundary rather than reinventing it.
 
 The non-negotiable rules are:
@@ -99,8 +101,8 @@ The non-negotiable rules are:
 
 The credential-boundary section is normative and may not be weakened by an
 implementation slice. Any slice that would persist a credential to make a
-download work is a bug. This matches `task-remediation-2026-07.md` P1.4's
-"no token in MPD/Chromecast/AirPlay ticket" rule verbatim.
+download work is a bug. This is `task-remediation-2026-07.md` P1.6's receiver
+rule restated: the ticket a receiver sees carries media, never a credential.
 
 ## Source-scoped identity and lifecycle
 
@@ -117,8 +119,9 @@ existing media row. As a consequence:
 2. The engine may extend a saved source with a new capability row for offline
    operations, but the source retains its existing identity, audit, and
    redaction behaviour.
-3. A track ID is opaque and bounded exactly as it is in `task.md:78-83`. The
-   download engine does not parse or normalise a `TrackId`. The only
+3. A track ID is opaque and bounded exactly as
+   [`architecture/source-lifecycle.md`](architecture/source-lifecycle.md)
+   defines it. The download engine does not parse or normalise a `TrackId`. The only
    transformation it ever applies is the one-way cache-key derivation defined
    in [Per-source layout](#per-source-layout), which feeds the exact,
    unmodified byte sequence of the ID to SHA-256 and uses a fixed-width hex
@@ -147,11 +150,13 @@ opt-in without taking the playback catalogue with it. The contract:
 ### Offline is not yet another credential lane
 
 The offline engine has its own job lifecycle but does not become a credential
-owner. Cached bytes arrive through the same exact-origin proxy used by live
-playback; the offline engine receives completion through the same opaque
-ticket and may only persist the resulting `Vec<u8>`. This mirrors the receiver
-ticket vocabulary in `chromecast_output.rs` and the proxy ticket vocabulary in
-`http_security.rs` without re-implementing either.
+owner. Cached bytes arrive only through the same exact-origin proxy path used
+by live playback, addressed by the same opaque ticket vocabulary — the engine
+never sees a URL or credential. This mirrors the receiver ticket vocabulary in
+`chromecast_output.rs` and the proxy ticket vocabulary in `http_security.rs`
+without re-implementing either. The engine persists those bytes as streamed,
+journaled segments per the resumption rules; it never buffers a whole media
+file in memory.
 
 ### Committed snapshots play without a live authority
 
@@ -362,7 +367,8 @@ digest must name that contract in an ADR row of this matrix first.
 
 ## Credential handling
 
-This section is normative. It repeats `task-remediation-2026-07.md` P1.4's rules,
+This section is normative. It repeats `task-remediation-2026-07.md` P1.6's
+credential-isolation rules — minted only through P1.4's exact-origin proxy —
 restated for offline storage:
 
 1. **Persistence is forbidden.** No `tracks` row carries a credential, URL,
@@ -395,8 +401,8 @@ is small and absolute:
 
 | OperationalLicence | Meaning | Visible to GTK | Persistent |
 | --- | --- | --- | --- |
-| `Denied` | Default. The cached row exists structurally but cannot become playable. | "Offline unavailable" for that source. | No |
-| `SourceDeclared` | The source declares a contract that allows offline replay of its content for the user. | The licence label only. | No stored text |
+| `Denied` | Default. Admission is refused before any network work, so no cache row exists and the denial itself is not persisted. | "Offline unavailable" for that source. | No |
+| `SourceDeclared` | The source declares a contract that allows offline replay of its content for the user. | The licence label only. | Label only, never the text |
 | `Revoked` | The source or backend has changed the licence after a row was committed. | "Licence revoked" for that row. | Row retired |
 
 Rules:
@@ -531,7 +537,7 @@ Each slice lands with its own focused regression suite. The slices are:
 | Resumable job | Bounded, `If-Range`-validated range requests; `200`/`412` restarts from zero; journal survives crash (offset truncation, last-segment digest re-check); no-validator jobs restart only. |
 | Atomic storage | Same-directory temp reservation; verify-before-publish ordering; same-filesystem rename with parent-directory `fsync`; cross-filesystem publish refused. |
 | Digest provenance | Advertised digest compared exactly; double-fetch fallback equality; no-tier backends fail `IntegrityUnverifiable` before publish. |
-| Credential boundary | No credential in metadata, file name, sidecar, log, or GTK row. Same regex-style coverage as `task-remediation-2026-07.md` P1.4. |
+| Credential boundary | No credential in metadata, file name, sidecar, log, or GTK row. Isolation scope per `task-remediation-2026-07.md` P1.6; redaction mechanics per P1.4. |
 | Redirect policy | Per `task-remediation-2026-07.md` P1.4 matrix; HTTPS-only, no `Referer`, no HTTPS→HTTP downgrade. |
 | Licensing | Default-deny; revocation retires rows but preserves files. |
 | Reconciliation | Refresh creates a sibling; no in-place mutation; unlink is content-aware. |
