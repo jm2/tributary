@@ -669,42 +669,69 @@ fn fold_record(parse: &mut JournalParse, record: JournalRecord) -> FoldOutcome {
             media_key,
             capability_epoch,
             validator,
-        } => {
-            if parse.head.is_some() {
-                return FoldOutcome::Unusable;
-            }
-            parse.head = Some((media_key, capability_epoch, validator));
-        }
+        } => fold_head(parse, media_key, capability_epoch, validator),
         JournalRecord::Segment {
             offset,
             len,
             sha256_hex,
-        } => {
-            let Some(_) = parse.head else {
-                return FoldOutcome::Unusable;
-            };
-            let expected_offset = parse
-                .segments
-                .last()
-                .map(|segment| segment.offset + segment.len)
-                .unwrap_or(0);
-            if len == 0 || offset != expected_offset {
-                // Out-of-order or duplicate ranges are rejected: the
-                // journaled progress is untrusted and the job restarts
-                // from zero.
-                parse.progress_trusted = false;
-                parse.segments.clear();
-            } else {
-                parse.segments.push(JournalSegment {
-                    offset,
-                    len,
-                    sha256_hex,
-                });
-            }
+        } => fold_segment(parse, offset, len, sha256_hex),
+        JournalRecord::Committed { snapshot } => {
+            parse.committed = Some(snapshot);
+            FoldOutcome::Continue
         }
-        JournalRecord::Committed { snapshot } => parse.committed = Some(snapshot),
-        JournalRecord::Terminal { state, failure } => parse.terminal = Some((state, failure)),
-        JournalRecord::Retired { reason } => parse.retired = Some(reason),
+        JournalRecord::Terminal { state, failure } => {
+            parse.terminal = Some((state, failure));
+            FoldOutcome::Continue
+        }
+        JournalRecord::Retired { reason } => {
+            parse.retired = Some(reason);
+            FoldOutcome::Continue
+        }
+    }
+}
+
+/// Fold a `Head` record. A second head makes the whole file unusable:
+/// one journal per slot records exactly one identity.
+fn fold_head(
+    parse: &mut JournalParse,
+    media_key: MediaKey,
+    capability_epoch: u64,
+    validator: Option<EntityValidator>,
+) -> FoldOutcome {
+    if parse.head.is_some() {
+        return FoldOutcome::Unusable;
+    }
+    parse.head = Some((media_key, capability_epoch, validator));
+    FoldOutcome::Continue
+}
+
+/// Fold a `Segment` record. Segments must follow a head and arrive
+/// contiguously: out-of-order or duplicate ranges are rejected — the
+/// journaled progress is untrusted and the job restarts from zero —
+/// while the file itself stays loadable.
+fn fold_segment(
+    parse: &mut JournalParse,
+    offset: u64,
+    len: u64,
+    sha256_hex: String,
+) -> FoldOutcome {
+    if parse.head.is_none() {
+        return FoldOutcome::Unusable;
+    }
+    let expected_offset = parse
+        .segments
+        .last()
+        .map(|segment| segment.offset + segment.len)
+        .unwrap_or(0);
+    if len == 0 || offset != expected_offset {
+        parse.progress_trusted = false;
+        parse.segments.clear();
+    } else {
+        parse.segments.push(JournalSegment {
+            offset,
+            len,
+            sha256_hex,
+        });
     }
     FoldOutcome::Continue
 }
@@ -730,6 +757,47 @@ fn finish_journal(parse: JournalParse) -> LoadedJournalFile {
     }))
 }
 
+/// Outcome of folding one journal line into the parse state.
+enum LineFold {
+    /// Record accepted; continue with the next line.
+    Continue,
+    /// Torn final line — an interrupted append; discard it and stop
+    /// cleanly.
+    TornTail,
+    /// The journal is structurally invalid; the whole file is unusable.
+    Unusable,
+}
+
+/// A parse defect is a torn tail when it hit the final line (an
+/// interrupted append) and fatal everywhere else.
+const fn defect(is_last: bool) -> LineFold {
+    if is_last {
+        LineFold::TornTail
+    } else {
+        LineFold::Unusable
+    }
+}
+
+/// Parse and fold one journal line. A torn final line — non-UTF-8 or
+/// unparseable at the last position, or the trailing empty chunk left
+/// by the final newline — is discarded; the same defect mid-file makes
+/// the journal unusable.
+fn fold_line(parse: &mut JournalParse, chunk: &[u8], is_last: bool) -> LineFold {
+    if chunk.is_empty() {
+        return defect(is_last);
+    }
+    let Ok(line) = std::str::from_utf8(chunk) else {
+        return defect(is_last);
+    };
+    let Ok(record) = serde_json::from_str::<JournalRecord>(line) else {
+        return defect(is_last);
+    };
+    match fold_record(parse, record) {
+        FoldOutcome::Continue => LineFold::Continue,
+        FoldOutcome::Unusable => LineFold::Unusable,
+    }
+}
+
 /// Parse and validate one journal file. A torn final line — an
 /// interrupted append — is discarded; a corrupt mid-file line makes the
 /// journal unusable.
@@ -741,26 +809,10 @@ pub fn load_journal(path: &Path) -> LoadedJournalFile {
     let last = chunks.len().saturating_sub(1);
     let mut parse = JournalParse::default();
     for (index, chunk) in chunks.iter().enumerate() {
-        if chunk.is_empty() && index == last {
-            break;
-        }
-        let Ok(line) = std::str::from_utf8(chunk) else {
-            if index == last {
-                break; // torn tail from an interrupted append
-            }
-            return LoadedJournalFile::Unusable;
-        };
-        let record: JournalRecord = match serde_json::from_str(line) {
-            Ok(record) => record,
-            Err(_) => {
-                if index == last {
-                    break; // torn tail
-                }
-                return LoadedJournalFile::Unusable;
-            }
-        };
-        if matches!(fold_record(&mut parse, record), FoldOutcome::Unusable) {
-            return LoadedJournalFile::Unusable;
+        match fold_line(&mut parse, chunk, index == last) {
+            LineFold::Continue => {}
+            LineFold::TornTail => break,
+            LineFold::Unusable => return LoadedJournalFile::Unusable,
         }
     }
     finish_journal(parse)

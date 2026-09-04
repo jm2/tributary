@@ -164,6 +164,21 @@ pub enum JobState {
 }
 
 impl JobState {
+    /// Redacted display label per state, indexed by variant order. The
+    /// label is a fixed category word — the only rendering any surface
+    /// (GTK, journal logs, cache rows) ever exposes. A field-less enum
+    /// has sequential discriminants from `0`, so the cast is total.
+    const LABELS: [&'static str; 8] = [
+        "queued",
+        "connecting",
+        "receiving",
+        "verifying",
+        "committing",
+        "committed",
+        "failed",
+        "cancelled",
+    ];
+
     /// Whether this state is terminal. A terminal state never advances
     /// again; the engine records it and releases the lease.
     pub fn is_terminal(self) -> bool {
@@ -173,17 +188,7 @@ impl JobState {
 
 impl fmt::Display for JobState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let label = match self {
-            Self::Queued => "queued",
-            Self::Connecting => "connecting",
-            Self::Receiving => "receiving",
-            Self::Verifying => "verifying",
-            Self::Committing => "committing",
-            Self::Committed => "committed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        };
-        formatter.write_str(label)
+        formatter.write_str(Self::LABELS[*self as usize])
     }
 }
 
@@ -229,20 +234,28 @@ pub enum OfflineError {
     UnsupportedSource,
 }
 
+impl OfflineError {
+    /// Redacted display label per variant, indexed by variant order.
+    /// The variant name is the only thing the cache rows, GTK, the
+    /// journal logs, and the redacted failure messages ever expose. A
+    /// field-less enum has sequential discriminants from `0`, so the
+    /// cast is total.
+    const LABELS: [&'static str; 9] = [
+        "network",
+        "auth-expired",
+        "lease-revoked",
+        "integrity-mismatch",
+        "integrity-unverifiable",
+        "licence-denied",
+        "quota-exceeded",
+        "storage-unavailable",
+        "unsupported-source",
+    ];
+}
+
 impl fmt::Display for OfflineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let label = match self {
-            Self::Network => "network",
-            Self::AuthExpired => "auth-expired",
-            Self::LeaseRevoked => "lease-revoked",
-            Self::IntegrityMismatch => "integrity-mismatch",
-            Self::IntegrityUnverifiable => "integrity-unverifiable",
-            Self::LicenceDenied => "licence-denied",
-            Self::QuotaExceeded => "quota-exceeded",
-            Self::StorageUnavailable => "storage-unavailable",
-            Self::UnsupportedSource => "unsupported-source",
-        };
-        formatter.write_str(label)
+        formatter.write_str(Self::LABELS[*self as usize])
     }
 }
 
