@@ -16,8 +16,9 @@
 //! * Both edited -> manual-or-skip forces the user to resolve, never
 //!   silently clobbering work on either side.
 //!
-//! The policy is plain data; the planner reads it. The executor never
-//! inspects a policy directly.
+//! The policy is plain data: the planner reads the destination, and the
+//! executor reads the conflict strategy and the delete-missing flag when
+//! it runs the plan.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -46,8 +47,9 @@ pub enum ConflictResolution {
 
 /// A user's chosen sync behaviour for one host playlist.
 ///
-/// Policies are plain data: the planner reads them, the executor never
-/// does. New fields can be added without touching the executor.
+/// Policies are plain data: the planner reads the destination, and the
+/// executor reads the conflict strategy and the delete-missing flag when
+/// it runs the plan.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncPolicy {
     enabled: bool,
