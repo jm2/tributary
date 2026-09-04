@@ -46,6 +46,12 @@ const CAST_RECEIVER_ID: &str = "receiver-0";
 pub struct ChromecastOutput {
     #[allow(dead_code)]
     display_name: String,
+    /// Receiver's control endpoint address. Recorded here (not only inside
+    /// the connector captured by the worker) so `ensure_cast_server` can
+    /// pass it to `CastHttpServer::start_for_target` and have the listener
+    /// bind on the interface the kernel routes to this specific device —
+    /// not on the interface blind first-match enumeration would surface.
+    device_address: SocketAddr,
     event_tx: async_channel::Sender<PlayerEvent>,
     event_generation: AtomicU64,
     volume: f64,
@@ -1815,6 +1821,7 @@ impl ChromecastOutput {
 
         Self {
             display_name: display_name.to_string(),
+            device_address: address,
             event_tx,
             event_generation: AtomicU64::new(0),
             volume: initial_volume.clamp(0.0, 1.0),
@@ -1978,9 +1985,13 @@ impl ChromecastOutput {
                 .as_ref()
                 .ok_or_else(|| CastFailure::new("media server startup"))?;
             let server = runtime
-                .block_on(CastHttpServer::start())
+                .block_on(CastHttpServer::start_for_target(self.device_address))
                 .map_err(|error| opaque_cast_failure("media server startup", error))?;
-            info!(addr = %server.addr(), "Cast HTTP server started");
+            info!(
+                bind = %server.addr(),
+                target = %self.device_address,
+                "Cast HTTP server started"
+            );
             *server_guard = Some(server);
         }
 
