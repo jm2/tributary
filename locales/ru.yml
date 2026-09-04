@@ -464,6 +464,8 @@ equalizer:
   preset_custom: "Свой"
   preamp: "Предусиление"
   clip_protection: "Защита от клиппинга"
+  clip_off: "Выключена"
+  clip_soft: "Мягкая"
   reset_flat: "Сбросить в плоский"
   reload: "Перечитать с диска"
   band_a11y: "Полоса эквалайзера %{frequency} герц, настройка в децибелах"

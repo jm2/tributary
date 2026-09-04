@@ -462,6 +462,8 @@ equalizer:
   preset_custom: "Eigen"
   preamp: "Voorversterking"
   clip_protection: "Overstuurbescherming"
+  clip_off: "Uit"
+  clip_soft: "Zacht"
   reset_flat: "Terugzetten op vlak"
   reload: "Opnieuw van schijf laden"
   band_a11y: "Equalizer-band op %{frequency} hertz, ingesteld in decibel"

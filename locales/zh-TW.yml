@@ -462,6 +462,8 @@ equalizer:
   preset_custom: "自訂"
   preamp: "前級放大"
   clip_protection: "削波保護"
+  clip_off: "關閉"
+  clip_soft: "柔和"
   reset_flat: "重設為平直"
   reload: "從磁碟重新載入"
   band_a11y: "%{frequency}赫茲等化器頻段，以分貝調整"

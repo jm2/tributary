@@ -462,6 +462,8 @@ equalizer:
   preset_custom: "Personalizado"
   preamp: "Pré-amplificação"
   clip_protection: "Proteção contra clipagem"
+  clip_off: "Desativada"
+  clip_soft: "Suave"
   reset_flat: "Redefinir para plano"
   reload: "Recarregar do disco"
   band_a11y: "Faixa do equalizador em %{frequency} hertz, ajustada em decibéis"

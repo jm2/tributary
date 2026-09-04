@@ -462,6 +462,8 @@ equalizer:
   preset_custom: "Eigenes"
   preamp: "Vorverstärkung"
   clip_protection: "Übersteuerungsschutz"
+  clip_off: "Aus"
+  clip_soft: "Sanft"
   reset_flat: "Auf Flach zurücksetzen"
   reload: "Von Festplatte neu laden"
   band_a11y: "Equalizer-Band bei %{frequency} Hertz, Einstellung in Dezibel"
