@@ -322,12 +322,13 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Truncate at a char boundary with an ellipsis.
+/// Truncate at a char boundary with an ellipsis. The result — including
+/// the ellipsis — stays within `MAX_ROW_LABEL_CHARS`.
 fn truncated(label: &str) -> String {
     if label.chars().count() <= MAX_ROW_LABEL_CHARS {
         return label.to_string();
     }
-    let cut: String = label.chars().take(MAX_ROW_LABEL_CHARS).collect();
+    let cut: String = label.chars().take(MAX_ROW_LABEL_CHARS - 1).collect();
     format!("{cut}…")
 }
 

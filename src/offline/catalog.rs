@@ -34,12 +34,17 @@ impl OfflineCatalog {
         }
     }
 
-    /// Record a freshly committed snapshot as playable. A predecessor for
-    /// the same key is returned so the engine can unlink its bytes; the
-    /// committed mapping itself is replaced atomically.
+    /// Record a freshly committed snapshot as playable. Any predecessor
+    /// for the same key — a committed snapshot or a licence-revoked row —
+    /// is returned so the engine can settle its bytes and quota charge;
+    /// the committed mapping itself is replaced atomically.
     pub fn publish(&mut self, snapshot: CommittedSnapshot) -> Option<CommittedSnapshot> {
-        self.revoked.remove(&snapshot.media_key);
-        self.committed.insert(snapshot.media_key.clone(), snapshot)
+        let predecessor = self
+            .revoked
+            .remove(&snapshot.media_key)
+            .or_else(|| self.committed.remove(&snapshot.media_key));
+        self.committed.insert(snapshot.media_key.clone(), snapshot);
+        predecessor
     }
 
     /// Retire a row whose licence was revoked. The file is preserved; the
@@ -160,6 +165,31 @@ mod tests {
             OfflineCatalogueEntry::Revoked(_)
         ));
         assert!(!catalog.retire(&key), "no committed row left to retire");
+    }
+
+    #[test]
+    fn publish_returns_a_revoked_predecessor_for_settlement() {
+        let mut catalog = OfflineCatalog::default();
+        let row = snapshot("track-3", 100);
+        let key = row.media_key.clone();
+        catalog.publish(row);
+        catalog.retire(&key);
+        // A refresh over a revoked row must return it: the engine owes
+        // its quota charge a release, and dropping it silently would
+        // orphan the charge with no row left to evict.
+        let fresh = snapshot("track-3", 200);
+        let predecessor = catalog.publish(fresh).unwrap();
+        assert_eq!(predecessor.committed_at_epoch_secs, 100);
+        assert!(matches!(
+            catalog.resolve(&key),
+            OfflineCatalogueEntry::Cached(_)
+        ));
+        // Exactly one row remains for the key, and republishing without a
+        // predecessor in either map returns none.
+        assert!(catalog.publish(snapshot("track-3", 300)).is_some());
+        let rows = catalog.all_snapshots();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].committed_at_epoch_secs, 300);
     }
 
     #[test]

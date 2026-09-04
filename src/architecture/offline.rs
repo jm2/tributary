@@ -34,19 +34,20 @@ use super::identity::MediaKey;
 pub const MAX_OFFLINE_SNAPSHOT_PATH_BYTES: usize = 4 * 1024;
 
 /// Upper bound for a server-advertised `Content-Length` (or
-/// `requested_bytes`) hint. The byte hint is metadata that the engine
-/// trusts only as a quota input, not as a committed size, so the bound
-/// is small (4 KiB) — well below any real audio payload and small
-/// enough that a mis-sized or hostile header cannot inflate the
-/// persisted row. Enforced by [`validate_byte_hint`].
-pub const MAX_OFFLINE_BYTE_HINT: u64 = 4 * 1024;
+/// `requested_bytes`) hint. The hint is advisory metadata that the
+/// engine never charges against the quota — committed bytes are
+/// measured and bounded by the quota ledger at publish — so the
+/// ceiling admits any honest audio payload (even a long lossless mix)
+/// while still rejecting absurd or hostile headers before a job row
+/// is minted. Enforced by [`validate_byte_hint`].
+pub const MAX_OFFLINE_BYTE_HINT: u64 = 512 * 1024 * 1024;
 
 /// Reject a server-advertised `Content-Length` (or equivalent
 /// `requested_bytes`) hint that exceeds [`MAX_OFFLINE_BYTE_HINT`].
 ///
-/// The hint is metadata, not a committed size: a payload above this
-/// ceiling is treated as malformed input rather than as a quota
-/// overrun. The engine surfaces the rejection as
+/// The hint is metadata, not a committed size: a hint above this
+/// per-file ceiling is treated as malformed input rather than as a
+/// quota overrun. The engine surfaces the rejection as
 /// [`OfflineError::StorageUnavailable`] because the source supplied a
 /// byte count the cache layer cannot trust.
 pub const fn validate_byte_hint(hint: u64) -> Result<(), OfflineError> {

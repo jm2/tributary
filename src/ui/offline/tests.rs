@@ -138,6 +138,16 @@ fn oversized_labels_are_truncated_at_the_projection_boundary() {
     long.labels.title = "x".repeat(500);
     let row_plan = plan(&long, LOCALE);
     assert!(row_plan.accessible_label.chars().count() < 200);
+    // The truncation bound is inclusive of the ellipsis: a truncated
+    // label never exceeds MAX_ROW_LABEL_CHARS characters in total.
+    let cut = truncated(&long.labels.title);
+    assert_eq!(cut.chars().count(), MAX_ROW_LABEL_CHARS);
+    assert!(cut.ends_with('…'));
+    assert_eq!(
+        truncated("short").chars().count(),
+        5,
+        "labels within the bound pass through unchanged"
+    );
 }
 
 #[test]

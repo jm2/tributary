@@ -37,7 +37,13 @@ impl<B: TransferBackend> OfflineEngine<B> {
                 job.total_bytes = opened.total_bytes;
                 job.record.state = JobState::Receiving;
                 // Mint the reservation inline: fields (`jobs`, `store`,
-                // `nonce`) are borrowed disjointly here.
+                // `nonce`) are borrowed disjointly here. A previous
+                // connect attempt (an entity restart re-enters this
+                // phase) may still hold a reservation whose superseded
+                // temp file must not leak on disk.
+                if let Some(stale) = job.reservation.take() {
+                    let _unused = std::fs::remove_file(stale.temp_path());
+                }
                 self.nonce += 1;
                 match self.store.reserve_temp(key, self.nonce) {
                     Ok(reservation) => {

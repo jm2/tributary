@@ -131,3 +131,71 @@ fn auth_expiry_mid_download_is_terminal_and_leaves_no_row() {
     let leftovers: Vec<_> = std::fs::read_dir(track_dir).unwrap().collect();
     assert!(leftovers.is_empty());
 }
+
+// -- refresh settlement ----------------------------------------------------
+
+#[test]
+fn a_refresh_over_a_cached_row_replaces_bytes_without_deleting_the_new_publish() {
+    let first = payload(2048, 1);
+    let second = payload(4096, 2);
+    let (mut engine, _dir) = engine(FakeServer::serving(first), QUOTA);
+    let src = source(20);
+    declared(&mut engine, src);
+    let media = key(src, "refreshed");
+    assert_eq!(engine.admit(media.clone(), labels("t"), None), Ok(()));
+    assert_eq!(
+        drive_until_terminal(&mut engine, &media),
+        JobState::Committed
+    );
+    let superseded = committed_snapshot(&engine, &media);
+
+    // The same track is offered again with new content: the refresh
+    // commits a sibling whose key-derived path is identical, and the
+    // fresh bytes must survive the predecessor settlement.
+    engine.backend = FakeServer::serving(second.clone());
+    assert_eq!(engine.admit(media.clone(), labels("t"), None), Ok(()));
+    assert_eq!(
+        drive_until_terminal(&mut engine, &media),
+        JobState::Committed
+    );
+
+    let fresh = committed_snapshot(&engine, &media);
+    assert_eq!(
+        fresh.cache_path, superseded.cache_path,
+        "cache paths are key-derived, so a refresh shares the path"
+    );
+    let on_disk = std::fs::read(&fresh.cache_path).unwrap();
+    assert_eq!(
+        on_disk, second,
+        "the fresh publish must survive the predecessor settlement"
+    );
+    assert_eq!(engine.board().committed_bytes, 4096);
+}
+
+#[test]
+fn an_entity_restart_leaves_no_temp_files_behind() {
+    let original = payload(10 * 1024, 7);
+    let replacement = payload(10 * 1024, 8);
+    let server = FakeServer::serving(original)
+        .without_advertised_digest()
+        .swaps_content_at(2, replacement.clone());
+    let (mut engine, _dir) = engine(server, QUOTA);
+    let src = source(23);
+    declared(&mut engine, src);
+    let media = key(src, "restart-clean");
+    assert_eq!(engine.admit(media.clone(), labels("t"), None), Ok(()));
+    assert_eq!(
+        drive_until_terminal(&mut engine, &media),
+        JobState::Committed
+    );
+    // The entity swap re-enters the connect phase, which mints a fresh
+    // temp reservation: every superseded temp must have been dropped,
+    // leaving exactly the committed file in the track directory.
+    let track_dir = engine.store.track_dir(&media);
+    let leftovers: Vec<_> = std::fs::read_dir(track_dir).unwrap().collect();
+    assert_eq!(
+        leftovers.len(),
+        1,
+        "only the committed file remains after a restart-driven commit"
+    );
+}

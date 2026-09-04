@@ -189,10 +189,17 @@ impl<B: TransferBackend> OfflineEngine<B> {
         match snapshot {
             Ok(snapshot) => {
                 let byte_size = snapshot.byte_size;
+                let published_path = snapshot.cache_path.clone();
                 if let Some(predecessor) = self.catalog.publish(snapshot) {
-                    // Refresh sibling bound: the superseded snapshot is
-                    // unlinked and its charge released in the same step.
-                    let _unused = self.store.unlink_snapshot(&predecessor);
+                    // Refresh sibling bound: the superseded snapshot's
+                    // charge is released in the same step. Its file is
+                    // only unlinked when it does not share the fresh
+                    // publish's key-derived path — the publish rename has
+                    // already replaced shared-path bytes, and unlinking
+                    // them would delete the new snapshot.
+                    if predecessor.cache_path != published_path {
+                        let _unused = self.store.unlink_snapshot(&predecessor);
+                    }
                     self.ledger.release(predecessor.byte_size);
                 }
                 self.ledger.commit(byte_size);

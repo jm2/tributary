@@ -225,8 +225,11 @@ impl CacheStore {
     /// `fsync` on Unix.
     ///
     /// A mismatch unlinks the temp and fails terminal
-    /// ([`OfflineError::IntegrityMismatch`]); nothing was ever renamed and no
-    /// caller can observe a half-promoted row.
+    /// ([`OfflineError::IntegrityMismatch`]); an unreadable temp or a
+    /// failed rename unlinks the temp and fails
+    /// [`OfflineError::StorageUnavailable`]. Nothing was ever renamed and
+    /// no caller can observe a half-promoted row, and no failure path
+    /// leaves the temp on disk.
     #[allow(
         clippy::unused_self,
         reason = "keeps the store-method call shape consistent across the storage API"
@@ -240,7 +243,16 @@ impl CacheStore {
         licence: OperationalLicence,
         committed_at_epoch_secs: u64,
     ) -> Result<CommittedSnapshot, OfflineError> {
-        let on_disk = Self::hash_file(&reservation.temp_path)?;
+        let on_disk = match Self::hash_file(&reservation.temp_path) {
+            Ok(digest) => digest,
+            Err(err) => {
+                // The caller has already taken the reservation out of the
+                // job, so no failure path downstream can clean up: leave
+                // no temp behind on the way out.
+                let _unused = fs::remove_file(&reservation.temp_path);
+                return Err(err);
+            }
+        };
         let expected = match check {
             PublishCheck::Advertised(digest) | PublishCheck::DoubleFetch(digest) => digest,
         };
@@ -250,8 +262,10 @@ impl CacheStore {
         }
         // Atomic publish: temp and final path share a directory, so the
         // rename is same-filesystem by construction.
-        fs::rename(&reservation.temp_path, &reservation.final_path)
-            .map_err(|_| OfflineError::StorageUnavailable)?;
+        if fs::rename(&reservation.temp_path, &reservation.final_path).is_err() {
+            let _unused = fs::remove_file(&reservation.temp_path);
+            return Err(OfflineError::StorageUnavailable);
+        }
         #[cfg(unix)]
         Self::fsync_parent(&reservation.final_path)?;
         let _unused = crate::architecture::offline::validate_snapshot_path_bytes(

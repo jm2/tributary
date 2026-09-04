@@ -168,6 +168,67 @@ fn user_cache_deletion_unlinks_bytes_releases_quota_and_clears_the_row() {
     );
 }
 
+#[test]
+fn user_cache_deletion_also_clears_a_revoked_row() {
+    let (mut engine, _dir) = engine(FakeServer::serving(payload(2048, 18)), QUOTA);
+    let src = source(25);
+    declared(&mut engine, src);
+    let media = key(src, "revoked-deletable");
+    assert_eq!(engine.admit(media.clone(), labels("t"), None), Ok(()));
+    assert_eq!(
+        drive_until_terminal(&mut engine, &media),
+        JobState::Committed
+    );
+    engine.reconcile_licence_revoked(&src);
+    let path = match engine.catalogue(&media) {
+        OfflineCatalogueEntry::Revoked(snapshot) => snapshot.cache_path.clone(),
+        other => panic!("expected revoked, got {other:?}"),
+    };
+    // A revoked row stays charged while its file is preserved.
+    assert_eq!(engine.board().committed_bytes, 2048);
+    assert!(engine.delete_cached(&media).unwrap());
+    assert!(!std::path::Path::new(&path).exists());
+    assert_eq!(engine.catalogue(&media), OfflineCatalogueEntry::LiveOnly);
+    assert_eq!(engine.board().committed_bytes, 0);
+}
+
+#[test]
+fn a_refresh_after_revocation_settles_the_revoked_charge() {
+    let (mut engine, _dir) = engine(FakeServer::serving(payload(2048, 19)), QUOTA);
+    let src = source(26);
+    declared(&mut engine, src);
+    let media = key(src, "revoked-then-refreshed");
+    assert_eq!(engine.admit(media.clone(), labels("t"), None), Ok(()));
+    assert_eq!(
+        drive_until_terminal(&mut engine, &media),
+        JobState::Committed
+    );
+    engine.reconcile_licence_revoked(&src);
+    assert!(matches!(
+        engine.catalogue(&media),
+        OfflineCatalogueEntry::Revoked(_)
+    ));
+
+    // The licence returns and the user re-downloads the same track: the
+    // revoked predecessor's charge must be released at publish, never
+    // orphaned with no row left to evict.
+    engine.set_source_position(
+        src,
+        SourceOfflinePosition::Declared(OperationalLicence::SourceDeclared),
+    );
+    engine.backend = FakeServer::serving(payload(2048, 20));
+    assert_eq!(engine.admit(media.clone(), labels("t"), None), Ok(()));
+    assert_eq!(
+        drive_until_terminal(&mut engine, &media),
+        JobState::Committed
+    );
+    assert_eq!(
+        engine.board().committed_bytes,
+        2048,
+        "the ledger holds exactly the fresh snapshot's charge"
+    );
+}
+
 // -- source replacement ---------------------------------------------------------
 
 #[test]

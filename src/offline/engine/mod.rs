@@ -441,10 +441,17 @@ impl<B: TransferBackend> OfflineEngine<B> {
     /// User-driven "Remove download": unlink the file, drop the row, release
     /// the quota charge. Returns `false` when nothing was cached.
     pub fn delete_cached(&mut self, key: &MediaKey) -> Result<bool, OfflineError> {
-        let Some(snapshot) = self.catalog.remove(key) else {
-            return Ok(false);
+        let snapshot = match self.catalog.resolve(key) {
+            OfflineCatalogueEntry::Cached(snapshot) | OfflineCatalogueEntry::Revoked(snapshot) => {
+                snapshot
+            }
+            OfflineCatalogueEntry::LiveOnly => return Ok(false),
         };
+        // The unlink is the only fallible step: the row and its charge
+        // stay until it succeeds, so a failed delete remains retryable
+        // instead of stranding an undeletable, quota-charged row.
         self.store.unlink_snapshot(&snapshot)?;
+        self.catalog.remove(key);
         self.ledger.release(snapshot.byte_size);
         Ok(true)
     }

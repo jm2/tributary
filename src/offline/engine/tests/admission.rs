@@ -51,9 +51,23 @@ fn admission_refuses_in_flight_duplicates_and_untrusted_byte_hints() {
         engine.admit(media.clone(), labels("t"), None),
         Err(AdmissionRefusal::AlreadyInFlight)
     );
-    // A hint above the contract's trusted ceiling is malformed input.
+    // An honest audio Content-Length is trusted advisory metadata:
+    // admitted, never charged until bytes commit.
     assert_eq!(
-        engine.admit(key(source(1), "track-2"), labels("t"), Some(5 * 1024)),
+        engine.admit(
+            key(source(1), "track-2"),
+            labels("t"),
+            Some(48 * 1024 * 1024)
+        ),
+        Ok(())
+    );
+    // A hint above the contract's per-file ceiling is malformed input.
+    assert_eq!(
+        engine.admit(
+            key(source(1), "track-3"),
+            labels("t"),
+            Some(513 * 1024 * 1024)
+        ),
         Err(AdmissionRefusal::ByteHintUntrusted)
     );
     // After the predecessor reaches a terminal state, a fresh job is
