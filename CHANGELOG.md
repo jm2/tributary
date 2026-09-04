@@ -20,7 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   controls are refused with the exclusive-control-required error and orphan cleanup retains
   the queue entry — until the user explicitly reconfirms by re-selecting the output. Quiet
   status polling never grants or restores authority, and a lapsed supervisor is terminal for
-  the output instance. The `exclusive_control: false` default, the fail-closed load gate, the
+  the output instance. The 2 s supervision age is enforced eagerly at every authority gate —
+  public loads, public playback controls, worker commands, and orphan cleanup — so a
+  confirmation whose clean evidence has gone stale is refused immediately (and lapses the
+  supervisor) instead of staying valid until the next poll observes the gap, and a `status`
+  reply that omits any of the four partition-option fields fails the poll rather than
+  defaulting the omission to a clean `false`. The `exclusive_control: false` default, the fail-closed load gate, the
   refuse-before-Buffering/epoch/enqueue ordering, and the relinquish-without-racy-stop rule
   for a foreign current song are all preserved; legacy `outputs.json` entries continue to
   deserialize with `detection_enabled: false`, and a legacy `detection_enabled: true` entry
