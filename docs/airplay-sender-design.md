@@ -714,6 +714,10 @@ record for the selected path must add, at minimum:
   the **15/39** active-backlog count
   ([`docs/task.md:26-34`](task.md)) stays ahead of this work in the
   backlog order.
-- It does not change `docs/task.md` or
-  `docs/release-component-policy.md` in this record; both are updated
-  by the implementation records that accept this design.
+- Its only changes outside its own file are the two cross-references
+  this branch already carries — the flipped P2.4 checkbox in
+  [`docs/task.md`](task.md) and the follow-on note in
+  [`docs/release-component-policy.md`](release-component-policy.md).
+  The substantive updates to both — the dependency decision, the
+  shared-policy containment run, the changelog entry — belong to the
+  implementation records that accept this design.
