@@ -287,36 +287,29 @@ struct PlaylistMutationFailedCopy {
 /// `few`/`many`. Counts are integers, so the fractional `other` branch of
 /// those two languages never applies.
 fn plural_category(locale: &str, count: usize) -> &'static str {
-    let language = locale.split(['-', '_']).next().unwrap_or(locale);
+    let language: String = locale
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect();
+    match language.as_str() {
+        "pl" => few_many_category(count, count == 1),
+        "ru" => few_many_category(count, count % 10 == 1 && count % 100 != 11),
+        _ if count == 1 => "one",
+        _ => "other",
+    }
+}
+
+/// `one`/`few`/`many` split shared by Polish and Russian for whole numbers;
+/// only the `one` rule differs, so the caller supplies it.
+fn few_many_category(count: usize, one: bool) -> &'static str {
     let tens = count % 10;
     let hundreds = count % 100;
-    let few = (2..=4).contains(&tens) && !(12..=14).contains(&hundreds);
-    match language {
-        "pl" => {
-            if count == 1 {
-                "one"
-            } else if few {
-                "few"
-            } else {
-                "many"
-            }
-        }
-        "ru" => {
-            if tens == 1 && hundreds != 11 {
-                "one"
-            } else if few {
-                "few"
-            } else {
-                "many"
-            }
-        }
-        _ => {
-            if count == 1 {
-                "one"
-            } else {
-                "other"
-            }
-        }
+    if one {
+        "one"
+    } else if (2..=4).contains(&tens) && !(12..=14).contains(&hundreds) {
+        "few"
+    } else {
+        "many"
     }
 }
 
