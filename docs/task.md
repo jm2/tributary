@@ -25,7 +25,7 @@ state.
 
 Current status: **15/39 (38.5%)** active implementation records complete. This percentage measures
 checklist completion, not equal engineering effort: several P3 records are deliberately large
-epics. The archived remediation remains **222/225 (98.7%)** complete; its three open records are
+epics. The archived remediation remains **223/226 (98.7%)** complete; its three open records are
 real-environment validation, not missing implementation.
 
 Release checkpoint: v0.6.2 (2026-09-01) packages OwnTone compressed-cache compatibility together
