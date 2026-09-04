@@ -16,7 +16,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -164,10 +164,10 @@ pub struct MtpStagingWrite {
     pub device_id: MtpDeviceId,
     /// Storage the fetch targets.
     pub storage_id: u32,
-    /// Object handle to fetch.
+    /// Object handle to fetch. The executor fetches the bytes through
+    /// the session with this handle; the planner never carries payload
+    /// bytes itself.
     pub object_handle: MtpObjectHandle,
-    /// Bytes the planner will write.
-    pub bytes: Vec<u8>,
     /// Where in the staging directory the bytes will be written. The
     /// path is relative to the staging root; the executor's read
     /// authority is the staging root, so the relative path is the
@@ -239,7 +239,7 @@ impl MtpTransferPlanner {
         if !request.budget.allows_any() {
             return Err(MtpPlanError::EmptyBrowse);
         }
-        if request.staging_root.as_os_str().is_empty() {
+        if request.staging_root.as_os_str().is_empty() || !request.staging_root.is_dir() {
             return Err(MtpPlanError::StagingRootMissing {
                 path: request.staging_root.clone(),
             });
@@ -342,7 +342,6 @@ fn build_transfer_item(
             device_id: request.session.device_id().clone(),
             storage_id: request.storage.storage_id,
             object_handle: object.handle,
-            bytes: Vec::new(),
             staging_relative_path: staging_relative.clone(),
             destination_relative_path: destination_relative.clone(),
         },
@@ -409,33 +408,33 @@ fn destination_path_for(
     request: &MtpTransferRequest,
     staging_relative: &Path,
 ) -> Result<PathBuf, MtpPlanError> {
+    // Only plain relative components are allowed in the destination
+    // root: `..`, a leading `/`, a Windows prefix, or `.` would let a
+    // configured root escape the destination authority.
+    for component in request.destination_relative_root.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(MtpPlanError::AbsoluteDestinationPath {
+                path: request.destination_relative_root.clone(),
+            });
+        }
+    }
     // Strip the leading `device-<id>` component the staging path
     // builder added. The destination is rooted beneath
-    // `request.destination_relative_root`.
-    let staging_components: Vec<String> = staging_relative
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    if staging_components.is_empty() {
+    // `request.destination_relative_root`, joined component by
+    // component with `PathBuf::push` so non-UTF-8 device names survive
+    // intact and the platform separator is used throughout instead of
+    // a hardcoded `/`.
+    let mut staging_components = staging_relative.components();
+    if staging_components.next().is_none() {
         return Err(MtpPlanError::HostPathLeaked(format!(
             "staging path is empty for object {}",
             object.handle
         )));
     }
-    let mut components: Vec<String> = vec![request
-        .destination_relative_root
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/")];
-    for component in staging_components.into_iter().skip(1) {
-        if component.is_empty() {
-            continue;
-        }
-        components.push(component);
+    let mut path = request.destination_relative_root.clone();
+    for component in staging_components {
+        path.push(component.as_os_str());
     }
-    let joined = components.join("/");
-    let path = PathBuf::from(joined);
     if path.as_os_str().is_empty() {
         return Err(MtpPlanError::HostPathLeaked(format!(
             "destination path is empty for object {}",
@@ -691,5 +690,47 @@ mod tests {
             Err(MtpPlanError::AbsoluteDestinationPath { .. })
         ));
         cleanup(&staging);
+    }
+
+    #[test]
+    fn plan_rejects_parent_dir_in_destination_root() {
+        let transport = InMemoryMtpTransport::single_device(descriptor());
+        let session = Arc::new(transport.open_session(&descriptor()).expect("session"));
+        let staging = unique_root("dotdot");
+        let request = MtpTransferRequest {
+            session,
+            storage: storage_descriptor(),
+            objects: vec![object(1, None, "song.flac", 5)],
+            staging_root: staging.clone(),
+            destination_relative_root: PathBuf::from("../outside"),
+            budget: TransferBudget::with_caps(1024, 1, 1024),
+        };
+        let result = MtpTransferPlanner::new().plan(&request);
+        assert!(matches!(
+            result,
+            Err(MtpPlanError::AbsoluteDestinationPath { .. })
+        ));
+        cleanup(&staging);
+    }
+
+    #[test]
+    fn plan_rejects_missing_staging_root() {
+        let transport = InMemoryMtpTransport::single_device(descriptor());
+        let session = Arc::new(transport.open_session(&descriptor()).expect("session"));
+        let staging = unique_root("missing");
+        cleanup(&staging); // ensure the directory does not exist
+        let request = MtpTransferRequest {
+            session,
+            storage: storage_descriptor(),
+            objects: vec![object(1, None, "song.flac", 5)],
+            staging_root: staging,
+            destination_relative_root: PathBuf::from("Music"),
+            budget: TransferBudget::with_caps(1024, 1, 1024),
+        };
+        let result = MtpTransferPlanner::new().plan(&request);
+        assert!(matches!(
+            result,
+            Err(MtpPlanError::StagingRootMissing { .. })
+        ));
     }
 }

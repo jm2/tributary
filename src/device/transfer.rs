@@ -477,7 +477,20 @@ impl TransferPlanner {
                 Ok(relative) => relative.to_path_buf(),
                 Err(_) => continue,
             };
-            let source_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            // A metadata failure must not silently become a zero-byte
+            // stage: that would let a plan slip past the capacity
+            // budget and skip the post-copy size check.
+            let source_size = entry
+                .metadata()
+                .map_err(|error| {
+                    TransferError::io(
+                        "failed to read source entry metadata during planning",
+                        error
+                            .into_io_error()
+                            .unwrap_or_else(|| io::Error::other("walkdir error without payload")),
+                    )
+                })?
+                .len();
 
             // Build the destination path by replacing the source prefix.
             let strip_prefix = &item.source_relative_path;

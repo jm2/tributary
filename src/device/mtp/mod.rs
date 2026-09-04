@@ -48,7 +48,10 @@ pub use browse::{BrowseBudget, MtpBrowser, MtpObject, MtpObjectKind};
 #[allow(unused_imports)]
 pub use identity::{MtpDeviceId, MtpDeviceVendor, MtpUsbDescriptor};
 #[allow(unused_imports)]
-pub use planner::{MtpTransferPlanner, MtpTransferRequest, MtpTransferStage, TransferBudget};
+pub use planner::{
+    MtpPlanError, MtpStagingWrite, MtpTransferPlan, MtpTransferPlanner, MtpTransferRequest,
+    MtpTransferStage, TransferBudget,
+};
 #[allow(unused_imports)]
 pub use transport::{MtpSession, MtpTransport, MtpTransportError};
 
