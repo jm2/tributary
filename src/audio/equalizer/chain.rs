@@ -35,6 +35,64 @@ fn make_element(factory: &'static str, name: &str) -> Result<gst::Element, EqBin
         .map_err(|_| EqBinBuildError::ElementUnavailable(factory))
 }
 
+/// Create the ordered filter-graph elements. The clipper slot exists only
+/// when clip protection is on (see `EqChain::build`).
+fn make_chain_elements(with_clipper: bool) -> Result<Vec<gst::Element>, EqBinBuildError> {
+    let mut specs: Vec<(&'static str, &str)> = vec![
+        ("audioresample", "eq-pre-resample"),
+        ("audioconvert", "eq-pre-convert"),
+        ("capsfilter", "eq-format-pin"),
+        ("volume", "eq-preamp"),
+        ("equalizer-10bands", "eq"),
+    ];
+    if with_clipper {
+        specs.push(("rglimiter", "clipper"));
+    }
+    specs.extend([
+        ("audioconvert", "eq-post-convert"),
+        ("audioresample", "eq-post-resample"),
+        ("capsfilter", "eq-sink-pin"),
+    ]);
+    let elements: Vec<gst::Element> = specs
+        .into_iter()
+        .map(|(factory, name)| make_element(factory, name))
+        .collect::<Result<_, _>>()?;
+    if with_clipper {
+        grab_element(&elements, "clipper").set_property("enabled", true);
+    }
+    Ok(elements)
+}
+
+/// The pre-EQ capsfilter pins F32LE stereo interleaved; the sample rate
+/// stays negotiable so `audioresample` follows the rate `playbin3`
+/// negotiates with the decoder.
+fn set_format_pin_caps(format_pin: gst::Element) {
+    format_pin.set_property(
+        "caps",
+        gst::Caps::builder("audio/x-raw")
+            .field("format", "F32LE")
+            .field("channels", 2)
+            .field("layout", "interleaved")
+            .build(),
+    );
+}
+
+/// Look up one of the just-created chain elements by its unique name.
+fn grab_element(elements: &[gst::Element], name: &str) -> gst::Element {
+    elements
+        .iter()
+        .find(|element| element.name() == name)
+        .cloned()
+        .expect("chain element present")
+}
+
+/// Remove a partial layout again so the bin is left empty.
+fn rollback_elements(bin: &gst::Bin, elements: &[gst::Element]) {
+    for element in elements {
+        let _ = bin.remove(element);
+    }
+}
+
 /// Return one limiter element to NULL and remove it from the bin.
 /// `gst_bin_remove` requires a NULL-state child.
 fn drop_limiter_from_bin(bin: &gst::Bin, clipper: &gst::Element) {
@@ -74,67 +132,46 @@ impl EqChain {
     /// error to the bus, and the caller rolls the bin back to passthrough.
     pub fn build(settings: &EqSettings) -> Result<Self, EqBinBuildError> {
         let bin = gst::Bin::with_name("eq-bin");
+        let with_clipper = settings.clip_protection == ClipProtection::Soft;
+        let elements = make_chain_elements(with_clipper)?;
+        set_format_pin_caps(grab_element(&elements, "eq-format-pin"));
+        Self::install(&bin, &elements)?;
 
-        let pre_resample = make_element("audioresample", "eq-pre-resample")?;
-        let pre_convert = make_element("audioconvert", "eq-pre-convert")?;
-        let format_pin = make_element("capsfilter", "eq-format-pin")?;
-        let preamp = make_element("volume", "eq-preamp")?;
-        let eq = make_element("equalizer-10bands", "eq")?;
-        let post_convert = make_element("audioconvert", "eq-post-convert")?;
-        let post_resample = make_element("audioresample", "eq-post-resample")?;
-        let sink_pin = make_element("capsfilter", "eq-sink-pin")?;
-
-        format_pin.set_property(
-            "caps",
-            gst::Caps::builder("audio/x-raw")
-                .field("format", "F32LE")
-                .field("channels", 2)
-                .field("layout", "interleaved")
-                .build(),
-        );
-
-        let elements: Vec<gst::Element> = if settings.clip_protection == ClipProtection::Soft {
-            let clipper = make_element("rglimiter", "clipper")?;
-            clipper.set_property("enabled", true);
-            vec![
-                pre_resample,
-                pre_convert,
-                format_pin,
-                preamp.clone(),
-                eq.clone(),
-                clipper,
-                post_convert.clone(),
-                post_resample,
-                sink_pin,
-            ]
-        } else {
-            vec![
-                pre_resample,
-                pre_convert,
-                format_pin,
-                preamp.clone(),
-                eq.clone(),
-                post_convert.clone(),
-                post_resample,
-                sink_pin,
-            ]
+        let chain = Self {
+            bin,
+            preamp: grab_element(&elements, "eq-preamp"),
+            eq: grab_element(&elements, "eq"),
+            post_convert: grab_element(&elements, "eq-post-convert"),
+            clipper: elements
+                .iter()
+                .find(|element| element.name() == "clipper")
+                .cloned(),
         };
+        chain.apply_band_transaction(settings);
+        Ok(chain)
+    }
 
-        let rollback = |elements: &[gst::Element]| {
-            for element in elements {
-                let _ = bin.remove(element);
-            }
-        };
+    /// Add, link, and expose `elements` on `bin`. On any failure the
+    /// partial layout is removed again so the bin is left empty and the
+    /// caller falls back to passthrough.
+    fn install(bin: &gst::Bin, elements: &[gst::Element]) -> Result<(), EqBinBuildError> {
+        let outcome = Self::add_and_link_and_expose(bin, elements);
+        if outcome.is_err() {
+            rollback_elements(bin, elements);
+        }
+        outcome
+    }
 
-        if bin.add_many(&elements).is_err() {
-            rollback(&elements);
+    fn add_and_link_and_expose(
+        bin: &gst::Bin,
+        elements: &[gst::Element],
+    ) -> Result<(), EqBinBuildError> {
+        if bin.add_many(elements).is_err() {
             return Err(EqBinBuildError::ConstructionFailed);
         }
-        if gst::Element::link_many(&elements).is_err() {
-            rollback(&elements);
+        if gst::Element::link_many(elements).is_err() {
             return Err(EqBinBuildError::ConstructionFailed);
         }
-
         let sink_ghost = Self::ghost_pad(&elements[0], "sink", "audio-filter-sink")?;
         let src_ghost = Self::ghost_pad(
             elements.last().expect("non-empty"),
@@ -142,24 +179,9 @@ impl EqChain {
             "audio-filter-src",
         )?;
         if bin.add_pad(&sink_ghost).is_err() || bin.add_pad(&src_ghost).is_err() {
-            rollback(&elements);
             return Err(EqBinBuildError::ConstructionFailed);
         }
-
-        let clipper = elements
-            .iter()
-            .find(|element| element.name() == "clipper")
-            .cloned();
-
-        let chain = Self {
-            bin,
-            preamp,
-            eq,
-            post_convert,
-            clipper,
-        };
-        chain.apply_band_transaction(settings);
-        Ok(chain)
+        Ok(())
     }
 
     /// Build one directional ghost pad over the bin's edge element.
