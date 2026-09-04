@@ -179,16 +179,8 @@ impl PlaylistMutationContext {
     }
 
     fn show_added(&self, count: usize, playlist_name: &str) {
-        // `AdwToast` titles are Pango markup by default; escape the
-        // user-controlled playlist name so `&`/`<` in it render literally
-        // instead of being parsed as markup.
-        let message = rust_i18n::t!(
-            "context.playlist_add_success",
-            count = count,
-            playlist = gtk::glib::markup_escape_text(playlist_name)
-        );
-        self.toast_overlay
-            .add_toast(adw::Toast::new(message.as_ref()));
+        let message = playlist_add_success_message(&rust_i18n::locale(), count, playlist_name);
+        self.toast_overlay.add_toast(adw::Toast::new(&message));
     }
 
     fn add_candidates_to_playlist(
@@ -285,6 +277,23 @@ struct UnsupportedPlaylistAddCopy {
 struct PlaylistMutationFailedCopy {
     heading: String,
     body: String,
+}
+
+fn playlist_add_success_message(locale: &str, count: usize, playlist_name: &str) -> String {
+    let key = if count == 1 {
+        "context.playlist_add_success.one"
+    } else {
+        "context.playlist_add_success.other"
+    };
+    // `AdwToast` titles are Pango markup by default. Keep the user-controlled
+    // name escaped on the same path that selects and renders the translation.
+    rust_i18n::t!(
+        key,
+        locale = locale,
+        count = count,
+        playlist = gtk::glib::markup_escape_text(playlist_name)
+    )
+    .into_owned()
 }
 
 fn unsupported_playlist_add_copy(locale: &str) -> UnsupportedPlaylistAddCopy {
@@ -1502,6 +1511,48 @@ mod tests {
             if locale != "en" {
                 assert_ne!(localized, english, "{locale} must not fall back to English");
             }
+        }
+    }
+
+    #[test]
+    fn playlist_add_success_selects_plural_form_and_escapes_playlist_markup() {
+        assert_eq!(
+            playlist_add_success_message("en", 1, "R&B <Mix>"),
+            "1 track added to R&amp;B &lt;Mix&gt;."
+        );
+        assert_eq!(
+            playlist_add_success_message("en", 2, "R&B <Mix>"),
+            "2 tracks added to R&amp;B &lt;Mix&gt;."
+        );
+
+        for locale in rust_i18n::available_locales!() {
+            let one = playlist_add_success_message(&locale, 1, "R&B <Mix>");
+            let other = playlist_add_success_message(&locale, 2, "R&B <Mix>");
+            let expected_one = rust_i18n::t!(
+                "context.playlist_add_success.one",
+                locale = locale,
+                count = 1,
+                playlist = "R&amp;B &lt;Mix&gt;"
+            );
+            let expected_other = rust_i18n::t!(
+                "context.playlist_add_success.other",
+                locale = locale,
+                count = 2,
+                playlist = "R&amp;B &lt;Mix&gt;"
+            );
+
+            assert_eq!(one, expected_one, "{locale}: singular form");
+            assert_eq!(other, expected_other, "{locale}: plural form");
+            assert!(!one.contains("%{count}"), "{locale}: singular count");
+            assert!(!other.contains("%{count}"), "{locale}: plural count");
+            assert!(
+                one.contains("R&amp;B &lt;Mix&gt;"),
+                "{locale}: escaped name"
+            );
+            assert!(
+                other.contains("R&amp;B &lt;Mix&gt;"),
+                "{locale}: escaped name"
+            );
         }
     }
 

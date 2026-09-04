@@ -194,7 +194,9 @@ context:
   playlist_add_unsupported_heading: "Nummers zijn niet toegevoegd"
   playlist_add_unsupported_body: "Ten minste één geselecteerd nummer is niet beschikbaar of wordt niet ondersteund in gewone afspeellijsten. Er is niets toegevoegd."
   playlist_drag_description: "Sleep geselecteerde nummers naar een gewone afspeellijst. Escape annuleert; Shift+F10 is het toetsenbordalternatief."
-  playlist_add_success: "%{count} nummers toegevoegd aan %{playlist}."
+  playlist_add_success:
+    one: "%{count} nummer toegevoegd aan %{playlist}."
+    other: "%{count} nummers toegevoegd aan %{playlist}."
 
 # ── Gewone afspeellijsten ─────────────────────────────────────────
 regular_playlist:
