@@ -420,14 +420,29 @@ pub fn build_browser(
     // ── Layout ───────────────────────────────────────────────────────
     let panes_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .homogeneous(true)
         .spacing(1)
         .vexpand(true)
         .build();
-    panes_box.append(&genre_pane);
-    panes_box.append(&artist_pane);
-    panes_box.append(&album_pane);
-    panes_box.append(&folder_pane);
+    // A real 1px `.browser-separator` gutter between the panes (HIG: a
+    // gutter, not a hard divider). Homogeneous is off because a
+    // homogeneous Box counts the separators in its equal split and would
+    // shrink every pane; each pane expands instead, and a Box distributes
+    // the extra width equally across expanding children, which preserves
+    // the equal-pane layout.
+    for (index, pane) in [&genre_pane, &artist_pane, &album_pane, &folder_pane]
+        .into_iter()
+        .enumerate()
+    {
+        if index > 0 {
+            let separator = gtk::Separator::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .css_classes(["browser-separator"])
+                .build();
+            panes_box.append(&separator);
+        }
+        pane.set_hexpand(true);
+        panes_box.append(pane);
+    }
 
     let browser_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -593,10 +608,21 @@ fn bind_browser_row(list_item: &gtk::ListItem, item: &BrowserItem) {
         .child()
         .and_downcast::<BrowserRow>()
         .expect("BrowserRow attached in setup");
-    let count_text = format!("({})", item.count());
+    // Folder navigation and status rows carry no count; render only the
+    // label rather than a meaningless "(0)" — numeric secondary text is
+    // only announced when it carries information (HIG).
+    let count_text = if item.count() > 0 {
+        format!("({})", item.count())
+    } else {
+        String::new()
+    };
     row.label().set_text(&item.label());
     row.count().set_text(&count_text);
-    let accessible = format!("{}, {}", item.label(), count_text);
+    let accessible = if count_text.is_empty() {
+        item.label()
+    } else {
+        format!("{}, {}", item.label(), count_text)
+    };
     list_item.set_accessible_label(&accessible);
 }
 
@@ -1026,7 +1052,11 @@ fn get_store_from_pane(pane: &gtk::Box) -> Option<gio::ListStore> {
         .and_then(|m| m.downcast::<gio::ListStore>().ok())
 }
 
-#[cfg(test)]
+// macOS is excluded at the module level: GTK's Quartz backend panics when
+// initialized from the test harness worker thread. Gating only the test
+// function instead would leave `use super::*` unused on macOS and fail the
+// `-D warnings` clippy pass there (observed in run 33921896331).
+#[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
 
@@ -1034,7 +1064,8 @@ mod tests {
     /// `GtkListItem` — the list-row boundary assistive technology
     /// actually navigates — not on an inner widget, and the child labels
     /// must be presentational so the row is announced as a single
-    /// utterance ("Artist Name, (123)").
+    /// utterance ("Artist Name, (123)"). Zero-count rows (folder
+    /// navigation and status) must render and announce only the label.
     ///
     /// This drives the real factory setup signal, then the exact
     /// production bind / unbind helpers on a standalone `GtkListItem`,
@@ -1046,16 +1077,25 @@ mod tests {
     /// list; `bind_browser_row` / `unbind_browser_row` are the exact
     /// functions the closure calls.)
     ///
-    /// Headless CI (cargo test in a container with no X/Wayland socket)
-    /// cannot initialize GTK, so the test gates on `gtk::init()`'s
-    /// non-panicking result and skips with a printed reason. macOS is
-    /// excluded because GTK's Quartz backend panics when initialized
-    /// from the test harness worker thread. The contract still holds on
-    /// any machine with a display (or a Broadway headless server) — run
-    /// there to exercise it.
-    #[cfg(not(target_os = "macos"))]
+    /// Skips on headless machines BEFORE initializing GTK: headless GTK
+    /// can still come up via its Broadway fallback, and a test process
+    /// that initialized GTK without a real display session segfaults in
+    /// GTK teardown at exit (observed as SIGSEGV after all tests passed
+    /// on headless Linux CI, run 33921896331). A display session
+    /// (`$WAYLAND_DISPLAY` or `$DISPLAY`) is required both to exercise
+    /// the contract meaningfully and to exit cleanly.
     #[test]
     fn browser_row_accessible_label_exposed_on_list_item_boundary() {
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
+            eprintln!(
+                "browser_row_accessible_label_exposed_on_list_item_boundary: \
+                 no display session ($WAYLAND_DISPLAY/$DISPLAY unset); \
+                 skipping. Re-run inside a desktop session to exercise the \
+                 contract."
+            );
+            return;
+        }
+
         if let Err(e) = gtk::init() {
             eprintln!(
                 "browser_row_accessible_label_exposed_on_list_item_boundary: \
@@ -1107,6 +1147,32 @@ mod tests {
             "",
             "unbind must reset the accessible label"
         );
+        assert_eq!(row.label().text(), "");
+        assert_eq!(row.count().text(), "");
+
+        // Zero-count rows (folder navigation and status) carry no count:
+        // render and announce only the label, never a meaningless "(0)".
+        let nav_item = BrowserItem::new("Folder browsing follows the local library sources", 0);
+        bind_browser_row(&list_item, &nav_item);
+        assert_eq!(
+            row.count().text(),
+            "",
+            "zero-count rows must not render a count"
+        );
+        assert_eq!(
+            list_item.accessible_label(),
+            "Folder browsing follows the local library sources",
+            "zero-count accessible label must be the bare label"
+        );
+        assert_eq!(
+            row.label().text(),
+            "Folder browsing follows the local library sources"
+        );
+
+        // The recycled item must still reset cleanly after a zero-count
+        // bind.
+        unbind_browser_row(&list_item);
+        assert_eq!(list_item.accessible_label(), "");
         assert_eq!(row.label().text(), "");
         assert_eq!(row.count().text(), "");
     }
