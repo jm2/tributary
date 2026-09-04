@@ -48,7 +48,7 @@ the download/cache engine must satisfy.
 
 | Area | What this document decides | What is explicitly reserved |
 | --- | --- | --- |
-| Identity | Cache entries use the same `SourceId` + `TrackId` shape as live playback. The download engine mints or adopts a per-source `MediaKey`; it never invents a new identity kind. | New persisted identifier types, new schema migrations, on-disk naming conventions beyond `task.md` and the credential-boundary section. |
+| Identity | Cache entries use the same `SourceId` + `TrackId` shape as live playback. The download engine adopts the live per-source `MediaKey`; it never invents a new identity kind. | New persisted identifier types, new schema migrations, on-disk naming conventions beyond `task.md` and the credential-boundary section. |
 | Authority | Every cached media entry remains owned by its source. The source registry's exact-snapshot capability gates download admission, reconciliation, and retirement. A committed snapshot renders offline without a live registry round-trip; disconnect and refresh never gate playback of committed bytes. No offline bypass of the registry for admission. | Concurrent access contracts for the registry's offline catalogue; specific read-side materialisation policies. |
 | Download jobs | A bounded resumable job model keyed by exact `(SourceId, TrackId)` with a durable, `fsync`'d progress journal, entity validators (`If-Range`) on every range request, opaque server caps, deterministic cancellation, and structured redacted failures. Job state survives restart; it is never memory-only. | Concrete worker pool scheduling, threading model, runtime selection, telemetry. |
 | Storage | Verify-then-publish: the temp file lives in the same directory (same filesystem) as its final cache path, integrity is verified on the temp file before any rename, and publish is an atomic rename with a parent-directory `fsync`. Cross-filesystem publish is refused at admission, never emulated with copy+sync+delete. A `tracks` row may link to a cache path only when integrity passed and the file is current. | Database migrations, schema, table layout, index choice, cache placement, encryption. |
@@ -519,7 +519,7 @@ implementation record. The migration:
    provenance in use — so that job state is durable across process
    restarts. No offline job is memory-only.
 3. Persists no row that points at a missing or partial file. Promotion to a
-   cached row is exactly the moment the verified rename (step 6 of Atomic
+   cached row is exactly the moment the verified rename (step 5 of Atomic
    storage) succeeds.
 4. Is reversible in the same way as migration 13: any error restores the
    complete predecessor schema and data so the upgrade remains retryable.
@@ -542,7 +542,7 @@ Each slice lands with its own focused regression suite. The slices are:
 | Licensing | Default-deny; revocation retires rows but preserves files. |
 | Reconciliation | Refresh creates a sibling; no in-place mutation; unlink is content-aware. |
 | Cancellation | Lifecycle supersession cancels in-flight jobs. |
-| Quota and eviction | Newest-source-first eviction; transactional unlink. |
+| Quota and eviction | Eviction walks sources oldest-cache-first, newest-first within a source; transactional unlink. |
 | UI | Credential-free GTK rows; localised progress and failure. |
 
 The contract does not bless a single language binding or test framework; it
