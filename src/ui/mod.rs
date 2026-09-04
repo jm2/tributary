@@ -1,6 +1,7 @@
 //! UI module — GTK4 / libadwaita interface components.
 
 pub mod album_art;
+pub mod album_art_cache;
 pub mod album_pane_art;
 pub mod browser;
 pub mod context_menu;
