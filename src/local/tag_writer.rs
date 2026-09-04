@@ -680,40 +680,80 @@ fn atomic_tag_replacement(
 
     let (temp, destination) = TempFile::create_beside(target_path)?;
     #[cfg(target_os = "windows")]
-    let mut destination = {
-        let security_result = source_dacl.apply_to(&destination).with_context(|| {
-            format!(
-                "Failed to protect the tagged copy of {} with its original Windows DACL",
-                target_path.display()
-            )
-        });
-        drop(destination);
-        security_result?;
-        temp.reopen_exclusive_for_tagging().with_context(|| {
-            format!(
-                "The original Windows DACL of {} does not permit writing the tagged copy",
-                target_path.display()
-            )
-        })?
-    };
+    let mut destination = open_tag_copy_destination(source_dacl, destination, &temp, target_path)?;
     #[cfg(not(target_os = "windows"))]
     let mut destination = destination;
-    let copy_result = std::io::copy(&mut source, &mut destination)
-        .map(|_| ())
-        .with_context(|| format!("Failed to copy {} for tag writing", target_path.display()));
+    let copy_result = copy_source_into_destination(&mut source, &mut destination, target_path);
     drop(source);
     drop(destination);
     copy_result?;
 
     write_tags_to(temp.path(), edits)?;
+    flush_and_confirm_tagged_copy(&temp, target_path, confirm_replacement)?;
 
+    temp.persist_to(target_path)?;
+    tracing::debug!("Tags written successfully");
+    Ok(())
+}
+
+/// Protect the tagged copy with the source file's original DACL and reopen it
+/// exclusively for tagging.
+///
+/// Windows attribute inheritance applies at creation: the complete DACL must
+/// be installed before the first copied byte, and installing it can strip the
+/// creation handle's write access, so tagging reopens a fresh exclusive
+/// handle afterwards.
+#[cfg(target_os = "windows")]
+fn open_tag_copy_destination(
+    source_dacl: WindowsDacl,
+    destination: File,
+    temp: &TempFile,
+    target_path: &Path,
+) -> Result<File> {
+    let security_result = source_dacl.apply_to(&destination).with_context(|| {
+        format!(
+            "Failed to protect the tagged copy of {} with its original Windows DACL",
+            target_path.display()
+        )
+    });
+    drop(destination);
+    security_result?;
+    temp.reopen_exclusive_for_tagging().with_context(|| {
+        format!(
+            "The original Windows DACL of {} does not permit writing the tagged copy",
+            target_path.display()
+        )
+    })
+}
+
+/// Copy the source bytes into the tagged copy, reporting but not raising a
+/// copy failure so the caller can release both handles before surfacing it.
+fn copy_source_into_destination(
+    source: &mut File,
+    destination: &mut File,
+    target_path: &Path,
+) -> Result<()> {
+    std::io::copy(source, destination)
+        .map(|_| ())
+        .with_context(|| format!("Failed to copy {} for tag writing", target_path.display()))
+}
+
+/// Flush the tagged copy, carry over the replaced file's Unix permissions,
+/// and run the caller's final replacement gate.
+///
+/// The flush happens *before* the permission copy: replacing a read-only file
+/// would otherwise make the temp read-only too, and a read-only file cannot
+/// be flushed. Windows installs the complete DACL before the first copied
+/// byte; its std Permissions value represents only the DOS read-only
+/// attribute, so the permission carry-over is Unix-only.
+fn flush_and_confirm_tagged_copy(
+    temp: &TempFile,
+    target_path: &Path,
+    confirm_replacement: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     // Flush the tagged copy before it becomes the user's file. Without this a
     // crash between rename and writeback can leave a truncated file where the
     // original used to be.
-    //
-    // This happens *before* the permission copy below: replacing a read-only
-    // file would otherwise make the temp read-only too, and a read-only file
-    // cannot be flushed.
     flush_to_disk(temp.path()).with_context(|| {
         format!(
             "Failed to flush the tagged copy of {}",
@@ -722,8 +762,6 @@ fn atomic_tag_replacement(
     })?;
 
     // Best-effort: match the Unix permissions of the file being replaced.
-    // Windows installs the complete DACL before the first copied byte above;
-    // its std Permissions value represents only the DOS read-only attribute.
     #[cfg(unix)]
     if let Ok(metadata) = std::fs::metadata(target_path) {
         let _ = std::fs::set_permissions(temp.path(), metadata.permissions());
@@ -732,11 +770,7 @@ fn atomic_tag_replacement(
     // Last gate before the replacement becomes visible: an authority-checked
     // caller refuses here if the pathname no longer names the exact file it
     // copied from.
-    confirm_replacement()?;
-
-    temp.persist_to(target_path)?;
-    tracing::debug!("Tags written successfully");
-    Ok(())
+    confirm_replacement()
 }
 
 /// Flush a file's contents to disk.
