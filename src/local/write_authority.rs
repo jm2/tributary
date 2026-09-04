@@ -77,7 +77,13 @@ pub struct PreparedWriteTarget {
     /// Absolute path of the staged temporary file. Sibling of the destination
     /// so the rename is atomic on the same filesystem.
     staged_path: PathBuf,
-    staged_file: File,
+    /// Retained handle on the staged file. Taken and dropped before publish
+    /// or rollback: Windows refuses to rename or delete a path while any
+    /// handle on the file is open unless that handle shares delete access,
+    /// and the staged handle deliberately does not (it enforces exclusivity).
+    /// POSIX rename and unlink are indifferent to open handles, so closing
+    /// early is harmless there.
+    staged_file: Option<File>,
     resolution: ConflictResolution,
     committed: bool,
 }
@@ -105,28 +111,52 @@ impl PreparedWriteTarget {
     }
 
     /// Borrow the staged file for reads (e.g. computing a digest).
+    ///
+    /// The handle is only available before [`commit`](Self::commit) or
+    /// [`rollback`](Self::rollback); both close it so the Windows publish can
+    /// rename the staged path.
     pub fn staged_file(&self) -> &File {
-        &self.staged_file
+        self.staged_file
+            .as_ref()
+            .expect("staged file handle taken by commit or rollback")
     }
 
     /// Append `bytes` to the staged file.
     pub fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.authority.validate()?;
-        self.staged_file.write_all(bytes)?;
-        self.staged_file.flush()?;
+        let staged_file = self
+            .staged_file
+            .as_mut()
+            .expect("staged file handle taken by commit or rollback");
+        staged_file.write_all(bytes)?;
+        staged_file.flush()?;
         self.authority.validate()?;
         Ok(())
+    }
+
+    /// Close the retained staged-file handle before publish or rollback.
+    ///
+    /// Windows: `MoveFileExW` needs DELETE access on the source path, and
+    /// `DeleteFileW` the same through share modes; the staged handle is
+    /// opened without `FILE_SHARE_DELETE`, so any live handle on the file
+    /// makes both fail with a sharing violation (os error 32). Dropping our
+    /// own handle first is platform-neutral: POSIX rename/unlink never cared
+    /// about open handles.
+    fn close_staged_handle(&mut self) {
+        drop(self.staged_file.take());
     }
 
     /// Commit the staged file atomically to its destination.
     ///
     /// On Unix this is a single `rename(2)`; on Windows a `MoveFileExW`
-    /// replacement. The mount boundary is revalidated immediately before and
-    /// after the rename so a binder swap or remount between staging and
-    /// commit cannot authorise a partial publish.
+    /// replacement. The staged handle is closed first (see
+    /// [`Self::close_staged_handle`]), and the mount boundary is revalidated
+    /// immediately before and after the rename so a binder swap or remount
+    /// between staging and commit cannot authorise a partial publish.
     pub fn commit(mut self) -> io::Result<CommitOutcome> {
         let final_path = self.authority.root().join(&self.final_relative_path);
         self.authority.validate()?;
+        self.close_staged_handle();
         publish_atomic(&self.staged_path, &final_path)?;
         self.authority.validate()?;
         self.committed = true;
@@ -137,10 +167,11 @@ impl PreparedWriteTarget {
     }
 
     /// Discard the staged file and any partial writes.
-    pub fn rollback(self) -> io::Result<()> {
+    pub fn rollback(mut self) -> io::Result<()> {
         if self.committed {
             return Ok(());
         }
+        self.close_staged_handle();
         let outcome = rollback_staged(&self.staged_path);
         let _ = self.authority.validate();
         outcome
@@ -153,6 +184,7 @@ impl Drop for PreparedWriteTarget {
             return;
         }
         // Best-effort cleanup if the caller forgets to roll back explicitly.
+        self.close_staged_handle();
         let _ = rollback_staged(&self.staged_path);
     }
 }
@@ -280,7 +312,7 @@ impl MountedWriteAuthority {
             authority: Arc::clone(&self.mounted),
             final_relative_path: final_relative,
             staged_path: staged_path_abs,
-            staged_file,
+            staged_file: Some(staged_file),
             resolution,
             committed: false,
         })
