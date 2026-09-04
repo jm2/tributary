@@ -51,7 +51,7 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -665,6 +665,21 @@ fn destination_is_atomic(destination: &MountedWriteAuthority) -> bool {
     destination.validate().is_ok()
 }
 
+/// Progress and cancellation context for one copy stage.
+///
+/// Groups the progress-related parameters of
+/// [`TransferExecutor::execute_copy_file`] so the copy loop reads
+/// through a single borrowed context instead of a long parameter list.
+struct CopyStageContext<'a> {
+    /// Running byte total shared across all stages of the plan.
+    bytes_so_far: &'a mut u64,
+    total_bytes: u64,
+    stage_index: u32,
+    total_stages: u32,
+    progress: &'a mut dyn TransferProgress,
+    cancellation: &'a CancellationObserver,
+}
+
 /// The transfer executor. Holds the authorities and the plan; runs the
 /// stages in order; rolls back on failure or cancellation.
 pub struct TransferExecutor {
@@ -703,38 +718,52 @@ impl TransferExecutor {
                 return Err(TransferError::Cancelled);
             }
             progress.on_stage_started(stage, index as u32, total_stages);
-            match stage {
+            let stage_result = match stage {
                 Stage::CreateDirectory {
                     destination_relative_path,
-                } => {
-                    self.execute_create_directory(destination_relative_path)?;
-                }
+                } => self.execute_create_directory(destination_relative_path),
                 Stage::CopyFile {
                     source_relative_path,
                     destination_relative_path,
                     bytes,
                     atomic: _,
-                    conflict,
+                    conflict: _,
                 } => {
-                    let outcome = self.execute_copy_file(
-                        source_relative_path,
-                        destination_relative_path,
-                        *bytes,
-                        &mut bytes_so_far,
+                    let mut context = CopyStageContext {
+                        bytes_so_far: &mut bytes_so_far,
                         total_bytes,
-                        index as u32,
+                        stage_index: index as u32,
                         total_stages,
                         progress,
                         cancellation,
-                    )?;
-                    let _ = outcome;
-                    let _ = conflict;
-                    committed_files.push(destination_relative_path.clone());
+                    };
+                    self.execute_copy_file(
+                        source_relative_path,
+                        destination_relative_path,
+                        *bytes,
+                        &mut context,
+                    )
+                    // Rollback must target the path that was actually
+                    // published, which under `Preserve` is a
+                    // disambiguated sibling, not the planned destination.
+                    .map(|outcome| committed_files.push(outcome.relative_path))
                 }
                 Stage::RemoveFile { .. } => {
                     // RemoveFile stages are inserted only by the rollback path
                     // and never appear in a forward plan. Skip defensively.
+                    Ok(())
                 }
+            };
+            if let Err(error) = stage_result {
+                // Every stage failure — including a mid-copy cancellation —
+                // rolls back already-committed files before propagating, as
+                // promised by the module-level rollback contract.
+                self.rollback(&mut committed_files)
+                    .map_err(|rollback_error| TransferError::RollbackFailed {
+                        path: PathBuf::new(),
+                        context: rollback_error.to_string(),
+                    })?;
+                return Err(error);
             }
             committed_stages = committed_stages.saturating_add(1);
             progress.on_stage_completed(
@@ -778,18 +807,12 @@ impl TransferExecutor {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn execute_copy_file(
         &self,
         source_relative: &Path,
         destination_relative: &Path,
         declared_bytes: u64,
-        bytes_so_far: &mut u64,
-        total_bytes: u64,
-        stage_index: u32,
-        total_stages: u32,
-        progress: &mut dyn TransferProgress,
-        cancellation: &CancellationObserver,
+        context: &mut CopyStageContext<'_>,
     ) -> Result<CommitOutcome, TransferError> {
         self.request
             .source
@@ -802,7 +825,7 @@ impl TransferExecutor {
         let source_result = self.request.source.with_relative_file(
             source_relative,
             |mut source_file| -> io::Result<(CommitOutcome, u64)> {
-                let staged = self
+                let mut staged = self
                     .request
                     .destination
                     .prepare_write_relative_file(destination_relative, self.request.conflict_policy)
@@ -813,7 +836,7 @@ impl TransferExecutor {
                 let mut buffer = vec![0u8; CHUNK];
                 let mut copied: u64 = 0;
                 loop {
-                    if cancellation.is_cancelled() {
+                    if context.cancellation.is_cancelled() {
                         let _ = staged.rollback();
                         return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
                     }
@@ -824,20 +847,24 @@ impl TransferExecutor {
                     if read == 0 {
                         break;
                     }
+                    // Write through the prepared target, not the raw staged
+                    // handle: `PreparedWriteTarget::write_all` revalidates the
+                    // destination authority around every chunk (and flushes),
+                    // so an unmount mid-copy fails closed instead of writing
+                    // past an invalid boundary.
                     staged
-                        .staged_file()
                         .write_all(&buffer[..read])
                         .map_err(|error| TransferError::io("failed to write staged file", error))
                         .map_err(io::Error::other)?;
                     copied = copied.saturating_add(read as u64);
-                    *bytes_so_far = bytes_so_far.saturating_add(read as u64);
-                    progress.on_bytes_copied(stage_index, total_stages, *bytes_so_far, total_bytes);
+                    *context.bytes_so_far = context.bytes_so_far.saturating_add(read as u64);
+                    context.progress.on_bytes_copied(
+                        context.stage_index,
+                        context.total_stages,
+                        *context.bytes_so_far,
+                        context.total_bytes,
+                    );
                 }
-                staged
-                    .staged_file()
-                    .flush()
-                    .map_err(|error| TransferError::io("failed to flush staged file", error))
-                    .map_err(io::Error::other)?;
 
                 if declared_bytes != 0 && copied != declared_bytes {
                     let _ = staged.rollback();
@@ -898,15 +925,14 @@ fn _unused_os_string(_value: OsString) {}
 mod tests {
     use super::*;
 
-    use uuid::Uuid;
-
     use crate::local::write_authority::ConflictPolicy;
 
     fn unique(label: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("tributary-transfer-{label}-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("create root");
-        path
+        tempfile::Builder::new()
+            .prefix(&format!("tributary-transfer-{label}-"))
+            .tempdir()
+            .expect("create temp root")
+            .keep()
     }
 
     fn cleanup(path: &Path) {

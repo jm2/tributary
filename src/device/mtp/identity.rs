@@ -52,8 +52,9 @@ impl MtpUsbDescriptor {
                 "vendor id {vendor_id:#06x} is not a known MTP vendor"
             )));
         }
-        let serial = serial.into();
-        if serial.trim().is_empty() {
+        let serial: String = serial.into();
+        let serial = serial.trim().to_string();
+        if serial.is_empty() {
             return Err(MtpTransportError::InvalidDescriptor(
                 "device serial is empty".to_string(),
             ));

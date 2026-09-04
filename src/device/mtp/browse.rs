@@ -107,16 +107,20 @@ impl MtpBrowser {
             let children = list_children(session, handle)?;
             let next_depth = depth.saturating_add(u32::from(budget.allows_recursion()));
             for child in children {
+                // Enforce the entry cap inside the child loop: a single
+                // listing may exceed the remaining budget, and pushing
+                // every child unconditionally would breach `max_entries`.
+                if result.len() as u64 >= budget.max_entries() {
+                    break;
+                }
                 let kind = child.kind;
                 let child_handle = child.handle;
-                let child_parent = child.parent;
                 if by_handle.insert(child_handle, child.clone()).is_none() {
                     result.push(child);
                 }
                 if matches!(kind, MtpObjectKind::Folder) && budget.allows_recursion() {
                     pending.push((child_handle, next_depth));
                 }
-                let _ = child_parent;
             }
         }
 

@@ -256,12 +256,17 @@ impl MountedWriteAuthority {
 
         // The destination parent directory must be opened through the
         // retained authority so the boundary check matches the read path.
+        // The bound handle is kept alive and used to create the staged
+        // file (`openat` on Unix) so the parent cannot be swapped by a
+        // symlink or bind between validation and creation.
         let parent_components = parent_components_of(&components);
-        if parent_components.as_os_str().is_empty() {
-            let _root_bound = self.mounted.bind_root_directory()?;
+        let parent_bound = if parent_components.as_os_str().is_empty() {
+            self.mounted.bind_root_directory()?
         } else {
-            let _parent_bound = self.mounted.open_relative_directory(&parent_components)?;
-        }
+            self.mounted.open_relative_directory(&parent_components)?
+        };
+        let parent_handle = parent_bound.try_clone_file()?;
+        drop(parent_bound);
 
         let (resolution, final_relative, staged_dir) = match policy {
             ConflictPolicy::Skip if final_path.exists() => {
@@ -304,7 +309,7 @@ impl MountedWriteAuthority {
 
         let staged_name = staging_leaf_name();
         let staged_path_abs = self.mounted.root().join(&staged_dir).join(&staged_name);
-        let staged_file = create_exclusive_staged_file(&staged_path_abs)?;
+        let staged_file = create_exclusive_staged_file(&staged_path_abs, &parent_handle)?;
         self.mounted.validate()?;
 
         Ok(PreparedWriteTarget {
@@ -549,7 +554,7 @@ fn create_directory_atomic(root: &Path, components: &[OsString]) -> io::Result<(
 }
 
 #[cfg(unix)]
-fn create_exclusive_staged_file(path: &Path) -> io::Result<File> {
+fn create_exclusive_staged_file(path: &Path, parent_dir: &File) -> io::Result<File> {
     use rustix::fs::{Mode, OFlags};
 
     let leaf = path.file_name().ok_or_else(|| {
@@ -558,15 +563,13 @@ fn create_exclusive_staged_file(path: &Path) -> io::Result<File> {
             "staged file path is missing a leaf",
         )
     })?;
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "staged file path is missing a parent",
-        )
-    })?;
-    let parent_file = File::open(parent)?;
+    // Create the staged file beneath the authority-bound parent handle
+    // rather than a freshly re-resolved absolute parent path: resolving
+    // the parent a second time would let a symlink or bind swap between
+    // the boundary check and this open land the staged file outside the
+    // validated mount.
     let descriptor = rustix::fs::openat(
-        &parent_file,
+        parent_dir,
         leaf,
         OFlags::WRONLY
             | OFlags::CREATE
@@ -581,7 +584,10 @@ fn create_exclusive_staged_file(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(windows)]
-fn create_exclusive_staged_file(path: &Path) -> io::Result<File> {
+fn create_exclusive_staged_file(path: &Path, _parent_dir: &File) -> io::Result<File> {
+    // Windows has no std-level `openat`; the exclusive create below is
+    // guarded by the authority-bound parent retained (and dropped) by the
+    // caller, matching the platform's traversal-guard model.
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
 
@@ -598,7 +604,7 @@ fn create_exclusive_staged_file(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn create_exclusive_staged_file(_path: &Path) -> io::Result<File> {
+fn create_exclusive_staged_file(_path: &Path, _parent_dir: &File) -> io::Result<File> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "write authority is unsupported on this platform",

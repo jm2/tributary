@@ -254,17 +254,6 @@ impl MtpTransferPlanner {
             return Err(MtpPlanError::EmptyBrowse);
         }
 
-        // First, sort objects by their depth-first walk so the staging
-        // directory mirrors the on-device tree.
-        let mut ordered = request.objects.clone();
-        ordered.sort_by(|left, right| {
-            left.parent
-                .map(|handle| handle.0)
-                .unwrap_or(0)
-                .cmp(&right.parent.map(|handle| handle.0).unwrap_or(0))
-                .then(left.handle.0.cmp(&right.handle.0))
-        });
-
         let mut mtp_stages: Vec<MtpTransferStage> = Vec::new();
         mtp_stages.push(MtpTransferStage::OpenSession);
         mtp_stages.push(MtpTransferStage::BrowseStorage);
@@ -275,47 +264,22 @@ impl MtpTransferPlanner {
         let mut file_count: u32 = 0;
         let mut seen_handles: BTreeSet<MtpObjectHandle> = BTreeSet::new();
 
-        for object in &ordered {
+        // Walk the objects in browse order (stable depth-first). MTP
+        // handles are opaque and not guaranteed sequential, so sorting
+        // by raw handle would break the browser's directory-local
+        // traversal order instead of restoring it.
+        for object in &request.objects {
             if !seen_handles.insert(object.handle) {
                 continue;
             }
-            match object.kind {
-                super::MtpObjectKind::RegularFile => {}
-                super::MtpObjectKind::Folder | super::MtpObjectKind::Other => continue,
+            if !matches!(object.kind, super::MtpObjectKind::RegularFile) {
+                continue;
             }
-            if file_count >= request.budget.max_file_count() {
-                return Err(MtpPlanError::FileCountExceeded {
-                    observed: file_count,
-                    budget: request.budget.max_file_count(),
-                });
-            }
-            if total_bytes.saturating_add(object.size_bytes) > request.budget.max_total_bytes() {
-                return Err(MtpPlanError::ByteCountExceeded {
-                    required: total_bytes.saturating_add(object.size_bytes),
-                    budget: request.budget.max_total_bytes(),
-                });
-            }
-            let name = relative_name(&object.name)?;
-            let staging_relative = staging_path_for(object, request, &name)?;
-            let destination_relative = destination_path_for(object, request, &staging_relative)?;
-            if destination_relative.is_absolute() {
-                return Err(MtpPlanError::AbsoluteDestinationPath {
-                    path: destination_relative.clone(),
-                });
-            }
+            Self::admit_within_budget(object, file_count, total_bytes, request)?;
+            let (staging_write, transfer_item) = build_transfer_item(object, request)?;
             mtp_stages.push(MtpTransferStage::FetchObject);
-            staging_writes.push(MtpStagingWrite {
-                device_id: request.session.device_id().clone(),
-                storage_id: request.storage.storage_id,
-                object_handle: object.handle,
-                bytes: Vec::new(),
-                staging_relative_path: staging_relative.clone(),
-                destination_relative_path: destination_relative.clone(),
-            });
-            transfer_items.push(TransferItem {
-                source_relative_path: staging_relative,
-                destination_relative_path: destination_relative,
-            });
+            staging_writes.push(staging_write);
+            transfer_items.push(transfer_item);
             total_bytes = total_bytes.saturating_add(object.size_bytes);
             file_count = file_count.saturating_add(1);
         }
@@ -333,6 +297,60 @@ impl MtpTransferPlanner {
             storage_id: request.storage.storage_id,
         })
     }
+
+    /// Enforce the file-count and byte-count budgets for one candidate
+    /// object before it is staged.
+    fn admit_within_budget(
+        object: &MtpObject,
+        file_count: u32,
+        total_bytes: u64,
+        request: &MtpTransferRequest,
+    ) -> Result<(), MtpPlanError> {
+        if file_count >= request.budget.max_file_count() {
+            return Err(MtpPlanError::FileCountExceeded {
+                observed: file_count,
+                budget: request.budget.max_file_count(),
+            });
+        }
+        if total_bytes.saturating_add(object.size_bytes) > request.budget.max_total_bytes() {
+            return Err(MtpPlanError::ByteCountExceeded {
+                required: total_bytes.saturating_add(object.size_bytes),
+                budget: request.budget.max_total_bytes(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Build the staging write and transfer item for one admitted file,
+/// reconstructing both relative paths from the object's sanitized
+/// parent chain.
+fn build_transfer_item(
+    object: &MtpObject,
+    request: &MtpTransferRequest,
+) -> Result<(MtpStagingWrite, TransferItem), MtpPlanError> {
+    let name = relative_name(&object.name)?;
+    let staging_relative = staging_path_for(object, request, &name)?;
+    let destination_relative = destination_path_for(object, request, &staging_relative)?;
+    if destination_relative.is_absolute() {
+        return Err(MtpPlanError::AbsoluteDestinationPath {
+            path: destination_relative.clone(),
+        });
+    }
+    Ok((
+        MtpStagingWrite {
+            device_id: request.session.device_id().clone(),
+            storage_id: request.storage.storage_id,
+            object_handle: object.handle,
+            bytes: Vec::new(),
+            staging_relative_path: staging_relative.clone(),
+            destination_relative_path: destination_relative.clone(),
+        },
+        TransferItem {
+            source_relative_path: staging_relative,
+            destination_relative_path: destination_relative,
+        },
+    ))
 }
 
 fn relative_name(name: &str) -> Result<String, MtpPlanError> {
@@ -356,16 +374,25 @@ fn staging_path_for(
     name: &str,
 ) -> Result<PathBuf, MtpPlanError> {
     // The staging path is built from the device id, the storage id,
-    // and the object's parent chain. Host paths never appear here.
+    // and the object's parent chain. Host paths never appear here:
+    // every device-supplied ancestor name is validated as a single
+    // relative component, and a cyclic parent chain is rejected so a
+    // misbehaving device cannot loop the walk forever.
     let mut components: Vec<String> = Vec::new();
+    let mut visited: BTreeSet<MtpObjectHandle> = BTreeSet::new();
     let mut current = object.parent;
     while let Some(handle) = current {
+        if !visited.insert(handle) {
+            return Err(MtpPlanError::HostPathLeaked(format!(
+                "cyclic parent chain at handle {handle}"
+            )));
+        }
         let parent_object = request
             .objects
             .iter()
             .find(|candidate| candidate.handle == handle)
             .ok_or_else(|| MtpPlanError::HostPathLeaked(format!("missing parent {handle}")))?;
-        components.push(parent_object.name.clone());
+        components.push(relative_name(&parent_object.name)?);
         current = parent_object.parent;
     }
     components.reverse();
