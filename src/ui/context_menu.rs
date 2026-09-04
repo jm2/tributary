@@ -1792,9 +1792,20 @@ mod tests {
             viewport.max_content_height(),
             CONTEXT_MENU_MAX_CONTENT_HEIGHT
         );
+        // The menu box is not `GtkScrollable`, so `ScrolledWindow::set_child`
+        // wraps it in an auto-added `GtkViewport`, and `child()` returns that
+        // viewport rather than the box. Look through the wrapper when present.
         let vbox = viewport
             .child()
-            .and_then(|child| child.downcast::<gtk::Box>().ok())
+            .and_then(|child| match child.downcast::<gtk::Box>() {
+                Ok(vbox) => Some(vbox),
+                Err(child) => child
+                    .downcast::<gtk::Viewport>()
+                    .ok()?
+                    .child()?
+                    .downcast::<gtk::Box>()
+                    .ok(),
+            })
             .expect("scrolling viewport must contain the menu's Box");
         assert_eq!(
             vbox.observe_children().n_items(),
