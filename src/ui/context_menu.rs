@@ -463,17 +463,20 @@ fn append_context_menu_actions(
             interaction_request,
             session.mutation_context,
         );
-    } else {
-        build_add_to_playlist_actions(
-            menu,
-            action_group,
-            session.sidebar_store,
-            session.sm,
-            &popup_plan.selection,
-            interaction_request,
-            session.mutation_context,
-        );
     }
+    // The track drag source is installed on every tracklist view, so tracks
+    // shown by a regular or smart playlist can be dragged onto another
+    // regular playlist. Keyboard users need the same destinations from the
+    // menu, so the add actions are offered in playlist views as well.
+    build_add_to_playlist_actions(
+        menu,
+        action_group,
+        session.sidebar_store,
+        session.sm,
+        &popup_plan.selection,
+        interaction_request,
+        session.mutation_context,
+    );
 
     // ── Properties… ──────────────────────────────────────────
     let automatic_device = active_source_is_automatic_device(session.sidebar_store, active_key);
@@ -609,9 +612,13 @@ pub fn attach_playlist_drop_target(
     );
     let store_for_accept = drop.store.clone();
     let list_item_for_accept = list_item.clone();
-    drop_target.connect_accept(move |_, _| {
-        position_source(&store_for_accept, &list_item_for_accept)
-            .is_some_and(|source| source.is_editable_regular_playlist())
+    drop_target.connect_accept(move |_, drop| {
+        playlist_drop_is_acceptable(
+            &drop.formats(),
+            drop.actions(),
+            position_source(&store_for_accept, &list_item_for_accept)
+                .is_some_and(|source| source.is_editable_regular_playlist()),
+        )
     });
     let context_for_drop = drop.context.clone();
     let store_for_drop = drop.store.clone();
@@ -639,6 +646,26 @@ pub fn attach_playlist_drop_target(
 fn position_source(store: &gtk::gio::ListStore, list_item: &gtk::ListItem) -> Option<SourceObject> {
     let pos = list_item.position();
     store.item(pos).and_downcast::<SourceObject>()
+}
+
+/// Decide whether the per-row track drop target may claim an in-flight drag.
+///
+/// Connecting a custom `accept` handler replaces GTK's default format and
+/// action compatibility check, so that check must be re-applied here. The
+/// same sidebar row also hosts the playlist-reorder target (string playlist
+/// id under `MOVE`), and GTK consults the most recently added controller
+/// first. Answering on row editability alone would let this target claim a
+/// reorder drag entering an editable regular playlist; the drop would then
+/// fail to decode as `PlaylistDragPayload` and reordering onto that row
+/// would silently break.
+fn playlist_drop_is_acceptable(
+    formats: &gtk::gdk::ContentFormats,
+    actions: gtk::gdk::DragAction,
+    editable_regular_playlist: bool,
+) -> bool {
+    editable_regular_playlist
+        && formats.contains_type(PlaylistDragPayload::static_type())
+        && actions.contains(gtk::gdk::DragAction::COPY)
 }
 
 /// Run the DB-backed playlist add on the blocking runtime and report the
@@ -1844,5 +1871,69 @@ mod tests {
         assert!(!pull_mirror.is_editable_regular_playlist());
         assert!(!server.is_editable_regular_playlist());
         assert!(!header.is_editable_regular_playlist());
+    }
+
+    #[test]
+    fn per_row_drop_target_leaves_reorder_drags_to_the_reorder_target() {
+        use gtk::gdk::{ContentFormatsBuilder, DragAction};
+
+        let track_drag = ContentFormatsBuilder::new()
+            .add_type(PlaylistDragPayload::static_type())
+            .build();
+        let reorder_drag = ContentFormatsBuilder::new()
+            .add_type(glib::Type::STRING)
+            .build();
+
+        assert!(playlist_drop_is_acceptable(
+            &track_drag,
+            DragAction::COPY,
+            true
+        ));
+        // The sidebar's playlist-reorder drag carries a string id under MOVE
+        // on the same row widget. A custom accept handler bypasses GTK's
+        // default format check, so this predicate must refuse it explicitly
+        // or the reorder target behind it never sees the drag.
+        assert!(!playlist_drop_is_acceptable(
+            &reorder_drag,
+            DragAction::MOVE,
+            true
+        ));
+        assert!(!playlist_drop_is_acceptable(
+            &reorder_drag,
+            DragAction::COPY,
+            true
+        ));
+        assert!(!playlist_drop_is_acceptable(
+            &track_drag,
+            DragAction::MOVE,
+            true
+        ));
+        assert!(!playlist_drop_is_acceptable(
+            &track_drag,
+            DragAction::COPY,
+            false
+        ));
+    }
+
+    #[test]
+    fn playlist_views_offer_add_destinations_alongside_removal() {
+        let source = include_str!("context_menu.rs");
+        let body = source
+            .split_once("fn append_context_menu_actions(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("append_context_menu_actions body");
+        let add_marker = ["build_add_to_", "playlist_actions("].concat();
+        let remove_marker = ["build_remove_from_", "playlist_action("].concat();
+
+        assert_eq!(body.matches(&add_marker).count(), 1);
+        assert_eq!(body.matches(&remove_marker).count(), 1);
+        // Removal stays gated on the playlist view, but the add destinations
+        // are the keyboard equivalent of the tracklist drag source, which is
+        // installed on every view, so they must not sit in an `else` branch.
+        assert!(
+            !body.contains("} else {"),
+            "add-to-playlist actions must be offered in every tracklist view"
+        );
     }
 }
