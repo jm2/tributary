@@ -241,6 +241,19 @@ fn preflight_each_target(
     TagEditingAvailability::Ready
 }
 
+/// The exact local paths in `targets`, preserving selection order, for
+/// path-scoped rehearsal. Removable targets carry no path-scoped mechanics:
+/// their rehearsal is authority-based and already complete at this point.
+fn local_paths_of(targets: &[SaveTarget]) -> Vec<PathBuf> {
+    targets
+        .iter()
+        .filter_map(|target| match target {
+            SaveTarget::LocalPath(path) => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Probe a complete, exact-deduplicated selection on a worker thread.
 ///
 /// Local paths are probed per file and per distinct parent directory.
@@ -285,14 +298,8 @@ fn preflight_save_targets(targets: &[SaveTarget]) -> TagEditingAvailability {
         // the post-DACL read/write/delete reopen for every exact local target
         // before any Save can begin. Removable targets rehearsed their
         // complete replacement shape in `preflight_write_capability` above.
-        let local_paths: Vec<PathBuf> = targets
-            .iter()
-            .filter_map(|target| match target {
-                SaveTarget::LocalPath(path) => Some(path.clone()),
-                _ => None,
-            })
-            .collect();
-        let target_access = preflight_each_target(&local_paths, preflight_tag_write_target_access);
+        let target_access =
+            preflight_each_target(&local_paths_of(targets), preflight_tag_write_target_access);
         if target_access != TagEditingAvailability::Ready {
             return target_access;
         }
@@ -301,14 +308,7 @@ fn preflight_save_targets(targets: &[SaveTarget]) -> TagEditingAvailability {
     // Directory mechanics are parent-scoped. Rehearse the flushed atomic
     // replacement once per exact local parent while retaining the per-file
     // checks above (including Windows read-only attributes).
-    let local_paths: Vec<PathBuf> = targets
-        .iter()
-        .filter_map(|target| match target {
-            SaveTarget::LocalPath(path) => Some(path.clone()),
-            _ => None,
-        })
-        .collect();
-    preflight_distinct_parents(&local_paths, preflight_tag_write_directory)
+    preflight_distinct_parents(&local_paths_of(targets), preflight_tag_write_directory)
 }
 
 fn apply_tag_editing_availability(
