@@ -165,17 +165,27 @@ struct RawEqConfig {
 impl RawEqConfig {
     /// Fold one parsed `key="value"` pair into the accumulator.
     fn absorb(&mut self, key: &str, value: &str) -> Result<(), String> {
+        if key == "preamp_db" {
+            self.preamp_db = Some(required_gain(value, "preamp_db")?);
+            return Ok(());
+        }
+        if self.absorb_scalar(key, value) {
+            return Ok(());
+        }
+        self.absorb_band(key, value)
+    }
+
+    /// Fold one enum-ish scalar key. Returns `false` when the key is not
+    /// one of the scalars, leaving it to the band/required-gain handlers.
+    fn absorb_scalar(&mut self, key: &str, value: &str) -> bool {
         match key {
             "schema_version" => self.schema_version = Some(value.to_string()),
             "enabled" => self.enabled = Some(value == "true"),
             "preset" => self.preset = Some(Preset::from_key(value)),
-            "preamp_db" => {
-                self.preamp_db = Some(parse_gain(value).ok_or_else(|| "preamp_db".to_string())?);
-            }
             "clip_protect" => self.clip_protection = ClipProtection::from_key(value),
-            _ => self.absorb_band(key, value)?,
+            _ => return false,
         }
-        Ok(())
+        true
     }
 
     /// Fold one `band<N>_db` key. Unknown keys are ignored so a future
@@ -246,6 +256,11 @@ fn parse_gain(value: &str) -> Option<f64> {
     gain.is_finite().then_some(gain)
 }
 
+/// `parse_gain` with the required-key error the strict grammar reports.
+fn required_gain(value: &str, key: &str) -> Result<f64, String> {
+    parse_gain(value).ok_or_else(|| key.to_string())
+}
+
 /// Parse a single `key="value"` line with `\"` / `\\` escapes. A bare
 /// (unquoted) value or an unknown escape is malformed.
 fn parse_line(line: &str) -> Option<(String, String)> {
@@ -272,18 +287,30 @@ fn unescape(value: &str) -> Option<String> {
     let mut out = String::with_capacity(value.len());
     let mut chars = value.chars();
     while let Some(ch) = chars.next() {
-        match ch {
-            '\\' => match chars.next()? {
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                _ => return None,
-            },
-            '"' => return None,
-            '\n' | '\r' => return None,
-            _ => out.push(ch),
+        if ch == '\\' {
+            out.push(escaped_char(&mut chars)?);
+        } else if is_forbidden_literal(ch) {
+            return None;
+        } else {
+            out.push(ch);
         }
     }
     Some(out)
+}
+
+/// Decode the character following a `\`. Any escape other than `\"` or
+/// `\\` is malformed.
+fn escaped_char(chars: &mut std::str::Chars<'_>) -> Option<char> {
+    match chars.next()? {
+        '"' => Some('"'),
+        '\\' => Some('\\'),
+        _ => None,
+    }
+}
+
+/// A raw (unescaped) embedded quote or newline is malformed.
+fn is_forbidden_literal(ch: char) -> bool {
+    ch == '"' || ch == '\n' || ch == '\r'
 }
 
 // ── Save ────────────────────────────────────────────────────────────────
@@ -302,34 +329,52 @@ pub fn save_equalizer_settings_to_disk(settings: &EqSettings) -> bool {
 }
 
 fn write_equalizer_file_atomic(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    use std::io::Write;
-
     let temp_path = temp_sibling(path);
-    let write_result = (|| {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temp_path)?;
-        file.write_all(content.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temp_path, path)?;
-        // The rename alone is not durable until the directory entry is.
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
-        Ok(())
-    })();
+    let write_result = write_temp_then_rename(&temp_path, path, content);
     if write_result.is_err() {
         let _ = std::fs::remove_file(&temp_path);
     }
     write_result
+}
+
+/// Write `content` to `temp_path` (O_EXCL, single write, fsync), then
+/// `rename(2)` it onto `path` and fsync the directory entry.
+fn write_temp_then_rename(
+    temp_path: &std::path::Path,
+    path: &std::path::Path,
+    content: &str,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = open_temp_file(temp_path)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(temp_path, path)?;
+    // The rename alone is not durable until the directory entry is.
+    sync_parent_dir(path);
+    Ok(())
+}
+
+/// Create the temp sibling for exclusive single-writer access.
+fn open_temp_file(temp_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(temp_path)
+}
+
+/// Flush the directory entry so the completed rename survives a crash.
+fn sync_parent_dir(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
 }
 
 fn temp_sibling(path: &std::path::Path) -> PathBuf {
