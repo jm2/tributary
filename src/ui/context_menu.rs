@@ -2015,6 +2015,7 @@ mod tests {
     /// one thread per process, and the test harness runs tests on a pool of
     /// threads, so a second GTK-initializing test panics whenever it lands on
     /// a different thread from the first.
+    #[cfg(not(target_os = "macos"))]
     fn assert_track_drags_start_only_from_the_data_row_area() {
         let store = gtk::gio::ListStore::new::<gtk::StringObject>();
         store.append(&gtk::StringObject::new("a"));
