@@ -2240,21 +2240,36 @@ mod tests {
             ])])
             .await;
         let endpoint = format!("{}/2.0/", service.base_url());
-        let client = LastFmClient::with_test_policy(
+        // Each bound is exercised with the other held slack so full-suite
+        // parallel load cannot reorder which limit fires. Sharing one tight
+        // policy (the production shape) made BodyLimit versus Timeout a
+        // scheduler race: the request-level timeout also covers connect and
+        // header wait, so a starved runtime lost the oversized-body race
+        // before the size check could run.
+        let body_limited = LastFmClient::with_test_policy(
             &endpoint,
             credentials(),
             RequestPolicy {
-                timeout: Duration::from_millis(25),
+                timeout: Duration::from_secs(5),
                 maximum_response_bytes: 64,
                 maximum_form_bytes: MAX_FORM_BODY_BYTES,
             },
         );
         assert_eq!(
-            client.request_auth_token().await.err(),
+            body_limited.request_auth_token().await.err(),
             Some(LastFmClientError::BodyLimit)
         );
+        let deadline_bounded = LastFmClient::with_test_policy(
+            &endpoint,
+            credentials(),
+            RequestPolicy {
+                timeout: Duration::from_millis(25),
+                maximum_response_bytes: MAX_RESPONSE_BODY_BYTES,
+                maximum_form_bytes: MAX_FORM_BODY_BYTES,
+            },
+        );
         assert_eq!(
-            client.request_auth_token().await.err(),
+            deadline_bounded.request_auth_token().await.err(),
             Some(LastFmClientError::Timeout)
         );
         service.finish().await;
