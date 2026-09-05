@@ -6,11 +6,12 @@ changes which need coordinated repair:
 
 - Compatible Cargo and Actions patch/minor updates may use native GitHub
   auto-merge, but only once the live gate enforces the repository's
-  all-checks policy. Native auto-merge waits only on the checks the `main`
-  ruleset marks required, so until the widened ruleset from the
-  "Deployment gate migration" section (below) is live and verified, routine
-  auto-merge stays off: a green required-check set alone never authorizes a
-  merge while any other check or bot review is pending or failing.
+  all-checks policy. The auto-merge workflow reads the active `main` rulesets
+  first and refuses to enable auto-merge until the complete policy check set
+  (see "Deployment gate migration" below) is required, so until that widened
+  ruleset is live and verified, routine auto-merge stays off by construction:
+  a green required-check set alone never authorizes a merge while any other
+  check or bot review is pending or failing.
 - `sea-orm` and `sea-orm-migration` always share one Dependabot group and must
   retain matching manifest requirements and resolved versions.
 - Cargo major updates remain reviewed changes and normally arrive
@@ -115,20 +116,88 @@ also changed through its own reviewed proposal.
 
 ## Deployment gate migration
 
-This change itself deliberately did not mutate GitHub rulesets or the local
-GasCity configuration; the MSRV migration it anticipated has since landed
-through separate reviewed changes. The live `main` ruleset ("Require CI before
-merge (main)") requires the stable `MSRV` context alongside Security Audit,
-Linux (x86_64), Linux (aarch64), macOS (aarch64), Windows (x86_64), and
-Flatpak (Linux), and GasCity's Tributary hosted-check configuration already
-emits `MSRV` rather than the old versioned `MSRV (1.92)` context. Future Rust
-bumps therefore keep the stable context and need no additional gate rename.
+The #225 documentation change itself deliberately did not mutate GitHub
+rulesets or the local GasCity configuration; the MSRV migration it
+anticipated has since landed through separate reviewed changes. The live
+`main` ruleset ("Require CI before merge (main)") requires the stable `MSRV`
+context alongside Security Audit, Linux (x86_64), Linux (aarch64),
+macOS (aarch64), Windows (x86_64), and Flatpak (Linux), and GasCity's
+Tributary hosted-check configuration already emits `MSRV` rather than the old
+versioned `MSRV (1.92)` context. Future Rust bumps therefore keep the stable
+context and need no additional gate rename.
 
-The ruleset is still narrower than the repository's all-checks policy: it does
-not yet require Coverage, CodeQL, Codacy Static Code Analysis, the CodeRabbit
-status context, or bot-review gating. Routine Dependabot auto-merge stays off
-until the live gate matches that policy (see "Closing the gap (the machine
-gate)" in docs/refinery-config.md).
+The auto-merge workflow's writer mechanically reads the active rulesets that
+apply to `main` and refuses to enable auto-merge until they require the
+complete policy check set below. Until that live rollout is done, a routine
+Dependabot patch/minor PR simply never gets auto-merge enabled (the workflow
+run fails loudly at the precondition) and must be merged through the normal
+reviewed path.
+
+The enforcement gap being closed: at the time of this change, the live
+ruleset "Require CI before merge (main)" (id 17650907) requires only seven
+GitHub Actions checks — Security Audit, Linux (x86_64), Linux (aarch64),
+macOS (aarch64), Windows (x86_64), Flatpak (Linux), and MSRV — so Coverage,
+CodeQL, Codacy, CodeRabbit, Windows (aarch64), and every bot review remain
+advisory, and native Dependabot auto-merge waits only on that narrower set
+and could land a dependency PR while a policy check or bot review is still
+pending or failing.
+
+### Required ruleset additions (exact live contexts and app bindings)
+
+Check contexts verified live on a green pull request. The app binding is part
+of the requirement: a same-named check from a different integration must not
+satisfy the gate.
+
+| Context | Integration (app id) |
+|---|---|
+| Coverage (Linux x86_64) | GitHub Actions (15368) |
+| Windows (aarch64) | GitHub Actions (15368) |
+| Bot Review Gate | GitHub Actions (15368) |
+| CodeQL | GitHub Advanced Security (57789) |
+| Analyze (python) | GitHub Advanced Security (57789) |
+| Analyze (rust) | GitHub Advanced Security (57789) |
+| Analyze (actions) | GitHub Advanced Security (57789) |
+| Codacy Static Code Analysis | Codacy (56611) |
+| CodeRabbit | unbound (commit-status context, no app id) |
+
+`Bot Review Gate` is reported by the repository-owned
+`.github/workflows/bot-review-gate.yml`, which fails while the pull request
+has unresolved, non-outdated review threads started by a bot. The CodeQL
+`Analyze (…)` contexts follow the languages configured in the CodeQL default
+setup; adding or removing a language changes those contexts and must update
+this ruleset and the auto-merge precondition in the same reviewed change.
+
+### Rollout order and live validation
+
+1. Land `.github/workflows/bot-review-gate.yml` first (this change) so the
+   `Bot Review Gate` check actually reports on pull requests before it can be
+   marked required. While the ruleset is still narrow, the gate is advisory
+   and the auto-merge precondition keeps routine Dependabot auto-merge off.
+2. Edit ruleset 17650907 to add every context in the table above with the
+   listed app binding (`CodeRabbit` unbound). Verify the saved ruleset
+   actually lists all sixteen required checks — the save, not the intent, is
+   what the auto-merge precondition reads.
+3. Validate against a live pull request before treating the widened gate as
+   authoritative: confirm all widened checks report on that PR, address and
+   resolve any actionable bot review threads, then confirm the next
+   Dependabot patch/minor PR's "Dependabot auto-merge" run passes the
+   "Require the live ruleset to enforce the full policy gate" step and reaches
+   the guarded merge enablement. That run passing is live proof both that the
+   widened ruleset is active and that the precondition agrees with it. Do not
+   claim enforcement is active until this verification has passed on
+   GitHub's side of the settings.
+
+Until that rollout completes, the ruleset is still narrower than the
+repository's all-checks policy: it does not yet require Coverage, CodeQL,
+Codacy Static Code Analysis, the CodeRabbit status context, or bot-review
+gating. Routine Dependabot auto-merge stays off (see "Closing the gap (the
+machine gate)" in docs/refinery-config.md).
+
+The stable `MSRV` context above is part of the required set for the same
+reason it was introduced — that migration has already landed, as described at
+the start of this section: GasCity's Tributary hosted-check configuration
+emits `MSRV` in place of the old versioned `MSRV (1.92)` expectation. Future
+Rust bumps keep the stable context and need no additional gate rename.
 
 ## Workflow security boundary
 
@@ -145,10 +214,14 @@ file count, rejects current or previous names for the privileged workflow, and
 then revalidates the head immediately before and after running the pinned
 metadata action with read authority. Per-PR concurrency cancels stale runs as
 defense in depth. The separate write-capable job contains no third-party
-action: it revalidates that exact head immediately before asking GitHub to
-enable auto-merge with an atomic expected-head guard.
+action: it first reads the active `main` rulesets (read-only `administration`
+authority, used for nothing else) and refuses to enable auto-merge until the
+full policy check set is required, then revalidates that exact head
+immediately before asking GitHub to enable auto-merge with an atomic
+expected-head guard.
 Thus a same-count H1/H2 race or mixed-path self-update fails closed rather than
-executing an H1 action ref with write authority.
+executing an H1 action ref with write authority, and a narrowed ruleset can
+never silently widen what native auto-merge waits on.
 
 Lockfile and toolchain repair intentionally remain GasCity Repairer operations
 instead of a `pull_request_target` writer. This keeps untrusted dependency or
