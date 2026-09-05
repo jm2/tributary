@@ -543,10 +543,11 @@ Right-click any local track and select **Properties…** to view and edit its me
 - **MusicBrainz Lookup** — In single-track mode, click "MusicBrainz Lookup" to search by title + artist. Results populate the form but are **not** saved automatically — you must click Save.
 
 All edits require an explicit **Save** click. Cancel discards all changes. Before enabling
-editing, Tributary checks that every selected file and its folder are writable; a read-only
-device is explained up front. Saves are written to a temporary sibling file and atomically replace
-the original, so a failed write leaves the track untouched. Supported formats: MP3 (ID3v2),
-M4A/AAC, OGG Vorbis, and FLAC.
+editing, Tributary checks that every selected file is readable and that its folder allows creating
+and replacing files, since saves replace the file by rename; a read-only device is explained up
+front. Saves are written to a temporary sibling file and atomically replace the original, so a
+failed write leaves the track untouched. Supported formats: MP3 (ID3v2), M4A/AAC, OGG Vorbis, and
+FLAC.
 
 ### Track Ratings
 
