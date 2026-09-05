@@ -567,17 +567,18 @@ Tributary supports regular and smart playlists:
   servers; a remote entry stores the track's identity and a non-authoritative metadata
   fingerprint, never a URL or credential. When a server is disconnected its entries stay in place
   as unavailable rows that you can keep or remove. Radio stations, removable media, and files
-  opened from the OS cannot be added. - **Smart playlists** — iTunes-style rules engine with
-  filterable metadata fields, text/numeric/date operators, sorting, and result limiting. Smart
-  playlists query the local library and are evaluated whenever they are opened or exported. Create
-  them via the sidebar context menu. - **Server playlists** — **Server Playlists…** on the
-  Playlists header browses the playlists on a connected Subsonic server. **Import Copy** creates
-  an ordinary editable playlist; **Keep Synced** creates a read-only mirror that refreshes when
-  the server reconnects or when you choose **Sync Now**; Tributary never polls the server in the
-  background. Selecting a mirror shows its status and the recovery actions that apply: **Sync
-  Now**, **Retry**, **Replace Local with Server**, **Unlink**, and **Remove Local Copy**.
-  Tributary never modifies playlists on the server. See the [Subsonic pull-sync
-  contract](docs/subsonic-playlist-sync.md).
+  opened from the OS cannot be added.
+- **Smart playlists** — iTunes-style rules engine with filterable metadata fields,
+  text/numeric/date operators, sorting, and result limiting. Smart playlists query the local
+  library and are evaluated whenever they are opened or exported. Create them via the sidebar
+  context menu.
+- **Server playlists** — **Server Playlists…** on the Playlists header browses the playlists on a
+  connected Subsonic server. **Import Copy** creates an ordinary editable playlist; **Keep
+  Synced** creates a read-only mirror that refreshes when the server reconnects or when you choose
+  **Sync Now**; Tributary never polls the server in the background. Selecting a mirror shows its
+  status and the recovery actions that apply: **Sync Now**, **Retry**, **Replace Local with
+  Server**, **Unlink**, and **Remove Local Copy**. Tributary never modifies playlists on the
+  server. See the [Subsonic pull-sync contract](docs/subsonic-playlist-sync.md).
 
 #### Importing and exporting playlists
 
