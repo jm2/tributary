@@ -282,7 +282,8 @@ flatpak-builder --user --install-deps-from=flathub --force-clean --repo=repo --i
   build-dir build-aux/flatpak/io.github.tributary.Tributary.yml
 ```
 
-`./scripts/build-linux.sh --flatpak` runs the same steps without first requiring a native build.
+`./scripts/build-linux.sh --flatpak` uses the same generator, then builds and validates a
+single-file `tributary.flatpak` bundle instead of installing; no native build is required first.
 
 The sandbox does not expose the whole home directory:
 
