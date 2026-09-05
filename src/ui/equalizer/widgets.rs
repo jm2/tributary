@@ -81,8 +81,8 @@ pub(super) fn preset_from_menu_position(position: u32) -> Option<Preset> {
 }
 
 /// Install the preset combo's factory: translated preset names, with
-/// the `Custom` row visible but not activatable — the five named
-/// values are the only selectable entries.
+/// the `Custom` row visible but neither activatable nor selectable —
+/// the five named values are the only selectable entries.
 pub(super) fn install_preset_factory(dropdown: &gtk::DropDown) {
     install_translated_choice_factory(
         dropdown,
@@ -96,14 +96,18 @@ pub(super) fn install_preset_factory(dropdown: &gtk::DropDown) {
 /// Install a factory that renders translated labels for a StringList-
 /// backed `DropDown`. Without a custom factory GTK displays the literal
 /// model values, which would leak the English persistence keys.
-/// `activatable` decides per key whether the row can be selected; the
-/// combo selection logic keeps reading stable positions while the
+/// `choosable` decides per key whether the row can be picked; it drives
+/// both `activatable` (keyboard/click activation) and `selectable`
+/// (the DropDown's selection model — activatable alone still lets a
+/// click land the selection on a write-only row such as `Custom`,
+/// which `preset_from_menu_position` cannot map back to a preset).
+/// The combo selection logic keeps reading stable positions while the
 /// visible label carries the localized name.
 pub(super) fn install_translated_choice_factory(
     dropdown: &gtk::DropDown,
     keys: &'static [&'static str],
     label_of: fn(&str) -> String,
-    activatable: fn(&str) -> bool,
+    choosable: fn(&str) -> bool,
 ) {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(move |_factory, item| {
@@ -129,7 +133,8 @@ pub(super) fn install_translated_choice_factory(
         let text = label_of(key);
         label.set_text(&text);
         label.set_tooltip_text(Some(&text));
-        list_item.set_activatable(activatable(key));
+        list_item.set_activatable(choosable(key));
+        list_item.set_selectable(choosable(key));
     });
     dropdown.set_factory(Some(&factory));
 }

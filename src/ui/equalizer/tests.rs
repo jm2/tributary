@@ -7,7 +7,7 @@ use super::widgets::{
     unsupported_explanation_for_output_type,
 };
 use super::{CLIP_KEYS, PRESET_KEYS};
-use crate::audio::equalizer::{Preset, MAX_GAIN_DB, MIN_GAIN_DB};
+use crate::audio::equalizer::{EqSettings, Preset, MAX_GAIN_DB, MIN_GAIN_DB};
 
 #[test]
 fn menu_positions_cover_the_six_contract_entries() {
@@ -30,6 +30,40 @@ fn custom_menu_position_is_never_a_selectable_choice() {
             assert!(preset.is_some());
         }
     }
+}
+
+/// Regression (contract acceptance 5, UI-state half): a manual preamp
+/// or band edit must move the preset combo to the `Custom` position at
+/// the same moment the applied state is marked custom. The wiring
+/// syncs the combo through `preset_menu_position(Preset::Custom)`, so
+/// that mapping must land exactly on the designated custom position —
+/// which itself is never a selectable menu choice, meaning the combo
+/// can only reach it through a manual edit, never through the menu.
+#[test]
+fn manual_edit_marks_custom_and_the_combo_follows_the_custom_position() {
+    let mut settings = EqSettings {
+        preset: Preset::Rock,
+        ..EqSettings::default()
+    };
+    // A named preset sits on its own selectable menu position…
+    assert_eq!(preset_menu_position(settings.preset), 2);
+
+    // …the state transition `wire_gain_sliders` performs on every
+    // drag, before applying the settings…
+    settings.mark_custom();
+    assert_eq!(settings.preset, Preset::Custom);
+
+    // …and the combo sync `wire_gain_sliders` performs under the same
+    // re-entrancy guard: the dropdown lands on the custom position.
+    assert_eq!(
+        preset_menu_position(settings.preset),
+        Preset::CUSTOM_MENU_POSITION as u32
+    );
+    assert!(
+        preset_from_menu_position(Preset::CUSTOM_MENU_POSITION as u32).is_none(),
+        "Custom must not be a selectable choice, so a custom-position combo \
+         can only reflect a manual slider edit"
+    );
 }
 
 #[test]
