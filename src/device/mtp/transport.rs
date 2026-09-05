@@ -350,6 +350,56 @@ pub mod test_transport {
         }
     }
 
+    /// The liveness probe a transport installs on the sessions it mints.
+    type LivenessProbe = Arc<dyn Fn() -> Result<(), MtpTransportError> + Send + Sync>;
+
+    /// Find the attached device whose descriptor equals `descriptor` in
+    /// every field (serial, vendor, product). The one descriptor lookup
+    /// every transport method shares; each caller maps `None` to its own
+    /// unreachable-device error so the messages keep their context.
+    fn find_attached_device<'a>(
+        devices: &'a [InMemoryDevice],
+        descriptor: &MtpUsbDescriptor,
+    ) -> Option<&'a InMemoryDevice> {
+        devices
+            .iter()
+            .find(|device| device.descriptor == *descriptor)
+    }
+
+    /// Build the transport-backed liveness probe for one freshly opened
+    /// session. The probe reports [`MtpTransportError::SessionLost`]
+    /// when the transport was dropped, the device detached or replaced,
+    /// or a newer session superseded this binding.
+    fn session_liveness_probe(
+        shared: &Arc<InMemoryShared>,
+        descriptor: &MtpUsbDescriptor,
+        label: String,
+        epoch: u64,
+    ) -> LivenessProbe {
+        // Hold the shared state weakly so a dropped transport
+        // makes every session it minted verify as lost instead
+        // of pinning the device table alive.
+        let shared = Arc::downgrade(shared);
+        let descriptor = descriptor.clone();
+        Arc::new(move || {
+            let shared = shared
+                .upgrade()
+                .ok_or_else(|| MtpTransportError::SessionLost(label.clone()))?;
+            let state = shared.state.lock().expect("transport mutex");
+            let present = state
+                .devices
+                .iter()
+                .any(|device| device.descriptor == descriptor);
+            if !present {
+                return Err(MtpTransportError::SessionLost(label.clone()));
+            }
+            if shared.session_epoch.load(Ordering::SeqCst) != epoch {
+                return Err(MtpTransportError::SessionLost(label.clone()));
+            }
+            Ok(())
+        })
+    }
+
     impl MtpTransport for InMemoryMtpTransport {
         fn list_devices(&self) -> Result<Vec<MtpUsbDescriptor>, MtpTransportError> {
             let state = self.shared.state.lock().expect("transport mutex");
@@ -366,21 +416,15 @@ pub mod test_transport {
         ) -> Result<MtpSession, MtpTransportError> {
             let mut state = self.shared.state.lock().expect("transport mutex");
             let id = MtpDeviceId::from_descriptor(descriptor)?;
-            let stored = state
-                .devices
-                .iter()
-                .find(|device| {
-                    device.descriptor.serial == descriptor.serial
-                        && device.descriptor.vendor == descriptor.vendor
-                        && device.descriptor.product == descriptor.product
-                })
+            let stored_descriptor = find_attached_device(&state.devices, descriptor)
                 .ok_or_else(|| {
                     MtpTransportError::DeviceUnreachable(
                         descriptor.serial.clone(),
                         "descriptor not present".to_string(),
                     )
-                })?;
-            let stored_descriptor = stored.descriptor.clone();
+                })?
+                .descriptor
+                .clone();
             state
                 .open_sessions
                 .insert(id.label().to_string(), stored_descriptor.clone());
@@ -389,34 +433,7 @@ pub mod test_transport {
             // liveness probe compares against it.
             let epoch = self.shared.session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
             drop(state);
-            let liveness: Arc<dyn Fn() -> Result<(), MtpTransportError> + Send + Sync> = {
-                // Hold the shared state weakly so a dropped transport
-                // makes every session it minted verify as lost instead
-                // of pinning the device table alive.
-                let shared = Arc::downgrade(&self.shared);
-                let serial = descriptor.serial.clone();
-                let vendor = descriptor.vendor;
-                let product = descriptor.product;
-                let label = id.to_string();
-                Arc::new(move || {
-                    let shared = shared
-                        .upgrade()
-                        .ok_or_else(|| MtpTransportError::SessionLost(label.clone()))?;
-                    let state = shared.state.lock().expect("transport mutex");
-                    let present = state.devices.iter().any(|device| {
-                        device.descriptor.serial == serial
-                            && device.descriptor.vendor == vendor
-                            && device.descriptor.product == product
-                    });
-                    if !present {
-                        return Err(MtpTransportError::SessionLost(label.clone()));
-                    }
-                    if shared.session_epoch.load(Ordering::SeqCst) != epoch {
-                        return Err(MtpTransportError::SessionLost(label.clone()));
-                    }
-                    Ok(())
-                })
-            };
+            let liveness = session_liveness_probe(&self.shared, descriptor, id.to_string(), epoch);
             Ok(MtpSession::new(
                 id,
                 stored_descriptor,
@@ -431,15 +448,8 @@ pub mod test_transport {
         ) -> Result<Vec<MtpStorageDescriptor>, MtpTransportError> {
             session.verify()?;
             let state = self.shared.state.lock().expect("transport mutex");
-            let device = state
-                .devices
-                .iter()
-                .find(|device| {
-                    device.descriptor.serial == session.descriptor().serial
-                        && device.descriptor.vendor == session.descriptor().vendor
-                        && device.descriptor.product == session.descriptor().product
-                })
-                .ok_or_else(|| {
+            let device =
+                find_attached_device(&state.devices, session.descriptor()).ok_or_else(|| {
                     MtpTransportError::DeviceUnreachable(
                         session.device_id().to_string(),
                         "device disappeared".to_string(),
@@ -459,15 +469,8 @@ pub mod test_transport {
         ) -> Result<MtpObjectBytes, MtpTransportError> {
             session.verify()?;
             let state = self.shared.state.lock().expect("transport mutex");
-            let device = state
-                .devices
-                .iter()
-                .find(|device| {
-                    device.descriptor.serial == session.descriptor().serial
-                        && device.descriptor.vendor == session.descriptor().vendor
-                        && device.descriptor.product == session.descriptor().product
-                })
-                .ok_or_else(|| {
+            let device =
+                find_attached_device(&state.devices, session.descriptor()).ok_or_else(|| {
                     MtpTransportError::DeviceUnreachable(
                         session.device_id().to_string(),
                         "device disappeared".to_string(),
