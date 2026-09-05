@@ -306,6 +306,16 @@ impl BoundDirectory {
     pub(super) fn is_same_object_as(&self, other: &Self) -> bool {
         self.lease_token == other.lease_token && self.object.identity == other.object.identity
     }
+
+    /// Clone a handle on the retained directory for descendant operations.
+    ///
+    /// The write authority uses this to create staged files through the
+    /// validated directory handle (`openat`) instead of re-resolving the
+    /// parent's absolute path, so the parent cannot be swapped between
+    /// validation and creation.
+    pub(super) fn try_clone_file(&self) -> io::Result<File> {
+        self.object.file.try_clone()
+    }
 }
 
 impl AbsenceProof {
