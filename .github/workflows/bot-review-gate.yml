@@ -1,0 +1,120 @@
+name: Bot review gate
+
+# Machine-readable merge evidence for the repository's all-green policy: this
+# check fails while the pull request still has actionable review threads that
+# were started by a bot reviewer (CodeRabbit, Codacy, or any GitHub App).
+#
+# Scope and semantics:
+#   * "Actionable" = the thread is neither resolved nor outdated. Outdated
+#     threads quote code that is no longer part of the diff; a fresh review
+#     opens new threads against the current head.
+#   * Resolving a thread is the machine-readable acknowledgement that its
+#     finding was addressed (fixed on the branch, or explicitly rejected by
+#     the resolution). A human reply inside the thread does not clear the
+#     gate — only resolution does.
+#   * The gate performs no review and never approves anything: it only
+#     reports whether unresolved actionable bot review threads remain.
+#   * A pending or failing result is merge-blocking only once the live `main`
+#     ruleset marks "Bot Review Gate" as required. docs/dependency-updates.md
+#     records the exact rollout order and the live-PR verification step.
+#
+# Security: strictly read-only. The workflow never checks out pull-request
+# code, holds no write permission, and queries the review threads of exactly
+# the pull request that triggered the event through the GraphQL API. A query
+# failure fails the check instead of silently passing it.
+on:
+  pull_request:
+    branches:
+      - main
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_thread:
+    types: [resolved, unresolved]
+
+permissions:
+  pull-requests: read
+
+concurrency:
+  group: bot-review-gate-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  bot-review-gate:
+    name: Bot Review Gate
+    runs-on: ubuntu-latest
+    # `pull_request` already restricts to the configured base branches; the
+    # review-event triggers have no branch filter, so the base is re-checked
+    # here so only `main` pull requests report the gate.
+    if: github.event_name == 'pull_request' || github.event.pull_request.base.ref == 'main'
+    steps:
+      - name: Fail while unresolved actionable bot review threads remain
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          thread_pages="${RUNNER_TEMP}/bot-review-threads.jsonl"
+
+          # Paginate every review thread of the exact triggering PR. gh's
+          # GraphQL pagination feeds the $endCursor variable automatically.
+          if ! gh api graphql --paginate -f query='
+            query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
+              repository(owner: $owner, name: $repo) {
+                pullRequest(number: $number) {
+                  reviewThreads(first: 100, after: $endCursor) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      isResolved
+                      isOutdated
+                      path
+                      line
+                      comments(first: 1) {
+                        nodes {
+                          url
+                          author { __typename login }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ' -f owner="${GITHUB_REPOSITORY%%/*}" -f repo="${GITHUB_REPOSITORY#*/}" \
+            -F number="${PR_NUMBER}" > "${thread_pages}"; then
+            echo "Review-thread query failed; failing closed." >&2
+            exit 1
+          fi
+
+          # A response without the pull request did not answer the question
+          # and must never read as "no open threads".
+          if ! jq -e '.data.repository.pullRequest != null' "${thread_pages}" > /dev/null; then
+            echo "Review-thread response omitted the pull request; failing closed." >&2
+            exit 1
+          fi
+
+          # Unresolved, non-outdated threads whose first comment was authored
+          # by a bot (GitHub App accounts and "[bot]"-suffixed logins) keep
+          # this check red.
+          offending="$(jq -c '
+            .data.repository.pullRequest.reviewThreads.nodes[]
+            | select(.isResolved == false and .isOutdated == false)
+            | select(
+                .comments.nodes[0].author.__typename == "Bot"
+                or ((.comments.nodes[0].author.login // "") | endswith("[bot]")))
+            | {
+                author_type: .comments.nodes[0].author.__typename,
+                author_login: .comments.nodes[0].author.login,
+                path: .path,
+                line: .line,
+                url: .comments.nodes[0].url
+              }
+          ' "${thread_pages}")"
+
+          if [ -n "${offending}" ]; then
+            printf '%s\n' "${offending}"
+            echo >&2 "Unresolved actionable bot review threads remain; address or resolve them first."
+            exit 1
+          fi
+
+          echo "No unresolved actionable bot review threads."
