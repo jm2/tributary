@@ -582,14 +582,15 @@ Tributary reads and writes [XSPF version 1](https://www.xspf.org/spec) (`.xspf`)
 playlist to export it, or use **Import Playlist…** on the Playlists header.
 
 On import, each track is matched against the local library by exact `file:` path first, then by
-exact title + artist (and album when supplied). If the entry carries a duration, only library
-tracks within five seconds of it qualify and the nearest one must be unique; without a duration,
-the metadata match itself must be unique. Unmatched entries are kept in playlist order and become
-playable if a matching track appears later. The whole import commits in one transaction and the
-completion dialog reports matched, unmatched, and failed counts.
+title + artist (and album when supplied), compared exactly after trimming whitespace and ignoring
+case. If the entry carries a duration, only library tracks within five seconds of it qualify and
+the nearest one must be unique; without a duration, the metadata match itself must be unique.
+Unmatched entries are kept in playlist order and become playable if a matching track appears
+later. The whole import commits in one transaction and the completion dialog reports matched,
+unmatched, and failed counts.
 
-Export writes to a temporary file and atomically replaces the destination. XSPF only represents
-resolved local tracks, so exporting a playlist that contains remote or still-unmatched entries is
+Export writes to a temporary file and atomically replaces the destination. Tributary exports
+only resolved local tracks, so a playlist that contains remote or still-unmatched entries is
 refused as a whole rather than silently exporting a subset. Ratings are not part of the
 interchange in either direction.
 
