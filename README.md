@@ -97,15 +97,16 @@ and [`docs/task.md`](docs/task.md) is the countable working list.
 ```
 
 The local library and the Subsonic, Jellyfin, Plex, and DAAP backends publish their catalogues
-through one async `MediaBackend` trait, so the tracklist and browser render every source the
-same way; connection and authentication flows still differ per backend. Radio-Browser views,
-removable mounts, and files opened from the OS plug in as lifecycle adapters instead.
-`SourceRegistry` owns the lifecycle of those managed sources — authenticated servers, radio,
-removable media, and OS-opened files — and resolves their media at playback time, while the
-local library is scanned and watched by its own engine. Remote and removable rows and every
-playback queue carry only a stable `SourceId` and `TrackId`, never a server address, credential,
-or mount path; local rows keep a file path for operations such as Properties. Outputs implement
-one `AudioOutput` trait. Last.fm is absent from the diagram because it is not user-visible yet.
+through one async `MediaBackend` trait, so the tracklist and browser render every source the same
+way; connection and authentication flows still differ per backend. Radio-Browser views, removable
+mounts, and files opened from the OS plug in as lifecycle adapters instead. `SourceRegistry` owns
+the lifecycle of those managed sources — authenticated servers, radio, removable media, and
+OS-opened files — and resolves their media at playback time, while the local library is scanned
+and watched by its own engine. Remote and removable rows and every playback queue identify tracks
+by a stable `SourceId` and `TrackId` plus non-locator metadata, never by a server address,
+credential, or mount path; local rows keep a file path for operations such as Properties. Outputs
+implement one `AudioOutput` trait. Last.fm is absent from the diagram because it is not
+user-visible yet.
 
 The [source identity and lifecycle decision](docs/architecture/source-lifecycle.md) documents the
 registry seam in detail.
@@ -639,10 +640,10 @@ volume. Packaged Windows and macOS builds follow changes to the system default a
 
 - **Play/Pause** — click the circular play button, or double-click any track in the tracklist
 - **Next / Previous** — skip buttons and OS media controls behave the same. More than three seconds
-  into a track, Previous restarts it; otherwise it returns to the previously played track, and Next
-  then retraces that history before moving on
-- **Shuffle** — randomises the queue without immediately repeating the current track, and remembers
-  recent history so Previous still works
+  into a track, Previous restarts it; otherwise it moves to the previous track in the queue
+- **Shuffle** — randomises the queue without immediately repeating the current track. In shuffle
+  mode Previous walks back through the tracks actually played, and Next then retraces that history
+  before continuing
 - **Repeat** — cycles through Off → All → One
 - **Seek** — drag the progress scrubber
 - **Volume** — drag the volume slider (cubic perceptual curve)
