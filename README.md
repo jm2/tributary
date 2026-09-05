@@ -546,7 +546,8 @@ M4A/AAC, OGG Vorbis, and FLAC.
 The Rating column shows a whole-number 1–100 value. Click a local track's rating to open the
 editor, choose a value, and select **Apply**, or **Clear** to return it to Unrated. Ratings from
 Subsonic, Jellyfin, and Plex are displayed read-only; DAAP and removable rows show Unavailable,
-and radio stations have no Rating column. Sorting by Rating keeps rated rows first in either direction, and smart-playlist rules can
+and radio stations have no Rating column. Sorting by Rating keeps rated rows first in either
+direction, and smart-playlist rules can
 compare ratings (**is**, **is not**, **greater than**, **less than**, **in range**, **is rated**,
 **is unrated**). See the [rating contract](docs/ratings.md) for the details.
 
@@ -682,7 +683,8 @@ enumerate those details — they belong in a design doc once an implementation p
 Likely paths forward (each to be evaluated when the work begins):
 
 - **Subprocess delegation** to a maintained external tool. Cheaper to integrate, but adds a runtime dependency outside the single-binary distribution model.
-- **A pure-Rust sender implementation**, either in-tree or as a contributed `gst-plugins-rs` element. Higher engineering cost; cleanest distribution story.
+- **A pure-Rust sender implementation**, either in-tree or as a contributed `gst-plugins-rs`
+  element. Higher engineering cost; cleanest distribution story.
 - **Wait for an upstream component** to mature to the point that one of the above becomes obviously preferable.
 
 The hook for whichever path is chosen is `service_type: "airplay2"` in [`src/discovery.rs`](src/discovery.rs); today that branch is dropped by [`src/ui/discovery_handler.rs`](src/ui/discovery_handler.rs), and that's where AirPlay 2 sender support will plug in.
