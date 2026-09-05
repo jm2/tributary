@@ -10,6 +10,7 @@ const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
 const RUST_TOOLCHAIN_MANIFEST: &str = include_str!("../.github/rust-toolchain.toml");
 const DEPENDABOT_CONFIG: &str = include_str!("../.github/dependabot.yml");
 const DEPENDABOT_AUTOMERGE: &str = include_str!("../.github/workflows/dependabot-automerge.yml");
+const BOT_REVIEW_GATE: &str = include_str!("../.github/workflows/bot-review-gate.yml");
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
 const REFINERY_CONFIG: &str = include_str!("../docs/refinery-config.md");
 const COVERAGE_BASELINE: &str = include_str!("../coverage-baseline.txt");
@@ -1316,8 +1317,8 @@ fn dependabot_automerge_writer_is_action_free_concurrent_and_exact_head_guarded(
     );
     assert_eq!(
         writer_steps.len(),
-        1,
-        "the write-capable job must contain only the guarded merge command"
+        2,
+        "the write-capable job must contain only the live-ruleset precondition and the guarded merge command"
     );
     assert_eq!(
         workflow["concurrency"]["cancel-in-progress"].as_bool(),
@@ -1372,6 +1373,175 @@ fn dependabot_automerge_writer_is_action_free_concurrent_and_exact_head_guarded(
     );
 }
 
+fn bot_review_gate_workflow() -> serde_yaml::Value {
+    serde_yaml::from_str(BOT_REVIEW_GATE).expect("bot review gate workflow must parse")
+}
+
+#[test]
+// These assertions jointly prove the gate's one privileged boundary — it is
+// the machine-readable merge evidence for bot reviews — and should fail as a
+// unit if its read-only permission, fail-closed query, thread semantics, or
+// stable check name regresses.
+// #lizard forgives
+fn bot_review_gate_is_read_only_fail_closed_and_pinned_to_main_prs() {
+    let workflow = bot_review_gate_workflow();
+
+    // The check name is the required-check context the live ruleset must
+    // reference; it is a deployment contract and must not drift silently.
+    assert_eq!(
+        workflow["jobs"]["bot-review-gate"]["name"].as_str(),
+        Some("Bot Review Gate"),
+        "the gate's check-run name is referenced by the live ruleset and must stay stable"
+    );
+
+    // YAML 1.1 parses the bare `on:` key as boolean true, so look up both
+    // spellings instead of assuming one.
+    let on = workflow
+        .get("on")
+        .or_else(|| workflow.get(serde_yaml::Value::Bool(true)))
+        .expect("the gate workflow must declare its triggers");
+    assert!(
+        on.get("pull_request_target").is_none(),
+        "the gate must never use pull_request_target"
+    );
+    assert_eq!(
+        on["pull_request"]["branches"]
+            .as_sequence()
+            .map(std::vec::Vec::len),
+        Some(1),
+        "the gate reports only on pull requests targeting main"
+    );
+    let review_types = yaml_string_list(&on["pull_request_review"], "types");
+    assert_eq!(
+        review_types,
+        ["submitted"],
+        "review submissions must re-evaluate the gate"
+    );
+    let thread_types = yaml_string_list(&on["pull_request_review_thread"], "types");
+    assert_eq!(
+        thread_types,
+        ["resolved", "unresolved"],
+        "thread resolution changes must re-evaluate the gate or a resolved gate would stay red"
+    );
+
+    let permissions = workflow["permissions"]
+        .as_mapping()
+        .expect("workflow permissions must be a mapping");
+    assert_eq!(
+        permissions.len(),
+        1,
+        "the gate must declare exactly one workflow-level permission"
+    );
+    assert_eq!(
+        workflow["permissions"]["pull-requests"].as_str(),
+        Some("read"),
+        "the gate must be strictly read-only"
+    );
+
+    let job_steps = workflow["jobs"]["bot-review-gate"]["steps"]
+        .as_sequence()
+        .expect("gate steps must be a sequence");
+    assert_eq!(
+        job_steps.len(),
+        1,
+        "the gate must stay a single API-only step"
+    );
+    assert!(
+        job_steps.iter().all(|step| step.get("uses").is_none()),
+        "the gate must not execute any third-party action or checkout"
+    );
+
+    assert_eq!(
+        workflow["concurrency"]["cancel-in-progress"].as_bool(),
+        Some(true),
+        "a newer review event must cancel the gate's stale run"
+    );
+    assert!(
+        workflow["concurrency"]["group"]
+            .as_str()
+            .is_some_and(|group| group.contains("github.event.pull_request.number")),
+        "gate concurrency must be scoped to the exact pull request"
+    );
+
+    assert!(
+        BOT_REVIEW_GATE.contains("isResolved")
+            && BOT_REVIEW_GATE.contains("isOutdated")
+            && BOT_REVIEW_GATE.contains(".comments.nodes[0].author.__typename == \"Bot\"")
+            && BOT_REVIEW_GATE.contains("endswith(\"[bot]\")")
+            && BOT_REVIEW_GATE.contains("reviewThreads"),
+        "the gate must fail on unresolved, non-outdated review threads started by bots"
+    );
+    assert!(
+        BOT_REVIEW_GATE.contains("Review-thread query failed; failing closed.")
+            && BOT_REVIEW_GATE
+                .contains("Review-thread response omitted the pull request; failing closed."),
+        "a failed or incomplete thread query must fail the check instead of passing it"
+    );
+}
+
+#[test]
+fn dependabot_automerge_waits_for_the_live_full_policy_ruleset() {
+    let workflow = dependabot_automerge_workflow();
+    let writer = &workflow["jobs"]["dependabot-automerge"];
+
+    assert_eq!(
+        writer["permissions"]["administration"].as_str(),
+        Some("read"),
+        "the writer needs exactly read authority over repository rulesets"
+    );
+
+    let writer_steps = writer["steps"]
+        .as_sequence()
+        .expect("write job steps must be a sequence");
+    assert!(
+        writer_steps.first().is_some_and(|step| {
+            step["name"].as_str()
+                == Some("Require the live ruleset to enforce the full policy gate")
+        }),
+        "the ruleset precondition must run before any merge request"
+    );
+
+    let expected_checks = [
+        "Security Audit|15368",
+        "Linux (x86_64)|15368",
+        "Linux (aarch64)|15368",
+        "macOS (aarch64)|15368",
+        "Windows (x86_64)|15368",
+        "Windows (aarch64)|15368",
+        "Flatpak (Linux)|15368",
+        "MSRV|15368",
+        "Coverage (Linux x86_64)|15368",
+        "Bot Review Gate|15368",
+        "CodeQL|57789",
+        "Analyze (python)|57789",
+        "Analyze (rust)|57789",
+        "Analyze (actions)|57789",
+        "Codacy Static Code Analysis|56611",
+        "CodeRabbit|",
+    ];
+    for expected in expected_checks {
+        assert!(
+            DEPENDABOT_AUTOMERGE.contains(&format!("\"{expected}\"")),
+            "the auto-merge precondition must require live ruleset context {expected}"
+        );
+    }
+    assert!(
+        DEPENDABOT_AUTOMERGE.contains("rulesets?ref=main")
+            && DEPENDABOT_AUTOMERGE.contains("select(.enforcement == \"active\")"),
+        "the precondition must read the active rulesets that apply to main"
+    );
+    assert!(
+        DEPENDABOT_AUTOMERGE.contains("The list endpoint omits rule parameters")
+            && DEPENDABOT_AUTOMERGE.contains("rulesets/${rule_id}"),
+        "the precondition must fetch each active ruleset's actual required checks"
+    );
+    assert!(
+        DEPENDABOT_AUTOMERGE.contains("Refusing to enable auto-merge")
+            && DEPENDABOT_AUTOMERGE.contains("refusing auto-merge"),
+        "every query failure or coverage gap must keep routine auto-merge off"
+    );
+}
+
 fn repository_workflow_names() -> (std::path::PathBuf, Vec<String>) {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workflows_dir = manifest_dir.join(".github/workflows");
@@ -1418,6 +1588,7 @@ fn hosted_ai_reviewer_remains_decommissioned() {
     assert_eq!(
         workflows,
         [
+            "bot-review-gate.yml",
             "ci.yml",
             "dependabot-automerge.yml",
             "fuzz.yml",
