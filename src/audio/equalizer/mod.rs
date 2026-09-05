@@ -28,9 +28,7 @@ pub mod chain;
 pub mod config;
 
 pub use chain::EqChain;
-pub use config::{
-    config_file_exists, load_settings_with_diagnostic, save_equalizer_settings_to_disk,
-};
+pub use config::{load_settings_with_status, save_equalizer_settings_to_disk, EqLoadStatus};
 
 // ── Contract constants ──────────────────────────────────────────────────
 
@@ -169,12 +167,6 @@ impl EqSettings {
         10.0_f64.powf(preamp_db / 20.0)
     }
 
-    /// True when this state is byte-for-byte the fresh-install default.
-    /// Persistence is suppressed entirely in this state.
-    pub fn is_fresh_default(&self) -> bool {
-        *self == Self::default()
-    }
-
     /// The manual-edit side effect: any band or preamp change from a
     /// named preset moves the persisted name to `Custom`.
     pub fn mark_custom(&mut self) {
@@ -222,7 +214,7 @@ mod tests {
         assert_eq!(defaults.preamp_db, 0.0);
         assert!(defaults.bands_db.iter().all(|gain| *gain == 0.0));
         assert_eq!(defaults.clip_protection, ClipProtection::Off);
-        assert!(defaults.is_fresh_default());
+        assert_eq!(defaults, EqSettings::default());
     }
 
     #[test]
