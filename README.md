@@ -38,7 +38,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Internet Radio (Top Clicked, Top Voted, Stations Near Me) | ✅ |
 | Tiered geo-location (geo-distance → state → country) | ✅ |
 | Column drag-and-drop reordering with persistence | ✅ |
-| Regular & smart playlists (iTunes-style rules engine) | ✅ Regular playlists may include remote tracks |
+| Regular & smart playlists (iTunes-style rules) | ✅ Regular playlists may include remote tracks |
 | Drag and drop tracks onto playlists | ✅ |
 | Subsonic server playlists (import a copy, or keep a read-only synced mirror) | ✅ |
 | Realtime text search filter (title, artist, album, genre) | ✅ |
@@ -52,7 +52,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Audio output selector (local + MPD + Chromecast) | ✅ |
 | MPD output backend (sink-only, hardened TCP) | ✅ Requires exclusive-control confirmation |
 | Output switching (click to swap local ↔ MPD) | ✅ |
-| AirPlay 1 (RAOP) output | ⚠️ Discovered, but supported GStreamer builds lack the `raopsink` sender |
+| AirPlay 1 (RAOP) output | ⚠️ Discovered, but supported GStreamer builds lack `raopsink` |
 | AirPlay 2 / HomeKit output | ❌ Not yet supported — see [AirPlay roadmap](#airplay-roadmap) below |
 | Chromecast output (Cast V2 — local files + remote sources) | ✅ |
 | Album artist sort (preference toggle) | ✅ |
