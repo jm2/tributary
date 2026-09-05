@@ -32,6 +32,7 @@ pub(super) fn wire_equalizer_controls(
     );
     wire_gain_sliders(
         active_output,
+        &controls.preset_dropdown,
         &controls.preamp_scale,
         &controls.band_scales,
         updating,
@@ -77,9 +78,10 @@ fn wire_preset_dropdown(
             return;
         }
         let position = dropdown.selected();
-        // `Custom` is not activatable in the list; guard anyway so a
-        // programmatic selection can never be mistaken for a menu
-        // choice, and restore the named-preset position.
+        // `Custom` is neither activatable nor selectable in the list;
+        // guard anyway so a programmatic selection can never be
+        // mistaken for a menu choice, and restore the named-preset
+        // position.
         let Some(preset) = preset_from_menu_position(position) else {
             return;
         };
@@ -100,9 +102,14 @@ fn wire_preset_dropdown(
 /// Preamp and band sliders: snap the dragged value to the contract's
 /// half-step grid, mirror the snapped DSP value back onto the
 /// originating slider (so the visible and accessible values cannot
-/// drift from the applied state), then apply.
+/// drift from the applied state), then apply. Every manual edit also
+/// moves the preset combo to `Custom` (contract acceptance 5: the
+/// persisted `preset` field becomes `custom` and the UI combo displays
+/// `Custom`) — the combo update runs under the same re-entrancy guard
+/// so it cannot be mistaken for a menu choice.
 fn wire_gain_sliders(
     active_output: &SharedAudioOutput,
+    preset_dropdown: &gtk::DropDown,
     preamp_scale: &gtk::Scale,
     band_scales: &[gtk::Scale],
     updating: &Rc<Cell<bool>>,
@@ -110,6 +117,7 @@ fn wire_gain_sliders(
     {
         let output_for_preamp = active_output.clone();
         let updating_for_preamp = updating.clone();
+        let preset_dropdown_for_preamp = preset_dropdown.clone();
         preamp_scale.connect_value_changed(move |scale| {
             if updating_for_preamp.get() {
                 return;
@@ -119,6 +127,7 @@ fn wire_gain_sliders(
             settings.mark_custom();
             updating_for_preamp.set(true);
             scale.set_value(settings.preamp_db);
+            preset_dropdown_for_preamp.set_selected(preset_menu_position(Preset::Custom));
             updating_for_preamp.set(false);
             output_for_preamp
                 .borrow()
@@ -129,6 +138,7 @@ fn wire_gain_sliders(
     for (index, scale) in band_scales.iter().enumerate() {
         let output_for_band = active_output.clone();
         let updating_for_band = updating.clone();
+        let preset_dropdown_for_band = preset_dropdown.clone();
         scale.connect_value_changed(move |scale| {
             if updating_for_band.get() {
                 return;
@@ -138,6 +148,7 @@ fn wire_gain_sliders(
             settings.mark_custom();
             updating_for_band.set(true);
             scale.set_value(settings.bands_db[index]);
+            preset_dropdown_for_band.set_selected(preset_menu_position(Preset::Custom));
             updating_for_band.set(false);
             output_for_band.borrow().apply_equalizer_settings(settings);
         });
