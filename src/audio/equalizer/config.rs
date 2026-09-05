@@ -8,21 +8,6 @@ use super::{ClipProtection, EqSettings, Preset};
 /// The only supported on-disk schema version.
 const SCHEMA_VERSION: &str = "1";
 
-/// Path to the equalizer state file: `<data_dir>/tributary/equalizer.cfg`,
-/// beside the `volume` file. Owned exclusively by this module.
-fn equalizer_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join("tributary").join("equalizer.cfg"))
-}
-
-/// Whether an `equalizer.cfg` currently exists on disk. The player uses
-/// this to keep the fresh-install shape (no file) until a real state
-/// change is persisted for the first time; once a file exists, even a
-/// reset to the default state is written back so a stale non-default
-/// file can never resurrect discarded settings.
-pub fn config_file_exists() -> bool {
-    equalizer_path().is_some_and(|path| path.exists())
-}
-
 // ── Render ──────────────────────────────────────────────────────────────
 
 /// Append one `key="value"` line with the contract's escaping (`\"`,
@@ -65,11 +50,18 @@ pub fn render_equalizer_file(settings: &EqSettings) -> String {
 
 // ── Load ────────────────────────────────────────────────────────────────
 
+/// Path to the equalizer state file: `<data_dir>/tributary/equalizer.cfg`,
+/// beside the `volume` file. Owned exclusively by this module.
+fn equalizer_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("tributary").join("equalizer.cfg"))
+}
+
 /// What happened when the on-disk state was read.
 #[derive(Debug)]
 pub enum EqLoadOutcome {
     /// The file was valid (coercions and clamps may still have been
-    /// applied per the validation rules).
+    /// applied per the validation rules), or no file exists (fresh
+    /// install).
     Loaded(EqSettings),
     /// The file was malformed or carried an unsupported schema version.
     /// Defaults are returned and have been re-written to disk via the
@@ -78,6 +70,25 @@ pub enum EqLoadOutcome {
         settings: EqSettings,
         diagnostic: EqFileDiagnostic,
     },
+    /// The file exists but could not be read (permissions, transient
+    /// I/O). This is *not* a malformed file: defaults run in memory for
+    /// the session and the on-disk bytes are left exactly as they are.
+    /// The caller must suppress every persistence path — the debounced
+    /// writer and the shutdown flush — until a subsequent read succeeds
+    /// and reconciles the in-memory state with disk, so a valid file can
+    /// never be overwritten with defaults (contract: *Persistence*,
+    /// transient read failure).
+    TransientReadFailure(EqSettings),
+}
+
+/// Coarse outcome of a settings load, for callers that must react to a
+/// transient read failure (suppressing persistence) without carrying
+/// the full outcome payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EqLoadStatus {
+    Loaded,
+    ReplacedWithDefaults,
+    TransientReadFailure,
 }
 
 /// Bounded diagnostic for a replaced malformed file: file path, byte
@@ -91,11 +102,13 @@ pub struct EqFileDiagnostic {
 
 /// Shared reader for startup and the settings UI's reload escape hatch:
 /// load the persisted state, replace a malformed file, and report
-/// exactly one bounded diagnostic per replacement. Both callers must
-/// share this path so the diagnostic wording cannot drift.
-pub fn load_settings_with_diagnostic() -> EqSettings {
+/// exactly one bounded diagnostic per replacement or transient failure.
+/// Both callers must share this path so the diagnostic wording cannot
+/// drift. The returned status tells the caller whether persistence must
+/// stay suppressed (transient read failure) until a successful read.
+pub fn load_settings_with_status() -> (EqSettings, EqLoadStatus) {
     match load_equalizer_settings_from_disk() {
-        EqLoadOutcome::Loaded(settings) => settings,
+        EqLoadOutcome::Loaded(settings) => (settings, EqLoadStatus::Loaded),
         EqLoadOutcome::ReplacedWithDefaults {
             settings,
             diagnostic,
@@ -106,17 +119,33 @@ pub fn load_settings_with_diagnostic() -> EqSettings {
                 bad_key = %diagnostic.bad_key,
                 "Malformed equalizer.cfg replaced with default state"
             );
-            settings
+            (settings, EqLoadStatus::ReplacedWithDefaults)
+        }
+        EqLoadOutcome::TransientReadFailure(settings) => {
+            tracing::warn!(
+                path = %equalizer_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                "equalizer.cfg exists but is unreadable; persistence is suppressed \
+                 until a successful read reconciles state with disk"
+            );
+            (settings, EqLoadStatus::TransientReadFailure)
         }
     }
 }
 
 /// Read `equalizer.cfg`, validate, clamp, and coerce per the contract.
 pub fn load_equalizer_settings_from_disk() -> EqLoadOutcome {
-    let Some(path) = equalizer_path() else {
-        return EqLoadOutcome::Loaded(EqSettings::default());
-    };
-    let bytes = match std::fs::read(&path) {
+    match equalizer_path() {
+        Some(path) => load_equalizer_settings_from_path(&path),
+        None => EqLoadOutcome::Loaded(EqSettings::default()),
+    }
+}
+
+/// Path-injected load used by startup and by tests: every caller must
+/// share this validation path so on-disk semantics cannot drift.
+fn load_equalizer_settings_from_path(path: &std::path::Path) -> EqLoadOutcome {
+    let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         // Missing file is the fresh-install shape: defaults, no write.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -124,14 +153,17 @@ pub fn load_equalizer_settings_from_disk() -> EqLoadOutcome {
         }
         Err(_) => {
             // Unreadable (permissions, transient I/O): run with defaults
-            // in memory but keep the on-disk state — one failed read must
-            // never discard valid persisted state the parser cannot see.
-            return EqLoadOutcome::Loaded(EqSettings::default());
+            // in memory, keep the on-disk state, and let the caller
+            // suppress persistence. A read that never succeeded cannot
+            // establish that the file is malformed, so the defaults-
+            // overwrite path below must stay out of reach — one failed
+            // read must never schedule a write over valid disk state.
+            return EqLoadOutcome::TransientReadFailure(EqSettings::default());
         }
     };
     match parse_equalizer_file(&bytes) {
         Ok(settings) => EqLoadOutcome::Loaded(settings),
-        Err(bad_key) => replace_with_defaults(&path, bytes.len() as u64, &bad_key),
+        Err(bad_key) => replace_with_defaults(path, bytes.len() as u64, &bad_key),
     }
 }
 
@@ -151,15 +183,20 @@ fn replace_with_defaults(path: &std::path::Path, byte_count: u64, bad_key: &str)
 
 // ── Parse ───────────────────────────────────────────────────────────────
 
-/// Line-scan accumulator for the config parser.
+/// Line-scan accumulator for the config parser. Every key is optional
+/// while scanning and *required* at the end: a file that parses but
+/// omits any of the fifteen keys is malformed as a whole — there are no
+/// per-key defaults for missing keys, because silently filling gaps
+/// would combine stale band values with fresh ones (contract:
+/// *Persistence*, validation rules).
 #[derive(Default)]
 struct RawEqConfig {
     schema_version: Option<String>,
     enabled: Option<bool>,
     preset: Option<Preset>,
     preamp_db: Option<f64>,
-    bands_db: [f64; 10],
-    clip_protection: ClipProtection,
+    bands_db: [Option<f64>; 10],
+    clip_protection: Option<ClipProtection>,
 }
 
 impl RawEqConfig {
@@ -182,7 +219,7 @@ impl RawEqConfig {
             "schema_version" => self.schema_version = Some(value.to_string()),
             "enabled" => self.enabled = Some(value == "true"),
             "preset" => self.preset = Some(Preset::from_key(value)),
-            "clip_protect" => self.clip_protection = ClipProtection::from_key(value),
+            "clip_protect" => self.clip_protection = Some(ClipProtection::from_key(value)),
             _ => return false,
         }
         true
@@ -192,13 +229,14 @@ impl RawEqConfig {
     /// minor schema can add keys without discarding user state.
     fn absorb_band(&mut self, key: &str, value: &str) -> Result<(), String> {
         if let Some(band) = band_index(key) {
-            self.bands_db[band] = parse_gain(value).ok_or_else(|| format!("band{band}_db"))?;
+            self.bands_db[band] = Some(parse_gain(value).ok_or_else(|| format!("band{band}_db"))?);
         }
         Ok(())
     }
 
-    /// Finish the scan: require the schema version, apply defaults for
-    /// absent optional keys, and clamp gains to the contract bounds.
+    /// Finish the scan: require the schema version *and* all fifteen
+    /// keys — a file omitting any key is malformed and reported with the
+    /// first missing key — then clamp gains to the contract bounds.
     fn into_settings(self) -> Result<EqSettings, String> {
         let schema_version = self
             .schema_version
@@ -206,12 +244,22 @@ impl RawEqConfig {
         if schema_version != SCHEMA_VERSION {
             return Err("schema_version".to_string());
         }
+        let enabled = self.enabled.ok_or_else(|| "enabled".to_string())?;
+        let preset = self.preset.ok_or_else(|| "preset".to_string())?;
+        let preamp_db = self.preamp_db.ok_or_else(|| "preamp_db".to_string())?;
+        let mut bands_db = [0.0; 10];
+        for (index, gain) in bands_db.iter_mut().enumerate() {
+            *gain = self.bands_db[index].ok_or_else(|| format!("band{index}_db"))?;
+        }
+        let clip_protection = self
+            .clip_protection
+            .ok_or_else(|| "clip_protect".to_string())?;
         let mut settings = EqSettings {
-            enabled: self.enabled.unwrap_or(false),
-            preset: self.preset.unwrap_or(Preset::Flat),
-            preamp_db: self.preamp_db.unwrap_or(0.0),
-            bands_db: self.bands_db,
-            clip_protection: self.clip_protection,
+            enabled,
+            preset,
+            preamp_db,
+            bands_db,
+            clip_protection,
         };
         settings.preamp_db = EqSettings::clamp_gain_db(settings.preamp_db);
         for gain in &mut settings.bands_db {
@@ -465,19 +513,33 @@ clip_protect=\"off\"
 
     #[test]
     fn parser_is_order_insensitive_but_strict_about_quoting() {
+        // Line order is free, but the file must still be whole: all
+        // fifteen keys are required, so the shuffled fixture carries
+        // every one of them (contract: *Persistence*, validation rules).
         let reordered = "\
 clip_protect=\"soft\"
-band9_db=\"+12.0\"
+band7_db=\"0.0\"
 schema_version=\"1\"
+band2_db=\"-3.0\"
 preamp_db=\"-24.0\"
+band9_db=\"+12.0\"
 preset=\"jazz\"
 band0_db=\"-24.0\"
 enabled=\"true\"
+band4_db=\"1.5\"
+band1_db=\"2.0\"
+band6_db=\"0.0\"
+band3_db=\"4.5\"
+band8_db=\"-1.0\"
+band5_db=\"6.0\"
 ";
         let parsed = parse_equalizer_file(reordered.as_bytes()).expect("reordered parse");
         assert!(parsed.enabled);
         assert_eq!(parsed.preset, Preset::Jazz);
         assert_eq!(parsed.preamp_db, -24.0);
+        assert_eq!(parsed.bands_db[0], -24.0);
+        assert_eq!(parsed.bands_db[1], 2.0);
+        assert_eq!(parsed.bands_db[2], -3.0);
         assert_eq!(parsed.bands_db[9], 12.0);
         assert_eq!(parsed.clip_protection, ClipProtection::Soft);
 
@@ -547,19 +609,40 @@ enabled=\"true\"
     }
 
     #[test]
-    fn missing_enabled_key_defaults_to_disabled() {
-        // A missing optional key is tolerated with its default; only a
-        // malformed line or a bad schema version replaces the file.
-        let content = render_equalizer_file(&EqSettings {
-            enabled: true,
-            ..EqSettings::default()
-        })
-        .lines()
-        .filter(|line| !line.starts_with("enabled="))
-        .collect::<Vec<_>>()
-        .join("\n");
-        let parsed = parse_equalizer_file(content.as_bytes()).expect("missing enabled tolerated");
-        assert!(!parsed.enabled);
+    fn missing_any_of_the_fifteen_keys_is_malformed() {
+        // No per-key defaults: a file that parses but omits any of the
+        // fifteen keys is malformed as a whole (contract: *Persistence*).
+        const ALL_KEYS: [&str; 15] = [
+            "schema_version",
+            "enabled",
+            "preset",
+            "preamp_db",
+            "band0_db",
+            "band1_db",
+            "band2_db",
+            "band3_db",
+            "band4_db",
+            "band5_db",
+            "band6_db",
+            "band7_db",
+            "band8_db",
+            "band9_db",
+            "clip_protect",
+        ];
+        for missing in ALL_KEYS {
+            let content = render_equalizer_file(&EqSettings {
+                enabled: true,
+                preset: Preset::Rock,
+                ..EqSettings::default()
+            })
+            .lines()
+            .filter(|line| !line.starts_with(&format!("{missing}=")))
+            .collect::<Vec<_>>()
+            .join("\n");
+            let error = parse_equalizer_file(content.as_bytes())
+                .expect_err("an omitted key must be malformed");
+            assert_eq!(error, missing, "the diagnostic names the missing key");
+        }
     }
 
     #[test]
@@ -602,6 +685,60 @@ enabled=\"true\"
         assert_eq!(
             temp_sibling(path),
             std::path::Path::new("state/tributary/equalizer.cfg.tmp")
+        );
+    }
+
+    // ── Disk-level load outcomes ────────────────────────────────────
+
+    /// Regression (contract acceptance 18): a *transient* read failure
+    /// is not a malformed file. The outcome is
+    /// `TransientReadFailure` with in-memory defaults, the on-disk bytes
+    /// stay exactly as they were, and no defaults-overwrite is scheduled.
+    #[test]
+    fn transient_unreadable_file_reports_failure_without_touching_disk() {
+        let base = tempfile::tempdir().expect("temporary config root");
+        let path = base.path().join("equalizer.cfg");
+        // A directory at the config path is portable way to make
+        // `std::fs::read` fail with a non-NotFound error on every host.
+        std::fs::create_dir(&path).expect("unreadable fixture");
+
+        let outcome = load_equalizer_settings_from_path(&path);
+        let settings = match &outcome {
+            EqLoadOutcome::TransientReadFailure(settings) => *settings,
+            other => panic!("an unreadable file must be a transient failure, not {other:?}"),
+        };
+        assert_eq!(settings, EqSettings::default());
+        // The unreadable fixture is untouched: no atomic replace ran
+        // over it, and no temp sibling was scheduled.
+        assert!(path.is_dir());
+        assert!(!temp_sibling(&path).exists());
+    }
+
+    /// The malformed-content path keeps its contract behavior: the
+    /// defaults-overwrite repair runs only for a read that *succeeded*,
+    /// with the bounded diagnostic carrying the bad key.
+    #[test]
+    fn malformed_content_is_repaired_at_the_path_level() {
+        let base = tempfile::tempdir().expect("temporary config root");
+        let path = base.path().join("equalizer.cfg");
+        let malformed = "preset=flat\n";
+        std::fs::write(&path, malformed).expect("seed malformed file");
+
+        let outcome = load_equalizer_settings_from_path(&path);
+        let (settings, diagnostic) = match &outcome {
+            EqLoadOutcome::ReplacedWithDefaults {
+                settings,
+                diagnostic,
+            } => (*settings, diagnostic.clone()),
+            other => panic!("malformed content must be replaced with defaults, not {other:?}"),
+        };
+        assert_eq!(settings, EqSettings::default());
+        assert_eq!(diagnostic.bad_key, "preset");
+        assert_eq!(diagnostic.byte_count, malformed.len() as u64);
+        // The repair wrote the default file content back to disk.
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some(render_equalizer_file(&EqSettings::default()).as_str())
         );
     }
 }
