@@ -83,15 +83,15 @@ and [`docs/task.md`](docs/task.md) is the countable working list.
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
-│ GTK4 / libadwaita UI and platform media controls            │
+│ GTK4 / libadwaita UI and platform media controls             │
 ├──────────────────────────────────────────────────────────────┤
 │ SourceRegistry: source identity, lifecycle, and              │
 │ playback-time media resolution                               │
-├──────────────────────────────────────────────────────────────┤
-│ MediaBackend trait (async)                                   │
-├────────┬──────────┬──────────┬──────┬──────┬────────┬────────┤
-│ Local  │ Subsonic │ Jellyfin │ Plex │ DAAP │ Radio  │ Device │
-├────────┴──────────┴──────────┴──────┴──────┴────────┴────────┤
+├─────────────────────────────────────────┬────────────────────┤
+│ MediaBackend trait (async)              │ Lifecycle adapters │
+├────────┬──────────┬──────────┬────┬─────┼───────┬────────────┤
+│ Local  │ Subsonic │ Jellyfin │Plex│DAAP │ Radio │ Device/OS  │
+├────────┴──────────┴──────────┴────┴─────┴───────┴────────────┤
 │ AudioOutput: Local/GStreamer │ MPD │ AirPlay 1 │ Chromecast  │
 └──────────────────────────────────────────────────────────────┘
 ```
