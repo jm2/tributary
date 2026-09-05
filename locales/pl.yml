@@ -145,6 +145,8 @@ dialogs:
   output_port: "Port"
   output_exclusive_control_warning: "Polecenia MPD wstrzymania, zatrzymania, powtarzania, losowania, trybu pojedynczego i zużywania dotyczą całej partycji odtwarzania. Nie udostępniaj jej innemu kontrolerowi ani innej instancji Tributary."
   output_exclusive_control_confirmation: "Potwierdzam, że Tributary ma wyłączną kontrolę nad tą partycją odtwarzania MPD."
+  output_detection_warning: "Przy włączonym nadzorze Tributary dalej obserwuje partycję podczas odtwarzania: obcy bieżący utwór, obca zmiana opcji lub utracone okno obserwacji cofają kontrolę odtwarzania i zachowują każdy osierocony wpis kolejki. Nadzór może tylko cofać, nigdy przyznawać: po takich dowodach wyjście odrzuca polecenia do momentu ponownego wybrania go w celu ponownego potwierdzenia."
+  output_detection_confirmation: "Nadzoruj to wyłączne wyjście i cofaj jego kontrolę po dowodach działania innego kontrolera."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
