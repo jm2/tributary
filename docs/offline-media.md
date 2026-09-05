@@ -139,10 +139,13 @@ opt-in without taking the playback catalogue with it. The contract:
    adapter. `None` and `Err(Denied)` are distinct; `None` means the source has
    not declared, `Denied` means it explicitly refuses.
 2. Only the same authenticated-backends that opt into live `ServerPlaylist`
-   reads (Subsonic, Jellyfin, Plex, DAAP) may opt in here. Radio-Browser,
-   removable, external-file, and the built-in local source must return
-   `None`. A local file is already local; a removable volume is lifecycle-bound
-   but not credentialed; an external file is one-shot.
+   reads (Subsonic, Jellyfin, Plex, DAAP) may opt in here. Removable,
+   external-file, and the built-in local source must return `None`: a local
+   file is already local; a removable volume is lifecycle-bound but not
+   credentialed; an external file is one-shot. Radio-Browser must return
+   `Err(Denied)`: its streams are public and not licensable for offline by
+   default, so it explicitly opts out instead of leaving the capability
+   undeclared.
 3. The capability is generation-owned. Replacing a source supersedes its offline
    decision; the cache layers generate replacement on the same generation as
    the live adapter.
@@ -212,9 +215,12 @@ The rules:
    or shutdown cancels the in-flight lease promptly. A cancelled job leaves no
    half-promoted GTK row and no committed cache entry.
 4. **Failure is structured.** `OfflineError` is a typed enum with redacted
-   variants (`Network`, `AuthExpired`, `LeaseRevoked`, `IntegrityMismatch`,
-   `IntegrityUnverifiable`, `LicenceDenied`, `QuotaExceeded`,
-   `StorageUnavailable`, `UnsupportedSource`). No raw HTTP status, redirect
+   variants (`Network`, `AuthExpired`, `LeaseRevoked`, `Denied`,
+   `IntegrityMismatch`, `IntegrityUnverifiable`, `LicenceDenied`,
+   `QuotaExceeded`, `StorageUnavailable`, `UnsupportedSource`). `Denied` is
+   the capability-level refusal surfaced by `offline_snapshot` for a source
+   that explicitly opts out; it is distinct from `LicenceDenied`, which is
+   the operational-licence verdict. No raw HTTP status, redirect
    path, body excerpt, header value, or URL parameter appears in the failure.
 5. **One job per `(media_key, capability_epoch)`.** A newer request that wants
    to replace an in-flight predecessor waits for its terminal state. Replacing
@@ -336,7 +342,7 @@ Adapters opt in by returning `Some(OfflineSnapshot)` from
 | Jellyfin | `GET /Items/<id>/Download` authenticated through the exact-origin proxy. | Identical. | None guaranteed by the API — double-fetch verification. | Same. |
 | Plex | `GET /library/parts/<partId>` authenticated through the exact-origin proxy; uses `X-Plex-Token` only inside the proxy boundary. | Identical. | None advertised by the API — double-fetch verification. | Same. |
 | DAAP | `DAAP.song` request, authenticated through the DAAP protocol-specific lane already retired to the source lifecycle. | Identical. | None advertised by the protocol — double-fetch verification. | DAAP connection still has exactly-once logout; committed cache rows survive disconnect — logout revokes only the in-flight lease. |
-| Radio-Browser | Disallowed. | — | — | Streams are public and not licensable for offline by default; deny hard. |
+| Radio-Browser | Disallowed. | — | — | Streams are public and not licensable for offline by default; deny hard — `offline_snapshot` returns `Err(Denied)` (explicit opt-out, distinct from `None`/undeclared). |
 | Built-in local | Disallowed. | — | — | Local files are already local; the cache is the filesystem. |
 | Removable | Disallowed. | — | — | Lifecycle-bound, not credentialed; the mount is the offline storage. |
 | External-file | Disallowed. | — | — | One-shot ephemeral session; no persistence. |
@@ -575,8 +581,9 @@ does not have to invent them mid-slice.
 Until an offline-capable source opts in for the first time, none of the offline
 machinery is exercised at runtime. A database that has never had an offline
 cache row is identical at the byte level to a database without the migration.
-A source that opts out keeps the same `OfflineSnapshot::None` semantics that
-the new adapter implies.
+A source that opts out — or revokes an earlier opt-in — returns `Err(Denied)`
+from `offline_snapshot`; the source stays default-deny for offline exactly as
+it was before it opted in.
 
 When the project eventually retires the offline subsystem, the migration is
 reversed by a follower migration that drops the offline tables, indexes, and
