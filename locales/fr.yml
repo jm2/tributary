@@ -447,3 +447,28 @@ rhythmbox_migration:
       automatic_rating_semantics: "la règle de note de la liste automatique ne peut pas être représentée exactement"
       invalid_occurrence: "l’entrée ne comporte aucun emplacement de fichier local utilisable"
       unmatched_occurrence: "l’entrée est conservée comme chemin sans correspondance"
+
+# ── Equalizer ──────────────────────────────────────────────────────
+equalizer:
+  title: "Égaliseur"
+  description: "Égaliseur à dix bandes avec préamplification et protection contre l’écrêtage pour la sortie audio locale."
+  enabled: "Activer l’égaliseur"
+  preset: "Préréglage"
+  preset_flat: "Plat"
+  preset_pop: "Pop"
+  preset_rock: "Rock"
+  preset_jazz: "Jazz"
+  preset_classical: "Classique"
+  preset_custom: "Personnalisé"
+  preamp: "Préamplification"
+  clip_protection: "Protection contre l’écrêtage"
+  clip_off: "Désactivée"
+  clip_soft: "Douce"
+  reset_flat: "Réinitialiser à plat"
+  reload: "Recharger depuis le disque"
+  band_a11y: "Bande de l’égaliseur à %{frequency} hertz, réglée en décibels"
+  unsupported:
+    local: "L’égaliseur fonctionne dans le pipeline audio local de Tributary."
+    airplay: "Les récepteurs AirPlay restituent le son de bout en bout ; l’égaliseur de Tributary ne peut donc pas atteindre l’enceinte."
+    chromecast: "Les appareils Chromecast restituent le son côté récepteur ; l’égaliseur de Tributary ne peut donc pas atteindre l’enceinte."
+    mpd: "MPD restitue le son côté serveur ; l’égaliseur de Tributary ne peut donc pas atteindre les lecteurs distants."

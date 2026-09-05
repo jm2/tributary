@@ -447,3 +447,28 @@ rhythmbox_migration:
       automatic_rating_semantics: "無法精確表示自動播放清單的評分規則"
       invalid_occurrence: "項目中沒有可用的本機檔案位置"
       unmatched_occurrence: "項目將保留為未配對路徑"
+
+# ── Equalizer ──────────────────────────────────────────────────────
+equalizer:
+  title: "等化器"
+  description: "適用於本機音訊輸出的十段等化器，具備前級放大與削波保護。"
+  enabled: "啟用等化器"
+  preset: "預設"
+  preset_flat: "平直"
+  preset_pop: "流行"
+  preset_rock: "搖滾"
+  preset_jazz: "爵士"
+  preset_classical: "古典"
+  preset_custom: "自訂"
+  preamp: "前級放大"
+  clip_protection: "削波保護"
+  clip_off: "關閉"
+  clip_soft: "柔和"
+  reset_flat: "重設為平直"
+  reload: "從磁碟重新載入"
+  band_a11y: "%{frequency}赫茲等化器頻段，以分貝調整"
+  unsupported:
+    local: "等化器在 Tributary 的本機音訊管線內運作。"
+    airplay: "AirPlay 接收端會自行完成全部音訊處理，因此 Tributary 的等化器無法作用到喇叭。"
+    chromecast: "Chromecast 裝置會在接收端處理音訊，因此 Tributary 的等化器無法作用到喇叭。"
+    mpd: "MPD 在伺服器端處理音訊，因此 Tributary 的等化器無法作用到遠端播放器。"

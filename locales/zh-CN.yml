@@ -447,3 +447,28 @@ rhythmbox_migration:
       automatic_rating_semantics: "无法精确表示自动播放列表的评分规则"
       invalid_occurrence: "条目中没有可用的本地文件位置"
       unmatched_occurrence: "条目将作为未匹配路径保留"
+
+# ── Equalizer ──────────────────────────────────────────────────────
+equalizer:
+  title: "均衡器"
+  description: "面向本地音频输出的十段均衡器，带前置放大与削波保护。"
+  enabled: "启用均衡器"
+  preset: "预设"
+  preset_flat: "平直"
+  preset_pop: "流行"
+  preset_rock: "摇滚"
+  preset_jazz: "爵士"
+  preset_classical: "古典"
+  preset_custom: "自定义"
+  preamp: "前置放大"
+  clip_protection: "削波保护"
+  clip_off: "关闭"
+  clip_soft: "柔和"
+  reset_flat: "重置为平直"
+  reload: "从磁盘重新加载"
+  band_a11y: "%{frequency}赫兹均衡器频段，以分贝调节"
+  unsupported:
+    local: "均衡器在 Tributary 的本地音频管线内运行。"
+    airplay: "AirPlay 接收端会自行完成全部音频处理，因此 Tributary 的均衡器无法作用于扬声器。"
+    chromecast: "Chromecast 设备在接收端处理音频，因此 Tributary 的均衡器无法作用于扬声器。"
+    mpd: "MPD 在服务器端处理音频，因此 Tributary 的均衡器无法作用于远程播放器。"
