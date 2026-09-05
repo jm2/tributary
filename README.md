@@ -65,7 +65,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Rhythmbox profile migration | ✅ Preview-first import of ratings, play counts, and playlists |
 | Local playback history (play counts and last-played times) | ✅ |
 | Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ |
-| Track ratings | ✅ Editable for local tracks; remote ratings are shown read-only |
+| Track ratings | ✅ Editable for local tracks; Subsonic, Jellyfin, and Plex ratings are read-only |
 | Last.fm scrobbling | 🚧 Internal foundation only — not yet available to users |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
@@ -97,13 +97,15 @@ and [`docs/task.md`](docs/task.md) is the countable working list.
 ```
 
 The local library and the Subsonic, Jellyfin, Plex, and DAAP backends publish their catalogues
-through one async `MediaBackend` trait, so the UI never knows or cares where the music comes
-from. Radio-Browser views, removable mounts, and files opened from the OS plug in as lifecycle
-adapters instead. `SourceRegistry` owns the lifecycle of every source and resolves media at
-playback time: remote and removable rows and every playback queue carry only a stable `SourceId`
-and `TrackId`, never a server address, credential, or mount path, while local rows keep a file
-path for operations such as Properties. Outputs implement one `AudioOutput` trait. Last.fm is
-absent from the diagram because it is not user-visible yet.
+through one async `MediaBackend` trait, so the tracklist and browser render every source the
+same way; connection and authentication flows still differ per backend. Radio-Browser views,
+removable mounts, and files opened from the OS plug in as lifecycle adapters instead.
+`SourceRegistry` owns the lifecycle of those managed sources — authenticated servers, radio,
+removable media, and OS-opened files — and resolves their media at playback time, while the
+local library is scanned and watched by its own engine. Remote and removable rows and every
+playback queue carry only a stable `SourceId` and `TrackId`, never a server address, credential,
+or mount path; local rows keep a file path for operations such as Properties. Outputs implement
+one `AudioOutput` trait. Last.fm is absent from the diagram because it is not user-visible yet.
 
 The [source identity and lifecycle decision](docs/architecture/source-lifecycle.md) documents the
 registry seam in detail.
@@ -568,9 +570,10 @@ Tributary supports regular and smart playlists:
   context menu.
 - **Server playlists** — **Server Playlists…** on the Playlists header browses the playlists on a
   connected Subsonic server. **Import Copy** creates an ordinary editable playlist; **Keep Synced**
-  creates a read-only mirror that follows the server. Selecting a mirror shows its status and the
-  recovery actions that apply: **Sync Now**, **Retry**, **Replace Local with Server**, **Unlink**,
-  and **Remove Local Copy**. Tributary never modifies playlists on the server. See the
+  creates a read-only mirror that refreshes when the server reconnects or when you choose
+  **Sync Now**; Tributary never polls the server in the background. Selecting a mirror shows its
+  status and the recovery actions that apply: **Sync Now**, **Retry**, **Replace Local with
+  Server**, **Unlink**, and **Remove Local Copy**. Tributary never modifies playlists on the server. See the
   [Subsonic pull-sync contract](docs/subsonic-playlist-sync.md).
 
 #### Importing and exporting playlists
