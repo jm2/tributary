@@ -114,6 +114,13 @@ not place them in Tributary's package payload, but it is a valid least-privilege
 both changes as a separate cross-platform packaging improvement with a real playback matrix, not
 as an unreviewed tightening of this emergency gate.
 
+The first P2.4 AirPlay sender design investigation is recorded in
+[`airplay-sender-design.md`](airplay-sender-design.md). It scopes a maintained RAOP-1
+sender selection without yet shipping one; the next implementation record must call this
+document back to the review-boundary section above, run the shared-policy containment
+pipeline against the bundled artifact, and update the changelog in the same PR. No
+sending-path change is in scope until that review record is complete.
+
 ## Reference boundary
 
 The conservative classification is informed by the official project descriptions for
