@@ -5,10 +5,15 @@ name: Dependabot auto-merge
 # How the pieces fit together:
 #   * This workflow only ENABLES GitHub's native auto-merge on the PR.
 #   * The actual gate ("wait for configured required checks") is enforced by
-#     the live branch ruleset on `main`, not by this file. Before deploying this
-#     workflow, that ruleset must be migrated to the documented stable check
-#     names, including `MSRV`. Auto-merge then lands the PR only after that
-#     configured set passes.
+#     the live branch ruleset on `main`, not by this file. Native auto-merge
+#     waits only on the checks that ruleset marks required, so before the
+#     writer enables auto-merge it reads the active rulesets for `main` and
+#     verifies they require the COMPLETE policy check set (every hosted CI
+#     job, CodeQL, Codacy, CodeRabbit, and the repo-owned Bot Review Gate).
+#     Until the live ruleset enforces that full set — including `MSRV` — the
+#     writer refuses and routine Dependabot auto-merge stays off. The exact
+#     rollout and verification steps are documented in
+#     docs/dependency-updates.md.
 #   * Majors are NOT auto-merged: they fall through the update-type guard below
 #     and wait for coordinated repair and review.
 #   * Rust compiler/MSRV and rust-toolchain action-code proposals are NOT
@@ -159,11 +164,87 @@ jobs:
         needs.inspect_changed_files.outputs.update_type == 'version-update:semver-minor'
       )
     permissions:
+      administration: read
       contents: write
       pull-requests: write
     steps:
       # Major bumps, compiler/MSRV proposals, rust-toolchain action-code
       # proposals, and metadata-action self-updates never reach this writer.
+      - name: Require the live ruleset to enforce the full policy gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Native auto-merge waits only on the checks the live main ruleset
+          # marks required. Until that set covers the complete all-green
+          # policy, a dependency PR could land while Coverage, CodeQL, Codacy,
+          # CodeRabbit, Windows (aarch64), or a bot review is still pending or
+          # failing. Read every active ruleset that applies to main and refuse
+          # auto-merge until each policy context below is required with its
+          # expected app binding ("15368" GitHub Actions, "57789" GitHub
+          # Advanced Security/CodeQL, "56611" Codacy, empty = unbound commit
+          # status context). Fail closed: a query failure or coverage gap
+          # keeps routine auto-merge off.
+          expected_checks=(
+            "Security Audit|15368"
+            "Linux (x86_64)|15368"
+            "Linux (aarch64)|15368"
+            "macOS (aarch64)|15368"
+            "Windows (x86_64)|15368"
+            "Windows (aarch64)|15368"
+            "Flatpak (Linux)|15368"
+            "MSRV|15368"
+            "Coverage (Linux x86_64)|15368"
+            "Bot Review Gate|15368"
+            "CodeQL|57789"
+            "Analyze (python)|57789"
+            "Analyze (rust)|57789"
+            "Analyze (actions)|57789"
+            "Codacy Static Code Analysis|56611"
+            "CodeRabbit|"
+          )
+          summary_file="${RUNNER_TEMP}/main-rulesets.json"
+          required_contexts="${RUNNER_TEMP}/required-contexts.txt"
+          : > "${required_contexts}"
+          if ! gh api --paginate "repos/${GITHUB_REPOSITORY}/rulesets?ref=main" \
+            > "${summary_file}"; then
+            echo "Unable to read repository rulesets; refusing auto-merge." >&2
+            exit 1
+          fi
+          rule_ids="$(jq -r '.[] | select(.enforcement == "active") | .id' "${summary_file}")"
+          if [ -z "${rule_ids}" ]; then
+            echo "No active ruleset applies to main; refusing auto-merge." >&2
+            exit 1
+          fi
+          # The list endpoint omits rule parameters, so each active ruleset
+          # must be fetched individually.
+          for rule_id in ${rule_ids}; do
+            if ! gh api "repos/${GITHUB_REPOSITORY}/rulesets/${rule_id}" \
+              > "${RUNNER_TEMP}/ruleset-${rule_id}.json"; then
+              echo "Unable to read ruleset ${rule_id}; refusing auto-merge." >&2
+              exit 1
+            fi
+            jq -r '.rules[]?
+              | select(.type == "required_status_checks")
+              | .parameters.required_status_checks[]
+              | "\(.context)|\(.integration_id // "")"' \
+              "${RUNNER_TEMP}/ruleset-${rule_id}.json" >> "${required_contexts}"
+          done
+          sort -u -o "${required_contexts}" "${required_contexts}"
+          unmet=0
+          for expected in "${expected_checks[@]}"; do
+            app_id="${expected##*|}"
+            if ! grep -Fxq "${expected}" "${required_contexts}"; then
+              echo >&2 "main ruleset does not yet require '${expected%%|*}' (expected app binding: ${app_id:-unbound})"
+              unmet=1
+            fi
+          done
+          if [ "${unmet}" -ne 0 ]; then
+            echo >&2 "Refusing to enable auto-merge: the live main ruleset does not yet enforce the full policy check set."
+            exit 1
+          fi
+
       - name: Enable exact-head auto-merge for patch & minor updates
         shell: bash
         run: |
