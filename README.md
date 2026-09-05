@@ -648,10 +648,10 @@ volume. Packaged Windows and macOS builds follow changes to the system default a
 - **Volume** — drag the volume slider (cubic perceptual curve)
 
 A local track with a known duration counts as played once half of it has been heard (capped at
-four minutes); a track with no known duration counts after four minutes of playback or when it
-plays to the end. Play counts and last-played times feed the **Recently Played** and **Top 25
-Most Played** smart playlists, which refresh without restarting Tributary. Remote, radio, and
-removable tracks are not counted. See the [playback-history contract](docs/playback-history.md).
+four minutes); tracks with no known duration use a more conservative rule described in the
+[playback-history contract](docs/playback-history.md). Play counts and last-played times feed the
+**Recently Played** and **Top 25 Most Played** smart playlists, which refresh without restarting
+Tributary. Remote, radio, and removable tracks are not counted.
 
 ### Keyboard Shortcuts
 
