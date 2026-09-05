@@ -296,8 +296,9 @@ The sandbox does not expose the whole home directory:
   **Devices** entries and playback. To edit tags on external media, add the folder explicitly in
   Preferences instead.
 - A custom path saved by an older Flatpak build may become unavailable under this policy. Use that
-  root's **Reauthorize…** action in Preferences to reselect the same folder through the portal
-  rather than removing and re-adding it, which would lose track IDs, history, and playlist links.
+  root's **Reauthorize…** action in Preferences to reselect the same folder through the portal,
+  confirm the move, and restart Tributary so the relocation completes before scanning. Removing and
+  re-adding the folder instead would lose track IDs, history, and playlist links.
 
 ---
 
