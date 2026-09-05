@@ -235,6 +235,9 @@ impl EqChain {
                 // Already installed: the `take()` above must be undone so
                 // the stored handle keeps matching the element linked in
                 // the bin (`clip_protection_installed` stays truthful).
+                // Re-sync the state first so a live pipeline can never
+                // keep the limiter stranded out of step with its bin.
+                let _ = clipper.sync_state_with_parent();
                 self.clipper = Some(clipper);
                 true
             }
@@ -242,8 +245,11 @@ impl EqChain {
     }
 
     /// Insert `rglimiter` between the EQ stage and the post-convert
-    /// stage. On any failure, degrade to the no-limiter layout and
-    /// report `false`.
+    /// stage, then state-sync it with the bin (contract:
+    /// *Live-reconfiguration boundary* — on add: link it, then
+    /// `gst_element_sync_state_with_parent` so the element's state
+    /// follows the running bin). On any failure, degrade to the
+    /// no-limiter layout and report `false`.
     fn insert_limiter(&mut self) -> bool {
         let Ok(clipper) = make_element("rglimiter", "clipper") else {
             return false;
@@ -263,12 +269,17 @@ impl EqChain {
             // `Element::unlink` returns `()`.
             self.eq.unlink(&self.post_convert);
         }
-        if self.eq.link(&clipper).is_ok() && clipper.link(&self.post_convert).is_ok() {
+        if self.eq.link(&clipper).is_ok()
+            && clipper.link(&self.post_convert).is_ok()
+            && clipper.sync_state_with_parent().is_ok()
+        {
             self.clipper = Some(clipper);
             return true;
         }
         // Degrade to the no-limiter layout: restore the direct
         // eq → post-convert link.
+        self.eq.unlink(&clipper);
+        clipper.unlink(&self.post_convert);
         drop_limiter_from_bin(&self.bin, &clipper);
         let _ = self.eq.link(&self.post_convert);
         false
@@ -452,6 +463,42 @@ mod tests {
         assert!(!chain.clip_protection_installed());
         assert!(chain.bin.by_name("clipper").is_none());
         assert_links_eq_directly_to_post_convert(&chain.bin);
+    }
+
+    /// Regression (contract acceptance 6, live-pipeline half): dynamic
+    /// `rglimiter` insertion must state-sync the new element with its
+    /// parent bin. A bin brought to `READY` completes that transition
+    /// synchronously, so a limiter inserted afterwards starts in `NULL`
+    /// unless the insert calls `gst_element_sync_state_with_parent` —
+    /// the exact live-pipeline hazard this regression pins.
+    #[test]
+    fn dynamic_limiter_insertion_syncs_state_with_the_running_bin() {
+        if !bin_requires_plugins() {
+            return;
+        }
+        let mut chain = EqChain::build(&EqSettings {
+            enabled: true,
+            ..EqSettings::default()
+        })
+        .expect("eq-bin builds");
+        chain
+            .bin
+            .set_state(gst::State::Ready)
+            .expect("a no-data bin reaches READY synchronously");
+        assert_eq!(chain.bin.current_state(), gst::State::Ready);
+
+        assert!(chain.set_clip_protection(ClipProtection::Soft));
+        let clipper = chain.bin.by_name("clipper").expect("inserted limiter");
+        assert_eq!(
+            clipper.current_state(),
+            chain.bin.current_state(),
+            "the inserted limiter must follow its bin's state, not stay in NULL"
+        );
+
+        // Removal returns the limiter to NULL before it leaves the bin.
+        assert!(chain.set_clip_protection(ClipProtection::Off));
+        assert!(chain.bin.by_name("clipper").is_none());
+        chain.bin.set_state(gst::State::Null).expect("bin to NULL");
     }
 
     #[test]
