@@ -508,9 +508,10 @@ Click any column header to sort; click again to reverse; click a third time to c
 ### Browsing Removable Media
 
 Mounted USB drives and other removable media appear under a **Devices** heading in the sidebar
-while they are attached. Tributary uses GIO's volume monitor, so it lists what the platform reports
-as removable and follows mount, change, and unmount events live. Selecting a device shows its
-scanned tracks; the scan stays on the device's own filesystem and does not follow links.
+while they are attached. Tributary uses GIO's volume monitor, listing mounts the platform reports
+as removable or ejectable and following mount, change, and unmount events live. That metadata is
+optional, so a non-removable or network mount can occasionally appear too. Selecting a device
+shows its scanned tracks; the scan stays on the device's own filesystem and does not follow links.
 
 Tributary does not mount or eject volumes, and MTP-only devices are not supported. In the Flatpak,
 automatic Devices entries are read-only and limited to `/media`, `/run/media`, and `/mnt` (see
@@ -578,8 +579,9 @@ Tributary reads and writes [XSPF version 1](https://www.xspf.org/spec) (`.xspf`)
 playlist to export it, or use **Import Playlist…** on the Playlists header.
 
 On import, each track is matched against the local library by exact `file:` path first, then by
-exact title + artist (and album when supplied); when several tracks match, the duration must
-single one out within five seconds. Unmatched entries are kept in playlist order and become
+exact title + artist (and album when supplied). If the entry carries a duration, only library
+tracks within five seconds of it qualify and the nearest one must be unique; without a duration,
+the metadata match itself must be unique. Unmatched entries are kept in playlist order and become
 playable if a matching track appears later. The whole import commits in one transaction and the
 completion dialog reports matched, unmatched, and failed counts.
 
@@ -617,7 +619,8 @@ Tributary only plays through an MPD output after you confirm that it has exclusi
 partition. Do not point another client or another Tributary instance at the same partition while
 it is in use. Outputs saved by an older release have no confirmation and refuse to play until you
 re-add the same host and port with the exclusive-control box checked; the existing entry is
-upgraded in place.
+upgraded in place. If that output is currently selected, select its row again so the confirmed
+mode takes effect.
 
 The volume slider is shared across outputs that support application volume; MPD keeps its own
 volume. Packaged Windows and macOS builds follow changes to the system default audio device.
