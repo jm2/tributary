@@ -40,10 +40,64 @@ hasn't already been applied out-of-band.
 ## Reviewer policy
 
 Repository-owned AI review workflows are deliberately absent from both forks.
-Refinery does not wait on an AI-review workflow, vendor bot status, or reviewer
-credential stored by the repository. The only repo-owned admission gate is the
-normal hosted CI gate above. Third-party status integrations configured outside
-the repository are not accepted as refinery-review evidence.
+That describes what these repositories run themselves; it is not an exemption
+from review. Third-party GitHub App integrations (Codacy, CodeQL, CodeRabbit,
+and any other bot) post genuine checks and reviews on every pull request, and
+those checks and reviews count.
+
+**Operator policy (2026-09-03): a pull request is merge-ready only when every
+check and every bot review is green.** That includes the hosted CI jobs above
+(test/lint/clippy, Coverage, the cross-compiled aarch64 matrix), Codacy Static
+Code Analysis, CodeQL, Coverage, CodeRabbit, and any other bot or status
+integration that posts on the pull request — regardless of whether branch
+protection marks the check "required". A pending or failing bot check blocks
+merge exactly like a red CI job; "not required" is not an exemption.
+
+### Enforcement status: policy gate vs. live ruleset (as of 2026-09-04)
+
+The all-green rule above is refinery policy, not yet a machine-enforced
+repository rule. The live default-branch ruleset ("Require CI before merge
+(main)") requires exactly seven GitHub Actions status checks — Security
+Audit, Linux (x86_64), Linux (aarch64), macOS (aarch64), Windows (x86_64),
+Flatpak (Linux), and MSRV — and no reviews. Coverage, CodeQL, Codacy Static
+Code Analysis, CodeRabbit, Windows (aarch64), and every bot review are
+advisory as far as the repository is concerned: GitHub will merge without
+them. Until the ruleset is widened, the all-green rule is enforced by the
+refinery's own fail-closed check polling (which observes every check on the
+head, required or not) and by review discipline — not by the repository
+refusing the merge.
+
+**Routine auto-merge stays off until the live gate matches the policy.** The
+`dependabot-automerge` workflow enables GitHub native auto-merge on clean
+patch/minor dependency PRs, and native auto-merge waits only for the
+ruleset's required checks. So while the ruleset is narrower than the policy,
+auto-merge can land a dependency PR while a bot check is pending or failing.
+Widening the gate is a precondition for trusting auto-merge, not an optional
+follow-up; do not enable or rely on it before then.
+
+**Closing the gap (the machine gate).** Widen "Require CI before merge
+(main)" to require the full policy set: the Coverage and Windows (aarch64)
+jobs, the CodeQL Analyze jobs, Codacy Static Code Analysis, the CodeRabbit
+status context, and a repo-owned `bot-review-gate` check that fails while
+the pull request has unresolved actionable bot review threads (queried via
+the API, so review threads become machine-readable merge evidence). That is
+a repository-settings and workflow change: it goes through its own bead and
+full CI validation, never an out-of-band ruleset edit, and it must be
+validated against a live pull request before the refinery treats the widened
+gate as authoritative.
+
+### Addressing Codacy/CodeRabbit findings
+
+When a bot leaves findings on your pull request:
+
+1. Read the bot's review comments on the PR (the Reviews tab and the inline
+   comments).
+2. Fix the valid findings in your worktree.
+3. Push the fixes to the same `polecat/<bead-id>` branch — never a side
+   branch or a second PR. The bots re-review the new head automatically.
+4. Repeat until every bot check and review is green. The refinery gate is
+   fail-closed ("pending is never green"), so a re-review still running at
+   poll time simply keeps the merge waiting.
 
 Operational review is performed out of band by Gas City's locally configured
 GLM 5.3 reviewer. Its admission and evidence belong to the rollout manifests,
