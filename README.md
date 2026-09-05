@@ -589,8 +589,9 @@ playable if a matching track appears later. The whole import commits in one tran
 completion dialog reports matched, unmatched, and failed counts.
 
 Export writes to a temporary file and atomically replaces the destination. XSPF only represents
-local tracks, so exporting a playlist that contains remote entries is refused as a whole rather
-than silently exporting a subset. Ratings are not part of the interchange in either direction.
+resolved local tracks, so exporting a playlist that contains remote or still-unmatched entries is
+refused as a whole rather than silently exporting a subset. Ratings are not part of the
+interchange in either direction.
 
 Apple Music/iTunes XML, Google Takeout CSV, and M3U are not accepted directly. To convert an Apple
 export, map each track's `Location`, `Name`, `Artist`, `Album`, and `Total Time` to the XSPF
