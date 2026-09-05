@@ -434,7 +434,15 @@ struct CancellationSwitch {
 impl CancellationSwitch {
     fn pair() -> (Self, CancellationObserver) {
         let (sender, receiver) = watch::channel(false);
-        (Self { sender }, CancellationObserver { receiver })
+        (
+            Self { sender },
+            CancellationObserver {
+                receiver,
+                // The switch owns the sender for this observer; no
+                // keepalive is needed.
+                keepalive: None,
+            },
+        )
     }
 
     fn cancel(&self) {
@@ -446,6 +454,11 @@ impl CancellationSwitch {
 #[derive(Clone)]
 pub struct CancellationObserver {
     receiver: watch::Receiver<bool>,
+    /// Keeps the watch channel open for observers minted by
+    /// [`CancellationObserver::never_cancelled`]. If every sender is
+    /// dropped the channel closes and `changed()` reports an error that
+    /// `cancelled()` would misread as a cancellation.
+    keepalive: Option<Arc<watch::Sender<bool>>>,
 }
 
 impl fmt::Debug for CancellationObserver {
@@ -461,8 +474,14 @@ impl CancellationObserver {
     /// Construct a never-cancelled observer. Useful for tests and for code
     /// paths that accept a cancellation handle but have no upstream source.
     pub fn never_cancelled() -> Self {
-        let (_sender, receiver) = watch::channel(false);
-        Self { receiver }
+        let (sender, receiver) = watch::channel(false);
+        Self {
+            receiver,
+            // Retain the sender so the channel stays open: a dropped
+            // sender would close it and make `changed()` fail as if the
+            // observer had been cancelled.
+            keepalive: Some(Arc::new(sender)),
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -4532,6 +4551,19 @@ mod tests {
             SourceState::Dormant
         );
         assert!(registry.shutdown().is_complete());
+    }
+
+    #[tokio::test]
+    async fn never_cancelled_observer_stays_pending_with_keepalive_sender() {
+        let mut observer = CancellationObserver::never_cancelled();
+        assert!(!observer.is_cancelled());
+        // The keepalive sender must hold the watch channel open. Before
+        // the keepalive existed, the channel closed immediately and
+        // `cancelled()` returned as if a cancellation had fired.
+        timeout(Duration::from_millis(50), observer.cancelled())
+            .await
+            .expect_err("never-cancelled observer must not complete");
+        assert!(!observer.is_cancelled());
     }
 
     #[tokio::test]

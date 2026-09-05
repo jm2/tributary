@@ -14,6 +14,7 @@
 //! [`crate::local::root_authority`] and
 //! [`crate::local::write_authority`].
 
+pub mod mtp;
 pub mod transfer;
 pub mod usb;
 
