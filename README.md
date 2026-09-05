@@ -38,7 +38,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Internet Radio (Top Clicked, Top Voted, Stations Near Me) | ✅ |
 | Tiered geo-location (geo-distance → state → country) | ✅ |
 | Column drag-and-drop reordering with persistence | ✅ |
-| Regular & smart playlists (iTunes-style rules engine) | ✅ Regular playlists can mix local and remote tracks; smart playlists query the local library |
+| Regular & smart playlists (iTunes-style rules engine) | ✅ Regular playlists may include remote tracks |
 | Drag and drop tracks onto playlists | ✅ |
 | Subsonic server playlists (import a copy, or keep a read-only synced mirror) | ✅ |
 | Realtime text search filter (title, artist, album, genre) | ✅ |
@@ -50,9 +50,9 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Network connection guard (prevents duplicate auth) | ✅ |
 | i18n/l10n framework (13 languages, auto locale detection) | ✅ |
 | Audio output selector (local + MPD + Chromecast) | ✅ |
-| MPD output backend (sink-only, TCP with security hardening) | ✅ Requires confirming exclusive control of the MPD partition |
+| MPD output backend (sink-only, hardened TCP) | ✅ Requires exclusive-control confirmation |
 | Output switching (click to swap local ↔ MPD) | ✅ |
-| AirPlay 1 (RAOP) output | ⚠️ Receivers are discovered, but no supported GStreamer build ships the required `raopsink` sender |
+| AirPlay 1 (RAOP) output | ⚠️ Discovered, but supported GStreamer builds lack the `raopsink` sender |
 | AirPlay 2 / HomeKit output | ❌ Not yet supported — see [AirPlay roadmap](#airplay-roadmap) below |
 | Chromecast output (Cast V2 — local files + remote sources) | ✅ |
 | Album artist sort (preference toggle) | ✅ |
@@ -81,7 +81,7 @@ and [`docs/task.md`](docs/task.md) is the countable working list.
 
 ## Architecture
 
-```
+```text
 ┌──────────────────────────────────────────────────────────────┐
 │ GTK4 / libadwaita UI and platform media controls            │
 ├──────────────────────────────────────────────────────────────┤
@@ -96,13 +96,14 @@ and [`docs/task.md`](docs/task.md) is the countable working list.
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Every source publishes its catalogue through the single async `MediaBackend` trait, so the UI
-never knows or cares where the music comes from. `SourceRegistry` owns the lifecycle of every
-source — authenticated servers, Radio-Browser views, removable mounts, and files opened from the
-OS — and resolves media at playback time. Rows and playback queues therefore carry only a stable
-`SourceId` and `TrackId`, never a server address, credential, mount path, or file location.
-Outputs implement one `AudioOutput` trait. Last.fm is absent from the diagram because it is not
-user-visible yet.
+The local library and the Subsonic, Jellyfin, Plex, and DAAP backends publish their catalogues
+through one async `MediaBackend` trait, so the UI never knows or cares where the music comes
+from. Radio-Browser views, removable mounts, and files opened from the OS plug in as lifecycle
+adapters instead. `SourceRegistry` owns the lifecycle of every source and resolves media at
+playback time: remote and removable rows and every playback queue carry only a stable `SourceId`
+and `TrackId`, never a server address, credential, or mount path, while local rows keep a file
+path for operations such as Properties. Outputs implement one `AudioOutput` trait. Last.fm is
+absent from the diagram because it is not user-visible yet.
 
 The [source identity and lifecycle decision](docs/architecture/source-lifecycle.md) documents the
 registry seam in detail.
@@ -160,7 +161,8 @@ Pre-built packages for Linux (Flatpak, .deb, .rpm), macOS (.dmg), and Windows (.
 
 ### Prerequisites (all platforms)
 
-- [Rust 1.94+](https://rustup.rs) (stable toolchain) — the declared MSRV in `Cargo.toml`, verified by a dedicated CI job
+- [Rust 1.94+](https://rustup.rs) (stable toolchain) — the declared MSRV in `Cargo.toml`,
+  verified by a dedicated CI job
 - **GTK 4.16+** and **libadwaita 1.6+** — older runtimes fail to build, not merely fail at startup
 - `pkg-config`
 
@@ -368,14 +370,17 @@ cargo +1.94.0 llvm-cov --all-targets --all-features --locked --html \
 CI's coverage number comes from one Linux x86_64 run pinned to Rust 1.94.0 and cargo-llvm-cov
 0.8.7 over every host target and feature; the other platforms' `--coverage` helpers are
 informational only. [`coverage-baseline.txt`](coverage-baseline.txt) is the minimum accepted line
-percentage and works as a ratchet: ordinary changes keep or raise it, and lowering it requires a
-dedicated change that explains why. To raise it, run the Linux command twice, take the lower
-total, round down to one decimal, and subtract 0.1 for instrumentation noise.
+percentage. CI enforces the checked-in value but does not compare it with the base branch; the
+repository review policy treats the floor as a ratchet: ordinary changes keep or raise it, while
+lowering it requires a dedicated measurement-definition change that explains why. To raise it,
+run the Linux command twice, take the lower total, round down to one decimal, and subtract 0.1
+for instrumentation noise.
 
 CI automatically runs on every push/PR:
 - **Security audit** — `cargo audit` checks dependencies against the RustSec Advisory Database
 - **Pedantic Clippy** — `clippy::pedantic` + `clippy::nursery` with `-D warnings`
-- **Code coverage** — pinned `cargo-llvm-cov` Linux x86_64 line-floor gate, plus an HTML report uploaded as a CI artifact
+- **Code coverage** — pinned `cargo-llvm-cov` Linux x86_64 line-floor gate, plus an HTML report
+  uploaded as a CI artifact
 - **Weekly fuzzing** — `cargo-fuzz` target for the DMAP binary parser (5 min, Sundays)
 
 ---
@@ -495,7 +500,10 @@ docs/                        # Design contracts, roadmap, and the active backlog
 
 ### Browsing Your Library
 
-On first launch, Tributary scans your `~/Music` folder (configurable in Preferences) and displays all discovered tracks in the main tracklist. Use the **browser panes** above the tracklist to filter by Genre → Artist → Album, or browse the library by folder. Click any column header to sort; click again to reverse; click a third time to clear the sort.
+On first launch, Tributary scans your XDG music directory (for example `~/Music`; configurable
+in Preferences) and displays all discovered tracks in the main tracklist. Use the **browser
+panes** above the tracklist to filter by Genre → Artist → Album, or browse the library by folder.
+Click any column header to sort; click again to reverse; click a third time to clear the sort.
 
 ### Browsing Removable Media
 
@@ -522,7 +530,8 @@ Use the **search bar** above the browser panes to filter tracks in real-time. Th
 
 Right-click any local track and select **Properties…** to view and edit its metadata. The Properties dialog supports:
 
-- **Single-track editing** — Title, Artist, Album, Genre, Composer, Year, Track #, Disc # (plus read-only Format, Bitrate, Sample Rate, Duration, and File Path)
+- **Single-track editing** — Title, Artist, Album, Genre, Composer, Year, Track #, Disc # (plus
+  read-only Format, Bitrate, Sample Rate, Duration, and File Path)
 - **Batch editing** — Select multiple tracks, then right-click → Properties. Only batch-appropriate fields are shown (Artist, Album, Genre, Composer, Year, Disc #). Fields with mixed values display "Mixed" as a placeholder; only fields you explicitly change are written.
 - **MusicBrainz Lookup** — In single-track mode, click "MusicBrainz Lookup" to search by title + artist. Results populate the form but are **not** saved automatically — you must click Save.
 
@@ -551,7 +560,10 @@ Tributary supports regular and smart playlists:
   entries are stored by identity only, never by URL or credential. When a server is disconnected
   its entries stay in place as unavailable rows that you can keep or remove. Radio stations,
   removable media, and files opened from the OS cannot be added.
-- **Smart playlists** — iTunes-style rules engine with filterable metadata fields, text/numeric/date operators, sorting, and result limiting. Smart playlists are evaluated against the current local library whenever they are opened or exported. Create them via the sidebar context menu.
+- **Smart playlists** — iTunes-style rules engine with filterable metadata fields,
+  text/numeric/date operators, sorting, and result limiting. Smart playlists query the local
+  library and are evaluated whenever they are opened or exported. Create them via the sidebar
+  context menu.
 - **Server playlists** — **Server Playlists…** on the Playlists header browses the playlists on a
   connected Subsonic server. **Import Copy** creates an ordinary editable playlist; **Keep Synced**
   creates a read-only mirror that follows the server. Selecting a mirror shows its status and the
@@ -591,8 +603,8 @@ optional root remap handles a library that has moved.
 Tracks are matched by exact file path only — never by title or a similar filename — and the
 preview lists anything that cannot be represented. Static playlists keep their order and
 duplicates; automatic playlists are imported only when their rules can be reproduced exactly. The
-import is one atomic transaction, and repeating it with the same profile is a no-op. See the
-[Rhythmbox migration contract](docs/rhythmbox-migration.md).
+import is one atomic transaction, and repeating it with an unchanged profile and the same
+choices is a no-op. See the [Rhythmbox migration contract](docs/rhythmbox-migration.md).
 
 ### Audio Outputs
 
@@ -662,7 +674,10 @@ Sender-side AirPlay 2 support requires, at minimum:
 3. **An audio streaming path** delivering encoded audio in the format and timing the receiver expects.
 4. **Multi-device clock sync** — only relevant if multi-room playback is in scope.
 
-Each of these has specifics (key exchange algorithms, audio codec, RTSP/HTTP verbs, timing format) that need to be confirmed against current AirPlay 2 reverse-engineering work before any concrete dependency or implementation can be committed. This README intentionally does not enumerate those details — they belong in a design doc once an implementation path is chosen.
+Each of these has specifics (key exchange algorithms, audio codec, RTSP/HTTP verbs, timing
+format) that need to be confirmed against current AirPlay 2 reverse-engineering work before any
+concrete dependency or implementation can be committed. This README intentionally does not
+enumerate those details — they belong in a design doc once an implementation path is chosen.
 
 Likely paths forward (each to be evaluated when the work begins):
 
