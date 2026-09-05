@@ -10873,8 +10873,9 @@ mod tests {
         let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
             .await
             .expect("persist non-empty legacy target root");
-        let request = build_root_trust_request(&scan, &stored, RootTrustReason::LegacyEnrollment, 0)
-            .expect("build legacy-enrollment request");
+        let request =
+            build_root_trust_request(&scan, &stored, RootTrustReason::LegacyEnrollment, 0)
+                .expect("build legacy-enrollment request");
         assert!(!request.requires_empty_acknowledgement());
         let request_id = request.request_id;
 
@@ -10961,10 +10962,8 @@ mod tests {
                 &event_tx,
                 driver_flag.as_ref(),
                 Ok(
-                    notify::Event::new(notify::EventKind::Create(
-                        notify::event::CreateKind::File,
-                    ))
-                    .add_path(driver_racing_audio.clone()),
+                    notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                        .add_path(driver_racing_audio.clone()),
                 ),
             );
             drop(event_tx);
