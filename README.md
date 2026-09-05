@@ -516,7 +516,8 @@ optional, so a non-removable or network mount can occasionally appear too. Selec
 shows its scanned tracks; the scan stays on the device's own filesystem and does not follow links.
 
 Tributary does not mount or eject volumes, and MTP-only devices are not supported. In the Flatpak,
-automatic Devices entries are read-only and limited to `/media`, `/run/media`, and `/mnt` (see
+file access for the automatic Devices entries is read-only and limited to `/media`, `/run/media`,
+and `/mnt`; a device mounted elsewhere can still be listed but cannot be scanned or played (see
 [Flatpak (Linux)](#flatpak-linux)).
 
 ### Connecting to Remote Servers
