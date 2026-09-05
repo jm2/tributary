@@ -23,34 +23,37 @@ Created: 2026-07-10
 
 Status summary:
 
-- [ ] P0 release blockers complete
+- [x] P0 release blockers complete
 - [x] P1 correctness and security complete
 - [ ] P2 resilience and packaging complete
 - [x] P3 architecture and integration coverage complete
 
-Progress snapshot (2026-07-18), recounted from the literal P0–P3 task checkboxes to correct the
-earlier numerator/denominator drift. The live protected-playback finding recorded under P2.11 now
-has eight independently verifiable tasks rather than the original three compound boxes. The
-in-scope counts exclude the two deferred P0.7
-live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
-global-validation gate boxes are not task progress:
-**220/223 (98.7%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
-and **30/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
-and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
-closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
-ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
-PR #105, the cancellable resolver box implemented in PR #106, and the
-held-ACK/slow-greeting/real-IPv6 coverage box completed by PR #107, and the final exclusive-control
-contract plus implementation record accepted in PR #112, since the earlier snapshot. The
-deterministic protected-HTTP compatibility box under P2.11 is also complete in PR #108. The
-process-isolated real-GStreamer fake-backend box under P2.11 is complete in PR #109. The packaged
-Windows plugin/source-policy/decode proof is complete in PR #110 after successful native x86_64 and
-ARM64 package executions; live Windows DAAP and Subsonic playback remains open. The P3.2 README
-claim was re-audited and closed because the
-document already labels its diagram as intended and names the shipping abstraction gaps exactly.
-P3.5 now reports every Linux-host source area in one pinned aggregate, keeps different native
-source sets as informational reports, and enforces the baseline accepted by two exact pinned PR
-executions in PR #111.
+Progress snapshot (2026-07-18, amended 2026-09-03), recounted from the literal P0–P3 task
+checkboxes to correct the earlier numerator/denominator drift. The live protected-playback
+finding recorded under P2.11 now has eight independently verifiable tasks rather than the
+original three compound boxes. The 2026-07-18 recount excluded the two then-deferred P0.7
+live-workflow verification boxes and the withdrawn P2.6 false finding; on 2026-09-03 the P0.7
+live manual-dispatch verification ran (Actions run
+[33781875201](https://github.com/jm2/tributary/actions/runs/33781875201), test workflow in PR
+#224), so those two boxes are complete and counted again, and PR #227 closed the v0.6.2 P0.8
+re-evaluation box. The withdrawn P2.6 false finding, section-summary, and global-validation gate
+boxes are still not task progress: **223/226 (98.7%)** in-scope checklist items complete:
+**53/53 P0**, **64/64 P1**, **76/79 P2**, and **30/30 P3**. This incorporates the four P2.9
+boxes closed by PR #99 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7
+platform-cache boxes closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR
+#102, and the three P2.10 ACK/terminal/orphan-semantics boxes implemented in PR #104, the
+bounded-ingress box implemented in PR #105, the cancellable resolver box implemented in PR #106,
+and the held-ACK/slow-greeting/real-IPv6 coverage box completed by PR #107, and the final
+exclusive-control contract plus implementation record accepted in PR #112, since the earlier
+snapshot. The deterministic protected-HTTP compatibility box under P2.11 is also complete in PR
+#108. The process-isolated real-GStreamer fake-backend box under P2.11 is complete in PR #109.
+The packaged Windows plugin/source-policy/decode proof is complete in PR #110 after successful
+native x86_64 and ARM64 package executions; live Windows DAAP and Subsonic playback remains
+open. The P3.2 README claim was re-audited and closed because the document already labels its
+diagram as intended and names the shipping abstraction gaps exactly. P3.5 now reports every
+Linux-host source area in one pinned aggregate, keeps different native source sets as
+informational reports, and enforces the baseline accepted by two exact pinned PR executions in
+PR #111.
 
 PR #123's P3.1 production cutover closed the centralized refresh/cancellation/disconnect/failure
 box while deliberately leaving the final implementation-record box unchecked, so at that cutover
@@ -537,9 +540,12 @@ and cannot access a repository write credential.
   `checksums` skip in dry-run and `publish` remains release-only, so a
   dry-run can never publish. Live manual-dispatch verification: run
   [33781875201](https://github.com/jm2/tributary/actions/runs/33781875201)
-  (2026-09-03, dispatch of `v0.6.2` with `dry_run=true`) resolved
-  `build_ref` to `74b4279` — the immutable commit of `v0.6.2` — at version
-  `0.6.2`, with all artifact jobs skipped.
+  (2026-09-03, dispatch of `v0.6.2` with `dry_run=true`) ran against pushed workflow ref
+  `polecat/tr-qcn` at `c5e9c99`. "Resolve release source" and "Dry-run tag contract
+  verification" both passed: `build_ref` resolved to
+  `74b42792e42bed0b48a350c8797686ee0588a12b`, the immutable commit of
+  `refs/tags/v0.6.2`, and version `0.6.2` matched the tag, with all artifact and publication
+  jobs skipped.
 
 Acceptance criteria: all artifacts in a run are built from the same requested immutable ref
 and carry the same version.
@@ -3448,6 +3454,17 @@ Record scope or design decisions here so deferred work is explicit.
   nor a redirect policy, and `Client::default()` panics on the same TLS-init failure that would
   have triggered it, so it could never have been a safety net.
 
+- 2026-09-03 — P0.7's live manual-dispatch acceptance ran after all. The release dry-run
+  workflow from PR #224 was dispatched by hand against the pushed ref `polecat/tr-qcn`
+  (`c5e9c99`) requesting tag `v0.6.2` with `dry_run: true`; run
+  [33781875201](https://github.com/jm2/tributary/actions/runs/33781875201) resolved
+  `build_ref` to `74b42792e42bed0b48a350c8797686ee0588a12b` — the immutable commit of
+  `refs/tags/v0.6.2` — derived the
+  matching version, and skipped every build/publish job. The two P0.7 verification boxes
+  are checked and counted; together with the P0.8 re-evaluation box closed by PR #227, that
+  completes P0 at 53/53 and moves the tracker to 223/226;
+  only the three physical/installed P2 validation records remain.
+
 ## Completed work log
 
 Add one line per completed task:
@@ -3524,3 +3541,4 @@ Add one line per completed task:
 | 2026-07-18 | P2.11 typed Windows PE-target repair | PR #127 | Removes the non-terminal array boundary by assembling explicit `List[string]` values for the Soup singleton, closure rounds, and bounded inspector batches. Per-target validation distinguishes null/empty, quote/control, rooted, normalization, extension, and existence failures. Its bounded single-line diagnostic retains at most 192 sanitized target characters plus a fixed truncation marker. The nonexecuting architecture-local inspector and every existing resource bound remain intact. AST parsing, formatting/diff, locked check, strict debug/release Clippy, 14 `windows_*` tests, three `powershell_*` tests, and complete 926-test debug/release profiles pass. CI run `29648906031` passed native x86_64 and ARM64 packages/probes, including the x86_64 Desktop PowerShell 5.1 behavior regression. The exact affected-host PowerShell/MSYS2 rerun remains pending, so this merged repair leaves progress at 219/223 overall and 76/79 P2. |
 | 2026-07-18 | P3.1 external-file at-use adapter (partial) | PR #128 | Replaces OS-open direct-URI playback with ordered first-accepted-audio admission into hidden, ephemeral registry sources. Exact-handle parsing and bounded metadata validation precede random source/track identity; accepted tracks and queues are pathless and bind the exact session epoch. One inseparable lease-bearing file capability drives output loading and post-acceptance embedded art, with pre/post-file-handle-clone revocation checks and no path/URI diagnostics. Native non-UTF-8 leaf names use a bounded lossy parser/presentation hint without replacing handle authority. Newer OS deliveries, explicit playback intents including scrubber seek, Stop, real output transfer, and shutdown reject stale admission; queue replacement, unrepeated EOS, player/load error, output transfer, and shutdown retire the exact source idempotently while same-output reselection is inert. Automatic EOS replay/advance deliberately does not invalidate in-flight admission. Independent review tightened the admission-gate predicate, hidden UI-owner filter, shutdown/publication serialization, and nonseparable resolver lease boundary, and verified sequential invalid-candidate handling plus the post-accept art handoff. Automated review simplified optional-extension validation; shared parser defaults already admit missing artist/album tags, position-independent proxy reads isolate playback from artwork seek, and a per-capability mutex plus deterministic regression serializes overlapping cursor-based parsers. Formatting/diff, locked check, strict debug/release Clippy, and serial complete 940-test debug/release suites pass. Only the removable adapter keeps P3.1's final record open, so progress remains 219/223 overall and 29/30 P3. |
 | 2026-07-18 | P3.1 removable-media lifecycle/at-use adapter (completion) | PR #129 | Completes P3.1 by claiming each eligible mount's deterministic source identity into `SourceRegistry`, scanning beneath retained mounted-root authority on the blocking runtime, and publishing only pathless lossless relative track IDs under an exact session epoch. Deterministic no-follow, same-filesystem traversal parses bounded metadata through exact file handles; at-use resolution rejects malformed or unlisted IDs and rechecks the live epoch and lease before returning one retained file capability for playback and embedded art. Pre-unmount, relocation, confirmed removal, replacement, and shutdown disconnect authority before UI/playback invalidation; failed unmount reconnects from fresh inventory under a new epoch, and confirmed removal releases provenance. Pathless removable rows omit Properties until typed mutation authority exists. Security review hardened Unix trailing-slash/`/.` no-follow roots and Windows intermediate-junction races by pinning the root/ancestor namespace, rejecting directory symlinks, and following a final reparse root only when Windows verifies a volume mount point. Automated review also found that an inactive background scan failure was reducer-deduplicated before later row selection could display it; selection now replays the retained sanitized lifecycle failure without consuming it. Locked check, strict debug Clippy, formatting/diff checks, focused authority/adapter/registry/UI coverage, and the complete 956-test serial debug suite pass. Release validation was interrupted by temporary workspace disk quota and is not claimed. This closes P3 at 30/30 and advances total progress to 220/223 (98.7%); only three manual P2 validation records remain. |
+| 2026-09-03 | P0.7 live manual-dispatch verification | PR #224 + Actions run [33781875201](https://github.com/jm2/tributary/actions/runs/33781875201) | The dry-run/manual workflow test was dispatched live against pushed ref `polecat/tr-qcn` (`c5e9c99`) requesting tag `v0.6.2` with `dry_run: true`. "Resolve release source" and "Dry-run tag contract verification" passed: dispatching v0.6.2 resolved `build_ref` to `74b42792e42bed0b48a350c8797686ee0588a12b`, the immutable commit of `refs/tags/v0.6.2`, and the derived version matched the tag, while every artifact build and publish job stayed skipped under dry-run. This closes P0.7's two deferred verification boxes; with the P0.8 re-evaluation box closed by PR #227, P0 is complete at 53/53 and the tracker advances to 223/226 (98.7%) with only the three physical/installed P2 validation records open. |

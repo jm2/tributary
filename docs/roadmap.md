@@ -5,7 +5,7 @@ Last audited: 2026-09-01
 This document explains the product and engineering work that remains **after** the holistic-review
 remediation. [`task.md`](task.md) is the countable active implementation backlog; the completed
 remediation record is preserved separately in
-[`task-remediation-2026-07.md`](task-remediation-2026-07.md) at **220/223 (98.7%)**, with only three
+[`task-remediation-2026-07.md`](task-remediation-2026-07.md) at **223/226 (98.7%)**, with only three
 real-environment validation records left. The active backlog is now **15/39 (38.5%)** complete.
 Neither percentage estimates equal engineering effort, and the historical percentage is not a
 claim that Tributary has implemented every requested product feature.
@@ -674,8 +674,11 @@ license, distribution, key-material provenance, and interoperability review.
   a possible future extension gated on product approval, not a committed feature.
 - A stronger platform-native removable file identifier and explicit saved-server endpoint rebind
   are possible future schema extensions, not scheduled work.
-- Proper Apple code signing/notarization and the intentionally deferred release-workflow exercise
-  are distribution/release work, not product implementation in this roadmap.
+- Proper Apple code signing/notarization is distribution/release work, not product implementation
+  in this roadmap. The release-workflow exercise is no longer deferred: the P0.7 dry-run manual
+  dispatch ran live on 2026-09-03 (PR #224, Actions run
+  [33781875201](https://github.com/jm2/tributary/actions/runs/33781875201)) and is recorded in the
+  remediation tracker.
 
 ## Keeping this roadmap current
 

@@ -25,7 +25,7 @@ state.
 
 Current status: **15/39 (38.5%)** active implementation records complete. This percentage measures
 checklist completion, not equal engineering effort: several P3 records are deliberately large
-epics. The archived remediation remains **220/223 (98.7%)** complete; its three open records are
+epics. The archived remediation remains **223/226 (98.7%)** complete; its three open records are
 real-environment validation, not missing implementation.
 
 Release checkpoint: v0.6.2 (2026-09-01) packages OwnTone compressed-cache compatibility together
@@ -1199,8 +1199,11 @@ affected-hardware evidence. P2.1 remains the feature focus at **15/39 (38.5%)**.
 - The three unchecked records in the archived remediation tracker are physical/installed/live
   validation: real removable hardware, installed Flatpak portal/USB behavior, and packaged Windows
   DAAP/Subsonic playback. They do not imply another implementation slice unless testing finds a bug.
-- The intentionally skipped release-workflow exercise and proper Apple signing/notarization are
-  distribution work, not part of this feature percentage.
+- Proper Apple signing/notarization remains distribution work, not part of this feature
+  percentage. The release-workflow exercise is no longer skipped: the remediation P0.7 dry-run
+  manual dispatch ran live (PR #224, Actions run
+  [33781875201](https://github.com/jm2/tributary/actions/runs/33781875201)) and proved that
+  dispatching tag v0.6.2 resolves the build to that tag's immutable commit.
 - Direct Apple/iTunes XML, Google Takeout CSV, M3U, service-URL playlist input, and fuzzy
   “similarly named” matching are not scheduled. XSPF is the supported interchange path.
 - Automount/eject, markerless read-only root enrollment, stronger native removable IDs, and saved
