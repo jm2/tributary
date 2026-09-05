@@ -171,21 +171,31 @@ pub enum PlayerState {
 /// exactly while an equalizer bin is installed at `playbin3.audio-filter`
 /// (i.e. only when the equalizer is enabled on the local output).
 /// `save_generation` implements the trailing-edge 750 ms debounce: every
-/// change re-arms the timer and only the newest generation writes.
-/// `ever_persisted` keeps the fresh-install no-file shape until a real
-/// state change reaches disk, after which even a reset to the default
-/// state is written back (so a stale non-default `equalizer.cfg` can
-/// never resurrect discarded settings on the next launch). `retired`
-/// records an error-driven rollback honored by
-/// [`Player::ensure_equalizer_installed`] until the user changes the
-/// setting.
+/// change re-arms the timer and only the newest generation writes. Every
+/// change-spell writes, including one whose result is exactly the
+/// fresh-install default state — the contract has no default-state
+/// suppression. `persistence_suppressed` latches a transient unreadable
+/// `equalizer.cfg`: the debounced writer and the shutdown flush stay
+/// blocked until a subsequent read of the file succeeds and reconciles
+/// the in-memory state with disk, so a valid on-disk file can never be
+/// overwritten with defaults. `retired` records an error-driven rollback
+/// honored by [`Player::ensure_equalizer_installed`] until the user
+/// changes the setting.
 #[derive(Default)]
 struct EqEngineState {
     settings: EqSettings,
     chain: Option<equalizer::EqChain>,
     save_generation: u64,
-    ever_persisted: bool,
+    persistence_suppressed: bool,
     retired: bool,
+}
+
+/// Whether an equalizer state change may reach disk right now. The only
+/// gate is the transient-read latch: persistence of *any* state —
+/// including the fresh-install default — is a contract requirement for
+/// every change-spell once the file is readable again.
+fn equalizer_persistence_allowed(state: &EqEngineState) -> bool {
+    !state.persistence_suppressed
 }
 
 /// GStreamer playback engine.
@@ -279,15 +289,15 @@ impl Player {
 
         // Load the persisted equalizer state. A malformed file has already
         // been replaced with the default state (atomic replace) and reports
-        // a single bounded diagnostic through the shared loader.
-        let eq_settings = equalizer::load_settings_with_diagnostic();
+        // a single bounded diagnostic through the shared loader. A file
+        // that exists but cannot be read leaves persistence suppressed
+        // until a successful read reconciles state with disk.
+        let (eq_settings, eq_load_status) = equalizer::load_settings_with_status();
         let eq_state = Rc::new(RefCell::new(EqEngineState {
             settings: eq_settings,
             chain: None,
             save_generation: 0,
-            // A pre-existing file counts as persisted: a reset on this
-            // run must still overwrite it with the (default) state.
-            ever_persisted: equalizer::config_file_exists(),
+            persistence_suppressed: eq_load_status == equalizer::EqLoadStatus::TransientReadFailure,
             retired: false,
         }));
 
@@ -565,11 +575,16 @@ impl Player {
         self.eq_state.borrow().settings
     }
 
-    /// Force a re-read of `equalizer.cfg` — the settings UI's only
-    /// escape hatch from a malformed on-disk file. Returns the state now
-    /// in effect and, if the pipeline is live, re-applies it.
+    /// Force a re-read of `equalizer.cfg` — the settings UI's
+    /// escape hatch from a malformed or transiently unreadable on-disk
+    /// file, and the contract's "subsequent successful read" that ends a
+    /// persistence suppression. Returns the state now in effect and, if
+    /// the pipeline is live, re-applies it. A read that fails again
+    /// keeps the suppression armed.
     pub fn reload_equalizer_settings(&self) -> EqSettings {
-        let settings = equalizer::load_settings_with_diagnostic();
+        let (settings, status) = equalizer::load_settings_with_status();
+        self.eq_state.borrow_mut().persistence_suppressed =
+            status == equalizer::EqLoadStatus::TransientReadFailure;
         self.apply_equalizer_settings(settings);
         settings
     }
@@ -581,8 +596,8 @@ impl Player {
     /// - Band, preamp, and preset changes are buffer-boundary
     ///   property-write transactions (freeze/thaw) on the running bin.
     /// - The new state is persisted through the trailing-edge debounce;
-    ///   the fresh-install no-file shape is kept until a real state
-    ///   change has been persisted once.
+    ///   every change-spell writes, including one whose result is exactly
+    ///   the fresh-install default state.
     ///
     /// A configuration update never emits a `Buffering` event: GObject
     /// property writes produce no pipeline event, and any `Buffering`
@@ -735,10 +750,11 @@ impl Player {
 
     /// Persist the equalizer state on the trailing edge of a change
     /// spell: every change re-arms the 750 ms timer, and only the newest
-    /// generation actually writes. A fresh install holding the default
-    /// state keeps the no-file shape; once anything has been persisted,
-    /// even a reset to the default state is written back so the
-    /// discarded settings can never be restored from a stale file.
+    /// generation actually writes. Every change-spell writes — including
+    /// one whose result is exactly the fresh-install default state, so a
+    /// user-visible reset can never be resurrected from a stale file.
+    /// A transient unreadable `equalizer.cfg` suppresses the write until
+    /// a subsequent read succeeds (see [`equalizer_persistence_allowed`]).
     fn schedule_equalizer_save(&self) {
         let next_generation = self.eq_state.borrow().save_generation.wrapping_add(1);
         self.eq_state.borrow_mut().save_generation = next_generation;
@@ -746,33 +762,28 @@ impl Player {
         glib::timeout_add_local_once(
             Duration::from_millis(equalizer::SAVE_DEBOUNCE_MS),
             move || {
-                let mut state = state.borrow_mut();
+                let state = state.borrow_mut();
                 if state.save_generation != next_generation {
                     return;
                 }
-                if !state.ever_persisted && state.settings.is_fresh_default() {
+                if !equalizer_persistence_allowed(&state) {
                     return;
                 }
-                if equalizer::save_equalizer_settings_to_disk(&state.settings) {
-                    state.ever_persisted = true;
-                }
+                let _ = equalizer::save_equalizer_settings_to_disk(&state.settings);
             },
         );
     }
 
     /// Shutdown flush: synchronously write the current state before the
     /// pipeline is retired, so quitting with a pending debounce never
-    /// loses the last change. The fresh-install no-file shape is kept
-    /// until state has actually been persisted once; after that, even a
-    /// reset to the default state is written back.
+    /// loses the last change. Suppressed while the on-disk file is
+    /// unreadable, for the same reason the debounced writer is.
     fn flush_equalizer_for_shutdown(&self) {
-        let mut state = self.eq_state.borrow_mut();
-        if !state.ever_persisted && state.settings.is_fresh_default() {
+        let state = self.eq_state.borrow_mut();
+        if !equalizer_persistence_allowed(&state) {
             return;
         }
-        if equalizer::save_equalizer_settings_to_disk(&state.settings) {
-            state.ever_persisted = true;
-        }
+        let _ = equalizer::save_equalizer_settings_to_disk(&state.settings);
     }
 
     // ── State / position queries ────────────────────────────────────
@@ -856,20 +867,27 @@ impl Player {
                     if let Some(ticket) = media_ticket.as_ref() {
                         media_proxy.revoke_if_current(ticket);
                     }
-                    // The equalizer chain may itself be the failure (e.g.
-                    // a non-PCM source that cannot deliver the pinned
-                    // F32LE stereo caps); retire it so every subsequent
+                    // Only equalizer-originated GStreamer failures retire
+                    // the equalizer chain (contract: *Filter graph*): an
+                    // error whose source lies inside `eq-bin` — such as a
+                    // non-PCM source that cannot deliver the pinned F32LE
+                    // stereo caps — rolls the bin back so every subsequent
                     // load stays in the passthrough layout instead of
-                    // rebuilding the same failing bin. The retirement is
+                    // rebuilding the same failing bin. Errors from the
+                    // decoder, demuxer, network, or audio sink are unrelated
+                    // playback failures: the bin stays installed and the
+                    // equalizer state is untouched. The retirement is
                     // honored by `ensure_equalizer_installed` until the
                     // user changes the equalizer setting (or restarts).
-                    if let Some(playbin) = playbin_for_eq.upgrade() {
-                        let mut state = eq_state.borrow_mut();
-                        if state.chain.take().is_some() {
+                    if eq_bin_originated(msg) {
+                        if let Some(playbin) = playbin_for_eq.upgrade() {
+                            let mut state = eq_state.borrow_mut();
+                            state.chain = None;
                             state.retired = true;
                             playbin.set_property("audio-filter", Option::<&gst::Element>::None);
                             info!(
-                                "Equalizer chain retired after pipeline error; passthrough restored for subsequent loads"
+                                "Equalizer chain retired after an equalizer-originated \
+                                 pipeline error; passthrough restored for subsequent loads"
                             );
                         }
                     }
@@ -1156,6 +1174,30 @@ fn pipeline_error_source_category(message: &gst::MessageRef) -> PipelineErrorSou
     pipeline_error_source_category_from_klass(&klass)
 }
 
+/// Whether a bus message originates inside the equalizer filter bin:
+/// the message source — an element or a pad — is `eq-bin` itself or an
+/// object parented into it. This is the contract's only retirement
+/// trigger; the source walk needs no message text, so the privacy rule
+/// (never inspect error/debug strings) is preserved.
+fn eq_bin_originated(message: &gst::MessageRef) -> bool {
+    const EQ_BIN_NAME: &str = "eq-bin";
+    const MAX_SOURCE_DEPTH: usize = 12;
+    // The walk owns each step: `parent()` hands back a fresh owned
+    // reference, so the loop carries `Option<gst::Object>` instead of
+    // a borrow into the previous step's handle.
+    let mut origin = message.src().cloned();
+    for _ in 0..MAX_SOURCE_DEPTH {
+        let Some(object) = origin else {
+            return false;
+        };
+        if object.name() == EQ_BIN_NAME {
+            return true;
+        }
+        origin = object.parent();
+    }
+    false
+}
+
 fn pipeline_error_source_category_from_klass(klass: &str) -> PipelineErrorSourceCategory {
     if klass.contains("Network") && klass.contains("Source") {
         PipelineErrorSourceCategory::Network
@@ -1190,10 +1232,10 @@ fn pipeline_error_domain(error: &glib::Error) -> &'static str {
 impl Drop for Player {
     fn drop(&mut self) {
         info!("Shutting down GStreamer pipeline");
-        // Shutdown flush: persist the current equalizer state (keeping
-        // the fresh-install no-file shape until anything was persisted)
-        // even if the debounce timer is still armed, so quitting never
-        // loses the last change.
+        // Shutdown flush: persist the current equalizer state even if
+        // the debounce timer is still armed, so quitting never loses
+        // the last change. A transient unreadable file keeps this
+        // suppressed, exactly like the debounced writer.
         self.flush_equalizer_for_shutdown();
         #[cfg(target_os = "macos")]
         drop(self.macos_audio_route.take());
@@ -1598,5 +1640,78 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Build one error bus message whose source is the given object.
+    fn error_message_from(source: &impl glib::object::IsA<gst::Object>) -> gst::Message {
+        gst::message::Error::builder(gst::StreamError::Failed, "test failure")
+            .src(source)
+            .build()
+    }
+
+    /// Regression (contract acceptance 19): only errors originating
+    /// inside `eq-bin` may retire the equalizer chain. Decoder, demuxer,
+    /// network, and sink errors — whose sources live anywhere else — are
+    /// unrelated playback failures and must not classify as equalizer
+    /// failures, so the bin stays installed and the state untouched.
+    #[test]
+    fn only_errors_originating_inside_eq_bin_classify_as_equalizer_failures() {
+        gst::init().expect("GStreamer init");
+        let Ok(child) = gst::ElementFactory::make("fakesink").build() else {
+            // fakesink ships with gst-plugins-base; skip only on a
+            // broken development host.
+            return;
+        };
+        let eq_bin = gst::Bin::with_name("eq-bin");
+        eq_bin.add(&child).expect("add child to eq-bin fixture");
+
+        // A child element inside the bin is equalizer-originated…
+        assert!(eq_bin_originated(&error_message_from(&child)));
+        // …as is one of its pads (pad → element → eq-bin walk)…
+        let pad = child.static_pad("sink").expect("fakesink has a sink pad");
+        assert!(eq_bin_originated(&error_message_from(&pad)));
+        // …and so is a grandchild nested one bin deeper.
+        let sub_bin = gst::Bin::new();
+        let grandchild = gst::ElementFactory::make("fakesink")
+            .build()
+            .expect("fakesink available");
+        sub_bin.add(&grandchild).expect("add grandchild");
+        eq_bin.add(&sub_bin).expect("nest sub-bin");
+        assert!(eq_bin_originated(&error_message_from(&grandchild)));
+
+        // The bin itself posting is equalizer-originated.
+        assert!(eq_bin_originated(&error_message_from(&eq_bin)));
+
+        // An unrelated element (the usual decoder/sink/network case)
+        // and a source-less message are not equalizer failures.
+        let outsider = gst::ElementFactory::make("fakesink")
+            .build()
+            .expect("fakesink available");
+        assert!(!eq_bin_originated(&error_message_from(&outsider)));
+        let sourceless =
+            gst::message::Error::builder(gst::StreamError::Failed, "no source").build();
+        assert!(!eq_bin_originated(&sourceless));
+    }
+
+    /// Regression (contract acceptance 18, persistence half): a
+    /// transient unreadable `equalizer.cfg` suppresses every persistence
+    /// path — the debounced writer and the shutdown flush — until a
+    /// subsequent read succeeds. Once readable, every change-spell
+    /// writes, including one whose result is exactly the fresh-install
+    /// default state: the contract has no default-state suppression.
+    #[test]
+    fn transient_unreadable_config_suppresses_every_persistence_path() {
+        let mut state = EqEngineState::default();
+        assert!(equalizer_persistence_allowed(&state));
+
+        state.persistence_suppressed = true;
+        assert!(!equalizer_persistence_allowed(&state));
+
+        state.persistence_suppressed = false;
+        state.settings = EqSettings::default();
+        assert!(
+            equalizer_persistence_allowed(&state),
+            "a readable file must accept default-state writes"
+        );
     }
 }

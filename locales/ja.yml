@@ -469,6 +469,6 @@ equalizer:
   band_a11y: "%{frequency}ヘルツのイコライザーバンド、デシベル単位で調整します"
   unsupported:
     local: "イコライザーはTributaryのローカル音声パイプライン内で動作します。"
-    airplay: "AirPlayレシーバーは音声を端到端で処理するため、Tributaryのイコライザーはスピーカーに届きません。"
+    airplay: "AirPlayレシーバーは音声をエンドツーエンドで処理するため、Tributaryのイコライザーはスピーカーに届きません。"
     chromecast: "Chromecastデバイスはレシーバー側で音声を処理するため、Tributaryのイコライザーはスピーカーに届きません。"
     mpd: "MPDはサーバー側で音声を処理するため、Tributaryのイコライザーはリモートプレーヤーに届きません。"
