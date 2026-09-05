@@ -1958,8 +1958,22 @@ Assert-TargetFailure $newlineTarget "target #1 contains an unsupported quote or 
         .concat();
 
         let run = |program: &str| {
-            std::process::Command::new(program)
-                .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+            let mut spawn = std::process::Command::new(program);
+            spawn.args(["-NoProfile", "-NonInteractive"]);
+            if cfg!(target_os = "windows") {
+                spawn.arg("-Command").arg(&command);
+            } else {
+                // A macOS host reads the full process arguments back via
+                // a KERN_PROCARGS sysctl during pwsh's login-shell
+                // detection, and current macOS runner images fail that
+                // read with errno 5 when argv carries the whole inline
+                // script. Hand the script over as a file instead of
+                // argv; pwsh 7 reads UTF-8 without a BOM by default.
+                let script_path = temp.path().join("pe-import-target-regression.ps1");
+                fs::write(&script_path, &command).unwrap();
+                spawn.arg("-File").arg(&script_path);
+            }
+            spawn
                 .env("TRIBUTARY_VALID_DLL", &valid_dll)
                 .env("TRIBUTARY_VALID_DRV", &valid_drv)
                 .env("TRIBUTARY_VALID_EXE", &valid_exe)

@@ -9,6 +9,7 @@ pub mod folder_browser;
 pub mod header_bar;
 mod library_commands;
 pub mod objects;
+pub mod offline;
 pub mod open_files;
 pub mod output_dialogs;
 pub mod output_switch;
