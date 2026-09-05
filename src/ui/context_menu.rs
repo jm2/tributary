@@ -7,6 +7,7 @@
 use adw::prelude::*;
 use gtk::gio::prelude::ActionExt;
 use gtk::glib;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::objects::{SourceObject, TrackObject};
@@ -84,6 +85,24 @@ struct PlaylistAddPlan {
     authority: Vec<RegularPlaylistTrackResolution>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, glib::Boxed)]
+#[boxed_type(name = "TributaryPlaylistDragPayload")]
+struct PlaylistDragPayload {
+    candidates: Vec<PlaylistAddCandidate>,
+}
+
+impl PlaylistDragPayload {
+    fn from_selection(sm: &gtk::SortListModel, selection: &gtk::MultiSelection) -> Option<Self> {
+        let selected = selection.selection();
+        let snapshot = SelectionSnapshot::from_positions(
+            (0..sm.n_items()).filter(|position| selected.contains(*position)),
+        )?;
+        Some(Self {
+            candidates: collect_selected_add_candidates(sm, &snapshot)?,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlaylistMutationOutcome {
     Committed,
@@ -94,6 +113,7 @@ enum PlaylistMutationOutcome {
 #[derive(Clone)]
 struct PlaylistMutationContext {
     window: gtk::glib::WeakRef<adw::ApplicationWindow>,
+    toast_overlay: adw::ToastOverlay,
     rt_handle: tokio::runtime::Handle,
     source_registry: SourceRegistry,
     sidebar_store: gtk::gio::ListStore,
@@ -113,6 +133,7 @@ impl PlaylistMutationContext {
     fn from_window(state: &WindowState) -> Self {
         Self {
             window: state.window.downgrade(),
+            toast_overlay: state.toast_overlay.clone(),
             rt_handle: state.rt_handle.clone(),
             source_registry: state.source_registry.clone(),
             sidebar_store: state.sidebar_store.clone(),
@@ -155,6 +176,49 @@ impl PlaylistMutationContext {
         if let Some(window) = self.window.upgrade() {
             show_playlist_mutation_failed_dialog(&window);
         }
+    }
+
+    fn show_added(&self, count: usize, playlist_name: &str) {
+        let message = playlist_add_success_message(&rust_i18n::locale(), count, playlist_name);
+        self.toast_overlay.add_toast(adw::Toast::new(&message));
+    }
+
+    fn add_candidates_to_playlist(
+        &self,
+        playlist_id: String,
+        playlist_name: String,
+        candidates: Vec<PlaylistAddCandidate>,
+    ) {
+        if !playlist_is_editable_regular(&self.sidebar_store, &playlist_id) {
+            self.show_unsupported();
+            return;
+        }
+        let Ok(plan) = prepare_playlist_add_plan(&self.source_registry, &candidates) else {
+            self.show_unsupported();
+            return;
+        };
+
+        let (result_tx, result_rx) = async_channel::bounded(1);
+        spawn_playlist_add_worker(
+            &self.rt_handle,
+            self.source_registry.clone(),
+            playlist_id.clone(),
+            plan,
+            result_tx,
+        );
+
+        let context = self.clone();
+        let count = candidates.len();
+        gtk::glib::MainContext::default().spawn_local(async move {
+            match result_rx.recv().await {
+                Ok(PlaylistMutationOutcome::Committed) => {
+                    context.show_added(count, &playlist_name);
+                    context.refresh_playlist_after_commit(&playlist_id);
+                }
+                Ok(PlaylistMutationOutcome::Rejected) => context.show_unsupported(),
+                Ok(PlaylistMutationOutcome::Failed) | Err(_) => context.show_mutation_failed(),
+            }
+        });
     }
 
     fn refresh_playlist_after_commit(&self, playlist_id: &str) {
@@ -213,6 +277,56 @@ struct UnsupportedPlaylistAddCopy {
 struct PlaylistMutationFailedCopy {
     heading: String,
     body: String,
+}
+
+/// CLDR plural category for the whole-number counts the playlist toast carries.
+///
+/// `rust-i18n` interpolates `count` but does not choose plural forms, so the
+/// form is selected here. Only the categories the shipped catalogs use are
+/// modelled: every catalog carries `one`/`other`, and Polish and Russian add
+/// `few`/`many`. Counts are integers, so the fractional `other` branch of
+/// those two languages never applies.
+fn plural_category(locale: &str, count: usize) -> &'static str {
+    let language: String = locale
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect();
+    match language.as_str() {
+        "pl" => few_many_category(count, count == 1),
+        "ru" => few_many_category(count, count % 10 == 1 && count % 100 != 11),
+        _ if count == 1 => "one",
+        _ => "other",
+    }
+}
+
+/// `one`/`few`/`many` split shared by Polish and Russian for whole numbers;
+/// only the `one` rule differs, so the caller supplies it.
+fn few_many_category(count: usize, one: bool) -> &'static str {
+    let tens = count % 10;
+    let hundreds = count % 100;
+    if one {
+        "one"
+    } else if (2..=4).contains(&tens) && !(12..=14).contains(&hundreds) {
+        "few"
+    } else {
+        "many"
+    }
+}
+
+fn playlist_add_success_message(locale: &str, count: usize, playlist_name: &str) -> String {
+    let key = format!(
+        "context.playlist_add_success.{}",
+        plural_category(locale, count)
+    );
+    // `AdwToast` titles are Pango markup by default. Keep the user-controlled
+    // name escaped on the same path that selects and renders the translation.
+    rust_i18n::t!(
+        key.as_str(),
+        locale = locale,
+        count = count,
+        playlist = gtk::glib::markup_escape_text(playlist_name)
+    )
+    .into_owned()
 }
 
 fn unsupported_playlist_add_copy(locale: &str) -> UnsupportedPlaylistAddCopy {
@@ -300,92 +414,159 @@ fn expose_context_menu_accessibility(column_view: &gtk::ColumnView) {
     ]);
 }
 
+/// Shared closure type for one-shot context-menu popups. Returns whether a
+/// non-empty menu was opened; keyboard consumers decide propagation from it.
+type ContextMenuPopupFn = Rc<dyn Fn(&gtk::ColumnView, Option<gtk::gdk::Rectangle>) -> bool>;
+
+/// Maximum natural height of a custom context-menu viewport before its
+/// vertical scrollbar takes over.
+const CONTEXT_MENU_MAX_CONTENT_HEIGHT: i32 = 480;
+
 /// Wire pointer and keyboard context-menu access on the tracklist.
 ///
 /// Right-click retains its exact pointer anchor. The Menu key and Shift+F10
 /// open the same selection-snapshotted action model relative to the focused
 /// tracklist, and are consumed only when a non-empty menu was opened.
-pub fn setup_context_menu(state: &WindowState) {
+pub fn setup_context_menu(
+    state: &WindowState,
+    playlist_row_drop: Rc<RefCell<Option<PlaylistRowDropContext>>>,
+) {
+    setup_playlist_transfer(state, playlist_row_drop);
     let sm = state.sort_model.clone();
     let sidebar_store = state.sidebar_store.clone();
     let active_source_key = state.active_source_key.clone();
     let mutation_context = PlaylistMutationContext::from_window(state);
 
-    let popup_menu = Rc::new(
+    let popup_menu: ContextMenuPopupFn = Rc::new(
         move |cv: &gtk::ColumnView, anchor: Option<gtk::gdk::Rectangle>| {
-            let active_key = active_source_key.borrow().clone();
-            let is_playlist_view = active_key.starts_with("playlist:");
-
-            // Freeze exact selected row identities while constructing this
-            // one-shot popover. No later mutation consults a URI, source label,
-            // or whatever rows happen to occupy these GTK positions.
-            let selection_model = cv.model();
-            let Some(sel) = selection_model.and_then(|m| m.downcast::<gtk::MultiSelection>().ok())
-            else {
-                return false;
+            let session = ContextMenuPopupSession {
+                mutation_context: &mutation_context,
+                sidebar_store: &sidebar_store,
+                sm: &sm,
+                column_view: cv,
             };
-
-            let selected = sel.selection();
-            let Some(popup_plan) = ContextMenuPopupPlan::from_positions(
-                (0..sm.n_items()).filter(|position| selected.contains(*position)),
-            ) else {
-                return false;
-            };
-
-            let menu = gtk::gio::Menu::new();
-            let action_group = gtk::gio::SimpleActionGroup::new();
-            let interaction_request = mutation_context.current_request(&active_key);
-
-            if is_playlist_view {
-                build_remove_from_playlist_action(
-                    &menu,
-                    &action_group,
-                    &active_key,
-                    &sm,
-                    &popup_plan.selection,
-                    interaction_request.as_ref(),
-                    &mutation_context,
-                );
-            } else {
-                build_add_to_playlist_actions(
-                    &menu,
-                    &action_group,
-                    &sidebar_store,
-                    &sm,
-                    &popup_plan.selection,
-                    interaction_request.as_ref(),
-                    &mutation_context,
-                );
-            }
-
-            // ── Properties… ──────────────────────────────────────────
-            let automatic_device = active_source_is_automatic_device(&sidebar_store, &active_key);
-            build_properties_action(
-                &menu,
-                &action_group,
-                cv,
-                &sm,
-                &popup_plan.selection,
-                automatic_device,
-            );
-
-            if menu.n_items() == 0 {
-                return false;
-            }
-
-            let popover = popover_from_menu_model(cv, &menu, &action_group);
-            if let Some(anchor) = anchor {
-                popover.set_pointing_to(Some(&anchor));
-            }
-            popover.popup();
-            true
+            open_context_menu_popup(&session, &active_source_key, anchor)
         },
     );
+    attach_pointer_context_menu(state, &popup_menu);
+    attach_keyboard_context_menu(state, popup_menu);
+    expose_context_menu_accessibility(&state.column_view);
+}
 
+/// Immutable view of everything a one-shot context-menu popup renders against.
+struct ContextMenuPopupSession<'a> {
+    mutation_context: &'a PlaylistMutationContext,
+    sidebar_store: &'a gtk::gio::ListStore,
+    sm: &'a gtk::SortListModel,
+    column_view: &'a gtk::ColumnView,
+}
+
+/// Freeze exact selected row identities for a one-shot popup.
+///
+/// No later mutation consults a URI, source label, or whatever rows happen
+/// to occupy these GTK positions.
+fn snapshot_popup_plan(session: &ContextMenuPopupSession<'_>) -> Option<ContextMenuPopupPlan> {
+    let sel = session
+        .column_view
+        .model()
+        .and_then(|m| m.downcast::<gtk::MultiSelection>().ok())?;
+    let selected = sel.selection();
+    ContextMenuPopupPlan::from_positions(
+        (0..session.sm.n_items()).filter(|position| selected.contains(*position)),
+    )
+}
+
+/// Populate a fresh menu model with the selection-scoped actions.
+fn append_context_menu_actions(
+    session: &ContextMenuPopupSession<'_>,
+    menu: &gtk::gio::Menu,
+    action_group: &gtk::gio::SimpleActionGroup,
+    active_key: &str,
+    is_playlist_view: bool,
+    popup_plan: &ContextMenuPopupPlan,
+    interaction_request: Option<&super::source_navigation::SourceRequest>,
+) {
+    if is_playlist_view {
+        build_remove_from_playlist_action(
+            menu,
+            action_group,
+            active_key,
+            session.sm,
+            &popup_plan.selection,
+            interaction_request,
+            session.mutation_context,
+        );
+    }
+    // The track drag source is installed on every tracklist view, so tracks
+    // shown by a regular or smart playlist can be dragged onto another
+    // regular playlist. Keyboard users need the same destinations from the
+    // menu, so the add actions are offered in playlist views as well.
+    build_add_to_playlist_actions(
+        menu,
+        action_group,
+        session.sidebar_store,
+        session.sm,
+        &popup_plan.selection,
+        interaction_request,
+        session.mutation_context,
+    );
+
+    // ── Properties… ──────────────────────────────────────────
+    let automatic_device = active_source_is_automatic_device(session.sidebar_store, active_key);
+    build_properties_action(
+        menu,
+        action_group,
+        session.column_view,
+        session.sm,
+        &popup_plan.selection,
+        automatic_device,
+    );
+}
+
+/// Open the selection-snapshotted context-menu popover on the session's
+/// column view. Returns `true` only when a non-empty menu was presented.
+fn open_context_menu_popup(
+    session: &ContextMenuPopupSession<'_>,
+    active_source_key: &Rc<RefCell<String>>,
+    anchor: Option<gtk::gdk::Rectangle>,
+) -> bool {
+    let active_key = active_source_key.borrow().clone();
+    let is_playlist_view = active_key.starts_with("playlist:");
+    let Some(popup_plan) = snapshot_popup_plan(session) else {
+        return false;
+    };
+
+    let menu = gtk::gio::Menu::new();
+    let action_group = gtk::gio::SimpleActionGroup::new();
+    let interaction_request = session.mutation_context.current_request(&active_key);
+
+    append_context_menu_actions(
+        session,
+        &menu,
+        &action_group,
+        &active_key,
+        is_playlist_view,
+        &popup_plan,
+        interaction_request.as_ref(),
+    );
+
+    if menu.n_items() == 0 {
+        return false;
+    }
+
+    let popover = popover_from_menu_model(session.column_view, &menu, &action_group);
+    if let Some(anchor) = anchor {
+        popover.set_pointing_to(Some(&anchor));
+    }
+    popover.popup();
+    true
+}
+
+fn attach_pointer_context_menu(state: &WindowState, popup_menu: &ContextMenuPopupFn) {
     let gesture = gtk::GestureClick::new();
     gesture.set_button(3); // right-click
     {
-        let popup_menu = Rc::clone(&popup_menu);
+        let popup_menu = Rc::clone(popup_menu);
         gesture.connect_pressed(move |gesture, _n_press, x, y| {
             let Some(cv) = gesture
                 .widget()
@@ -398,7 +579,9 @@ pub fn setup_context_menu(state: &WindowState) {
         });
     }
     state.column_view.add_controller(gesture);
+}
 
+fn attach_keyboard_context_menu(state: &WindowState, popup_menu: ContextMenuPopupFn) {
     let key_controller = match CONTEXT_MENU_INTERACTION.keyboard_controller {
         ContextMenuControllerPlan::EventControllerKeyBubble => {
             let controller = gtk::EventControllerKey::new();
@@ -421,7 +604,206 @@ pub fn setup_context_menu(state: &WindowState) {
         keyboard_context_menu_propagation(true, popup_menu(&cv, None)).into_gtk()
     });
     state.column_view.add_controller(key_controller);
-    expose_context_menu_accessibility(&state.column_view);
+}
+
+/// Per-row drop-target payload used by the sidebar factory to install the
+/// playlist drop handler. The sidebar's `ListView` resolves the destination
+/// from the *drop coordinates* (via `list_item.position()`), not from the
+/// current sidebar selection: rows that are non-selectable (headers, servers,
+/// pull mirrors) still need a usable hit target, and dropping on a different
+/// playlist row than the one currently focused must add to the row the
+/// pointer actually landed on, not the row the keyboard cursor last visited.
+pub struct PlaylistRowDropContext {
+    context: PlaylistMutationContext,
+    store: gtk::gio::ListStore,
+}
+
+impl PlaylistRowDropContext {
+    pub fn from_window(state: &WindowState) -> Self {
+        Self {
+            context: PlaylistMutationContext::from_window(state),
+            store: state.sidebar_store.clone(),
+        }
+    }
+}
+
+/// Attach a `DropTarget` to a single sidebar row.
+///
+/// The drop handler resolves the destination from `list_item.position()`,
+/// which reflects the row currently bound to this widget — even for the
+/// non-selectable header rows that the `ListView`-level selection never
+/// tracks. Installing the target on `row_box` (per row) keeps the active
+/// drag hit area scoped to whichever row the pointer is over.
+pub fn attach_playlist_drop_target(
+    row_box: &gtk::Box,
+    list_item: &gtk::ListItem,
+    drop: &PlaylistRowDropContext,
+) {
+    let drop_target = gtk::DropTarget::new(
+        PlaylistDragPayload::static_type(),
+        gtk::gdk::DragAction::COPY,
+    );
+    let store_for_accept = drop.store.clone();
+    let list_item_for_accept = list_item.clone();
+    drop_target.connect_accept(move |_, drop| {
+        playlist_drop_is_acceptable(
+            &drop.formats(),
+            drop.actions(),
+            position_source(&store_for_accept, &list_item_for_accept)
+                .is_some_and(|source| source.is_editable_regular_playlist()),
+        )
+    });
+    let context_for_drop = drop.context.clone();
+    let store_for_drop = drop.store.clone();
+    let list_item_for_drop = list_item.clone();
+    drop_target.connect_drop(move |_, value, _, _| {
+        let Ok(payload) = value.get::<PlaylistDragPayload>() else {
+            return false;
+        };
+        let Some(source) = position_source(&store_for_drop, &list_item_for_drop) else {
+            return false;
+        };
+        if !source.is_editable_regular_playlist() {
+            return false;
+        }
+        context_for_drop.add_candidates_to_playlist(
+            source.playlist_id(),
+            source.name(),
+            payload.candidates,
+        );
+        true
+    });
+    row_box.add_controller(drop_target);
+}
+
+fn position_source(store: &gtk::gio::ListStore, list_item: &gtk::ListItem) -> Option<SourceObject> {
+    let pos = list_item.position();
+    store.item(pos).and_downcast::<SourceObject>()
+}
+
+/// Decide whether the per-row track drop target may claim an in-flight drag.
+///
+/// Connecting a custom `accept` handler replaces GTK's default format and
+/// action compatibility check, so that check must be re-applied here. The
+/// same sidebar row also hosts the playlist-reorder target (string playlist
+/// id under `MOVE`), and GTK consults the most recently added controller
+/// first. Answering on row editability alone would let this target claim a
+/// reorder drag entering an editable regular playlist; the drop would then
+/// fail to decode as `PlaylistDragPayload` and reordering onto that row
+/// would silently break.
+fn playlist_drop_is_acceptable(
+    formats: &gtk::gdk::ContentFormats,
+    actions: gtk::gdk::DragAction,
+    editable_regular_playlist: bool,
+) -> bool {
+    editable_regular_playlist
+        && formats.contains_type(PlaylistDragPayload::static_type())
+        && actions.contains(gtk::gdk::DragAction::COPY)
+}
+
+/// Run the DB-backed playlist add on the blocking runtime and report the
+/// outcome through `result_tx`.
+///
+/// Authorization revalidation (`acquire_regular_playlist_commit_authority`)
+/// happens inside the write transaction, so a stale menu snapshot can never
+/// commit against a playlist that lost editability between click and commit.
+fn spawn_playlist_add_worker(
+    rt_handle: &tokio::runtime::Handle,
+    registry: SourceRegistry,
+    playlist_id: String,
+    plan: PlaylistAddPlan,
+    result_tx: async_channel::Sender<PlaylistMutationOutcome>,
+) {
+    rt_handle.spawn(async move {
+        let outcome = match crate::db::connection::init_db().await {
+            Ok(db) => {
+                let manager = crate::local::playlist_manager::PlaylistManager::new(db);
+                match manager
+                    .add_entries_if_authorized(&playlist_id, &plan.inputs, || {
+                        registry.acquire_regular_playlist_commit_authority(&plan.authority)
+                    })
+                    .await
+                {
+                    Ok(PlaylistEntryAddOutcome::Committed(_)) => PlaylistMutationOutcome::Committed,
+                    Ok(PlaylistEntryAddOutcome::Rejected) => PlaylistMutationOutcome::Rejected,
+                    Err(error) => {
+                        tracing::error!(%error, playlist = %playlist_id, "Failed to add exact playlist occurrences");
+                        PlaylistMutationOutcome::Failed
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "Failed to open DB for playlist add");
+                PlaylistMutationOutcome::Failed
+            }
+        };
+        let _ = result_tx.send(outcome).await;
+    });
+}
+
+fn setup_playlist_transfer(
+    state: &WindowState,
+    playlist_row_drop: Rc<RefCell<Option<PlaylistRowDropContext>>>,
+) {
+    use gtk::glib::prelude::ToValue;
+
+    // Publish the per-row drop context so any sidebar row that is realized
+    // after this point gets a `DropTarget` resolving to its own `position()`.
+    // Rows already realized will not retroactively gain a target, so the
+    // sidebar factory must consult this slot lazily on every row setup.
+    *playlist_row_drop.borrow_mut() = Some(PlaylistRowDropContext::from_window(state));
+
+    let drag_source = gtk::DragSource::builder()
+        .actions(gtk::gdk::DragAction::COPY)
+        .build();
+    let sort_model = state.sort_model.clone();
+    let column_view = state.column_view.clone();
+    drag_source.connect_prepare(move |_, x, y| {
+        // The source is installed on the whole `ColumnView`, whose header
+        // owns GTK's column reorder and resize gestures. Only a press inside
+        // the data-row area may become a track drag.
+        let picked = column_view.pick(x, y, gtk::PickFlags::DEFAULT);
+        if !drag_origin_is_data_row(&column_view, picked) {
+            return None;
+        }
+        let selection = column_view
+            .model()?
+            .downcast::<gtk::MultiSelection>()
+            .ok()?;
+        let payload = PlaylistDragPayload::from_selection(&sort_model, &selection)?;
+        Some(gtk::gdk::ContentProvider::for_value(&payload.to_value()))
+    });
+    state.column_view.add_controller(drag_source);
+    state.column_view.update_property(&[
+        gtk::accessible::Property::Description(
+            rust_i18n::t!("context.playlist_drag_description").as_ref(),
+        ),
+        gtk::accessible::Property::KeyShortcuts("Shift+F10 ContextMenu"),
+    ]);
+}
+
+/// Whether a drag starting at `picked`, the widget under the pointer as
+/// resolved by [`gtk::prelude::WidgetExt::pick`] on `column_view`, begins in
+/// the data-row area.
+///
+/// `GtkColumnView` parents two children directly: a header row widget, which
+/// hosts the column reorder and resize gestures, and an internal
+/// `GtkListView` subclass holding the data rows. A track drag may only start
+/// from a widget inside that list view; the header, empty space, and the
+/// column view itself refuse.
+fn drag_origin_is_data_row(column_view: &gtk::ColumnView, picked: Option<gtk::Widget>) -> bool {
+    let column_view = column_view.upcast_ref::<gtk::Widget>();
+    let mut widget = picked;
+    while let Some(current) = widget {
+        if &current == column_view {
+            return false;
+        }
+        if current.is::<gtk::ListView>() {
+            return true;
+        }
+        widget = current.parent();
+    }
+    false
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -551,6 +933,7 @@ fn build_add_to_playlist_actions(
                 let action_name = format!("add-to-{}", pl_id.replace('-', "_"));
                 let add_action = gtk::gio::SimpleAction::new(&action_name, None);
                 let pid = pl_id.clone();
+                let action_playlist_name = pl_name.clone();
                 let interaction_request = interaction_request.cloned();
                 let candidates = candidates.clone();
                 let context = context.clone();
@@ -573,75 +956,11 @@ fn build_add_to_playlist_actions(
                         context.show_unsupported();
                         return;
                     };
-                    let Ok(plan) =
-                        prepare_playlist_add_plan(&context.source_registry, &candidates)
-                    else {
-                        context.show_unsupported();
-                        return;
-                    };
-
-                    let pid = pid.clone();
-                    let worker_pid = pid.clone();
-                    let registry = context.source_registry.clone();
-                    let (result_tx, result_rx) = async_channel::bounded(1);
-                    context.rt_handle.spawn(async move {
-                        let outcome = match crate::db::connection::init_db().await {
-                            Ok(db) => {
-                                let manager =
-                                    crate::local::playlist_manager::PlaylistManager::new(db);
-                                // Stage the complete ordered mutation first,
-                                // then acquire exact live authority at the
-                                // transaction's final commit boundary. The
-                                // manager retains it through commit; stale
-                                // acquisition rejects and rolls back every
-                                // staged insert.
-                                match manager
-                                    .add_entries_if_authorized(
-                                        &worker_pid,
-                                        &plan.inputs,
-                                        || {
-                                            registry.acquire_regular_playlist_commit_authority(
-                                                &plan.authority,
-                                            )
-                                        },
-                                    )
-                                    .await
-                                {
-                                    Ok(PlaylistEntryAddOutcome::Committed(_)) => {
-                                        PlaylistMutationOutcome::Committed
-                                    }
-                                    Ok(PlaylistEntryAddOutcome::Rejected) => {
-                                        PlaylistMutationOutcome::Rejected
-                                    }
-                                    Err(error) => {
-                                        tracing::error!(%error, playlist = %worker_pid, "Failed to add exact playlist occurrences");
-                                        PlaylistMutationOutcome::Failed
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                tracing::error!(%error, "Failed to open DB for playlist add");
-                                PlaylistMutationOutcome::Failed
-                            }
-                        };
-                        let _ = result_tx.send(outcome).await;
-                    });
-
-                    let context = context.clone();
-                    let playlist_id = pid.clone();
-                    let count = candidates.len();
-                    gtk::glib::MainContext::default().spawn_local(async move {
-                        match result_rx.recv().await {
-                            Ok(PlaylistMutationOutcome::Committed) => {
-                                tracing::info!(playlist = %playlist_id, count, "Tracks added to playlist");
-                                context.refresh_playlist_after_commit(&playlist_id);
-                            }
-                            Ok(PlaylistMutationOutcome::Rejected) => context.show_unsupported(),
-                            Ok(PlaylistMutationOutcome::Failed) | Err(_) => {
-                                context.show_mutation_failed();
-                            }
-                        }
-                    });
+                    context.add_candidates_to_playlist(
+                        pid.clone(),
+                        action_playlist_name.clone(),
+                        candidates,
+                    );
                 });
                 action_group.add_action(&add_action);
                 menu.append(
@@ -938,8 +1257,9 @@ fn active_source_is_automatic_device(
 /// invisible popover (no widget tree attached), which manifested as
 /// Track Properties / New Playlist / New Smart Playlist dialogs failing
 /// to open after the user clicked their menu entries. Hosting plain
-/// buttons in a generic `gtk::Popover` keeps the same one-shot popover
-/// lifecycle without relying on the broken binding.
+/// buttons in a bounded `gtk::ScrolledWindow` inside a generic `gtk::Popover`
+/// keeps the same one-shot lifecycle without relying on the broken binding or
+/// making later playlist actions unreachable on a short display.
 pub fn popover_from_menu_model(
     parent: &impl IsA<gtk::Widget>,
     menu: &gtk::gio::Menu,
@@ -999,7 +1319,15 @@ pub fn popover_from_menu_model(
         }
     }
 
-    popover.set_child(Some(&vbox));
+    let viewport = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_width(true)
+        .propagate_natural_height(true)
+        .max_content_height(CONTEXT_MENU_MAX_CONTENT_HEIGHT)
+        .child(&vbox)
+        .build();
+    popover.set_child(Some(&viewport));
     popover.connect_closed(|popover| popover.unparent());
     popover
 }
@@ -1291,6 +1619,108 @@ mod tests {
     }
 
     #[test]
+    fn playlist_add_success_selects_plural_form_and_escapes_playlist_markup() {
+        assert_eq!(
+            playlist_add_success_message("en", 1, "R&B <Mix>"),
+            "1 track added to R&amp;B &lt;Mix&gt;."
+        );
+        assert_eq!(
+            playlist_add_success_message("en", 2, "R&B <Mix>"),
+            "2 tracks added to R&amp;B &lt;Mix&gt;."
+        );
+
+        for locale in rust_i18n::available_locales!() {
+            let one = playlist_add_success_message(&locale, 1, "R&B <Mix>");
+            let other = playlist_add_success_message(&locale, 2, "R&B <Mix>");
+            let expected_one = rust_i18n::t!(
+                "context.playlist_add_success.one",
+                locale = locale,
+                count = 1,
+                playlist = "R&amp;B &lt;Mix&gt;"
+            );
+            // Count 2 is `other` in most catalogs but `few` in Polish and
+            // Russian; the catalog form must match whatever the selector picks.
+            let other_key = format!(
+                "context.playlist_add_success.{}",
+                plural_category(&locale, 2)
+            );
+            let expected_other = rust_i18n::t!(
+                other_key.as_str(),
+                locale = locale,
+                count = 2,
+                playlist = "R&amp;B &lt;Mix&gt;"
+            );
+
+            assert_eq!(one, expected_one, "{locale}: singular form");
+            assert_eq!(other, expected_other, "{locale}: plural form");
+            assert!(!one.contains("%{count}"), "{locale}: singular count");
+            assert!(!other.contains("%{count}"), "{locale}: plural count");
+            assert!(
+                one.contains("R&amp;B &lt;Mix&gt;"),
+                "{locale}: escaped name"
+            );
+            assert!(
+                other.contains("R&amp;B &lt;Mix&gt;"),
+                "{locale}: escaped name"
+            );
+        }
+    }
+
+    #[test]
+    fn playlist_add_success_uses_locale_plural_categories() {
+        assert_eq!(plural_category("pl", 1), "one");
+        assert_eq!(plural_category("pl", 2), "few");
+        assert_eq!(plural_category("pl", 5), "many");
+        assert_eq!(plural_category("pl", 12), "many");
+        assert_eq!(plural_category("pl", 22), "few");
+        assert_eq!(plural_category("ru", 1), "one");
+        assert_eq!(plural_category("ru", 21), "one");
+        assert_eq!(plural_category("ru", 11), "many");
+        assert_eq!(plural_category("ru", 3), "few");
+        assert_eq!(plural_category("ru", 5), "many");
+        assert_eq!(plural_category("en", 21), "other");
+        assert_eq!(plural_category("pt-BR", 1), "one");
+        assert_eq!(plural_category("zh-CN", 2), "other");
+
+        assert_eq!(
+            playlist_add_success_message("pl", 3, "Mix"),
+            "Dodano 3 utwory do Mix."
+        );
+        assert_eq!(
+            playlist_add_success_message("pl", 5, "Mix"),
+            "Dodano 5 utworów do Mix."
+        );
+        assert_eq!(
+            playlist_add_success_message("ru", 21, "Mix"),
+            "Добавлена 21 композиция в Mix."
+        );
+        assert_eq!(
+            playlist_add_success_message("ru", 3, "Mix"),
+            "Добавлено 3 композиции в Mix."
+        );
+        assert_eq!(
+            playlist_add_success_message("ru", 5, "Mix"),
+            "Добавлено 5 композиций в Mix."
+        );
+
+        // Every category the selector can pick must resolve in every catalog;
+        // a missing form would surface the raw key in the toast.
+        for locale in rust_i18n::available_locales!() {
+            for count in 1..=25 {
+                let message = playlist_add_success_message(&locale, count, "Mix");
+                assert!(
+                    !message.contains("playlist_add_success"),
+                    "{locale}: no catalog form for count {count}"
+                );
+                assert!(
+                    message.contains(&count.to_string()),
+                    "{locale}: count {count} missing"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn properties_path_conversion_is_local_and_fail_closed() {
         let path = std::env::temp_dir().join("tributary properties fixture.flac");
         let uri = url::Url::from_file_path(&path)
@@ -1426,9 +1856,10 @@ mod tests {
     ///
     /// This test exercises that contract end-to-end: with a populated
     /// menu and matching action group, the resulting popover MUST have a
-    /// child widget containing one button per enabled action. If a future
-    /// change drops the child assignment (e.g. by re-introducing
-    /// `gtk::PopoverMenu::from_model`), this test will fail.
+    /// bounded scrolling child containing one button per enabled action. If a
+    /// future change drops the child assignment or scrolling constraint (e.g.
+    /// by re-introducing `gtk::PopoverMenu::from_model` or attaching the menu
+    /// box directly), this test will fail.
     ///
     /// Headless CI (cargo test in the Fedora container with no X/Wayland socket)
     /// cannot initialize GTK, so the test gates on `gtk::init()`'s
@@ -1448,6 +1879,7 @@ mod tests {
             );
             return;
         }
+        assert_track_drags_start_only_from_the_data_row_area();
 
         let menu = gtk::gio::Menu::new();
         menu.append(Some("Open Properties"), Some("ctx.properties"));
@@ -1474,9 +1906,32 @@ mod tests {
         let child = popover
             .child()
             .expect("popover must have a non-null child after construction");
-        let vbox = child
-            .downcast::<gtk::Box>()
-            .expect("popover child must be the menu's Box");
+        let viewport = child
+            .downcast::<gtk::ScrolledWindow>()
+            .expect("popover child must be a scrolling viewport");
+        assert_eq!(viewport.hscrollbar_policy(), gtk::PolicyType::Never);
+        assert_eq!(viewport.vscrollbar_policy(), gtk::PolicyType::Automatic);
+        assert!(viewport.propagates_natural_width());
+        assert!(viewport.propagates_natural_height());
+        assert_eq!(
+            viewport.max_content_height(),
+            CONTEXT_MENU_MAX_CONTENT_HEIGHT
+        );
+        // The menu box is not `GtkScrollable`, so `ScrolledWindow::set_child`
+        // wraps it in an auto-added `GtkViewport`, and `child()` returns that
+        // viewport rather than the box. Look through the wrapper when present.
+        let vbox = viewport
+            .child()
+            .and_then(|child| match child.downcast::<gtk::Box>() {
+                Ok(vbox) => Some(vbox),
+                Err(child) => child
+                    .downcast::<gtk::Viewport>()
+                    .ok()?
+                    .child()?
+                    .downcast::<gtk::Box>()
+                    .ok(),
+            })
+            .expect("scrolling viewport must contain the menu's Box");
         assert_eq!(
             vbox.observe_children().n_items(),
             2,
@@ -1498,6 +1953,165 @@ mod tests {
             add_rx.try_recv(),
             Err(async_channel::TryRecvError::Empty),
             "non-clicked actions must not fire"
+        );
+    }
+
+    /// The per-row drop target attached by `attach_playlist_drop_target`
+    /// resolves the destination from `list_item.position()` and asks
+    /// `is_editable_regular_playlist()` of that exact row — not the row the
+    /// sidebar selection happens to point at. This test pins the data-layer
+    /// invariant that drives that decision: the only sidebar rows that the
+    /// drop handler accepts are local regular playlists, so the lookup never
+    /// silently routes a drop to a different row's playlist.
+    #[test]
+    fn per_row_drop_target_accepts_only_editable_regular_playlists() {
+        use crate::db::entities::server_playlist_link::{
+            ServerPlaylistLocalState, ServerPlaylistRemoteState,
+        };
+        use crate::local::playlist_sidebar::PlaylistSidebarEntry;
+        use crate::local::playlist_sidebar::PlaylistSidebarKind;
+        use crate::ui::objects::HeaderKind;
+
+        let regular = SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "regular-1",
+            "My Mix",
+            PlaylistSidebarKind::EditableRegular,
+        ));
+        let smart = SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "smart-1",
+            "Smart Mix",
+            PlaylistSidebarKind::EditableSmart,
+        ));
+        let pull_mirror = SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "mirror-1",
+            "Linked",
+            PlaylistSidebarKind::PullMirror {
+                local_state: ServerPlaylistLocalState::Clean,
+                remote_state: ServerPlaylistRemoteState::Present,
+            },
+        ));
+        let server = SourceObject::discovered("Mini", "subsonic", "http://mini.local:4533");
+        let header = SourceObject::header("Wiedergabelisten", HeaderKind::Playlists);
+
+        // Only an editable regular playlist may receive a drop. The other
+        // kinds model every non-regular sidebar row the per-row factory
+        // setup installs: smart playlists, pull mirrors, server sources,
+        // and headers. The `position_source` resolver and the
+        // `connect_drop`/`connect_accept` handlers both depend on this
+        // exact split, so a regression here would re-introduce the
+        // rejected behavior where dropping on a non-regular row falls
+        // through to whatever regular playlist the keyboard selection
+        // last visited.
+        assert!(regular.is_editable_regular_playlist());
+        assert!(!smart.is_editable_regular_playlist());
+        assert!(!pull_mirror.is_editable_regular_playlist());
+        assert!(!server.is_editable_regular_playlist());
+        assert!(!header.is_editable_regular_playlist());
+    }
+
+    /// Widget-constructing contract for the tracklist drag origin. Called from
+    /// [`popover_from_menu_model_attaches_a_visible_child_widget`] rather than
+    /// being its own `#[test]`: gtk-rs allows GTK to be initialized on exactly
+    /// one thread per process, and the test harness runs tests on a pool of
+    /// threads, so a second GTK-initializing test panics whenever it lands on
+    /// a different thread from the first.
+    #[cfg(not(target_os = "macos"))]
+    fn assert_track_drags_start_only_from_the_data_row_area() {
+        let store = gtk::gio::ListStore::new::<gtk::StringObject>();
+        store.append(&gtk::StringObject::new("a"));
+        let selection = gtk::MultiSelection::new(Some(store));
+        let factory = gtk::SignalListItemFactory::new();
+        let column_view = gtk::ColumnView::new(Some(selection));
+        column_view.append_column(&gtk::ColumnViewColumn::new(Some("Title"), Some(factory)));
+
+        // GTK parents the header row widget first and the internal list view
+        // last; the header owns column reordering and resizing.
+        let header = column_view.first_child().expect("header row widget");
+        let rows = column_view.last_child().expect("internal list view");
+        assert!(
+            !header.is::<gtk::ListView>(),
+            "first child must be the header"
+        );
+        assert!(
+            rows.is::<gtk::ListView>(),
+            "last child must be the list view"
+        );
+
+        assert!(drag_origin_is_data_row(&column_view, Some(rows.clone())));
+        assert!(!drag_origin_is_data_row(&column_view, Some(header)));
+        assert!(!drag_origin_is_data_row(
+            &column_view,
+            Some(column_view.clone().upcast())
+        ));
+        assert!(!drag_origin_is_data_row(&column_view, None));
+        // A widget outside the column view never qualifies.
+        assert!(!drag_origin_is_data_row(
+            &column_view,
+            Some(gtk::Label::new(None).upcast())
+        ));
+    }
+
+    #[test]
+    fn per_row_drop_target_leaves_reorder_drags_to_the_reorder_target() {
+        use gtk::gdk::{ContentFormatsBuilder, DragAction};
+
+        let track_drag = ContentFormatsBuilder::new()
+            .add_type(PlaylistDragPayload::static_type())
+            .build();
+        let reorder_drag = ContentFormatsBuilder::new()
+            .add_type(glib::Type::STRING)
+            .build();
+
+        assert!(playlist_drop_is_acceptable(
+            &track_drag,
+            DragAction::COPY,
+            true
+        ));
+        // The sidebar's playlist-reorder drag carries a string id under MOVE
+        // on the same row widget. A custom accept handler bypasses GTK's
+        // default format check, so this predicate must refuse it explicitly
+        // or the reorder target behind it never sees the drag.
+        assert!(!playlist_drop_is_acceptable(
+            &reorder_drag,
+            DragAction::MOVE,
+            true
+        ));
+        assert!(!playlist_drop_is_acceptable(
+            &reorder_drag,
+            DragAction::COPY,
+            true
+        ));
+        assert!(!playlist_drop_is_acceptable(
+            &track_drag,
+            DragAction::MOVE,
+            true
+        ));
+        assert!(!playlist_drop_is_acceptable(
+            &track_drag,
+            DragAction::COPY,
+            false
+        ));
+    }
+
+    #[test]
+    fn playlist_views_offer_add_destinations_alongside_removal() {
+        let source = include_str!("context_menu.rs");
+        let body = source
+            .split_once("fn append_context_menu_actions(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("append_context_menu_actions body");
+        let add_marker = ["build_add_to_", "playlist_actions("].concat();
+        let remove_marker = ["build_remove_from_", "playlist_action("].concat();
+
+        assert_eq!(body.matches(&add_marker).count(), 1);
+        assert_eq!(body.matches(&remove_marker).count(), 1);
+        // Removal stays gated on the playlist view, but the add destinations
+        // are the keyboard equivalent of the tracklist drag source, which is
+        // installed on every view, so they must not sit in an `else` branch.
+        assert!(
+            !body.contains("} else {"),
+            "add-to-playlist actions must be offered in every tracklist view"
         );
     }
 }

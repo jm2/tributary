@@ -193,6 +193,10 @@ context:
   remove_from_playlist: "재생목록에서 제거"
   playlist_add_unsupported_heading: "트랙이 추가되지 않았습니다"
   playlist_add_unsupported_body: "선택한 트랙 중 하나 이상을 사용할 수 없거나 일반 재생목록에서 지원하지 않습니다. 아무것도 추가되지 않았습니다."
+  playlist_drag_description: "선택한 트랙을 일반 재생목록으로 드래그하세요. Escape로 취소하고 Shift+F10으로 키보드 조작을 사용합니다."
+  playlist_add_success:
+    one: "%{playlist}에 %{count}개 트랙을 추가했습니다."
+    other: "%{playlist}에 %{count}개 트랙을 추가했습니다."
 
 # ── 일반 재생목록 ───────────────────────────────────────────────
 regular_playlist:
