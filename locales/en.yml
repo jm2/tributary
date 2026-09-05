@@ -49,6 +49,13 @@ browser:
   album: "Album"
   folder: "Folder"
   all: "All"
+  # Album-pane artwork toggle labels. The browser key set ships in
+  # every locale at the `browser:` level; artwork controls live under
+  # preferences to match the existing grouping-toggle placement.
+  album_artwork: "Album pane artwork"
+  album_artwork_size_small: "Small"
+  album_artwork_size_medium: "Medium"
+  album_artwork_size_large: "Large"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:
