@@ -561,23 +561,23 @@ compare ratings (**is**, **is not**, **greater than**, **less than**, **in range
 
 Tributary supports regular and smart playlists:
 
-- **Regular playlists** — Right-click the Playlists header in the sidebar to create one. Add tracks
-  by right-clicking a selection, or by dragging it onto the playlist in the sidebar. Playlists can
-  mix local tracks with tracks from connected Subsonic, Jellyfin, Plex, and DAAP servers; remote
-  entries are stored by identity only, never by URL or credential. When a server is disconnected
-  its entries stay in place as unavailable rows that you can keep or remove. Radio stations,
-  removable media, and files opened from the OS cannot be added.
-- **Smart playlists** — iTunes-style rules engine with filterable metadata fields,
-  text/numeric/date operators, sorting, and result limiting. Smart playlists query the local
-  library and are evaluated whenever they are opened or exported. Create them via the sidebar
-  context menu.
-- **Server playlists** — **Server Playlists…** on the Playlists header browses the playlists on a
-  connected Subsonic server. **Import Copy** creates an ordinary editable playlist; **Keep
-  Synced** creates a read-only mirror that refreshes when the server reconnects or when you choose
-  **Sync Now**; Tributary never polls the server in the background. Selecting a mirror shows its
-  status and the recovery actions that apply: **Sync Now**, **Retry**, **Replace Local with
-  Server**, **Unlink**, and **Remove Local Copy**. Tributary never modifies playlists on the
-  server. See the [Subsonic pull-sync contract](docs/subsonic-playlist-sync.md).
+- **Regular playlists** — Right-click the Playlists header in the sidebar to create one. Add
+  tracks by right-clicking a selection, or by dragging it onto the playlist in the sidebar.
+  Playlists can mix local tracks with tracks from connected Subsonic, Jellyfin, Plex, and DAAP
+  servers; a remote entry stores the track's identity and a non-authoritative metadata
+  fingerprint, never a URL or credential. When a server is disconnected its entries stay in place
+  as unavailable rows that you can keep or remove. Radio stations, removable media, and files
+  opened from the OS cannot be added. - **Smart playlists** — iTunes-style rules engine with
+  filterable metadata fields, text/numeric/date operators, sorting, and result limiting. Smart
+  playlists query the local library and are evaluated whenever they are opened or exported. Create
+  them via the sidebar context menu. - **Server playlists** — **Server Playlists…** on the
+  Playlists header browses the playlists on a connected Subsonic server. **Import Copy** creates
+  an ordinary editable playlist; **Keep Synced** creates a read-only mirror that refreshes when
+  the server reconnects or when you choose **Sync Now**; Tributary never polls the server in the
+  background. Selecting a mirror shows its status and the recovery actions that apply: **Sync
+  Now**, **Retry**, **Replace Local with Server**, **Unlink**, and **Remove Local Copy**.
+  Tributary never modifies playlists on the server. See the [Subsonic pull-sync
+  contract](docs/subsonic-playlist-sync.md).
 
 #### Importing and exporting playlists
 
@@ -612,10 +612,11 @@ last-played timestamps and overwriting an existing Tributary rating are explicit
 optional root remap handles a library that has moved.
 
 Tracks are matched by exact file path only — never by title or a similar filename — and the
-preview lists anything that cannot be represented. Static playlists keep their order and
-duplicates; automatic playlists are imported only when their rules can be reproduced exactly. The
-import is one atomic transaction, and repeating it with an unchanged profile and the same
-choices is a no-op. See the [Rhythmbox migration contract](docs/rhythmbox-migration.md).
+preview reports whatever cannot be represented, listing up to 100 details per category with a
+count of the rest. Static playlists keep their order and duplicates; automatic playlists are
+imported only when their rules can be reproduced exactly. The import is one atomic transaction,
+and repeating it with an unchanged profile and the same choices is a no-op. See the [Rhythmbox
+migration contract](docs/rhythmbox-migration.md).
 
 ### Audio Outputs
 
