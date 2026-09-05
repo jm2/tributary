@@ -1,15 +1,18 @@
 /* Tributary — Custom CSS overrides for the GTK4/libadwaita theme */
 
-/* Dense row spacing for the tracklist column view */
+/* Tracklist column view — let Adwaita drive row padding so the list
+ * keeps the standard dense-list rhythm rather than collapsing onto
+ * the row separators. (HIG: dense data lists should not look like a
+ * grid; Adwaita already encodes the right vertical rhythm.) */
 .data-table .cell {
-    padding-top: 1px;
-    padding-bottom: 1px;
+    min-height: 24px;
 }
 
 /* Status bar at bottom of tracklist */
 .statusbar-box {
     background-color: alpha(@window_bg_color, 0.95);
     border-top: 1px solid alpha(@borders, 0.3);
+    padding: 4px 12px;
 }
 
 /* Sidebar header labels */
@@ -41,9 +44,14 @@
     min-height: 4px;
 }
 
-/* Subtle separator between browser panes */
+/* Subtle separator between browser panes (HIG: rely on background
+ * contrast rather than a hard rule; tone the line down so it reads
+ * as a gutter, not a divider). Standard CSS only: the opaque theme
+ * border color scaled down by element opacity — the web-CSS-safe
+ * equivalent of GTK's alpha(@borders, 0.15). */
 .browser-separator {
-    background-color: alpha(@borders, 0.3);
+    background-color: @borders;
+    opacity: 0.15;
     min-width: 1px;
 }
 
@@ -56,6 +64,15 @@
 /* Search entry in the browser filter bar */
 searchentry {
     border-radius: 6px;
+}
+
+/* Numeric secondary text in browser rows — keep the dim-label opacity
+ * but lift the minimum contrast a touch so the count remains legible
+ * at small caption size. Scoped to the dedicated `.browser-count` class
+ * so the rule does not also re-style the header-bar scrubber time
+ * labels (which share the same `dim-label caption numeric` triplet). */
+.browser-count {
+    opacity: 0.75;
 }
 
 
