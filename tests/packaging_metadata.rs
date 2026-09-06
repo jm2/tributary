@@ -1389,7 +1389,7 @@ fn dependabot_automerge_workflow() -> serde_yaml::Value {
 
 // The full policy check-context set the live main ruleset must require, each
 // entry as "check context|app id" (empty app id = unbound commit status).
-fn required_policy_check_contexts() -> [&'static str; 16] {
+const fn required_policy_check_contexts() -> [&'static str; 16] {
     [
         "Security Audit|15368",
         "Linux (x86_64)|15368",
