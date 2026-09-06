@@ -205,3 +205,150 @@ fn remove_relative_file_only_accepts_regular_files() {
         .expect_err("directory must be rejected");
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 }
+
+// ── Overwrite backup/restore and no-replace publish ─────────────────────
+
+#[test]
+fn overwrite_commit_saves_original_and_restore_puts_it_back() {
+    let root = tempfile::tempdir().expect("temporary root");
+    std::fs::write(root.path().join("song.flac"), b"original bytes")
+        .expect("write original");
+    let authority = authority(&root);
+
+    let mut staged = authority
+        .prepare_write_with_resolution(Path::new("song.flac"), ConflictResolution::Overwrite)
+        .expect("prepare overwrite with planned resolution");
+    staged.write_all(b"published bytes").expect("write staged");
+    let outcome = staged.commit().expect("commit overwrite");
+
+    // The commit replaced the destination and saved the original aside.
+    assert_eq!(outcome.resolution, ConflictResolution::Overwrite);
+    assert_eq!(
+        std::fs::read(root.path().join("song.flac")).expect("read published"),
+        b"published bytes"
+    );
+    let backup = outcome.backup_relative_path.expect("overwrite must save the original");
+    assert_eq!(
+        std::fs::read(root.path().join(&backup)).expect("read backup"),
+        b"original bytes",
+        "the saved original must hold the pre-overwrite content"
+    );
+
+    // Rollback restores the original over the published file.
+    authority
+        .restore_overwritten_file(Path::new("song.flac"), &backup)
+        .expect("restore overwritten original");
+    assert_eq!(
+        std::fs::read(root.path().join("song.flac")).expect("read restored"),
+        b"original bytes"
+    );
+    assert!(!root.path().join(&backup).exists(), "restore consumes the backup");
+}
+
+#[test]
+fn overwrite_without_existing_destination_has_no_backup() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let authority = authority(&root);
+
+    let mut staged = authority
+        .prepare_write_with_resolution(Path::new("song.flac"), ConflictResolution::Overwrite)
+        .expect("prepare overwrite on absent destination");
+    staged.write_all(b"fresh").expect("write staged");
+    let outcome = staged.commit().expect("commit overwrite");
+    assert_eq!(outcome.backup_relative_path, None);
+    assert_eq!(
+        std::fs::read(root.path().join("song.flac")).expect("read final"),
+        b"fresh"
+    );
+}
+
+#[test]
+fn fresh_resolution_refuses_post_plan_destination() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let authority = authority(&root);
+
+    let mut staged = authority
+        .prepare_write_with_resolution(Path::new("song.flac"), ConflictResolution::Fresh)
+        .expect("prepare fresh");
+    staged.write_all(b"planned").expect("write staged");
+    // The destination appears after the resolution was made.
+    std::fs::write(root.path().join("song.flac"), b"racer").expect("write racer");
+
+    let error = staged
+        .commit()
+        .expect_err("no-replace publish must refuse an existing destination");
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        std::fs::read(root.path().join("song.flac")).expect("read racer"),
+        b"racer",
+        "the fresh publish must never replace the destination"
+    );
+    let names: Vec<String> = std::fs::read_dir(root.path())
+        .expect("read dir")
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["song.flac".to_string()],
+        "the refused staged file must be discarded"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_destination_is_never_replaced_through() {
+    let root = tempfile::tempdir().expect("temporary root");
+    std::os::unix::fs::symlink("missing-target.flac", root.path().join("song.flac"))
+        .expect("create dangling symlink");
+    let authority = authority(&root);
+
+    let mut staged = authority
+        .prepare_write_with_resolution(Path::new("song.flac"), ConflictResolution::Fresh)
+        .expect("prepare fresh");
+    staged.write_all(b"payload").expect("write staged");
+    let error = staged
+        .commit()
+        .expect_err("no-replace publish must refuse the symlink entry");
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    let metadata = std::fs::symlink_metadata(root.path().join("song.flac"))
+        .expect("destination still present");
+    assert!(
+        metadata.file_type().is_symlink(),
+        "the symlink must be left exactly as found, not replaced through"
+    );
+}
+
+#[test]
+fn overwrite_onto_directory_destination_is_refused() {
+    let root = tempfile::tempdir().expect("temporary root");
+    std::fs::create_dir(root.path().join("album")).expect("create directory destination");
+    let authority = authority(&root);
+
+    let mut staged = authority
+        .prepare_write_with_resolution(Path::new("album"), ConflictResolution::Overwrite)
+        .expect("prepare overwrite onto directory");
+    staged.write_all(b"payload").expect("write staged");
+    let error = staged
+        .commit()
+        .expect_err("a directory destination must not be overwritten by a file");
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    assert!(
+        root.path().join("album").is_dir(),
+        "the directory must survive the refused overwrite"
+    );
+}
+
+#[test]
+fn restore_requires_sibling_backup() {
+    let root = tempfile::tempdir().expect("temporary root");
+    std::fs::create_dir_all(root.path().join("a")).expect("create a");
+    std::fs::create_dir_all(root.path().join("other")).expect("create other");
+    std::fs::write(root.path().join("other/backup.tmp"), b"backup").expect("write backup");
+    let authority = authority(&root);
+
+    let error = authority
+        .restore_overwritten_file(Path::new("a/song.flac"), Path::new("other/backup.tmp"))
+        .expect_err("a non-sibling backup must be rejected");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+}

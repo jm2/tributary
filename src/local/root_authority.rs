@@ -286,6 +286,15 @@ impl BoundFile {
 }
 
 impl BoundDirectory {
+    /// Clone the already-authorized directory handle for
+    /// descriptor-relative publish operations. The retained identity is
+    /// revalidated before the clone so a replaced directory is refused
+    /// rather than handed out.
+    pub(crate) fn try_clone_dir_handle(&self) -> io::Result<File> {
+        self.object.validate_live()?;
+        self.object.file.try_clone()
+    }
+
     /// Verify that the exact path still names this retained directory.
     pub(super) fn validate(&self, lease: &RootAuthorityLease) -> io::Result<()> {
         lease.validate_bound_token(self.lease_token)?;
@@ -526,6 +535,22 @@ impl MountedRootAuthority {
     /// boundary, ancestor chain, and platform mount generation.
     pub(crate) fn validate(&self) -> io::Result<()> {
         validate_root_binding(self)
+    }
+
+    /// Open a directory beneath the retained mounted root (or the root
+    /// itself for an empty relative path) and return a cloned plain handle
+    /// bound through the retained-root machinery. Publish operations use
+    /// this descriptor so the final rename is anchored to the validated
+    /// directory object rather than to a re-walked absolute path, closing
+    /// the validate-then-path-rename window on platforms with descriptor
+    /// relative renames.
+    pub(crate) fn cloned_relative_directory_handle(&self, relative: &Path) -> io::Result<File> {
+        let bound = if relative.as_os_str().is_empty() {
+            self.bind_root_directory()?
+        } else {
+            self.open_relative_directory(relative)?
+        };
+        bound.try_clone_dir_handle()
     }
 }
 

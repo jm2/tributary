@@ -465,6 +465,14 @@ impl CancellationObserver {
         Self { receiver }
     }
 
+    /// Construct an observer bound to an existing shared cancellation
+    /// channel. Callers holding the matching `watch::Sender<bool>` can flip
+    /// every observer derived from it, which is how transfer callers cancel
+    /// an in-flight copy.
+    pub fn from_receiver(receiver: watch::Receiver<bool>) -> Self {
+        Self { receiver }
+    }
+
     pub fn is_cancelled(&self) -> bool {
         *self.receiver.borrow()
     }

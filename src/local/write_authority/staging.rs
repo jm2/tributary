@@ -1,13 +1,16 @@
 //! Staging primitives: strict relative-path handling, unique staged leaf
-//! names, preserved-sibling disambiguation, and the platform-specific
-//! exclusive staged-file creation plus atomic publish/rollback.
+//! names, preserved-sibling disambiguation, bound-parent publishes, and the
+//! platform-specific exclusive staged-file creation plus atomic
+//! no-replace/replace renames.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
+
+use crate::local::root_authority::MountedRootAuthority;
 
 /// Decompose a relative write target into strict normal components.
 pub(super) fn strict_relative_components(relative: &Path) -> io::Result<Vec<OsString>> {
@@ -63,6 +66,87 @@ pub(super) fn staging_leaf_name() -> OsString {
     name.push(token.to_string());
     name.push(".tmp");
     name
+}
+
+/// A unique hidden leaf name for a saved original moved aside by the
+/// Overwrite policy so rollback can restore it.
+pub(super) fn backup_leaf_name() -> OsString {
+    let token = Uuid::new_v4();
+    let mut name = OsString::from(".tributary-backup-");
+    name.push(token.to_string());
+    name.push(".tmp");
+    name
+}
+
+/// A validated parent-directory binding used to anchor publish renames.
+///
+/// On Unix it carries a cloned directory descriptor obtained through the
+/// retained-root machinery, so renames are descriptor-relative and a swap of
+/// the directory between validation and publish cannot redirect them. On
+/// Windows it carries the validated absolute directory; `MoveFileExW`
+/// provides the atomic publish and the retained authority is revalidated
+/// around the call.
+pub(super) struct BoundParent {
+    #[cfg(unix)]
+    pub(super) dir: File,
+    #[cfg(windows)]
+    pub(super) absolute_dir: PathBuf,
+}
+
+/// Rename `old_leaf` to `new_leaf` inside the bound parent.
+///
+/// With `no_replace` set, an existing destination makes the rename fail with
+/// `AlreadyExists` instead of replacing it; this is the atomic publish for
+/// Fresh and Preserved resolutions. Without it, an existing destination is
+/// replaced, which is what the Overwrite backup move and restore need.
+pub(super) fn rename_bounded(
+    parent: &BoundParent,
+    old_leaf: &OsStr,
+    new_leaf: &OsStr,
+    no_replace: bool,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let old = Path::new(old_leaf);
+        let new = Path::new(new_leaf);
+        if no_replace {
+            let flags = rustix::fs::RenameFlags::NOREPLACE;
+            rustix::fs::renameat_with(&parent.dir, old, &parent.dir, new, flags)
+        } else {
+            rustix::fs::renameat(&parent.dir, old, &parent.dir, new)
+        }
+        .map_err(io::Error::from)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+
+        let from_wide: Vec<u16> = parent
+            .absolute_dir
+            .join(old_leaf)
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let to_wide: Vec<u16> = parent
+            .absolute_dir
+            .join(new_leaf)
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let flags = if no_replace { 0 } else { MOVEFILE_REPLACE_EXISTING };
+        // SAFETY: both pointers are null-terminated wide strings owned for
+        // the duration of the call; MoveFileExW does not retain them.
+        let ok = unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), flags) };
+        if ok == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Choose a non-colliding `stem (n).ext` sibling for the Preserve policy.
@@ -219,10 +303,24 @@ pub(super) fn rollback_staged(staged_path: &Path) -> io::Result<()> {
     }
 }
 
-/// Publish a staged file atomically. POSIX rename is atomic on the same
-/// filesystem. Windows std::fs::rename uses MoveFileExW with
-/// MOVEFILE_REPLACE_EXISTING semantics, which is likewise atomic on the same
-/// volume.
-pub(super) fn publish_atomic(staged_path: &Path, final_path: &Path) -> io::Result<()> {
-    std::fs::rename(staged_path, final_path)
+/// Bind the parent directory of a staged publish through the retained-root
+/// machinery. Unix callers receive a cloned, validated directory descriptor
+/// for descriptor-relative renames; Windows callers receive the validated
+/// absolute directory used by `MoveFileExW`.
+pub(super) fn bind_publish_parent(
+    mounted: &MountedRootAuthority,
+    parent_relative: &Path,
+) -> io::Result<BoundParent> {
+    #[cfg(unix)]
+    {
+        let dir = mounted.cloned_relative_directory_handle(parent_relative)?;
+        Ok(BoundParent { dir })
+    }
+    #[cfg(windows)]
+    {
+        mounted.validate()?;
+        Ok(BoundParent {
+            absolute_dir: mounted.root().join(parent_relative),
+        })
+    }
 }

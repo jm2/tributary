@@ -58,7 +58,10 @@ pub enum Stage {
         /// destination filesystem; false when the planner fell back to a
         /// non-atomic path (cross-filesystem, or source authority absent).
         atomic: bool,
-        /// How the conflict policy was resolved before staging.
+        /// How the conflict policy was resolved at plan time. The executor
+        /// consumes this decision verbatim through
+        /// [`MountedWriteAuthority::prepare_write_with_resolution`] and
+        /// never re-decides a conflict against the live filesystem.
         conflict: ConflictResolution,
     },
     /// Remove a previously published destination file. Used for rollback.
@@ -267,6 +270,13 @@ pub trait TransferProgress: Send {
         _total_bytes: u64,
     ) {
     }
+    /// Called when a stage planned as a fresh or preserved write hits a
+    /// destination that appeared after planning: the atomic no-replace
+    /// publish refused to replace it, the staged bytes were discarded, and
+    /// the transfer continues without it. Distinct from a planned
+    /// `ConflictPolicy::Skip`, which the planner already removed from the
+    /// plan before execution.
+    fn on_stage_post_plan_skipped(&mut self, _stage: &Stage, _index: u32, _total: u32) {}
 }
 
 /// No-op progress sink used when the caller does not supply one.
@@ -277,6 +287,11 @@ impl TransferProgress for () {}
 pub struct TransferSummary {
     /// Number of stages that were fully committed.
     pub committed_stages: u32,
+    /// Number of copy stages that were skipped at execution time because the
+    /// destination appeared after planning and the atomic no-replace publish
+    /// refused to replace it. Reported distinctly from a planned
+    /// `ConflictPolicy::Skip`, which never produces a stage.
+    pub post_plan_skipped_stages: u32,
     /// Total bytes successfully copied to the destination.
     pub bytes_copied: u64,
     /// Set to `true` when the executor completed every stage in the plan.

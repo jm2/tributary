@@ -33,12 +33,20 @@ pub enum ConflictResolution {
     Preserved,
 }
 
-/// Detail of what `commit` actually published, for callers that need to log
-/// or report the publish outcome.
+/// Detail of what `commit` actually published, for callers that need to log,
+/// report, roll back, or clean up the publish outcome.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitOutcome {
     /// The relative path beneath the retained mount that now names the data.
+    /// This is the actual published path: for a `Preserved` resolution it is
+    /// the disambiguated sibling, not the originally requested destination.
     pub relative_path: PathBuf,
     /// How the conflict policy was resolved against the live filesystem.
     pub resolution: ConflictResolution,
+    /// Relative path of the saved original moved aside before an `Overwrite`
+    /// publish, when a pre-existing destination was present. The caller owns
+    /// it from commit onward: restore it on rollback, delete it once the
+    /// whole transfer succeeds. `None` for fresh and preserved writes and for
+    /// an overwrite whose destination vanished before commit.
+    pub backup_relative_path: Option<PathBuf>,
 }
