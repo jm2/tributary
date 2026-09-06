@@ -227,7 +227,7 @@ impl RetainedObject {
 
 impl BoundFile {
     /// Clone the already-authorized file handle for handle-based parsing.
-    pub(super) fn try_clone_file(&self) -> io::Result<File> {
+    pub(crate) fn try_clone_file(&self) -> io::Result<File> {
         self.object.validate_live()?;
         self.object.file.try_clone()
     }
@@ -463,6 +463,63 @@ impl MountedRootAuthority {
             object,
             parent_guards,
         })
+    }
+
+    /// Open a real directory using only normal components relative to the
+    /// retained mounted root. Used by the write authority to bind a parent
+    /// directory before staging a temporary file in it.
+    pub(super) fn open_relative_directory(&self, relative: &Path) -> io::Result<BoundDirectory> {
+        let components = strict_relative_components(relative)?;
+        self.validate()?;
+        let path = join_components(&self.root, &components);
+        let opened =
+            open_descendant_from_root(self, &path, &components, DescendantKind::Directory)?;
+        self.validate()?;
+        Ok(BoundDirectory {
+            lease_token: self.token,
+            path,
+            object: opened.object,
+            parent_guards: opened.parent_guards,
+        })
+    }
+
+    /// Bind the exact retained root itself as a directory. Used by the write
+    /// authority when a staged file is published directly beneath the root.
+    pub(super) fn bind_root_directory(&self) -> io::Result<BoundDirectory> {
+        self.validate()?;
+        let file = self.root_handle.file.try_clone()?;
+        ensure_boundary(self.boundary, &file)?;
+        Ok(BoundDirectory {
+            lease_token: self.token,
+            path: self.root.clone(),
+            object: RetainedObject::new(file)?,
+            parent_guards: Vec::new(),
+        })
+    }
+
+    /// Return the unique token identifying this exact authority instance.
+    /// Other modules use this to reject evidence held by a different root.
+    pub(super) fn token(&self) -> Uuid {
+        self.token
+    }
+
+    /// Open a regular file beneath the root and run `body` with a cloned
+    /// handle. The handle is revalidated before the call so a remount between
+    /// the call site and `body` produces a fail-closed error rather than
+    /// surfacing a stale file descriptor.
+    ///
+    /// The closure receives a `File` cloned from the retained handle; the
+    /// caller is responsible for any I/O and error propagation through its
+    /// own `Result` type. The bound is dropped when the closure returns, so
+    /// the caller must clone the handle again if it needs to outlive the
+    /// closure. The retained root and parent-chain handles are not exposed.
+    pub(crate) fn with_relative_file<F, T>(&self, relative: &Path, body: F) -> io::Result<T>
+    where
+        F: FnOnce(File) -> io::Result<T>,
+    {
+        let bound = self.open_relative_regular_file(relative)?;
+        let file = bound.try_clone_file()?;
+        body(file)
     }
 
     /// Reopen the mount path and verify the exact retained root, filesystem
