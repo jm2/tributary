@@ -10951,7 +10951,9 @@ mod tests {
                     Ok(LibraryEvent::ScanComplete) => completed_scans += 1,
                     Ok(LibraryEvent::ScanProgress(..)) if completed_scans >= 1 => break,
                     Ok(_) => {}
-                    Err(_) => panic!("library events ended before the authority scan ran"),
+                    Err(err) => {
+                        panic!("library events ended before the authority scan ran: {err}")
+                    }
                 }
             }
             // The track appears and its watcher evidence queues while the
