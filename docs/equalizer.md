@@ -368,14 +368,33 @@ The fifteen keys, in six logical groups:
 `equalizer.cfg` lives in the existing `dirs::data_dir()/tributary/` directory beside
 `volume`. The file is owned by the equalizer module; no other module reads or writes it.
 
-The writer uses an *atomic replace* protocol: it constructs the new content in memory, opens
-`equalizer.cfg.tmp` next to the destination (mode `0600`, owned by the user), writes the entire
-file in a single `write()`/`pwrite()` (the size is bounded by the schema — at most a few hundred
-bytes even at the maximum band precision), `fsync`s the file descriptor, then `close()`s it,
-then `rename(2)`s the temp file to `equalizer.cfg`, then `fsync`s the directory. After the
-directory `fsync` returns, the new file is durable; an on-disk reader observes either the prior
-file or the new file, never a partial one. The temp file is opened with `O_EXCL` so that a
-concurrent writer cannot race the rename.
+The writer uses an *atomic replace* protocol: it constructs the new content in memory, creates a
+uniquely named temporary file in the destination's directory (mode `0600`, owned by the user),
+writes the entire file in a single `write()`/`pwrite()` (the size is bounded by the schema — at
+most a few hundred bytes even at the maximum band precision), `fsync`s the file descriptor, then
+`close()`s it, then `rename(2)`s the temp file to `equalizer.cfg`, then `fsync`s the directory.
+After the directory `fsync` returns, the new file is durable; an on-disk reader observes either
+the prior file or the new file, never a partial one.
+
+The temp name is minted fresh for every write attempt — a random segment (for example a UUID, as
+in the existing XSPF-export writer) beside the destination — and created exclusively (`O_EXCL`,
+as `tempfile::NamedTempFile` provides). A fixed sibling name such as `equalizer.cfg.tmp` is
+explicitly rejected: exclusive creation with a fixed name does not serialize writers, it makes
+the second writer's create fail with `AlreadyExists`, and a crash between create and rename
+would wedge every later save behind a stale temp the next writer must not delete. With a unique
+name, every writer owns a private staging path, so interleaved or crash-interrupted writes can
+never corrupt each other's temp file; `rename(2)` itself is atomic with respect to the
+destination and publishes that writer's complete content or nothing. Within the application the
+equalizer module is the sole writer — the debounced save and the shutdown flush both run on the
+GTK main loop — so completed renames are ordered and last-writer-wins by construction.
+
+Recovery edges are specified, not incidental: if exclusive creation reports `AlreadyExists`
+(name collision, vanishingly unlikely with a random segment), the writer mints a new unique
+name and retries rather than deleting the existing file. If any step fails before the rename,
+the writer removes only the temp file it created for that attempt and leaves the destination
+untouched. A temp file orphaned by a crash between creation and rename is inert garbage:
+readers only ever open `equalizer.cfg` itself, and no code path deletes a temp whose name it
+did not mint, so no recovery sweep is required or permitted.
 
 Persistence uses a debounced single-writer pattern: a 750 ms idle interval coalesces slider-drag
 changes into one write per change-spell, and the save runs on the GTK main loop. Every
@@ -390,8 +409,8 @@ trailing edge of the gesture.
 In addition to the debounce, the equalizer module installs a *shutdown flush* hook: on
 `gtk::main_quit` (and on `SIGTERM`/`SIGINT` via the application's main-loop signal hook), the
 module synchronously performs an atomic-replace write of the current state to disk before the
-GTK main loop exits. The shutdown flush is its own write-temp-and-rename cycle; it does not
-wait for the debounce timer and runs even if the timer is armed. This guarantees that no
+GTK main loop exits. The shutdown flush is its own uniquely named write-temp-and-rename cycle; it
+does not wait for the debounce timer and runs even if the timer is armed. This guarantees that no
 partial write is observable on disk if the user quits while the debounce is pending.
 
 Fresh-install default state is exactly:
