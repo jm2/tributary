@@ -89,42 +89,87 @@ impl MtpBrowser {
     ) -> Result<Vec<MtpObject>, MtpTransportError> {
         session.verify()?;
 
-        let mut visited: BTreeSet<MtpObjectHandle> = BTreeSet::new();
-        let mut by_handle: BTreeMap<MtpObjectHandle, MtpObject> = BTreeMap::new();
-        let mut result: Vec<MtpObject> = Vec::new();
-        let mut pending: Vec<(MtpObjectHandle, u32)> = vec![(root, 0)];
-
-        while let Some((handle, depth)) = pending.pop() {
-            if !visited.insert(handle) {
+        let mut state = BrowseState::new(root);
+        while let Some((handle, depth)) = state.next_node() {
+            if !state.admit_node(handle) {
                 continue;
             }
-            if result.len() as u64 >= budget.max_entries() {
+            if state.budget_exhausted(&budget) {
                 break;
             }
             if depth > budget.max_depth() {
                 continue;
             }
             let children = list_children(session, handle)?;
-            let next_depth = depth.saturating_add(u32::from(budget.allows_recursion()));
-            for child in children {
-                // Enforce the entry cap inside the child loop: a single
-                // listing may exceed the remaining budget, and pushing
-                // every child unconditionally would breach `max_entries`.
-                if result.len() as u64 >= budget.max_entries() {
-                    break;
-                }
-                let kind = child.kind;
-                let child_handle = child.handle;
-                if by_handle.insert(child_handle, child.clone()).is_none() {
-                    result.push(child);
-                }
-                if matches!(kind, MtpObjectKind::Folder) && budget.allows_recursion() {
-                    pending.push((child_handle, next_depth));
-                }
-            }
+            state.admit_children(children, &budget, depth);
         }
 
-        Ok(result)
+        Ok(state.into_result())
+    }
+}
+
+/// Working state of one bounded browse walk.
+struct BrowseState {
+    visited: BTreeSet<MtpObjectHandle>,
+    by_handle: BTreeMap<MtpObjectHandle, MtpObject>,
+    result: Vec<MtpObject>,
+    pending: Vec<(MtpObjectHandle, u32)>,
+}
+
+impl BrowseState {
+    fn new(root: MtpObjectHandle) -> Self {
+        Self {
+            visited: BTreeSet::new(),
+            by_handle: BTreeMap::new(),
+            result: Vec::new(),
+            pending: vec![(root, 0)],
+        }
+    }
+
+    fn next_node(&mut self) -> Option<(MtpObjectHandle, u32)> {
+        self.pending.pop()
+    }
+
+    /// Record a node as visited; `false` means it was already seen.
+    fn admit_node(&mut self, handle: MtpObjectHandle) -> bool {
+        self.visited.insert(handle)
+    }
+
+    /// True when the walk has filled the entry budget.
+    fn budget_exhausted(&self, budget: &BrowseBudget) -> bool {
+        self.result.len() as u64 >= budget.max_entries()
+    }
+
+    /// Admit one listing's children under the entry cap, queueing
+    /// folders for descent.
+    ///
+    /// The cap is enforced inside the child loop: a single listing may
+    /// exceed the remaining budget, and pushing every child
+    /// unconditionally would breach `max_entries`.
+    fn admit_children(
+        &mut self,
+        children: Vec<MtpObject>,
+        budget: &BrowseBudget,
+        depth: u32,
+    ) {
+        let next_depth = depth.saturating_add(u32::from(budget.allows_recursion()));
+        for child in children {
+            if self.budget_exhausted(budget) {
+                break;
+            }
+            let kind = child.kind;
+            let child_handle = child.handle;
+            if self.by_handle.insert(child_handle, child.clone()).is_none() {
+                self.result.push(child);
+            }
+            if matches!(kind, MtpObjectKind::Folder) && budget.allows_recursion() {
+                self.pending.push((child_handle, next_depth));
+            }
+        }
+    }
+
+    fn into_result(self) -> Vec<MtpObject> {
+        self.result
     }
 }
 
@@ -240,7 +285,7 @@ mod tests {
             .expect("session");
         let browser = MtpBrowser::new();
         let objects = {
-            let mut list_children = build_list_children(&transport, root);
+            let mut list_children = build_list_children(&transport);
             browser.browse(&session, root, BrowseBudget::new(64, 4), &mut list_children)
         }
         .expect("browse");
@@ -253,20 +298,27 @@ mod tests {
 
     fn build_list_children(
         transport: &InMemoryMtpTransport,
-        root: MtpObjectHandle,
     ) -> impl FnMut(&MtpSession, MtpObjectHandle) -> Result<Vec<MtpObject>, MtpTransportError> + '_
     {
+        // (handle, parent handle, name). Folders fetch as empty bytes,
+        // files as non-empty, mirroring the in-memory transport.
+        const ENTRIES: &[(u32, u32, &str)] = &[
+            (0x0000_0010, 0x0000_0001, "Music"),
+            (0x0000_0011, 0x0000_0001, "Photos"),
+            (0x0000_0012, 0x0000_0010, "Tracks"),
+            (0x0000_0020, 0x0000_0010, "song.flac"),
+            (0x0000_0021, 0x0000_0012, "deep.flac"),
+            (0x0000_0022, 0x0000_0011, "img.jpg"),
+        ];
         move |session: &MtpSession, parent: MtpObjectHandle| {
             let _ = transport.list_storage(session).expect("storage");
             let mut children = Vec::new();
-            for handle in [
-                MtpObjectHandle(0x0000_0010),
-                MtpObjectHandle(0x0000_0011),
-                MtpObjectHandle(0x0000_0012),
-                MtpObjectHandle(0x0000_0020),
-                MtpObjectHandle(0x0000_0021),
-                MtpObjectHandle(0x0000_0022),
-            ] {
+            for &(raw_handle, raw_parent, name) in ENTRIES {
+                let handle = MtpObjectHandle(raw_handle);
+                let parent_of = MtpObjectHandle(raw_parent);
+                if parent_of != parent {
+                    continue;
+                }
                 let bytes = match transport.fetch_object(session, handle) {
                     Ok(bytes) => bytes.bytes,
                     Err(_) => continue,
@@ -276,32 +328,13 @@ mod tests {
                 } else {
                     MtpObjectKind::RegularFile
                 };
-                let name = match handle.0 {
-                    0x0000_0010 => "Music",
-                    0x0000_0011 => "Photos",
-                    0x0000_0012 => "Tracks",
-                    0x0000_0020 => "song.flac",
-                    0x0000_0021 => "deep.flac",
-                    0x0000_0022 => "img.jpg",
-                    _ => "unknown",
-                };
-                let parent_of = match handle.0 {
-                    0x0000_0010 | 0x0000_0011 => Some(root),
-                    0x0000_0012 => Some(MtpObjectHandle(0x0000_0010)),
-                    0x0000_0020 => Some(MtpObjectHandle(0x0000_0010)),
-                    0x0000_0021 => Some(MtpObjectHandle(0x0000_0012)),
-                    0x0000_0022 => Some(MtpObjectHandle(0x0000_0011)),
-                    _ => None,
-                };
-                if parent_of == Some(parent) {
-                    children.push(MtpObject {
-                        handle,
-                        parent: parent_of,
-                        name: name.to_string(),
-                        kind,
-                        size_bytes: bytes.len() as u64,
-                    });
-                }
+                children.push(MtpObject {
+                    handle,
+                    parent: Some(parent_of),
+                    name: name.to_string(),
+                    kind,
+                    size_bytes: bytes.len() as u64,
+                });
             }
             Ok(children)
         }
