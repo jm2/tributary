@@ -28,6 +28,11 @@ on:
       - main
   pull_request_review:
     types: [submitted]
+  # A review thread can also be opened by a single review comment (no review
+  # submission), e.g. a bot leaving an inline comment directly; that event
+  # must re-evaluate the gate too.
+  pull_request_review_comment:
+    types: [created]
   pull_request_review_thread:
     types: [resolved, unresolved]
 
@@ -87,8 +92,12 @@ jobs:
           fi
 
           # A response without the pull request did not answer the question
-          # and must never read as "no open threads".
-          if ! jq -e '.data.repository.pullRequest != null' "${thread_pages}" > /dev/null; then
+          # and must never read as "no open threads". `gh api graphql
+          # --paginate` emits ONE JSON DOCUMENT PER PAGE, and a plain `jq -e`
+          # derives its exit status from the LAST value only — so the guard
+          # must slurp every page and verify each one reported the pull
+          # request, not just the final page.
+          if ! jq -s -e 'all(.[]; .data.repository.pullRequest != null)' "${thread_pages}" > /dev/null; then
             echo "Review-thread response omitted the pull request; failing closed." >&2
             exit 1
           fi

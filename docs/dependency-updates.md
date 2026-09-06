@@ -169,6 +169,17 @@ this ruleset and the auto-merge precondition in the same reviewed change.
 
 ### Rollout order and live validation
 
+0. Register the ruleset-reader GitHub App before the auto-merge precondition
+   can ever pass: the precondition must read rulesets, and the workflow
+   `GITHUB_TOKEN` cannot (see "Workflow security boundary" below). Create a
+   GitHub App with only the `Administration: read` repository permission
+   (nothing else), install it on this repository, and store its credentials
+   as the repository secrets `RULESET_READER_APP_ID` and
+   `RULESET_READER_APP_PRIVATE_KEY`. The writer mints a single-purpose
+   installation token from those secrets with the pinned GitHub-org
+   `actions/create-github-app-token` action; without this prerequisite the
+   precondition fails closed and routine Dependabot auto-merge stays off,
+   which is the safe direction.
 1. Land `.github/workflows/bot-review-gate.yml` first (this change) so the
    `Bot Review Gate` check actually reports on pull requests before it can be
    marked required. While the ruleset is still narrow, the gate is advisory
@@ -213,12 +224,19 @@ head before and after paginated changed-file enumeration, requires the observed
 file count, rejects current or previous names for the privileged workflow, and
 then revalidates the head immediately before and after running the pinned
 metadata action with read authority. Per-PR concurrency cancels stale runs as
-defense in depth. The separate write-capable job contains no third-party
-action: it first reads the active `main` rulesets (read-only `administration`
-authority, used for nothing else) and refuses to enable auto-merge until the
-full policy check set is required, then revalidates that exact head
-immediately before asking GitHub to enable auto-merge with an atomic
-expected-head guard.
+defense in depth. The separate write-capable job contains exactly one action —
+the pinned GitHub-org `actions/create-github-app-token` (v2.2.1), which signs a
+JWT and exchanges it for an installation token without executing any
+repository code. That token carries `administration: read` and nothing else:
+reading rulesets requires the `administration` permission, which the workflow
+`GITHUB_TOKEN` cannot hold (it is not a valid `GITHUB_TOKEN` scope; declaring
+it makes GitHub reject the workflow at validation), so the live-ruleset
+precondition authenticates with the minted token, reads the rulesets that
+apply to `main` via the branch-rules endpoint, and uses the token for nothing
+else. The job then revalidates that exact head immediately before asking
+GitHub to enable auto-merge with an atomic expected-head guard — a merge
+request that still uses the workflow `GITHUB_TOKEN` (contents +
+pull-requests write only).
 Thus a same-count H1/H2 race or mixed-path self-update fails closed rather than
 executing an H1 action ref with write authority, and a narrowed ruleset can
 never silently widen what native auto-merge waits on.
