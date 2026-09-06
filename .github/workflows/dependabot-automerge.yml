@@ -235,7 +235,11 @@ jobs:
             echo "Unable to read repository rulesets; refusing auto-merge." >&2
             exit 1
           fi
-          rule_ids="$(jq -r '.[] | select(.enforcement == "active") | .id' "${summary_file}")"
+          # The branch-rules endpoint returns per-rule records carrying
+          # `ruleset_id` (there is no top-level `id` or `enforcement` field),
+          # and it only reports rules inherited from active rulesets — so the
+          # IDs need no enforcement filter, only deduplication.
+          rule_ids="$(jq -r '.[].ruleset_id' "${summary_file}" | sort -u)"
           if [ -z "${rule_ids}" ]; then
             echo "No active ruleset applies to main; refusing auto-merge." >&2
             exit 1
