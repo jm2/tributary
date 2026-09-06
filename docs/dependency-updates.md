@@ -149,7 +149,7 @@ of the requirement: a same-named check from a different integration must not
 satisfy the gate.
 
 | Context | Integration (app id) |
-|---|---|
+| --- | --- |
 | Coverage (Linux x86_64) | GitHub Actions (15368) |
 | Windows (aarch64) | GitHub Actions (15368) |
 | Bot Review Gate | GitHub Actions (15368) |

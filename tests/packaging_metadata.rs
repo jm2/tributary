@@ -1387,6 +1387,29 @@ fn dependabot_automerge_workflow() -> serde_yaml::Value {
     serde_yaml::from_str(DEPENDABOT_AUTOMERGE).expect("Dependabot auto-merge workflow must parse")
 }
 
+// The full policy check-context set the live main ruleset must require, each
+// entry as "check context|app id" (empty app id = unbound commit status).
+fn required_policy_check_contexts() -> [&'static str; 16] {
+    [
+        "Security Audit|15368",
+        "Linux (x86_64)|15368",
+        "Linux (aarch64)|15368",
+        "macOS (aarch64)|15368",
+        "Windows (x86_64)|15368",
+        "Windows (aarch64)|15368",
+        "Flatpak (Linux)|15368",
+        "MSRV|15368",
+        "Coverage (Linux x86_64)|15368",
+        "Bot Review Gate|15368",
+        "CodeQL|57789",
+        "Analyze (python)|57789",
+        "Analyze (rust)|57789",
+        "Analyze (actions)|57789",
+        "Codacy Static Code Analysis|56611",
+        "CodeRabbit|",
+    ]
+}
+
 #[test]
 fn dependabot_automerge_inspection_and_metadata_stay_read_only_and_head_bound() {
     let workflow = dependabot_automerge_workflow();
@@ -1639,25 +1662,7 @@ fn dependabot_automerge_waits_for_the_live_full_policy_ruleset() {
         "the ruleset precondition must run before any merge request"
     );
 
-    let expected_checks = [
-        "Security Audit|15368",
-        "Linux (x86_64)|15368",
-        "Linux (aarch64)|15368",
-        "macOS (aarch64)|15368",
-        "Windows (x86_64)|15368",
-        "Windows (aarch64)|15368",
-        "Flatpak (Linux)|15368",
-        "MSRV|15368",
-        "Coverage (Linux x86_64)|15368",
-        "Bot Review Gate|15368",
-        "CodeQL|57789",
-        "Analyze (python)|57789",
-        "Analyze (rust)|57789",
-        "Analyze (actions)|57789",
-        "Codacy Static Code Analysis|56611",
-        "CodeRabbit|",
-    ];
-    for expected in expected_checks {
+    for expected in required_policy_check_contexts() {
         assert!(
             DEPENDABOT_AUTOMERGE.contains(&format!("\"{expected}\"")),
             "the auto-merge precondition must require live ruleset context {expected}"
