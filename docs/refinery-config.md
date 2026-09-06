@@ -80,10 +80,16 @@ follow-up; do not enable or rely on it before then.
 **Closing the gap (the machine gate).** Widen "Require CI before merge
 (main)" to require the full policy set: the Coverage and Windows (aarch64)
 jobs, the CodeQL Analyze jobs, Codacy Static Code Analysis, the CodeRabbit
-status context, and a repo-owned `bot-review-gate` check that fails while
-the pull request has unresolved actionable bot review threads (queried via
-the API, so review threads become machine-readable merge evidence). That is
-a repository-settings and workflow change: it goes through its own bead and
+status context, and a repo-owned `bot-review-gate` check. The gate fails
+closed unless all three of the following hold: every in-scope bot review has
+reached an acceptable conclusion — a pending review blocks, and a
+CHANGES_REQUESTED review blocks even when its threads are resolved; every
+such review was submitted against the pull request's current head SHA — a
+review of an older head does not count; and no actionable bot review thread
+remains unresolved. All three inputs are queried via the API, so review
+conclusions, review head SHAs, and review threads become machine-readable
+merge evidence. That is a repository-settings and workflow change: it goes
+through its own bead and
 full CI validation, never an out-of-band ruleset edit, and it must be
 validated against a live pull request before the refinery treats the widened
 gate as authoritative.
