@@ -1668,16 +1668,11 @@ fn bot_review_gate_is_read_only_fail_closed_and_pinned_to_main_prs() {
     );
 }
 
-#[test]
-fn dependabot_automerge_waits_for_the_live_full_policy_ruleset() {
-    let workflow = dependabot_automerge_workflow();
+// The auto-merge writer must hold exactly contents + pull-requests on the
+// workflow GITHUB_TOKEN: `administration` is not a valid GITHUB_TOKEN scope
+// and declaring it makes GitHub reject the whole workflow at validation.
+fn assert_writer_permissions_are_valid_github_token_scopes(workflow: &serde_yaml::Value) {
     let writer = &workflow["jobs"]["dependabot-automerge"];
-
-    // `administration` is not a valid GITHUB_TOKEN scope; declaring it makes
-    // GitHub reject the whole workflow at validation. The workflow-level
-    // writer permissions must therefore stay contents + pull-requests only,
-    // with the ruleset read performed by a minted GitHub App installation
-    // token restricted to administration: read.
     let writer_permissions = writer["permissions"]
         .as_mapping()
         .expect("writer permissions must be a mapping");
@@ -1695,7 +1690,13 @@ fn dependabot_automerge_waits_for_the_live_full_policy_ruleset() {
         writer["permissions"].get("administration").is_none(),
         "administration is not a GITHUB_TOKEN scope and must never be declared"
     );
+}
 
+// The ruleset read must authenticate with a single-purpose minted GitHub App
+// installation token (administration: read only), and the ruleset
+// precondition must be the writer's next step, ahead of any merge request.
+fn assert_ruleset_read_uses_the_minted_app_token(workflow: &serde_yaml::Value) {
+    let writer = &workflow["jobs"]["dependabot-automerge"];
     let writer_steps = writer["steps"]
         .as_sequence()
         .expect("write job steps must be a sequence");
@@ -1719,13 +1720,17 @@ fn dependabot_automerge_waits_for_the_live_full_policy_ruleset() {
         Some("${{ steps.ruleset_reader.outputs.token }}"),
         "the ruleset precondition must use the minted read-only token, not the workflow GITHUB_TOKEN"
     );
-
     assert_eq!(
         precondition["name"].as_str(),
         Some("Require the live ruleset to enforce the full policy gate"),
         "the ruleset precondition must run before any merge request"
     );
+}
 
+// Every policy context must be present in the workflow's expected set, the
+// applicable rulesets must be discovered via the branch-rules endpoint, and
+// every query failure or coverage gap must fail closed.
+fn assert_precondition_enforces_the_full_policy() {
     for expected in required_policy_check_contexts() {
         assert!(
             DEPENDABOT_AUTOMERGE.contains(&format!("\"{expected}\"")),
@@ -1734,12 +1739,14 @@ fn dependabot_automerge_waits_for_the_live_full_policy_ruleset() {
     }
     // The ruleset list endpoint ignores a ref parameter and returns rulesets
     // for every branch, so the precondition must read the branch-rules
-    // endpoint to know which rulesets actually apply to main.
+    // endpoint to know which rulesets actually apply to main. That endpoint
+    // reports per-rule records carrying `ruleset_id` (rules inherited from
+    // active rulesets only), not ruleset records with `id` and `enforcement`.
     assert!(
         DEPENDABOT_AUTOMERGE.contains("rules/branches/main")
             && !DEPENDABOT_AUTOMERGE.contains("rulesets?ref=main")
-            && DEPENDABOT_AUTOMERGE.contains("select(.enforcement == \"active\")"),
-        "the precondition must read the active rulesets that apply to main"
+            && DEPENDABOT_AUTOMERGE.contains(".[].ruleset_id"),
+        "the precondition must derive the applicable rulesets from their per-rule records"
     );
     assert!(
         DEPENDABOT_AUTOMERGE
@@ -1752,6 +1759,14 @@ fn dependabot_automerge_waits_for_the_live_full_policy_ruleset() {
             && DEPENDABOT_AUTOMERGE.contains("refusing auto-merge"),
         "every query failure or coverage gap must keep routine auto-merge off"
     );
+}
+
+#[test]
+fn dependabot_automerge_waits_for_the_live_full_policy_ruleset() {
+    let workflow = dependabot_automerge_workflow();
+    assert_writer_permissions_are_valid_github_token_scopes(&workflow);
+    assert_ruleset_read_uses_the_minted_app_token(&workflow);
+    assert_precondition_enforces_the_full_policy();
 }
 
 fn repository_workflow_names() -> (std::path::PathBuf, Vec<String>) {
