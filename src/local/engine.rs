@@ -10854,37 +10854,38 @@ mod tests {
 
     #[tokio::test]
     async fn pending_root_trust_boundary_suppresses_backlog_and_keeps_racing_events() {
-        let db = rename_test_database().await;
+        let db = Arc::new(rename_test_database().await);
         let target = TestDirectory::new("trust-boundary-backlog");
+        // A remembered track makes this the LegacyEnrollment flow: the
+        // request's evidence is non-empty, so no empty acknowledgement is
+        // required and the conversion tolerates on-disk files — the queued
+        // evidence below can reference a real file for the whole run.
+        let remembered = target.path().join("remembered.wav");
+        write_minimal_wav(&remembered);
         let scan = scan_root(target.path().to_path_buf());
         let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
             .await
-            .expect("persist empty target root");
-        let request = build_root_trust_request(&scan, &stored, RootTrustReason::EmptyRoot, 0)
-            .expect("build empty-root request");
-
-        let music_dirs = vec![target.path().to_path_buf()];
-        let (event_tx, _event_rx) = async_channel::unbounded();
-        let RootTrustCommandStart::Pending(pending) = begin_root_trust_command(
+            .expect("persist nonempty legacy root");
+        insert_rename_test_track(
             &db,
-            &music_dirs,
-            &event_tx,
-            &test_playlist_sidebar_refresh(),
-            &request,
+            "trust-boundary-remembered",
+            remembered.to_string_lossy().as_ref(),
+            "Remembered",
+            0,
         )
-        .await
-        .expect("run forced conversion") else {
-            panic!("conversion must queue the ordinary follow-up scan");
-        };
-        let request_id = pending.request_id;
-        let boundary_path = pending.path.clone();
+        .await;
+        let request =
+            build_root_trust_request(&scan, &stored, RootTrustReason::LegacyEnrollment, 1)
+                .expect("build nonempty request");
+        assert!(!request.requires_empty_acknowledgement());
+        let request_id = request.request_id;
 
-        // The conversion scan intentionally wrote no track rows. A track now
-        // appears on disk, and a healthy watcher stream queues evidence for it
-        // before the pending-root-trust boundary.
+        // The conversion scan intentionally writes no track rows. A further
+        // track now sits on disk, and a healthy watcher stream queues
+        // evidence for it before the pending-root-trust boundary.
         let boundary_audio = target.path().join("boundary.wav");
         write_minimal_wav(&boundary_audio);
-        let (watcher_tx, mut watcher_rx) = mpsc::channel(WATCHER_EVENT_CAPACITY);
+        let (watcher_tx, watcher_rx) = mpsc::channel(WATCHER_EVENT_CAPACITY);
         let ingress_overflowed = Arc::new(AtomicBool::new(false));
         enqueue_watcher_result(
             &watcher_tx,
@@ -10896,7 +10897,7 @@ mod tests {
         );
         assert!(!ingress_overflowed.load(Ordering::Acquire));
 
-        // That evidence is actionable: processed normally it would upsert the
+        // That evidence is actionable: debounced normally it would upsert the
         // track incrementally. The boundary must still suppress it, because
         // the distinct ordinary authority scan — not the stale incremental —
         // is what converts the pending trust decision into applied content.
@@ -10913,62 +10914,184 @@ mod tests {
             "the suppressed backlog is real incremental evidence, not access noise"
         );
 
-        // The boundary: suppress the pre-authority backlog even though the
-        // stream is healthy, then run the real pending-root-trust completion.
-        discard_watcher_backlog(&mut watcher_rx);
-        assert!(
-            watcher_rx.try_recv().is_err(),
-            "watcher evidence queued before the authority scan is suppressed"
-        );
-
-        // Evidence racing the authority scan remains queued: the scan itself
-        // never consumes the watcher queue, so it stays available for the
-        // following loop boundary.
-        let racing_audio = target.path().join("racing.wav");
-        enqueue_watcher_result(
-            &watcher_tx,
-            ingress_overflowed.as_ref(),
-            Ok(
-                notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
-                    .add_path(racing_audio.clone()),
-            ),
-        );
-        drop(watcher_tx);
-
+        // Drive the real loop: the confirmation command is a serialized UI
+        // command, the queued evidence sits in the watcher channel the loop
+        // owns, and the boundary discard below is the production
+        // `discard_watcher_backlog` call — not a test-side simulation.
+        let music_dirs = vec![target.path().to_path_buf()];
+        let (library_events, library_event_rx) = async_channel::unbounded();
+        let driver_rx = library_event_rx.clone();
+        let (_command_tx, command_rx) = async_channel::unbounded::<LibraryCommand>();
+        _command_tx
+            .send(LibraryCommand::ConfirmRootTrust(request))
+            .await
+            .expect("queue the root-trust confirmation command");
+        let playlist_sidebar_refresh = test_playlist_sidebar_refresh();
         let mut completed_commands = HashMap::new();
-        finish_pending_root_trust_scan(
-            &db,
-            &music_dirs,
-            &event_tx,
-            &test_playlist_sidebar_refresh(),
-            &mut completed_commands,
-            pending,
+
+        // Idle backend: a real `RecommendedWatcher` with zero installed
+        // watches contributes no platform event timing, so the ordering
+        // contract is exercised deterministically (the P3.4 harness shape).
+        let idle_backend = RecommendedWatcher::new(
+            |_: notify::Result<notify::Event>| {},
+            notify::Config::default(),
         )
-        .await;
+        .expect("construct idle watcher backend");
+        let watcher = DirectoryWatcher {
+            watcher: idle_backend,
+            rx: watcher_rx,
+            ingress_overflowed: Arc::clone(&ingress_overflowed),
+            watched_directories: HashSet::new(),
+        };
+
+        let racing_audio = target.path().join("racing.wav");
+        // The driver consumes events while it synchronizes; record everything
+        // it observes so the post-run assertions still see the complete
+        // ordered sequence.
+        let observed_events = Arc::new(std::sync::Mutex::new(Vec::<LibraryEvent>::new()));
+        let driver_observed = Arc::clone(&observed_events);
+        let driver_overflowed = Arc::clone(&ingress_overflowed);
+        let driver_racing = racing_audio.clone();
+        let driver = async move {
+            // Deterministic gate 1: the conversion scan's `ScanComplete` is
+            // the last event the confirm command publishes before the loop
+            // enters the pending-root-trust boundary.
+            loop {
+                let event = driver_rx
+                    .recv()
+                    .await
+                    .expect("library event stream stays open");
+                let scan_complete = matches!(&event, LibraryEvent::ScanComplete);
+                driver_observed
+                    .lock()
+                    .expect("observed event log lock")
+                    .push(event);
+                if scan_complete {
+                    break;
+                }
+            }
+            // Deterministic gate 2: the next event exists only because the
+            // authoritative scan has begun, and the boundary's backlog
+            // discard runs strictly before that scan. Receiving it proves the
+            // real loop — not test code — already consumed the queued
+            // boundary evidence.
+            let event = driver_rx
+                .recv()
+                .await
+                .expect("authoritative scan publishes at least one event");
+            driver_observed
+                .lock()
+                .expect("observed event log lock")
+                .push(event);
+            // The authoritative traversal is finished by its first published
+            // event, so the racing file is invisible to the scan snapshot and
+            // can enter the library only through the racing watcher evidence.
+            write_minimal_wav(&racing_audio);
+            enqueue_watcher_result(
+                &watcher_tx,
+                driver_overflowed.as_ref(),
+                Ok(notify::Event::new(notify::EventKind::Create(
+                    notify::event::CreateKind::File,
+                ))
+                .add_path(racing_audio.clone())),
+            );
+            drop(watcher_tx);
+        };
+
+        let (loop_result, ()) = tokio::join!(
+            process_directory_events(
+                &db,
+                &music_dirs,
+                &library_events,
+                &command_rx,
+                &mut completed_commands,
+                watcher,
+                &playlist_sidebar_refresh,
+            ),
+            driver,
+        );
+        loop_result.expect("watcher loop exits cleanly");
+
+        // Merge the driver's consumed prefix with everything still queued so
+        // the assertions below see the complete ordered event sequence.
+        let mut events = std::mem::take(
+            &mut *observed_events
+                .lock()
+                .expect("observed event log lock"),
+        );
+        while let Ok(event) = library_event_rx.try_recv() {
+            events.push(event);
+        }
+
+        // Two scans ran: the conversion scan and the distinct ordinary
+        // authority scan. No per-track incremental may precede the authority
+        // scan's completion: the boundary had to suppress the pre-command
+        // backlog even though the stream was healthy.
+        let scan_completes: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                matches!(event, LibraryEvent::ScanComplete).then_some(index)
+            })
+            .collect();
+        assert_eq!(
+            scan_completes.len(),
+            2,
+            "conversion and authority scans must each complete exactly once: {events:?}"
+        );
+        let authority_complete = scan_completes[1];
+        for event in &events[..authority_complete] {
+            assert!(
+                !matches!(event, LibraryEvent::TrackUpserted(_)),
+                "incremental upsert applied before the authority scan completed: {event:?}"
+            );
+        }
+
+        // Suppression loses no content: the authority scan — not the
+        // suppressed incremental — delivers the boundary track.
+        let full_sync = events[..authority_complete]
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                LibraryEvent::FullSync(tracks) => Some(tracks),
+                _ => None,
+            })
+            .expect("authority scan publishes FullSync");
+        assert!(full_sync.iter().any(|track| {
+            track.file_path.as_deref() == Some(boundary_audio.to_string_lossy().as_ref())
+        }));
+
+        // Evidence racing the authority scan remained queued through the
+        // boundary and applied at the following loop boundary, against the
+        // re-confirmed root.
+        assert!(events[authority_complete + 1..].iter().any(|event| matches!(
+            event,
+            LibraryEvent::TrackUpserted(track)
+                if track.file_path.as_deref() == Some(racing_audio.to_string_lossy().as_ref())
+        )));
 
         let completion = completed_commands
             .get(&request_id)
             .expect("boundary completes the pending root-trust command");
-        assert_eq!(completion.path, boundary_path);
-        assert_eq!(completion.reason, RootTrustReason::EmptyRoot);
+        assert_eq!(completion.reason, RootTrustReason::LegacyEnrollment);
         assert_eq!(completion.outcome, RootTrustOutcome::Active);
         assert!(
             track::Entity::find()
-                .filter(track::Column::FilePath.eq(boundary_audio.to_string_lossy().as_ref()))
-                .one(&db)
+                .filter(track::Column::FilePath.eq(racing_audio.to_string_lossy().as_ref()))
+                .one(db.as_ref())
                 .await
-                .expect("query boundary audio after authority scan")
+                .expect("query racing track after the next boundary")
                 .is_some(),
-            "suppression loses no content: the authority scan delivers the track"
+            "racing evidence survives the boundary and applies at the next one"
         );
-        assert_eq!(
-            watcher_rx
-                .try_recv()
-                .expect("racing evidence survives the boundary")
-                .expect("queued notify event")
-                .paths,
-            [racing_audio]
-        );
+        let root_state = library_root::Entity::find_by_id(target.path().to_string_lossy().as_ref())
+            .one(db.as_ref())
+            .await
+            .expect("query root state")
+            .expect("root row survives");
+        assert!(root_state.identity_confirmed);
+        assert!(root_state.is_available);
+        assert!(root_state.last_scan_complete);
         assert!(
             !ingress_overflowed.load(Ordering::Acquire),
             "the trust boundary never consults or clears the overflow signal"
