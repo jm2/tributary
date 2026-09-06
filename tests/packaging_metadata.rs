@@ -1472,14 +1472,29 @@ fn dependabot_automerge_writer_is_action_free_concurrent_and_exact_head_guarded(
     let writer_steps = writer["steps"]
         .as_sequence()
         .expect("write job steps must be a sequence");
+    // Exactly one action may appear in the write job: the pinned GitHub-org
+    // app-token minter. It executes no repository code — it only signs a JWT
+    // and exchanges it for an installation token — and checkout remains
+    // forbidden; anything else reintroduces an unreviewed execution context
+    // into the only job that can enable auto-merge.
+    let used_steps: Vec<&serde_yaml::Value> = writer_steps
+        .iter()
+        .filter(|step| step.get("uses").is_some())
+        .collect();
+    assert_eq!(
+        used_steps.len(),
+        1,
+        "the write-capable job must contain exactly one action: the pinned ruleset-reader token minter"
+    );
     assert!(
-        writer_steps.iter().all(|step| step.get("uses").is_none()),
-        "the write-capable job must remain third-party-action-free"
+        used_steps.first().is_some_and(|step| step["uses"].as_str()
+            == Some("actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf")),
+        "the token minter must be the GitHub-org action pinned to its full commit SHA"
     );
     assert_eq!(
         writer_steps.len(),
-        2,
-        "the write-capable job must contain only the live-ruleset precondition and the guarded merge command"
+        3,
+        "the write-capable job must contain only the token mint, the live-ruleset precondition, and the guarded merge command"
     );
     assert_eq!(
         workflow["concurrency"]["cancel-in-progress"].as_bool(),
@@ -1578,6 +1593,12 @@ fn bot_review_gate_is_read_only_fail_closed_and_pinned_to_main_prs() {
         ["submitted"],
         "review submissions must re-evaluate the gate"
     );
+    let review_comment_types = yaml_string_list(&on["pull_request_review_comment"], "types");
+    assert_eq!(
+        review_comment_types,
+        ["created"],
+        "a thread opened by a single review comment (no review submission) must re-evaluate the gate"
+    );
     let thread_types = yaml_string_list(&on["pull_request_review_thread"], "types");
     assert_eq!(
         thread_types,
@@ -1638,6 +1659,13 @@ fn bot_review_gate_is_read_only_fail_closed_and_pinned_to_main_prs() {
                 .contains("Review-thread response omitted the pull request; failing closed."),
         "a failed or incomplete thread query must fail the check instead of passing it"
     );
+    // `gh api graphql --paginate` emits one JSON document per page and a
+    // plain `jq -e` derives its exit status from the last value only, so the
+    // incompleteness guard must slurp every page and validate each one.
+    assert!(
+        BOT_REVIEW_GATE.contains("jq -s -e 'all(.[]; .data.repository.pullRequest != null)'"),
+        "the fail-closed guard must validate every paginated page, not just the last one"
+    );
 }
 
 #[test]
@@ -1645,20 +1673,56 @@ fn dependabot_automerge_waits_for_the_live_full_policy_ruleset() {
     let workflow = dependabot_automerge_workflow();
     let writer = &workflow["jobs"]["dependabot-automerge"];
 
+    // `administration` is not a valid GITHUB_TOKEN scope; declaring it makes
+    // GitHub reject the whole workflow at validation. The workflow-level
+    // writer permissions must therefore stay contents + pull-requests only,
+    // with the ruleset read performed by a minted GitHub App installation
+    // token restricted to administration: read.
+    let writer_permissions = writer["permissions"]
+        .as_mapping()
+        .expect("writer permissions must be a mapping");
     assert_eq!(
-        writer["permissions"]["administration"].as_str(),
-        Some("read"),
-        "the writer needs exactly read authority over repository rulesets"
+        writer_permissions.len(),
+        2,
+        "the writer must hold exactly contents and pull-requests on the workflow GITHUB_TOKEN"
+    );
+    assert_eq!(writer["permissions"]["contents"].as_str(), Some("write"));
+    assert_eq!(
+        writer["permissions"]["pull-requests"].as_str(),
+        Some("write")
+    );
+    assert!(
+        writer["permissions"].get("administration").is_none(),
+        "administration is not a GITHUB_TOKEN scope and must never be declared"
     );
 
     let writer_steps = writer["steps"]
         .as_sequence()
         .expect("write job steps must be a sequence");
     assert!(
-        writer_steps.first().is_some_and(|step| {
-            step["name"].as_str()
-                == Some("Require the live ruleset to enforce the full policy gate")
-        }),
+        writer_steps
+            .first()
+            .is_some_and(|step| step["name"].as_str()
+                == Some("Mint a read-only ruleset-reader token")
+                && step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("actions/create-github-app-token@"))
+                && step["with"]["permission-administration"].as_str() == Some("read")
+                && step["with"]["app-id"].as_str() == Some("${{ secrets.RULESET_READER_APP_ID }}")
+                && step["with"]["private-key"].as_str()
+                    == Some("${{ secrets.RULESET_READER_APP_PRIVATE_KEY }}")),
+        "the ruleset read must authenticate with a minted installation token restricted to administration: read"
+    );
+    let precondition = writer_steps.get(1).expect("precondition step must exist");
+    assert_eq!(
+        precondition["env"]["GH_TOKEN"].as_str(),
+        Some("${{ steps.ruleset_reader.outputs.token }}"),
+        "the ruleset precondition must use the minted read-only token, not the workflow GITHUB_TOKEN"
+    );
+
+    assert_eq!(
+        precondition["name"].as_str(),
+        Some("Require the live ruleset to enforce the full policy gate"),
         "the ruleset precondition must run before any merge request"
     );
 
@@ -1668,13 +1732,18 @@ fn dependabot_automerge_waits_for_the_live_full_policy_ruleset() {
             "the auto-merge precondition must require live ruleset context {expected}"
         );
     }
+    // The ruleset list endpoint ignores a ref parameter and returns rulesets
+    // for every branch, so the precondition must read the branch-rules
+    // endpoint to know which rulesets actually apply to main.
     assert!(
-        DEPENDABOT_AUTOMERGE.contains("rulesets?ref=main")
+        DEPENDABOT_AUTOMERGE.contains("rules/branches/main")
+            && !DEPENDABOT_AUTOMERGE.contains("rulesets?ref=main")
             && DEPENDABOT_AUTOMERGE.contains("select(.enforcement == \"active\")"),
         "the precondition must read the active rulesets that apply to main"
     );
     assert!(
-        DEPENDABOT_AUTOMERGE.contains("The list endpoint omits rule parameters")
+        DEPENDABOT_AUTOMERGE
+            .contains("The per-ruleset detail endpoint is the authoritative source")
             && DEPENDABOT_AUTOMERGE.contains("rulesets/${rule_id}"),
         "the precondition must fetch each active ruleset's actual required checks"
     );
