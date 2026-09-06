@@ -110,14 +110,20 @@ also changed through its own reviewed proposal.
 
 ## Deployment gate migration
 
-This change deliberately does not mutate GitHub rulesets or the local GasCity
-configuration. At the time of adoption, the live `main` ruleset does not
-require either the old versioned MSRV context or the new stable `MSRV` context.
-Before enabling routine Dependabot auto-merge, maintainers must make the live
-required-check set match the policy promised here, including `MSRV`. GasCity's
-Tributary hosted-check configuration must also replace `MSRV (1.92)` with
-`MSRV` in the same deployment. Future Rust bumps then keep the stable context
-and need no additional gate rename.
+This change itself deliberately did not mutate GitHub rulesets or the local
+GasCity configuration; the MSRV migration it anticipated has since landed
+through separate reviewed changes. The live `main` ruleset ("Require CI before
+merge (main)") requires the stable `MSRV` context alongside Security Audit,
+Linux (x86_64), Linux (aarch64), macOS (aarch64), Windows (x86_64), and
+Flatpak (Linux), and GasCity's Tributary hosted-check configuration already
+emits `MSRV` rather than the old versioned `MSRV (1.92)` context. Future Rust
+bumps therefore keep the stable context and need no additional gate rename.
+
+The ruleset is still narrower than the repository's all-checks policy: it does
+not yet require Coverage, CodeQL, Codacy Static Code Analysis, the CodeRabbit
+status context, or bot-review gating. Routine Dependabot auto-merge stays off
+until the live gate matches that policy (see "Closing the gap (the machine
+gate)" in docs/refinery-config.md).
 
 ## Workflow security boundary
 
