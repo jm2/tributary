@@ -7,9 +7,6 @@
 __pycache__/
 *.py[cod]
 
-# Misc
-.beads*
-
 # IDE
 .vscode/
 .idea/

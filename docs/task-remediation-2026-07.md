@@ -23,37 +23,34 @@ Created: 2026-07-10
 
 Status summary:
 
-- [x] P0 release blockers complete
+- [ ] P0 release blockers complete
 - [x] P1 correctness and security complete
 - [ ] P2 resilience and packaging complete
 - [x] P3 architecture and integration coverage complete
 
-Progress snapshot (2026-07-18, amended 2026-09-03), recounted from the literal P0–P3 task
-checkboxes to correct the earlier numerator/denominator drift. The live protected-playback
-finding recorded under P2.11 now has eight independently verifiable tasks rather than the
-original three compound boxes. The 2026-07-18 recount excluded the two then-deferred P0.7
-live-workflow verification boxes and the withdrawn P2.6 false finding; on 2026-09-03 the P0.7
-live manual-dispatch verification ran (Actions run
-[33781875201](https://github.com/jm2/tributary/actions/runs/33781875201), test workflow in PR
-#224), so those two boxes are complete and counted again, and PR #227 closed the v0.6.2 P0.8
-re-evaluation box. The withdrawn P2.6 false finding, section-summary, and global-validation gate
-boxes are still not task progress: **223/226 (98.7%)** in-scope checklist items complete:
-**53/53 P0**, **64/64 P1**, **76/79 P2**, and **30/30 P3**. This incorporates the four P2.9
-boxes closed by PR #99 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7
-platform-cache boxes closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR
-#102, and the three P2.10 ACK/terminal/orphan-semantics boxes implemented in PR #104, the
-bounded-ingress box implemented in PR #105, the cancellable resolver box implemented in PR #106,
-and the held-ACK/slow-greeting/real-IPv6 coverage box completed by PR #107, and the final
-exclusive-control contract plus implementation record accepted in PR #112, since the earlier
-snapshot. The deterministic protected-HTTP compatibility box under P2.11 is also complete in PR
-#108. The process-isolated real-GStreamer fake-backend box under P2.11 is complete in PR #109.
-The packaged Windows plugin/source-policy/decode proof is complete in PR #110 after successful
-native x86_64 and ARM64 package executions; live Windows DAAP and Subsonic playback remains
-open. The P3.2 README claim was re-audited and closed because the document already labels its
-diagram as intended and names the shipping abstraction gaps exactly. P3.5 now reports every
-Linux-host source area in one pinned aggregate, keeps different native source sets as
-informational reports, and enforces the baseline accepted by two exact pinned PR executions in
-PR #111.
+Progress snapshot (2026-07-18), recounted from the literal P0–P3 task checkboxes to correct the
+earlier numerator/denominator drift. The live protected-playback finding recorded under P2.11 now
+has eight independently verifiable tasks rather than the original three compound boxes. The
+in-scope counts exclude the two deferred P0.7
+live-workflow verification boxes and the withdrawn P2.6 false finding; section-summary and
+global-validation gate boxes are not task progress:
+**220/223 (98.7%)** in-scope checklist items complete: **50/50 P0**, **64/64 P1**, **76/79 P2**,
+and **30/30 P3** after those exclusions. This incorporates the four P2.9 boxes closed by PR #99
+and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
+closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
+ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
+PR #105, the cancellable resolver box implemented in PR #106, and the
+held-ACK/slow-greeting/real-IPv6 coverage box completed by PR #107, and the final exclusive-control
+contract plus implementation record accepted in PR #112, since the earlier snapshot. The
+deterministic protected-HTTP compatibility box under P2.11 is also complete in PR #108. The
+process-isolated real-GStreamer fake-backend box under P2.11 is complete in PR #109. The packaged
+Windows plugin/source-policy/decode proof is complete in PR #110 after successful native x86_64 and
+ARM64 package executions; live Windows DAAP and Subsonic playback remains open. The P3.2 README
+claim was re-audited and closed because the
+document already labels its diagram as intended and names the shipping abstraction gaps exactly.
+P3.5 now reports every Linux-host source area in one pinned aggregate, keeps different native
+source sets as informational reports, and enforces the baseline accepted by two exact pinned PR
+executions in PR #111.
 
 PR #123's P3.1 production cutover closed the centralized refresh/cancellation/disconnect/failure
 box while deliberately leaving the final implementation-record box unchecked, so at that cutover
@@ -531,21 +528,9 @@ and cannot access a repository write credential.
 - [x] Pass the ref to every checkout in the release workflow.
 - [x] Derive every package version from the checked-out source/tag.
 - [x] Reject a missing or malformed requested tag.
-- [x] Add a dry-run/manual workflow test demonstrating that tag X builds tag X.
-- [x] Record implementation: workflow contract implemented in PR #68; the
-  `release.yml` `workflow_dispatch` input `dry_run` (default `false`) runs
-  only the `prepare` tag-resolution contract plus a `dry-run-verify` job
-  that asserts `build_ref` equals the remote commit of the requested tag
-  and `version` equals the tag's `Cargo.toml` version; every build job and
-  `checksums` skip in dry-run and `publish` remains release-only, so a
-  dry-run can never publish. Live manual-dispatch verification: run
-  [33781875201](https://github.com/jm2/tributary/actions/runs/33781875201)
-  (2026-09-03, dispatch of `v0.6.2` with `dry_run=true`) ran against pushed workflow ref
-  `polecat/tr-qcn` at `c5e9c99`. "Resolve release source" and "Dry-run tag contract
-  verification" both passed: `build_ref` resolved to
-  `74b42792e42bed0b48a350c8797686ee0588a12b`, the immutable commit of
-  `refs/tags/v0.6.2`, and version `0.6.2` matched the tag, with all artifact and publication
-  jobs skipped.
+- [ ] Add a dry-run/manual workflow test demonstrating that tag X builds tag X.
+- [ ] Record implementation: workflow contract implemented in PR #68; live
+  manual-dispatch verification pending after push.
 
 Acceptance criteria: all artifacts in a run are built from the same requested immutable ref
 and carry the same version.
@@ -565,25 +550,15 @@ and carry the same version.
   justified and time-bounded below rather than removed based on active-tree output: the
   affected package remains in `Cargo.lock` even though it is inactive in Tributary's
   configured feature graph.
-- [x] Apply the P0.8 re-evaluation triggered by the v0.6.2 release (due "2026-10-10 or next
-  release, whichever is first"). The inactive lockfile-only `rsa` path was eliminated outright:
-  the 2026-08-05 SeaORM group bump moved `sqlx-mysql` to 0.9.0, which no longer depends on
-  `rsa` (PR #196), the independent fuzz-lock copy fell with the same day's dependency repair
-  (PR #206), and the `.cargo/audit.toml` `RUSTSEC-2023-0071` ignore was dropped. The
-  production-lock `proc-macro-error2` path left in that same repair (PR #206), and the
-  fuzz-lock copy left at the release review by synchronizing `sea-bae` 0.2.2 (PR #218).
-  `paste` was revalidated as an unavoidable compile-time Lofty edge with no patched release
-  (details in `docs/task.md` P3.4).
 
-Audit disposition recorded 2026-07-10, amended and revalidated 2026-07-13, and re-evaluated at
-the 2026-09-01 v0.6.2 release review:
+Audit disposition recorded 2026-07-10, amended and revalidated 2026-07-13:
 
 | Advisory | Dependency path | Disposition | Revisit by |
 |---|---|---|---|
 | [`RUSTSEC-2026-0190`](https://rustsec.org/advisories/RUSTSEC-2026-0190) (`anyhow`) | direct and transitive | Fixed by locking and requiring `anyhow >= 1.0.103`. | Closed |
-| [`RUSTSEC-2024-0436`](https://rustsec.org/advisories/RUSTSEC-2024-0436) (`paste`) | `lofty 0.24.0 -> paste 1.0.15` | Informational/unmaintained, with no patched `paste` release. Re-evaluated 2026-09-01: still an unavoidable compile-time edge through Lofty (the latest Lofty 0.25.1 declares the same dependency); no direct Tributary use. Track Lofty migration to a maintained replacement. | 2026-12-01 or next release, whichever comes first |
-| [`RUSTSEC-2026-0173`](https://rustsec.org/advisories/RUSTSEC-2026-0173) (`proc-macro-error2`) | was `sea-orm 1.1.20 -> sea-bae 0.2.1`; removed from the production lock (PR #206) and from the independent fuzz lock via `sea-bae` 0.2.2 (PR #218) | Informational/unmaintained compile-time macro dependency. Closed 2026-09-01: absent from both lockfiles at the v0.6.2 release. | Closed |
-| [`RUSTSEC-2023-0071`](https://rustsec.org/advisories/RUSTSEC-2023-0071) (`rsa`, Marvin Attack) | was a lockfile-only optional graph: `sqlx 0.8.6` and `sqlx-macros-core 0.8.6` retained `sqlx-mysql 0.8.6 -> rsa 0.9.10`, inactive under Tributary's `sqlx-sqlite` feature set | Closed: the 2026-08-05 SeaORM group bump moved `sqlx-mysql` to 0.9.0, which no longer depends on `rsa` (PR #196), and the fuzz-lock copy fell with the same day's dependency repair (PR #206). `rsa` is absent from both lockfiles and the `.cargo/audit.toml` ignore was removed; `cargo audit --no-fetch` passes without it. Re-review immediately before enabling MySQL support. | Closed; immediately if MySQL is enabled |
+| [`RUSTSEC-2024-0436`](https://rustsec.org/advisories/RUSTSEC-2024-0436) (`paste`) | `lofty 0.24.0 -> paste 1.0.15` | Informational/unmaintained, with no patched `paste` release. Track Lofty migration to a maintained replacement; no direct Tributary use. | 2026-10-10 or next release, whichever comes first |
+| [`RUSTSEC-2026-0173`](https://rustsec.org/advisories/RUSTSEC-2026-0173) (`proc-macro-error2`) | `sea-orm 1.1.20 -> sea-bae 0.2.1` | Informational/unmaintained compile-time macro dependency. Track SeaORM's removal or evaluate the SeaORM 2 migration. | 2026-10-10 or next release, whichever comes first |
+| [`RUSTSEC-2023-0071`](https://rustsec.org/advisories/RUSTSEC-2023-0071) (`rsa`, Marvin Attack) | Lockfile-only optional graph: `sqlx 0.8.6` and `sqlx-macros-core 0.8.6` retain `sqlx-mysql 0.8.6 -> rsa 0.9.10`; `sqlx-mysql` and `rsa` are inactive under Tributary's `sqlx-sqlite` feature set. | Retain the narrowly documented `.cargo/audit.toml` ignore. `cargo tree --locked -i rsa` and `cargo tree --locked -e features -i sqlx-mysql` are empty, but `cargo-audit` checks every locked package and fails on this advisory without the ignore. No fixed upgrade exists. Re-review immediately before enabling MySQL support. | 2026-10-10 or next release, whichever comes first; immediately if MySQL is enabled |
 
 Acceptance criteria: the CI security-audit job passes with every remaining ignored advisory
 explicitly justified and time-bounded.
@@ -3454,17 +3429,6 @@ Record scope or design decisions here so deferred work is explicit.
   nor a redirect policy, and `Client::default()` panics on the same TLS-init failure that would
   have triggered it, so it could never have been a safety net.
 
-- 2026-09-03 — P0.7's live manual-dispatch acceptance ran after all. The release dry-run
-  workflow from PR #224 was dispatched by hand against the pushed ref `polecat/tr-qcn`
-  (`c5e9c99`) requesting tag `v0.6.2` with `dry_run: true`; run
-  [33781875201](https://github.com/jm2/tributary/actions/runs/33781875201) resolved
-  `build_ref` to `74b42792e42bed0b48a350c8797686ee0588a12b` — the immutable commit of
-  `refs/tags/v0.6.2` — derived the
-  matching version, and skipped every build/publish job. The two P0.7 verification boxes
-  are checked and counted; together with the P0.8 re-evaluation box closed by PR #227, that
-  completes P0 at 53/53 and moves the tracker to 223/226;
-  only the three physical/installed P2 validation records remain.
-
 ## Completed work log
 
 Add one line per completed task:
@@ -3541,4 +3505,3 @@ Add one line per completed task:
 | 2026-07-18 | P2.11 typed Windows PE-target repair | PR #127 | Removes the non-terminal array boundary by assembling explicit `List[string]` values for the Soup singleton, closure rounds, and bounded inspector batches. Per-target validation distinguishes null/empty, quote/control, rooted, normalization, extension, and existence failures. Its bounded single-line diagnostic retains at most 192 sanitized target characters plus a fixed truncation marker. The nonexecuting architecture-local inspector and every existing resource bound remain intact. AST parsing, formatting/diff, locked check, strict debug/release Clippy, 14 `windows_*` tests, three `powershell_*` tests, and complete 926-test debug/release profiles pass. CI run `29648906031` passed native x86_64 and ARM64 packages/probes, including the x86_64 Desktop PowerShell 5.1 behavior regression. The exact affected-host PowerShell/MSYS2 rerun remains pending, so this merged repair leaves progress at 219/223 overall and 76/79 P2. |
 | 2026-07-18 | P3.1 external-file at-use adapter (partial) | PR #128 | Replaces OS-open direct-URI playback with ordered first-accepted-audio admission into hidden, ephemeral registry sources. Exact-handle parsing and bounded metadata validation precede random source/track identity; accepted tracks and queues are pathless and bind the exact session epoch. One inseparable lease-bearing file capability drives output loading and post-acceptance embedded art, with pre/post-file-handle-clone revocation checks and no path/URI diagnostics. Native non-UTF-8 leaf names use a bounded lossy parser/presentation hint without replacing handle authority. Newer OS deliveries, explicit playback intents including scrubber seek, Stop, real output transfer, and shutdown reject stale admission; queue replacement, unrepeated EOS, player/load error, output transfer, and shutdown retire the exact source idempotently while same-output reselection is inert. Automatic EOS replay/advance deliberately does not invalidate in-flight admission. Independent review tightened the admission-gate predicate, hidden UI-owner filter, shutdown/publication serialization, and nonseparable resolver lease boundary, and verified sequential invalid-candidate handling plus the post-accept art handoff. Automated review simplified optional-extension validation; shared parser defaults already admit missing artist/album tags, position-independent proxy reads isolate playback from artwork seek, and a per-capability mutex plus deterministic regression serializes overlapping cursor-based parsers. Formatting/diff, locked check, strict debug/release Clippy, and serial complete 940-test debug/release suites pass. Only the removable adapter keeps P3.1's final record open, so progress remains 219/223 overall and 29/30 P3. |
 | 2026-07-18 | P3.1 removable-media lifecycle/at-use adapter (completion) | PR #129 | Completes P3.1 by claiming each eligible mount's deterministic source identity into `SourceRegistry`, scanning beneath retained mounted-root authority on the blocking runtime, and publishing only pathless lossless relative track IDs under an exact session epoch. Deterministic no-follow, same-filesystem traversal parses bounded metadata through exact file handles; at-use resolution rejects malformed or unlisted IDs and rechecks the live epoch and lease before returning one retained file capability for playback and embedded art. Pre-unmount, relocation, confirmed removal, replacement, and shutdown disconnect authority before UI/playback invalidation; failed unmount reconnects from fresh inventory under a new epoch, and confirmed removal releases provenance. Pathless removable rows omit Properties until typed mutation authority exists. Security review hardened Unix trailing-slash/`/.` no-follow roots and Windows intermediate-junction races by pinning the root/ancestor namespace, rejecting directory symlinks, and following a final reparse root only when Windows verifies a volume mount point. Automated review also found that an inactive background scan failure was reducer-deduplicated before later row selection could display it; selection now replays the retained sanitized lifecycle failure without consuming it. Locked check, strict debug Clippy, formatting/diff checks, focused authority/adapter/registry/UI coverage, and the complete 956-test serial debug suite pass. Release validation was interrupted by temporary workspace disk quota and is not claimed. This closes P3 at 30/30 and advances total progress to 220/223 (98.7%); only three manual P2 validation records remain. |
-| 2026-09-03 | P0.7 live manual-dispatch verification | PR #224 + Actions run [33781875201](https://github.com/jm2/tributary/actions/runs/33781875201) | The dry-run/manual workflow test was dispatched live against pushed ref `polecat/tr-qcn` (`c5e9c99`) requesting tag `v0.6.2` with `dry_run: true`. "Resolve release source" and "Dry-run tag contract verification" passed: dispatching v0.6.2 resolved `build_ref` to `74b42792e42bed0b48a350c8797686ee0588a12b`, the immutable commit of `refs/tags/v0.6.2`, and the derived version matched the tag, while every artifact build and publish job stayed skipped under dry-run. This closes P0.7's two deferred verification boxes; with the P0.8 re-evaluation box closed by PR #227, P0 is complete at 53/53 and the tracker advances to 223/226 (98.7%) with only the three physical/installed P2 validation records open. |
