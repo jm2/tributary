@@ -127,7 +127,7 @@ fn fall_back_to_local(
         .get("local")
         .cloned()
         .unwrap_or_default();
-    super::window::display_tracks(
+    super::window::display_local_tracks(
         &local_tracks,
         track_store,
         master_tracks,
@@ -135,6 +135,7 @@ fn fall_back_to_local(
         browser_state,
         status_label,
         column_view,
+        app_config,
     );
 }
 

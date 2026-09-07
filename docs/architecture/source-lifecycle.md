@@ -667,7 +667,11 @@ queue can extend the same ephemeral-source rule explicitly.
 - Each accepted OS-opened file owns a hidden registry adapter with fresh independent random source
   and track identities plus the exact adopted epoch. Ordered first-accepted-audio admission runs on
   a blocking worker and rechecks its exact generation under the shutdown/publication gate before
-  identity is minted or the retained already-open file is adopted. Its one-item queue is pathless;
+  identity is minted or the retained already-open file is adopted. One delivery is one ordered
+  playback intent: candidates after the first successfully admitted audio file are deliberately
+  discarded rather than queued, and a later delivery supersedes an earlier one through the same
+  generation gate. Preserving every occurrence as a multi-file ephemeral queue is a deliberate
+  current limitation pending product approval, not committed work. Its one-item queue is pathless;
   stream resolution returns only a lease-checked file capability, embedded art clones that
   capability after output acceptance, and every terminal or superseding boundary retires the
   ephemeral adapter idempotently. Count-only OS-open diagnostics expose no path.

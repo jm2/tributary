@@ -9,6 +9,11 @@ on:
         description: "Existing release tag to build (for example, v0.5.0)"
         required: true
         type: string
+      dry_run:
+        description: "Validate tag resolution only; skip every artifact build"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -31,12 +36,14 @@ jobs:
       build_ref: ${{ steps.source.outputs.build_ref }}
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.source.outputs.version }}
+      dry_run: ${{ steps.release.outputs.dry_run }}
     steps:
       - name: Validate requested tag
         id: release
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           DISPATCH_TAG: ${{ inputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
             TAG="${RELEASE_TAG}"
@@ -53,6 +60,11 @@ jobs:
             exit 1
           fi
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          if [[ "${DRY_RUN}" == "true" ]]; then
+            echo "dry_run=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "dry_run=false" >> "${GITHUB_OUTPUT}"
+          fi
 
       - uses: actions/checkout@v7
         with:
@@ -78,10 +90,62 @@ jobs:
           echo "build_ref=${BUILD_REF}" >> "${GITHUB_OUTPUT}"
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
 
+  # Dry-run contract proof for manual dispatch: dispatching tag X with
+  # dry_run=true must resolve build_ref to tag X's immutable commit and
+  # version to X's Cargo.toml version, without building any artifact. Every
+  # build job checks out prepare.outputs.build_ref, so a passing dry-run
+  # demonstrates that dispatching tag X builds tag X and that all artifacts
+  # of a real run are built from the same ref and carry the same version.
+  dry-run-verify:
+    name: Dry-run tag contract verification
+    needs: prepare
+    if: needs.prepare.outputs.dry_run == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Verify build ref and version match the requested tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          BUILD_REF: ${{ needs.prepare.outputs.build_ref }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          echo "Requested tag:    ${TAG}"
+          echo "Resolved ref:     ${BUILD_REF}"
+          echo "Resolved version: ${VERSION}"
+
+          expected_version="${TAG#v}"
+          tag_commit="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" --jq '.sha')"
+
+          failed=0
+          if [[ -z "${tag_commit}" ]]; then
+            echo "FAIL: could not resolve ${TAG} to a commit on ${GITHUB_REPOSITORY}" >&2
+            failed=1
+          elif [[ "${tag_commit}" != "${BUILD_REF}" ]]; then
+            echo "FAIL: build_ref ${BUILD_REF} is not the commit of ${TAG} (${tag_commit})" >&2
+            failed=1
+          fi
+          if [[ "${VERSION}" != "${expected_version}" ]]; then
+            echo "FAIL: version ${VERSION} does not match tag ${TAG}" >&2
+            failed=1
+          fi
+          if (( failed )); then
+            exit 1
+          fi
+
+          echo "PASS: dispatching ${TAG} resolved build_ref to ${BUILD_REF}, the immutable"
+          echo "commit of ${TAG}, at version ${VERSION}. Every build job in this workflow"
+          echo "checks out ${BUILD_REF}, so all artifacts of a run are built from ${TAG}"
+          echo "and carry version ${VERSION}."
+
   # ── Linux Flatpak (x86_64 + aarch64) ─────────────────────────────────────
   flatpak:
     name: Flatpak (${{ matrix.arch }})
     needs: prepare
+    if: needs.prepare.outputs.dry_run != 'true'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -163,6 +227,7 @@ jobs:
   macos:
     name: macOS (${{ matrix.arch }})
     needs: prepare
+    if: needs.prepare.outputs.dry_run != 'true'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -217,6 +282,7 @@ jobs:
   windows:
     name: Windows (${{ matrix.arch }})
     needs: prepare
+    if: needs.prepare.outputs.dry_run != 'true'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -345,6 +411,7 @@ jobs:
   linux-deb:
     name: Debian Package (${{ matrix.arch }})
     needs: prepare
+    if: needs.prepare.outputs.dry_run != 'true'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -407,6 +474,7 @@ jobs:
   linux-rpm:
     name: RPM Package (${{ matrix.arch }})
     needs: prepare
+    if: needs.prepare.outputs.dry_run != 'true'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -476,6 +544,7 @@ jobs:
   linux-arch:
     name: Arch Linux Package (x86_64)
     needs: prepare
+    if: needs.prepare.outputs.dry_run != 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -541,6 +610,7 @@ jobs:
     name: SHA256 Checksums
     runs-on: ubuntu-24.04
     needs: [flatpak, macos, windows, linux-deb, linux-rpm, linux-arch]
+    if: needs.prepare.outputs.dry_run != 'true'
     permissions:
       contents: read
     steps:

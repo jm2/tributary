@@ -15,20 +15,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **OwnTone DAAP reconnects** — Decode gzip-compressed catalogue responses produced by OwnTone's
-  slow-query cache while preserving decoded-size limits and byte-exact ranged Cast media relays.
-- **Dependency-update CI** — Adapt raw database queries and transactions to SeaORM 2 while
-  preserving the existing SQLite schema, repair root/fuzz lock synchronization across Cargo
-  feature unification, and keep Dependabot action pins aligned with repository policy tests.
+- **OwnTone DAAP reconnects** — Decode the gzip-compressed catalogue responses OwnTone serves from
+  its slow-query cache, keeping the existing response-size limits and byte-exact Chromecast range
+  relays.
+- **Dependency-update CI** — Port raw database queries and transactions to SeaORM 2 without
+  changing the SQLite schema, keep the root and fuzz lockfiles in sync under Cargo feature
+  unification, and keep Dependabot's action pins aligned with the repository policy tests.
 
 ### Security
 
 - **Advisory tracking** — Remove obsolete inactive RSA and fuzz-only `proc-macro-error2` paths,
   and renew bounded review of the unavoidable compile-time `paste` and inactive lock-only `rkyv`
   edges.
-- **Workflow action integrity** — Pin Rust setup to one immutable commit in the action's permanent
-  history, track compiler releases independently through a dedicated manifest, and keep both
-  update classes behind manual review and the full CI matrix.
+- **Workflow action integrity** — Pin the Rust setup action to an immutable commit, track compiler
+  releases through a dedicated manifest, and keep both kinds of update behind manual review and
+  the full CI matrix.
 
 ---
 

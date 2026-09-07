@@ -27,6 +27,9 @@ pub struct WindowState {
     /// Used by: source_connect (auth dialogs), playlist_actions (dialogs), context_menu (results).
     pub window: adw::ApplicationWindow,
 
+    /// Non-modal feedback host for completed user actions.
+    pub toast_overlay: adw::ToastOverlay,
+
     /// Tokio runtime handle for spawning async background work.
     /// Used by: discovery_handler, source_connect, playlist_actions, context_menu.
     pub rt_handle: tokio::runtime::Handle,
