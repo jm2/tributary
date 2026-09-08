@@ -566,10 +566,10 @@ impl MountedRootAuthority {
     /// cannot redirect it: the rename lands in the exact audited directory
     /// object or fails. When `no_replace` is set the publication fails if
     /// the final leaf already exists; the platform-native no-replace rename
-    /// is tried first, then a link-based publish, and finally a no-follow
-    /// existence check bracketing a plain rename for filesystems that offer
-    /// neither. On Windows the rename uses the absolute paths with the
-    /// retained parent identity revalidated immediately before and after.
+    /// is tried first, then a link-based publish, and finally an
+    /// exclusive-reservation publish for filesystems that offer neither. On
+    /// Windows the rename uses the absolute paths with the retained parent
+    /// identity revalidated immediately before and after.
     pub(super) fn rename_within_directory(
         &self,
         parent: &RetainedWriteParent,
@@ -613,12 +613,12 @@ impl MountedRootAuthority {
     pub(super) fn remove_regular_file_within(&self, relative: &Path) -> io::Result<()> {
         let components = strict_relative_components(relative)?;
         self.validate()?;
-        let leaf = components.last().expect("non-empty components").clone();
-        let parent = self.retain_write_parent_directory(&components)?;
         #[cfg(unix)]
         {
             use rustix::fs::AtFlags;
 
+            let leaf = components.last().expect("non-empty components").clone();
+            let parent = self.retain_write_parent_directory(&components)?;
             let stat = match rustix::fs::statat(parent.handle(), &leaf, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(stat) => stat,
                 Err(error) => return Err(io::Error::from(error)),
@@ -640,7 +640,6 @@ impl MountedRootAuthority {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = (&parent, &leaf);
             return Err(unsupported_platform());
         }
         self.validate()
@@ -652,12 +651,12 @@ impl MountedRootAuthority {
     pub(super) fn remove_directory_within(&self, relative: &Path) -> io::Result<()> {
         let components = strict_relative_components(relative)?;
         self.validate()?;
-        let leaf = components.last().expect("non-empty components").clone();
-        let parent = self.retain_write_parent_directory(&components)?;
         #[cfg(unix)]
         {
             use rustix::fs::AtFlags;
 
+            let leaf = components.last().expect("non-empty components").clone();
+            let parent = self.retain_write_parent_directory(&components)?;
             let stat = match rustix::fs::statat(parent.handle(), &leaf, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(stat) => stat,
                 Err(error) => return Err(io::Error::from(error)),
@@ -679,7 +678,6 @@ impl MountedRootAuthority {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = (&parent, &leaf);
             return Err(unsupported_platform());
         }
         self.validate()
@@ -2518,16 +2516,18 @@ fn rename_within_parent(
 
 /// No-replace rename of `from_leaf` to `to_leaf` inside the retained parent.
 ///
-/// The platform-native no-replace rename is tried first (`renameat2` with
-/// `RENAME_NOREPLACE` on Linux, `renameatx_np` with `RENAME_EXCL` on macOS).
-/// Filesystems that do not implement the flag — FAT and exFAT USB mounts
-/// return `EINVAL`/`ENOSYS`, for example — fall back to a link-based
-/// publish, which is atomic and fails with `EEXIST` on a collision; the
-/// staged leaf is then unlinked. Filesystems without hard links (also common
-/// on FAT) fall back to a no-follow existence check immediately before a
-/// plain rename, both anchored to the retained parent handle. A collision
-/// detected by any strategy is a definitive failure that leaves the
-/// destination untouched.
+/// The platform-native no-replace rename is tried first: `renameat_with`
+/// with `RENAME_NOREPLACE`, backed by `renameat2` on Linux/Android and the
+/// flagged renamer (`renameatx_np`) on Apple platforms. Filesystems that do
+/// not implement the flag — FAT and exFAT USB mounts return `EINVAL`/
+/// `ENOSYS`, for example — fall back to a link-based publish, which is
+/// atomic and fails with `EEXIST` on a collision; the staged leaf is then
+/// unlinked. Filesystems without hard links (also common on FAT) fall back
+/// to an exclusive-reservation publish: the destination leaf is created
+/// exclusively as a private placeholder and the staged leaf is renamed over
+/// it, so a collision fails definitively and no pre-existing or concurrently
+/// created file can ever be replaced. A collision detected by any strategy
+/// is a definitive failure that leaves the destination untouched.
 #[cfg(unix)]
 fn rename_no_replace_within_parent(
     parent: &File,
@@ -2573,16 +2573,62 @@ fn rename_no_replace_within_parent(
         Err(error) => return Err(io::Error::from(error)),
     }
 
-    // Last resort for filesystems with neither rename flags nor hard links.
-    // Both probes are anchored to the retained parent handle, so the window
-    // is bounded to the two adjacent syscalls on one directory.
-    if rustix::fs::statat(parent, to_leaf, AtFlags::SYMLINK_NOFOLLOW).is_ok() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "destination appeared before the no-replace publish",
-        ));
+    publish_by_exclusive_reservation(parent, from_leaf, from_absolute, to_leaf, to_absolute)
+}
+
+/// Final no-replace strategy for filesystems offering neither rename flags
+/// nor hard links.
+///
+/// The destination leaf is created exclusively (`O_CREAT | O_EXCL`) as a
+/// private placeholder, then the staged leaf is renamed over it. Any other
+/// creator loses the exclusive create and learns the name is taken, so the
+/// only bytes the replace can ever discard are the placeholder's own —
+/// unlike an existence probe bracketing a plain rename, which could replace
+/// a file created inside the probe-to-rename window. A failed replace
+/// unlinks the placeholder best-effort so the name is released cleanly; it
+/// held only bytes this call created. Both steps stay anchored to the
+/// retained parent handle.
+#[cfg(unix)]
+fn publish_by_exclusive_reservation(
+    parent: &File,
+    from_leaf: &OsStr,
+    from_absolute: &Path,
+    to_leaf: &OsStr,
+    to_absolute: &Path,
+) -> io::Result<()> {
+    use rustix::fs::{unlinkat, AtFlags, Mode, OFlags};
+
+    let reserved = rustix::fs::openat(
+        parent,
+        to_leaf,
+        OFlags::WRONLY
+            | OFlags::CREATE
+            | OFlags::EXCL
+            | OFlags::CLOEXEC
+            | OFlags::NOFOLLOW
+            | OFlags::NOCTTY,
+        Mode::from_bits_truncate(0o600),
+    );
+    match reserved {
+        // The name is reserved. Close the placeholder immediately: the
+        // publish replaces the directory entry, not this open descriptor.
+        Ok(reserved) => drop(reserved),
+        Err(rustix::io::Errno::EXIST) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "destination appeared before the no-replace publish",
+            ));
+        }
+        Err(error) => return Err(io::Error::from(error)),
     }
-    rename_within_parent(parent, from_leaf, from_absolute, to_leaf, to_absolute)
+    if let Err(error) = rename_within_parent(parent, from_leaf, from_absolute, to_leaf, to_absolute)
+    {
+        // Release the reserved name so a retry sees a clean directory; the
+        // placeholder never held caller data.
+        let _ = unlinkat(parent, to_leaf, AtFlags::empty());
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Windows no-replace rename: `MoveFileExW` without
@@ -3453,6 +3499,58 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert!(lease.mount_generation().is_some());
         lease.validate().expect("validate lease");
+    }
+
+    /// The exclusive-reservation publish is the final no-replace strategy
+    /// for filesystems offering neither rename flags nor hard links. It must
+    /// refuse an existing destination without touching it, and publish by
+    /// consuming the staged leaf when the destination is free.
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_reservation_publish_refuses_existing_destination() {
+        let directory = TestDirectory::new("reservation-publish");
+        let parent = fs::File::open(directory.path()).expect("open parent handle");
+        fs::write(directory.path().join(".stage-tmp"), b"payload").expect("write staged leaf");
+        fs::write(directory.path().join("final.flac"), b"original")
+            .expect("write existing destination");
+
+        let error = publish_by_exclusive_reservation(
+            &parent,
+            OsStr::new(".stage-tmp"),
+            directory.path().join(".stage-tmp").as_path(),
+            OsStr::new("final.flac"),
+            directory.path().join("final.flac").as_path(),
+        )
+        .expect_err("existing destination must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(directory.path().join("final.flac")).expect("read destination"),
+            b"original",
+            "the pre-existing destination must be untouched"
+        );
+        assert_eq!(
+            fs::read(directory.path().join(".stage-tmp")).expect("read staged leaf"),
+            b"payload",
+            "the staged leaf must be untouched on a refused publish"
+        );
+
+        publish_by_exclusive_reservation(
+            &parent,
+            OsStr::new(".stage-tmp"),
+            directory.path().join(".stage-tmp").as_path(),
+            OsStr::new("published.flac"),
+            directory.path().join("published.flac").as_path(),
+        )
+        .expect("publish to a free destination");
+        assert_eq!(
+            fs::read(directory.path().join("published.flac")).expect("read published"),
+            b"payload",
+            "publish must move the staged bytes under the final name"
+        );
+        assert!(
+            !directory.path().join(".stage-tmp").exists(),
+            "publish must consume the staged leaf"
+        );
     }
 
     #[test]
