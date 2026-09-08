@@ -1204,6 +1204,7 @@ fn build_properties_action(
     );
     let registry_for_props = mutation_context.source_registry.clone();
     let rt_handle_for_props = mutation_context.rt_handle.clone();
+    let failure_context_for_props = mutation_context.clone();
 
     props_action.connect_activate(move |_, _| {
         let Some(ref win) = win_for_props else {
@@ -1228,6 +1229,7 @@ fn build_properties_action(
         let rt_handle = rt_handle_for_props.clone();
         let win = win.clone();
         let track_infos_for_resolve = track_infos.clone();
+        let failure_context = failure_context_for_props.clone();
         let (tx, rx) = async_channel::bounded::<
             Option<
                 std::collections::HashMap<String, crate::source_registry::RemovableMutationTarget>,
@@ -1252,7 +1254,7 @@ fn build_properties_action(
                             %error,
                             source = %mutation.source_id,
                             track = mutation.track_id.as_str(),
-                            "removable properties resolution failed; skipping dialog"
+                            "removable properties resolution failed; surfacing the cancelled action"
                         );
                         let _ = tx.send_blocking(None);
                         return;
@@ -1262,7 +1264,13 @@ fn build_properties_action(
             let _ = tx.send_blocking(Some(resolved));
         });
         glib::MainContext::default().spawn_local(async move {
+            // Every other failure path in this file presents an alert; a
+            // resolution refused between menu build and activation (device
+            // removed, session retired, epoch changed) must be visible too —
+            // the user activated Properties and must not watch the popover
+            // silently close.
             let Ok(Some(resolved)) = rx.recv().await else {
+                failure_context.show_mutation_failed();
                 return;
             };
             let mut infos = track_infos_for_resolve;
