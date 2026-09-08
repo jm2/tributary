@@ -2693,6 +2693,42 @@ fn status_observes_foreign_song(status: &MpdStatus, song_id: u64) -> bool {
 /// never grants or restores anything — quiet polling cannot re-arm a lapsed
 /// supervisor. Only a fresh explicit user confirmation (re-selecting the
 /// output, which constructs a fresh `Armed` supervisor) restores authority.
+/// Apply one authoritative [`MpdStatus`] observation to a supervised
+/// supervisor. This is the shared core behind the poll path and every
+/// pre-mutation status check: any code path that inspects a fresh status
+/// before touching the partition must feed that status through here so the
+/// evidence it just observed is applied BEFORE the mutation decision.
+/// Foreign-controller evidence (foreign current song, partition-option
+/// drift) revokes the user-confirmed authority; a clean observation
+/// refreshes it but never grants or restores anything.
+fn supervise_status(
+    plan: MpdControlPlan,
+    supervision: &Mutex<SupervisionState>,
+    status: &MpdStatus,
+    owned_song_id: u64,
+) {
+    if !(plan.supervised && plan.mode == MpdControlMode::Exclusive) {
+        return;
+    }
+    let now = Instant::now();
+    let mut supervisor = supervision
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if supervisor.is_lapsed() {
+        // Terminal for this output instance: never restore on polling.
+        return;
+    }
+    if status_observes_foreign_song(status, owned_song_id) || status.observes_options_drift() {
+        supervisor.lapse();
+        return;
+    }
+    if observation_gap_exceeded(supervisor.last_observation, now) {
+        supervisor.lapse();
+        return;
+    }
+    supervisor.observe(now);
+}
+
 fn observe_supervision<C>(
     active: &Option<WorkerSession<C>>,
     owner: CommandOwner,
@@ -2713,23 +2749,7 @@ fn observe_supervision<C>(
     let Some(song_id) = session.song_id else {
         return;
     };
-    let now = Instant::now();
-    let mut supervisor = supervision
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if supervisor.is_lapsed() {
-        // Terminal for this output instance: never restore on polling.
-        return;
-    }
-    if status_observes_foreign_song(status, song_id) || status.observes_options_drift() {
-        supervisor.lapse();
-        return;
-    }
-    if observation_gap_exceeded(supervisor.last_observation, now) {
-        supervisor.lapse();
-        return;
-    }
-    supervisor.observe(now);
+    supervise_status(plan, supervision, status, song_id);
 }
 
 fn retire_status_if_stale<C>(
@@ -2920,6 +2940,25 @@ fn handle_control<C>(
     let Some(song_id) = session.song_id else {
         return;
     };
+    // The authoritative status above is itself supervision evidence:
+    // `apply_authoritative_status` lapses the supervisor when it observed
+    // option drift or a foreign current song, and the status round-trip may
+    // have consumed the remaining supervision window. Recheck authority
+    // immediately before issuing the control so a supervisor that just
+    // lapsed cannot send a partition-global command the evidence it just
+    // produced forbids. The refusal mirrors the worker gate: the localized
+    // exclusive-control-required error and no mutation of any kind — no
+    // control, no cleanup, no epoch burn.
+    if !supervision_authorizes(plan, supervision) {
+        fail_current(
+            owner,
+            MpdFailure::exclusive_control_required(),
+            intent_epoch,
+            cache,
+            event_tx,
+        );
+        return;
+    }
     let result = match kind {
         // `playid` begins the selected queue entry and therefore restarts a
         // paused song. Use MPD's explicit resume operation for Paused, but
@@ -3340,9 +3379,25 @@ where
             return CleanupOutcome::Stale;
         }
 
+        // The status this cleanup just fetched is supervision evidence:
+        // option drift or a foreign current song observed here (or the
+        // round-trip time itself) must be applied BEFORE the mutation
+        // decision below, exactly as the poll path would.
+        if let Ok(status) = &status {
+            supervise_status(plan, supervision, status, song_id);
+        }
+
         match status {
             Ok(status) if status.song_id == Some(song_id) => {
                 if status.state != MpdPlaybackState::Stopped {
+                    // The stop is a partition-global playback control: a
+                    // supervisor lapsed by the status above (or by the
+                    // status round-trip consuming the supervision window)
+                    // must not issue it. The targeted delete below keeps
+                    // its own authority gate.
+                    if !supervision_authorizes(plan, supervision) {
+                        return CleanupOutcome::Completed;
+                    }
                     let stopped = session.connection.stop(deadline);
                     if !is_current(owner, intent_epoch) {
                         if stopped
@@ -3439,6 +3494,20 @@ fn cleanup_unconditionally<C>(
         }
         let deadline = timing.deadline();
         let status = session.connection.status(deadline);
+        // The shutdown-time status is itself supervision evidence: option
+        // drift or a foreign current song observed here revokes authority
+        // even though the initial gate above passed, and the status
+        // round-trip may on its own have consumed the remaining supervision
+        // window. Apply the observation BEFORE any mutation decision, then
+        // recheck — a fresh-at-the-gate supervisor whose teardown status
+        // (or whose round-trip time) supplied disqualifying evidence must
+        // send neither the partition-global stop nor the targeted delete.
+        if let Ok(status) = &status {
+            supervise_status(plan, supervision, status, song_id);
+        }
+        if !supervision_authorizes(plan, supervision) {
+            return;
+        }
         let can_delete = match status {
             Ok(status) if status.song_id == Some(song_id) => {
                 if status.state == MpdPlaybackState::Stopped {
@@ -3459,6 +3528,12 @@ fn cleanup_unconditionally<C>(
             Err(failure) => failure.connection_usable,
         };
         if can_delete {
+            // The delete is a second mutation with its own round-trip between
+            // it and the last fresh evidence: recheck rather than letting the
+            // stop's duration (or the earlier status) speak for it.
+            if !supervision_authorizes(plan, supervision) {
+                return;
+            }
             let _ = session.connection.delete_id(song_id, deadline);
         }
     }
@@ -3682,6 +3757,13 @@ impl AudioOutput for MpdOutput {
 
     fn supports_volume(&self) -> bool {
         false
+    }
+
+    fn supervision_lapsed(&self) -> bool {
+        self.supervision
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_lapsed()
     }
 
     fn load_uri(&self, uri: &str) -> bool {
@@ -4892,6 +4974,80 @@ mod tests {
     }
 
     #[test]
+    fn supervised_control_refused_when_its_own_precontrol_status_observes_drift() {
+        // The TOCTOU window the corrective handoff flagged: the worker gate
+        // passes while the confirmation is still fresh, then the control's
+        // OWN pre-control status observes partition-option drift —
+        // `apply_authoritative_status` lapses the supervisor while the
+        // session is still ours. The control must not be issued anyway:
+        // authority is rechecked after the status is applied, immediately
+        // before the partition-global command goes to the wire.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(playing_status(0, 10_000));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/clean".to_string(),
+            },
+        );
+        harness.fence(owner);
+        assert!(
+            !harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the clean load must leave the supervisor armed"
+        );
+
+        // The NEXT status reply — the one the pause control itself fetches
+        // before issuing the command — reports our own song with drifted
+        // partition options.
+        let mut drifted = playing_status(0, 10_000);
+        drifted.repeat = true;
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(drifted);
+
+        harness.send(owner, CommandKind::Pause);
+        harness.fence(owner);
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the drift observed by the pre-control status must lapse the supervisor"
+        );
+        assert_eq!(
+            shared
+                .actions()
+                .iter()
+                .filter(|action| matches!(action, Action::Pause(_)))
+                .count(),
+            0,
+            "a control whose own pre-control status lapsed the supervisor must not be issued"
+        );
+        harness.shutdown();
+    }
+
+    #[test]
     fn supervised_worker_refuses_commands_whose_evidence_went_stale_between_polls() {
         // The audit's stale-between-polls case at the worker gate: no poll
         // has yet observed the observation gap (the harness polls only on
@@ -5147,6 +5303,152 @@ mod tests {
             0,
             "a lapsed supervisor must not issue the targeted delete"
         );
+    }
+
+    #[test]
+    fn supervised_shutdown_status_option_drift_sends_neither_stop_nor_delete() {
+        // The corrective handoff's second cleanup case: the supervisor is
+        // still FRESH at the initial teardown gate, but the shutdown-time
+        // status itself observes partition-option drift while reporting our
+        // own song. The observation must be applied and authority rechecked
+        // before either mutation — the ungated path would send `stop` and
+        // `deleteid` on evidence it never looked at.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(playing_status(0, 10_000));
+        let owner = harness.next_owner(3);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/quiet".to_string(),
+            },
+        );
+        harness.fence(owner);
+        assert!(
+            !harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the supervisor must still be armed when shutdown begins"
+        );
+
+        // The teardown status reports our own song (42) playing with
+        // drifted partition options.
+        let mut drifted = playing_status(0, 10_000);
+        drifted.repeat = true;
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(drifted);
+
+        let supervision = Arc::clone(&harness.supervision);
+        harness.shutdown();
+        assert!(
+            supervision.lock().expect("supervision lock").is_lapsed(),
+            "the drift observed by the shutdown status must lapse the supervisor"
+        );
+        let actions = shared.actions();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Point(Point::Stop)))
+                .count(),
+            0,
+            "teardown evidence that revokes authority must not be followed by a stop"
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Delete(42)))
+                .count(),
+            0,
+            "teardown evidence that revokes authority must not be followed by a delete"
+        );
+    }
+
+    #[test]
+    fn supervised_stop_cleanup_refused_when_its_own_status_observes_drift() {
+        // Same defect shape on the Stop command's StopOwned cleanup path:
+        // the worker gate passes on fresh evidence, then the cleanup's own
+        // status observes option drift. The stop is a partition-global
+        // playback control and must be gated on authority AFTER that
+        // observation, exactly like the targeted delete has always been.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(playing_status(0, 10_000));
+        let owner = harness.next_owner(3);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/clean".to_string(),
+            },
+        );
+        harness.fence(owner);
+
+        // The status fetched inside the stop cleanup reports our own song
+        // with drifted partition options.
+        let mut drifted = playing_status(0, 10_000);
+        drifted.repeat = true;
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(drifted);
+
+        harness.send(owner, CommandKind::Stop);
+        harness.fence(owner);
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the drift observed by the cleanup status must lapse the supervisor"
+        );
+        let actions = shared.actions();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Point(Point::Stop)))
+                .count(),
+            0,
+            "a stop whose own cleanup status lapsed the supervisor must not reach MPD"
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Delete(42)))
+                .count(),
+            0,
+            "the targeted delete stays gated behind lapsed authority"
+        );
+        harness.shutdown();
     }
 
     #[test]
