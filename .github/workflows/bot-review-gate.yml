@@ -7,8 +7,10 @@ name: Bot review gate
 #      "[bot]"-suffixed login) is not explicitly resolved — including threads
 #      GitHub marks outdated, because code movement is not evidence that a
 #      finding was addressed;
-#   2. a bot reviewer's latest review requests changes: an outstanding change
-#      request blocks even when it opened no inline thread;
+#   2. a bot reviewer's latest decisive review requests changes: only a
+#      CHANGES_REQUESTED, APPROVED or DISMISSED review carries a conclusion,
+#      so a comment-only review never clears an outstanding change request,
+#      and that request blocks even when it opened no inline thread;
 #   3. a bot reviewer's latest review predates the head being evaluated:
 #      bot-review evidence must be bound to the exact commit being merged.
 #
@@ -232,14 +234,19 @@ jobs:
                   } ];
 
             # Per-bot-author conclusion from the complete paginated review
-            # list. The author's LATEST review (databaseId grows
-            # monotonically within one pull request) decides:
+            # list. Only a DECISIVE review carries a conclusion
+            # (databaseId grows monotonically within one pull request);
+            # the author's latest decisive review decides:
             #   CHANGES_REQUESTED — an outstanding change request, wherever
             #                       it was made;
             #   DISMISSED         — formally withdrawn, no outstanding
             #                       conclusion left;
             #   anything else     — the review must be bound to the evaluated
             #                       head, or the evidence is stale.
+            # A comment-only review is never decisive: GitHub clears
+            # Request-changes only on a later approval or a formal dismissal,
+            # so ranking every state together would let a comment silently
+            # lift an outstanding change request.
             def bot_review_violations($head):
               [ .[]
                 | .data.repository.pullRequest.reviews.nodes[]
@@ -254,12 +261,17 @@ jobs:
                   } ]
               | group_by(.author)[]
               | (sort_by(.database_id) | last) as $latest
-              | if $latest.state == "CHANGES_REQUESTED" then
+              | (map(select(.state == "CHANGES_REQUESTED"
+                     or .state == "APPROVED"
+                     or .state == "DISMISSED"))
+                 | sort_by(.database_id)
+                 | last) as $decisive
+              | if $decisive.state == "CHANGES_REQUESTED" then
                   [ { reason: "outstanding_bot_change_request",
-                      author: $latest.author,
-                      review_head: $latest.review_head,
-                      url: $latest.url } ]
-                elif $latest.state == "DISMISSED" then []
+                      author: $decisive.author,
+                      review_head: $decisive.review_head,
+                      url: $decisive.url } ]
+                elif $decisive.state == "DISMISSED" then []
                 elif $latest.review_head != $head then
                   [ { reason: "stale_bot_review_evidence",
                       author: $latest.author,

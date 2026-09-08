@@ -1726,6 +1726,12 @@ fn bot_review_gate_script_binds_conclusions_to_the_evaluated_head() {
         "a bot change request must block the gate even when it opened no thread"
     );
     assert!(
+        script.contains("as $decisive"),
+        "conclusions must come from the author's latest decisive review \
+         (CHANGES_REQUESTED, APPROVED or DISMISSED): a comment-only review \
+         never clears an outstanding change request"
+    );
+    assert!(
         script.contains("DISMISSED"),
         "a formally dismissed review must clear its author's conclusion"
     );
