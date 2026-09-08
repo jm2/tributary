@@ -54,6 +54,8 @@ mod planner;
 mod types;
 
 #[cfg(test)]
+mod executor_rollback_directory_tests;
+#[cfg(test)]
 mod executor_rollback_tests;
 #[cfg(test)]
 mod executor_tests;

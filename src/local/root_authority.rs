@@ -668,10 +668,25 @@ impl MountedRootAuthority {
         let components = strict_relative_components(relative)?;
         self.validate()?;
         let parent = self.retain_write_parent_directory(&components)?;
+        Self::remove_regular_leaf_entry(self, &parent, &components)?;
+        drop(parent);
+        self.validate()
+    }
+
+    /// Remove the final component of `components` through the retained
+    /// parent, refusing a directory leaf with the typed `InvalidInput`
+    /// error. Per-platform leaf-removal body of
+    /// [`Self::remove_regular_file_within`].
+    fn remove_regular_leaf_entry(
+        authority: &Self,
+        parent: &RetainedWriteParent,
+        components: &[OsString],
+    ) -> io::Result<()> {
         #[cfg(unix)]
         {
             use rustix::fs::AtFlags;
 
+            let _ = authority;
             let leaf = components.last().expect("non-empty components").clone();
             let stat = match rustix::fs::statat(parent.handle(), &leaf, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(stat) => stat,
@@ -694,8 +709,8 @@ impl MountedRootAuthority {
             // never through its target. The retained parent is revalidated
             // immediately before the removal to narrow the pin-to-delete
             // window on a platform that cannot unlink through a handle.
-            parent.validate_with(self)?;
-            let final_path = join_components(&self.root, &components);
+            parent.validate_with(authority)?;
+            let final_path = join_components(&authority.root, components);
             let metadata = std::fs::symlink_metadata(&final_path)?;
             if metadata.is_dir() {
                 return Err(io::Error::new(
@@ -707,11 +722,10 @@ impl MountedRootAuthority {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = &parent;
+            let _ = (parent, components);
             return Err(unsupported_platform());
         }
-        drop(parent);
-        self.validate()
+        Ok(())
     }
 
     /// Remove the empty directory at `relative` beneath the retained root,
@@ -723,10 +737,25 @@ impl MountedRootAuthority {
         let components = strict_relative_components(relative)?;
         self.validate()?;
         let parent = self.retain_write_parent_directory(&components)?;
+        Self::remove_directory_leaf_entry(self, &parent, &components)?;
+        drop(parent);
+        self.validate()
+    }
+
+    /// Remove the final component of `components` through the retained
+    /// parent as an empty directory, refusing a non-directory leaf with the
+    /// typed `InvalidInput` error. Per-platform leaf-removal body of
+    /// [`Self::remove_directory_within`].
+    fn remove_directory_leaf_entry(
+        authority: &Self,
+        parent: &RetainedWriteParent,
+        components: &[OsString],
+    ) -> io::Result<()> {
         #[cfg(unix)]
         {
             use rustix::fs::AtFlags;
 
+            let _ = authority;
             let leaf = components.last().expect("non-empty components").clone();
             let stat = match rustix::fs::statat(parent.handle(), &leaf, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(stat) => stat,
@@ -744,8 +773,8 @@ impl MountedRootAuthority {
         }
         #[cfg(windows)]
         {
-            parent.validate_with(self)?;
-            let final_path = join_components(&self.root, &components);
+            parent.validate_with(authority)?;
+            let final_path = join_components(&authority.root, components);
             let metadata = std::fs::symlink_metadata(&final_path)?;
             if !metadata.is_dir() {
                 return Err(io::Error::new(
@@ -757,11 +786,10 @@ impl MountedRootAuthority {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = &parent;
+            let _ = (parent, components);
             return Err(unsupported_platform());
         }
-        drop(parent);
-        self.validate()
+        Ok(())
     }
 
     /// Create every component of `components` as a directory beneath the
@@ -2686,14 +2714,12 @@ fn rename_no_replace_within_parent(
             // staged leaf is best-effort: a failure leaves a hidden
             // temporary behind rather than lying about the publish.
             let _ = std::fs::remove_file(from_absolute);
-            return Ok(());
+            Ok(())
         }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "destination appeared before the no-replace publish",
-            ));
-        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "destination appeared before the no-replace publish",
+        )),
         // No hard-link support on this filesystem: fail closed rather than
         // publishing through an unbacked replace.
         Err(_) => Err(io::Error::new(
@@ -2719,6 +2745,27 @@ fn rename_no_replace_within_parent(
 /// absorbs an active concurrent writer without spinning.
 const REPLACE_BIND_ATTEMPTS: usize = 4;
 
+/// Rename the staged file over the destination after the occupant that was
+/// destroyed by the replace has been bound to `backup_leaf`. A failed
+/// rename releases the backup so the parent is not polluted with a hidden
+/// copy. Per-platform publication body shared by the hard-link bind and
+/// the commit-time copy-bind arms of [`replace_publish_loop`].
+#[cfg(unix)]
+fn rename_over_bound_backup(
+    parent: &File,
+    from_leaf: &OsStr,
+    to_leaf: &OsStr,
+    backup_leaf: &OsStr,
+) -> io::Result<()> {
+    use rustix::fs::{renameat, unlinkat, AtFlags};
+
+    if let Err(error) = renameat(parent, from_leaf, parent, to_leaf) {
+        let _ = unlinkat(parent, backup_leaf, AtFlags::empty());
+        return Err(io::Error::from(error));
+    }
+    Ok(())
+}
+
 /// The Overwrite publish loop shared by both platforms: bind the current
 /// occupant to the backup leaf, then replace it; when the name is absent,
 /// publish through the no-replace cascade and report a fresh publish. A
@@ -2735,7 +2782,7 @@ fn replace_publish_loop(
     backup_leaf: &OsStr,
     _backup_absolute: &Path,
 ) -> io::Result<bool> {
-    use rustix::fs::{linkat, renameat, unlinkat, AtFlags};
+    use rustix::fs::{linkat, AtFlags};
 
     for _ in 0..REPLACE_BIND_ATTEMPTS {
         // Bind the current occupant atomically: a hard link to the leaf
@@ -2746,12 +2793,7 @@ fn replace_publish_loop(
         // unknown flag bit and fail with `EINVAL`.
         match linkat(parent, to_leaf, parent, backup_leaf, AtFlags::empty()) {
             Ok(()) => {
-                if let Err(error) = renameat(parent, from_leaf, parent, to_leaf) {
-                    // The publish failed; release our backup so the parent
-                    // is not polluted with a hidden copy.
-                    let _ = unlinkat(parent, backup_leaf, AtFlags::empty());
-                    return Err(io::Error::from(error));
-                }
+                rename_over_bound_backup(parent, from_leaf, to_leaf, backup_leaf)?;
                 return Ok(true);
             }
             // Absent at bind time: publish no-replace so a concurrent
@@ -2782,10 +2824,7 @@ fn replace_publish_loop(
                 | rustix::io::Errno::MLINK,
             ) => match copy_bind_occupant_backup(parent, to_leaf, backup_leaf)? {
                 OccupantBackup::Bound => {
-                    if let Err(error) = renameat(parent, from_leaf, parent, to_leaf) {
-                        let _ = unlinkat(parent, backup_leaf, AtFlags::empty());
-                        return Err(io::Error::from(error));
-                    }
+                    rename_over_bound_backup(parent, from_leaf, to_leaf, backup_leaf)?;
                     return Ok(true);
                 }
                 // The occupant vanished (or was replaced) while it was being
@@ -2811,6 +2850,75 @@ enum OccupantBackup {
     Vanished,
 }
 
+/// Refuse to copy-bind an occupant that cannot be backed up safely: a
+/// directory must never be replaced by a file, and a symlink occupant
+/// cannot be opened no-follow, so without hard links there is no way to
+/// bind the link itself — fail closed rather than replacing it unbacked.
+#[cfg(unix)]
+fn classify_copy_bind_occupant(st_mode: rustix::fs::RawMode) -> io::Result<()> {
+    use rustix::fs::FileType;
+
+    if FileType::from_raw_mode(st_mode) == FileType::Directory {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to replace a directory with a file",
+        ));
+    }
+    if FileType::from_raw_mode(st_mode) == FileType::Symlink {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot bind a symlink occupant for backup on a filesystem without hard links",
+        ));
+    }
+    Ok(())
+}
+
+/// Open the backup leaf exclusively through the retained parent handle: a
+/// staged 0600 write-only file that must not already exist, so a backup
+/// sibling planted by a concurrent writer fails the bind instead of being
+/// overwritten.
+#[cfg(unix)]
+fn open_exclusive_backup_leaf(parent: &File, backup_leaf: &OsStr) -> io::Result<File> {
+    use rustix::fs::{openat, Mode, OFlags};
+
+    match openat(
+        parent,
+        backup_leaf,
+        OFlags::WRONLY
+            | OFlags::CREATE
+            | OFlags::EXCL
+            | OFlags::CLOEXEC
+            | OFlags::NOFOLLOW
+            | OFlags::NOCTTY,
+        Mode::from_bits_truncate(0o600),
+    ) {
+        Ok(backup) => Ok(File::from(backup)),
+        Err(rustix::io::Errno::EXIST) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "backup sibling appeared before the copy-bind",
+        )),
+        Err(error) => Err(io::Error::from(error)),
+    }
+}
+
+/// Verify the occupant of `to_leaf` still names the exact object that was
+/// copied: a replacement or a deletion discards the copy and the caller
+/// re-binds from the top.
+#[cfg(unix)]
+fn verify_occupant_identity(
+    parent: &File,
+    to_leaf: &OsStr,
+    before: &rustix::fs::Stat,
+) -> io::Result<bool> {
+    use rustix::fs::{statat, AtFlags};
+
+    match statat(parent, to_leaf, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(after) => Ok(after.st_dev == before.st_dev && after.st_ino == before.st_ino),
+        Err(rustix::io::Errno::NOENT) => Ok(false),
+        Err(error) => Err(io::Error::from(error)),
+    }
+}
+
 /// Copy the current occupant of `to_leaf` into `backup_leaf` through the
 /// retained parent handle, used when the filesystem offers no hard links
 /// for an atomic bind. The copy is verified against the occupant's identity
@@ -2830,21 +2938,7 @@ fn copy_bind_occupant_backup(
         Err(rustix::io::Errno::NOENT) => return Ok(OccupantBackup::Vanished),
         Err(error) => return Err(io::Error::from(error)),
     };
-    if rustix::fs::FileType::from_raw_mode(before.st_mode) == rustix::fs::FileType::Directory {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "refusing to replace a directory with a file",
-        ));
-    }
-    // A symlink occupant cannot be opened no-follow, and without hard
-    // links there is no way to bind the link itself: fail closed rather
-    // than replacing it unbacked.
-    if rustix::fs::FileType::from_raw_mode(before.st_mode) == rustix::fs::FileType::Symlink {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "cannot bind a symlink occupant for backup on a filesystem without hard links",
-        ));
-    }
+    classify_copy_bind_occupant(before.st_mode)?;
     let occupant = openat(
         parent,
         to_leaf,
@@ -2853,27 +2947,7 @@ fn copy_bind_occupant_backup(
     )
     .map_err(io::Error::from)?;
     let mut occupant_file = File::from(occupant);
-    let backup = openat(
-        parent,
-        backup_leaf,
-        OFlags::WRONLY
-            | OFlags::CREATE
-            | OFlags::EXCL
-            | OFlags::CLOEXEC
-            | OFlags::NOFOLLOW
-            | OFlags::NOCTTY,
-        Mode::from_bits_truncate(0o600),
-    );
-    let mut backup_file = match backup {
-        Ok(backup) => File::from(backup),
-        Err(rustix::io::Errno::EXIST) => {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "backup sibling appeared before the copy-bind",
-            ));
-        }
-        Err(error) => return Err(io::Error::from(error)),
-    };
+    let mut backup_file = open_exclusive_backup_leaf(parent, backup_leaf)?;
     let copied = std::io::copy(&mut occupant_file, &mut backup_file);
     let synced = backup_file.sync_all();
     drop(backup_file);
@@ -2881,20 +2955,16 @@ fn copy_bind_occupant_backup(
     // A failed or unverified copy leaves the backup leaf behind: remove it
     // so the parent is not polluted with a hidden partial copy.
     let bound = match copied.and(synced) {
-        Ok(()) => {
-            // The bind is only trustworthy if the name still holds the
-            // exact occupant that was copied. Anything else — a
-            // replacement, or a deletion — discards the copy and re-binds
-            // from the top.
-            match statat(parent, to_leaf, AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(after) => after.st_dev == before.st_dev && after.st_ino == before.st_ino,
-                Err(rustix::io::Errno::NOENT) => false,
-                Err(error) => {
-                    let _ = unlinkat(parent, backup_leaf, AtFlags::empty());
-                    return Err(io::Error::from(error));
-                }
+        // The bind is only trustworthy if the name still holds the exact
+        // occupant that was copied. Anything else — a replacement, or a
+        // deletion — discards the copy and re-binds from the top.
+        Ok(()) => match verify_occupant_identity(parent, to_leaf, &before) {
+            Ok(bound) => bound,
+            Err(error) => {
+                let _ = unlinkat(parent, backup_leaf, AtFlags::empty());
+                return Err(error);
             }
-        }
+        },
         Err(error) => {
             let _ = unlinkat(parent, backup_leaf, AtFlags::empty());
             return Err(error);

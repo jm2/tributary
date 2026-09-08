@@ -1,7 +1,7 @@
 //! The staged-write handle ([`PreparedWriteTarget`]) and the bound
 //! directory handle ([`MountedDirectory`]) produced by the write authority.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
@@ -140,31 +140,9 @@ impl PreparedWriteTarget {
                 io::Error::new(io::ErrorKind::InvalidInput, "final path is missing a leaf")
             })?
             .to_os_string();
-        let staged_file = self
-            .staged_file
-            .take()
-            .expect("staged handle is open until commit");
-        staged_file.sync_all()?;
-        drop(staged_file);
+        self.flush_and_close_staged()?;
         let replaced_original = if self.resolution == ConflictResolution::Overwrite {
-            let backup_leaf = backup_leaf_name();
-            let mut backup_relative = self
-                .final_relative_path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_default();
-            backup_relative.push(backup_leaf.as_os_str());
-            let backup_absolute = self.authority.root().join(&backup_relative);
-            let replaced = self.authority.replace_within_directory(
-                &self.parent,
-                &self.staged_leaf,
-                &self.staged_path,
-                &final_leaf,
-                &final_path,
-                backup_leaf.as_os_str(),
-                &backup_absolute,
-            )?;
-            replaced.then_some(backup_relative)
+            self.publish_overwrite_with_backup(&final_leaf, &final_path)?
         } else {
             self.authority.rename_within_directory(
                 &self.parent,
@@ -183,6 +161,51 @@ impl PreparedWriteTarget {
             resolution: self.resolution,
             replaced_original,
         })
+    }
+
+    /// Flush the staged handle to disk and close it before any publish
+    /// step. Windows refuses to rename or delete a file while a handle
+    /// without `FILE_SHARE_DELETE` is open, and a publish must not depend
+    /// on handle sharing modes anywhere.
+    fn flush_and_close_staged(&mut self) -> io::Result<()> {
+        let staged_file = self
+            .staged_file
+            .take()
+            .expect("staged handle is open until commit");
+        staged_file.sync_all()?;
+        drop(staged_file);
+        Ok(())
+    }
+
+    /// Publish the staged file over an existing occupant by replace, never
+    /// unbacked: the occupant of the destination name is bound to a hidden
+    /// backup sibling at commit time (a hard link where the filesystem
+    /// supports them, else a verified commit-time copy), and the backup's
+    /// relative path is returned so the caller can restore exactly the
+    /// bytes that were destroyed.
+    fn publish_overwrite_with_backup(
+        &self,
+        final_leaf: &OsStr,
+        final_path: &Path,
+    ) -> io::Result<Option<PathBuf>> {
+        let backup_leaf = backup_leaf_name();
+        let mut backup_relative = self
+            .final_relative_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        backup_relative.push(backup_leaf.as_os_str());
+        let backup_absolute = self.authority.root().join(&backup_relative);
+        let replaced = self.authority.replace_within_directory(
+            &self.parent,
+            &self.staged_leaf,
+            &self.staged_path,
+            final_leaf,
+            final_path,
+            backup_leaf.as_os_str(),
+            &backup_absolute,
+        )?;
+        Ok(replaced.then_some(backup_relative))
     }
 
     /// Discard the staged file and any partial writes.
