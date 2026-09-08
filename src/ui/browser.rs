@@ -418,9 +418,12 @@ pub fn build_browser(
     }
 
     // ── Layout ───────────────────────────────────────────────────────
+    // Spacing must stay 0: the separators appended below are the gutter,
+    // and Box spacing adds pixels on both sides of each separator,
+    // widening every 1px gutter to 3px (2026-09-07 review rejection).
     let panes_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(1)
+        .spacing(0)
         .vexpand(true)
         .build();
     // A real 1px `.browser-separator` gutter between the panes (HIG: a
