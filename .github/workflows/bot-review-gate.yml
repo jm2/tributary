@@ -32,7 +32,10 @@ name: Bot review gate
 # is a webhook event, not an Actions trigger), so after resolving threads the
 # check is refreshed by re-running it or by dispatching:
 #   gh workflow run bot-review-gate.yml --ref <head branch> -f pr_number=<n>
-# The failure output prints both paths. Everything else refreshes itself:
+#   (a dispatch is bound to the pull request head: the run is attached to the
+#   dispatched ref's tip, so any ref whose tip is not the pull request head
+#   is refused). The failure output prints both paths. Everything else
+#   refreshes itself:
 #   * pull_request synchronize re-evaluates at every new head;
 #   * pull_request_review submitted/edited/dismissed re-evaluates when a
 #     conclusion is made, revised, or formally withdrawn;
@@ -117,6 +120,18 @@ jobs:
           fi
           if [ -n "${EVENT_HEAD_SHA}" ] && [ "${EVENT_HEAD_SHA}" != "${rest_head}" ]; then
             echo "Event head ${EVENT_HEAD_SHA} no longer matches pull request head ${rest_head}; a newer event will re-evaluate; failing closed." >&2
+            exit 1
+          fi
+          # A workflow_dispatch run is attached to the dispatched ref's tip
+          # (GITHUB_SHA), while pr_number only names the pull request to
+          # evaluate. Dispatching on any other ref would attach this pull
+          # request's required check to a run whose evidence was evaluated at
+          # a different commit, so the dispatch is accepted only when the
+          # dispatched tip is exactly the pull request head — the documented
+          # refresh path dispatches on the head branch, which satisfies this
+          # by construction.
+          if [ -z "${EVENT_HEAD_SHA}" ] && [ "${GITHUB_SHA:-}" != "${rest_head}" ]; then
+            echo "Dispatched ref head ${GITHUB_SHA:-<unset>} is not pull request head ${rest_head}; dispatch on the pull request's head branch; failing closed." >&2
             exit 1
           fi
 

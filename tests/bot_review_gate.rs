@@ -134,13 +134,25 @@ impl GateSandbox {
     }
 
     fn run(&self, event_name: &str, event_head_sha: Option<&str>) -> Output {
+        self.run_with_github_sha(event_name, event_head_sha, None)
+    }
+
+    /// Runs the gate with an explicit `GITHUB_SHA`, the runner-injected tip
+    /// of the ref an event (notably `workflow_dispatch`) executed against.
+    fn run_with_github_sha(
+        &self,
+        event_name: &str,
+        event_head_sha: Option<&str>,
+        github_sha: Option<&str>,
+    ) -> Output {
         let script_path = self.root.join("gate.sh");
         std::fs::write(&script_path, gate_run_script()).expect("gate script must be writable");
 
         let system_path = std::env::var("PATH").unwrap_or_default();
         let path = format!("{}:{system_path}", self.root.join("bin").display());
 
-        Command::new("bash")
+        let mut command = Command::new("bash");
+        command
             .arg(&script_path)
             .env("PATH", path)
             .env("GH_TOKEN", "stub-token")
@@ -150,7 +162,11 @@ impl GateSandbox {
             .env("EVENT_HEAD_SHA", event_head_sha.unwrap_or(""))
             .env("RUNNER_TEMP", self.root.join("runner-temp"))
             .env("GH_STUB_PAGES", self.root.join("pages"))
-            .env("GH_STUB_STATE", self.root.join("state"))
+            .env("GH_STUB_STATE", self.root.join("state"));
+        if let Some(sha) = github_sha {
+            command.env("GITHUB_SHA", sha);
+        }
+        command
             .output()
             .expect("the gate script must be runnable under bash")
     }
@@ -322,6 +338,41 @@ fn stale_bot_review_evidence_blocks() {
 }
 
 #[test]
+fn dispatch_on_a_ref_other_than_the_head_is_refused() {
+    // A workflow_dispatch run is attached to the dispatched ref's tip
+    // (GITHUB_SHA) while pr_number only names the pull request to evaluate.
+    // A dispatch on any other ref — another branch, or main — would attach
+    // this pull request's required check to a run whose evidence was
+    // evaluated at a different commit, so the gate must refuse it before
+    // evaluating anything.
+    let sandbox = GateSandbox::new("dispatch-cross-bound");
+    sandbox.use_scenario("clean");
+    let output = sandbox.run_with_github_sha("workflow_dispatch", None, Some(OTHER_SHA));
+    assert_blocked(&output, &[], "is not pull request head");
+}
+
+#[test]
+fn dispatch_on_the_head_branch_publishes_evidence_at_that_head() {
+    // The documented refresh path dispatches on the head branch, whose tip
+    // equals the pull request head, so the run must proceed and publish its
+    // result bound to exactly that head.
+    let sandbox = GateSandbox::new("dispatch-head-bound");
+    sandbox.use_scenario("clean");
+    let output = sandbox.run_with_github_sha("workflow_dispatch", None, Some(HEAD_SHA));
+    assert!(
+        output.status.success(),
+        "the documented dispatch refresh path must pass on the head branch:\n{}",
+        report(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("clean at {HEAD_SHA}")),
+        "the dispatched run must publish evidence at the pull request head:\n{}",
+        report(&output)
+    );
+}
+
+#[test]
 fn reviews_beyond_the_first_pagination_page_reach_the_decisions() {
     let output = run_scenario("review-pagination-boundary", "pull_request", Some(HEAD_SHA));
     assert_blocked(
@@ -360,9 +411,12 @@ fn head_moved_during_evaluation_fails_closed() {
 #[test]
 fn workflow_dispatch_derives_the_head_from_the_pull_request() {
     // workflow_dispatch carries no pull-request context, so the head comes
-    // from the pull request record itself — the documented resolution
-    // refresh path.
-    let output = run_scenario("dispatch", "workflow_dispatch", None);
+    // from the pull request record itself, bound to the dispatched ref's
+    // tip — the documented resolution refresh path dispatches on the head
+    // branch, whose tip is the pull request head.
+    let sandbox = GateSandbox::new("dispatch");
+    sandbox.use_scenario("dispatch");
+    let output = sandbox.run_with_github_sha("workflow_dispatch", None, Some(HEAD_SHA));
     assert!(
         output.status.success(),
         "a dispatched refresh of clean evidence must pass:\n{}",
