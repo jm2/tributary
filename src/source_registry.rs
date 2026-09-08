@@ -138,11 +138,21 @@ impl RemovableMutationTarget {
     ///
     /// Fails closed when the owning session was retired, when the mount or
     /// retained evidence changed, or when the exact pathname no longer names
-    /// the admitted file at commit time. Blocking — worker threads only.
+    /// the admitted file at commit time. A pass through the active check
+    /// atomically acquires one in-flight lease permit and holds it until the
+    /// write commits or rolls back, so a retirement that begins mid-write is
+    /// serialized behind this section instead of revoking the authority
+    /// underneath an observed-but-unadmitted check. Blocking — worker threads
+    /// only.
     pub fn write_tags(&self, edits: &crate::local::tag_writer::TagEdits) -> anyhow::Result<()> {
-        if !self.lease.is_active() {
-            anyhow::bail!("The removable media source is no longer active");
-        }
+        // Acquire — never merely observe — the lease. `is_active()` followed
+        // by a write leaves a revocation window between the two steps; a
+        // permit makes admission and revocation mutually exclusive, and the
+        // revoker waits until this section ends.
+        let _write_section = self
+            .lease
+            .try_acquire()
+            .ok_or_else(|| anyhow::anyhow!("The removable media source is no longer active"))?;
         crate::local::tag_writer::write_tags_with_mutation_target(&self.inner, edits)
     }
 }
@@ -7469,6 +7479,149 @@ mod tests {
         assert!(registry.release_provenance(source_id, claim));
         wait_until_pruned(&registry, source_id).await;
         assert!(!resolved.is_active());
+        registry.shutdown().wait().await;
+    }
+
+    /// A resolved removable mutation target authorizes writes only while its
+    /// owning session is live: a full retirement must refuse the next commit
+    /// even though every retained filesystem object is still untouched, and
+    /// the refused write must leave the admitted file byte-identical.
+    #[tokio::test]
+    async fn retired_removable_session_refuses_its_retained_mutation_target() {
+        let registry = registry();
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let path = mount.path().join("tagged.flac");
+        write_tagged_removable_fixture(&path, "Before Retirement", "Fixture Artist", None);
+        let source_id = SourceId::removable("registry:test:mutation-retire")
+            .expect("removable source identity");
+        let claim = registry
+            .claim_provenance(source_id, SourceProvenance::Removable)
+            .expect("claim removable source");
+        registry
+            .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+            .expect("removable connection admitted");
+        let (_, session_epoch) = wait_for_catalogue(&registry, source_id).await;
+        let track_id = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .and_then(|catalogue| catalogue.value.tracks().first().cloned())
+            .and_then(|track| track.native_track_id)
+            .expect("accepted track identity");
+
+        let target = registry
+            .resolve_mutation_target(source_id, session_epoch, track_id)
+            .await
+            .expect("resolve retained mutation target");
+        assert!(target.is_active());
+
+        // The live session admits a write through the retained authority.
+        target
+            .write_tags(&crate::local::tag_writer::TagEdits {
+                title: Some("Retirement Pending".to_string()),
+                ..Default::default()
+            })
+            .expect("a live session authorizes its mutation target");
+
+        // Retirement revokes the lease the target carries: the write
+        // authority must die with the session even though the mount, the
+        // retained ancestry, and the exact file are all still valid.
+        assert!(registry.release_provenance(source_id, claim));
+        wait_until_pruned(&registry, source_id).await;
+        assert!(!target.is_active());
+
+        target
+            .write_tags(&crate::local::tag_writer::TagEdits {
+                title: Some("After Retirement".to_string()),
+                ..Default::default()
+            })
+            .expect_err("a retired session must never authorize a commit");
+
+        let tagged = lofty::read_from_path(&path).expect("reopen untouched fixture");
+        use lofty::file::TaggedFileExt;
+        use lofty::tag::Accessor;
+        assert_eq!(
+            tagged
+                .primary_tag()
+                .expect("primary tag")
+                .title()
+                .as_deref(),
+            Some("Retirement Pending"),
+            "the refused write must leave the admitted file untouched"
+        );
+        registry.shutdown().wait().await;
+    }
+
+    /// Revocation racing a tag write can serialize in either order, and both
+    /// must be consistent: either the write was admitted first — revocation
+    /// waits behind its in-flight permit and the tags land — or retirement
+    /// landed first and the write is refused at admission with the file
+    /// untouched. No order may tear the file or lose the retirement.
+    #[tokio::test]
+    async fn revocation_during_a_removable_tag_write_never_tears_the_outcome() {
+        let registry = registry();
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let path = mount.path().join("tagged.flac");
+        write_tagged_removable_fixture(&path, "Before Retirement", "Fixture Artist", None);
+        let source_id =
+            SourceId::removable("registry:test:mutation-race").expect("removable source identity");
+        let claim = registry
+            .claim_provenance(source_id, SourceProvenance::Removable)
+            .expect("claim removable source");
+        registry
+            .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+            .expect("removable connection admitted");
+        let (_, session_epoch) = wait_for_catalogue(&registry, source_id).await;
+        let track_id = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .and_then(|catalogue| catalogue.value.tracks().first().cloned())
+            .and_then(|track| track.native_track_id)
+            .expect("accepted track identity");
+
+        let target = registry
+            .resolve_mutation_target(source_id, session_epoch, track_id)
+            .await
+            .expect("resolve retained mutation target");
+        let writer_target = target.clone();
+        let writer = std::thread::spawn(move || {
+            writer_target
+                .write_tags(&crate::local::tag_writer::TagEdits {
+                    title: Some("Mid-Flight Title".to_string()),
+                    ..Default::default()
+                })
+                .is_ok()
+        });
+
+        // Retire while the write may be mid-flight. An admitted section
+        // holds its lease permit until commit or rollback, so a revocation
+        // that began after admission cannot invalidate authority underneath
+        // the write; it must wait for the section to end.
+        assert!(registry.release_provenance(source_id, claim));
+        let admitted = writer.join().expect("writer thread finishes");
+        wait_until_pruned(&registry, source_id).await;
+        assert!(!target.is_active());
+
+        let tagged = lofty::read_from_path(&path).expect("reopen fixture");
+        use lofty::file::TaggedFileExt;
+        use lofty::tag::Accessor;
+        let title = tagged
+            .primary_tag()
+            .expect("primary tag")
+            .title()
+            .as_deref()
+            .expect("fixture keeps a title")
+            .to_string();
+        if admitted {
+            assert_eq!(
+                title, "Mid-Flight Title",
+                "an admitted write must complete even when revocation began mid-flight"
+            );
+        } else {
+            assert_eq!(
+                title, "Before Retirement",
+                "a write refused at admission must leave the admitted file untouched"
+            );
+        }
         registry.shutdown().wait().await;
     }
 
