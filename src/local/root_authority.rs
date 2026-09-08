@@ -566,12 +566,12 @@ impl MountedRootAuthority {
     /// cannot redirect it: the rename lands in the exact audited directory
     /// object or fails. When `no_replace` is set the publication fails if
     /// the final leaf already exists; the platform-native no-replace rename
-    /// is tried first, then a link-based publish, and finally an
-    /// exclusive-reservation publish for filesystems that offer neither. On
-    /// Windows the no-replace publish mirrors that cascade with safe path
-    /// operations — a hard-link publish first, then the exclusive
-    /// reservation — and the retained parent identity is revalidated
-    /// immediately before and after.
+    /// is tried first, then a link-based publish, and filesystems offering
+    /// neither primitive fail closed with `Unsupported` — see
+    /// [`Self::rename_no_replace_within`]. On Windows the no-replace publish
+    /// mirrors that cascade with safe path operations — a hard-link publish,
+    /// then the same fail-closed refusal — and the retained parent identity
+    /// is revalidated immediately before and after.
     pub(super) fn rename_within_directory(
         &self,
         parent: &RetainedWriteParent,
@@ -605,22 +605,74 @@ impl MountedRootAuthority {
         parent.validate_with(self)
     }
 
+    /// Replace the leaf at `to_leaf` with `from_leaf` inside the retained
+    /// write parent, binding a backup of the replaced occupant first.
+    ///
+    /// This is the Overwrite publish. The occupant — whatever name
+    /// `to_leaf` resolves to at the moment of replacement — is bound to
+    /// `backup_leaf` so the caller can restore it on rollback, and the
+    /// returned flag reports whether an occupant was actually replaced:
+    ///
+    /// * `Ok(true)` — `to_leaf` was occupied; the backup names the exact
+    ///   replaced bytes (hard-link bind, or a commit-time copy-bind on
+    ///   filesystems without hard links).
+    /// * `Ok(false)` — `to_leaf` was absent; the staged leaf took the name
+    ///   through the no-replace publish, so a concurrent creation is never
+    ///   silently replaced-and-deleted. A creation racing the no-replace
+    ///   publish re-enters the bind loop above and is backed up instead.
+    ///
+    /// A directory occupant is refused with a typed `InvalidInput` error —
+    /// a file publish never replaces a directory. The retained parent is
+    /// revalidated immediately before and after, exactly like
+    /// [`Self::rename_within_directory`].
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn replace_within_directory(
+        &self,
+        parent: &RetainedWriteParent,
+        from_leaf: &OsStr,
+        from_absolute: &Path,
+        to_leaf: &OsStr,
+        to_absolute: &Path,
+        backup_leaf: &OsStr,
+        backup_absolute: &Path,
+    ) -> io::Result<bool> {
+        validate_leaf_name(from_leaf)?;
+        validate_leaf_name(to_leaf)?;
+        validate_leaf_name(backup_leaf)?;
+        parent.validate_with(self)?;
+        let replaced = replace_publish_loop(
+            parent.handle(),
+            from_leaf,
+            from_absolute,
+            to_leaf,
+            to_absolute,
+            backup_leaf,
+            backup_absolute,
+        )?;
+        parent.validate_with(self)?;
+        Ok(replaced)
+    }
+
     /// Remove the regular file at `relative` beneath the retained root.
     ///
-    /// On Unix the removal is anchored to the retained root: the parent
-    /// directory is walked no-follow from the retained root handle and the
-    /// leaf is unlinked through its handle, so an intermediate symlink or
-    /// replaced directory cannot redirect the removal. The final leaf must
-    /// not be a directory; a symlink is removed as a link.
+    /// Every platform walks the intermediate components no-follow from the
+    /// retained root and retains the leaf's parent directory for the
+    /// duration of the removal: Unix through parent-directory handles, and
+    /// Windows through reparse-refusing directory opens that pin each walk
+    /// level, so an intermediate symlink or replaced directory cannot
+    /// redirect the removal outside the retained root. The final leaf is
+    /// typed no-follow: it must not be a directory (a typed `InvalidInput`
+    /// refusal, not a platform permission error); a symlink is removed as a
+    /// link.
     pub(super) fn remove_regular_file_within(&self, relative: &Path) -> io::Result<()> {
         let components = strict_relative_components(relative)?;
         self.validate()?;
+        let parent = self.retain_write_parent_directory(&components)?;
         #[cfg(unix)]
         {
             use rustix::fs::AtFlags;
 
             let leaf = components.last().expect("non-empty components").clone();
-            let parent = self.retain_write_parent_directory(&components)?;
             let stat = match rustix::fs::statat(parent.handle(), &leaf, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(stat) => stat,
                 Err(error) => return Err(io::Error::from(error)),
@@ -637,28 +689,45 @@ impl MountedRootAuthority {
         }
         #[cfg(windows)]
         {
+            // The leaf is typed no-follow through `symlink_metadata`, so a
+            // symlink or junction leaf is removed (or refused) as itself,
+            // never through its target. The retained parent is revalidated
+            // immediately before the removal to narrow the pin-to-delete
+            // window on a platform that cannot unlink through a handle.
+            parent.validate_with(self)?;
             let final_path = join_components(&self.root, &components);
+            let metadata = std::fs::symlink_metadata(&final_path)?;
+            if metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to remove a directory through remove_relative_file",
+                ));
+            }
             std::fs::remove_file(&final_path)?;
         }
         #[cfg(not(any(unix, windows)))]
         {
+            let _ = &parent;
             return Err(unsupported_platform());
         }
+        drop(parent);
         self.validate()
     }
 
     /// Remove the empty directory at `relative` beneath the retained root,
     /// anchored to the retained root exactly like
-    /// [`Self::remove_regular_file_within`].
+    /// [`Self::remove_regular_file_within`]. The final leaf must be a real
+    /// directory; a symlink or junction leaf is refused with a typed
+    /// `InvalidInput` error instead of being unlinked through its target.
     pub(super) fn remove_directory_within(&self, relative: &Path) -> io::Result<()> {
         let components = strict_relative_components(relative)?;
         self.validate()?;
+        let parent = self.retain_write_parent_directory(&components)?;
         #[cfg(unix)]
         {
             use rustix::fs::AtFlags;
 
             let leaf = components.last().expect("non-empty components").clone();
-            let parent = self.retain_write_parent_directory(&components)?;
             let stat = match rustix::fs::statat(parent.handle(), &leaf, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(stat) => stat,
                 Err(error) => return Err(io::Error::from(error)),
@@ -675,13 +744,23 @@ impl MountedRootAuthority {
         }
         #[cfg(windows)]
         {
+            parent.validate_with(self)?;
             let final_path = join_components(&self.root, &components);
+            let metadata = std::fs::symlink_metadata(&final_path)?;
+            if !metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to remove a non-directory through remove_relative_directory",
+                ));
+            }
             std::fs::remove_dir(&final_path)?;
         }
         #[cfg(not(any(unix, windows)))]
         {
+            let _ = &parent;
             return Err(unsupported_platform());
         }
+        drop(parent);
         self.validate()
     }
 
@@ -2519,24 +2598,27 @@ fn rename_within_parent(
 /// No-replace rename of `from_leaf` to `to_leaf` inside the retained parent.
 ///
 /// The platform-native no-replace rename is tried first: `renameat_with`
-/// with `RENAME_NOREPLACE`, backed by `renameat2` on Linux/Android and the
-/// flagged renamer (`renameatx_np`) on Apple platforms. Filesystems that do
-/// not implement the flag — FAT and exFAT USB mounts return `EINVAL`/
-/// `ENOSYS`, for example — fall back to a link-based publish, which is
-/// atomic and fails with `EEXIST` on a collision; the staged leaf is then
-/// unlinked. Filesystems without hard links (also common on FAT) fall back
-/// to an exclusive-reservation publish: the destination leaf is created
-/// exclusively as a private placeholder and the staged leaf is renamed over
-/// it, so a collision fails definitively and no pre-existing or concurrently
-/// created file can ever be replaced. A collision detected by any strategy
-/// is a definitive failure that leaves the destination untouched.
+/// with `RENAME_NOREPLACE`, which rustix backs with `renameat2` on
+/// Linux/Android and with the weak-linked `renameatx_np` flagged renamer on
+/// Apple platforms (macOS 10.12 and later; the macOS (aarch64) CI run at
+/// the rework head passed through this path). Filesystems that do not
+/// implement the flag — FAT and exFAT USB mounts return `EINVAL`/`ENOSYS`,
+/// for example — fall back to a link-based publish, which is atomic and
+/// fails with `EEXIST` on a collision; the staged leaf is then unlinked.
+/// Filesystems offering neither primitive fail closed with `Unsupported`
+/// and the staged file is left for the caller's normal discard path: the
+/// historical exclusive-reservation fallback reserved the destination name
+/// against creation but not against a later unlink, so another writer could
+/// remove the placeholder, create the leaf, and the replacing rename would
+/// have destroyed that writer's file — with the failure-path unlink then
+/// deleting it outright.
 #[cfg(unix)]
 fn rename_no_replace_within_parent(
     parent: &File,
     from_leaf: &OsStr,
-    from_absolute: &Path,
+    _from_absolute: &Path,
     to_leaf: &OsStr,
-    to_absolute: &Path,
+    _to_absolute: &Path,
 ) -> io::Result<()> {
     use rustix::fs::{linkat, renameat_with, unlinkat, AtFlags, RenameFlags};
 
@@ -2575,70 +2657,21 @@ fn rename_no_replace_within_parent(
         Err(error) => return Err(io::Error::from(error)),
     }
 
-    publish_by_exclusive_reservation(parent, from_leaf, from_absolute, to_leaf, to_absolute)
-}
-
-/// Final no-replace strategy for filesystems offering neither rename flags
-/// nor hard links.
-///
-/// The destination leaf is created exclusively (`O_CREAT | O_EXCL`) as a
-/// private placeholder, then the staged leaf is renamed over it. Any other
-/// creator loses the exclusive create and learns the name is taken, so the
-/// only bytes the replace can ever discard are the placeholder's own —
-/// unlike an existence probe bracketing a plain rename, which could replace
-/// a file created inside the probe-to-rename window. A failed replace
-/// unlinks the placeholder best-effort so the name is released cleanly; it
-/// held only bytes this call created. Both steps stay anchored to the
-/// retained parent handle.
-#[cfg(unix)]
-fn publish_by_exclusive_reservation(
-    parent: &File,
-    from_leaf: &OsStr,
-    from_absolute: &Path,
-    to_leaf: &OsStr,
-    to_absolute: &Path,
-) -> io::Result<()> {
-    use rustix::fs::{unlinkat, AtFlags, Mode, OFlags};
-
-    let reserved = rustix::fs::openat(
-        parent,
-        to_leaf,
-        OFlags::WRONLY
-            | OFlags::CREATE
-            | OFlags::EXCL
-            | OFlags::CLOEXEC
-            | OFlags::NOFOLLOW
-            | OFlags::NOCTTY,
-        Mode::from_bits_truncate(0o600),
-    );
-    match reserved {
-        // The name is reserved. Close the placeholder immediately: the
-        // publish replaces the directory entry, not this open descriptor.
-        Ok(reserved) => drop(reserved),
-        Err(rustix::io::Errno::EXIST) => {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "destination appeared before the no-replace publish",
-            ));
-        }
-        Err(error) => return Err(io::Error::from(error)),
-    }
-    if let Err(error) = rename_within_parent(parent, from_leaf, from_absolute, to_leaf, to_absolute)
-    {
-        // Release the reserved name so a retry sees a clean directory; the
-        // placeholder never held caller data.
-        let _ = unlinkat(parent, to_leaf, AtFlags::empty());
-        return Err(error);
-    }
-    Ok(())
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "filesystem offers neither no-replace rename nor hard links; refusing an unsafe publish",
+    ))
 }
 
 /// Windows no-replace publish, mirroring the Unix strategy cascade with
 /// safe `std` operations. A hard-link publish is tried first: creating the
 /// link fails when the final leaf exists, so the publish is atomic and a
 /// collision is a definitive failure. Filesystems without hard-link support
-/// — FAT and exFAT USB mounts — fall back to the exclusive-reservation
-/// publish.
+/// — FAT and exFAT USB mounts — fail closed with `Unsupported` and the
+/// staged file is left for the caller's normal discard path, mirroring the
+/// Unix reservation-fallback removal: an exclusive placeholder cannot
+/// reserve a name against a later unlink, so the replacing rename could
+/// have destroyed another writer's file.
 #[cfg(windows)]
 fn rename_no_replace_within_parent(
     _parent: &File,
@@ -2661,48 +2694,13 @@ fn rename_no_replace_within_parent(
                 "destination appeared before the no-replace publish",
             ));
         }
-        // No hard-link support on this filesystem: fall through to the
-        // exclusive-reservation publish below.
-        Err(_) => {}
+        // No hard-link support on this filesystem: fail closed rather than
+        // publishing through an unbacked replace.
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "filesystem offers neither no-replace rename nor hard links; refusing an unsafe publish",
+        )),
     }
-    publish_no_replace_by_reservation(from_absolute, to_absolute)
-}
-
-/// Final no-replace strategy for filesystems offering no hard links.
-///
-/// The destination leaf is created exclusively as a private placeholder,
-/// then the staged leaf is renamed over it. Any other exclusive creator
-/// loses and learns the name is taken, so the only bytes the replace can
-/// ever discard are the placeholder's own — unlike an existence probe
-/// bracketing a plain rename, which could replace a file created inside the
-/// probe-to-rename window. A failed replace removes the placeholder
-/// best-effort so the name is released cleanly; it held only bytes this
-/// call created.
-#[cfg(windows)]
-fn publish_no_replace_by_reservation(from_absolute: &Path, to_absolute: &Path) -> io::Result<()> {
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(to_absolute)
-    {
-        // The name is reserved. Close the placeholder immediately: the
-        // publish replaces the directory entry, not this handle.
-        Ok(reserved) => drop(reserved),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "destination appeared before the no-replace publish",
-            ));
-        }
-        Err(error) => return Err(error),
-    }
-    if let Err(error) = std::fs::rename(from_absolute, to_absolute) {
-        // Release the reserved name so a retry sees a clean directory; the
-        // placeholder never held caller data.
-        let _ = std::fs::remove_file(to_absolute);
-        return Err(error);
-    }
-    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -2714,6 +2712,268 @@ fn rename_no_replace_within_parent(
     _to_absolute: &Path,
 ) -> io::Result<()> {
     Err(unsupported_platform())
+}
+
+/// How many times the replace publish may re-bind a changing occupant
+/// before it gives up as a definitive collision. A bound of a few rounds
+/// absorbs an active concurrent writer without spinning.
+const REPLACE_BIND_ATTEMPTS: usize = 4;
+
+/// The Overwrite publish loop shared by both platforms: bind the current
+/// occupant to the backup leaf, then replace it; when the name is absent,
+/// publish through the no-replace cascade and report a fresh publish. A
+/// collision during the no-replace publish means an occupant appeared and
+/// must be bound, so the loop retries with a small bound. Returns whether
+/// an occupant was replaced (and therefore backed up).
+#[cfg(unix)]
+fn replace_publish_loop(
+    parent: &File,
+    from_leaf: &OsStr,
+    from_absolute: &Path,
+    to_leaf: &OsStr,
+    to_absolute: &Path,
+    backup_leaf: &OsStr,
+    _backup_absolute: &Path,
+) -> io::Result<bool> {
+    use rustix::fs::{linkat, renameat, unlinkat, AtFlags};
+
+    for _ in 0..REPLACE_BIND_ATTEMPTS {
+        // Bind the current occupant atomically: a hard link to the leaf
+        // names exactly the bytes (or link itself) the replace below will
+        // remove, so rollback can always restore what was destroyed.
+        // `linkat` never follows the old path unless `AT_SYMLINK_FOLLOW`
+        // is supplied — passing `SYMLINK_NOFOLLOW` here would be an
+        // unknown flag bit and fail with `EINVAL`.
+        match linkat(parent, to_leaf, parent, backup_leaf, AtFlags::empty()) {
+            Ok(()) => {
+                if let Err(error) = renameat(parent, from_leaf, parent, to_leaf) {
+                    // The publish failed; release our backup so the parent
+                    // is not polluted with a hidden copy.
+                    let _ = unlinkat(parent, backup_leaf, AtFlags::empty());
+                    return Err(io::Error::from(error));
+                }
+                return Ok(true);
+            }
+            // Absent at bind time: publish no-replace so a concurrent
+            // creation is never silently replaced-and-deleted. A collision
+            // means the creation won the race — loop back and bind it.
+            Err(rustix::io::Errno::NOENT) => {
+                match rename_no_replace_within_parent(
+                    parent,
+                    from_leaf,
+                    from_absolute,
+                    to_leaf,
+                    to_absolute,
+                ) {
+                    Ok(()) => return Ok(false),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            // Hard links unavailable: copy-bind the occupant at commit
+            // time. The bind is verified against the occupant's identity
+            // immediately before the replace, shrinking the unbound window
+            // to the rename itself.
+            Err(
+                rustix::io::Errno::PERM
+                | rustix::io::Errno::OPNOTSUPP
+                | rustix::io::Errno::NOSYS
+                | rustix::io::Errno::XDEV
+                | rustix::io::Errno::MLINK,
+            ) => match copy_bind_occupant_backup(parent, to_leaf, backup_leaf)? {
+                OccupantBackup::Bound => {
+                    if let Err(error) = renameat(parent, from_leaf, parent, to_leaf) {
+                        let _ = unlinkat(parent, backup_leaf, AtFlags::empty());
+                        return Err(io::Error::from(error));
+                    }
+                    return Ok(true);
+                }
+                // The occupant vanished (or was replaced) while it was being
+                // copied: discard the stale copy and re-bind from the top.
+                OccupantBackup::Vanished => {}
+            },
+            Err(error) => return Err(io::Error::from(error)),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "destination kept changing through the replace publish",
+    ))
+}
+
+/// Outcome of a commit-time copy-bind attempt.
+#[cfg(unix)]
+enum OccupantBackup {
+    /// The backup leaf now names a verified copy of the occupant.
+    Bound,
+    /// The occupant vanished or changed under the copy; the backup was
+    /// discarded and the caller must re-bind.
+    Vanished,
+}
+
+/// Copy the current occupant of `to_leaf` into `backup_leaf` through the
+/// retained parent handle, used when the filesystem offers no hard links
+/// for an atomic bind. The copy is verified against the occupant's identity
+/// after the fact: a vanished or replaced occupant discards the copy and
+/// reports [`OccupantBackup::Vanished`] so the caller re-binds. A directory
+/// occupant is refused with the typed `InvalidInput` error.
+#[cfg(unix)]
+fn copy_bind_occupant_backup(
+    parent: &File,
+    to_leaf: &OsStr,
+    backup_leaf: &OsStr,
+) -> io::Result<OccupantBackup> {
+    use rustix::fs::{openat, statat, unlinkat, AtFlags, Mode, OFlags};
+
+    let before = match statat(parent, to_leaf, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(rustix::io::Errno::NOENT) => return Ok(OccupantBackup::Vanished),
+        Err(error) => return Err(io::Error::from(error)),
+    };
+    if rustix::fs::FileType::from_raw_mode(before.st_mode) == rustix::fs::FileType::Directory {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to replace a directory with a file",
+        ));
+    }
+    // A symlink occupant cannot be opened no-follow, and without hard
+    // links there is no way to bind the link itself: fail closed rather
+    // than replacing it unbacked.
+    if rustix::fs::FileType::from_raw_mode(before.st_mode) == rustix::fs::FileType::Symlink {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot bind a symlink occupant for backup on a filesystem without hard links",
+        ));
+    }
+    let occupant = openat(
+        parent,
+        to_leaf,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let mut occupant_file = File::from(occupant);
+    let backup = openat(
+        parent,
+        backup_leaf,
+        OFlags::WRONLY
+            | OFlags::CREATE
+            | OFlags::EXCL
+            | OFlags::CLOEXEC
+            | OFlags::NOFOLLOW
+            | OFlags::NOCTTY,
+        Mode::from_bits_truncate(0o600),
+    );
+    let mut backup_file = match backup {
+        Ok(backup) => File::from(backup),
+        Err(rustix::io::Errno::EXIST) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "backup sibling appeared before the copy-bind",
+            ));
+        }
+        Err(error) => return Err(io::Error::from(error)),
+    };
+    let copied = std::io::copy(&mut occupant_file, &mut backup_file);
+    let synced = backup_file.sync_all();
+    drop(backup_file);
+    drop(occupant_file);
+    // A failed or unverified copy leaves the backup leaf behind: remove it
+    // so the parent is not polluted with a hidden partial copy.
+    let bound = match copied.and(synced) {
+        Ok(()) => {
+            // The bind is only trustworthy if the name still holds the
+            // exact occupant that was copied. Anything else — a
+            // replacement, or a deletion — discards the copy and re-binds
+            // from the top.
+            match statat(parent, to_leaf, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(after) => after.st_dev == before.st_dev && after.st_ino == before.st_ino,
+                Err(rustix::io::Errno::NOENT) => false,
+                Err(error) => {
+                    let _ = unlinkat(parent, backup_leaf, AtFlags::empty());
+                    return Err(io::Error::from(error));
+                }
+            }
+        }
+        Err(error) => {
+            let _ = unlinkat(parent, backup_leaf, AtFlags::empty());
+            return Err(error);
+        }
+    };
+    if bound {
+        Ok(OccupantBackup::Bound)
+    } else {
+        let _ = unlinkat(parent, backup_leaf, AtFlags::empty());
+        Ok(OccupantBackup::Vanished)
+    }
+}
+
+/// Windows Overwrite publish loop. See [`replace_publish_loop`] for the
+/// contract; the operations are absolute-path based after the caller
+/// revalidated and pinned the retained parent, mirroring the established
+/// Windows publish discipline.
+#[cfg(windows)]
+fn replace_publish_loop(
+    parent: &File,
+    from_leaf: &OsStr,
+    from_absolute: &Path,
+    to_leaf: &OsStr,
+    to_absolute: &Path,
+    _backup_leaf: &OsStr,
+    backup_absolute: &Path,
+) -> io::Result<bool> {
+    for _ in 0..REPLACE_BIND_ATTEMPTS {
+        // Type the occupant no-follow first: a directory is refused with
+        // the typed error, and a present non-directory is bound by hard
+        // link before the replace.
+        match std::fs::symlink_metadata(to_absolute) {
+            Ok(metadata) if metadata.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to replace a directory with a file",
+                ));
+            }
+            Ok(_) => match std::fs::hard_link(to_absolute, backup_absolute) {
+                Ok(()) => {
+                    if let Err(error) = std::fs::rename(from_absolute, to_absolute) {
+                        // The publish failed; release our backup so the
+                        // parent is not polluted with a hidden copy.
+                        let _ = std::fs::remove_file(backup_absolute);
+                        return Err(error);
+                    }
+                    return Ok(true);
+                }
+                // The occupant vanished between the typing and the bind.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                // No hard-link support (or an unbindable occupant): fail
+                // closed rather than replacing unbacked.
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "cannot bind the destination occupant for backup; refusing an unbacked replace",
+                    ));
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match rename_no_replace_within_parent(
+                    parent,
+                    from_leaf,
+                    from_absolute,
+                    to_leaf,
+                    to_absolute,
+                ) {
+                    Ok(()) => return Ok(false),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "destination kept changing through the replace publish",
+    ))
 }
 
 /// Windows fallback for [`MountedRootAuthority::create_directories_within`]:
@@ -3546,58 +3806,6 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert!(lease.mount_generation().is_some());
         lease.validate().expect("validate lease");
-    }
-
-    /// The exclusive-reservation publish is the final no-replace strategy
-    /// for filesystems offering neither rename flags nor hard links. It must
-    /// refuse an existing destination without touching it, and publish by
-    /// consuming the staged leaf when the destination is free.
-    #[cfg(unix)]
-    #[test]
-    fn exclusive_reservation_publish_refuses_existing_destination() {
-        let directory = TestDirectory::new("reservation-publish");
-        let parent = fs::File::open(directory.path()).expect("open parent handle");
-        fs::write(directory.path().join(".stage-tmp"), b"payload").expect("write staged leaf");
-        fs::write(directory.path().join("final.flac"), b"original")
-            .expect("write existing destination");
-
-        let error = publish_by_exclusive_reservation(
-            &parent,
-            OsStr::new(".stage-tmp"),
-            directory.path().join(".stage-tmp").as_path(),
-            OsStr::new("final.flac"),
-            directory.path().join("final.flac").as_path(),
-        )
-        .expect_err("existing destination must be refused");
-        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(
-            fs::read(directory.path().join("final.flac")).expect("read destination"),
-            b"original",
-            "the pre-existing destination must be untouched"
-        );
-        assert_eq!(
-            fs::read(directory.path().join(".stage-tmp")).expect("read staged leaf"),
-            b"payload",
-            "the staged leaf must be untouched on a refused publish"
-        );
-
-        publish_by_exclusive_reservation(
-            &parent,
-            OsStr::new(".stage-tmp"),
-            directory.path().join(".stage-tmp").as_path(),
-            OsStr::new("published.flac"),
-            directory.path().join("published.flac").as_path(),
-        )
-        .expect("publish to a free destination");
-        assert_eq!(
-            fs::read(directory.path().join("published.flac")).expect("read published"),
-            b"payload",
-            "publish must move the staged bytes under the final name"
-        );
-        assert!(
-            !directory.path().join(".stage-tmp").exists(),
-            "publish must consume the staged leaf"
-        );
     }
 
     #[test]

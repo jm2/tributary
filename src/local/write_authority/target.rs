@@ -108,14 +108,27 @@ impl PreparedWriteTarget {
     /// Fresh and Preserved resolutions publish with no-replace semantics: a
     /// destination that appeared after staging — including the original file
     /// of a Preserve conflict — fails the commit instead of being replaced,
-    /// and is never touched. On Windows a `MoveFileExW` publish is bracketed
-    /// by retained-parent identity revalidations. The staged handle is
-    /// flushed to disk and closed before the rename: Windows refuses to
-    /// rename or delete a file while a handle without `FILE_SHARE_DELETE` is
-    /// open, and a publish must not depend on handle sharing modes anyway.
-    /// The mount boundary is revalidated immediately before and after the
-    /// rename so a binder swap or remount between staging and commit cannot
-    /// authorise a partial publish.
+    /// and is never touched.
+    ///
+    /// An Overwrite resolution publishes by replace, but never unbacked:
+    /// the occupant of the destination name is bound to a hidden backup
+    /// sibling at commit time (a hard link where the filesystem supports
+    /// them, else a verified commit-time copy), and the backup's relative
+    /// path is reported on the outcome as `replaced_original` so the caller
+    /// can restore exactly the bytes that were destroyed. If the
+    /// destination turned out to be absent at commit, the publish degrades
+    /// to the no-replace cascade — a concurrent creation is bypassed or
+    /// backed up, never silently replaced-and-deleted. A directory occupant
+    /// is refused with a typed `InvalidInput` error.
+    ///
+    /// On Windows a `MoveFileExW` publish is bracketed by retained-parent
+    /// identity revalidations. The staged handle is flushed to disk and
+    /// closed before the rename: Windows refuses to rename or delete a file
+    /// while a handle without `FILE_SHARE_DELETE` is open, and a publish
+    /// must not depend on handle sharing modes anyway. The mount boundary
+    /// is revalidated immediately before and after the rename so a binder
+    /// swap or remount between staging and commit cannot authorise a
+    /// partial publish.
     pub fn commit(mut self) -> io::Result<CommitOutcome> {
         self.authority.validate()?;
         self.parent.validate_with(&self.authority)?;
@@ -133,20 +146,42 @@ impl PreparedWriteTarget {
             .expect("staged handle is open until commit");
         staged_file.sync_all()?;
         drop(staged_file);
-        let no_replace = self.resolution != ConflictResolution::Overwrite;
-        self.authority.rename_within_directory(
-            &self.parent,
-            &self.staged_leaf,
-            &self.staged_path,
-            &final_leaf,
-            &final_path,
-            no_replace,
-        )?;
+        let replaced_original = if self.resolution == ConflictResolution::Overwrite {
+            let backup_leaf = backup_leaf_name();
+            let mut backup_relative = self
+                .final_relative_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            backup_relative.push(backup_leaf.as_os_str());
+            let backup_absolute = self.authority.root().join(&backup_relative);
+            let replaced = self.authority.replace_within_directory(
+                &self.parent,
+                &self.staged_leaf,
+                &self.staged_path,
+                &final_leaf,
+                &final_path,
+                backup_leaf.as_os_str(),
+                &backup_absolute,
+            )?;
+            replaced.then_some(backup_relative)
+        } else {
+            self.authority.rename_within_directory(
+                &self.parent,
+                &self.staged_leaf,
+                &self.staged_path,
+                &final_leaf,
+                &final_path,
+                true,
+            )?;
+            None
+        };
         self.authority.validate()?;
         self.committed = true;
         Ok(CommitOutcome {
             relative_path: self.final_relative_path.clone(),
             resolution: self.resolution,
+            replaced_original,
         })
     }
 
@@ -204,6 +239,16 @@ impl Drop for PreparedWriteTarget {
             }
         }
     }
+}
+
+/// A unique hidden leaf name for a commit-time backup sibling: the
+/// occupant destroyed by an Overwrite publish is bound here so a rollback
+/// can restore it, and a successful transfer discards it.
+fn backup_leaf_name() -> OsString {
+    let mut name = OsString::from(".tributary-backup-");
+    name.push(Uuid::new_v4().to_string());
+    name.push(".tmp");
+    name
 }
 
 /// A directory created by
