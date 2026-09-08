@@ -307,6 +307,38 @@ fn dismissing_a_bot_change_request_clears_it() {
 }
 
 #[test]
+fn comment_after_a_dismissal_is_still_bound_to_the_head() {
+    // A formal dismissal clears the dismissed conclusion, but it exempts
+    // only itself from the head binding: a review submitted after the
+    // dismissal is ordinary evidence again, so a comment left at a
+    // since-superseded head must report stale evidence instead of passing.
+    let output = run_scenario(
+        "change-request-dismissed-then-stale-comment",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert_blocked(
+        &output,
+        &["STALE BOT REVIEW EVIDENCE", OTHER_SHA, HEAD_SHA],
+        "not clean",
+    );
+}
+
+#[test]
+fn current_comment_after_a_dismissal_passes() {
+    let output = run_scenario(
+        "change-request-dismissed-then-current-comment",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert!(
+        output.status.success(),
+        "a dismissal followed by a current-head review provides current evidence:\n{}",
+        report(&output)
+    );
+}
+
+#[test]
 fn comment_only_bot_review_does_not_clear_a_change_request() {
     // GitHub clears Request-changes only on a later approval or a formal
     // dismissal. A comment-only review carries no conclusion, so a bot

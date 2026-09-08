@@ -13,6 +13,8 @@ name: Bot review gate
 #      and that request blocks even when it opened no inline thread;
 #   3. a bot reviewer's latest review predates the head being evaluated:
 #      bot-review evidence must be bound to the exact commit being merged.
+#      A formal dismissal clears the dismissed conclusion, but it does not
+#      exempt reviews submitted afterwards from this head binding.
 #
 # Semantics:
 #   * Only explicit thread resolution or a formal review dismissal clears a
@@ -255,13 +257,19 @@ jobs:
             #   CHANGES_REQUESTED — an outstanding change request, wherever
             #                       it was made;
             #   DISMISSED         — formally withdrawn, no outstanding
-            #                       conclusion left;
+            #                       conclusion left, and no freshness debt
+            #                       of its own (the dismissal is an
+            #                       administrator action on the old review,
+            #                       not new evidence about the head);
             #   anything else     — the review must be bound to the evaluated
             #                       head, or the evidence is stale.
             # A comment-only review is never decisive: GitHub clears
             # Request-changes only on a later approval or a formal dismissal,
             # so ranking every state together would let a comment silently
-            # lift an outstanding change request.
+            # lift an outstanding change request. A dismissal clears the
+            # dismissed conclusion but exempts only itself from the head
+            # binding: any review submitted AFTER the dismissal is ordinary
+            # evidence again and must sit at the evaluated head.
             def bot_review_violations($head):
               [ .[]
                 | .data.repository.pullRequest.reviews.nodes[]
@@ -281,12 +289,17 @@ jobs:
                      or .state == "DISMISSED"))
                  | sort_by(.database_id)
                  | last) as $decisive
+              | (map(select(.database_id > ($decisive.database_id // 0)))
+                 | sort_by(.database_id)
+                 | last) as $after_decisive
               | if $decisive.state == "CHANGES_REQUESTED" then
                   [ { reason: "outstanding_bot_change_request",
                       author: $decisive.author,
                       review_head: $decisive.review_head,
                       url: $decisive.url } ]
-                elif $decisive.state == "DISMISSED" then []
+                elif $decisive.state == "DISMISSED"
+                  and (($after_decisive.review_head // $head) == $head)
+                then []
                 elif $latest.review_head != $head then
                   [ { reason: "stale_bot_review_evidence",
                       author: $latest.author,

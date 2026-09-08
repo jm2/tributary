@@ -1389,7 +1389,7 @@ fn dependabot_automerge_workflow() -> serde_yaml::Value {
 
 // The full policy check-context set the live main ruleset must require, each
 // entry as "check context|app id" (empty app id = unbound commit status).
-const fn required_policy_check_contexts() -> [&'static str; 16] {
+const fn required_policy_check_contexts() -> [&'static str; 18] {
     [
         "Security Audit|15368",
         "Linux (x86_64)|15368",
@@ -1400,6 +1400,8 @@ const fn required_policy_check_contexts() -> [&'static str; 16] {
         "Flatpak (Linux)|15368",
         "MSRV|15368",
         "Coverage (Linux x86_64)|15368",
+        "Desktop Metadata|15368",
+        "SHA256 Checksums|15368",
         "Bot Review Gate|15368",
         "CodeQL|57789",
         "Analyze (python)|57789",
