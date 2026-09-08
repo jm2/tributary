@@ -258,7 +258,7 @@ tree, not by data revision 1 imagined. Today:
   (`src/discovery.rs:524-546`); the AirPlay instance name is the raw
   instance name with the `MAC@` prefix stripped
   (`src/discovery.rs:522-526`,
-  [`strip_airplay_mac_prefix`](../src/discovery.rs) at :900).
+  [`strip_airplay_mac_prefix`](../src/discovery.rs) at :944).
 - The UI path keeps only display name plus endpoint: the airplay row
   stores `"{host}:{port}"` as its widget name
   ([`src/ui/discovery_handler.rs:281-304`](../src/ui/discovery_handler.rs)),
