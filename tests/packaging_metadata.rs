@@ -1670,10 +1670,11 @@ fn bot_review_gate_is_read_only_fail_closed_and_pinned_to_main_prs() {
     let _script = bot_review_gate_run_script(&workflow);
 }
 
+// The gate script's decision contract, pinned as text across four focused
+// tests. The decisions themselves run against recorded fixtures in
+// tests/bot_review_gate.rs.
 #[test]
-// The gate script's decision contract, pinned as text. The decisions
-// themselves run against recorded fixtures in tests/bot_review_gate.rs.
-fn bot_review_gate_script_pins_resolution_conclusions_and_head_binding() {
+fn bot_review_gate_script_paginates_evidence_and_ranks_reviews() {
     let script = bot_review_gate_run_script(&bot_review_gate_workflow());
 
     // Complete paginated evidence: review conclusions (a change request can
@@ -1686,6 +1687,11 @@ fn bot_review_gate_script_pins_resolution_conclusions_and_head_binding() {
         script.contains("group_by(.author)") && script.contains("sort_by(.database_id)"),
         "review conclusions must be evaluated per bot author from their latest review"
     );
+}
+
+#[test]
+fn bot_review_gate_script_requires_explicit_thread_resolution() {
+    let script = bot_review_gate_run_script(&bot_review_gate_workflow());
 
     // Thread semantics: only explicit resolution clears a thread. GitHub's
     // "outdated" flag is reported but never substitutes for resolution —
@@ -1706,6 +1712,11 @@ fn bot_review_gate_script_pins_resolution_conclusions_and_head_binding() {
         script.contains("endswith(\"[bot]\")"),
         "the gate must recognise both GitHub App accounts and [bot]-suffixed logins"
     );
+}
+
+#[test]
+fn bot_review_gate_script_binds_conclusions_to_the_evaluated_head() {
+    let script = bot_review_gate_run_script(&bot_review_gate_workflow());
 
     // Review-conclusion semantics: an outstanding change request blocks even
     // without an inline thread, a formal dismissal clears it, and otherwise
@@ -1729,6 +1740,11 @@ fn bot_review_gate_script_pins_resolution_conclusions_and_head_binding() {
         script.contains("headRefOid == $head") && script.contains("Pull request head moved to"),
         "paginated evidence and the published result must be bound to one exact head"
     );
+}
+
+#[test]
+fn bot_review_gate_script_fails_closed_on_incomplete_or_wrong_base_queries() {
+    let script = bot_review_gate_run_script(&bot_review_gate_workflow());
 
     // Every query failure, incomplete pagination, or wrong base must fail
     // the check instead of passing it.
