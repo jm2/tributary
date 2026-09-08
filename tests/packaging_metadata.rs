@@ -1756,7 +1756,7 @@ fn bot_review_gate_script_binds_conclusions_to_the_evaluated_head() {
 }
 
 #[test]
-fn bot_review_gate_rate_limit_substitution_stays_fail_closed() {
+fn bot_review_gate_substitution_policy_is_read_from_main_under_read_only_grant() {
     let script = bot_review_gate_run_script(&bot_review_gate_workflow());
     let workflow = bot_review_gate_workflow();
 
@@ -1775,6 +1775,11 @@ fn bot_review_gate_rate_limit_substitution_stays_fail_closed() {
         script.contains(".github/bot-review-substitution.json") && script.contains("ref=main"),
         "the substitution policy must be read from the repository-owned file on main"
     );
+}
+
+#[test]
+fn bot_review_gate_substitution_defaults_to_disabled_on_policy_failures() {
+    let script = bot_review_gate_run_script(&bot_review_gate_workflow());
 
     // The substitution is an opt-in relaxation: a missing file, a failed
     // read, or a malformed document must disable the waiver — never enable
@@ -1787,6 +1792,11 @@ fn bot_review_gate_rate_limit_substitution_stays_fail_closed() {
         script.contains("(HTTP 404)") || script.contains("Not Found"),
         "a repository without a policy file must simply have no waiver available"
     );
+}
+
+#[test]
+fn bot_review_gate_substitution_waiver_is_scoped_and_audited() {
+    let script = bot_review_gate_run_script(&bot_review_gate_workflow());
 
     // Waiver conditions: a listed reviewer, an affirmative (APPROVED)
     // substitute review bound to the exact evaluated head, every thread
