@@ -3422,6 +3422,21 @@ fn cleanup_unconditionally<C>(
         let Some(song_id) = session.song_id else {
             return;
         };
+        // Gate EVERY authority-requiring mutation before the first one —
+        // including the teardown `stop`, which is a partition-global
+        // playback-control command just like the targeted delete. A
+        // supervised `Exclusive` output whose supervision has lapsed —
+        // foreign current song, partition-option drift, or an observation
+        // gap older than `MAX_SUPERVISION_GAP` — retains its orphan AND
+        // issues no stop: stale confirmation must not authorise either,
+        // and no poll will arrive during shutdown to re-check it. The
+        // failure class of the call (shutdown, disconnect) is irrelevant —
+        // the guarantee applies in every cleanup path. Unsupervised
+        // `Exclusive` proceeds on the user's confirmation alone, exactly
+        // as before.
+        if !supervision_authorizes(plan, supervision) {
+            return;
+        }
         let deadline = timing.deadline();
         let status = session.connection.status(deadline);
         let can_delete = match status {
@@ -3443,16 +3458,6 @@ fn cleanup_unconditionally<C>(
             Ok(_) => true,
             Err(failure) => failure.connection_usable,
         };
-        // Mirror the cleanup_session gate: only an `Exclusive` output whose
-        // supervision is armed and fresh may issue a targeted delete. The
-        // failure class of the call (shutdown, disconnect) is irrelevant —
-        // the orphan-retention guarantee applies in every cleanup path, and
-        // the freshness check is eager: supervision evidence older than
-        // `MAX_SUPERVISION_GAP` retains the orphan instead of awaiting a
-        // poll that will never come during shutdown.
-        if !supervision_authorizes(plan, supervision) {
-            return;
-        }
         if can_delete {
             let _ = session.connection.delete_id(song_id, deadline);
         }
@@ -5063,6 +5068,84 @@ mod tests {
                 .count(),
             0,
             "a lapsed supervisor must not authorise orphan deletion, even on shutdown"
+        );
+    }
+
+    #[test]
+    fn supervised_exclusive_shutdown_after_lapse_sends_neither_stop_nor_delete() {
+        // The teardown `stop` is a partition-global playback-control
+        // command: a lapsed supervisor must not issue it any more than it
+        // may issue the targeted delete. The shutdown-time status reports
+        // our own song still playing — the exact observation under which
+        // the ungated cleanup would have sent `stop` before checking
+        // authority — so this regression pins both mutations to zero.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(playing_status(0, 10_000));
+        let owner = harness.next_owner(3);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/quiet".to_string(),
+            },
+        );
+        harness.fence(owner);
+
+        // Lapse via a foreign current song.
+        let mut foreign = playing_status(0, 10_000);
+        foreign.song_id = Some(99);
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(foreign);
+        harness.send(owner, CommandKind::PollNow);
+        harness.fence(owner);
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the foreign song must have lapsed the supervisor"
+        );
+
+        // The teardown status would report our own song (42) still playing.
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(playing_status(0, 10_000));
+
+        harness.shutdown();
+        let actions = shared.actions();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Point(Point::Stop)))
+                .count(),
+            0,
+            "a lapsed supervisor must not issue the teardown stop"
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Delete(42)))
+                .count(),
+            0,
+            "a lapsed supervisor must not issue the targeted delete"
         );
     }
 
