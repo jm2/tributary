@@ -1,6 +1,7 @@
 //! The staged-write handle ([`PreparedWriteTarget`]) and the bound
 //! directory handle ([`MountedDirectory`]) produced by the write authority.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
@@ -10,8 +11,11 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use super::policy::{CommitOutcome, ConflictPolicy, ConflictResolution};
-use super::staging::{publish_atomic, rollback_staged};
-use crate::local::root_authority::MountedRootAuthority;
+#[cfg(unix)]
+use super::staging::discard_staged_file;
+#[cfg(not(unix))]
+use super::staging::{discard_staged_file, rollback_staged};
+use crate::local::root_authority::{MountedRootAuthority, RetainedWriteParent};
 
 /// A staged write below a [`MountedWriteAuthority`](super::MountedWriteAuthority)
 /// ready for commit/rollback.
@@ -24,9 +28,17 @@ use crate::local::root_authority::MountedRootAuthority;
 pub struct PreparedWriteTarget {
     pub(super) lease_token: Uuid,
     pub(super) authority: Arc<MountedRootAuthority>,
+    /// The destination parent directory retained from staging through
+    /// commit. Publication is anchored to this exact object so a parent or
+    /// mount replacement between staging and commit cannot redirect the
+    /// write.
+    pub(super) parent: RetainedWriteParent,
     pub(super) final_relative_path: PathBuf,
+    /// Leaf name of the staged temporary file inside the retained parent.
+    pub(super) staged_leaf: OsString,
     /// Absolute path of the staged temporary file. Sibling of the destination
-    /// so the rename is atomic on the same filesystem.
+    /// so the rename is atomic on the same filesystem; Windows publishes and
+    /// discards through this path after the retained parent is revalidated.
     pub(super) staged_path: PathBuf,
     /// Handle on the staged temporary file. Taken and closed before the
     /// staged path is renamed or removed: on Windows a rename/delete of a
@@ -90,24 +102,46 @@ impl PreparedWriteTarget {
 
     /// Commit the staged file atomically to its destination.
     ///
-    /// On Unix this is a single `rename(2)`; on Windows a `MoveFileExW`
-    /// replacement. The staged handle is flushed to disk and closed before
-    /// the rename: Windows refuses to rename or delete a file while a
-    /// handle without `FILE_SHARE_DELETE` is open, and a publish must not
-    /// depend on handle sharing modes anyway. The mount boundary is
-    /// revalidated immediately before and after the rename so a binder swap
-    /// or remount between staging and commit cannot authorise a partial
-    /// publish.
+    /// On Unix this is a single `renameat(2)` anchored to the parent
+    /// directory handle retained at staging time, so a parent or mount
+    /// replacement between staging and commit cannot redirect the publish.
+    /// Fresh and Preserved resolutions publish with no-replace semantics: a
+    /// destination that appeared after staging — including the original file
+    /// of a Preserve conflict — fails the commit instead of being replaced,
+    /// and is never touched. On Windows a `MoveFileExW` publish is bracketed
+    /// by retained-parent identity revalidations. The staged handle is
+    /// flushed to disk and closed before the rename: Windows refuses to
+    /// rename or delete a file while a handle without `FILE_SHARE_DELETE` is
+    /// open, and a publish must not depend on handle sharing modes anyway.
+    /// The mount boundary is revalidated immediately before and after the
+    /// rename so a binder swap or remount between staging and commit cannot
+    /// authorise a partial publish.
     pub fn commit(mut self) -> io::Result<CommitOutcome> {
-        let final_path = self.authority.root().join(&self.final_relative_path);
         self.authority.validate()?;
+        self.parent.validate_with(&self.authority)?;
+        let final_path = self.authority.root().join(&self.final_relative_path);
+        let final_leaf = self
+            .final_relative_path
+            .file_name()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "final path is missing a leaf")
+            })?
+            .to_os_string();
         let staged_file = self
             .staged_file
             .take()
             .expect("staged handle is open until commit");
         staged_file.sync_all()?;
         drop(staged_file);
-        publish_atomic(&self.staged_path, &final_path)?;
+        let no_replace = self.resolution != ConflictResolution::Overwrite;
+        self.authority.rename_within_directory(
+            &self.parent,
+            &self.staged_leaf,
+            &self.staged_path,
+            &final_leaf,
+            &final_path,
+            no_replace,
+        )?;
         self.authority.validate()?;
         self.committed = true;
         Ok(CommitOutcome {
@@ -122,7 +156,25 @@ impl PreparedWriteTarget {
             return Ok(());
         }
         drop(self.staged_file.take());
-        let outcome = rollback_staged(&self.staged_path);
+        self.discard_staged()
+    }
+
+    /// Unlink the staged temporary file through the retained parent handle
+    /// (Unix) or by its absolute path after revalidation (Windows). A lost
+    /// authority fails closed: the staged file is never removed through a
+    /// namespace that no longer names the audited mount.
+    fn discard_staged(&self) -> io::Result<()> {
+        if self.parent.validate_with(&self.authority).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "authority is no longer current; leaving staged file untouched",
+            ));
+        }
+        let outcome = discard_staged_file(
+            Some(self.parent.handle()),
+            &self.staged_leaf,
+            &self.staged_path,
+        );
         let _ = self.authority.validate();
         outcome
     }
@@ -137,7 +189,20 @@ impl Drop for PreparedWriteTarget {
         // a file while a handle without FILE_SHARE_DELETE is open.
         drop(self.staged_file.take());
         // Best-effort cleanup if the caller forgets to roll back explicitly.
-        let _ = rollback_staged(&self.staged_path);
+        // A lost authority leaves the staged file untouched; the transfer's
+        // error path surfaces the authority loss instead.
+        if self.parent.validate_with(&self.authority).is_ok() {
+            #[cfg(unix)]
+            {
+                use rustix::fs::{unlinkat, AtFlags};
+
+                let _ = unlinkat(self.parent.handle(), &self.staged_leaf, AtFlags::empty());
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = rollback_staged(&self.staged_path);
+            }
+        }
     }
 }
 

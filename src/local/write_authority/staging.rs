@@ -2,7 +2,7 @@
 //! names, preserved-sibling disambiguation, and the platform-specific
 //! exclusive staged-file creation plus atomic publish/rollback.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -123,6 +123,11 @@ pub(super) fn preserved_sibling_path(
 
 /// Create each missing directory of a component chain, refusing any
 /// intermediate collision with a non-directory.
+///
+/// Only used on non-Unix platforms; Unix walks and creates the chain
+/// no-follow from the retained root handle through
+/// [`MountedRootAuthority::create_directories_within`].
+#[cfg(not(unix))]
 pub(super) fn create_directory_atomic(root: &Path, components: &[OsString]) -> io::Result<()> {
     let mut path = root.to_path_buf();
     for component in components {
@@ -145,26 +150,14 @@ pub(super) fn create_directory_atomic(root: &Path, components: &[OsString]) -> i
 }
 
 /// Create the staged file exclusively with `O_CREAT | O_EXCL | O_NOFOLLOW`
-/// and mode 0600, opening the parent through a plain descriptor.
+/// and mode 0600, relative to the retained parent directory handle so a
+/// replaced or symlinked parent cannot redirect the staged write.
 #[cfg(unix)]
-pub(super) fn create_exclusive_staged_file(path: &Path) -> io::Result<File> {
+pub(super) fn create_exclusive_staged_file(parent: &File, leaf: &OsStr) -> io::Result<File> {
     use rustix::fs::{Mode, OFlags};
 
-    let leaf = path.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "staged file path is missing a leaf",
-        )
-    })?;
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "staged file path is missing a parent",
-        )
-    })?;
-    let parent_file = File::open(parent)?;
     let descriptor = rustix::fs::openat(
-        &parent_file,
+        parent,
         leaf,
         OFlags::WRONLY
             | OFlags::CREATE
@@ -211,18 +204,52 @@ pub(super) fn create_exclusive_staged_file(_path: &Path) -> io::Result<File> {
 }
 
 /// Drop a staged file, tolerating a concurrent removal.
+///
+/// On Unix the removal is anchored to the retained parent handle when one is
+/// supplied; on Windows the absolute staged path is used after the caller
+/// revalidated the authority.
+#[cfg(unix)]
+pub(super) fn discard_staged_file(
+    parent: Option<&File>,
+    staged_leaf: &OsStr,
+    staged_path: &Path,
+) -> io::Result<()> {
+    use rustix::fs::{unlinkat, AtFlags};
+
+    match parent {
+        Some(parent) => match unlinkat(parent, staged_leaf, AtFlags::empty()) {
+            Ok(()) => Ok(()),
+            Err(rustix::io::Errno::NOENT) => Ok(()),
+            Err(error) => Err(io::Error::from(error)),
+        },
+        None => rollback_staged(staged_path),
+    }
+}
+
+/// Windows discard of the staged file by absolute path.
+#[cfg(windows)]
+pub(super) fn discard_staged_file(
+    _parent: Option<&File>,
+    _staged_leaf: &OsStr,
+    staged_path: &Path,
+) -> io::Result<()> {
+    rollback_staged(staged_path)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(super) fn discard_staged_file(
+    _parent: Option<&File>,
+    _staged_leaf: &OsStr,
+    staged_path: &Path,
+) -> io::Result<()> {
+    rollback_staged(staged_path)
+}
+
+/// Drop a staged file by absolute path, tolerating a concurrent removal.
 pub(super) fn rollback_staged(staged_path: &Path) -> io::Result<()> {
     match std::fs::remove_file(staged_path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
-}
-
-/// Publish a staged file atomically. POSIX rename is atomic on the same
-/// filesystem. Windows std::fs::rename uses MoveFileExW with
-/// MOVEFILE_REPLACE_EXISTING semantics, which is likewise atomic on the same
-/// volume.
-pub(super) fn publish_atomic(staged_path: &Path, final_path: &Path) -> io::Result<()> {
-    std::fs::rename(staged_path, final_path)
 }
