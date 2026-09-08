@@ -82,12 +82,28 @@ struct GateSandbox {
     root: PathBuf,
 }
 
+/// Crate-owned scratch root for sandbox trees.
+///
+/// Deriving scratch space from the system temp directory is flagged by
+/// Codacy's "`temp_dir` should not be used for security operations" advisory,
+/// and the zero-new-issues policy makes that advisory blocking. The gate
+/// fixtures never need a system-wide temp directory — every staged byte
+/// derives from in-repo fixtures — so the sandbox lives under the cargo
+/// target tree instead: it stays gitignored, co-located with the build, and
+/// removable by `cargo clean`.
+fn scratch_root() -> PathBuf {
+    if let Ok(target_tmp) = std::env::var("CARGO_TARGET_TMPDIR") {
+        return PathBuf::from(target_tmp);
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("target/scratch")
+}
+
 impl GateSandbox {
     fn new(tag: &str) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch_root().join(format!(
             "bot-review-gate-fixture-{}-{tag}-{serial}",
             std::process::id()
         ));
