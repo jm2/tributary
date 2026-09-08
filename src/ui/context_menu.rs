@@ -1137,20 +1137,17 @@ fn build_properties_action(
     automatic_device: bool,
     mutation_context: &PlaylistMutationContext,
 ) {
-    // The one removable source that can own rows of this view, if the active
-    // view is a removable device. Opaque logical GIO keys and mount-path
-    // spellings are not navigation identities, so the sidebar's exact
-    // SourceId decides — the same match `active_source_is_automatic_device`
-    // uses.
-    let active_source_key = mutation_context.active_source_key.borrow().clone();
-    let removable_source =
-        active_removable_source(&mutation_context.sidebar_store, &active_source_key);
+    // A removable device can own rows of any view: a playlist can contain
+    // removable entries while the active view is the playlist, not the
+    // device, so removable ownership is decided per row from the sidebar's
+    // exact SourceId metadata — never from which view happens to be active.
+    let sidebar_store = &mutation_context.sidebar_store;
 
     // Snapshot the exact selection while building the menu. Properties is an
     // all-or-none operation: silently dropping a malformed, remote, or
     // pathless lifecycle row would let a batch edit only an unexpected
-    // subset. Local rows snapshot their validated native path; rows of the
-    // active removable device snapshot their exact source-scoped identity
+    // subset. Local rows snapshot their validated native path; rows owned by
+    // a known removable device snapshot their exact source-scoped identity
     // for resolution through the live session when the action fires.
     let mut track_infos = Vec::new();
     for &position in &selection.positions {
@@ -1160,7 +1157,7 @@ fn build_properties_action(
         let Some(track) = item.downcast_ref::<TrackObject>() else {
             return;
         };
-        let Some(target) = properties_save_target(track, removable_source) else {
+        let Some(target) = properties_save_target(track, sidebar_store) else {
             return;
         };
         track_infos.push(super::properties_dialog::TrackInfo {
@@ -1199,7 +1196,12 @@ fn build_properties_action(
     tracing::debug!(
         has_win = win_for_props.is_some(),
         track_count = track_infos.len(),
-        removable = removable_source.is_some(),
+        removable = track_infos.iter().any(|info| {
+            matches!(
+                info.target,
+                SaveTarget::PendingRemovable(_) | SaveTarget::Removable(_)
+            )
+        }),
         "build_properties_action"
     );
     let registry_for_props = mutation_context.source_registry.clone();
@@ -1324,22 +1326,24 @@ fn local_file_path(uri: &str) -> Option<std::path::PathBuf> {
         .flatten()
 }
 
-/// The removable source that owns the active view, if any.
+/// The removable device that owns one row, matched against exact sidebar
+/// metadata.
 ///
-/// Mirrors `active_source_is_automatic_device`: an opaque logical GIO key or
-/// mount-path spelling is not a navigation identity, so the sidebar's exact
-/// SourceId for the active key decides.
-fn active_removable_source(
+/// The match mirrors `active_source_is_automatic_device`: an opaque logical
+/// GIO key or mount-path spelling is not a navigation identity, so the
+/// sidebar's exact SourceId decides. Ownership is read from the row's own
+/// source identity — never from the active view — because a playlist can
+/// display removable rows while the active navigation key is the playlist,
+/// not the device.
+fn removable_row_source(
+    track: &TrackObject,
     sidebar_store: &gtk::gio::ListStore,
-    active_source_key: &str,
 ) -> Option<SourceId> {
+    let row_source = track.source_id()?;
     (0..sidebar_store.n_items())
         .filter_map(|position| sidebar_store.item(position).and_downcast::<SourceObject>())
         .find(|source| {
-            source.backend_type() == "usb-device"
-                && source
-                    .source_id()
-                    .is_some_and(|source_id| source_id.to_string() == active_source_key)
+            source.backend_type() == "usb-device" && source.source_id() == Some(row_source)
         })
         .and_then(|source| source.source_id())
 }
@@ -1350,30 +1354,26 @@ fn active_removable_source(
 /// the whole action is dropped rather than editing an unexpected subset.
 fn properties_save_target(
     track: &TrackObject,
-    removable_source: Option<SourceId>,
+    sidebar_store: &gtk::gio::ListStore,
 ) -> Option<super::properties_dialog::SaveTarget> {
-    match removable_source {
-        Some(source_id) if track.source_id() == Some(source_id) => {
-            // A removable row is pathless by design: its edit authorization
-            // is the exact source-scoped identity, exchanged for a retained
-            // mutation authority through the live session when the action
-            // fires. A row without a session epoch is a wiring fault and
-            // aborts the whole selection.
-            let track_id = TrackId::new(track.track_id()).ok()?;
-            Some(SaveTarget::PendingRemovable(
-                super::properties_dialog::PendingRemovableMutation {
-                    source_id,
-                    session_epoch: track.source_session_epoch()?,
-                    track_id,
-                },
-            ))
-        }
-        _ => {
-            // Every other view remains a path-authorized local-file edit.
-            let path = local_file_path(&track.uri())?;
-            Some(SaveTarget::LocalPath(path))
-        }
+    // A row owned by a known removable device is pathless by design, in this
+    // or any other view: its edit authorization is the exact source-scoped
+    // identity, exchanged for a retained mutation authority through the live
+    // session when the action fires. A row without a session epoch is a
+    // wiring fault and aborts the whole selection.
+    if let Some(source_id) = removable_row_source(track, sidebar_store) {
+        let track_id = TrackId::new(track.track_id()).ok()?;
+        return Some(SaveTarget::PendingRemovable(
+            super::properties_dialog::PendingRemovableMutation {
+                source_id,
+                session_epoch: track.source_session_epoch()?,
+                track_id,
+            },
+        ));
     }
+    // Every other row remains a path-authorized local-file edit.
+    let path = local_file_path(&track.uri())?;
+    Some(SaveTarget::LocalPath(path))
 }
 
 /// One pending mutation per distinct removable identity, in selection order.
