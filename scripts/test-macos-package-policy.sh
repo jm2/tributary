@@ -47,6 +47,29 @@ assert_no_policy_manifests() {
   done
 }
 
+# The v0.6.2 bundle contained the Soup plugin without the library it opens
+# dynamically. A plugin-only inventory must fail even on a Homebrew host.
+AUDIO_PLUGINS="${TEST_ROOT}/Audio Runtime/plugins"
+AUDIO_FRAMEWORKS="${TEST_ROOT}/Audio Runtime/Frameworks"
+mkdir -p "$AUDIO_PLUGINS" "$AUDIO_FRAMEWORKS"
+for plugin in libgstcoreelements libgstosxaudio libgstplayback libgstsoup; do
+  printf 'fixture\n' > "$AUDIO_PLUGINS/${plugin}.dylib"
+done
+assert_status 1 macos_validate_audio_runtime_inventory "$AUDIO_PLUGINS" "$AUDIO_FRAMEWORKS"
+[[ "$MACOS_PACKAGE_POLICY_REASON" == *'libsoup runtime'* ]] \
+  || fail "plugin-only audio runtime did not identify the missing libsoup library"
+touch "$AUDIO_FRAMEWORKS/libsoup-3.0.0.dylib"
+assert_status 1 macos_validate_audio_runtime_inventory "$AUDIO_PLUGINS" "$AUDIO_FRAMEWORKS"
+printf 'fixture\n' > "$AUDIO_FRAMEWORKS/libsoup-3.0.0.dylib"
+assert_status 0 macos_validate_audio_runtime_inventory "$AUDIO_PLUGINS" "$AUDIO_FRAMEWORKS"
+for plugin in libgstcoreelements libgstosxaudio libgstplayback libgstsoup; do
+  rm "$AUDIO_PLUGINS/${plugin}.dylib"
+  assert_status 1 macos_validate_audio_runtime_inventory "$AUDIO_PLUGINS" "$AUDIO_FRAMEWORKS"
+  [[ "$MACOS_PACKAGE_POLICY_REASON" == *"${plugin}"* ]] \
+    || fail "missing audio plugin did not produce a useful diagnostic: ${plugin}"
+  printf 'fixture\n' > "$AUDIO_PLUGINS/${plugin}.dylib"
+done
+
 POLICY_FILE="$(macos_package_policy_default_file)"
 
 EMPTY_POLICY="${TEST_ROOT}/empty-policy.txt"

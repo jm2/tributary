@@ -1,6 +1,6 @@
-//! Packaged-Windows GStreamer playback and fail-closed runtime probe.
+//! Packaged GStreamer playback and fail-closed runtime probe.
 //!
-//! This module is compiled only for Windows. The packaging workflow invokes
+//! This module is compiled for Windows and macOS. The packaging workflow invokes
 //! the hidden probe after assembling the distribution so discovery and
 //! playback are proven against the copied plugins, not the build host.
 
@@ -31,13 +31,13 @@ const TEARDOWN_DEADLINE: Duration = Duration::from_secs(3);
 const MAX_REQUEST_HEADERS: usize = 32 * 1024;
 const FIXED_ROUTING_ERROR: &str = "Protected loopback routing unavailable";
 
-/// Exercise the packaged Windows audio runtime without opening a real output.
+/// Exercise the packaged audio runtime without opening a real output.
 ///
 /// Diagnostics intentionally contain no URIs, proxy addresses, native error
 /// text, or plugin paths. Any of those values can disclose protected request
 /// material when this probe is extended to backend-shaped streams.
 #[allow(clippy::redundant_pub_crate)]
-pub(crate) fn run_packaged_windows_runtime_probe(plugin_dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn run_packaged_audio_runtime_probe(plugin_dir: &Path) -> anyhow::Result<()> {
     if AUDIO_BYTES.is_empty() {
         bail!("packaged audio probe fixture is empty");
     }
@@ -57,15 +57,18 @@ pub(crate) fn run_packaged_windows_runtime_probe(plugin_dir: &Path) -> anyhow::R
 
     let playbin_factory = bundled_factory("playbin3", &canonical_plugin_dir)?;
     let _soup_factory = bundled_factory("souphttpsrc", &canonical_plugin_dir)?;
-    let wasapi2_factory = bundled_factory("wasapi2sink", &canonical_plugin_dir)?;
     let fakesink_factory = bundled_factory("fakesink", &canonical_plugin_dir)?;
     let filesrc_factory = bundled_factory("filesrc", &canonical_plugin_dir)?;
-    let wasapi2_sink = wasapi2_factory
-        .create()
-        .build()
-        .map_err(|_| anyhow!("packaged audio probe could not create wasapi2sink"))?;
-    if !super::windows_audio::configure_wasapi2_sink(&wasapi2_sink) {
-        bail!("packaged Windows audio sink lacks dynamic device recovery");
+    #[cfg(target_os = "windows")]
+    {
+        let wasapi2_factory = bundled_factory("wasapi2sink", &canonical_plugin_dir)?;
+        let wasapi2_sink = wasapi2_factory
+            .create()
+            .build()
+            .map_err(|_| anyhow!("packaged audio probe could not create wasapi2sink"))?;
+        if !super::windows_audio::configure_wasapi2_sink(&wasapi2_sink) {
+            bail!("packaged Windows audio sink lacks dynamic device recovery");
+        }
     }
     media_server.arm()?;
     poison_server.arm()?;
@@ -874,9 +877,7 @@ mod tests {
 
     #[test]
     fn runtime_probe_entrypoint_is_reachable() {
-        std::hint::black_box(
-            super::super::run_packaged_windows_runtime_probe as fn(&Path) -> anyhow::Result<()>,
-        );
+        std::hint::black_box(run_packaged_audio_runtime_probe as fn(&Path) -> anyhow::Result<()>);
     }
 
     fn classify(request: &[u8]) -> (MediaRequestOutcome, Vec<u8>) {

@@ -8,6 +8,26 @@ MACOS_PACKAGE_POLICY_MATCHED_TOKEN=""
 MACOS_FORBIDDEN_COMPONENT_TOKENS=()
 MACOS_FORBIDDEN_COMPONENT_TOKEN_COUNT=0
 
+# These files are required even when the build host can provide an ambient
+# fallback. In particular, libsoup is loaded dynamically by recent Homebrew
+# Soup plugins and does not appear in their linked dependency inventory.
+macos_validate_audio_runtime_inventory() {
+  local plugin_dir="$1"
+  local frameworks_dir="$2"
+  local plugin
+  MACOS_PACKAGE_POLICY_REASON=""
+  for plugin in libgstcoreelements libgstosxaudio libgstplayback libgstsoup; do
+    if [[ ! -s "$plugin_dir/${plugin}.dylib" ]]; then
+      MACOS_PACKAGE_POLICY_REASON="Missing required GStreamer audio plugin: ${plugin}"
+      return 1
+    fi
+  done
+  if [[ ! -s "$frameworks_dir/libsoup-3.0.0.dylib" ]]; then
+    MACOS_PACKAGE_POLICY_REASON="Missing required bundled libsoup runtime: libsoup-3.0.0.dylib"
+    return 1
+  fi
+}
+
 macos_package_policy_default_file() {
   local helper_dir
   helper_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

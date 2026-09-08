@@ -5,6 +5,15 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **macOS local playback** — Bundle the dynamically loaded libsoup runtime and its
+  dependencies so protected streams can use the required HTTP source on Macs without
+  Homebrew. The signed package probe now verifies direct HTTP routing, audio decoding,
+  and end-of-stream with the bundled plugins.
+
 ## [0.6.2] — 2026-09-01
 
 ### Changed
@@ -515,6 +524,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.desktop` file and AppStream metainfo for Linux desktop integration.
 - Windows resource file with icon embedding.
 
+[Unreleased]: https://github.com/jm2/tributary/compare/v0.6.2...HEAD
 [0.6.2]: https://github.com/jm2/tributary/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/jm2/tributary/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/jm2/tributary/compare/v0.5.1...v0.6.0

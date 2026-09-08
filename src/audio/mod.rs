@@ -31,11 +31,14 @@ pub mod local_output;
 mod macos_audio;
 pub mod mpd_output;
 pub mod output;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 mod runtime_probe;
+#[cfg(target_os = "macos")]
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) use runtime_probe::run_packaged_audio_runtime_probe;
 #[cfg(target_os = "windows")]
 #[allow(clippy::redundant_pub_crate)]
-pub(crate) use runtime_probe::run_packaged_windows_runtime_probe;
+pub(crate) use runtime_probe::run_packaged_audio_runtime_probe as run_packaged_windows_runtime_probe;
 #[cfg(test)]
 pub mod test_support;
 #[cfg(any(target_os = "windows", test))]
