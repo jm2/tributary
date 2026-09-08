@@ -163,7 +163,15 @@ impl<'a> PlanBuilder<'a> {
             Ok(relative) => relative.to_path_buf(),
             Err(_) => return Ok(()),
         };
-        let bytes = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let bytes = entry
+            .metadata()
+            .map_err(|error| {
+                TransferError::io(
+                    "failed to read source entry metadata",
+                    walkdir_io_error(error),
+                )
+            })?
+            .len();
         let Some(destination_relative) = destination_for_source_path(item, &source_relative) else {
             return Ok(());
         };
