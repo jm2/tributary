@@ -568,8 +568,10 @@ impl MountedRootAuthority {
     /// the final leaf already exists; the platform-native no-replace rename
     /// is tried first, then a link-based publish, and finally an
     /// exclusive-reservation publish for filesystems that offer neither. On
-    /// Windows the rename uses the absolute paths with the retained parent
-    /// identity revalidated immediately before and after.
+    /// Windows the no-replace publish mirrors that cascade with safe path
+    /// operations — a hard-link publish first, then the exclusive
+    /// reservation — and the retained parent identity is revalidated
+    /// immediately before and after.
     pub(super) fn rename_within_directory(
         &self,
         parent: &RetainedWriteParent,
@@ -635,7 +637,7 @@ impl MountedRootAuthority {
         }
         #[cfg(windows)]
         {
-            let final_path = self.root.join(relative);
+            let final_path = join_components(&self.root, &components);
             std::fs::remove_file(&final_path)?;
         }
         #[cfg(not(any(unix, windows)))]
@@ -673,7 +675,7 @@ impl MountedRootAuthority {
         }
         #[cfg(windows)]
         {
-            let final_path = self.root.join(relative);
+            let final_path = join_components(&self.root, &components);
             std::fs::remove_dir(&final_path)?;
         }
         #[cfg(not(any(unix, windows)))]
@@ -2631,8 +2633,12 @@ fn publish_by_exclusive_reservation(
     Ok(())
 }
 
-/// Windows no-replace rename: `MoveFileExW` without
-/// `MOVEFILE_REPLACE_EXISTING` fails when the destination exists.
+/// Windows no-replace publish, mirroring the Unix strategy cascade with
+/// safe `std` operations. A hard-link publish is tried first: creating the
+/// link fails when the final leaf exists, so the publish is atomic and a
+/// collision is a definitive failure. Filesystems without hard-link support
+/// — FAT and exFAT USB mounts — fall back to the exclusive-reservation
+/// publish.
 #[cfg(windows)]
 fn rename_no_replace_within_parent(
     _parent: &File,
@@ -2641,19 +2647,60 @@ fn rename_no_replace_within_parent(
     _to_leaf: &OsStr,
     to_absolute: &Path,
 ) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
+    match std::fs::hard_link(from_absolute, to_absolute) {
+        Ok(()) => {
+            // The data is published under the final name. Removing the
+            // staged leaf is best-effort: a failure leaves a hidden
+            // temporary behind rather than lying about the publish.
+            let _ = std::fs::remove_file(from_absolute);
+            return Ok(());
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "destination appeared before the no-replace publish",
+            ));
+        }
+        // No hard-link support on this filesystem: fall through to the
+        // exclusive-reservation publish below.
+        Err(_) => {}
+    }
+    publish_no_replace_by_reservation(from_absolute, to_absolute)
+}
 
-    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
-
-    let mut from: Vec<u16> = from_absolute.as_os_str().encode_wide().collect();
-    from.push(0);
-    let mut to: Vec<u16> = to_absolute.as_os_str().encode_wide().collect();
-    to.push(0);
-    // SAFETY: both pointers refer to NUL-terminated wide string buffers for
-    // the complete duration of the call.
-    let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
+/// Final no-replace strategy for filesystems offering no hard links.
+///
+/// The destination leaf is created exclusively as a private placeholder,
+/// then the staged leaf is renamed over it. Any other exclusive creator
+/// loses and learns the name is taken, so the only bytes the replace can
+/// ever discard are the placeholder's own — unlike an existence probe
+/// bracketing a plain rename, which could replace a file created inside the
+/// probe-to-rename window. A failed replace removes the placeholder
+/// best-effort so the name is released cleanly; it held only bytes this
+/// call created.
+#[cfg(windows)]
+fn publish_no_replace_by_reservation(from_absolute: &Path, to_absolute: &Path) -> io::Result<()> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to_absolute)
+    {
+        // The name is reserved. Close the placeholder immediately: the
+        // publish replaces the directory entry, not this handle.
+        Ok(reserved) => drop(reserved),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "destination appeared before the no-replace publish",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    if let Err(error) = std::fs::rename(from_absolute, to_absolute) {
+        // Release the reserved name so a retry sees a clean directory; the
+        // placeholder never held caller data.
+        let _ = std::fs::remove_file(to_absolute);
+        return Err(error);
     }
     Ok(())
 }

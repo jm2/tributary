@@ -362,6 +362,18 @@ impl TransferExecutor {
                 ));
             }
         };
+        let staged = Self::flush_and_verify_size(staged, declared_bytes, copied)?;
+        self.save_backup_and_commit(staged, destination_relative, context)
+    }
+
+    /// Flush the staged file and verify the copied byte count against the
+    /// plan's declared size. A short or oversized copy is a corrupted
+    /// transfer: the staged copy is discarded and the failure reported.
+    fn flush_and_verify_size(
+        staged: PreparedWriteTarget,
+        declared_bytes: u64,
+        copied: u64,
+    ) -> Result<PreparedWriteTarget, TransferError> {
         staged
             .staged_file()
             .flush()
@@ -375,12 +387,23 @@ impl TransferExecutor {
                 )),
             ));
         }
-        // An Overwrite commit replaces a pre-existing original. Save the
-        // original through the retained authority first so a later rollback
-        // can put it back; the original stays in place until the replace
-        // publish, so a mid-copy cancellation never disturbs it. A absent
-        // destination has nothing to save — the commit publishes fresh and
-        // rollback removes the published file outright.
+        Ok(staged)
+    }
+
+    /// Save the restorable original for an Overwrite commit and publish.
+    ///
+    /// An Overwrite commit replaces a pre-existing original. The original is
+    /// saved through the retained authority first so a later rollback can
+    /// put it back; the original stays in place until the replace publish,
+    /// so a mid-copy cancellation never disturbs it. An absent destination
+    /// has nothing to save — the commit publishes fresh and rollback removes
+    /// the published file outright.
+    fn save_backup_and_commit(
+        &self,
+        staged: PreparedWriteTarget,
+        destination_relative: &Path,
+        context: &RunContext<'_>,
+    ) -> Result<Option<CommittedCopy>, TransferError> {
         let backup = if staged.resolution() == ConflictResolution::Overwrite {
             match self.save_original_backup(destination_relative, context) {
                 Ok(backup) => backup,
