@@ -10856,10 +10856,14 @@ mod tests {
     /// `process_directory_events` loop: the `ConfirmRootTrust` command queues
     /// the pending trust scan inside the loop, and the loop's own
     /// `pending_trust_scan.take()` boundary performs the backlog discard and
-    /// the distinct ordinary authority scan. The racing event is injected only
-    /// after the authority scan has begun — deterministically synchronized on
-    /// the scan's per-file `ScanProgress` event — so it is distinguishable
-    /// from backlog that escaped the discard.
+    /// the distinct ordinary authority scan. The racing event is injected
+    /// while the authority scan is provably still in flight: the library
+    /// event channel is bounded to one slot and the driver withholds draining
+    /// after the scan's per-file `ScanProgress`, so the scan's `ScanComplete`
+    /// send cannot complete until the driver resumes — which happens only
+    /// after the injection. The racing evidence is therefore mid-scan,
+    /// distinguishable from backlog that escaped the discard, and still
+    /// retained at the following boundary.
     #[tokio::test]
     async fn pending_root_trust_boundary_suppresses_backlog_and_keeps_racing_events() {
         let db = Arc::new(rename_test_database().await);
@@ -10926,7 +10930,20 @@ mod tests {
             "the suppressed backlog is real incremental evidence, not access noise"
         );
 
-        let (library_events, library_event_rx) = async_channel::unbounded();
+        // The library event channel is deliberately bounded to one slot. The
+        // driver below withholds draining after the authority scan's first
+        // per-file ScanProgress, so the scan's subsequent sends back up behind
+        // the full channel and its ScanComplete send cannot complete until the
+        // driver resumes — which happens only after the racing injection. That
+        // backpressure is the acknowledgement pinning the injection mid-scan;
+        // an unbounded channel would let the scan race to completion first.
+        let (library_events, library_event_rx) = async_channel::bounded(1);
+        // Everything the driver consumes must stay visible to the final
+        // assertions, so each drain phase records its events in order.
+        let pre_injection_events: Arc<std::sync::Mutex<Vec<LibraryEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let post_injection_events: Arc<std::sync::Mutex<Vec<LibraryEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
         let (command_tx, command_rx) = async_channel::unbounded::<LibraryCommand>();
         command_tx
             .send(LibraryCommand::ConfirmRootTrust(request))
@@ -10938,27 +10955,57 @@ mod tests {
         let driver_racing_audio = racing_audio.clone();
         let driver_flag = Arc::clone(&ingress_overflowed);
         let driver_event_rx = &library_event_rx;
+        let driver_pre_injection = Arc::clone(&pre_injection_events);
+        let driver_post_injection = Arc::clone(&post_injection_events);
         let driver = async move {
-            // Deterministic mid-scan synchronization: consume library events
-            // until the conversion scan's ScanComplete has passed, then block
-            // on the authority scan's first per-file ScanProgress. That event
-            // only fires after the boundary's discard ran (the discard
+            // Deterministic mid-scan synchronization, phase 1: consume library
+            // events until the conversion scan's ScanComplete has passed, then
+            // until the authority scan's first per-file ScanProgress. That
+            // event only fires after the boundary's discard ran (the discard
             // precedes the authority scan), so the racing evidence queued
-            // here is provably distinct from suppressed backlog.
+            // below is provably distinct from suppressed backlog. Recording
+            // keeps every consumed event visible to the final assertions.
             let mut completed_scans = 0u32;
             loop {
                 match driver_event_rx.recv().await {
-                    Ok(LibraryEvent::ScanComplete) => completed_scans += 1,
-                    Ok(LibraryEvent::ScanProgress(..)) if completed_scans >= 1 => break,
-                    Ok(_) => {}
+                    Ok(LibraryEvent::ScanComplete) => {
+                        completed_scans += 1;
+                        // Record completions too — the pre-injection count of
+                        // ScanComplete events is the mid-scan proof.
+                        driver_pre_injection
+                            .lock()
+                            .expect("pre-injection record poisoned")
+                            .push(LibraryEvent::ScanComplete);
+                    }
+                    Ok(event @ LibraryEvent::ScanProgress(..)) if completed_scans >= 1 => {
+                        // Record the trigger event itself: the driver stops
+                        // draining exactly here, and the timeline must show it.
+                        driver_pre_injection
+                            .lock()
+                            .expect("pre-injection record poisoned")
+                            .push(event);
+                        break;
+                    }
+                    Ok(event) => driver_pre_injection
+                        .lock()
+                        .expect("pre-injection record poisoned")
+                        .push(event),
                     Err(err) => {
                         panic!("library events ended before the authority scan ran: {err}")
                     }
                 }
             }
-            // The track appears and its watcher evidence queues while the
-            // authority scan is still running: the scan itself never consumes
-            // the watcher queue, so this evidence must survive the boundary.
+            // Phase 2: inject while the authority scan is provably still in
+            // flight. The driver has stopped draining and the channel holds at
+            // most one slot, so of the scan's remaining sequential sends
+            // (FullSync, PlaylistProjectionsInvalidated, ScanComplete) at most
+            // the first can complete before it blocks; ScanComplete — last in
+            // that order — cannot be sent until the driver resumes in phase 3.
+            // The injection therefore happens-before the authority scan's
+            // completion event. The track appears and its watcher evidence
+            // queues while the authority scan is still running: the scan
+            // itself never consumes the watcher queue, so this evidence must
+            // survive the boundary.
             write_minimal_wav(&driver_racing_audio);
             enqueue_watcher_result(
                 &event_tx,
@@ -10969,6 +11016,37 @@ mod tests {
                 ),
             );
             drop(event_tx);
+            // Phase 3: resume draining so the blocked scan can finish, the
+            // watcher boundary can apply the racing evidence, and the loop can
+            // reach its final send. The batch's trailing
+            // PlaylistProjectionsInvalidated (emitted by
+            // settle_playlist_projections_after_watcher_batch after the racing
+            // upsert commits) is the loop's last event for this scenario, so
+            // consuming it proves the loop finished mutating and can exit
+            // cleanly on its exhausted watcher stream. Events stay recorded so
+            // nothing the driver consumed is lost to the assertions.
+            let mut authority_scan_complete = false;
+            loop {
+                match driver_event_rx.recv().await {
+                    Ok(event) => {
+                        let is_scan_complete = matches!(event, LibraryEvent::ScanComplete);
+                        let is_projections =
+                            matches!(event, LibraryEvent::PlaylistProjectionsInvalidated);
+                        driver_post_injection
+                            .lock()
+                            .expect("post-injection record poisoned")
+                            .push(event);
+                        if is_scan_complete {
+                            authority_scan_complete = true;
+                        } else if is_projections && authority_scan_complete {
+                            break;
+                        }
+                    }
+                    Err(err) => panic!(
+                        "library events ended before the boundary applied the racing evidence: {err}"
+                    ),
+                }
+            }
         };
 
         let mut completed_commands = HashMap::new();
@@ -10986,8 +11064,46 @@ mod tests {
         );
         loop_result.expect("watcher loop exits cleanly");
 
-        let events: Vec<LibraryEvent> =
-            std::iter::from_fn(|| library_event_rx.try_recv().ok()).collect();
+        // The injection was pinned mid-scan by the bounded channel and the
+        // withheld drain; the recorded timeline proves it. At injection time
+        // exactly one scan had completed — the conversion scan — so the
+        // authority scan's ScanComplete was emitted strictly after the racing
+        // evidence was injected, and the driver stopped draining right on the
+        // authority scan's first per-file ScanProgress.
+        assert_eq!(
+            pre_injection_events
+                .lock()
+                .expect("pre-injection record poisoned")
+                .iter()
+                .filter(|event| matches!(event, LibraryEvent::ScanComplete))
+                .count(),
+            1,
+            "the driver must inject while only the conversion scan has completed"
+        );
+        assert!(matches!(
+            pre_injection_events
+                .lock()
+                .expect("pre-injection record poisoned")
+                .last(),
+            Some(LibraryEvent::ScanProgress(..))
+        ));
+
+        // Reassemble the full timeline in channel order: everything the
+        // driver consumed before the injection, everything it consumed after,
+        // then whatever remained channel-resident (empty when the driver's
+        // final drain ran to the loop's last send).
+        let mut events: Vec<LibraryEvent> = std::mem::take(
+            &mut *pre_injection_events
+                .lock()
+                .expect("pre-injection record poisoned"),
+        );
+        events.extend(std::mem::take(
+            &mut *post_injection_events
+                .lock()
+                .expect("post-injection record poisoned"),
+        ));
+        events.extend(std::iter::from_fn(|| library_event_rx.try_recv().ok()));
+
         let boundary_delivered = boundary_audio.to_string_lossy().into_owned();
         let racing_delivered = racing_audio.to_string_lossy().into_owned();
 
