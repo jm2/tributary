@@ -28,6 +28,15 @@ name: Bot review gate
 #   * A pending or failing result is merge-blocking only once the live `main`
 #     ruleset marks "Bot Review Gate" as required. docs/dependency-updates.md
 #     records the exact rollout order and the live-PR verification step.
+#   * Operator rate-limit substitution: a repo-owned policy file on `main`
+#     (.github/bot-review-substitution.json) may document a required bot
+#     reviewer as rate-limited. For a listed reviewer ONLY, the gate then
+#     waives the stale-evidence violation when — and only when — the named
+#     substitute reviewer has APPROVED the exact head being evaluated,
+#     every review thread is resolved, and no author has an outstanding
+#     change request. A missing policy file disables the waiver entirely;
+#     the waiver never touches unresolved threads or outstanding change
+#     requests, and a comment-only review is never an approval.
 #
 # Refresh paths — every trigger here is a documented Actions event. Resolving
 # a review thread fires no Actions event at all (`pull_request_review_thread`
@@ -46,9 +55,10 @@ name: Bot review gate
 #
 # Security: strictly read-only. The workflow never checks out pull-request
 # code, holds no write permission, and queries only the pull request that
-# triggered the event through the GitHub API. A query failure, an incomplete
-# pagination, or a head mismatch fails the check instead of silently passing
-# it.
+# triggered the event through the GitHub API — plus the repository-owned
+# substitution policy file (below), read from `main`. A query failure, an
+# incomplete pagination, or a head mismatch fails the check instead of
+# silently passing it.
 on:
   pull_request:
     branches:
@@ -66,6 +76,7 @@ on:
         type: string
 
 permissions:
+  contents: read
   pull-requests: read
 
 concurrency:
@@ -225,6 +236,51 @@ jobs:
             exit 1
           fi
 
+          # ── Substitution policy: documented reviewer rate limits ────────
+          # The operator may document a rate-limited required reviewer in a
+          # repo-owned file on `main`. The file is read from `main` so a
+          # pull request can never edit its own waiver. Any fetch problem
+          # other than a clean 404, and any malformed document, disables
+          # the waiver (and warns) instead of enabling it: the substitution
+          # is an opt-in relaxation, so its failure mode is "no waiver",
+          # never "gate passes".
+          substitution_path=".github/bot-review-substitution.json"
+          policy_json=""
+          if policy_response="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${substitution_path}?ref=main" 2>"${RUNNER_TEMP}/policy-fetch.err")"; then
+            policy_b64="$(jq -r '.content // ""' <<<"${policy_response}" | tr -d '\n')"
+            if policy_json="$(printf '%s' "${policy_b64}" | base64 -d 2>/dev/null)" \
+              && [ -n "${policy_json}" ] \
+              && jq -e 'type == "object"
+                        and (.substitute_reviewer | type == "string" and length > 0)
+                        and (.rate_limited_reviewers | type == "array")
+                        and all(.rate_limited_reviewers[];
+                                type == "object"
+                                and (.login | type == "string" and length > 0)
+                                and (.evidence | type == "string" and length > 0))' \
+                <<<"${policy_json}" > /dev/null; then
+              :
+            else
+              policy_json=""
+              echo "WARNING: ${substitution_path} on main is present but malformed; the rate-limit substitution stays disabled." >&2
+            fi
+          else
+            fetch_err="$(cat "${RUNNER_TEMP}/policy-fetch.err" 2>/dev/null || true)"
+            case "${fetch_err}" in
+              *"(HTTP 404)"*|*"Not Found"*) : ;; # no policy on file: the waiver is simply unavailable
+              *)
+                if [ -n "${fetch_err}" ]; then
+                  echo "WARNING: could not read ${substitution_path} from main; the rate-limit substitution stays disabled." >&2
+                fi
+                ;;
+            esac
+          fi
+          policy_file="${RUNNER_TEMP}/substitution-policy.json"
+          if [ -n "${policy_json}" ]; then
+            printf '%s' "${policy_json}" > "${policy_file}"
+          else
+            printf 'null' > "${policy_file}"
+          fi
+
           # ── Decisions: the complete rule set, in one reviewed filter ─────
           cat > "${decisions_jq}" <<'DECISIONS'
             # A bot author is a GitHub App account or a "[bot]"-suffixed login.
@@ -310,23 +366,82 @@ jobs:
                 else []
                 end;
 
-            {
-              evaluated_head: $head,
-              evaluated_threads: ([ $threads[].data.repository.pullRequest.reviewThreads.nodes[] ] | length),
-              evaluated_reviews: ([ $reviews[].data.repository.pullRequest.reviews.nodes[] ] | length),
-              violations: (
-                ($threads | unresolved_bot_threads)
-                + [ $reviews | bot_review_violations($head)[] ]
-              )
-            }
+            # Operator rate-limit substitution: for a reviewer documented in
+            # the repo-owned policy file, the stale-evidence violation may
+            # be waived only when ALL of the following hold at the exact
+            # evaluated head:
+            #   * the policy is present and well-formed (checked before this
+            #     filter; a malformed or missing file passes null here);
+            #   * the policy's substitute reviewer has an APPROVED review —
+            #     a comment-only review is never an approval — bound to the
+            #     exact head being evaluated;
+            #   * every review thread is resolved (bot or human);
+            #   * no author has an outstanding change request (bot or
+            #     human; latest decisive review per author decides).
+            # The waiver removes ONLY the stale_bot_review_evidence
+            # violations of the listed reviewers: unresolved threads and
+            # outstanding change requests always block.
+            def substitution_eligible($head; $policy):
+              ($policy != null)
+              and ([ $threads[].data.repository.pullRequest.reviewThreads.nodes[]
+                     | select(.isResolved == false) ] | length == 0)
+              and ([ $reviews[].data.repository.pullRequest.reviews.nodes[]
+                     | select(.state == "CHANGES_REQUESTED"
+                            or .state == "APPROVED"
+                            or .state == "DISMISSED")
+                     | { author: (.author.login // ""), database_id: .databaseId, state: .state } ]
+                   | group_by(.author)
+                   | all(.[]; ((sort_by(.database_id) | last).state != "CHANGES_REQUESTED")))
+              and ([ $reviews[].data.repository.pullRequest.reviews.nodes[]
+                     | select(.author.login == $policy.substitute_reviewer)
+                     | select(.state == "APPROVED" and .commit.oid == $head) ] | length > 0);
+
+            ( ($threads | unresolved_bot_threads)
+            + [ $reviews | bot_review_violations($head)[] ] ) as $all_violations
+            | $policy[0] as $policy
+            | substitution_eligible($head; $policy) as $eligible
+            | (($policy.rate_limited_reviewers // []) | map(.login)) as $waivable_logins
+            | {
+                evaluated_head: $head,
+                evaluated_threads: ([ $threads[].data.repository.pullRequest.reviewThreads.nodes[] ] | length),
+                evaluated_reviews: ([ $reviews[].data.repository.pullRequest.reviews.nodes[] ] | length),
+                violations: (
+                  if $eligible then
+                    [ $all_violations[]
+                      | . as $v
+                      | select(.reason != "stale_bot_review_evidence"
+                               or ($waivable_logins | index($v.author) | not)) ]
+                  else $all_violations
+                  end
+                ),
+                waived: (
+                  if $eligible then
+                    [ $all_violations[]
+                      | select(.reason == "stale_bot_review_evidence")
+                      | . as $v
+                      | select($waivable_logins | index($v.author))
+                      | { author: $v.author,
+                          url: $v.url,
+                          substitute: $policy.substitute_reviewer,
+                          evidence: ([ $policy.rate_limited_reviewers[]
+                                       | select(.login == $v.author) ] | map(.evidence) | join(", ")) } ]
+                  else []
+                  end
+                )
+              }
           DECISIONS
 
           evaluated="$(jq -n \
             --slurpfile threads "${threads_pages}" \
             --slurpfile reviews "${reviews_pages}" \
+            --slurpfile policy "${policy_file}" \
             --arg head "${intended_head}" \
             -f "${decisions_jq}")"
 
+          jq -r '.waived[] |
+                 "RATE-LIMIT SUBSTITUTION: stale evidence by \(.author) waived under the documented rate limit"
+                 + " (\(.evidence)) — substitute approval by \(.substitute) at the evaluated head: \(.url)"' \
+            <<<"${evaluated}"
           violation_count="$(jq '.violations | length' <<<"${evaluated}")"
           if [ "${violation_count}" -gt 0 ]; then
             jq -r '.violations[] |
