@@ -386,16 +386,32 @@ cargo test --bin tributary local::engine::tests::marker_mutation_requires_reconc
 cargo test --bin tributary local::engine::tests::watcher_batch
 ```
 
-Name-existence check for every test named in this document:
+Name-uniqueness check for every test named in this document. Unlike a bare
+`grep -c`, which only prints a count and exits 0 even for duplicates, each
+iteration asserts that the definition count is exactly 1 — a duplicated or
+missing definition fails the loop with a non-zero exit:
 
 ```sh
-grep -c "fn watcher_batch_name_any_alone_demands_reconciliation_without_identity(" src/local/engine.rs
-grep -c "fn pending_root_trust_boundary_suppresses_backlog_and_keeps_racing_events(" src/local/engine.rs
-grep -c "fn marker_mutation_confirms_root_before_backlog_incrementals_end_to_end(" src/local/engine.rs
+for name in \
+  watcher_batch_name_any_alone_demands_reconciliation_without_identity \
+  pending_root_trust_boundary_suppresses_backlog_and_keeps_racing_events \
+  marker_mutation_confirms_root_before_backlog_incrementals_end_to_end
+do
+  count=$(grep -F -c "fn ${name}(" src/local/engine.rs)
+  test "$count" -eq 1 || exit 1
+done
 ```
 
-(Each prints `1`; the remaining §2 names were verified the same way against
-this branch's head.)
+(Verified against this branch's head: the loop exits 0 with all three
+definitions present exactly once; the remaining §2 names were checked the
+same way. Duplicate rejection demonstrated at the same head by temporarily
+appending a second
+
+`fn pending_root_trust_boundary_suppresses_backlog_and_keeps_racing_events(`
+
+definition: the count for that name became 2 and the loop exited 1. The
+temporary duplicate was removed before commit and the working tree was
+verified clean afterwards.)
 
 ## 9. Acceptance
 
