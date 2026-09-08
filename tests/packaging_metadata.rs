@@ -1553,11 +1553,32 @@ fn bot_review_gate_workflow() -> serde_yaml::Value {
     serde_yaml::from_str(BOT_REVIEW_GATE).expect("bot review gate workflow must parse")
 }
 
+fn bot_review_gate_run_script(workflow: &serde_yaml::Value) -> String {
+    let job_steps = workflow["jobs"]["bot-review-gate"]["steps"]
+        .as_sequence()
+        .expect("gate steps must be a sequence");
+    assert_eq!(
+        job_steps.len(),
+        1,
+        "the gate must stay a single API-only step"
+    );
+    assert!(
+        job_steps.iter().all(|step| step.get("uses").is_none()),
+        "the gate must not execute any third-party action or checkout"
+    );
+    job_steps[0]["run"]
+        .as_str()
+        .expect("the gate step must inline its script")
+        .to_owned()
+}
+
 #[test]
 // These assertions jointly prove the gate's one privileged boundary — it is
 // the machine-readable merge evidence for bot reviews — and should fail as a
-// unit if its read-only permission, fail-closed query, thread semantics, or
-// stable check name regresses.
+// unit if its read-only permission, fail-closed queries, review-conclusion
+// semantics, head binding, or stable check name regresses. The decision
+// logic itself is exercised against recorded fixtures by
+// tests/bot_review_gate.rs; this test pins the workflow-level contract.
 // #lizard forgives
 fn bot_review_gate_is_read_only_fail_closed_and_pinned_to_main_prs() {
     let workflow = bot_review_gate_workflow();
@@ -1587,11 +1608,17 @@ fn bot_review_gate_is_read_only_fail_closed_and_pinned_to_main_prs() {
         Some(1),
         "the gate reports only on pull requests targeting main"
     );
+    let pull_request_types = yaml_string_list(&on["pull_request"], "types");
+    assert_eq!(
+        pull_request_types,
+        ["opened", "synchronize", "reopened"],
+        "every push to a pull request must re-evaluate the gate at the new head"
+    );
     let review_types = yaml_string_list(&on["pull_request_review"], "types");
     assert_eq!(
         review_types,
-        ["submitted"],
-        "review submissions must re-evaluate the gate"
+        ["submitted", "edited", "dismissed"],
+        "review conclusions and their formal withdrawal must re-evaluate the gate"
     );
     let review_comment_types = yaml_string_list(&on["pull_request_review_comment"], "types");
     assert_eq!(
@@ -1599,11 +1626,17 @@ fn bot_review_gate_is_read_only_fail_closed_and_pinned_to_main_prs() {
         ["created"],
         "a thread opened by a single review comment (no review submission) must re-evaluate the gate"
     );
-    let thread_types = yaml_string_list(&on["pull_request_review_thread"], "types");
-    assert_eq!(
-        thread_types,
-        ["resolved", "unresolved"],
-        "thread resolution changes must re-evaluate the gate or a resolved gate would stay red"
+    // `pull_request_review_thread` is a webhook event, not an Actions
+    // trigger: declaring it here would make the workflow invalid. Thread
+    // resolution is instead refreshed by the documented re-run and
+    // workflow_dispatch paths.
+    assert!(
+        on.get("pull_request_review_thread").is_none(),
+        "the gate must declare only documented Actions events, not webhooks"
+    );
+    assert!(
+        on["workflow_dispatch"]["inputs"]["pr_number"]["required"].as_bool() == Some(true),
+        "the dispatch refresh path must name exactly the pull request it evaluates"
     );
 
     let permissions = workflow["permissions"]
@@ -1620,51 +1653,107 @@ fn bot_review_gate_is_read_only_fail_closed_and_pinned_to_main_prs() {
         "the gate must be strictly read-only"
     );
 
-    let job_steps = workflow["jobs"]["bot-review-gate"]["steps"]
-        .as_sequence()
-        .expect("gate steps must be a sequence");
-    assert_eq!(
-        job_steps.len(),
-        1,
-        "the gate must stay a single API-only step"
-    );
-    assert!(
-        job_steps.iter().all(|step| step.get("uses").is_none()),
-        "the gate must not execute any third-party action or checkout"
-    );
-
     assert_eq!(
         workflow["concurrency"]["cancel-in-progress"].as_bool(),
         Some(true),
         "a newer review event must cancel the gate's stale run"
     );
     assert!(
-        workflow["concurrency"]["group"]
-            .as_str()
-            .is_some_and(|group| group.contains("github.event.pull_request.number")),
-        "gate concurrency must be scoped to the exact pull request"
+        workflow["concurrency"]["group"].as_str().is_some_and(
+            |group| group.contains("github.event.pull_request.number || inputs.pr_number")
+        ),
+        "gate concurrency must be scoped to the exact pull request across event kinds"
     );
 
+    // Extracting the run script also proves the step shape: exactly one
+    // API-only step, no checkout, no third-party actions.
+    let _script = bot_review_gate_run_script(&workflow);
+}
+
+#[test]
+// The gate script's decision contract, pinned as text. The decisions
+// themselves run against recorded fixtures in tests/bot_review_gate.rs.
+fn bot_review_gate_script_pins_resolution_conclusions_and_head_binding() {
+    let script = bot_review_gate_run_script(&bot_review_gate_workflow());
+
+    // Complete paginated evidence: review conclusions (a change request can
+    // exist without any inline thread) and review threads alike.
     assert!(
-        BOT_REVIEW_GATE.contains("isResolved")
-            && BOT_REVIEW_GATE.contains("isOutdated")
-            && BOT_REVIEW_GATE.contains(".comments.nodes[0].author.__typename == \"Bot\"")
-            && BOT_REVIEW_GATE.contains("endswith(\"[bot]\")")
-            && BOT_REVIEW_GATE.contains("reviewThreads"),
-        "the gate must fail on unresolved, non-outdated review threads started by bots"
+        script.contains("reviewThreads(first: 100") && script.contains("reviews(first: 100"),
+        "the gate must paginate both review threads and reviews completely"
     );
     assert!(
-        BOT_REVIEW_GATE.contains("Review-thread query failed; failing closed.")
-            && BOT_REVIEW_GATE
-                .contains("Review-thread response omitted the pull request; failing closed."),
-        "a failed or incomplete thread query must fail the check instead of passing it"
+        script.contains("group_by(.author)") && script.contains("sort_by(.database_id)"),
+        "review conclusions must be evaluated per bot author from their latest review"
     );
+
+    // Thread semantics: only explicit resolution clears a thread. GitHub's
+    // "outdated" flag is reported but never substitutes for resolution —
+    // code movement is not evidence that a finding was addressed.
+    assert!(
+        script.contains("select(.isResolved == false)"),
+        "the gate must fail on bot review threads that are not explicitly resolved"
+    );
+    assert!(
+        !script.contains(".isOutdated == false"),
+        "an outdated unresolved thread must stay blocking: movement is not resolution"
+    );
+    assert!(
+        script.contains("isOutdated"),
+        "the report must disclose whether a blocking thread is outdated"
+    );
+    assert!(
+        script.contains("endswith(\"[bot]\")"),
+        "the gate must recognise both GitHub App accounts and [bot]-suffixed logins"
+    );
+
+    // Review-conclusion semantics: an outstanding change request blocks even
+    // without an inline thread, a formal dismissal clears it, and otherwise
+    // the latest review must be bound to the evaluated head.
+    assert!(
+        script.contains("CHANGES_REQUESTED") && script.contains("outstanding_bot_change_request"),
+        "a bot change request must block the gate even when it opened no thread"
+    );
+    assert!(
+        script.contains("DISMISSED"),
+        "a formally dismissed review must clear its author's conclusion"
+    );
+    assert!(
+        script.contains("stale_bot_review_evidence") && script.contains("commit { oid }"),
+        "bot review evidence must be bound to the exact evaluated head"
+    );
+
+    // Head binding: pagination and the published result are bound to one
+    // exact head, re-verified immediately before publication.
+    assert!(
+        script.contains("headRefOid == $head") && script.contains("Pull request head moved to"),
+        "paginated evidence and the published result must be bound to one exact head"
+    );
+
+    // Every query failure, incomplete pagination, or wrong base must fail
+    // the check instead of passing it.
+    for fragment in [
+        "Pull request query failed; failing closed.",
+        "Review-thread query failed; failing closed.",
+        "Review query failed; failing closed.",
+        "Review-thread response omitted the pull request; failing closed.",
+        "Review response omitted the pull request; failing closed.",
+    ] {
+        assert!(
+            script.contains(fragment),
+            "a failed or incomplete query must fail the check: {fragment}"
+        );
+    }
     // `gh api graphql --paginate` emits one JSON document per page and a
     // plain `jq -e` derives its exit status from the last value only, so the
     // incompleteness guard must slurp every page and validate each one.
     assert!(
-        BOT_REVIEW_GATE.contains("jq -s -e 'all(.[]; .data.repository.pullRequest != null)'"),
+        script.contains("all(.[]; .data.repository.pullRequest != null)"),
         "the fail-closed guard must validate every paginated page, not just the last one"
+    );
+    assert!(
+        script.contains("!= \"main\"") || script.contains("!= 'main'"),
+        "the gate must re-derive and require the main base branch"
     );
 }
 

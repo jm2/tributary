@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Test double for `gh` used by the bot-review-gate fixture tests. It serves
+# recorded API responses from GH_STUB_PAGES (copied fixture data) and counts
+# REST calls in GH_STUB_STATE; it never touches a network. An invocation the
+# gate script should never make exits 64 so the tests fail loudly.
+#
+# Behaviour:
+#   * `gh api graphql --paginate -f query=...` — the query is fingerprinted
+#     by connection name; pages are served in order from
+#     GH_STUB_PAGES/{threads,reviews}/page.N.json, one compact JSON document
+#     per page (matching `gh api graphql --paginate` output), stopping after
+#     a page whose pageInfo.hasNextPage is false.
+#   * `gh api repos/.../pulls/N [--jq <filter>]` — the Nth REST call serves
+#     GH_STUB_PAGES/pr.N.json, falling back to pr.1.json.
+#   * A GH_STUB_PAGES/fail file injects failures: tokens "threads",
+#     "reviews", "graphql" fail the matching GraphQL query; "pr" fails REST.
+set -u
+
+pages="${GH_STUB_PAGES:?GH_STUB_PAGES must be set}"
+state="${GH_STUB_STATE:?GH_STUB_STATE must be set}"
+fail_mode=""
+if [ -f "${pages}/fail" ]; then
+  fail_mode="$(cat "${pages}/fail")"
+fi
+
+paginate=false
+jq_filter=""
+query=""
+rest_path=""
+prev=""
+for arg in "$@"; do
+  if [ "${prev}" = "--jq" ]; then
+    jq_filter="${arg}"
+  elif [ "${prev}" = "-f" ] || [ "${prev}" = "-F" ]; then
+    case "${arg}" in
+      query=*) query="${arg#query=}" ;;
+    esac
+  fi
+  case "${arg}" in
+    --paginate) paginate=true ;;
+    --jq | -f | -F)
+      prev="${arg}"
+      continue
+      ;;
+    api) ;;
+    repos/*)
+      if [ -z "${rest_path}" ]; then rest_path="${arg}"; fi
+      ;;
+  esac
+  prev="${arg}"
+done
+
+if [ -n "${rest_path}" ]; then
+  case "${fail_mode}" in
+    *pr*)
+      echo "stub: injected pull request query failure" >&2
+      exit 1
+      ;;
+  esac
+  count_file="${state}/rest.count"
+  n="$(cat "${count_file}" 2>/dev/null || printf '0')"
+  n=$((n + 1))
+  printf '%s\n' "${n}" > "${count_file}"
+  file="${pages}/pr.${n}.json"
+  if [ ! -f "${file}" ]; then file="${pages}/pr.1.json"; fi
+  if [ -n "${jq_filter}" ]; then
+    exec jq -r "${jq_filter}" "${file}"
+  fi
+  cat "${file}"
+  exit 0
+fi
+
+if [ "${paginate}" = true ] && [ -n "${query}" ]; then
+  kind=""
+  case "${query}" in
+    *reviewThreads*first:*) kind="threads" ;;
+    *reviews*first:*) kind="reviews" ;;
+  esac
+  if [ -z "${kind}" ]; then
+    echo "stub: unrecognised graphql query" >&2
+    exit 64
+  fi
+  case "${fail_mode}" in
+    *graphql* | *"${kind}"*)
+      echo "stub: injected ${kind} query failure" >&2
+      exit 1
+      ;;
+  esac
+  n=1
+  while :; do
+    file="${pages}/${kind}/page.${n}.json"
+    if [ ! -f "${file}" ]; then
+      echo "stub: ${kind} page ${n} missing after a page promised another" >&2
+      exit 64
+    fi
+    jq -c . "${file}"
+    has_next="$(jq -r '[.. | objects | select(has("hasNextPage")) | .hasNextPage] | any' "${file}")"
+    if [ "${has_next}" != "true" ]; then
+      exit 0
+    fi
+    n=$((n + 1))
+  done
+fi
+
+echo "stub: unexpected invocation: $*" >&2
+exit 64
