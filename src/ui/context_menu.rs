@@ -792,15 +792,18 @@ fn setup_playlist_transfer(
 /// from a widget inside that list view; the header, empty space, and the
 /// column view itself refuse.
 fn drag_origin_is_data_row(column_view: &gtk::ColumnView, picked: Option<gtk::Widget>) -> bool {
+    let Some(picked) = picked.filter(|widget| !widget.is::<gtk::ListView>()) else {
+        // An internal ListView pick is its unused viewport, not a data row.
+        return false;
+    };
     let column_view = column_view.upcast_ref::<gtk::Widget>();
-    let mut widget = picked;
+    let mut widget = picked.parent();
+    let mut inside_rows = false;
     while let Some(current) = widget {
         if &current == column_view {
-            return false;
+            return inside_rows;
         }
-        if current.is::<gtk::ListView>() {
-            return true;
-        }
+        inside_rows |= current.is::<gtk::ListView>();
         widget = current.parent();
     }
     false
@@ -2017,12 +2020,7 @@ mod tests {
     /// a different thread from the first.
     #[cfg(not(target_os = "macos"))]
     fn assert_track_drags_start_only_from_the_data_row_area() {
-        let store = gtk::gio::ListStore::new::<gtk::StringObject>();
-        store.append(&gtk::StringObject::new("a"));
-        let selection = gtk::MultiSelection::new(Some(store));
-        let factory = gtk::SignalListItemFactory::new();
-        let column_view = gtk::ColumnView::new(Some(selection));
-        column_view.append_column(&gtk::ColumnViewColumn::new(Some("Title"), Some(factory)));
+        let (window, column_view, label) = realized_tracklist_for_drag_test();
 
         // GTK parents the header row widget first and the internal list view
         // last; the header owns column reordering and resizing.
@@ -2037,7 +2035,15 @@ mod tests {
             "last child must be the list view"
         );
 
-        assert!(drag_origin_is_data_row(&column_view, Some(rows.clone())));
+        assert!(!drag_origin_is_data_row(&column_view, Some(rows)));
+        assert!(drag_origin_is_data_row(
+            &column_view,
+            Some(label.clone().upcast())
+        ));
+        assert!(!drag_origin_is_data_row(
+            &gtk::ColumnView::new(None::<gtk::SelectionModel>),
+            Some(label.upcast())
+        ));
         assert!(!drag_origin_is_data_row(&column_view, Some(header)));
         assert!(!drag_origin_is_data_row(
             &column_view,
@@ -2049,6 +2055,35 @@ mod tests {
             &column_view,
             Some(gtk::Label::new(None).upcast())
         ));
+        window.close();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn realized_tracklist_for_drag_test() -> (gtk::Window, gtk::ColumnView, gtk::Label) {
+        let store = gtk::gio::ListStore::new::<gtk::StringObject>();
+        store.append(&gtk::StringObject::new("a"));
+        let selection = gtk::MultiSelection::new(Some(store));
+        let factory = gtk::SignalListItemFactory::new();
+        let row_label = Rc::new(RefCell::new(None::<gtk::Label>));
+        let created_label = row_label.clone();
+        factory.connect_setup(move |_, item| {
+            let label = gtk::Label::new(Some("a"));
+            item.downcast_ref::<gtk::ListItem>()
+                .expect("factory list item")
+                .set_child(Some(&label));
+            *created_label.borrow_mut() = Some(label);
+        });
+        let column_view = gtk::ColumnView::new(Some(selection));
+        column_view.append_column(&gtk::ColumnViewColumn::new(Some("Title"), Some(factory)));
+        let window = gtk::Window::builder().child(&column_view).build();
+        window.present();
+        let context = glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
+
+        let label = row_label.borrow().clone().expect("realized data-row label");
+        (window, column_view, label)
     }
 
     #[test]

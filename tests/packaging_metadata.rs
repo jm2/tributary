@@ -26,6 +26,7 @@ const MACOS_AUDIO_NATIVE: &str = include_str!("../src/audio/macos_audio_native.r
 const MACOS_AUDIO_TESTS: &str = include_str!("../src/audio/macos_audio_tests.rs");
 const PLATFORM_RUNTIME: &str = include_str!("../src/platform_runtime.rs");
 const RUST_TOOLCHAIN_ACTION_SHA: &str = "6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772";
+const FLATPAK_BUILDER_ACTION_SHA: &str = "79327416609af08178ad73b352877e51450790b3";
 const FORBIDDEN_BUNDLED_COMPONENTS: &str =
     include_str!("../build-aux/packaging/forbidden-bundled-components.txt");
 
@@ -210,12 +211,7 @@ fn assert_flatpak_artifact_boundary(
         job[build..validation].contains("upload-artifact: false"),
         "{label} must disable flatpak-builder's implicit pre-validation artifact upload"
     );
-    assert_eq!(
-        job.matches("uses: flatpak/flatpak-github-actions/flatpak-builder@v6")
-            .count(),
-        1,
-        "{label} must contain exactly one Flatpak builder action"
-    );
+    assert_flatpak_builder_pin(source, job_name, label);
     assert_eq!(
         job.matches("uses: actions/upload-artifact@v7").count(),
         1,
@@ -227,6 +223,66 @@ fn assert_flatpak_artifact_boundary(
             && upload_step.contains(&format!("path: {artifact_path}"))
             && upload_step.contains("if-no-files-found: error"),
         "{label} must upload the exact validated Flatpak and fail when it is missing"
+    );
+}
+
+fn assert_flatpak_builder_pin(source: &str, job_name: &str, label: &str) {
+    let workflow: serde_yaml::Value = serde_yaml::from_str(source).expect("workflow YAML");
+    let steps = workflow["jobs"][job_name]["steps"]
+        .as_sequence()
+        .expect("Flatpak job steps");
+    let builds: Vec<_> = steps
+        .iter()
+        .filter(|step| step["name"].as_str() == Some("Build Flatpak bundle"))
+        .collect();
+    assert_eq!(builds.len(), 1, "{label} must have one named build step");
+    let expected =
+        format!("flatpak/flatpak-github-actions/flatpak-builder@{FLATPAK_BUILDER_ACTION_SHA}");
+    assert_eq!(
+        builds[0]["uses"].as_str(),
+        Some(expected.as_str()),
+        "{label} must pin the build step to the exact reviewed revision"
+    );
+    assert_eq!(
+        steps
+            .iter()
+            .filter_map(|step| step["uses"].as_str())
+            .filter(|uses| uses.starts_with("flatpak/flatpak-github-actions/flatpak-builder@"))
+            .count(),
+        1,
+        "{label} must contain exactly one Flatpak builder action"
+    );
+}
+
+#[test]
+fn flatpak_builder_pin_rejects_inexact_revision() {
+    for revision in [
+        FLATPAK_BUILDER_ACTION_SHA[..10].to_owned(),
+        format!("{FLATPAK_BUILDER_ACTION_SHA}-unreviewed"),
+    ] {
+        let changed = CI_WORKFLOW.replace(FLATPAK_BUILDER_ACTION_SHA, &revision);
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_flatpak_builder_pin(&changed, "build-flatpak", "CI");
+            })
+            .is_err(),
+            "an inexact revision must not satisfy the build-step pin"
+        );
+    }
+}
+
+#[test]
+fn flatpak_builder_pin_rejects_pin_on_another_step() {
+    let changed = CI_WORKFLOW.replace(
+        "      - name: Build Flatpak bundle",
+        "      - name: Build Flatpak bundle\n        run: echo unreviewed\n      - name: Other step",
+    );
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_flatpak_builder_pin(&changed, "build-flatpak", "CI");
+        })
+        .is_err(),
+        "a pinned action on another step must not satisfy the build-step pin"
     );
 }
 
@@ -251,6 +307,12 @@ fn flatpak_artifacts_publish_once_after_compliance_validation() {
 #[test]
 fn release_checksums_require_one_exact_asset_set() {
     let checksums = workflow_job(RELEASE_WORKFLOW, "checksums");
+    assert_release_asset_set(checksums);
+    assert_release_checksum_guards(checksums);
+    assert_release_checksum_guard_order(checksums);
+}
+
+fn assert_release_asset_set(checksums: &str) {
     let expected_assets = shell_array(checksums, "expected_assets");
     assert_eq!(
         expected_assets,
@@ -270,7 +332,9 @@ fn release_checksums_require_one_exact_asset_set() {
         ],
         "release checksums must cover exactly the published package set"
     );
+}
 
+fn assert_release_checksum_guards(checksums: &str) {
     for fragment in [
         "release_file_list=\"$(mktemp)\"",
         "trap 'rm -f \"$release_file_list\"' EXIT",
@@ -286,7 +350,9 @@ fn release_checksums_require_one_exact_asset_set() {
             "release checksum validation is missing its fail-closed contract: {fragment}"
         );
     }
+}
 
+fn assert_release_checksum_guard_order(checksums: &str) {
     let discovery = checksums
         .find("release_file_list=\"$(mktemp)\"")
         .expect("release artifact discovery must use a checked temporary list");
@@ -316,6 +382,74 @@ fn release_checksums_require_one_exact_asset_set() {
     assert!(
         !checksums.contains("sort -u") && !checksums.contains("< <("),
         "release checksums must neither hide duplicate names nor lose discovery failures"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn release_checksum_hash_failure_is_terminal() {
+    let script = checksum_step_script(RELEASE_WORKFLOW);
+    let assets = shell_array(&script, "expected_assets").join("\n");
+    assert_checksum_hash_failure_is_terminal(&script, &assets, 23);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ci_checksum_hash_failure_is_terminal() {
+    assert_checksum_hash_failure_is_terminal(
+        &checksum_step_script(CI_WORKFLOW),
+        "tributary.zip",
+        1,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn checksum_step_script(source: &str) -> String {
+    let workflow: serde_yaml::Value = serde_yaml::from_str(source).unwrap();
+    let steps = workflow["jobs"]["checksums"]["steps"]
+        .as_sequence()
+        .unwrap();
+    steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Generate SHA256SUMS"))
+        .unwrap()["run"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[cfg(target_os = "linux")]
+fn assert_checksum_hash_failure_is_terminal(script: &str, assets: &str, exit_code: i32) {
+    let output = std::process::Command::new("bash")
+        .args([
+            "-e",
+            "-c",
+            r#"
+test_dir="$(mktemp -d "${TMPDIR:-/var/tmp}/tributary-checksums.XXXXXX")"
+trap 'rm -rf "$test_dir"' EXIT
+cd "$test_dir"
+mkdir artifacts bin
+while IFS= read -r asset; do : > "artifacts/$asset"; done <<< "$EXPECTED_ASSETS"
+printf '#!/bin/sh\necho "injected checksum failure" >&2\nexit 23\n' > bin/sha256sum
+chmod +x bin/sha256sum
+export PATH="$test_dir/bin:$PATH"
+bash -e -c "$1"
+"#,
+            "checksum-test",
+            script,
+        ])
+        .env("EXPECTED_ASSETS", assets)
+        .output()
+        .expect("run the checksum script with an injected hashing failure");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("injected checksum failure"),
+        "hashing must run: {stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(exit_code),
+        "hashing failure must prevent publication: {stderr}"
     );
 }
 
