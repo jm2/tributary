@@ -51,12 +51,12 @@ the download/cache engine must satisfy.
 | Identity | Cache entries use the same `SourceId` + `TrackId` shape as live playback. The download engine adopts the live per-source `MediaKey`; it never invents a new identity kind. | New persisted identifier types, new schema migrations, on-disk naming conventions beyond `task.md` and the credential-boundary section. |
 | Authority | Every cached media entry remains owned by its source. The source registry's exact-snapshot capability gates download admission, reconciliation, and retirement. A committed snapshot renders offline without a live registry round-trip; disconnect and refresh never gate playback of committed bytes. No offline bypass of the registry for admission. | Concurrent access contracts for the registry's offline catalogue; specific read-side materialisation policies. |
 | Download jobs | A bounded resumable job model keyed by exact `(SourceId, TrackId)` with a durable, `fsync`'d progress journal, entity validators (`If-Range`) on every range request, opaque server caps, deterministic cancellation, and structured redacted failures. Job state survives restart; it is never memory-only. | Concrete worker pool scheduling, threading model, runtime selection, telemetry. |
-| Storage | Verify-then-publish: the temp file lives in the same directory (same filesystem) as its final cache path, integrity is verified on the temp file before any rename, and publish is an atomic rename with a parent-directory `fsync`. Cross-filesystem publish is refused at admission, never emulated with copy+sync+delete. A `tracks` row may link to a cache path only when integrity passed and the file is current. | Database migrations, schema, table layout, index choice, cache placement, encryption. |
+| Storage | Verify-then-publish: the temp file lives in the same directory (same filesystem) as its final cache path, integrity is verified on the temp file before any rename, and publish is an atomic rename with a parent-directory `fsync`. The final path is snapshot-scoped, so a refresh publishes a sibling instead of overwriting a predecessor's bytes; a journaled publish intent makes the rename-to-commit window crash-recoverable. Cross-filesystem publish is refused at admission, never emulated with copy+sync+delete. A `tracks` row may link to a cache path only when integrity passed and the file is current. | Database migrations, schema, table layout, index choice, cache placement, encryption. |
 | Integrity | SHA-256 is computed over the bytes on disk and compared against an expected digest whose provenance is declared per backend (capability matrix below). A backend that advertises no digest is verified by independent double-fetch; the absence of any verification path is terminal, never a silent pass. Verification completes before publish. | Hashing algorithm extension, content-defined chunking, content-addressable stores. |
 | Capabilities | The remote source owns a default-deny `OfflineSnapshot` capability. Only the same set of backends that opt into live `ServerPlaylist`-style read authority may opt in. Radio-Browser, removable, external-file, and built-in local sources cannot. | Adapter-specific download strategies beyond HTTP(S) `Range` and Subsonic/Jellyfin/Plex/DAAP download endpoints. |
 | Credentials | Cached media may carry no credential, password, signed URL, or session cookie in metadata, file name, sidecar, log, or GTK-visible row. Bearer URLs are minted only by the existing exact-origin proxy and consumed through the same opaque revocable ticket used by live playback. | New credential storage paths, new vault tables, package or build-credential integration, distribution-time-key loading. |
 | Licensing | `OperationalLicence` is a per-source opt-in declared before any download is admitted. Default is `Denied`. The source emits a structured reason when licence is denied. The catalogue carries the licence label for every offline row but never the licence text itself. | Bundle-bundled music, automatic licensing negotiation, third-party licence clearing, payment integration. |
-| Reconciliation | A snapshot is the durable result of one admitted job at its committed version. Refresh creates a new sibling; it never mutates the predecessor in place, and a superseded snapshot is preserved until the new one is committed and integrity-checked. | Distributed multi-device sync, push-style update subscriptions. |
+| Reconciliation | A snapshot is the durable result of one admitted job at its committed version. Refresh creates a new sibling; it never mutates the predecessor in place, and a superseded snapshot is preserved until the new one is committed and integrity-checked. Superseded snapshots retire through a staged delete: durable tombstone first, idempotent unlink after. | Distributed multi-device sync, push-style update subscriptions. |
 | UI | The contract covers what the UI may show: progress, byte ranges, integrity state, licence label, offline-localised status text. It deliberately does not cover widget layout. | GTK widget design, accessibility tree placement, localization strings. |
 
 This table must not be revisited until the implementation record earns each row
@@ -228,7 +228,9 @@ The rules:
    a terminal state or supersedes its capability_epoch.
 6. **Job state is durable.** Jobs are persisted rows, not memory objects. A
    process restart re-derives `Queued`/`Receiving`/`Verifying` state from
-   the journal and either resumes (validator present) or restarts cleanly.
+   the journal, resolves a journaled publish intent per the
+   [publish intent and restart recovery](#publish-intent-and-restart-recovery)
+   protocol, and either resumes (validator present) or restarts cleanly.
    No offline job exists only in RAM.
 
 The download engine and the source registry both treat the lease as opaque
@@ -271,15 +273,22 @@ directory.
    obtain any verification path — unlinks the temp file and fails the job
    terminally (`IntegrityMismatch`, or `IntegrityUnverifiable` when no
    digest source exists at all). No rename has occurred at this point.
-5. **Publish by atomic rename.** The verified temp file is renamed onto the
-   cache path — atomic because temp and final path share a directory and
-   therefore a filesystem. On Unix, the parent directory is `fsync`'d after
-   the rename so the published name survives power loss. Windows uses
-   `FlushFileBuffers` followed by `MoveFileEx` with
+5. **Publish by atomic rename.** The engine first appends an `fsync`'d
+   publish-intent record to the job's durable journal, naming the
+   snapshot-scoped final cache path and the verified digest (see
+   [Publish intent and restart recovery](#publish-intent-and-restart-recovery)).
+   It then renames the verified temp file onto that path — a path no
+   committed snapshot owns, so the rename cannot overwrite a predecessor's
+   bytes. The rename is atomic because temp and final path share a
+   directory and therefore a filesystem. On Unix, the parent directory is
+   `fsync`'d after the rename so the published name survives power loss.
+   Windows uses `FlushFileBuffers` followed by `MoveFileEx` with
    `MOVEFILE_REPLACE_EXISTING`.
 6. **Commit.** Only after a successful rename does the cache row exist.
    The row records the `MediaKey` → cache-path mapping, the engine-computed
    digest, the digest provenance used, and the licence label at commit.
+   The commit clears the journaled publish intent; so does any terminal
+   state the job reaches without a commit.
 
 Failure at any step:
 
@@ -292,21 +301,65 @@ Failure at any step:
   an expected digest. The temp file is unlinked; no cache row is created;
   nothing was ever renamed.
 - Publish: `OfflineError::StorageUnavailable`. A failed rename leaves the
-  temp in place for cleanup and the cache path untouched.
+  temp in place for cleanup and the cache path untouched. The journaled
+  publish intent is cleared when the job reaches a terminal state without
+  a commit.
 
 A half-promoted cache row that points at a missing or partial file is a bug
 that the contract forbids; downstream layers must never observe it. The
 `tracks` row remains untouched until step 6 succeeds, and the lookup path
 between admission and publish returns the live endpoint only.
 
+### Publish intent and restart recovery
+
+The six steps leave exactly one window that ordinary journal recovery
+cannot see: a crash between the step-5 rename and the step-6 commit. The
+temp file no longer exists to resume from, and the final file exists
+without a cache row. The contract closes that window with a persisted
+publish intent:
+
+1. **The intent precedes the rename.** The last journal record written
+   before the rename is an `fsync`'d publish-intent record naming the
+   snapshot-scoped final cache path and the verified digest. A crash after
+   the intent but before the rename therefore leaves a durable, inspectable
+   record that a publication was about to happen.
+2. **The intent is cleared on completion.** A successful step-6 commit
+   clears the intent with a further journal record. Any terminal state the
+   job reaches without a commit — failure, cancellation, supersession —
+   clears it as well.
+3. **Startup resolves a pending intent by inspection.** A job whose journal
+   ends in a publish intent is resolved by examining the intent's final
+   path:
+   - The file is present and its SHA-256 matches the journaled digest: the
+     rename happened. The engine completes step 6 — inserting the cache
+     row; the `(source_key, track_key, snapshot_key)` key makes the insert
+     idempotent — and clears the intent.
+   - The file is present and the digest does not match: the bytes are not
+     the verified publication. The engine unlinks the file, clears the
+     intent, and restarts the job from zero.
+   - The file is absent: the rename never happened. The engine clears the
+     intent and continues per the journal — resume or restart from zero
+     under the normal resumption rules.
+4. **The gap is invisible downstream.** Between the rename and the commit
+   or adoption there is no cache row, so lookups return the live endpoint
+   exactly as before admission. The transient unowned file is observable
+   only by the engine's own recovery pass and is bounded by the same
+   per-track quota as any committed snapshot.
+
+Restart recovery and the staged delete of
+[Eviction](#cancellation-quota-and-eviction) are the two crash-recovery
+protocols of the cache engine; together they ensure no playable row ever
+lacks its bytes, and no engine-owned file is ever stranded without a row
+beyond one recovery pass.
+
 ### Per-source layout
 
 The cache is split by exact `SourceId`, never by backend string or base URL:
 
-- `<cache_root>/<source_key>/<track_key>/`
+- `<cache_root>/<source_key>/<track_key>/<snapshot_key>/`
 
-`source_key` and `track_key` are **derived cache keys**, not the raw
-identifiers: each is the first 32 hex characters (128 bits) of
+`source_key`, `track_key`, and `snapshot_key` are **derived cache keys**,
+not the raw identifiers: each is the first 32 hex characters (128 bits) of
 `SHA-256(identifier_bytes)`. The identifiers are fed to the hash as their
 exact, unmodified byte sequences — the engine still never parses,
 normalises, or interprets them. The result is bounded (fixed length),
@@ -315,13 +368,24 @@ traversal, stable across runtimes, and reveals nothing about the identifier
 it was derived from. Raw `TrackId` bytes — which may contain `/`, `..`,
 unicode, or control characters — never appear in a path.
 
-The durable `MediaKey` → cache-path mapping is recorded in the cache row at
-commit; lookups are table-driven. No code path reconstructs a cache path
-from an identifier except through this recorded mapping, and no URL or
-credential is recoverable from a location.
+`source_key` and `track_key` are derived from the `SourceId` and `TrackId`.
+`snapshot_key` is engine-minted at admission from the durable job ID
+through the same first-32-hex SHA-256 discipline. Each committed snapshot
+owns its own `<snapshot_key>/` directory, and one job publishes at most one
+snapshot — so a refresh, which is always a new job, publishes beside its
+predecessor instead of over it. The predecessor's row and bytes remain
+valid and playable until the staged delete of
+[Reconciliation](#reconciliation) retires them, which is what makes the
+sibling rule of snapshot immutability implementable on the filesystem.
 
-The file name inside `<track_key>/` is an implementation-chosen,
-credential-free constant — the directory is the per-track scope, so the
+The durable mapping recorded in the cache row at commit is
+`(source_key, track_key, snapshot_key)` → cache path; lookups are
+table-driven. No code path reconstructs a cache path from an identifier
+except through this recorded mapping, and no URL or credential is
+recoverable from a location.
+
+The file name inside `<snapshot_key>/` is an implementation-chosen,
+credential-free constant — the directory is the per-snapshot scope, so the
 name carries no identity beyond the recorded mapping. Temp files in that
 directory follow the `<final_name>.part-<job-id>` shape required by
 [Atomic storage](#atomic-storage).
@@ -441,7 +505,9 @@ does not mutate; it siblings. The rules:
    identity never change. Refresh creates a new snapshot; the predecessor
    remains until the new snapshot is committed.
 2. **Sibling retention is bounded.** When a new snapshot is committed, the
-   predecessor is queued for unlink. The unlink path goes through the same
+   predecessor is queued for unlink and retired through the same staged
+   delete as eviction — durable tombstone first, idempotent post-commit
+   unlink, recovery pass for interrupted deletes — through the same
    `tracks` integrity-as-unlink authority that `task-remediation-2026-07.md` P2.3 closes.
 3. **Refresh is monotonic.** A successful refresh only retires a row when
    either the new snapshot is committed or the user explicitly chooses
@@ -462,8 +528,15 @@ policy:
 2. **Eviction is newest-first within source, oldest-first across sources.**
    When the quota is exceeded, eviction walks sources in oldest-cache-first
    order and within a source newest-first.
-3. **Eviction is content-aware.** Evicted rows are also `Deleted` rows in the
-   same transaction — no half-evicted state.
+3. **Eviction is a staged delete.** Eviction first commits a durable
+   tombstone: the row leaves the playable set in the transaction that
+   marks it `Deleted`, and that transaction is the only thing the word
+   "same transaction" ever promises. The unlink of the recorded file
+   happens after that commit and is idempotent — unlinking an
+   already-missing file succeeds. A crash between tombstone and unlink
+   strands at most an owned, non-playable file until the recovery pass
+   re-attempts the unlink for tombstoned rows that still record a path;
+   no playable row is ever left without its bytes.
 4. **Cancellation is local-failure equivalent.** A cancelled job leaves the
    same atomicity footprint as a `QuotaExceeded` failure: temp file unlinked,
    no cache row created.
@@ -505,6 +578,8 @@ This contract fixes the following failure cases:
 | Network dies between two byte ranges | Resumable; the resumed range request revalidates the entity with `If-Range` and continues from the journaled offset. A `200`/`412` answer discards partial bytes and restarts from zero. |
 | Radio-Browser adapter receives an offline request | `Err(Denied)` from the capability; no network work. |
 | Local file is requested for offline | `None` from the capability; no offline layer is created; the file is already local. |
+| Crash between the publish rename and the row commit | Startup recovery resolves the journaled publish intent: adopt (complete the commit), or unlink and restart from zero. Never a playable row without verified bytes, never a stranded orphan beyond one recovery pass. |
+| Crash between a delete tombstone and its unlink | The row stays non-playable throughout; the recovery pass re-attempts the idempotent unlink for tombstoned rows that still record a path. |
 
 ## Migration plan
 
@@ -514,16 +589,16 @@ exact schema, indexes, and triggers are deliberately left for the
 implementation record. The migration:
 
 1. Creates the cache table keyed by the derived cache key
-   (`source_key`, `track_key`) — an identity in its own right, **not** a
-   strict foreign key on `tracks(id)`. A nullable advisory link to
-   `tracks(id)` may exist for UI join convenience, but the cache row must
-   remain valid when the track's catalogue row is absent, replaced by a
-   refresh, or never materialised: a remote track's offline snapshot exists
-   independent of any local `tracks` row.
+   (`source_key`, `track_key`, `snapshot_key`) — an identity in its own
+   right, **not** a strict foreign key on `tracks(id)`. A nullable advisory
+   link to `tracks(id)` may exist for UI join convenience, but the cache
+   row must remain valid when the track's catalogue row is absent,
+   replaced by a refresh, or never materialised: a remote track's offline
+   snapshot exists independent of any local `tracks` row.
 2. Creates the download-job table carrying the full job model — including
-   the journaled offset, the captured `resume_validator`, and the digest
-   provenance in use — so that job state is durable across process
-   restarts. No offline job is memory-only.
+   the journaled offset, the captured `resume_validator`, the pending
+   publish intent, and the digest provenance in use — so that job state is
+   durable across process restarts. No offline job is memory-only.
 3. Persists no row that points at a missing or partial file. Promotion to a
    cached row is exactly the moment the verified rename (step 5 of Atomic
    storage) succeeds.
@@ -541,14 +616,14 @@ Each slice lands with its own focused regression suite. The slices are:
 | Identity | Same `SourceId` + `TrackId` semantics as live; no second identity kind minted. Derived cache keys: fixed hex charset and width, no separators or traversal, byte-exact identifier input. |
 | Capability | Default-deny behaviour for adapters that opt out; Subsonic/Jellyfin/Plex/DAAP opt in. |
 | Resumable job | Bounded, `If-Range`-validated range requests; `200`/`412` restarts from zero; journal survives crash (offset truncation, last-segment digest re-check); no-validator jobs restart only. |
-| Atomic storage | Same-directory temp reservation; verify-before-publish ordering; same-filesystem rename with parent-directory `fsync`; cross-filesystem publish refused. |
+| Atomic storage | Same-directory temp reservation; verify-before-publish ordering; same-filesystem rename with parent-directory `fsync`; cross-filesystem publish refused; publish-intent recovery across the kill points between intent, rename, and commit. |
 | Digest provenance | Advertised digest compared exactly; double-fetch fallback equality; no-tier backends fail `IntegrityUnverifiable` before publish. |
 | Credential boundary | No credential in metadata, file name, sidecar, log, or GTK row. Isolation scope per `task-remediation-2026-07.md` P1.6; redaction mechanics per P1.4. |
 | Redirect policy | Per `task-remediation-2026-07.md` P1.4 matrix; HTTPS-only, no `Referer`, no HTTPS→HTTP downgrade. |
 | Licensing | Default-deny; revocation retires rows but preserves files. |
-| Reconciliation | Refresh creates a sibling; no in-place mutation; unlink is content-aware. |
+| Reconciliation | Refresh creates a sibling with its own snapshot-scoped path; no in-place mutation; staged-delete unlink with idempotent recovery. |
 | Cancellation | Lifecycle supersession cancels in-flight jobs. |
-| Quota and eviction | Eviction walks sources oldest-cache-first, newest-first within a source; transactional unlink. |
+| Quota and eviction | Eviction walks sources oldest-cache-first, newest-first within a source; staged tombstone-then-unlink; recovery completes interrupted deletes. |
 | UI | Credential-free GTK rows; localised progress and failure. |
 
 The contract does not bless a single language binding or test framework; it
@@ -578,10 +653,17 @@ does not have to invent them mid-slice.
 
 ## Compatibility and abandonment
 
-Until an offline-capable source opts in for the first time, none of the offline
-machinery is exercised at runtime. A database that has never had an offline
-cache row is identical at the byte level to a database without the migration.
-A source that opts out — or revokes an earlier opt-in — returns `Err(Denied)`
+Until an offline-capable source opts in for the first time, none of the
+offline machinery is exercised at runtime. The migration itself is
+unconditional — it creates the two offline tables and raises the schema
+version whether or not any source ever opts in — so byte-level identity
+with a pre-migration database is explicitly **not** a guarantee, and no
+migration test may promise one. The compatibility guarantee is
+behavioural: a database whose offline tables are empty behaves exactly
+like a database without the offline subsystem — identical query results
+at the application level, no files under the cache root, no offline
+runtime path exercised. A source that opts out — or revokes an earlier
+opt-in — returns `Err(Denied)`
 from `offline_snapshot`; the source stays default-deny for offline exactly as
 it was before it opted in.
 
@@ -597,16 +679,19 @@ dropped. The order is normative — the follower migration never destroys the
    supersession — a cancelled job unlinks its temp file and promotes no row.
 2. **Reconcile every row that owns a file.** The engine walks the cache
    table and, for each row regardless of state — including rows retired as
-   `Revoked`, whose files revocation deliberately preserved — unlinks the
-   recorded file through the same validated cache-unlink path used by
-   eviction and catalogue invalidation, and tombstones the row in the same
-   transaction, the atomicity footprint of an eviction. Unlinking an
-   already-missing file succeeds; the row is tombstoned all the same.
+   `Revoked`, whose files revocation deliberately preserved — retires the
+   row through the same staged delete used by eviction: the tombstone
+   commits first, then the recorded file is unlinked through the same
+   validated cache-unlink path used by eviction and catalogue
+   invalidation, idempotently, after the commit. Unlinking an
+   already-missing file succeeds; the row is tombstoned all the same. A
+   crash-orphaned file left by an interrupted unlink is absorbed by the
+   bounded root sweep of step 3.
 3. **Sweep the engine-owned cache root.** After the row walk, the engine
    unlinks every remaining file inside `<cache_root>` — crash-orphaned
    `<final_name>.part-<job-id>` temps among them — and removes the
-   now-empty `<source_key>/<track_key>/` directories it created. Nothing
-   outside the cache root is touched.
+   now-empty `<source_key>/<track_key>/<snapshot_key>/` directories it
+   created. Nothing outside the cache root is touched.
 4. **Drop the metadata.** Only when no owning row remains does the follower
    migration drop the offline tables, indexes, and triggers in one
    transaction, mirroring the forward migration's reversibility: any error
@@ -614,10 +699,10 @@ dropped. The order is normative — the follower migration never destroys the
    retryable.
 
 Because a file is only ever unlinked while the row naming it is queryable —
-or inside the bounded root sweep — retirement cannot strand media that no
-remaining metadata can attribute, and it cannot delete anything the offline
-subsystem does not own. No live production path depends on the offline
-machinery existing.
+as a live row or as a durable tombstone — or inside the bounded root sweep,
+retirement cannot strand media that no remaining metadata can attribute, and
+it cannot delete anything the offline subsystem does not own. No live
+production path depends on the offline machinery existing.
 
 ## See also
 
