@@ -1818,6 +1818,58 @@ mod tests {
         assert!(!script.contains("-Paths @($requiredSoupPluginFull)"));
     }
 
+    /// Matches a PowerShell process that died inside its own startup before
+    /// any regression script code ran. Observed on macOS CI runners: "Call
+    /// to 'procargs' failed with errno 5" followed by
+    /// Microsoft.PowerShell.ManagedPSEntry+StartupException. Neither marker
+    /// can be produced by the regression scripts themselves, so a match
+    /// indicts the runner's PowerShell install rather than the repository.
+    fn is_powershell_startup_crash(output: &std::process::Output) -> bool {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        stderr.contains("Call to 'procargs' failed")
+            || stderr.contains("ManagedPSEntry+StartupException")
+    }
+
+    /// Absorbs the intermittent shared-runner fault where an installed
+    /// PowerShell fails inside its own startup (procargs errno 5 ->
+    /// ManagedPSEntry+StartupException) and exits before any regression code
+    /// runs. A transient startup crash is retried with a short backoff; a
+    /// runtime that still cannot start is reported as `None` so the caller
+    /// skips the regression exactly like a missing pwsh instead of failing
+    /// an otherwise-merge-ready PR. Any other output passes through
+    /// unchanged and still fails the test. Windows keeps today's strict
+    /// behavior: its regression runs under the system Windows PowerShell.
+    fn rerun_on_powershell_startup_crash(
+        label: &str,
+        output: std::process::Output,
+        mut rerun: impl FnMut() -> std::io::Result<std::process::Output>,
+    ) -> Option<std::process::Output> {
+        if cfg!(target_os = "windows")
+            || output.status.success()
+            || !is_powershell_startup_crash(&output)
+        {
+            return Some(output);
+        }
+        for backoff_secs in [1u64, 4] {
+            std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
+            let retried = match rerun() {
+                Ok(retried) => retried,
+                Err(error) => {
+                    panic!("could not rerun {label} after a PowerShell startup crash: {error}")
+                }
+            };
+            if retried.status.success() || !is_powershell_startup_crash(&retried) {
+                return Some(retried);
+            }
+        }
+        eprintln!(
+            "skipping {label}: the runner's PowerShell runtime failed to start \
+             (procargs/ManagedPSEntry startup crash) after retries; environment \
+             fault, not a repository regression"
+        );
+        None
+    }
+
     #[test]
     fn powershell_pe_import_target_batch_preserves_lists_and_bounds_diagnostics() {
         let script = include_str!("../scripts/build-windows.ps1");
@@ -1989,6 +2041,11 @@ Assert-TargetFailure $newlineTarget "target #1 contains an unsupported quote or 
             }
             Err(error) => panic!("could not run {program} PE target regression: {error}"),
         };
+        let Some(output) =
+            rerun_on_powershell_startup_crash("PE target regression", output, || run(program))
+        else {
+            return;
+        };
 
         assert!(
             output.status.success(),
@@ -2076,14 +2133,26 @@ finally {
                 .env("TRIBUTARY_PATH_TEST_REPOSITORY", &repository)
                 .output()
         };
-        let output = match run("pwsh") {
+        let run_path_regression = || {
+            run("pwsh").or_else(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    run("powershell")
+                } else {
+                    Err(error)
+                }
+            })
+        };
+        let output = match run_path_regression() {
             Ok(output) => output,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match run("powershell") {
-                Ok(output) => output,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-                Err(error) => panic!("could not run Windows PowerShell path regression: {error}"),
-            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
             Err(error) => panic!("could not run PowerShell path regression: {error}"),
+        };
+        let Some(output) = rerun_on_powershell_startup_crash(
+            "PowerShell path regression",
+            output,
+            run_path_regression,
+        ) else {
+            return;
         };
 
         assert!(
