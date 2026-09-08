@@ -8,17 +8,13 @@
 //! mount-generation checks to an ephemeral mounted root without requiring the
 //! removable filesystem to contain an application marker.
 
-// `OsStr` is only referenced by `#[cfg(unix)]` helpers (e.g.
-// `open_unix_regular_at`); importing it unconditionally breaks the Windows
-// build with an unused-import error under `-D warnings`.
-#[cfg(unix)]
-use std::ffi::OsStr;
-use std::ffi::OsString;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use uuid::Uuid;
 
@@ -92,28 +88,28 @@ struct RetainedObject {
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ObjectIdentity {
     device: u64,
     inode: u64,
 }
 
 #[cfg(windows)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ObjectIdentity {
     volume: u64,
     file_id: WindowsFileId,
 }
 
 #[cfg(windows)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum WindowsFileId {
     Extended([u8; 16]),
     Legacy(u64),
 }
 
 #[cfg(not(any(unix, windows)))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ObjectIdentity;
 
 #[cfg(target_os = "linux")]
@@ -670,18 +666,69 @@ impl MountedMutationCommit<'_> {
     /// Confirm the replacement target and perform the atomic replacement with
     /// the staged copy at `staged`.
     ///
-    /// Confirmation runs first (mount, retained ancestry, exact file identity
-    /// — see [`Self::confirm_replacement_target`]). On platforms with
-    /// retained parent handles the replacement itself is then performed
-    /// relative to that retained parent directory on both sides, so no
-    /// pathname resolution — root, ancestor, or leaf — can retarget the
-    /// rename after the confirmation. The staged copy must live inside the
-    /// exact retained parent directory; anything else is a lost staging area
-    /// and is refused rather than re-resolved by path. Any uncertainty fails
-    /// closed and leaves both files untouched.
+    /// The whole section — validation and rename together — first excludes
+    /// every other Tributary-side committer for the same directory leaf (see
+    /// [`Self::with_leaf_commit_exclusion`]): the per-target commit lock
+    /// serializes one [`MountedMutationTarget`] object, but two targets
+    /// admitted at different times can name the same leaf, and their
+    /// confirm-and-rename spans must never interleave.
+    ///
+    /// Confirmation then proves the mount, the retained ancestry, and the
+    /// exact leaf identity (see [`Self::confirm_replacement_target`]). On
+    /// platforms with retained parent handles the replacement itself is then
+    /// performed relative to that retained parent directory on both sides, so
+    /// no pathname resolution — root, ancestor, or leaf — can retarget the
+    /// rename after the confirmation, and the destination entry is displaced
+    /// and re-proved before anything is installed over its name (see
+    /// [`Self::replace_confirmed_staging`]). The staged copy must live inside
+    /// the exact retained parent directory; anything else is a lost staging
+    /// area and is refused rather than re-resolved by path. Any uncertainty
+    /// fails closed and leaves both files untouched.
     pub(crate) fn commit_replacement(&self, staged: &Path) -> io::Result<()> {
-        self.confirm_replacement_target()?;
-        self.replace_confirmed_staging(staged)
+        self.with_leaf_commit_exclusion(|| {
+            self.confirm_replacement_target()?;
+            #[cfg(test)]
+            run_post_confirm_interpose(self);
+            self.replace_confirmed_staging(staged)
+        })
+    }
+
+    /// Run one replacement section while holding the process-wide exclusion
+    /// for this target's leaf.
+    ///
+    /// See [`with_leaf_commit_lock`] for why the lock is scoped to the
+    /// directory leaf — shared by every target for that leaf — and not to the
+    /// target object.
+    fn with_leaf_commit_exclusion(&self, run: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        with_leaf_commit_lock(self.leaf_commit_key()?, run)
+    }
+
+    /// Identify the directory leaf this section would replace.
+    ///
+    /// On platforms with retained parent handles the leaf is identified by
+    /// the retained parent's exact filesystem object plus the leaf name —
+    /// never by a pathname spelling, which a displaced parent could retarget.
+    #[cfg(unix)]
+    fn leaf_commit_key(&self) -> io::Result<LeafCommitKey> {
+        Ok(LeafCommitKey::Retained {
+            parent: self.retained_parent().identity,
+            leaf: self.target.relative_leaf()?,
+        })
+    }
+
+    /// Windows keeps no retained parent handle; the admitted target's
+    /// normalized absolute pathname is the leaf identity every target object
+    /// for that leaf shares.
+    #[cfg(windows)]
+    fn leaf_commit_key(&self) -> io::Result<LeafCommitKey> {
+        Ok(LeafCommitKey::AdmittedPath(self.target.path.clone()))
+    }
+
+    /// Non-unix, non-Windows targets have no retained parent either; the
+    /// admitted pathname identifies the leaf.
+    #[cfg(not(any(unix, windows)))]
+    fn leaf_commit_key(&self) -> io::Result<LeafCommitKey> {
+        Ok(LeafCommitKey::AdmittedPath(self.target.path.clone()))
     }
 
     /// Resolve the retained directory that must contain the replacement.
@@ -696,7 +743,18 @@ impl MountedMutationCommit<'_> {
     }
 
     /// Rename the staged copy over the confirmed target through the retained
-    /// parent, then prove the replacement landed on that exact entry.
+    /// parent, conditioning the destination on its confirmed identity, then
+    /// prove the replacement landed on that exact entry.
+    ///
+    /// A plain rename over the leaf would silently overwrite whatever an
+    /// external writer swapped into the name after the confirm step proved
+    /// it. Instead the confirmed entry is first displaced under a unique
+    /// quarantine sibling — a rename to a fresh name can never clobber
+    /// anything — the displaced object is proved to be the exact admitted
+    /// file, and the staged copy is installed only into the vacancy. If the
+    /// displaced object is not the admitted file, the newcomer is returned
+    /// byte-exact to its own name and the commit refuses with both objects
+    /// untouched.
     #[cfg(unix)]
     fn replace_confirmed_staging(&self, staged: &Path) -> io::Result<()> {
         let parent = self.retained_parent();
@@ -707,18 +765,67 @@ impl MountedMutationCommit<'_> {
 
         // The staged copy must be reachable through this exact retained
         // directory. Opening it here — rather than trusting the staging
-        // pathname — proves the rename below will move the object this
+        // pathname — proves the install below will publish the object this
         // section created, and refuses a parent that was disturbed enough to
         // strand the staging area elsewhere.
         let staged_file = open_unix_regular_at(&parent.file, staged_leaf)?;
         let staged_identity = object_identity(&staged_file)?;
         drop(staged_file);
 
-        // Both rename sides are relative to the retained parent handle: a
-        // concurrent parent or mount replacement cannot redirect the
-        // replacement because the kernel never resolves an absolute path.
+        // Displace whatever occupies the leaf. This rename is atomic and its
+        // destination is a fresh unique name, so it cannot destroy anything:
+        // afterwards the confirmed object — or whatever replaced it since the
+        // confirm step — sits under the quarantine name and the leaf is
+        // vacant.
+        let quarantine_leaf = quarantine_name(&leaf);
+        if let Err(error) =
+            rustix::fs::renameat(&parent.file, &leaf, &parent.file, &quarantine_leaf)
+        {
+            return Err(
+                if io::Error::from(error).kind() == io::ErrorKind::NotFound {
+                    // The leaf vanished after the confirm step. Nothing has
+                    // been displaced; refuse without touching anything.
+                    authority_changed("the confirmed mutation target no longer exists")
+                } else {
+                    io::Error::from(error)
+                },
+            );
+        }
+
+        // Prove the displaced entry is the exact object the confirm step
+        // verified. Anything else means the leaf was swapped between confirm
+        // and quarantine: put the newcomer back — byte-exact, under its own
+        // name — and refuse.
+        let displaced_is_confirmed = open_unix_regular_at(&parent.file, &quarantine_leaf)
+            .and_then(|displaced| object_identity(&displaced))
+            .is_ok_and(|identity| identity == self.file.object.identity);
+        if !displaced_is_confirmed {
+            rustix::fs::renameat(&parent.file, &quarantine_leaf, &parent.file, &leaf)
+                .map_err(io::Error::from)?;
+            return Err(authority_changed(
+                "the confirmed mutation target was replaced before the commit",
+            ));
+        }
+
+        // Install the staged copy into the vacant leaf name. The quarantine
+        // above closed the confirm-to-install window for swaps; the residual
+        // hazard is an external writer recreating the leaf inside the
+        // install's own nanosecond-scale vacancy, which portable rename
+        // primitives cannot detect on every removable-media filesystem
+        // (FAT-family media supports neither hard links nor rename flags).
+        // A recreate there is replaced by the authorized replacement of the
+        // same user-visible name; every pre-existing object is proven and
+        // preserved by the quarantine proof above.
         rustix::fs::renameat(&parent.file, staged_leaf, &parent.file, &leaf)
             .map_err(io::Error::from)?;
+
+        // The install rename consumed the staging entry — rename moves the
+        // source name onto the destination — so only the displaced original,
+        // the same directory entry a plain rename over the leaf would have
+        // consumed, remains to retire. The replacement has already landed,
+        // so a removal failure here leaves the prior object under the
+        // quarantine sibling rather than failing the committed write.
+        let _ = rustix::fs::unlinkat(&parent.file, &quarantine_leaf, rustix::fs::AtFlags::empty());
 
         // Prove the replacement landed on the exact directory entry.
         let replaced = open_unix_regular_at(&parent.file, &leaf)?;
@@ -731,12 +838,192 @@ impl MountedMutationCommit<'_> {
     }
 
     /// Platforms without retained parent handles replace through the staged
-    /// and target pathnames after the confirm above.
+    /// and target pathnames, with the same conditional-destination discipline:
+    /// displace the confirmed entry under a unique quarantine sibling, prove
+    /// the displaced object is the exact admitted file, restore a swapped
+    /// newcomer byte-exact to its own name, and only then install the staged
+    /// copy into the vacancy.
+    ///
+    /// Residual window, documented for review: an external writer recreating
+    /// the leaf between the quarantine proof and the install rename would be
+    /// overwritten by the install. No portable Windows rename primitive
+    /// refuses an existing destination, so this nanosecond-scale recreate
+    /// race cannot be closed mechanically here; every object that existed
+    /// when the commit began is still proven and preserved by the quarantine
+    /// proof above.
     #[cfg(not(unix))]
     fn replace_confirmed_staging(&self, staged: &Path) -> io::Result<()> {
-        std::fs::rename(staged, &self.target.path)
+        let quarantine_leaf = quarantine_name(&self.target.relative_leaf()?);
+        let Some(parent_dir) = self.target.path.parent() else {
+            return Err(invalid_input(
+                "mutation target has no parent directory to stage the replacement in",
+            ));
+        };
+        let quarantine_path = parent_dir.join(&quarantine_leaf);
+
+        // Displace the confirmed entry under the fresh quarantine name. A
+        // rename to a name that did not exist a moment ago never replaces an
+        // existing entry, so this cannot clobber anything.
+        if let Err(error) = std::fs::rename(&self.target.path, &quarantine_path) {
+            return Err(if error.kind() == io::ErrorKind::NotFound {
+                authority_changed("the confirmed mutation target no longer exists")
+            } else {
+                error
+            });
+        }
+
+        // Prove the displaced entry is the exact admitted file; return a
+        // swapped newcomer to its own name and refuse otherwise.
+        let displaced_is_confirmed = std::fs::File::open(&quarantine_path)
+            .and_then(|displaced| object_identity(&displaced))
+            .is_ok_and(|identity| identity == self.file.object.identity);
+        if !displaced_is_confirmed {
+            std::fs::rename(&quarantine_path, &self.target.path)?;
+            return Err(authority_changed(
+                "the confirmed mutation target was replaced before the commit",
+            ));
+        }
+
+        // Install the staged copy into the vacant name (see the unix
+        // comment above for the documented recreate-window residual).
+        if let Err(error) = std::fs::rename(staged, &self.target.path) {
+            // The leaf is vacant and the staged copy never landed: restore
+            // the admitted original to its name and refuse.
+            let _ = std::fs::rename(&quarantine_path, &self.target.path);
+            return Err(error);
+        }
+
+        // Retire the displaced original — the entry a plain rename over the
+        // target would have consumed. The replacement has already landed, so
+        // a removal failure here leaves the prior object under the
+        // quarantine sibling rather than failing the committed write.
+        let _ = std::fs::remove_file(&quarantine_path);
+        Ok(())
     }
 }
+
+/// The key that identifies one replaceable directory leaf across every
+/// mutation target that resolves to it.
+///
+/// On platforms with retained parent handles the key is the retained parent's
+/// exact filesystem object plus the leaf name, so a pathname spelling can
+/// never widen or split the exclusion. Platforms without retained parents
+/// fall back to the admitted absolute pathname.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum LeafCommitKey {
+    #[cfg(unix)]
+    Retained {
+        parent: ObjectIdentity,
+        leaf: OsString,
+    },
+    #[cfg(not(unix))]
+    AdmittedPath(PathBuf),
+}
+
+/// The process-wide registry of per-leaf replacement exclusions.
+static LEAF_COMMIT_LOCKS: OnceLock<Mutex<HashMap<LeafCommitKey, Arc<Mutex<()>>>>> = OnceLock::new();
+
+/// Run one replacement section while holding the process-wide exclusion for
+/// one directory leaf.
+///
+/// The per-target commit lock serializes commit sections through one
+/// [`MountedMutationTarget`] object, but nothing about that object is unique
+/// to the leaf it names: two targets admitted at different times can name the
+/// same directory entry, and each carries only its own admitted object. Their
+/// confirm-and-rename spans must never interleave, or the later confirm would
+/// prove a leaf that the earlier rename then overwrites with a different
+/// object. The exclusion is therefore scoped to the leaf itself — identified
+/// by retained parent object plus leaf name — and shared by every target for
+/// that leaf.
+///
+/// The registry entry is removed when the section's lock is released and no
+/// other committer holds or waits for that leaf, so the registry cannot grow
+/// without bound. The strong-count re-check happens under the registry lock,
+/// which every committer must hold to clone the entry, so a removal never
+/// strands a waiter on an orphaned lock.
+fn with_leaf_commit_lock(
+    key: LeafCommitKey,
+    run: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let registry = LEAF_COMMIT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let entry = {
+        let mut table = registry
+            .lock()
+            .map_err(|_| io::Error::other("leaf commit registry is unavailable"))?;
+        Arc::clone(table.entry(key.clone()).or_default())
+    };
+    let result = {
+        let _leaf_lock = entry
+            .lock()
+            .map_err(|_| io::Error::other("leaf commit section is unavailable"))?;
+        run()
+    };
+    // Two strong references — the registry table and this section's own
+    // clone — mean no other committer holds or waits for this leaf, so the
+    // entry can be retired. The re-check under the registry lock, which
+    // every committer must hold to clone the entry, closes the window
+    // against a concurrent clone between the two checks: a removal never
+    // strands a waiter on an orphaned lock, and a waiter that clones first
+    // raises the count past two so the entry stays.
+    if Arc::strong_count(&entry) == 2 {
+        if let Ok(mut table) = registry.lock() {
+            if let Some(existing) = table.get(&key) {
+                if Arc::strong_count(existing) == 2 && Arc::ptr_eq(existing, &entry) {
+                    table.remove(&key);
+                }
+            }
+        }
+    }
+    result
+}
+
+/// A fresh hidden sibling name for the quarantine step of a conditional
+/// replacement. The uuid makes the name unpredictable and collision-free,
+/// and the original leaf contributes a bounded prefix so a long leaf cannot
+/// exceed the filesystem's name limit once the suffix is appended.
+fn quarantine_name(leaf: &OsStr) -> OsString {
+    let lossy = leaf.to_string_lossy();
+    let mut prefix = String::new();
+    for character in lossy.chars() {
+        if prefix.len() + character.len_utf8() > 96 {
+            break;
+        }
+        prefix.push(character);
+    }
+    format!(".{}.tributary-replaced-{}", prefix, Uuid::new_v4().simple()).into()
+}
+
+/// Test-only seam: run the registered post-confirm interposition, if any.
+///
+/// The conditional replacement's refusal logic is only reachable when the
+/// leaf is swapped inside the confirm-to-replace window — microseconds wide
+/// in production. A regression test registers a closure here that performs
+/// that swap deterministically between the confirm step and the replace
+/// step. Never compiled outside `cargo test`.
+#[cfg(test)]
+fn run_post_confirm_interpose(commit: &MountedMutationCommit<'_>) {
+    if let Some(interpose) = POST_CONFIRM_INTERPOSE.lock().unwrap().as_ref() {
+        interpose(commit);
+    }
+}
+
+#[cfg(test)]
+type PostConfirmInterpose = dyn Fn(&MountedMutationCommit<'_>) + Send + Sync;
+
+#[cfg(test)]
+static POST_CONFIRM_INTERPOSE: Mutex<Option<Box<PostConfirmInterpose>>> = Mutex::new(None);
+
+/// Serialize tests that use the post-confirm interposition seam.
+#[cfg(test)]
+fn with_post_confirm_interpose(interpose: Box<PostConfirmInterpose>, run: impl FnOnce()) {
+    let _serial = POST_CONFIRM_INTERPOSE_SERIAL.lock().unwrap();
+    *POST_CONFIRM_INTERPOSE.lock().unwrap() = Some(interpose);
+    run();
+    *POST_CONFIRM_INTERPOSE.lock().unwrap() = None;
+}
+
+#[cfg(test)]
+static POST_CONFIRM_INTERPOSE_SERIAL: Mutex<()> = Mutex::new(());
 
 /// Verify a mounted bound against its retained mount authority.
 fn validate_mounted_bound(authority: &MountedRootAuthority, bound: &BoundFile) -> io::Result<()> {
@@ -2525,5 +2812,148 @@ mod tests {
         assert!(parse_fdinfo_mount_generation("pos:\t0\n").is_err());
         assert!(parse_fdinfo_mount_generation("mnt_id:\tnot-a-number\n").is_err());
         assert!(parse_fdinfo_mount_generation("mnt_id:\t1\nmnt_id:\t2\n").is_err());
+    }
+
+    /// The replacement must be conditional on the confirmed leaf identity.
+    /// An external writer that swaps the leaf after the confirm step has
+    /// proven it — precisely what a plain rename over the name would
+    /// silently overwrite — must be detected, restored byte-exact to its
+    /// own name, and the commit refused with every pre-existing object
+    /// untouched and no quarantine sibling left behind.
+    #[test]
+    fn commit_replacement_refuses_a_leaf_swapped_after_confirm_and_restores_the_newcomer() {
+        let directory = TestDirectory::new("mutation-post-confirm-swap");
+        let song = directory.path().join("song.flac");
+        fs::write(&song, b"original audio").expect("write song");
+
+        let authority =
+            Arc::new(MountedRootAuthority::acquire(directory.path()).expect("acquire authority"));
+        let target = authority
+            .open_mutation_target(Path::new("song.flac"))
+            .expect("open mutation target");
+
+        // The staged copy sits beside the target, as the tag writer stages it.
+        let staged = directory.path().join(".song.tributary-tag-tmp.flac");
+        fs::write(&staged, b"tagged audio").expect("stage the replacement");
+        let displaced_original = directory.path().join("displaced.flac");
+        let displaced_for_closure = displaced_original.clone();
+        // The seam is process-global and the harness runs tests in parallel,
+        // so the closure must act only on this test's own leaf: a concurrent
+        // test's commit section must pass through the seam untouched.
+        let watched_leaf = song.clone();
+
+        with_post_confirm_interpose(
+            Box::new(move |commit| {
+                if commit.target.path != watched_leaf {
+                    return;
+                }
+                // Swap the leaf after the confirm step proved it: the
+                // admitted object is moved aside and a different object
+                // takes the name, as an external writer would mid-commit.
+                let path = commit.target.path.clone();
+                fs::rename(&path, &displaced_for_closure).expect("displace the confirmed leaf");
+                fs::write(&path, b"newcomer audio").expect("install a newcomer at the leaf");
+            }),
+            || {
+                let commit = target.begin_commit().expect("begin commit section");
+                commit
+                    .commit_replacement(&staged)
+                    .expect_err("a leaf swapped after confirm must refuse the commit");
+            },
+        );
+
+        // The newcomer keeps its name and exact bytes: the refused write
+        // must not replace whatever took the name.
+        assert_eq!(
+            fs::read(&song).expect("read the leaf back"),
+            b"newcomer audio",
+            "the refused write must not replace whatever took the name"
+        );
+        // The displaced admitted object is untouched where the external
+        // writer moved it.
+        assert_eq!(
+            fs::read(&displaced_original).expect("read the displaced original"),
+            b"original audio",
+            "the admitted object must be byte-for-byte untouched"
+        );
+        // A refused commit does not consume the staged copy; the caller
+        // cleans it up. Remove it here, then require that the refusal left
+        // no quarantine sibling behind.
+        assert!(
+            staged.exists(),
+            "the staged copy must survive a refused commit for the caller to clean up"
+        );
+        fs::remove_file(&staged).expect("remove the staged copy");
+        let leftovers: Vec<PathBuf> = fs::read_dir(directory.path())
+            .expect("list the directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("tributary-replaced"))
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a refused commit must restore the swapped leaf and leave no quarantine sibling: {leftovers:?}"
+        );
+    }
+
+    /// Two targets admitted for the same leaf at different times must
+    /// serialize on the leaf itself, not on each other's object: the first
+    /// replacement retires the object the second target admitted, and the
+    /// second commit must then refuse closed — without deadlocking the
+    /// leaf exclusion both sections share.
+    #[test]
+    fn two_targets_for_one_leaf_serialize_and_the_displaced_one_refuses() {
+        let directory = TestDirectory::new("mutation-two-targets-one-leaf");
+        let song = directory.path().join("song.flac");
+        fs::write(&song, b"original audio").expect("write song");
+
+        let authority =
+            Arc::new(MountedRootAuthority::acquire(directory.path()).expect("acquire authority"));
+        let first = authority
+            .open_mutation_target(Path::new("song.flac"))
+            .expect("open the first target");
+        let second = authority
+            .open_mutation_target(Path::new("song.flac"))
+            .expect("open the second target");
+
+        let staged = directory.path().join(".staged-one.flac");
+        fs::write(&staged, b"tagged audio").expect("stage the first replacement");
+        {
+            let commit = first
+                .begin_commit()
+                .expect("begin the first commit section");
+            commit
+                .commit_replacement(&staged)
+                .expect("the first replacement commits");
+        }
+        assert!(
+            !staged.exists(),
+            "a successful install consumes the staging name"
+        );
+
+        // The second target's admitted object was retired by the first
+        // replacement; its commit must refuse and leave the first
+        // replacement installed and exact.
+        let staged_second = directory.path().join(".staged-two.flac");
+        fs::write(&staged_second, b"second audio").expect("stage the second replacement");
+        {
+            let commit = second
+                .begin_commit()
+                .expect("begin the second commit section");
+            commit
+                .commit_replacement(&staged_second)
+                .expect_err("the displaced target must refuse the commit");
+        }
+        assert_eq!(
+            fs::read(&song).expect("read the leaf back"),
+            b"tagged audio",
+            "the refused second commit must not replace the first replacement"
+        );
+        fs::remove_file(&staged_second)
+            .expect("a refused commit leaves its staging name to the caller");
     }
 }
