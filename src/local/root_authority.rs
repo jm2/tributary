@@ -57,6 +57,46 @@ pub struct MountedRootAuthority {
     mount_generation: Option<u64>,
 }
 
+/// A write-parent directory retained from staging through commit.
+///
+/// Publication must never consult the mutable path namespace at the moment
+/// of the rename: a parent directory or mount root replaced between
+/// validation and publish could otherwise redirect the write outside the
+/// audited subtree. The write authority therefore retains this exact parent
+/// directory object when a staged file is created and publishes through its
+/// handle. Only the final parent object is retained; the short-lived
+/// traversal guards are dropped so a live staged write never pins ancestor
+/// renames or unmounts.
+pub(super) struct RetainedWriteParent {
+    lease_token: Uuid,
+    directory: RetainedObject,
+}
+
+impl fmt::Debug for RetainedWriteParent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetainedWriteParent")
+            .field("lease_token", &self.lease_token)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetainedWriteParent {
+    /// Verify the retained parent still names the same directory object and
+    /// still belongs to the same retained root authority.
+    pub(super) fn validate_with(&self, authority: &MountedRootAuthority) -> io::Result<()> {
+        validate_bound_token(authority, self.lease_token)?;
+        self.directory.validate_live()?;
+        authority.validate()
+    }
+
+    /// The retained parent directory handle. Publication is anchored to this
+    /// exact object; it must never be replaced by a fresh path-based open.
+    pub(super) fn handle(&self) -> &File {
+        &self.directory.file
+    }
+}
+
 /// A regular descendant opened through its retained library root.
 pub(super) struct BoundFile {
     lease_token: Uuid,
@@ -497,6 +537,223 @@ impl MountedRootAuthority {
             object: RetainedObject::new(file)?,
             parent_guards: Vec::new(),
         })
+    }
+
+    /// Retain the write-parent directory for a staged write whose final path
+    /// is `relative` beneath this root. An empty `relative` retains the root
+    /// itself. Only the final directory object is retained: the traversal
+    /// guards are dropped so a held staged write never pins ancestor
+    /// renames or unmounts.
+    pub(super) fn retain_write_parent(&self, relative: &Path) -> io::Result<RetainedWriteParent> {
+        if relative.as_os_str().is_empty() {
+            let bound = self.bind_root_directory()?;
+            return Ok(RetainedWriteParent {
+                lease_token: bound.lease_token,
+                directory: bound.object,
+            });
+        }
+        let bound = self.open_relative_directory(relative)?;
+        Ok(RetainedWriteParent {
+            lease_token: bound.lease_token,
+            directory: bound.object,
+        })
+    }
+
+    /// Rename one leaf to another leaf inside the retained write parent.
+    ///
+    /// On Unix the rename is issued relative to the retained parent handle,
+    /// so a parent or mount replacement between validation and publish
+    /// cannot redirect it: the rename lands in the exact audited directory
+    /// object or fails. When `no_replace` is set the publication fails if
+    /// the final leaf already exists; the platform-native no-replace rename
+    /// is tried first, then a link-based publish, and finally a no-follow
+    /// existence check bracketing a plain rename for filesystems that offer
+    /// neither. On Windows the rename uses the absolute paths with the
+    /// retained parent identity revalidated immediately before and after.
+    pub(super) fn rename_within_directory(
+        &self,
+        parent: &RetainedWriteParent,
+        from_leaf: &OsStr,
+        from_absolute: &Path,
+        to_leaf: &OsStr,
+        to_absolute: &Path,
+        no_replace: bool,
+    ) -> io::Result<()> {
+        validate_leaf_name(from_leaf)?;
+        validate_leaf_name(to_leaf)?;
+        parent.validate_with(self)?;
+        let outcome = if no_replace {
+            rename_no_replace_within_parent(
+                parent.handle(),
+                from_leaf,
+                from_absolute,
+                to_leaf,
+                to_absolute,
+            )
+        } else {
+            rename_within_parent(
+                parent.handle(),
+                from_leaf,
+                from_absolute,
+                to_leaf,
+                to_absolute,
+            )
+        };
+        outcome?;
+        parent.validate_with(self)
+    }
+
+    /// Remove the regular file at `relative` beneath the retained root.
+    ///
+    /// On Unix the removal is anchored to the retained root: the parent
+    /// directory is walked no-follow from the retained root handle and the
+    /// leaf is unlinked through its handle, so an intermediate symlink or
+    /// replaced directory cannot redirect the removal. The final leaf must
+    /// not be a directory; a symlink is removed as a link.
+    pub(super) fn remove_regular_file_within(&self, relative: &Path) -> io::Result<()> {
+        let components = strict_relative_components(relative)?;
+        self.validate()?;
+        let leaf = components.last().expect("non-empty components").clone();
+        let parent = self.retain_write_parent_directory(&components)?;
+        #[cfg(unix)]
+        {
+            use rustix::fs::AtFlags;
+
+            let stat = match rustix::fs::statat(parent.handle(), &leaf, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => stat,
+                Err(error) => return Err(io::Error::from(error)),
+            };
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Directory
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to remove a directory through remove_relative_file",
+                ));
+            }
+            rustix::fs::unlinkat(parent.handle(), &leaf, AtFlags::empty())
+                .map_err(io::Error::from)?;
+        }
+        #[cfg(windows)]
+        {
+            let final_path = self.root.join(relative);
+            std::fs::remove_file(&final_path)?;
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (&parent, &leaf);
+            return Err(unsupported_platform());
+        }
+        self.validate()
+    }
+
+    /// Remove the empty directory at `relative` beneath the retained root,
+    /// anchored to the retained root exactly like
+    /// [`Self::remove_regular_file_within`].
+    pub(super) fn remove_directory_within(&self, relative: &Path) -> io::Result<()> {
+        let components = strict_relative_components(relative)?;
+        self.validate()?;
+        let leaf = components.last().expect("non-empty components").clone();
+        let parent = self.retain_write_parent_directory(&components)?;
+        #[cfg(unix)]
+        {
+            use rustix::fs::AtFlags;
+
+            let stat = match rustix::fs::statat(parent.handle(), &leaf, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => stat,
+                Err(error) => return Err(io::Error::from(error)),
+            };
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to remove a non-directory through remove_relative_directory",
+                ));
+            }
+            rustix::fs::unlinkat(parent.handle(), &leaf, AtFlags::REMOVEDIR)
+                .map_err(io::Error::from)?;
+        }
+        #[cfg(windows)]
+        {
+            let final_path = self.root.join(relative);
+            std::fs::remove_dir(&final_path)?;
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (&parent, &leaf);
+            return Err(unsupported_platform());
+        }
+        self.validate()
+    }
+
+    /// Create every component of `components` as a directory beneath the
+    /// retained root, walking and creating each level no-follow from the
+    /// retained root handle on Unix. An existing directory is tolerated
+    /// only when it is a real directory, never a symlink.
+    pub(super) fn create_directories_within(&self, components: &[OsString]) -> io::Result<()> {
+        if components.is_empty() {
+            return Err(invalid_input(
+                "directory creation requires a path below the mounted root",
+            ));
+        }
+        self.validate()?;
+        #[cfg(unix)]
+        {
+            use rustix::fs::{AtFlags, Mode, OFlags};
+
+            let mut current = self.root_handle.file.try_clone()?;
+            for component in components {
+                match rustix::fs::mkdirat(&current, component, Mode::from_bits_truncate(0o777)) {
+                    Ok(()) => {}
+                    Err(rustix::io::Errno::EXIST) => {
+                        let stat =
+                            rustix::fs::statat(&current, component, AtFlags::SYMLINK_NOFOLLOW)
+                                .map_err(io::Error::from)?;
+                        if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                            != rustix::fs::FileType::Directory
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::AlreadyExists,
+                                "intermediate path is not a directory",
+                            ));
+                        }
+                    }
+                    Err(error) => return Err(io::Error::from(error)),
+                }
+                current = File::from(
+                    rustix::fs::openat(
+                        &current,
+                        component,
+                        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+                        Mode::empty(),
+                    )
+                    .map_err(io::Error::from)?,
+                );
+                ensure_boundary(self.boundary, &current)?;
+            }
+        }
+        #[cfg(windows)]
+        {
+            create_directory_tree_by_path(&self.root, components)?;
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = components;
+            return Err(unsupported_platform());
+        }
+        self.validate()
+    }
+
+    /// Open the parent directory of the final component of `components` as a
+    /// retained write parent. The root is used when only a leaf remains.
+    fn retain_write_parent_directory(
+        &self,
+        components: &[OsString],
+    ) -> io::Result<RetainedWriteParent> {
+        let mut parent_relative = PathBuf::new();
+        for component in &components[..components.len() - 1] {
+            parent_relative.push(component);
+        }
+        self.retain_write_parent(&parent_relative)
     }
 
     /// Return the unique token identifying this exact authority instance.
@@ -2173,6 +2430,210 @@ fn join_components(root: &Path, components: &[OsString]) -> PathBuf {
         path.push(component);
     }
     path
+}
+
+/// Verify one leaf name is a single normal path component: non-empty and
+/// free of separators and NUL. Handles passed to handle-relative operations
+/// must never be able to traverse out of the retained parent directory.
+fn validate_leaf_name(leaf: &OsStr) -> io::Result<()> {
+    let bytes = leaf.as_encoded_bytes();
+    if bytes.is_empty() {
+        return Err(invalid_input("leaf name is empty"));
+    }
+    if bytes.contains(&0) {
+        return Err(invalid_input("leaf name contains NUL"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        if leaf.as_bytes().contains(&b'/') {
+            return Err(invalid_input("leaf name contains a path separator"));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        for unit in leaf.encode_wide() {
+            if matches!(unit, b'\\' as u16 | b'/' as u16 | b':' as u16) {
+                return Err(invalid_input("leaf name contains a path separator"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rename `from_leaf` to `to_leaf` inside the parent directory `parent`,
+/// replacing any existing `to_leaf`. The rename is anchored to the retained
+/// parent handle on Unix; Windows uses the absolute paths after the caller
+/// revalidated the retained parent.
+#[cfg(unix)]
+fn rename_within_parent(
+    parent: &File,
+    from_leaf: &OsStr,
+    _from_absolute: &Path,
+    to_leaf: &OsStr,
+    _to_absolute: &Path,
+) -> io::Result<()> {
+    rustix::fs::renameat(parent, from_leaf, parent, to_leaf).map_err(io::Error::from)
+}
+
+/// Windows replace-rename: `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`
+/// through the absolute paths. The retained parent was revalidated by the
+/// caller immediately before, and is revalidated again after.
+#[cfg(windows)]
+fn rename_within_parent(
+    _parent: &File,
+    _from_leaf: &OsStr,
+    from_absolute: &Path,
+    _to_leaf: &OsStr,
+    to_absolute: &Path,
+) -> io::Result<()> {
+    std::fs::rename(from_absolute, to_absolute)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn rename_within_parent(
+    _parent: &File,
+    _from_leaf: &OsStr,
+    _from_absolute: &Path,
+    _to_leaf: &OsStr,
+    _to_absolute: &Path,
+) -> io::Result<()> {
+    Err(unsupported_platform())
+}
+
+/// No-replace rename of `from_leaf` to `to_leaf` inside the retained parent.
+///
+/// The platform-native no-replace rename is tried first (`renameat2` with
+/// `RENAME_NOREPLACE` on Linux, `renameatx_np` with `RENAME_EXCL` on macOS).
+/// Filesystems that do not implement the flag — FAT and exFAT USB mounts
+/// return `EINVAL`/`ENOSYS`, for example — fall back to a link-based
+/// publish, which is atomic and fails with `EEXIST` on a collision; the
+/// staged leaf is then unlinked. Filesystems without hard links (also common
+/// on FAT) fall back to a no-follow existence check immediately before a
+/// plain rename, both anchored to the retained parent handle. A collision
+/// detected by any strategy is a definitive failure that leaves the
+/// destination untouched.
+#[cfg(unix)]
+fn rename_no_replace_within_parent(
+    parent: &File,
+    from_leaf: &OsStr,
+    from_absolute: &Path,
+    to_leaf: &OsStr,
+    to_absolute: &Path,
+) -> io::Result<()> {
+    use rustix::fs::{linkat, renameat_with, unlinkat, AtFlags, RenameFlags};
+
+    match renameat_with(parent, from_leaf, parent, to_leaf, RenameFlags::NOREPLACE) {
+        // The data is published under the final name and the staged leaf is
+        // gone; there is nothing left for the fallbacks below to do.
+        Ok(()) => return Ok(()),
+        // Filesystems and kernels without renameat2 flag support fall back
+        // to the link-based publish below.
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::OPNOTSUPP) => {
+        }
+        Err(other) => return Err(io::Error::from(other)),
+    }
+
+    match linkat(parent, from_leaf, parent, to_leaf, AtFlags::empty()) {
+        Ok(()) => {
+            // The data is published under the final name. Unlinking the
+            // staged leaf is best-effort: a failure leaves a hidden
+            // temporary behind rather than lying about the publish.
+            let _ = unlinkat(parent, from_leaf, AtFlags::empty());
+            return Ok(());
+        }
+        Err(rustix::io::Errno::EXIST) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "destination appeared before the no-replace publish",
+            ));
+        }
+        Err(
+            rustix::io::Errno::PERM
+            | rustix::io::Errno::OPNOTSUPP
+            | rustix::io::Errno::NOSYS
+            | rustix::io::Errno::XDEV
+            | rustix::io::Errno::MLINK,
+        ) => {}
+        Err(error) => return Err(io::Error::from(error)),
+    }
+
+    // Last resort for filesystems with neither rename flags nor hard links.
+    // Both probes are anchored to the retained parent handle, so the window
+    // is bounded to the two adjacent syscalls on one directory.
+    if rustix::fs::statat(parent, to_leaf, AtFlags::SYMLINK_NOFOLLOW).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "destination appeared before the no-replace publish",
+        ));
+    }
+    rename_within_parent(parent, from_leaf, from_absolute, to_leaf, to_absolute)
+}
+
+/// Windows no-replace rename: `MoveFileExW` without
+/// `MOVEFILE_REPLACE_EXISTING` fails when the destination exists.
+#[cfg(windows)]
+fn rename_no_replace_within_parent(
+    _parent: &File,
+    _from_leaf: &OsStr,
+    from_absolute: &Path,
+    _to_leaf: &OsStr,
+    to_absolute: &Path,
+) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let mut from: Vec<u16> = from_absolute.as_os_str().encode_wide().collect();
+    from.push(0);
+    let mut to: Vec<u16> = to_absolute.as_os_str().encode_wide().collect();
+    to.push(0);
+    // SAFETY: both pointers refer to NUL-terminated wide string buffers for
+    // the complete duration of the call.
+    let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn rename_no_replace_within_parent(
+    _parent: &File,
+    _from_leaf: &OsStr,
+    _from_absolute: &Path,
+    _to_leaf: &OsStr,
+    _to_absolute: &Path,
+) -> io::Result<()> {
+    Err(unsupported_platform())
+}
+
+/// Windows fallback for [`MountedRootAuthority::create_directories_within`]:
+/// path-based per-component creation with a reparse-free is-directory check,
+/// mirroring the historical `create_directory_atomic` behavior.
+#[cfg(windows)]
+fn create_directory_tree_by_path(root: &Path, components: &[OsString]) -> io::Result<()> {
+    let mut path = root.to_path_buf();
+    for component in components {
+        path.push(component);
+        match std::fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let metadata = std::fs::symlink_metadata(&path)?;
+                if !metadata.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "intermediate path is not a directory",
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
