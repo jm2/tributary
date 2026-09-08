@@ -151,6 +151,8 @@ satisfy the gate.
 | Context | Integration (app id) |
 | --- | --- |
 | Coverage (Linux x86_64) | GitHub Actions (15368) |
+| Desktop Metadata | GitHub Actions (15368) |
+| SHA256 Checksums | GitHub Actions (15368) |
 | Windows (aarch64) | GitHub Actions (15368) |
 | Bot Review Gate | GitHub Actions (15368) |
 | CodeQL | GitHub Advanced Security (57789) |
@@ -170,7 +172,9 @@ or DISMISSED review carries a conclusion, and a change request blocks even
 when it opened no inline thread); or a bot reviewer's latest review predates
 the head being evaluated (review evidence must be bound to the commit being
 merged). A later approving or dismissing review by the same bot clears that
-bot's conclusion; a comment-only review never does. Both the review-thread
+bot's conclusion; a comment-only review never does, and reviews submitted
+after a dismissal are bound to the evaluated head like any other evidence.
+Both the review-thread
 and the review queries are paginated
 completely, every page is validated, and the published result is bound to the
 exact head, which is re-verified immediately before the green result. The

@@ -219,6 +219,8 @@ jobs:
             "Flatpak (Linux)|15368"
             "MSRV|15368"
             "Coverage (Linux x86_64)|15368"
+            "Desktop Metadata|15368"
+            "SHA256 Checksums|15368"
             "Bot Review Gate|15368"
             "CodeQL|57789"
             "Analyze (python)|57789"
