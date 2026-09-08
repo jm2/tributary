@@ -273,7 +273,10 @@ not re-enable non-Dependabot auto-merge.
    and the auto-merge precondition keeps routine Dependabot auto-merge off.
 2. Edit ruleset 17650907 to add every context in the table above with the
    listed app binding (`CodeRabbit` unbound). Verify the saved ruleset
-   actually lists all sixteen required checks — the save, not the intent, is
+   actually lists all eighteen required checks — the seven the ruleset
+   already required (Security Audit, Linux (x86_64), Linux (aarch64),
+   macOS (aarch64), Windows (x86_64), Flatpak (Linux), MSRV) plus the
+   eleven additions in the table above — the save, not the intent, is
    what the auto-merge precondition reads.
 3. Validate against a live pull request before treating the widened gate as
    authoritative: confirm all widened checks report on that PR, address and
