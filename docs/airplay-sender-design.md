@@ -311,7 +311,10 @@ trait SenderSession: Send {
     /// Push interleaved s16le 44100 Hz stereo PCM into the session.
     /// Returns the number of bytes accepted so callers can apply
     /// backpressure; a session that cannot accept audio without
-    /// stalling returns 0.
+    /// stalling returns 0. A session that sources its own decoder
+    /// from the prepared URI (§4.2) owns its decode internally,
+    /// never consumes pushed audio, and documents `write_pcm` as an
+    /// unsupported no-op for its type.
     fn write_pcm(&mut self, samples: &[u8]) -> usize;
     /// Receiver-facing volume in [0.0, 1.0]; the adapter owns the
     /// mapping to its protocol's convention (§2.2: RAOP dB, mute at
@@ -336,13 +339,22 @@ trait AirplaySender: Send + Sync {
     /// surfaces verbatim (this is today's localized
     /// `airplay_raopsink_missing` contract, generalized).
     fn probe(&self) -> Result<(), String>;
-    /// Negotiate a session with the receiver at `host:port` and return
+    /// Negotiate a session with the receiver at `host:port`, sourcing
+    /// audio from the prepared media at `prepared_uri`, and return
     /// it. Called only after `probe` succeeded and after media
     /// preparation, so a failure here is a receiver-side failure, not
-    /// a missing dependency.
+    /// a missing dependency. The seam must carry `prepared_uri`
+    /// because a sender is one immutable instance per backend — never
+    /// per track — so it cannot capture the URI anywhere else; it is
+    /// the same loopback URL today's `open_prepared_session` passes
+    /// to `build_raop_pipeline`
+    /// (`src/audio/airplay_output.rs:231-241`). Ticket revocation on
+    /// failure stays in the load path (`open_prepared_media`,
+    /// :199-208), exactly as today.
     fn open_session(
         &self,
         target: &AirplayTarget,
+        prepared_uri: &str,
         event_tx: async_channel::Sender<PlayerEvent>,
         generation: PlayerEventGeneration,
     ) -> Result<Box<dyn SenderSession>, String>;
@@ -352,19 +364,24 @@ trait AirplaySender: Send + Sync {
 Key differences from revision 1, and why:
 
 - **No `gst::Element` anywhere in the contract.** The GStreamer
-  adapter (§4.2) internally keeps the existing pipeline; the daemon
-  adapter (§4.3) writes PCM into a pipe. Neither exposes its transport
-  type.
-- **PCM in, not ALAC in.** The contract feeds s16le 44100/2 PCM, the
-  one format every candidate accepts at its boundary (OwnTone's pipe
-  input: "read a PCM16 stream from a named pipe";
+  adapter (§4.2) internally keeps the existing pipeline, sourced from
+  the `prepared_uri` the seam carries; the daemon adapter (§4.3)
+  feeds its pipe from a decode pump the adapter owns. Neither exposes
+  its transport type.
+- **PCM in, not ALAC in — with decode-and-pump ownership assigned.**
+  The pushed-audio contract is s16le 44100/2 PCM, the format the
+  pump-fed boundary accepts (OwnTone's pipe input: "read a PCM16
+  stream from a named pipe";
   [`src/inputs/pipe.c`](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/src/inputs/pipe.c);
-  its fifo output quality is `{44100, 16, 2}`). Each adapter owns its
-  own encoding and framing — which is where the 352-sample contract
-  (§2.4) lives, inside adapters, not in the shared seam. The GStreamer
-  adapter keeps today's `avenc_alac ! raopsink` tail internally and
-  bridges the PCM contract to it with an `appsrc`, preserving the
-  element's exact current input behavior.
+  its fifo output quality is `{44100, 16, 2}`). Who decodes is
+  explicit, per adapter: the daemon adapter owns the decode pump that
+  produces the PCM it pushes (§4.3), while the GStreamer adapter's
+  first refactor is pipeline-sourced — it consumes `prepared_uri`
+  through the seam, keeps `uridecodebin ! audioconvert !
+  avenc_alac ! raopsink` intact (decode included), and is driven by
+  its pipeline, not by pushed PCM. Encoding and framing stay inside
+  adapters — where the 352-sample contract (§2.4) lives — never in
+  the shared seam.
 - **`open_session` returns a session, not a sink element.** Pause /
   resume / volume / flush are protocol operations (RTSP
   SET_PARAMETER / PAUSE, daemon RPC), not pipeline state writes, so
@@ -379,15 +396,22 @@ Key differences from revision 1, and why:
 
 Wraps today's path: `probe` is `raopsink_available`
 (`src/audio/airplay_output.rs:266-270`) behind `ensure_raopsink`
-(:279-285) semantics; the session runs
-`uridecodebin ! audioconvert ! some-alac-enc ! raopsink` and
-implements `write_pcm` via an interposed `appsink/appsrc` hop, or —
-preferred for the first refactor — keeps the whole pipeline intact
-and implements `SenderSession` over the pipeline's lifecycle so the
-existing bus watch (:307-376) and position timer (:384-412) are
-reused unchanged. Zero new dependencies; quality equal to today's;
-subject to `raopsink` never being packaged (policy record,
+(:279-285) semantics; the session consumes the `prepared_uri` carried
+through the seam and runs the whole existing
+`uridecodebin ! audioconvert ! some-alac-enc ! raopsink` pipeline,
+reusing today's bus watch (:307-376) and position timer (:384-412)
+unchanged. **Decode-and-pump ownership is the pipeline's:**
+`uridecodebin` fetches and decodes the prepared URI inside the
+session, so this session never consumes `write_pcm` — the trait
+documents a pipeline-sourced session's `write_pcm` as an unsupported
+no-op, and pause/resume/volume/flush map onto pipeline state and the
+RAOP volume exactly as today's session. Zero new dependencies;
+quality equal to today's; subject to `raopsink` never being packaged
+(policy record,
 [`docs/release-component-policy.md:87-96`](release-component-policy.md)).
+The `appsrc`-bridged variant whose hot path *is* `write_pcm` stays
+deferred until §4.3's pump exists and a record needs it; it is not
+part of the first refactor.
 
 ### 4.3 Process adapter (OwnTone daemon)
 
@@ -397,7 +421,15 @@ Tributary talks to an OwnTone instance as a transmission service:
   PCM16, startable by selecting it or autostarted
   (`src/inputs/pipe.c`: "This module will read a PCM16 stream from a
   named pipe"; `pipe_autostart`). The adapter's `write_pcm` is a FIFO
-  write; backpressure is natural.
+  write; backpressure is natural. **Decode-and-pump ownership is the
+  adapter's:** it owns a headless decode pipeline
+  (`uridecodebin ! audioconvert ! appsink`, caps
+  `audio/x-raw, format=s16le, rate=44100, channels=2`) sourcing the
+  same `prepared_uri` the seam carries, and pumps the decoded PCM
+  into `write_pcm`. This reuses the GStreamer decoder stack
+  Tributary already requires — no new dependency — and it keeps the
+  protected loopback ticket URI entirely inside Tributary's process:
+  the daemon never receives the URL, only the decoded bytes.
 - **Transport out:** OwnTone's AirPlay outputs, classic RAOP *and*
   AirPlay 2 (§5.4), discovered and paired by the daemon itself —
   including the password and PIN-verification flows Tributary cannot
@@ -569,7 +601,15 @@ scope; revisit only if the OwnTone path fails in validation.**
 
 **Adopt the OwnTone 29.3 process adapter (§4.3, §5.4) as the first
 shipping path, behind the §4.1 seam, with the `raopsink` adapter (§4.2)
-retained for user-supplied elements.**
+retained for user-supplied elements — on the platforms §5.4's channels
+cover.** Tributary's Windows and macOS packages (install matrix,
+[`README.md`](../README.md)) have no OwnTone acquisition channel, and
+§11 forbids bundling the daemon into release artifacts: on those
+platforms this design ships the fail-closed unavailable state — the
+localized guidance names the platform limitation — and implies no
+sender behavior. Sender support there requires a future supported
+acquisition/integration path, which this investigation deliberately
+does not promise (§8, §9).
 
 Ordering rationale:
 
@@ -623,12 +663,19 @@ What the implementation record must nail down, per §4.3:
   macOS, native Linux, Flatpak gates) still runs on the
   implementation PR and records artifact evidence, per
   [`docs/release-component-policy.md`](release-component-policy.md).
-- **Dependency documentation:** each supported platform's install
-  docs gain a "for AirPlay output, install OwnTone ≥ 29.x" entry
-  with the pinned source (upstream releases page, FreeBSD port,
-  OpenWrt package). Where OwnTone is unavailable (no official Debian
-  archive), the docs say so and the probe error repeats it — an
-  honest unavailable state, exactly like today's `raopsink` message.
+- **Dependency documentation, scoped to real channels.** Platforms
+  with an OwnTone channel (§5.4: Debian/Ubuntu, Raspberry Pi OS,
+  Docker, OpenWrt, FreeBSD) gain a "for AirPlay output, install
+  OwnTone ≥ 29.x" install-docs entry with the pinned source (upstream
+  releases page, FreeBSD port, OpenWrt package); where OwnTone is
+  unavailable even on a covered platform (no official Debian
+  archive), the docs say so and the probe error repeats it.
+  Tributary's Windows and macOS packages have no OwnTone channel and
+  §11 forbids bundling: their install docs state that AirPlay output
+  requires an OwnTone-capable platform, with no acquisition path
+  implied, and the probe fails closed with the same honest localized
+  unavailable state as today's `raopsink` message. The acceptance
+  matrix (§9) scopes to match.
 - **Probe reflects reality:** `AirplaySender::probe` for the daemon
   adapter checks: binary/service present (documented discovery only —
   no PATH guessing beyond the documented locations), daemon
@@ -686,10 +733,19 @@ record for the selected path must add, at minimum:
    receiver (HomePod/Apple TV class) for any record that flips the
    §3 discovery filter.
 
+**Platform scope:** items 1-8 run on the platforms §5.4's channels
+cover. On Windows and macOS packaged deployments — no OwnTone
+channel, bundling forbidden (§11) — the acceptance contract is the
+fail-closed path itself: §9.1's probe refusal with localized guidance
+naming the platform limitation. No sender playback is claimed there
+until a supported acquisition path exists.
+
 ## 10. Proposed next-record plan
 
 1. **Seam refactor (mechanical).** Land the §4.1 contract with the
-   existing GStreamer path as the first `AirplaySender`; no behavior
+   existing GStreamer path as the first `AirplaySender`; the contract
+   carries the prepared URI exactly as `open_prepared_session` does
+   today (`src/audio/airplay_output.rs:231-241`), so no behavior
    change; the §9.1-§9.3 tests land here. Locked `cargo check`,
    `cargo clippy` (debug + release), `cargo test --all-targets`.
 2. **OwnTone daemon adapter.** Dependency documentation per §8,
@@ -715,8 +771,9 @@ record for the selected path must add, at minimum:
 - It does not implement AirPlay 2, MFi-SAP/FairPlay-encrypted session
   types (`et=3/4`), or multi-room sync.
 - It does not promise a target date; the P2.1 feature focus leading
-  the **15/39** active-backlog count
-  ([`docs/task.md:26-34`](task.md)) stays ahead of this work in the
+  the **17/39** active-backlog count
+  ([`docs/task.md:26`](task.md), kept synchronized with that file's
+  literal top-level checkboxes) stays ahead of this work in the
   backlog order.
 - Its only changes outside its own file are the two cross-references
   this branch already carries — the flipped P2.4 checkbox in
