@@ -199,22 +199,41 @@ cargo build --release
 
 The binary is at `target/release/tributary`.
 
+To build and launch in the same terminal, use `./scripts/build-linux.sh --run`.
+This builds the native target with locked dependencies and validates the binary before launch.
+
 ### macOS
 
 Requires [Homebrew](https://brew.sh):
 
 ```bash
-brew install gtk4 libadwaita pkg-config gstreamer gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav adwaita-icon-theme
+brew install gtk4 libadwaita pkg-config gstreamer gst-plugins-good gst-plugins-bad \
+  gst-plugins-ugly gst-libav libsoup adwaita-icon-theme
 cargo build --release
 ```
 
+For a native development build that launches in the same terminal:
+
+```bash
+./scripts/build-macos.sh --run
+```
+
+The helper uses locked dependencies, validates the binary's Mach-O imports, and runs with
+Homebrew libraries. It skips app bundling and disk-image creation.
+
 To create a `.app` bundle and `.dmg`:
+
 ```bash
 brew install create-dmg   # optional, for DMG packaging
 ./scripts/build-macos.sh --dmg
 ```
 
 The app bundle is at `dist/Tributary.app`, and the DMG at `dist/Tributary.dmg`.
+
+On Linux and macOS, `--run` builds `target/<native-target>/release/tributary`, keeps logs in
+the terminal, and returns the application's exit status. It cannot be combined with formatting,
+checks, coverage, or packaging flags. Both helpers accept at most one quick-exit mode;
+`--fmt` requires only Cargo. They can be invoked by path from outside the repository.
 
 > **Note:** The `.app` bundle includes rpath-fixed dylibs and is ad-hoc code-signed so it can run without Homebrew on the target machine. For distribution, proper Apple Developer code signing and notarization are recommended.
 

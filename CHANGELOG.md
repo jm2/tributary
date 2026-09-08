@@ -7,12 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Folder browsing** — Browse the local library by configured root and folder, with
+  distinct identities for multiple roots, lazy navigation, and visible reasons when a root
+  is unavailable or has changed identity.
+- **Playlist drag and drop** — Drop selected tracks onto an editable local playlist in
+  their displayed order, and reorder playlists in the sidebar with persistent ordering.
+- **Chromecast IPv6** — Discover receivers and publish media over routable IPv6, choosing
+  the local interface that reaches the selected receiver on multihomed networks.
+- **Build and run helpers** — Add `--run` on Linux and macOS to build with locked
+  dependencies, validate the native binary, and launch it with logs in the terminal.
+  The macOS development route uses Homebrew libraries and skips app packaging.
+
 ### Changed
 
 - **Implementation backlog** — Reconcile completed slices and Gas City dependencies, add eleven
   corrective and seven engineering records, and expose operator/release acceptance separately.
   Preserve the prior detailed contracts and delivery history in an archive; no feature is marked
   complete by this documentation update.
+- **Build helper routing** — Reject conflicting quick-exit, launch, and packaging flags
+  before setup. Formatting needs only Cargo, and macOS builds work when invoked from
+  outside the repository.
+- **Last.fm preparation** — Persist consent and per-source policy generations for future
+  scrobbling activation, with transactional updates and validation. Scrobbling remains disabled.
+- **Dependency maintenance** — Refresh Rust dependencies and the release-upload action,
+  and keep the fuzz lockfile synchronized with dependency updates.
 
 ### Fixed
 
@@ -20,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dependencies so protected streams can use the required HTTP source on Macs without
   Homebrew. The signed package probe now verifies direct HTTP routing, audio decoding,
   and end-of-stream with the bundled plugins.
+- **Imported metadata** — Recognize standard Ogg/FLAC recording dates as years and remove
+  trailing whitespace from tag text while preserving meaningful leading and internal spaces.
+- **Column ordering** — Save reordered columns after the drag completes so an interrupted
+  save cannot lose the column in flight.
+- **Track dragging** — Start playlist transfers only in the track-row area, preventing
+  drags from empty space or column headers from transferring the existing selection.
+- **Release verification** — Verify that manual releases build the requested tag and stop
+  artifact publication when checksum generation fails.
 
 ## [0.6.2] — 2026-09-01
 
