@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::test_support::{authority_pair, read_authority, write_source_file};
-use super::types::{TransferError, TransferItem, TransferRequest};
+use super::types::{Stage, TransferError, TransferItem, TransferRequest};
 use super::TransferPlanner;
 use crate::local::root_authority::MountedRootAuthority;
 use crate::local::write_authority::{ConflictPolicy, MountedWriteAuthority};
@@ -138,6 +138,61 @@ fn skip_policy_skips_existing_destination() {
         plan.file_count(),
         0,
         "skip policy should produce no copy stages"
+    );
+}
+
+/// A walked file skipped under the Skip policy must stage no parent
+/// directory work either: conflict resolution happens before parent
+/// staging, so never-copied files emit no `CreateDirectory` stages for
+/// their ancestors (and execution creates no empty destination directories
+/// for them). The explicit directory item's own creation stage is the
+/// directory-item contract and is still staged exactly once.
+#[test]
+fn skip_walk_stages_no_work_for_skipped_files() {
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    write_source_file(source_root.path(), "album/sub/a.flac", b"new");
+    std::fs::create_dir_all(destination_root.path().join("imported/sub")).expect("create dest");
+    std::fs::write(destination_root.path().join("imported/sub/a.flac"), b"old")
+        .expect("write existing destination");
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = plan_request(
+        source,
+        destination,
+        vec![TransferItem::new(
+            PathBuf::from("album"),
+            PathBuf::from("imported"),
+        )],
+        ConflictPolicy::Skip,
+        None,
+    );
+    let plan = TransferPlanner::new().plan(&request).expect("plan");
+    assert_eq!(
+        plan.file_count(),
+        0,
+        "a fully skipped walk must stage no copy work"
+    );
+    assert_eq!(
+        plan.directory_count(),
+        1,
+        "only the directory item itself may be staged; the skipped \
+         file's walked ancestors must not be"
+    );
+    let directories: Vec<&PathBuf> = plan
+        .stages()
+        .iter()
+        .filter_map(|stage| match stage {
+            Stage::CreateDirectory {
+                destination_relative_path,
+            } => Some(destination_relative_path),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        directories,
+        vec![&PathBuf::from("imported")],
+        "the walked ancestor 'imported/sub' of the skipped file must not be staged"
     );
 }
 
