@@ -14,7 +14,7 @@ use super::staging::{
     staging_leaf_name, strict_relative_components,
 };
 use super::target::{MountedDirectory, PreparedWriteTarget};
-use crate::local::root_authority::MountedRootAuthority;
+use crate::local::root_authority::{MountedRootAuthority, RetainedWriteParent};
 /// Retained write authority over one exact mounted filesystem.
 ///
 /// The underlying [`MountedRootAuthority`] is shared so the read-side scans
@@ -92,7 +92,53 @@ impl MountedWriteAuthority {
             assemble_relative(&components),
             policy,
         )?;
+        self.stage_into_resolved_destination(parent, resolved)
+    }
 
+    /// Prepare a writable target whose conflict outcome the planner already
+    /// recorded on the stage. The recorded resolution is consumed verbatim:
+    ///
+    /// - [`ConflictResolution::Fresh`] publishes no-replace: a destination
+    ///   that appears after planning fails the commit instead of being
+    ///   replaced.
+    /// - [`ConflictResolution::Overwrite`] publishes by replace with a
+    ///   commit-time backup bind (see
+    ///   [`PreparedWriteTarget::commit`]); an occupant that appears or
+    ///   vanishes after planning is backed up or bypassed, never destroyed.
+    /// - [`ConflictResolution::Preserved`] allocates the disambiguated
+    ///   sibling name now and publishes it no-replace.
+    ///
+    /// The live filesystem is never consulted to re-decide a recorded
+    /// resolution — only to allocate a Preserved sibling name — so the
+    /// executor can never flip a decision the planner made.
+    pub fn prepare_write_relative_file_with_resolution(
+        &self,
+        relative: &Path,
+        resolution: ConflictResolution,
+    ) -> io::Result<PreparedWriteTarget> {
+        let components = strict_relative_components(relative)?;
+        self.mounted.validate()?;
+
+        let parent_components = parent_components_of(&components);
+        let parent = self.mounted.retain_write_parent(&parent_components)?;
+
+        let resolved = destination_for_resolution(
+            self.mounted.root(),
+            &components,
+            assemble_relative(&components),
+            resolution,
+        )?;
+        self.stage_into_resolved_destination(parent, resolved)
+    }
+
+    /// Create the exclusive staged file inside the resolved destination and
+    /// bundle it into the prepared target. Shared tail of both prepare
+    /// entry points.
+    fn stage_into_resolved_destination(
+        &self,
+        parent: RetainedWriteParent,
+        resolved: ResolvedDestination,
+    ) -> io::Result<PreparedWriteTarget> {
         let staged_name = staging_leaf_name();
         let staged_path = self
             .mounted
@@ -279,6 +325,37 @@ fn resolve_write_destination(
             final_relative,
             staged_dir: parent_components,
         }),
+    }
+}
+
+/// Allocate the staged-write destination for a planner-recorded resolution.
+/// Unlike [`resolve_write_destination`] this never consults the conflict
+/// policy or re-decides an outcome: Fresh and Overwrite keep the final
+/// name, and Preserved only allocates its disambiguated sibling name.
+fn destination_for_resolution(
+    root: &Path,
+    components: &[OsString],
+    final_relative: PathBuf,
+    resolution: ConflictResolution,
+) -> io::Result<ResolvedDestination> {
+    match resolution {
+        ConflictResolution::Fresh | ConflictResolution::Overwrite => Ok(ResolvedDestination {
+            resolution,
+            final_relative,
+            staged_dir: parent_components_of(components),
+        }),
+        ConflictResolution::Preserved => {
+            let (preserved_relative, preserved_components) = preserved_sibling_path(
+                root,
+                &parent_components_of(components),
+                components.last().expect("non-empty"),
+            )?;
+            Ok(ResolvedDestination {
+                resolution: ConflictResolution::Preserved,
+                final_relative: preserved_relative,
+                staged_dir: preserved_components,
+            })
+        }
     }
 }
 
