@@ -61,6 +61,8 @@ awk '
 ' "${SCRIPT_DIR}/build-macos.sh" > "$LAUNCHER"
 [[ -s "$LAUNCHER" ]] || fail "could not extract the macOS launcher"
 
+# Verify bundled library precedence and argument forwarding for the supplied
+# environment mode (unset or set) and inherited library path in a subshell.
 assert_launcher_library_path() (
   trap - EXIT
   mode="$1"
@@ -72,6 +74,8 @@ assert_launcher_library_path() (
     export DYLD_LIBRARY_PATH="$inherited"
     [[ -z "$inherited" ]] || expected="${expected}:${inherited}"
   fi
+  # Validate the environment and argv at the generated launcher's exec call.
+  # shellcheck disable=SC2329
   exec() {
     [[ "${DYLD_LIBRARY_PATH-}" == "$expected" ]] \
       || fail "launcher lost bundled precedence or user library paths (${mode})"
@@ -79,6 +83,8 @@ assert_launcher_library_path() (
        && "$2" == 'argument with spaces' && "$3" == '*.flac' ]] \
       || fail "launcher changed executable selection or arguments"
   }
+  # The launcher is extracted into the temporary fixture above at test runtime.
+  # shellcheck source=/dev/null
   source "$LAUNCHER" 'argument with spaces' '*.flac'
 )
 

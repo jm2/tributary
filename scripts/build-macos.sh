@@ -562,6 +562,8 @@ chmod -R a-w "$PROBE_APP"
 # Set an inherited library path after the system shell starts: macOS SIP may
 # strip DYLD_* while launching /bin/bash and otherwise mask a launcher bug.
 # Sourcing the exact signed wrapper still execs the packaged binary normally.
+# Positional parameters in the command string must expand in the child shell.
+# shellcheck disable=SC2016
 env -u GST_REGISTRY \
     -u GST_REGISTRY_1_0 \
     -u GDK_PIXBUF_MODULE_FILE \

@@ -833,6 +833,8 @@ fn windows_bundle_requires_dynamic_system_audio_output_support() {
     );
 }
 
+/// Guard the macOS package and probe contracts for the app-owned output route,
+/// including its required plugins, native dependencies, and channel caps.
 #[test]
 fn macos_bundle_requires_app_owned_system_audio_output_support() {
     let manifest = manifest();

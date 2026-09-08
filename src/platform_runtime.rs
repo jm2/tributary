@@ -987,6 +987,8 @@ fn atomic_replace(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate icon loading, protected audio playback, and external runtime caches
+/// for the relocated macOS bundle without opening a physical audio output.
 #[cfg(target_os = "macos")]
 fn run_macos_runtime_probe(
     layout: &MacBundleLayout,

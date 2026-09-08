@@ -875,6 +875,8 @@ mod tests {
 
     use super::*;
 
+    /// Keep the shared probe entry point available on each supported platform
+    /// without running its environment-mutating playback checks in unit tests.
     #[test]
     fn runtime_probe_entrypoint_is_reachable() {
         std::hint::black_box(run_packaged_audio_runtime_probe as fn(&Path) -> anyhow::Result<()>);
