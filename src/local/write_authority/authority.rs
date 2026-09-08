@@ -7,13 +7,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::policy::{ConflictPolicy, ConflictResolution};
+#[cfg(not(unix))]
+use super::staging::create_directory_atomic;
 use super::staging::{
-    assemble_relative, create_directory_atomic, create_exclusive_staged_file, parent_components_of,
-    preserved_sibling_path, staging_leaf_name, strict_relative_components,
+    assemble_relative, create_exclusive_staged_file, parent_components_of, preserved_sibling_path,
+    staging_leaf_name, strict_relative_components,
 };
 use super::target::{MountedDirectory, PreparedWriteTarget};
 use crate::local::root_authority::MountedRootAuthority;
-
 /// Retained write authority over one exact mounted filesystem.
 ///
 /// The underlying [`MountedRootAuthority`] is shared so the read-side scans
@@ -68,6 +69,12 @@ impl MountedWriteAuthority {
     /// checked against the conflict policy; a fresh, sibling temp file is
     /// created with `O_CREAT | O_EXCL` so a concurrent writer cannot smuggle
     /// a same-named file past publish.
+    ///
+    /// The parent directory is retained for the lifetime of the target and
+    /// every later operation — staged creation, publish, and discard — is
+    /// anchored to that retained handle (or revalidated against it), so a
+    /// parent or mount replacement between staging and commit cannot
+    /// redirect a write.
     pub fn prepare_write_relative_file(
         &self,
         relative: &Path,
@@ -75,7 +82,9 @@ impl MountedWriteAuthority {
     ) -> io::Result<PreparedWriteTarget> {
         let components = strict_relative_components(relative)?;
         self.mounted.validate()?;
-        bind_parent_directory(&self.mounted, &components)?;
+
+        let parent_components = parent_components_of(&components);
+        let parent = self.mounted.retain_write_parent(&parent_components)?;
 
         let resolved = resolve_write_destination(
             self.mounted.root(),
@@ -90,13 +99,20 @@ impl MountedWriteAuthority {
             .root()
             .join(&resolved.staged_dir)
             .join(&staged_name);
+        #[cfg(unix)]
+        let staged_file = create_exclusive_staged_file(parent.handle(), staged_name.as_os_str())?;
+        #[cfg(windows)]
+        let staged_file = create_exclusive_staged_file(&staged_path)?;
+        #[cfg(not(any(unix, windows)))]
         let staged_file = create_exclusive_staged_file(&staged_path)?;
         self.mounted.validate()?;
 
         Ok(PreparedWriteTarget {
             lease_token: self.mounted.token(),
             authority: Arc::clone(&self.mounted),
+            parent,
             final_relative_path: resolved.final_relative,
+            staged_leaf: staged_name,
             staged_path,
             staged_file: Some(staged_file),
             resolution: resolved.resolution,
@@ -133,6 +149,11 @@ impl MountedWriteAuthority {
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                #[cfg(unix)]
+                self.mounted.create_directories_within(&components)?;
+                #[cfg(windows)]
+                create_directory_atomic(self.mounted.root(), &components)?;
+                #[cfg(not(any(unix, windows)))]
                 create_directory_atomic(self.mounted.root(), &components)?;
             }
             Err(error) => return Err(error),
@@ -149,54 +170,61 @@ impl MountedWriteAuthority {
     }
 
     /// Remove a regular file atomically through the retained authority.
+    ///
+    /// On Unix the removal is anchored to the retained root handle: the
+    /// parent is walked no-follow from the retained root and the leaf is
+    /// unlinked through its descriptor, so an intermediate symlink or a
+    /// replaced directory cannot redirect the removal.
     pub fn remove_relative_file(&self, relative: &Path) -> io::Result<()> {
-        let components = strict_relative_components(relative)?;
-        self.mounted.validate()?;
-        let final_path = self.mounted.root().join(assemble_relative(&components));
-        let metadata = std::fs::symlink_metadata(&final_path)?;
-        if metadata.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "refusing to remove a directory through remove_relative_file",
-            ));
-        }
-        std::fs::remove_file(&final_path)?;
-        self.mounted.validate()?;
-        Ok(())
+        strict_relative_components(relative)?;
+        self.mounted.remove_regular_file_within(relative)
     }
 
-    /// Remove an empty directory atomically through the retained authority.
+    /// Remove an empty directory atomically through the retained authority,
+    /// anchored to the retained root exactly like
+    /// [`Self::remove_relative_file`].
     pub fn remove_relative_directory(&self, relative: &Path) -> io::Result<()> {
-        let components = strict_relative_components(relative)?;
-        self.mounted.validate()?;
-        let final_path = self.mounted.root().join(assemble_relative(&components));
-        let metadata = std::fs::symlink_metadata(&final_path)?;
-        if !metadata.is_dir() {
+        strict_relative_components(relative)?;
+        self.mounted.remove_directory_within(relative)
+    }
+
+    /// Restore a previously saved backup over its destination within the
+    /// same parent directory, replacing whatever currently occupies the
+    /// destination name.
+    ///
+    /// Used by the transfer executor's rollback to put a pre-existing
+    /// original back after an Overwrite commit. The rename is anchored to
+    /// the retained root/parent handles on Unix; the backup and the
+    /// destination must be siblings so one retained parent directory serves
+    /// both sides of the rename.
+    pub fn restore_relative_file(
+        &self,
+        backup_relative: &Path,
+        destination_relative: &Path,
+    ) -> io::Result<()> {
+        let backup_components = strict_relative_components(backup_relative)?;
+        let destination_components = strict_relative_components(destination_relative)?;
+        if parent_components_of(&backup_components) != parent_components_of(&destination_components)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "refusing to remove a non-directory through remove_relative_directory",
+                "backup and destination must share a parent directory",
             ));
         }
-        std::fs::remove_dir(&final_path)?;
+        let parent_components = parent_components_of(&destination_components);
         self.mounted.validate()?;
-        Ok(())
+        let parent = self.mounted.retain_write_parent(&parent_components)?;
+        let backup_leaf = backup_components.last().expect("non-empty").clone();
+        let destination_leaf = destination_components.last().expect("non-empty").clone();
+        self.mounted.rename_within_directory(
+            &parent,
+            backup_leaf.as_os_str(),
+            self.mounted.root().join(backup_relative).as_path(),
+            destination_leaf.as_os_str(),
+            self.mounted.root().join(destination_relative).as_path(),
+            false,
+        )
     }
-}
-
-/// Bind the destination parent directory through the retained authority so
-/// the boundary check matches the read path. A write directly beneath the
-/// root binds the root itself.
-fn bind_parent_directory(
-    mounted: &MountedRootAuthority,
-    components: &[OsString],
-) -> io::Result<()> {
-    let parent = parent_components_of(components);
-    if parent.as_os_str().is_empty() {
-        let _root_bound = mounted.bind_root_directory()?;
-    } else {
-        let _parent_bound = mounted.open_relative_directory(&parent)?;
-    }
-    Ok(())
 }
 
 /// Resolve the conflict policy against the live filesystem and decide where
