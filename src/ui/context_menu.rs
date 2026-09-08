@@ -1865,23 +1865,27 @@ mod tests {
     /// box directly), this test will fail.
     ///
     /// Headless CI (cargo test in the Fedora container with no X/Wayland socket)
-    /// cannot initialize GTK, so the test gates on `gtk::init()`'s
-    /// non-panicking result and skips with a printed reason when GTK
-    /// cannot acquire a display. macOS is excluded because GTK's Quartz
-    /// backend panics when initialized from the test harness worker thread.
-    /// The contract still holds on any machine with a display — the test is
-    /// therefore meaningful on a developer box and harmless in CI.
+    /// cannot initialize GTK, so the test skips with a printed reason when
+    /// no display session is available or GTK cannot acquire a display.
+    /// macOS is excluded because GTK's Quartz backend panics when
+    /// initialized from the test harness worker thread. The contract still
+    /// holds on any machine with a display — the test is therefore
+    /// meaningful on a developer box and harmless in CI.
+    ///
+    /// The display gate, `gtk::init`, and every widget construction and
+    /// assertion below run while holding the crate-wide
+    /// `ui::widget_test_session` lock: libtest runs each `#[test]` on its
+    /// own worker thread, and GTK requires single-threaded use after
+    /// initialization, so the browser.rs widget test must not be able to
+    /// touch GTK state while this one is mid-flight (or vice versa).
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn popover_from_menu_model_attaches_a_visible_child_widget() {
-        if let Err(e) = gtk::init() {
-            eprintln!(
-                "popover_from_menu_model_attaches_a_visible_child_widget: \
-                 GTK unavailable ({e}); skipping. Re-run on a box with a display \
-                 session to exercise the contract."
-            );
+        let Some(_gtk_session) = crate::ui::widget_test_session::acquire(
+            "popover_from_menu_model_attaches_a_visible_child_widget",
+        ) else {
             return;
-        }
+        };
         assert_track_drags_start_only_from_the_data_row_area();
 
         let menu = gtk::gio::Menu::new();
@@ -2014,10 +2018,11 @@ mod tests {
 
     /// Widget-constructing contract for the tracklist drag origin. Called from
     /// [`popover_from_menu_model_attaches_a_visible_child_widget`] rather than
-    /// being its own `#[test]`: gtk-rs allows GTK to be initialized on exactly
-    /// one thread per process, and the test harness runs tests on a pool of
-    /// threads, so a second GTK-initializing test panics whenever it lands on
-    /// a different thread from the first.
+    /// being its own `#[test]`: the harness runs tests on a pool of threads,
+    /// so a second GTK-initializing test would have to coordinate through the
+    /// `ui::widget_test_session` lock with a test in another module; folding
+    /// it into the one GTK session this module already holds keeps the
+    /// contract exercised without a cross-module handshake.
     #[cfg(not(target_os = "macos"))]
     fn assert_track_drags_start_only_from_the_data_row_area() {
         let (window, column_view, label) = realized_tracklist_for_drag_test();

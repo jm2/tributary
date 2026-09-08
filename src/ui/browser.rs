@@ -1063,40 +1063,13 @@ fn get_store_from_pane(pane: &gtk::Box) -> Option<gio::ListStore> {
 // The contract under test stays in ONE `#[test]` function (GTK must be
 // exercised from a single thread, and `gtk::init` must not race itself);
 // its sections live in small helpers below, which also keeps each function
-// under Codacy's 50-lines-of-code method limit.
+// under Codacy's 50-lines-of-code method limit. The test funnels its
+// display gate, `gtk::init`, and the whole widget-exercising body through
+// the crate-wide `ui::widget_test_session` lock so it cannot race the
+// context_menu widget test on libtest's worker threads.
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
-
-    /// Skips on headless machines BEFORE initializing GTK: headless GTK
-    /// can still come up via its Broadway fallback, and a test process
-    /// that initialized GTK without a real display session segfaults in
-    /// GTK teardown at exit (observed as SIGSEGV after all tests passed
-    /// on headless Linux CI, run 33921896331). A display session
-    /// (`$WAYLAND_DISPLAY` or `$DISPLAY`) is required both to exercise
-    /// the contract meaningfully and to exit cleanly. Returns `false`
-    /// (after printing why) when the caller must skip.
-    fn display_session_available() -> bool {
-        if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
-            eprintln!(
-                "browser_row widget test: no display session \
-                 ($WAYLAND_DISPLAY/$DISPLAY unset); skipping. Re-run inside \
-                 a desktop session to exercise the contract."
-            );
-            return false;
-        }
-
-        if let Err(e) = gtk::init() {
-            eprintln!(
-                "browser_row widget test: GTK unavailable ({e}); skipping. \
-                 Re-run on a box with a display session (or under a Broadway \
-                 headless server) to exercise the contract."
-            );
-            return false;
-        }
-
-        true
-    }
 
     /// Drives the real factory setup signal on a standalone `GtkListItem`.
     /// (`ListItem:item` is read-only and set by the ListView, so the bind
@@ -1189,9 +1162,15 @@ mod tests {
     /// equivalent of an Orca row-announcement smoke test.
     #[test]
     fn browser_row_accessible_label_exposed_on_list_item_boundary() {
-        if !display_session_available() {
+        // Hold the process-wide GTK test session (display gate + single
+        // `gtk::init` + serialization lock) across every widget
+        // construction and assertion below; libtest runs each `#[test]`
+        // on its own worker thread, and GTK requires single-threaded use
+        // after initialization. See `ui::widget_test_session`.
+        let Some(_gtk_session) = crate::ui::widget_test_session::acquire("browser_row widget test")
+        else {
             return;
-        }
+        };
 
         let (list_item, row) = make_setup_list_item();
         assert_row_roles_presentational(&row);

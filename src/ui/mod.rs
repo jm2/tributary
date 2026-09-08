@@ -34,3 +34,78 @@ pub mod tracklist;
 pub mod win32_snap;
 pub mod window;
 pub mod window_state;
+
+// GTK must be initialized exactly once per process and used from a single
+// thread afterwards, but libtest runs each `#[test]` function on its own
+// worker thread. Two widget tests that both pass their display gate can
+// therefore reach `gtk::init()` concurrently — or on successive worker
+// threads — which panics or races GTK's single-threaded state on any
+// machine with a real display session. Headless CI never sees this because
+// `gtk::init` fails there and every test skips. Every widget test in this
+// crate funnels through [`widget_test_session::acquire`], which
+// serializes them behind one process-wide mutex held across `gtk::init()`
+// AND all widget construction/assertions, while keeping the display-gated
+// skip messages on machines without a display session.
+#[cfg(all(test, not(target_os = "macos")))]
+pub mod widget_test_session {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// The process-wide GTK test lock.
+    fn lock() -> &'static Mutex<()> {
+        static GTK_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        GTK_TEST_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Acquires the process-wide GTK test lock, then — still holding it —
+    /// applies the display-session gate and initializes GTK at most once
+    /// per process.
+    ///
+    /// Returns the guard that the caller MUST hold across every widget
+    /// construction and assertion in the test body (that is the whole
+    /// point of the lock: a second GTK-initializing test must not touch
+    /// GTK state while the first is mid-flight, on this or any other
+    /// worker thread). Returns `None` — releasing the lock — when the
+    /// caller must skip:
+    ///
+    /// - no display session (`$WAYLAND_DISPLAY`/`$DISPLAY` both unset):
+    ///   headless GTK can still come up via its Broadway fallback, and a
+    ///   test process that initialized GTK without a real display session
+    ///   segfaults in GTK teardown at exit (observed as SIGSEGV after all
+    ///   tests passed on headless Linux CI, run 33921896331), so the gate
+    ///   fires BEFORE any GTK call;
+    /// - GTK cannot initialize (no display server reachable): same skip
+    ///   path, with the reason printed.
+    ///
+    /// `label` names the calling test so the printed skip reason stays
+    /// attributable to the test that produced it.
+    pub fn acquire(label: &str) -> Option<MutexGuard<'static, ()>> {
+        // A panicked earlier test must not cascade into every later widget
+        // test: the data the guard protects is stateless (just ordering),
+        // so a poisoned lock is safe to carry on from.
+        let guard = lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
+            eprintln!(
+                "{label}: no display session ($WAYLAND_DISPLAY/$DISPLAY \
+                 unset); skipping. Re-run inside a desktop session to \
+                 exercise the contract."
+            );
+            return None;
+        }
+
+        if !gtk::is_initialized() {
+            if let Err(e) = gtk::init() {
+                eprintln!(
+                    "{label}: GTK unavailable ({e}); skipping. Re-run on a \
+                     box with a display session (or under a Broadway \
+                     headless server) to exercise the contract."
+                );
+                return None;
+            }
+        }
+
+        Some(guard)
+    }
+}
