@@ -47,6 +47,47 @@ assert_no_policy_manifests() {
   done
 }
 
+# Exercise the exact generated launcher with unset, empty, and inherited
+# library paths. Intercept exec in the same shell: macOS SIP can strip DYLD_*
+# when starting another system interpreter and otherwise hide this regression.
+LAUNCHER_CONTENTS="${TEST_ROOT}/Launcher With Spaces.app/Contents"
+mkdir -p "$LAUNCHER_CONTENTS/MacOS"
+LAUNCHER_CONTENTS="$(cd "$LAUNCHER_CONTENTS" && pwd)"
+LAUNCHER="$LAUNCHER_CONTENTS/MacOS/Tributary"
+awk '
+  /^cat > .*BIN_DEST.*<< / { copying = 1; next }
+  copying && /^EOF$/ { exit }
+  copying { print }
+' "${SCRIPT_DIR}/build-macos.sh" > "$LAUNCHER"
+[[ -s "$LAUNCHER" ]] || fail "could not extract the macOS launcher"
+
+assert_launcher_library_path() (
+  trap - EXIT
+  mode="$1"
+  inherited="$2"
+  expected="$LAUNCHER_CONTENTS/Frameworks"
+  if [[ "$mode" == unset ]]; then
+    unset DYLD_LIBRARY_PATH
+  else
+    export DYLD_LIBRARY_PATH="$inherited"
+    [[ -z "$inherited" ]] || expected="${expected}:${inherited}"
+  fi
+  exec() {
+    [[ "${DYLD_LIBRARY_PATH-}" == "$expected" ]] \
+      || fail "launcher lost bundled precedence or user library paths (${mode})"
+    [[ "$#" -eq 3 && "$1" == "${LAUNCHER}-bin" \
+       && "$2" == 'argument with spaces' && "$3" == '*.flac' ]] \
+      || fail "launcher changed executable selection or arguments"
+  }
+  source "$LAUNCHER" 'argument with spaces' '*.flac'
+)
+
+assert_launcher_library_path unset ''
+assert_launcher_library_path set ''
+assert_launcher_library_path set '/custom/lib'
+assert_launcher_library_path set '/custom/Library One:/custom/Library Two'
+assert_launcher_library_path set ':/custom/Library One::/custom/Library Two:'
+
 # The v0.6.2 bundle contained the Soup plugin without the library it opens
 # dynamically. A plugin-only inventory must fail even on a Homebrew host.
 AUDIO_PLUGINS="${TEST_ROOT}/Audio Runtime/plugins"

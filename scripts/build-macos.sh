@@ -190,12 +190,10 @@ BUNDLE_ROOT="$(dirname "$DIR")"
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 # The Rust entry point sets absolute GTK/GStreamer resource paths before either
-# toolkit initializes and preserves every explicit user override. DYLD must be
-# available before the binary starts, but an explicit value (including empty)
-# remains authoritative.
-if [[ -z "${DYLD_LIBRARY_PATH+x}" ]]; then
-  export DYLD_LIBRARY_PATH="$BUNDLE_ROOT/Frameworks"
-fi
+# toolkit initializes and preserves explicit toolkit overrides. Bundled dylibs
+# must take precedence before the binary starts, including bare-name dlopen
+# dependencies such as libsoup. Retain user search entries as fallbacks.
+export DYLD_LIBRARY_PATH="$BUNDLE_ROOT/Frameworks${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 
 # Launch the actual Rust binary
 exec "$DIR/Tributary-bin" "$@"
@@ -561,6 +559,9 @@ mkdir -p "$PROBE_PARENT"
 ditto "$APP_BUNDLE" "$PROBE_APP"
 chmod -R a-w "$PROBE_APP"
 
+# Set an inherited library path after the system shell starts: macOS SIP may
+# strip DYLD_* while launching /bin/bash and otherwise mask a launcher bug.
+# Sourcing the exact signed wrapper still execs the packaged binary normally.
 env -u GST_REGISTRY \
     -u GST_REGISTRY_1_0 \
     -u GDK_PIXBUF_MODULE_FILE \
@@ -576,6 +577,9 @@ env -u GST_REGISTRY \
     -u GSETTINGS_SCHEMA_DIR \
     -u GTK_PATH \
     -u DYLD_LIBRARY_PATH \
+    /bin/bash -c 'export DYLD_LIBRARY_PATH="$1"; shift; source "$@"' \
+    tributary-bundle-probe \
+    "$PROBE_CACHE/User Libraries One:$PROBE_CACHE/User Libraries Two" \
     "$PROBE_APP/Contents/MacOS/${APP_NAME}" \
     --tributary-platform-runtime-probe "$PROBE_CACHE"
 
