@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use crate::audio::airplay_output::AirPlayOutput;
 use crate::audio::chromecast_output::ChromecastOutput;
-use crate::audio::mpd_output::{control_plan, MpdOutput};
+use crate::audio::mpd_output::{control_plan, MpdControlMode, MpdOutput};
 use crate::audio::output::{AudioOutput, OutputType};
 use crate::audio::PlayerEvent;
 
@@ -259,6 +259,90 @@ fn apply_shared_output_selection(
     (OutputSelectionOutcome::Changed, external_source)
 }
 
+/// Whether same-target reselection of this target can ever need the
+/// lapsed-supervisor rebuild. Only `Mpd` targets confirmed for exclusive
+/// control with detection enabled produce a supervised plan; every other
+/// target — and an unsupervised MPD plan — never lapses, so their
+/// same-target reselection keeps the non-perturbing no-op path.
+fn supervision_rebuild_applies(target: &OutputTarget) -> bool {
+    match target {
+        OutputTarget::Mpd {
+            exclusive_control,
+            detection_enabled,
+            ..
+        } => {
+            let plan = control_plan(*exclusive_control, *detection_enabled);
+            plan.supervised && plan.mode == MpdControlMode::Exclusive
+        }
+        OutputTarget::Local | OutputTarget::AirPlay { .. } | OutputTarget::Chromecast { .. } => {
+            false
+        }
+    }
+}
+
+/// Commit a same-target rebuild of the active output — the documented
+/// recovery for a lapsed supervised MPD supervisor. The requested endpoint
+/// equals the active one by definition, so
+/// [`apply_shared_output_selection`]'s preflight (which deliberately
+/// rejects an unchanged target) cannot be used; this helper validates the
+/// activation against the CURRENT target instead and keeps the identical
+/// ordering guarantees: the playback-session proof is cleared before
+/// coordinator ingress, the predecessor is retired between proof revocation
+/// and the first output call, then stopped and replaced. The target itself
+/// is unchanged.
+fn commit_same_target_output_rebuild(
+    active_target: &Rc<RefCell<OutputTarget>>,
+    playback_session: &Rc<RefCell<PlaybackSession>>,
+    active_output: &Rc<RefCell<Box<dyn AudioOutput>>>,
+    activation: OutputActivation,
+    retire_predecessor: impl FnOnce(),
+) -> (
+    OutputSelectionOutcome,
+    Option<crate::architecture::SourceId>,
+) {
+    // Same target: the fresh activation must still typecheck against the
+    // CURRENT target, and the slot it replaces must be of the same type —
+    // otherwise the rebuild is unavailable and the old (refusing) output
+    // stays in place untouched.
+    let valid = {
+        let target = active_target.borrow();
+        let output = active_output.borrow();
+        match &activation {
+            OutputActivation::Remote(remote) => {
+                remote.output_type() == output_type_for_target(&target)
+                    && output.output_type() == output_type_for_target(&target)
+            }
+            OutputActivation::Local => false,
+        }
+    };
+    if !valid {
+        return (OutputSelectionOutcome::Unavailable, None);
+    }
+
+    // The fresh instance owns no playback session: clear the proof before
+    // the replacement so a stale queue cursor can never attach to it.
+    let external_source = {
+        let mut session = playback_session.borrow_mut();
+        let external_source = session.current_external_source_id();
+        session.clear();
+        external_source
+    };
+
+    // No guard crosses coordinator ingress — the old output remains
+    // untouched until the predecessor proof is gone.
+    retire_predecessor();
+
+    {
+        let mut output = active_output.borrow_mut();
+        output.stop();
+        if let OutputActivation::Remote(remote) = activation {
+            *output = remote;
+        }
+    }
+
+    (OutputSelectionOutcome::Changed, external_source)
+}
+
 /// Wire the output selector popover: switching between local, MPD,
 /// AirPlay, and Chromecast outputs.
 ///
@@ -299,13 +383,31 @@ pub fn setup_output_selector(
         };
 
         // Selecting the already-active endpoint must not stop or otherwise
-        // perturb playback.
-        if !output_change_required(&active_target.borrow(), &requested_target) {
+        // perturb playback — with one documented exception: when the active
+        // output is a supervised MPD instance whose supervisor has LAPSED,
+        // re-selecting the row is the user's recovery gesture. The fresh
+        // construction below is the only path that re-arms the supervisor
+        // (construction time IS the explicit reconfirmation), so the
+        // reselection must fall through to the rebuild instead of being
+        // swallowed as a no-op. A healthy supervisor keeps the
+        // non-perturbing behavior, and targets that cannot carry a
+        // supervisor never take the rebuild path.
+        let same_target = !output_change_required(&active_target.borrow(), &requested_target);
+        let rebuild_lapsed_supervision = same_target
+            && supervision_rebuild_applies(&requested_target)
+            && active_output.borrow().supervision_lapsed();
+        if same_target && !rebuild_lapsed_supervision {
             update_checkmarks(list_box, idx);
             if let Some(popover) = output_button.popover() {
                 popover.popdown();
             }
             return;
+        }
+        if rebuild_lapsed_supervision {
+            info!(
+                ?requested_target,
+                "Rebuilding lapsed supervised MPD output on reselection"
+            );
         }
 
         // Output changes deliberately clear rather than implicitly transfer a
@@ -366,19 +468,38 @@ pub fn setup_output_selector(
             }
         };
 
-        let (outcome, external_source) = apply_shared_output_selection(
-            &active_target,
-            requested_target,
-            &playback_session,
-            &active_output,
-            &parked_local,
-            activation,
-            || {
-                let _ = lastfm_playback.retire(
-                    crate::lastfm::playback_coordinator::LastFmPlaybackRetirement::OutputReplacement,
-                );
-            },
-        );
+        let (outcome, external_source) = if rebuild_lapsed_supervision {
+            // Same-target rebuild: apply_shared_output_selection would
+            // preflight-reject an unchanged target, so the lapsed instance
+            // goes through the dedicated same-target commit with the
+            // identical session-proof → coordinator-retire → stop/replace
+            // ordering.
+            commit_same_target_output_rebuild(
+                &active_target,
+                &playback_session,
+                &active_output,
+                activation,
+                || {
+                    let _ = lastfm_playback.retire(
+                        crate::lastfm::playback_coordinator::LastFmPlaybackRetirement::OutputReplacement,
+                    );
+                },
+            )
+        } else {
+            apply_shared_output_selection(
+                &active_target,
+                requested_target,
+                &playback_session,
+                &active_output,
+                &parked_local,
+                activation,
+                || {
+                    let _ = lastfm_playback.retire(
+                        crate::lastfm::playback_coordinator::LastFmPlaybackRetirement::OutputReplacement,
+                    );
+                },
+            )
+        };
         if outcome != OutputSelectionOutcome::Changed {
             warn!(?outcome, "Output selection could not be committed");
             return;
@@ -550,6 +671,7 @@ mod tests {
         state: Rc<RefCell<FakeOutputState>>,
         order: Option<Rc<RefCell<Vec<&'static str>>>>,
         reject_loads: Cell<usize>,
+        lapsed: Cell<bool>,
         volume: f64,
     }
 
@@ -568,6 +690,26 @@ mod tests {
             reject_loads: usize,
             order: Option<Rc<RefCell<Vec<&'static str>>>>,
         ) -> (Box<dyn AudioOutput>, Rc<RefCell<FakeOutputState>>) {
+            Self::build(name, output_type, reject_loads, order, false)
+        }
+
+        /// A supervised MPD fake whose supervisor has lapsed.
+        fn boxed_lapsed_with_order(
+            name: &str,
+            output_type: OutputType,
+            reject_loads: usize,
+            order: Option<Rc<RefCell<Vec<&'static str>>>>,
+        ) -> (Box<dyn AudioOutput>, Rc<RefCell<FakeOutputState>>) {
+            Self::build(name, output_type, reject_loads, order, true)
+        }
+
+        fn build(
+            name: &str,
+            output_type: OutputType,
+            reject_loads: usize,
+            order: Option<Rc<RefCell<Vec<&'static str>>>>,
+            lapsed: bool,
+        ) -> (Box<dyn AudioOutput>, Rc<RefCell<FakeOutputState>>) {
             let state = Rc::new(RefCell::new(FakeOutputState::default()));
             (
                 Box::new(Self {
@@ -576,6 +718,7 @@ mod tests {
                     state: Rc::clone(&state),
                     order,
                     reject_loads: Cell::new(reject_loads),
+                    lapsed: Cell::new(lapsed),
                     volume: 0.5,
                 }),
                 state,
@@ -599,6 +742,10 @@ mod tests {
 
         fn output_type(&self) -> OutputType {
             self.output_type
+        }
+
+        fn supervision_lapsed(&self) -> bool {
+            self.lapsed.get()
         }
 
         fn supports_volume(&self) -> bool {
@@ -801,6 +948,136 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn supervision_rebuild_only_applies_to_supervised_exclusive_mpd_targets() {
+        let confirmed_detected = OutputTarget::Mpd {
+            host: "music.local".to_string(),
+            port: 6600,
+            exclusive_control: true,
+            detection_enabled: true,
+        };
+        assert!(supervision_rebuild_applies(&confirmed_detected));
+
+        // Confirmed but unsupervised: the user's confirmation alone governs,
+        // nothing can lapse, so same-target reselection stays a no-op.
+        let confirmed_undetected = OutputTarget::Mpd {
+            host: "music.local".to_string(),
+            port: 6600,
+            exclusive_control: true,
+            detection_enabled: false,
+        };
+        assert!(!supervision_rebuild_applies(&confirmed_undetected));
+
+        // Detection without confirmation is fail-closed: no supervisor.
+        let unconfirmed = OutputTarget::Mpd {
+            host: "music.local".to_string(),
+            port: 6600,
+            exclusive_control: false,
+            detection_enabled: true,
+        };
+        assert!(!supervision_rebuild_applies(&unconfirmed));
+        assert!(!supervision_rebuild_applies(&OutputTarget::Local));
+        assert!(!supervision_rebuild_applies(&OutputTarget::AirPlay {
+            host: "music.local".to_string(),
+            port: 7000,
+        }));
+        assert!(!supervision_rebuild_applies(&OutputTarget::Chromecast {
+            address: "192.168.0.20:8009".parse().unwrap(),
+        }));
+    }
+
+    #[test]
+    fn same_target_rebuild_clears_the_session_then_stops_and_replaces_the_lapsed_output() {
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let (lapsed, lapsed_state) = FakeOutput::boxed_lapsed_with_order(
+            "mpd-lapsed",
+            OutputType::Mpd,
+            0,
+            Some(order.clone()),
+        );
+        let (fresh, _) = FakeOutput::boxed("mpd-fresh", OutputType::Mpd, 0);
+        let active_output = Rc::new(RefCell::new(lapsed));
+        let active_target = Rc::new(RefCell::new(OutputTarget::Mpd {
+            host: "music.local".to_string(),
+            port: 6600,
+            exclusive_control: true,
+            detection_enabled: true,
+        }));
+        let playback_session = Rc::new(RefCell::new(PlaybackSession::default()));
+        assert!(playback_session.borrow_mut().replace_queue(
+            vec![super::super::playback::QueueItem::direct_for_test(
+                "file:///tmp/owned.flac".to_string(),
+                "Owned".to_string(),
+                "Artist".to_string(),
+                "Album".to_string(),
+            )],
+            0,
+        ));
+        assert!(playback_session.borrow().has_current());
+        let callbacks = Cell::new(0);
+
+        let (outcome, external_source) = commit_same_target_output_rebuild(
+            &active_target,
+            &playback_session,
+            &active_output,
+            OutputActivation::Remote(fresh),
+            || {
+                order.borrow_mut().push("coordinator-retire");
+                assert!(playback_session.try_borrow_mut().is_ok());
+                assert!(active_output.try_borrow_mut().is_ok());
+                assert!(!playback_session.borrow().has_current());
+                callbacks.set(callbacks.get() + 1);
+            },
+        );
+        assert_eq!(outcome, OutputSelectionOutcome::Changed);
+        assert_eq!(external_source, None);
+        assert_eq!(callbacks.get(), 1);
+        // The stale (lapsed) instance is stopped and dropped; the fresh one
+        // takes the slot; the target is unchanged by definition.
+        assert_eq!(lapsed_state.borrow().stops, 1);
+        assert_eq!(
+            *order.borrow(),
+            ["coordinator-retire", "output-stop", "output-drop"]
+        );
+        assert_eq!(active_output.borrow().name(), "mpd-fresh");
+        assert!(matches!(*active_target.borrow(), OutputTarget::Mpd { .. }));
+    }
+
+    #[test]
+    fn same_target_rebuild_is_unavailable_on_activation_type_mismatch() {
+        let (local_active, local_state) = FakeOutput::boxed("local", OutputType::Local, 0);
+        let (remote_activation, _) = FakeOutput::boxed("mpd", OutputType::Mpd, 0);
+        let active_output = Rc::new(RefCell::new(local_active));
+        let active_target = Rc::new(RefCell::new(OutputTarget::Local));
+        let playback_session = Rc::new(RefCell::new(PlaybackSession::default()));
+        assert!(playback_session.borrow_mut().replace_queue(
+            vec![super::super::playback::QueueItem::direct_for_test(
+                "file:///tmp/owned.flac".to_string(),
+                "Owned".to_string(),
+                "Artist".to_string(),
+                "Album".to_string(),
+            )],
+            0,
+        ));
+
+        let (outcome, external_source) = commit_same_target_output_rebuild(
+            &active_target,
+            &playback_session,
+            &active_output,
+            OutputActivation::Remote(remote_activation),
+            || {
+                panic!("coordinator ingress must stay silent on an invalid rebuild");
+            },
+        );
+        assert_eq!(outcome, OutputSelectionOutcome::Unavailable);
+        assert_eq!(external_source, None);
+        // The active output is untouched: not stopped, not replaced, and the
+        // session proof survives.
+        assert_eq!(local_state.borrow().stops, 0);
+        assert!(playback_session.borrow().has_current());
+        assert_eq!(active_output.borrow().name(), "local");
     }
 
     #[test]

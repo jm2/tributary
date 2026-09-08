@@ -60,6 +60,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Supervised MPD control TOCTOU** (`src/audio/mpd_output.rs`) — A playback
+  control (play/pause/toggle/seek) whose own pre-control `status` observed
+  partition-option drift or a foreign current song lapsed the supervisor yet was
+  still issued. Authority is now rechecked immediately after the authoritative
+  status is applied and before the control goes to the wire; a just-lapsed
+  supervisor receives the exclusive-control-required error and no command, the
+  same refusal shape as the worker gate.
+- **Supervised MPD cleanup rechecks authority on fresh evidence**
+  (`src/audio/mpd_output.rs`) — The shutdown-time `status` in
+  `cleanup_unconditionally` (and the `status` fetched by the Stop command's
+  `StopOwned` cleanup in `cleanup_session`) is now applied to the supervisor
+  before any mutation decision, and authority is rechecked before the teardown
+  `stop` and again before the targeted `delete`. A supervisor that is fresh at
+  the initial gate but whose own teardown observation (option drift, foreign
+  song, or the round-trip time past the 2 s window) supplies disqualifying
+  evidence now retains the orphan and issues neither command.
+- **Lapsed supervised MPD outputs rebuild on same-target reselection**
+  (`src/audio/output.rs`, `src/audio/mpd_output.rs`, `src/ui/output_switch.rs`)
+  — After supervision lapsed, the documented recovery — re-select the output —
+  never reached the constructor, because clicking the already-active row was
+  swallowed as a non-perturbing no-op and every later command stayed refused.
+  The selector now detects a lapsed supervisor on the active MPD row and routes
+  the reselection through a dedicated same-target rebuild that keeps the
+  committed-switch ordering (session proof cleared before coordinator ingress,
+  predecessor retired, stopped, replaced) while re-arming authority via the
+  fresh construction. Healthy supervisors and non-MPD targets keep the old
+  no-op behavior.
+
 - **macOS local playback** — Bundle the dynamically loaded libsoup runtime and its
   dependencies so protected streams can use the required HTTP source on Macs without
   Homebrew. The signed package probe now verifies direct HTTP routing, audio decoding,
