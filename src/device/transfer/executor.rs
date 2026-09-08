@@ -289,13 +289,7 @@ impl TransferExecutor {
         stage_index: u32,
         context: &mut RunContext<'_>,
     ) -> Result<Option<CommitOutcome>, TransferError> {
-        self.request
-            .source
-            .validate()
-            .map_err(|error| TransferError::authority(format!("source not current: {error}")))?;
-        self.request.destination.validate().map_err(|error| {
-            TransferError::authority(format!("destination not current: {error}"))
-        })?;
+        self.validate_endpoints()?;
         let result = self
             .request
             .source
@@ -327,6 +321,30 @@ impl TransferExecutor {
                     }
                 }
             });
+        Self::translate_source_handle_error(result)
+    }
+
+    /// Verify that both transfer endpoints are still the authorities the
+    /// request was planned against; a stale endpoint fails the stage
+    /// fail-closed before any namespace access.
+    fn validate_endpoints(&self) -> Result<(), TransferError> {
+        self.request
+            .source
+            .validate()
+            .map_err(|error| TransferError::authority(format!("source not current: {error}")))?;
+        self.request
+            .destination
+            .validate()
+            .map_err(|error| TransferError::authority(format!("destination not current: {error}")))
+    }
+
+    /// Flatten the source-handle closure outcome: the closure speaks in
+    /// `TransferError` terms already, while a closure-level I/O error means
+    /// the copy source itself failed — except `Interrupted`, which is the
+    /// cooperative cancellation signal.
+    fn translate_source_handle_error(
+        result: io::Result<Result<Option<CommitOutcome>, TransferError>>,
+    ) -> Result<Option<CommitOutcome>, TransferError> {
         match result {
             // The closure ran; its outcome speaks in TransferError terms.
             Ok(committed) => committed,
