@@ -442,6 +442,28 @@ impl CancellationSwitch {
     }
 }
 
+/// A cancellable switch paired with its observer, for in-process regressions
+/// that must flip cancellation from a synchronous callback mid-operation
+/// (for example from a transfer progress hook).
+#[cfg(test)]
+pub struct CancellationTrigger {
+    switch: CancellationSwitch,
+}
+
+#[cfg(test)]
+impl CancellationTrigger {
+    /// Pair a fresh trigger with its observer.
+    pub fn new() -> (Self, CancellationObserver) {
+        let (switch, observer) = CancellationSwitch::pair();
+        (Self { switch }, observer)
+    }
+
+    /// Cancel the paired observer.
+    pub fn cancel(&self) {
+        self.switch.cancel();
+    }
+}
+
 /// Wakeable cancellation observation safe when cancellation precedes waiting.
 #[derive(Clone)]
 pub struct CancellationObserver {

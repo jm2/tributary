@@ -205,3 +205,120 @@ fn remove_relative_file_only_accepts_regular_files() {
         .expect_err("directory must be rejected");
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 }
+
+// ── No-replace publish and backup restore ───────────────────────────────
+
+#[test]
+fn fresh_publish_refuses_post_plan_destination() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let authority = authority(&root);
+
+    // The destination is absent at staging, so Preserve resolves fresh.
+    let mut staged = authority
+        .prepare_write_relative_file(Path::new("song.flac"), ConflictPolicy::Preserve)
+        .expect("prepare fresh");
+    assert_eq!(staged.resolution(), ConflictResolution::Fresh);
+    staged.write_all(b"planned").expect("write staged");
+    // The destination appears after the resolution was made.
+    std::fs::write(root.path().join("song.flac"), b"racer").expect("write racer");
+
+    let error = staged
+        .commit()
+        .expect_err("no-replace publish must refuse an existing destination");
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        std::fs::read(root.path().join("song.flac")).expect("read racer"),
+        b"racer",
+        "the fresh publish must never replace the destination"
+    );
+    let names: Vec<String> = std::fs::read_dir(root.path())
+        .expect("read dir")
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["song.flac".to_string()],
+        "the refused staged file must be discarded"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_destination_is_never_replaced_through() {
+    let root = tempfile::tempdir().expect("temporary root");
+    std::os::unix::fs::symlink("missing-target.flac", root.path().join("song.flac"))
+        .expect("create dangling symlink");
+    let authority = authority(&root);
+
+    let mut staged = authority
+        .prepare_write_relative_file(Path::new("song.flac"), ConflictPolicy::Preserve)
+        .expect("prepare fresh");
+    staged.write_all(b"payload").expect("write staged");
+    let error = staged
+        .commit()
+        .expect_err("no-replace publish must refuse the symlink entry");
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    let metadata = std::fs::symlink_metadata(root.path().join("song.flac"))
+        .expect("destination still present");
+    assert!(
+        metadata.file_type().is_symlink(),
+        "the symlink must be left exactly as found, not replaced through"
+    );
+}
+
+#[test]
+fn overwrite_onto_directory_destination_is_refused() {
+    let root = tempfile::tempdir().expect("temporary root");
+    std::fs::create_dir(root.path().join("album")).expect("create directory destination");
+    let authority = authority(&root);
+
+    let mut staged = authority
+        .prepare_write_relative_file(Path::new("album"), ConflictPolicy::Overwrite)
+        .expect("prepare overwrite onto directory");
+    staged.write_all(b"payload").expect("write staged");
+    let error = staged
+        .commit()
+        .expect_err("a directory destination must not be overwritten by a file");
+    let _ = error;
+    assert!(
+        root.path().join("album").is_dir(),
+        "the directory must survive the refused overwrite"
+    );
+}
+
+#[test]
+fn restore_relative_file_puts_backup_back_and_consumes_it() {
+    let root = tempfile::tempdir().expect("temporary root");
+    std::fs::write(root.path().join("song.flac"), b"published bytes")
+        .expect("write published file");
+    let backup = root.path().join(".tributary-backup-test.tmp");
+    std::fs::write(&backup, b"original bytes").expect("write backup");
+    let authority = authority(&root);
+
+    authority
+        .restore_relative_file(
+            Path::new(".tributary-backup-test.tmp"),
+            Path::new("song.flac"),
+        )
+        .expect("restore overwritten original");
+    assert_eq!(
+        std::fs::read(root.path().join("song.flac")).expect("read restored"),
+        b"original bytes"
+    );
+    assert!(!backup.exists(), "restore consumes the backup");
+}
+
+#[test]
+fn restore_requires_sibling_backup() {
+    let root = tempfile::tempdir().expect("temporary root");
+    std::fs::create_dir_all(root.path().join("a")).expect("create a");
+    std::fs::create_dir_all(root.path().join("other")).expect("create other");
+    std::fs::write(root.path().join("other/backup.tmp"), b"backup").expect("write backup");
+    let authority = authority(&root);
+
+    let error = authority
+        .restore_relative_file(Path::new("other/backup.tmp"), Path::new("a/song.flac"))
+        .expect_err("a non-sibling backup must be rejected");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+}

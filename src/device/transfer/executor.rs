@@ -1,16 +1,56 @@
 //! The transfer executor.
 //!
 //! Holds the authorities and the plan; runs the stages in order; rolls back
-//! committed stages on failure or cancellation.
+//! committed stages on failure or cancellation. Rollback is outcome-driven:
+//! the executor records what each stage *actually* published at the
+//! destination (the planned path, a preserved sibling, or a replacement
+//! backed by a saved original) and reverses exactly those owned changes.
 
+use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+
+use uuid::Uuid;
 
 use super::types::{
     Stage, TransferError, TransferPlan, TransferProgress, TransferRequest, TransferSummary,
 };
-use crate::local::write_authority::PreparedWriteTarget;
+use crate::local::write_authority::{
+    CommitOutcome, ConflictPolicy, ConflictResolution, PreparedWriteTarget,
+};
 use crate::source_lifecycle::CancellationObserver;
+
+/// One destination mutation the executor owns and must undo on rollback.
+///
+/// Rollback reverses what was actually published, never what the plan
+/// predicted. A Preserve conflict publishes to a renamed sibling — removing
+/// the planned path would destroy the pre-existing original — and an
+/// Overwrite commit replaces an original that only a saved copy can restore.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OwnedChange {
+    /// A file the executor published at this path; rollback removes exactly
+    /// this path. Fresh publishes and preserved siblings both land here.
+    PublishedFile { relative_path: PathBuf },
+    /// A pre-existing file the executor replaced; its bytes were saved at
+    /// `backup_relative_path` before the replace. Rollback republishes the
+    /// backup over `relative_path` and consumes the backup.
+    ReplacedFile {
+        relative_path: PathBuf,
+        backup_relative_path: PathBuf,
+    },
+    /// A directory the executor created; it must be empty once every file
+    /// inside it has been rolled back. Recorded only when the directory was
+    /// provably absent immediately before creation.
+    CreatedDirectory { relative_path: PathBuf },
+}
+
+/// What one committed copy stage produced at the destination.
+struct CommittedCopy {
+    outcome: CommitOutcome,
+    /// Restorable original of a replaced destination, when the commit
+    /// overwrote a pre-existing file.
+    backup: Option<PathBuf>,
+}
 
 /// The transfer executor. Holds the authorities and the plan; runs the
 /// stages in order; rolls back on failure or cancellation.
@@ -21,14 +61,14 @@ pub struct TransferExecutor {
 
 /// Mutable state shared by every stage runner of one [`TransferExecutor`]
 /// run: the progress sink, the cancellation observer, the running byte
-/// count, and the committed files eligible for rollback.
+/// count, and the owned destination changes eligible for rollback.
 struct RunContext<'a> {
     progress: &'a mut dyn TransferProgress,
     cancellation: &'a CancellationObserver,
     bytes_so_far: u64,
     total_bytes: u64,
     total_stages: u32,
-    committed_files: Vec<PathBuf>,
+    committed: Vec<OwnedChange>,
 }
 
 impl TransferExecutor {
@@ -38,8 +78,14 @@ impl TransferExecutor {
     }
 
     /// Run the plan to completion, reporting progress through `progress`,
-    /// observing `cancellation` between stages, and rolling back committed
-    /// stages on any error.
+    /// observing `cancellation` between stages and between copy chunks, and
+    /// rolling back every committed stage on any error or cancellation.
+    ///
+    /// Every unsuccessful exit — a failed stage, a mid-copy cancellation, a
+    /// lost authority — is routed through the checked rollback before the
+    /// error is surfaced. When the rollback itself fails, its error is
+    /// reported instead of the original cause: a destination left dirty is
+    /// the more severe condition and must not be masked.
     pub fn run(
         self,
         progress: &mut dyn TransferProgress,
@@ -51,19 +97,43 @@ impl TransferExecutor {
             bytes_so_far: 0,
             total_bytes: self.plan.total_bytes(),
             total_stages: self.plan.stage_count(),
-            committed_files: Vec::new(),
+            committed: Vec::new(),
         };
         let mut committed_stages: u32 = 0;
+        match self.execute_plan(&mut context, &mut committed_stages) {
+            Ok(()) => Ok(TransferSummary {
+                committed_stages,
+                bytes_copied: context.bytes_so_far,
+                completed: true,
+            }),
+            Err(error) => {
+                self.rollback(&mut context)?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Run every planned stage in order. Errors and cancellations return
+    /// directly; the caller owns rollback.
+    fn execute_plan(
+        &self,
+        context: &mut RunContext<'_>,
+        committed_stages: &mut u32,
+    ) -> Result<(), TransferError> {
         for (index, stage) in self.plan.stages().iter().enumerate() {
             if context.cancellation.is_cancelled() {
-                self.rollback(&mut context)?;
                 return Err(TransferError::Cancelled);
             }
             context
                 .progress
                 .on_stage_started(stage, index as u32, context.total_stages);
-            self.run_stage(stage, index as u32, &mut context)?;
-            committed_stages = committed_stages.saturating_add(1);
+            let committed = self.run_stage(stage, index as u32, context)?;
+            // A stage that was distinctly skipped (a destination that
+            // appeared after planning under a Skip policy) finished without
+            // committing anything and must not inflate the count.
+            if committed {
+                *committed_stages = committed_stages.saturating_add(1);
+            }
             context.progress.on_stage_completed(
                 stage,
                 index as u32,
@@ -72,53 +142,93 @@ impl TransferExecutor {
                 context.total_bytes,
             );
         }
-        Ok(TransferSummary {
-            committed_stages,
-            bytes_copied: context.bytes_so_far,
-            completed: true,
-        })
+        Ok(())
     }
 
-    /// Execute one stage, recording committed file copies for rollback.
+    /// Execute one stage, recording the stage's actual owned destination
+    /// changes for rollback. Returns whether the stage committed a change;
+    /// a distinctly skipped stage reports `false`.
     fn run_stage(
         &self,
         stage: &Stage,
         index: u32,
         context: &mut RunContext<'_>,
-    ) -> Result<(), TransferError> {
+    ) -> Result<bool, TransferError> {
         match stage {
             Stage::CreateDirectory {
                 destination_relative_path,
-            } => self.execute_create_directory(destination_relative_path),
+            } => self
+                .execute_create_directory(destination_relative_path, context)
+                .map(|()| true),
             Stage::CopyFile {
                 source_relative_path,
                 destination_relative_path,
                 bytes,
+                conflict,
                 ..
             } => {
-                self.execute_copy_file(
+                let committed = self.execute_copy_file(
                     source_relative_path,
                     destination_relative_path,
                     *bytes,
+                    *conflict,
                     index,
                     context,
                 )?;
-                context
-                    .committed_files
-                    .push(destination_relative_path.clone());
-                Ok(())
+                let Some(committed) = committed else {
+                    // A destination that appeared between planning and
+                    // execution under a Skip policy is skipped, distinctly:
+                    // nothing was published and nothing is owned.
+                    return Ok(false);
+                };
+                context.committed.push(match committed.outcome.resolution {
+                    ConflictResolution::Overwrite => match committed.backup {
+                        Some(backup_relative_path) => OwnedChange::ReplacedFile {
+                            relative_path: committed.outcome.relative_path,
+                            backup_relative_path,
+                        },
+                        // The overwrite published where nothing pre-existed;
+                        // rollback removes the published file outright.
+                        None => OwnedChange::PublishedFile {
+                            relative_path: committed.outcome.relative_path,
+                        },
+                    },
+                    ConflictResolution::Fresh | ConflictResolution::Preserved => {
+                        OwnedChange::PublishedFile {
+                            relative_path: committed.outcome.relative_path,
+                        }
+                    }
+                });
+                Ok(true)
             }
             Stage::RemoveFile { .. } => {
                 // RemoveFile stages are inserted only by the rollback path
                 // and never appear in a forward plan. Skip defensively.
-                Ok(())
+                Ok(false)
             }
         }
     }
 
     /// Create one destination directory. Idempotent: an existing directory
-    /// with the same identity is not an error.
-    fn execute_create_directory(&self, relative: &Path) -> Result<(), TransferError> {
+    /// with the same identity is not an error. When the directory was
+    /// provably absent immediately before creation, the new directory is
+    /// recorded for rollback.
+    fn execute_create_directory(
+        &self,
+        relative: &Path,
+        context: &mut RunContext<'_>,
+    ) -> Result<(), TransferError> {
+        let final_path = self.request.destination.root().join(relative);
+        let absent = match std::fs::symlink_metadata(&final_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+            Err(error) => {
+                return Err(TransferError::io(
+                    "failed to inspect destination directory",
+                    error,
+                ));
+            }
+            Ok(_) => false,
+        };
         self.request.destination.validate().map_err(|error| {
             TransferError::authority(format!("destination not current: {error}"))
         })?;
@@ -127,9 +237,15 @@ impl TransferExecutor {
             .destination
             .create_relative_directory(relative, self.request.conflict_policy)
         {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if absent {
+                    context.committed.push(OwnedChange::CreatedDirectory {
+                        relative_path: relative.to_path_buf(),
+                    });
+                }
+                Ok(())
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let final_path = self.request.destination.root().join(relative);
                 match std::fs::symlink_metadata(&final_path) {
                     Ok(metadata) if metadata.is_dir() => Ok(()),
                     _ => Err(TransferError::io(
@@ -144,14 +260,20 @@ impl TransferExecutor {
 
     /// Validate both authorities, then copy one source file into a staged
     /// destination file and commit it atomically.
+    ///
+    /// Returns `Ok(None)` when the stage is distinctly skipped: the
+    /// destination was absent at planning but appeared since, under a Skip
+    /// policy. A Fail policy surfaces the post-plan collision as a typed
+    /// rejection instead.
     fn execute_copy_file(
         &self,
         source_relative: &Path,
         destination_relative: &Path,
         declared_bytes: u64,
+        planned_conflict: ConflictResolution,
         stage_index: u32,
         context: &mut RunContext<'_>,
-    ) -> Result<(), TransferError> {
+    ) -> Result<Option<CommittedCopy>, TransferError> {
         self.request
             .source
             .validate()
@@ -163,16 +285,18 @@ impl TransferExecutor {
             .request
             .source
             .with_relative_file(source_relative, |mut source_file| {
-                self.stage_and_commit_file(
+                Ok(self.stage_and_commit_file(
                     destination_relative,
                     declared_bytes,
+                    planned_conflict,
                     stage_index,
                     context,
                     &mut source_file,
-                )
+                ))
             });
         match result {
-            Ok(()) => Ok(()),
+            // The closure ran; its outcome speaks in TransferError terms.
+            Ok(committed) => committed,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                 Err(TransferError::Cancelled)
             }
@@ -180,64 +304,217 @@ impl TransferExecutor {
         }
     }
 
-    /// Stage one destination file, stream the source into it, and commit.
+    /// Stage one destination file, stream the source into it, save a
+    /// restorable original when the commit will replace an existing file,
+    /// and commit.
+    ///
     /// A cancelled or short copy rolls the staged file back; a flush or
-    /// commit failure is cleaned up by the staged target's `Drop`.
+    /// commit failure is cleaned up by the staged target's `Drop`. The
+    /// returned backup path is set only when an Overwrite commit actually
+    /// replaced a pre-existing original and must be recorded as owned by
+    /// the caller: rollback restores it over the destination.
     fn stage_and_commit_file(
         &self,
         destination_relative: &Path,
         declared_bytes: u64,
+        planned_conflict: ConflictResolution,
         stage_index: u32,
         context: &mut RunContext<'_>,
         source_file: &mut dyn Read,
-    ) -> io::Result<()> {
-        let staged = self
+    ) -> Result<Option<CommittedCopy>, TransferError> {
+        let staged = match self
             .request
             .destination
             .prepare_write_relative_file(destination_relative, self.request.conflict_policy)
-            .map_err(|error| TransferError::io("failed to stage destination file", error))
-            .map_err(io::Error::other)?;
+        {
+            Ok(staged) => staged,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                // The destination existed at staging but not at planning.
+                // Skip and Fail are represented distinctly; Preserve and
+                // Overwrite re-resolve naturally inside prepare.
+                match (self.request.conflict_policy, planned_conflict) {
+                    (ConflictPolicy::Skip, ConflictResolution::Fresh) => return Ok(None),
+                    (ConflictPolicy::Fail, ConflictResolution::Fresh) => {
+                        return Err(TransferError::ConflictRejected {
+                            path: destination_relative.to_path_buf(),
+                        });
+                    }
+                    _ => {
+                        return Err(TransferError::io("failed to stage destination file", error));
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(TransferError::io("failed to stage destination file", error));
+            }
+        };
         let copied = match copy_in_chunks(source_file, &staged, stage_index, context) {
             Ok(copied) => copied,
             Err(error) => {
                 let _ = staged.rollback();
-                return Err(error);
+                return Err(transfer_io("failed to copy source file", error));
             }
         };
         staged
             .staged_file()
             .flush()
-            .map_err(|error| TransferError::io("failed to flush staged file", error))
-            .map_err(io::Error::other)?;
+            .map_err(|error| TransferError::io("failed to flush staged file", error))?;
         if declared_bytes != 0 && copied != declared_bytes {
             let _ = staged.rollback();
-            return Err(io::Error::other(format!(
-                "source size {copied} differs from declared {declared_bytes} bytes"
-            )));
+            return Err(TransferError::io(
+                "source size differs from declared size",
+                io::Error::other(format!(
+                    "source size {copied} differs from declared {declared_bytes} bytes"
+                )),
+            ));
         }
-        staged
-            .commit()
-            .map_err(|error| TransferError::io("staged commit failed", error))
-            .map_err(io::Error::other)?;
-        Ok(())
+        // An Overwrite commit replaces a pre-existing original. Save the
+        // original through the retained authority first so a later rollback
+        // can put it back; the original stays in place until the replace
+        // publish, so a mid-copy cancellation never disturbs it. A absent
+        // destination has nothing to save — the commit publishes fresh and
+        // rollback removes the published file outright.
+        let backup = if staged.resolution() == ConflictResolution::Overwrite {
+            match self.save_original_backup(destination_relative, context) {
+                Ok(backup) => backup,
+                Err(error) => {
+                    let _ = staged.rollback();
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        match staged.commit() {
+            Ok(outcome) => Ok(Some(CommittedCopy { outcome, backup })),
+            Err(error) => {
+                // The publish failed, so the backup was never needed.
+                // Remove it so the destination parent is not polluted with
+                // a hidden copy of the original.
+                if let Some(backup) = &backup {
+                    let _ = self.request.destination.remove_relative_file(backup);
+                }
+                Err(TransferError::CommitFailed {
+                    context: error.to_string(),
+                })
+            }
+        }
     }
 
-    /// Remove committed files in reverse commit order, revalidating the
-    /// destination authority before each removal.
+    /// Copy the current bytes of the destination file into a hidden backup
+    /// sibling through the retained authority. Returns the backup's
+    /// relative path, or `None` when the destination did not exist (an
+    /// overwrite onto an absent name has no original to restore).
+    fn save_original_backup(
+        &self,
+        destination_relative: &Path,
+        context: &RunContext<'_>,
+    ) -> Result<Option<PathBuf>, TransferError> {
+        let backup_relative = backup_sibling_path(destination_relative);
+        let backup = self
+            .request
+            .destination
+            .prepare_write_relative_file(&backup_relative, ConflictPolicy::Fail)
+            .map_err(|error| TransferError::io("failed to stage original backup file", error))?;
+        let saved = self.request.destination.mount().with_relative_file(
+            destination_relative,
+            |mut original| {
+                copy_in_chunks_quiet(&mut original, backup.staged_file(), context.cancellation)?;
+                backup.staged_file().flush()
+            },
+        );
+        if let Err(error) = saved {
+            let _ = backup.rollback();
+            if error.kind() == io::ErrorKind::NotFound {
+                // No pre-existing original: the overwrite will publish
+                // fresh and owns only what it publishes.
+                return Ok(None);
+            }
+            return Err(transfer_io("failed to save original backup", error));
+        }
+        let outcome = match backup.commit() {
+            Ok(outcome) => outcome,
+            // `commit` consumed the target; its own Drop already discarded
+            // any uncommitted staged bytes, so only the error is left.
+            Err(error) => {
+                return Err(TransferError::io("failed to commit original backup", error));
+            }
+        };
+        Ok(Some(outcome.relative_path))
+    }
+
+    /// Reverse every owned change in reverse commit order, revalidating the
+    /// destination authority before each reversal.
+    ///
+    /// Published files are removed exactly where they were published — a
+    /// preserved sibling is removed by its own name, never by the planned
+    /// destination. Replaced files are restored from their saved backups.
+    /// Created directories are removed deepest-first after their files are
+    /// gone; an unexpected residue fails the rollback rather than deleting
+    /// data the executor does not own.
     fn rollback(&self, context: &mut RunContext<'_>) -> Result<(), TransferError> {
-        while let Some(relative) = context.committed_files.pop() {
+        while let Some(change) = context.committed.pop() {
             self.request.destination.validate().map_err(|error| {
                 TransferError::authority(format!("destination not current: {error}"))
             })?;
-            self.request
-                .destination
-                .remove_relative_file(&relative)
-                .map_err(|error| TransferError::RollbackFailed {
-                    path: relative,
-                    context: error.to_string(),
-                })?;
+            match change {
+                OwnedChange::PublishedFile { relative_path } => {
+                    self.request
+                        .destination
+                        .remove_relative_file(&relative_path)
+                        .map_err(|error| TransferError::RollbackFailed {
+                            path: relative_path,
+                            context: error.to_string(),
+                        })?;
+                }
+                OwnedChange::ReplacedFile {
+                    relative_path,
+                    backup_relative_path,
+                } => {
+                    self.request
+                        .destination
+                        .restore_relative_file(&backup_relative_path, &relative_path)
+                        .map_err(|error| TransferError::RollbackFailed {
+                            path: relative_path,
+                            context: error.to_string(),
+                        })?;
+                }
+                OwnedChange::CreatedDirectory { relative_path } => {
+                    self.request
+                        .destination
+                        .remove_relative_directory(&relative_path)
+                        .map_err(|error| TransferError::RollbackFailed {
+                            path: relative_path,
+                            context: error.to_string(),
+                        })?;
+                }
+            }
         }
         Ok(())
+    }
+}
+
+/// Build the hidden backup sibling path for a destination file: a unique
+/// `.tributary-backup-*` leaf in the destination's own directory.
+fn backup_sibling_path(destination_relative: &Path) -> PathBuf {
+    let mut backup = destination_relative
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let mut leaf = OsString::from(".tributary-backup-");
+    leaf.push(Uuid::new_v4().to_string());
+    leaf.push(".tmp");
+    backup.push(leaf);
+    backup
+}
+
+/// Map an I/O error carrying the cancellation interrupt into the typed
+/// cancelled error, everything else into a transfer I/O error.
+fn transfer_io(context: &'static str, error: io::Error) -> TransferError {
+    if error.kind() == io::ErrorKind::Interrupted {
+        TransferError::Cancelled
+    } else {
+        TransferError::io(context, error)
     }
 }
 
@@ -278,4 +555,26 @@ fn copy_in_chunks(
         );
     }
     Ok(copied)
+}
+
+/// Stream a backup copy with cancellation checks but no progress reports:
+/// backup bytes are not transfer bytes.
+fn copy_in_chunks_quiet(
+    source: &mut dyn Read,
+    mut staged: &std::fs::File,
+    cancellation: &CancellationObserver,
+) -> io::Result<()> {
+    const CHUNK: usize = 64 * 1024;
+    let mut buffer = vec![0u8; CHUNK];
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        staged.write_all(&buffer[..read])?;
+    }
+    Ok(())
 }
