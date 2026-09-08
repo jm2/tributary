@@ -339,6 +339,48 @@ fn assert_release_checksum_guard_order(checksums: &str) {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn release_checksum_hash_failure_is_terminal() {
+    let workflow: serde_yaml::Value = serde_yaml::from_str(RELEASE_WORKFLOW).unwrap();
+    let steps = workflow["jobs"]["checksums"]["steps"]
+        .as_sequence()
+        .unwrap();
+    let script = steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Generate SHA256SUMS"))
+        .unwrap()["run"]
+        .as_str()
+        .unwrap();
+    let assets = shell_array(script, "expected_assets").join("\n");
+    let output = std::process::Command::new("bash")
+        .args([
+            "-e",
+            "-c",
+            r#"
+test_dir="$(mktemp -d "${TMPDIR:-/var/tmp}/tributary-checksums.XXXXXX")"
+trap 'rm -rf "$test_dir"' EXIT
+cd "$test_dir"
+mkdir artifacts
+while IFS= read -r asset; do : > "artifacts/$asset"; done <<< "$EXPECTED_ASSETS"
+sha256sum() { return 23; }
+export -f sha256sum
+bash -e -c "$1"
+"#,
+            "release-checksum-test",
+            script,
+        ])
+        .env("EXPECTED_ASSETS", assets)
+        .output()
+        .expect("run the release checksum script with an injected hashing failure");
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "hashing failure must prevent publication: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn forbidden_bundle_tokens() -> Vec<&'static str> {
     FORBIDDEN_BUNDLED_COMPONENTS
         .lines()

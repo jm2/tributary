@@ -621,6 +621,7 @@ jobs:
 
       - name: Generate SHA256SUMS
         run: |
+          set -euo pipefail
           cd artifacts
           expected_assets=(
             'tributary-aarch64.rpm'
