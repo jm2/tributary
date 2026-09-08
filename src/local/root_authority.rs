@@ -698,36 +698,9 @@ impl MountedRootAuthority {
         self.validate()?;
         #[cfg(unix)]
         {
-            use rustix::fs::{AtFlags, Mode, OFlags};
-
             let mut current = self.root_handle.file.try_clone()?;
             for component in components {
-                match rustix::fs::mkdirat(&current, component, Mode::from_bits_truncate(0o777)) {
-                    Ok(()) => {}
-                    Err(rustix::io::Errno::EXIST) => {
-                        let stat =
-                            rustix::fs::statat(&current, component, AtFlags::SYMLINK_NOFOLLOW)
-                                .map_err(io::Error::from)?;
-                        if rustix::fs::FileType::from_raw_mode(stat.st_mode)
-                            != rustix::fs::FileType::Directory
-                        {
-                            return Err(io::Error::new(
-                                io::ErrorKind::AlreadyExists,
-                                "intermediate path is not a directory",
-                            ));
-                        }
-                    }
-                    Err(error) => return Err(io::Error::from(error)),
-                }
-                current = File::from(
-                    rustix::fs::openat(
-                        &current,
-                        component,
-                        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-                        Mode::empty(),
-                    )
-                    .map_err(io::Error::from)?,
-                );
+                current = ensure_directory_component(&current, component)?;
                 ensure_boundary(self.boundary, &current)?;
             }
         }
@@ -2468,6 +2441,39 @@ fn validate_leaf_name(leaf: &OsStr) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Create one path component as a directory inside `current` (or verify the
+/// existing entry is a real directory), then open it no-follow for the next
+/// walk level. Unix only; used by
+/// [`MountedRootAuthority::create_directories_within`].
+#[cfg(unix)]
+fn ensure_directory_component(current: &File, component: &OsString) -> io::Result<File> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+
+    match rustix::fs::mkdirat(current, component, Mode::from_bits_truncate(0o777)) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::EXIST) => {
+            let stat = rustix::fs::statat(current, component, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(io::Error::from)?;
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "intermediate path is not a directory",
+                ));
+            }
+        }
+        Err(error) => return Err(io::Error::from(error)),
+    }
+    let opened = rustix::fs::openat(
+        current,
+        component,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    Ok(File::from(opened))
 }
 
 /// Rename `from_leaf` to `to_leaf` inside the parent directory `parent`,

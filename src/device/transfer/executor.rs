@@ -52,6 +52,29 @@ struct CommittedCopy {
     backup: Option<PathBuf>,
 }
 
+/// Classify a committed copy into the owned change rollback must reverse.
+///
+/// An Overwrite commit with a saved original is rolled back by restoring
+/// that original; an Overwrite commit that published where nothing
+/// pre-existed, a fresh publish, and a preserved sibling all roll back by
+/// removing the actual published path.
+fn owned_change_for_copy(committed: CommittedCopy) -> OwnedChange {
+    match committed.outcome.resolution {
+        ConflictResolution::Overwrite => match committed.backup {
+            Some(backup_relative_path) => OwnedChange::ReplacedFile {
+                relative_path: committed.outcome.relative_path,
+                backup_relative_path,
+            },
+            None => OwnedChange::PublishedFile {
+                relative_path: committed.outcome.relative_path,
+            },
+        },
+        ConflictResolution::Fresh | ConflictResolution::Preserved => OwnedChange::PublishedFile {
+            relative_path: committed.outcome.relative_path,
+        },
+    }
+}
+
 /// The transfer executor. Holds the authorities and the plan; runs the
 /// stages in order; rolls back on failure or cancellation.
 pub struct TransferExecutor {
@@ -181,24 +204,7 @@ impl TransferExecutor {
                     // nothing was published and nothing is owned.
                     return Ok(false);
                 };
-                context.committed.push(match committed.outcome.resolution {
-                    ConflictResolution::Overwrite => match committed.backup {
-                        Some(backup_relative_path) => OwnedChange::ReplacedFile {
-                            relative_path: committed.outcome.relative_path,
-                            backup_relative_path,
-                        },
-                        // The overwrite published where nothing pre-existed;
-                        // rollback removes the published file outright.
-                        None => OwnedChange::PublishedFile {
-                            relative_path: committed.outcome.relative_path,
-                        },
-                    },
-                    ConflictResolution::Fresh | ConflictResolution::Preserved => {
-                        OwnedChange::PublishedFile {
-                            relative_path: committed.outcome.relative_path,
-                        }
-                    }
-                });
+                context.committed.push(owned_change_for_copy(committed));
                 Ok(true)
             }
             Stage::RemoveFile { .. } => {
@@ -332,17 +338,12 @@ impl TransferExecutor {
                 // The destination existed at staging but not at planning.
                 // Skip and Fail are represented distinctly; Preserve and
                 // Overwrite re-resolve naturally inside prepare.
-                match (self.request.conflict_policy, planned_conflict) {
-                    (ConflictPolicy::Skip, ConflictResolution::Fresh) => return Ok(None),
-                    (ConflictPolicy::Fail, ConflictResolution::Fresh) => {
-                        return Err(TransferError::ConflictRejected {
-                            path: destination_relative.to_path_buf(),
-                        });
-                    }
-                    _ => {
-                        return Err(TransferError::io("failed to stage destination file", error));
-                    }
-                }
+                return post_plan_collision_outcome(
+                    self.request.conflict_policy,
+                    planned_conflict,
+                    destination_relative,
+                    error,
+                );
             }
             Err(error) => {
                 return Err(TransferError::io("failed to stage destination file", error));
@@ -351,8 +352,11 @@ impl TransferExecutor {
         let copied = match copy_in_chunks(source_file, &staged, stage_index, context) {
             Ok(copied) => copied,
             Err(error) => {
-                let _ = staged.rollback();
-                return Err(transfer_io("failed to copy source file", error));
+                return Err(discard_staged_copy(
+                    staged,
+                    "failed to copy source file",
+                    error,
+                ));
             }
         };
         staged
@@ -360,8 +364,8 @@ impl TransferExecutor {
             .flush()
             .map_err(|error| TransferError::io("failed to flush staged file", error))?;
         if declared_bytes != 0 && copied != declared_bytes {
-            let _ = staged.rollback();
-            return Err(TransferError::io(
+            return Err(discard_staged_copy(
+                staged,
                 "source size differs from declared size",
                 io::Error::other(format!(
                     "source size {copied} differs from declared {declared_bytes} bytes"
@@ -387,17 +391,26 @@ impl TransferExecutor {
         };
         match staged.commit() {
             Ok(outcome) => Ok(Some(CommittedCopy { outcome, backup })),
-            Err(error) => {
-                // The publish failed, so the backup was never needed.
-                // Remove it so the destination parent is not polluted with
-                // a hidden copy of the original.
-                if let Some(backup) = &backup {
-                    let _ = self.request.destination.remove_relative_file(backup);
-                }
-                Err(TransferError::CommitFailed {
-                    context: error.to_string(),
-                })
-            }
+            // The publish failed, so the backup was never needed: remove it
+            // so the destination parent is not polluted with a hidden copy
+            // of the original.
+            Err(error) => Err(self.failed_commit_discards_backup(backup, error)),
+        }
+    }
+
+    /// A failed publish never needed its saved original: remove the backup
+    /// sibling so the destination parent is not polluted with a hidden copy
+    /// of the original, then translate the commit failure.
+    fn failed_commit_discards_backup(
+        &self,
+        backup: Option<PathBuf>,
+        error: io::Error,
+    ) -> TransferError {
+        if let Some(backup) = &backup {
+            let _ = self.request.destination.remove_relative_file(backup);
+        }
+        TransferError::CommitFailed {
+            context: error.to_string(),
         }
     }
 
@@ -516,6 +529,40 @@ fn transfer_io(context: &'static str, error: io::Error) -> TransferError {
     } else {
         TransferError::io(context, error)
     }
+}
+
+/// Resolve a destination that appeared between planning and staging.
+///
+/// Skip and Fail are represented distinctly — a Skip-policy stage is
+/// skipped without committing anything, a Fail-policy stage rejects the
+/// collision — while Preserve and Overwrite re-resolve naturally inside
+/// prepare, so reaching this function with those policies means the
+/// staging failure is a genuine I/O error.
+fn post_plan_collision_outcome(
+    policy: ConflictPolicy,
+    planned_conflict: ConflictResolution,
+    destination_relative: &Path,
+    error: io::Error,
+) -> Result<Option<CommittedCopy>, TransferError> {
+    match (policy, planned_conflict) {
+        (ConflictPolicy::Skip, ConflictResolution::Fresh) => Ok(None),
+        (ConflictPolicy::Fail, ConflictResolution::Fresh) => Err(TransferError::ConflictRejected {
+            path: destination_relative.to_path_buf(),
+        }),
+        _ => Err(TransferError::io("failed to stage destination file", error)),
+    }
+}
+
+/// Roll a staged file back and translate its copy-phase failure. The
+/// staged sibling is discarded so a failed copy never leaves litter in
+/// the destination directory.
+fn discard_staged_copy(
+    staged: PreparedWriteTarget,
+    context: &'static str,
+    error: io::Error,
+) -> TransferError {
+    let _ = staged.rollback();
+    transfer_io(context, error)
 }
 
 /// Stream `source` into the staged file in fixed-size chunks, reporting
