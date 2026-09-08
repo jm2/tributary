@@ -585,9 +585,38 @@ A source that opts out — or revokes an earlier opt-in — returns `Err(Denied)
 from `offline_snapshot`; the source stays default-deny for offline exactly as
 it was before it opted in.
 
-When the project eventually retires the offline subsystem, the migration is
-reversed by a follower migration that drops the offline tables, indexes, and
-triggers in one transaction; no live production path depends on the offline
+When the project eventually retires the offline subsystem, retirement is an
+ordered, two-phase operation: every on-disk media file is reconciled while
+the cache rows that own it still exist, and only then is the metadata
+dropped. The order is normative — the follower migration never destroys the
+`MediaKey` → cache-path mapping while an owning file may still exist:
+
+1. **Quiesce admission and drain jobs.** The offline capability is withdrawn
+   first: no new download is admitted, and every in-flight job is driven to
+   a terminal state under the same supervisor rules as any lifecycle
+   supersession — a cancelled job unlinks its temp file and promotes no row.
+2. **Reconcile every row that owns a file.** The engine walks the cache
+   table and, for each row regardless of state — including rows retired as
+   `Revoked`, whose files revocation deliberately preserved — unlinks the
+   recorded file through the same validated cache-unlink path used by
+   eviction and catalogue invalidation, and tombstones the row in the same
+   transaction, the atomicity footprint of an eviction. Unlinking an
+   already-missing file succeeds; the row is tombstoned all the same.
+3. **Sweep the engine-owned cache root.** After the row walk, the engine
+   unlinks every remaining file inside `<cache_root>` — crash-orphaned
+   `<final_name>.part-<job-id>` temps among them — and removes the
+   now-empty `<source_key>/<track_key>/` directories it created. Nothing
+   outside the cache root is touched.
+4. **Drop the metadata.** Only when no owning row remains does the follower
+   migration drop the offline tables, indexes, and triggers in one
+   transaction, mirroring the forward migration's reversibility: any error
+   restores the predecessor schema and data so the retirement remains
+   retryable.
+
+Because a file is only ever unlinked while the row naming it is queryable —
+or inside the bounded root sweep — retirement cannot strand media that no
+remaining metadata can attribute, and it cannot delete anything the offline
+subsystem does not own. No live production path depends on the offline
 machinery existing.
 
 ## See also
