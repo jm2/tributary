@@ -19,18 +19,20 @@ the timer would have blamed the wrong check.
 Configured under `[rigs.formula_vars]` in the city config (the rig-side
 clone does not own this value — `city.toml` does):
 
-```
+```toml
 ci_timeout_seconds = "3600"   # 1 hour, comfortable margin over the tail
 ```
 
 Everything else stays at the upstream defaults:
 
-| var | value | meaning |
-|---|---|---|
-| `ci_gate` | `true` | "pending is never green" — fail-closed when checks are still running. **Preserved.** |
-| `ci_poll_seconds` | `60` | Poll GitHub for check-runs every minute. **Preserved.** |
-| `ci_zero_check_grace_seconds` | `300` | Allow the workflow runs to materialize before declaring zero-on-this-branch. **Preserved.** |
-| `ci_timeout_seconds` | `3600` | **Raised from 900**: covers the observed ~20-53 min tail with margin. |
+- `ci_gate` — `true` — "pending is never green" — fail-closed when checks are
+  still running. **Preserved.**
+- `ci_poll_seconds` — `60` — Poll GitHub for check-runs every minute.
+  **Preserved.**
+- `ci_zero_check_grace_seconds` — `300` — Allow the workflow runs to
+  materialize before declaring zero-on-this-branch. **Preserved.**
+- `ci_timeout_seconds` — `3600` — **Raised from 900**: covers the observed
+  ~20-53 min tail with margin.
 
 The change is the deadline alone; the fail-closed policy is intentionally
 left intact. A bead (tr-3h7) opened the issue and another polecat can land
