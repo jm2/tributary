@@ -434,7 +434,13 @@ struct CancellationSwitch {
 impl CancellationSwitch {
     fn pair() -> (Self, CancellationObserver) {
         let (sender, receiver) = watch::channel(false);
-        (Self { sender }, CancellationObserver { receiver })
+        (
+            Self { sender },
+            CancellationObserver {
+                receiver,
+                keepalive: None,
+            },
+        )
     }
 
     fn cancel(&self) {
@@ -468,6 +474,13 @@ impl CancellationTrigger {
 #[derive(Clone)]
 pub struct CancellationObserver {
     receiver: watch::Receiver<bool>,
+    /// Retains the channel sender for a never-cancelled observer so the
+    /// channel stays open: a closed sender makes `changed()` report
+    /// closure, which `cancelled()` would misread as cancellation. `None`
+    /// for paired observers, where the sender closing *is* the cancellation
+    /// signal and must stay observable. Shared through `Arc` because the
+    /// observer is cloned.
+    keepalive: Option<Arc<watch::Sender<bool>>>,
 }
 
 impl fmt::Debug for CancellationObserver {
@@ -482,9 +495,15 @@ impl fmt::Debug for CancellationObserver {
 impl CancellationObserver {
     /// Construct a never-cancelled observer. Useful for tests and for code
     /// paths that accept a cancellation handle but have no upstream source.
+    ///
+    /// The observer retains its own channel sender so `cancelled()` can
+    /// never misread channel closure as cancellation.
     pub fn never_cancelled() -> Self {
-        let (_sender, receiver) = watch::channel(false);
-        Self { receiver }
+        let (sender, receiver) = watch::channel(false);
+        Self {
+            receiver,
+            keepalive: Some(Arc::new(sender)),
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -4584,6 +4603,27 @@ mod tests {
             SourceState::Dormant
         );
         assert!(registry.shutdown().is_complete());
+    }
+
+    /// A never-cancelled observer retains its channel sender, so
+    /// `cancelled()` must stay pending instead of misreading channel
+    /// closure as cancellation.
+    #[tokio::test]
+    async fn never_cancelled_observer_keeps_its_channel_open() {
+        let mut observer = CancellationObserver::never_cancelled();
+        assert!(!observer.is_cancelled());
+        let still_pending = timeout(Duration::from_millis(50), observer.cancelled()).await;
+        assert!(
+            still_pending.is_err(),
+            "never_cancelled() resolved cancelled(): the channel closed"
+        );
+        // Clones share the same retained sender and stay open too.
+        let mut cloned = observer.clone();
+        let clone_pending = timeout(Duration::from_millis(50), cloned.cancelled()).await;
+        assert!(
+            clone_pending.is_err(),
+            "cloned never_cancelled() resolved cancelled(): the channel closed"
+        );
     }
 
     #[tokio::test]
