@@ -131,30 +131,9 @@ impl MountedWriteAuthority {
         let final_path = self.mounted.root().join(assemble_relative(&components));
 
         match std::fs::symlink_metadata(&final_path) {
-            Ok(metadata) => {
-                if !metadata.is_dir() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "path exists and is not a directory",
-                    ));
-                }
-                match policy {
-                    ConflictPolicy::Skip | ConflictPolicy::Fail => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::AlreadyExists,
-                            "directory exists and policy forbids overwriting",
-                        ));
-                    }
-                    ConflictPolicy::Overwrite | ConflictPolicy::Preserve => {}
-                }
-            }
+            Ok(metadata) => adopt_existing_directory(metadata, policy)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                #[cfg(unix)]
-                self.mounted.create_directories_within(&components)?;
-                #[cfg(windows)]
-                create_directory_atomic(self.mounted.root(), &components)?;
-                #[cfg(not(any(unix, windows)))]
-                create_directory_atomic(self.mounted.root(), &components)?;
+                create_missing_directory(&self.mounted, &components)?;
             }
             Err(error) => return Err(error),
         }
@@ -225,6 +204,39 @@ impl MountedWriteAuthority {
             false,
         )
     }
+}
+
+/// Reconcile an existing destination directory with the conflict policy:
+/// the entry must be a real directory, and Skip/Fail reject it outright
+/// while Overwrite/Preserve adopt it as-is.
+fn adopt_existing_directory(metadata: std::fs::Metadata, policy: ConflictPolicy) -> io::Result<()> {
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "path exists and is not a directory",
+        ));
+    }
+    match policy {
+        ConflictPolicy::Skip | ConflictPolicy::Fail => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "directory exists and policy forbids overwriting",
+        )),
+        ConflictPolicy::Overwrite | ConflictPolicy::Preserve => Ok(()),
+    }
+}
+
+/// Create every component of a not-yet-existing directory path through the
+/// retained authority: walked and created no-follow from the retained root
+/// handle on Unix, path-based per-component creation elsewhere.
+fn create_missing_directory(
+    authority: &MountedRootAuthority,
+    components: &[OsString],
+) -> io::Result<()> {
+    #[cfg(unix)]
+    authority.create_directories_within(components)?;
+    #[cfg(not(unix))]
+    create_directory_atomic(authority.root(), components)?;
+    Ok(())
 }
 
 /// Resolve the conflict policy against the live filesystem and decide where
