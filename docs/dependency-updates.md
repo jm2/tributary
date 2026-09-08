@@ -196,12 +196,21 @@ prints the dispatch path with the pull request number filled in.
    `GITHUB_TOKEN` cannot (see "Workflow security boundary" below). Create a
    GitHub App with only the `Administration: read` repository permission
    (nothing else), install it on this repository, and store its credentials
-   as the repository secrets `RULESET_READER_APP_ID` and
-   `RULESET_READER_APP_PRIVATE_KEY`. The writer mints a single-purpose
-   installation token from those secrets with the pinned GitHub-org
-   `actions/create-github-app-token` action; without this prerequisite the
-   precondition fails closed and routine Dependabot auto-merge stays off,
-   which is the safe direction.
+   as repository-level **Dependabot secrets** (Settings → Secrets and
+   variables → Dependabot → Repository secrets) named `RULESET_READER_APP_ID`
+   and `RULESET_READER_APP_PRIVATE_KEY`. Dependabot secrets, not Actions
+   secrets, are the only secret store available to this workflow: it runs
+   exclusively on Dependabot-initiated pull requests, where GitHub withholds
+   every Actions repository secret and exposes only Dependabot secrets and
+   the read-only `GITHUB_TOKEN`. Credentials stored as plain Actions secrets
+   reach the writer job as empty inputs and the pinned
+   `actions/create-github-app-token` action fails — the same fail-closed
+   outcome as a missing prerequisite, but the rollout instruction as written
+   would have made the failure permanent. The writer mints a single-purpose
+   installation token from those Dependabot secrets with the pinned
+   GitHub-org `actions/create-github-app-token` action; without this
+   prerequisite the precondition fails closed and routine Dependabot
+   auto-merge stays off, which is the safe direction.
 1. Land `.github/workflows/bot-review-gate.yml` first (this change) so the
    `Bot Review Gate` check actually reports on pull requests before it can be
    marked required. While the ruleset is still narrow, the gate is advisory
