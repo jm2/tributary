@@ -210,7 +210,7 @@ fn assert_flatpak_artifact_boundary(
         job[build..validation].contains("upload-artifact: false"),
         "{label} must disable flatpak-builder's implicit pre-validation artifact upload"
     );
-    assert_flatpak_builder_pin(job, label);
+    assert_flatpak_builder_pin(source, job_name, label);
     assert_eq!(
         job.matches("uses: actions/upload-artifact@v7").count(),
         1,
@@ -225,18 +225,63 @@ fn assert_flatpak_artifact_boundary(
     );
 }
 
-fn assert_flatpak_builder_pin(job: &str, label: &str) {
+fn assert_flatpak_builder_pin(source: &str, job_name: &str, label: &str) {
+    let workflow: serde_yaml::Value = serde_yaml::from_str(source).expect("workflow YAML");
+    let steps = workflow["jobs"][job_name]["steps"]
+        .as_sequence()
+        .expect("Flatpak job steps");
+    let builds: Vec<_> = steps
+        .iter()
+        .filter(|step| step["name"].as_str() == Some("Build Flatpak bundle"))
+        .collect();
+    assert_eq!(builds.len(), 1, "{label} must have one named build step");
+    let expected =
+        format!("flatpak/flatpak-github-actions/flatpak-builder@{FLATPAK_BUILDER_ACTION_SHA}");
     assert_eq!(
-        job.matches("uses: flatpak/flatpak-github-actions/flatpak-builder@")
+        builds[0]["uses"].as_str(),
+        Some(expected.as_str()),
+        "{label} must pin the build step to the exact reviewed revision"
+    );
+    assert_eq!(
+        steps
+            .iter()
+            .filter_map(|step| step["uses"].as_str())
+            .filter(|uses| uses.starts_with("flatpak/flatpak-github-actions/flatpak-builder@"))
             .count(),
         1,
         "{label} must contain exactly one Flatpak builder action"
     );
+}
+
+#[test]
+fn flatpak_builder_pin_rejects_inexact_revision() {
+    for revision in [
+        FLATPAK_BUILDER_ACTION_SHA[..10].to_owned(),
+        format!("{FLATPAK_BUILDER_ACTION_SHA}-unreviewed"),
+    ] {
+        let changed = CI_WORKFLOW.replace(FLATPAK_BUILDER_ACTION_SHA, &revision);
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_flatpak_builder_pin(&changed, "build-flatpak", "CI");
+            })
+            .is_err(),
+            "an inexact revision must not satisfy the build-step pin"
+        );
+    }
+}
+
+#[test]
+fn flatpak_builder_pin_rejects_pin_on_another_step() {
+    let changed = CI_WORKFLOW.replace(
+        "      - name: Build Flatpak bundle",
+        "      - name: Build Flatpak bundle\n        run: echo unreviewed\n      - name: Other step",
+    );
     assert!(
-        job.contains(&format!(
-            "uses: flatpak/flatpak-github-actions/flatpak-builder@{FLATPAK_BUILDER_ACTION_SHA}"
-        )),
-        "{label} must pin the Flatpak builder to the reviewed immutable revision"
+        std::panic::catch_unwind(|| {
+            assert_flatpak_builder_pin(&changed, "build-flatpak", "CI");
+        })
+        .is_err(),
+        "a pinned action on another step must not satisfy the build-step pin"
     );
 }
 
