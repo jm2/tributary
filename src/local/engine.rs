@@ -10957,6 +10957,17 @@ mod tests {
         let driver_event_rx = &library_event_rx;
         let driver_pre_injection = Arc::clone(&pre_injection_events);
         let driver_post_injection = Arc::clone(&post_injection_events);
+        // Regressions in the send order this harness pins must fail the test,
+        // not hang it: if the authority scan never emits the phase-1 trigger,
+        // the driver blocks in recv() still holding the watcher ingress sender
+        // (so the loop can never close), and if the racing batch never emits
+        // its trailing PlaylistProjectionsInvalidated, the driver blocks in
+        // phase-3 recv() with the outer library_events sender keeping the
+        // receiver open. The join below is therefore bounded by a timeout, and
+        // this flag records whether the driver got past phase 1 so the
+        // timeout's panic can name which regression fired.
+        let driver_injected = Arc::new(AtomicBool::new(false));
+        let driver_injected_flag = Arc::clone(&driver_injected);
         let driver = async move {
             // Deterministic mid-scan synchronization, phase 1: consume library
             // events until the conversion scan's ScanComplete has passed, then
@@ -11006,6 +11017,7 @@ mod tests {
             // queues while the authority scan is still running: the scan
             // itself never consumes the watcher queue, so this evidence must
             // survive the boundary.
+            driver_injected_flag.store(true, Ordering::Release);
             write_minimal_wav(&driver_racing_audio);
             enqueue_watcher_result(
                 &event_tx,
@@ -11050,18 +11062,56 @@ mod tests {
         };
 
         let mut completed_commands = HashMap::new();
-        let (loop_result, ()) = tokio::join!(
-            process_directory_events(
-                &db,
-                &music_dirs,
-                &library_events,
-                &command_rx,
-                &mut completed_commands,
-                watcher,
-                &playlist_sidebar_refresh,
-            ),
-            driver,
-        );
+        // Bound the join so the exact regressions this test exists to report
+        // fail fast instead of hanging the suite until the CI job timeout.
+        // 60s is orders of magnitude above this harness's normal sub-second
+        // run (tiny directory, real scan path, deterministic channel
+        // synchronization) yet far below any CI job timeout, and the panic
+        // names the specific regression from the driver's recorded progress.
+        const DRIVER_JOIN_TIMEOUT: Duration = Duration::from_secs(60);
+        let (loop_result, ()) = tokio::time::timeout(
+            DRIVER_JOIN_TIMEOUT,
+            // tokio::join! is itself an async expression (it polls inline and
+            // evaluates to the outputs tuple), so the timeout needs a real
+            // future here: the async block preserves the join's semantics —
+            // both futures driven concurrently to completion on this runtime.
+            async {
+                tokio::join!(
+                    process_directory_events(
+                        &db,
+                        &music_dirs,
+                        &library_events,
+                        &command_rx,
+                        &mut completed_commands,
+                        watcher,
+                        &playlist_sidebar_refresh,
+                    ),
+                    driver,
+                )
+            },
+        )
+        .await
+        .unwrap_or_else(|_: tokio::time::error::Elapsed| {
+            // The two regressions are distinguished by the driver's recorded
+            // progress at the moment of the timeout: still before the racing
+            // injection (phase 1) or already past it (phase 3).
+            assert!(
+                driver_injected.load(Ordering::Acquire),
+                "watcher-boundary harness timed out after {DRIVER_JOIN_TIMEOUT:?} in \
+                 phase 1: the authority scan never emitted its first per-file \
+                 ScanProgress trigger, so the driver is blocked in recv() still \
+                 holding the watcher ingress sender and the loop can never close — \
+                 exactly the regression this test exists to report"
+            );
+            panic!(
+                "watcher-boundary harness timed out after {DRIVER_JOIN_TIMEOUT:?} in \
+                 phase 3: the racing batch never produced its trailing \
+                 PlaylistProjectionsInvalidated (the loop stalled mid-batch, or exited \
+                 while the outer library_events sender kept the receiver open), so the \
+                 driver is blocked in recv() — exactly the regression this test exists \
+                 to report"
+            );
+        });
         loop_result.expect("watcher loop exits cleanly");
 
         // The injection was pinned mid-scan by the bounded channel and the
