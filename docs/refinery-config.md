@@ -80,16 +80,21 @@ follow-up; do not enable or rely on it before then.
 **Closing the gap (the machine gate).** Widen "Require CI before merge
 (main)" to require the full policy set: the Coverage and Windows (aarch64)
 jobs, the CodeQL Analyze jobs, Codacy Static Code Analysis, the CodeRabbit
-status context, and a repo-owned `bot-review-gate` check. The gate fails
-closed unless all three of the following hold: every in-scope bot review has
-reached an acceptable conclusion — a pending review blocks, and a
-CHANGES_REQUESTED review blocks even when its threads are resolved; every
-such review was submitted against the pull request's current head SHA — a
-review of an older head does not count; and no actionable bot review thread
-remains unresolved. All three inputs are queried via the API, so review
-conclusions, review head SHAs, and review threads become machine-readable
-merge evidence. That is a repository-settings and workflow change: it goes
-through its own bead and
+status context, and a repo-owned `bot-review-gate` check. The GitHub reviews
+API returns a bot's full review history, and a later review never deletes an
+earlier one, so the gate evaluates exactly one review per bot: its latest
+submitted review. The gate fails closed unless all three of the following
+hold: the latest submitted review of every in-scope bot has reached an
+acceptable conclusion — a later review supersedes the bot's own earlier
+reviews (a bot whose newest review is APPROVED is green even if an older
+review requested changes), a pending latest review blocks, and a
+CHANGES_REQUESTED latest review blocks even when its threads are resolved;
+that latest review was submitted against the pull request's current head
+SHA — a review of an older head does not count and leaves the bot unproven
+at this head; and no actionable bot review thread remains unresolved. All
+three inputs are queried via the API, so review conclusions, review head
+SHAs, and review threads become machine-readable merge evidence. That is a
+repository-settings and workflow change: it goes through its own bead and
 full CI validation, never an out-of-band ruleset edit, and it must be
 validated against a live pull request before the refinery treats the widened
 gate as authoritative.
