@@ -8,7 +8,7 @@
 //! mount-generation checks to an ephemeral mounted root without requiring the
 //! removable filesystem to contain an application marker.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
@@ -540,6 +540,15 @@ impl MountedMutationTarget {
         &self.path
     }
 
+    /// Return the admitted leaf name, relative to the retained parent
+    /// directory. Private machinery for the retained-parent commit.
+    fn relative_leaf(&self) -> io::Result<OsString> {
+        self.relative_path
+            .file_name()
+            .map(|name| name.to_os_string())
+            .ok_or_else(|| invalid_input("mutation target has no leaf file name"))
+    }
+
     /// Re-bind the retained exact file to the object now admitted at this
     /// target's accepted mount-relative path.
     ///
@@ -614,17 +623,114 @@ impl MountedMutationCommit<'_> {
     /// exact pathname must still name the retained object. A file that was
     /// renamed away, replaced, or removed refuses the replacement: the write
     /// is authorized for the file the user selected, not for whatever now
-    /// occupies its old name.
+    /// occupies its old name. The proof opens the leaf name through the
+    /// retained parent directory — never an absolute pathname lookup, which a
+    /// replaced parent could retarget and which would follow a symlink
+    /// planted at the target name.
     pub(crate) fn confirm_replacement_target(&self) -> io::Result<()> {
-        self.target.authority.validate()?;
-        self.file.object.validate_live()?;
-        let current = File::open(&self.target.path)?;
-        if object_identity(&current)? != self.file.object.identity {
+        validate_mounted_bound(self.target.authority.as_ref(), &self.file)?;
+        let parent = self.retained_parent();
+        let leaf = self.target.relative_leaf()?;
+        #[cfg(unix)]
+        {
+            let current = open_unix_regular_at(&parent.file, &leaf)?;
+            if object_identity(&current)? != self.file.object.identity {
+                return Err(authority_changed(
+                    "mutation target no longer names the retained file",
+                ));
+            }
+            // Close the check window on the authority side before the caller
+            // proceeds, mirroring the double-validation discipline of every
+            // other retained-evidence path.
+            parent.validate_live()?;
+            self.target.authority.validate()
+        }
+        #[cfg(not(unix))]
+        {
+            // Platforms without retained parent handles (Windows) keep the
+            // documented discipline: revalidate the mount, then prove the
+            // pathname still names the admitted object through a fresh open
+            // and an exact identity comparison.
+            let _ = parent;
+            let _ = leaf;
+            let current = File::open(&self.target.path)?;
+            if object_identity(&current)? != self.file.object.identity {
+                return Err(authority_changed(
+                    "mutation target no longer names the retained file",
+                ));
+            }
+            self.target.authority.validate()
+        }
+    }
+
+    /// Confirm the replacement target and perform the atomic replacement with
+    /// the staged copy at `staged`.
+    ///
+    /// Confirmation runs first (mount, retained ancestry, exact file identity
+    /// — see [`Self::confirm_replacement_target`]). On platforms with
+    /// retained parent handles the replacement itself is then performed
+    /// relative to that retained parent directory on both sides, so no
+    /// pathname resolution — root, ancestor, or leaf — can retarget the
+    /// rename after the confirmation. The staged copy must live inside the
+    /// exact retained parent directory; anything else is a lost staging area
+    /// and is refused rather than re-resolved by path. Any uncertainty fails
+    /// closed and leaves both files untouched.
+    pub(crate) fn commit_replacement(&self, staged: &Path) -> io::Result<()> {
+        self.confirm_replacement_target()?;
+        self.replace_confirmed_staging(staged)
+    }
+
+    /// Resolve the retained directory that must contain the replacement.
+    #[cfg(unix)]
+    fn retained_parent(&self) -> &RetainedObject {
+        if let Some(parent) = self.file.parent_guards.last() {
+            return parent;
+        }
+        // A target at the top of the mount has no retained ancestor chain;
+        // the retained root itself is the parent.
+        self.target.authority.root_handle()
+    }
+
+    /// Rename the staged copy over the confirmed target through the retained
+    /// parent, then prove the replacement landed on that exact entry.
+    #[cfg(unix)]
+    fn replace_confirmed_staging(&self, staged: &Path) -> io::Result<()> {
+        let parent = self.retained_parent();
+        let leaf = self.target.relative_leaf()?;
+        let staged_leaf = staged
+            .file_name()
+            .ok_or_else(|| invalid_input("staged tag replacement has no file name"))?;
+
+        // The staged copy must be reachable through this exact retained
+        // directory. Opening it here — rather than trusting the staging
+        // pathname — proves the rename below will move the object this
+        // section created, and refuses a parent that was disturbed enough to
+        // strand the staging area elsewhere.
+        let staged_file = open_unix_regular_at(&parent.file, staged_leaf)?;
+        let staged_identity = object_identity(&staged_file)?;
+        drop(staged_file);
+
+        // Both rename sides are relative to the retained parent handle: a
+        // concurrent parent or mount replacement cannot redirect the
+        // replacement because the kernel never resolves an absolute path.
+        rustix::fs::renameat(&parent.file, staged_leaf, &parent.file, &leaf)
+            .map_err(io::Error::from)?;
+
+        // Prove the replacement landed on the exact directory entry.
+        let replaced = open_unix_regular_at(&parent.file, &leaf)?;
+        if object_identity(&replaced)? != staged_identity {
             return Err(authority_changed(
-                "mutation target no longer names the retained file",
+                "the tagged replacement did not land on the retained mutation target",
             ));
         }
         Ok(())
+    }
+
+    /// Platforms without retained parent handles replace through the staged
+    /// and target pathnames after the confirm above.
+    #[cfg(not(unix))]
+    fn replace_confirmed_staging(&self, staged: &Path) -> io::Result<()> {
+        std::fs::rename(staged, &self.target.path)
     }
 }
 
@@ -1227,7 +1333,7 @@ fn open_unix_directory_at(parent: &File, name: &OsString) -> io::Result<File> {
 }
 
 #[cfg(unix)]
-fn open_unix_regular_at(parent: &File, name: &OsString) -> io::Result<File> {
+fn open_unix_regular_at(parent: &File, name: &OsStr) -> io::Result<File> {
     use rustix::fs::{Mode, OFlags};
 
     let descriptor = rustix::fs::openat(
@@ -1894,6 +2000,91 @@ mod tests {
         let mut contents = Vec::new();
         source.read_to_end(&mut contents).expect("read source");
         assert_eq!(contents, b"replacement audio");
+    }
+
+    /// The replacement must be performed relative to the retained parent
+    /// directory, never by resolving the target pathname: a parent displaced
+    /// between selection and commit must not redirect the write into
+    /// whatever now occupies the old name.
+    #[cfg(unix)]
+    #[test]
+    fn mutation_target_replacement_lands_through_the_retained_parent_after_parent_displacement() {
+        let directory = TestDirectory::new("mutation-parent-displace");
+        let album = directory.path().join("album");
+        fs::create_dir(&album).expect("create album");
+        let song = album.join("song.flac");
+        fs::write(&song, b"original audio").expect("write song");
+
+        let authority =
+            Arc::new(MountedRootAuthority::acquire(directory.path()).expect("acquire authority"));
+        let target = authority
+            .open_mutation_target(Path::new("album/song.flac"))
+            .expect("open mutation target");
+
+        // Displace the retained parent and install an impostor directory at
+        // its old pathname, as an outside writer could between selection and
+        // commit. A path-based rename would land the replacement on the
+        // impostor; the retained parent cannot.
+        let displaced_album = directory.path().join("displaced-album");
+        fs::rename(&album, &displaced_album).expect("displace retained parent");
+        fs::create_dir(&album).expect("install impostor parent");
+        fs::write(album.join("song.flac"), b"impostor audio").expect("install impostor file");
+
+        // Stage inside the retained parent — the directory object the
+        // authority still holds — not beside the now-impostor pathname.
+        let staged = displaced_album.join(".tributary-tag-staged.flac");
+        fs::write(&staged, b"tagged audio").expect("stage the replacement");
+
+        let commit = target.begin_commit().expect("begin commit section");
+        commit
+            .commit_replacement(&staged)
+            .expect("commit through the retained parent");
+
+        assert_eq!(
+            fs::read(displaced_album.join("song.flac")).expect("read replaced file"),
+            b"tagged audio",
+            "the replacement must land beside the admitted file in the retained directory"
+        );
+        assert_eq!(
+            fs::read(album.join("song.flac")).expect("read impostor file"),
+            b"impostor audio",
+            "the impostor directory must never receive the write"
+        );
+    }
+
+    /// A symlink installed at the target name must never be followed by the
+    /// commit-time identity proof: the proof opens the leaf through the
+    /// retained parent with no-follow semantics, so a displaced-and-linked
+    /// name refuses the replacement instead of re-finding the retained
+    /// identity behind the link.
+    #[cfg(unix)]
+    #[test]
+    fn mutation_target_confirm_refuses_a_symlink_installed_at_the_target_name() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("mutation-symlink-name");
+        let song = directory.path().join("song.flac");
+        fs::write(&song, b"original audio").expect("write song");
+
+        let authority =
+            Arc::new(MountedRootAuthority::acquire(directory.path()).expect("acquire authority"));
+        let target = authority
+            .open_mutation_target(Path::new("song.flac"))
+            .expect("open mutation target");
+
+        let displaced = directory.path().join("displaced.flac");
+        fs::rename(&song, &displaced).expect("displace the admitted file");
+        symlink(&displaced, &song).expect("install a symlink at the target name");
+
+        let commit = target.begin_commit().expect("begin commit section");
+        commit
+            .confirm_replacement_target()
+            .expect_err("a symlink at the target name must never be followed");
+        assert_eq!(
+            fs::read(&displaced).expect("read displaced file"),
+            b"original audio",
+            "the retained original must stay byte-for-byte intact"
+        );
     }
 
     #[cfg(unix)]

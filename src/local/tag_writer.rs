@@ -392,7 +392,7 @@ impl TempFile {
     /// Atomically move the temp file onto `target`, disarming the cleanup.
     ///
     /// On failure `self` is dropped, so the temp file is still removed.
-    fn persist_to(mut self, target: &Path) -> Result<()> {
+    fn persist_to(&mut self, target: &Path) -> Result<()> {
         std::fs::rename(&self.path, target).with_context(|| {
             format!(
                 "Failed to atomically replace {} with the tagged copy",
@@ -401,6 +401,14 @@ impl TempFile {
         })?;
         self.persisted = true;
         Ok(())
+    }
+
+    /// Disarm the drop cleanup after an external authority renamed this temp
+    /// file into place. The staging name no longer exists, and a failed
+    /// best-effort cleanup of a name that was never persisted must not
+    /// mislead the guard.
+    fn disarm_cleanup(&mut self) {
+        self.persisted = true;
     }
 
     /// Remove a probe sibling and disarm the best-effort drop cleanup.
@@ -533,7 +541,7 @@ pub fn preflight_tag_write_directory(path: &Path) -> Result<(), TagWritePrefligh
     // Rehearse the complete metadata-only shape of the atomic replacement:
     // create two exclusive siblings, flush them, replace an existing sibling,
     // and require explicit cleanup. The user's audio file is never modified.
-    let (replacement, replacement_file) =
+    let (mut replacement, replacement_file) =
         TempFile::create_beside(path).map_err(|_| TagWritePreflightError::Unavailable)?;
     let replacement_result = replacement_file.sync_all();
     drop(replacement_file);
@@ -591,17 +599,19 @@ pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
 
     let source = std::fs::File::open(path)
         .with_context(|| format!("Failed to open {} for tag writing", path.display()))?;
-    atomic_tag_replacement(source, path, edits, || Ok(()))
+    atomic_tag_replacement(source, path, edits, |temp| temp.persist_to(path))
 }
 
 /// Write tag edits to one exact file beneath a retained mounted authority.
 ///
 /// This is the removable-media form of [`write_tags`]. The read source is the
 /// retained exact file object — never a pathname lookup — and the atomic
-/// replacement is refused unless the mounted root, the retained ancestry, and
-/// the exact pathname still name the file the authority admitted, revalidated
-/// immediately before the rename. Every failure leaves the target untouched.
-/// This is a blocking operation — call from a background thread.
+/// replacement is confirmed and performed by the retained authority itself:
+/// the mounted root, the retained ancestry, and the exact pathname must still
+/// name the file the authority admitted, revalidated immediately before the
+/// rename, and the rename runs relative to the retained parent directory so
+/// no pathname resolution can retarget it. Every failure leaves the target
+/// untouched. This is a blocking operation — call from a background thread.
 pub fn write_tags_with_mutation_target(
     target: &MountedMutationTarget,
     edits: &TagEdits,
@@ -634,10 +644,15 @@ pub fn write_tags_with_mutation_target(
     let source = commit
         .source_file()
         .with_context(|| "Failed to read the exact retained mutation target".to_string())?;
-    atomic_tag_replacement(source, target.replacement_path(), edits, || {
-        commit
-            .confirm_replacement_target()
-            .context("The exact file to replace changed before the tagged copy was committed")
+    atomic_tag_replacement(source, target.replacement_path(), edits, |temp| {
+        commit.commit_replacement(temp.path()).map_err(|error| {
+            anyhow::Error::new(error)
+                .context("The exact file to replace changed before the tagged copy was committed")
+        })?;
+        // The retained authority renamed the staged copy into place; the
+        // staging name no longer exists for the drop guard to remove.
+        temp.disarm_cleanup();
+        Ok(())
     })?;
 
     // A successful replacement retired the object this section copied from.
@@ -656,18 +671,20 @@ pub fn write_tags_with_mutation_target(
 }
 
 /// Copy `source` to an exclusively created sibling of `target_path`, tag the
-/// copy, flush it, and atomically rename it over `target_path`.
+/// copy, flush it, and hand it to `commit_replacement` for the atomic
+/// replacement of `target_path`.
 ///
-/// `confirm_replacement` runs between the flush and the rename and must
-/// prove — for authority-checked callers — that `target_path` still names
-/// the exact file `source` was cloned from. Path-based callers have no
-/// retained identity to compare and pass a no-op; the rename itself is their
-/// point-in-time replacement.
+/// `commit_replacement` runs after the flush and permission carry-over and
+/// owns the entire final gate: authority-checked callers prove the exact
+/// target identity there and perform the rename through retained handles.
+/// Path-based callers have no retained identity to compare and simply rename
+/// the staged copy into place; the rename itself is their point-in-time
+/// replacement.
 fn atomic_tag_replacement(
     source: File,
     target_path: &Path,
     edits: &TagEdits,
-    confirm_replacement: impl FnOnce() -> Result<()>,
+    commit_replacement: impl FnOnce(&mut TempFile) -> Result<()>,
 ) -> Result<()> {
     let mut source = source;
     #[cfg(target_os = "windows")]
@@ -678,7 +695,7 @@ fn atomic_tag_replacement(
         )
     })?;
 
-    let (temp, destination) = TempFile::create_beside(target_path)?;
+    let (mut temp, destination) = TempFile::create_beside(target_path)?;
     #[cfg(target_os = "windows")]
     let mut destination = open_tag_copy_destination(source_dacl, destination, &temp, target_path)?;
     #[cfg(not(target_os = "windows"))]
@@ -689,9 +706,9 @@ fn atomic_tag_replacement(
     copy_result?;
 
     write_tags_to(temp.path(), edits)?;
-    flush_and_confirm_tagged_copy(&temp, target_path, confirm_replacement)?;
+    flush_and_prepare_tagged_copy(&temp, target_path)?;
+    commit_replacement(&mut temp)?;
 
-    temp.persist_to(target_path)?;
     tracing::debug!("Tags written successfully");
     Ok(())
 }
@@ -738,19 +755,15 @@ fn copy_source_into_destination(
         .with_context(|| format!("Failed to copy {} for tag writing", target_path.display()))
 }
 
-/// Flush the tagged copy, carry over the replaced file's Unix permissions,
-/// and run the caller's final replacement gate.
+/// Flush the tagged copy and carry over the replaced file's Unix permissions
+/// before the caller's final replacement gate runs.
 ///
 /// The flush happens *before* the permission copy: replacing a read-only file
 /// would otherwise make the temp read-only too, and a read-only file cannot
 /// be flushed. Windows installs the complete DACL before the first copied
 /// byte; its std Permissions value represents only the DOS read-only
 /// attribute, so the permission carry-over is Unix-only.
-fn flush_and_confirm_tagged_copy(
-    temp: &TempFile,
-    target_path: &Path,
-    confirm_replacement: impl FnOnce() -> Result<()>,
-) -> Result<()> {
+fn flush_and_prepare_tagged_copy(temp: &TempFile, target_path: &Path) -> Result<()> {
     // Flush the tagged copy before it becomes the user's file. Without this a
     // crash between rename and writeback can leave a truncated file where the
     // original used to be.
@@ -767,10 +780,7 @@ fn flush_and_confirm_tagged_copy(
         let _ = std::fs::set_permissions(temp.path(), metadata.permissions());
     }
 
-    // Last gate before the replacement becomes visible: an authority-checked
-    // caller refuses here if the pathname no longer names the exact file it
-    // copied from.
-    confirm_replacement()
+    Ok(())
 }
 
 /// Flush a file's contents to disk.
@@ -1355,6 +1365,73 @@ mod tests {
             directory.temp_files().is_empty(),
             "a refused commit leaves no private sibling behind"
         );
+    }
+
+    /// A parent directory displaced between selection and commit strands the
+    /// staging area inside whatever now occupies the old pathname. The
+    /// retained authority stages and replaces only through its retained
+    /// parent object, so the commit must refuse, leave the impostor
+    /// untouched, and clean up the stranded sibling.
+    #[cfg(unix)]
+    #[test]
+    fn a_mutation_target_write_refuses_when_the_parent_directory_was_displaced() {
+        let directory = TestDirectory::new("mutation-parent-e2e");
+        let album = directory.path.join("album");
+        std::fs::create_dir(&album).expect("create album");
+        let track = album.join("silence.flac");
+        std::fs::write(
+            &track,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        )
+        .expect("write fixture");
+
+        let authority = std::sync::Arc::new(
+            crate::local::root_authority::MountedRootAuthority::acquire(&directory.path)
+                .expect("acquire mounted authority"),
+        );
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+
+        let displaced_album = directory.path.join("displaced-album");
+        std::fs::rename(&album, &displaced_album).expect("displace retained parent");
+        std::fs::create_dir(&album).expect("install impostor parent");
+        std::fs::write(&track, b"impostor audio").expect("install impostor file");
+
+        write_tags_with_mutation_target(&target, &year("2026"))
+            .expect_err("a stranded staging area must refuse the commit");
+
+        assert_eq!(
+            std::fs::read(&track).expect("read impostor file"),
+            b"impostor audio",
+            "the impostor directory must never receive the replacement"
+        );
+        let displaced_track = displaced_album.join("silence.flac");
+        let displaced_tagged =
+            lofty::read_from_path(&displaced_track).expect("reopen the displaced admitted file");
+        assert_ne!(
+            displaced_tagged
+                .primary_tag()
+                .expect("primary tag")
+                .get_string(ItemKey::Year),
+            Some("2026"),
+            "the admitted file must be untouched by the refused commit"
+        );
+        for directory_path in [&album, &displaced_album] {
+            let leftovers: Vec<PathBuf> = std::fs::read_dir(directory_path)
+                .expect("list displaced directories")
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| is_tag_write_temp_file(path))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "a refused commit must clean up its stranded sibling: {leftovers:?}"
+            );
+        }
     }
 
     #[test]
