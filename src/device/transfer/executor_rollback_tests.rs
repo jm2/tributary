@@ -210,6 +210,53 @@ fn overwrite_of_absent_destination_rolls_back_as_published() {
     );
 }
 
+/// A destination that existed at planning, was deleted, and was recreated
+/// by a concurrent writer before the overwrite stage ran: the commit must
+/// bind the racer's file as the replaced original, so rollback restores the
+/// racer's bytes instead of deleting data the transfer does not own.
+#[test]
+fn overwrite_rollback_restores_racer_recreated_destination() {
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    write_source_file(source_root.path(), "one.flac", b"new one");
+    write_source_file(source_root.path(), "two.flac", b"new two");
+    std::fs::write(
+        destination_root.path().join("one.flac"),
+        b"planned occupant",
+    )
+    .expect("write destination occupied at planning");
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = transfer_request(
+        source,
+        destination,
+        vec![
+            TransferItem::same(PathBuf::from("one.flac")),
+            TransferItem::same(PathBuf::from("two.flac")),
+        ],
+        ConflictPolicy::Overwrite,
+    );
+    let plan = TransferPlanner::new().plan(&request).expect("plan");
+    // The planned occupant vanishes and a racer recreates the name before
+    // execution; the second source is then removed so stage two fails after
+    // stage one committed over the racer.
+    std::fs::remove_file(destination_root.path().join("one.flac")).expect("occupant vanishes");
+    std::fs::write(destination_root.path().join("one.flac"), b"racer bytes")
+        .expect("racer recreates destination");
+    std::fs::remove_file(source_root.path().join("two.flac")).expect("remove source two");
+    let _error = run_plan_expect_failure(request, plan);
+    assert_eq!(
+        std::fs::read(destination_root.path().join("one.flac")).expect("read restored"),
+        b"racer bytes",
+        "rollback must restore the concurrent writer's file, never delete it"
+    );
+    assert_eq!(
+        entry_names(destination_root.path()),
+        vec!["one.flac".to_string()],
+        "restored racer file only: no backups, no published copies, no staged files"
+    );
+}
+
 /// A progress sink that flips a shared cancellation trigger from inside a
 /// callback mid-transfer.
 struct CancellingProgress {
