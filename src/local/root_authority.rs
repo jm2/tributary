@@ -2455,8 +2455,14 @@ fn validate_leaf_name(leaf: &OsStr) -> io::Result<()> {
     {
         use std::os::windows::ffi::OsStrExt;
 
+        // `as` casts are not valid in match patterns, so the wide-char
+        // separators are declared as constants and matched by name.
+        const BACKSLASH: u16 = b'\\' as u16;
+        const FORWARD_SLASH: u16 = b'/' as u16;
+        const COLON: u16 = b':' as u16;
+
         for unit in leaf.encode_wide() {
-            if matches!(unit, b'\\' as u16 | b'/' as u16 | b':' as u16) {
+            if matches!(unit, BACKSLASH | FORWARD_SLASH | COLON) {
                 return Err(invalid_input("leaf name contains a path separator"));
             }
         }
