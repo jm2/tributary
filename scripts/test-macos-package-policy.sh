@@ -47,6 +47,76 @@ assert_no_policy_manifests() {
   done
 }
 
+# Exercise the exact generated launcher with unset, empty, and inherited
+# library paths. Intercept exec in the same shell: macOS SIP can strip DYLD_*
+# when starting another system interpreter and otherwise hide this regression.
+LAUNCHER_CONTENTS="${TEST_ROOT}/Launcher With Spaces.app/Contents"
+mkdir -p "$LAUNCHER_CONTENTS/MacOS"
+LAUNCHER_CONTENTS="$(cd "$LAUNCHER_CONTENTS" && pwd)"
+LAUNCHER="$LAUNCHER_CONTENTS/MacOS/Tributary"
+awk '
+  /^cat > .*BIN_DEST.*<< / { copying = 1; next }
+  copying && /^EOF$/ { exit }
+  copying { print }
+' "${SCRIPT_DIR}/build-macos.sh" > "$LAUNCHER"
+[[ -s "$LAUNCHER" ]] || fail "could not extract the macOS launcher"
+
+# Verify bundled library precedence and argument forwarding for the supplied
+# environment mode (unset or set) and inherited library path in a subshell.
+assert_launcher_library_path() (
+  trap - EXIT
+  mode="$1"
+  inherited="$2"
+  expected="$LAUNCHER_CONTENTS/Frameworks"
+  if [[ "$mode" == unset ]]; then
+    unset DYLD_LIBRARY_PATH
+  else
+    export DYLD_LIBRARY_PATH="$inherited"
+    [[ -z "$inherited" ]] || expected="${expected}:${inherited}"
+  fi
+  # Validate the environment and argv at the generated launcher's exec call.
+  # shellcheck disable=SC2329
+  exec() {
+    [[ "${DYLD_LIBRARY_PATH-}" == "$expected" ]] \
+      || fail "launcher lost bundled precedence or user library paths (${mode})"
+    [[ "$#" -eq 3 && "$1" == "${LAUNCHER}-bin" \
+       && "$2" == 'argument with spaces' && "$3" == '*.flac' ]] \
+      || fail "launcher changed executable selection or arguments"
+  }
+  # The launcher is extracted into the temporary fixture above at test runtime.
+  # shellcheck source=/dev/null
+  source "$LAUNCHER" 'argument with spaces' '*.flac'
+)
+
+assert_launcher_library_path unset ''
+assert_launcher_library_path set ''
+assert_launcher_library_path set '/custom/lib'
+assert_launcher_library_path set '/custom/Library One:/custom/Library Two'
+assert_launcher_library_path set ':/custom/Library One::/custom/Library Two:'
+
+# The v0.6.2 bundle contained the Soup plugin without the library it opens
+# dynamically. A plugin-only inventory must fail even on a Homebrew host.
+AUDIO_PLUGINS="${TEST_ROOT}/Audio Runtime/plugins"
+AUDIO_FRAMEWORKS="${TEST_ROOT}/Audio Runtime/Frameworks"
+mkdir -p "$AUDIO_PLUGINS" "$AUDIO_FRAMEWORKS"
+for plugin in libgstcoreelements libgstosxaudio libgstplayback libgstsoup; do
+  printf 'fixture\n' > "$AUDIO_PLUGINS/${plugin}.dylib"
+done
+assert_status 1 macos_validate_audio_runtime_inventory "$AUDIO_PLUGINS" "$AUDIO_FRAMEWORKS"
+[[ "$MACOS_PACKAGE_POLICY_REASON" == *'libsoup runtime'* ]] \
+  || fail "plugin-only audio runtime did not identify the missing libsoup library"
+touch "$AUDIO_FRAMEWORKS/libsoup-3.0.0.dylib"
+assert_status 1 macos_validate_audio_runtime_inventory "$AUDIO_PLUGINS" "$AUDIO_FRAMEWORKS"
+printf 'fixture\n' > "$AUDIO_FRAMEWORKS/libsoup-3.0.0.dylib"
+assert_status 0 macos_validate_audio_runtime_inventory "$AUDIO_PLUGINS" "$AUDIO_FRAMEWORKS"
+for plugin in libgstcoreelements libgstosxaudio libgstplayback libgstsoup; do
+  rm "$AUDIO_PLUGINS/${plugin}.dylib"
+  assert_status 1 macos_validate_audio_runtime_inventory "$AUDIO_PLUGINS" "$AUDIO_FRAMEWORKS"
+  [[ "$MACOS_PACKAGE_POLICY_REASON" == *"${plugin}"* ]] \
+    || fail "missing audio plugin did not produce a useful diagnostic: ${plugin}"
+  printf 'fixture\n' > "$AUDIO_PLUGINS/${plugin}.dylib"
+done
+
 POLICY_FILE="$(macos_package_policy_default_file)"
 
 EMPTY_POLICY="${TEST_ROOT}/empty-policy.txt"

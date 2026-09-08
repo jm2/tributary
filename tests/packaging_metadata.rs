@@ -17,6 +17,7 @@ const README: &str = include_str!("../README.md");
 const BUILD_SCRIPT: &str = include_str!("../build.rs");
 const BUILD_LINUX: &str = include_str!("../scripts/build-linux.sh");
 const BUILD_MACOS: &str = include_str!("../scripts/build-macos.sh");
+const MACOS_PACKAGE_POLICY: &str = include_str!("../scripts/macos-package-policy.sh");
 const BUILD_WINDOWS: &str = include_str!("../scripts/build-windows.ps1");
 const WINDOWS_AUDIO: &str = include_str!("../src/audio/windows_audio.rs");
 const WINDOWS_RUNTIME_PROBE: &str = include_str!("../src/audio/runtime_probe.rs");
@@ -832,6 +833,8 @@ fn windows_bundle_requires_dynamic_system_audio_output_support() {
     );
 }
 
+/// Guard the macOS package and probe contracts for the app-owned output route,
+/// including its required plugins, native dependencies, and channel caps.
 #[test]
 fn macos_bundle_requires_app_owned_system_audio_output_support() {
     let manifest = manifest();
@@ -843,10 +846,11 @@ fn macos_bundle_requires_app_owned_system_audio_output_support() {
         "CoreAudio output notifications must remain target-only macOS dependencies"
     );
     assert!(
-        BUILD_MACOS.contains("for required_route_plugin in libgstcoreelements libgstosxaudio; do")
-            && BUILD_MACOS.contains(
-                "error \"Missing required GStreamer audio-route plugin: ${required_route_plugin}\""
-            ),
+        BUILD_MACOS.contains(
+            "if ! macos_validate_audio_runtime_inventory \"$GST_PLUGIN_DEST\" \"$FRAMEWORKS_DIR\"; then"
+        ) && MACOS_PACKAGE_POLICY.contains(
+            "for plugin in libgstcoreelements libgstosxaudio libgstplayback libgstsoup; do"
+        ),
         "the macOS bundle must fail closed when its explicit route elements are absent"
     );
     assert!(

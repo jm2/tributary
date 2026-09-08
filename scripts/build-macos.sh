@@ -90,7 +90,7 @@ info "Checking build dependencies..."
 command -v cargo &>/dev/null || error "cargo not found. Install Rust: https://rustup.rs"
 command -v brew  &>/dev/null || error "Homebrew not found. Install: https://brew.sh"
 
-for formula in gtk4 libadwaita pkg-config gstreamer gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav adwaita-icon-theme; do
+for formula in gtk4 libadwaita pkg-config gstreamer gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav libsoup adwaita-icon-theme; do
   brew list "$formula" &>/dev/null || {
     warn "$formula not installed. Installing via Homebrew..."
     brew install "$formula"
@@ -190,12 +190,10 @@ BUNDLE_ROOT="$(dirname "$DIR")"
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 # The Rust entry point sets absolute GTK/GStreamer resource paths before either
-# toolkit initializes and preserves every explicit user override. DYLD must be
-# available before the binary starts, but an explicit value (including empty)
-# remains authoritative.
-if [[ -z "${DYLD_LIBRARY_PATH+x}" ]]; then
-  export DYLD_LIBRARY_PATH="$BUNDLE_ROOT/Frameworks"
-fi
+# toolkit initializes and preserves explicit toolkit overrides. Bundled dylibs
+# must take precedence before the binary starts, including bare-name dlopen
+# dependencies such as libsoup. Retain user search entries as fallbacks.
+export DYLD_LIBRARY_PATH="$BUNDLE_ROOT/Frameworks${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 
 # Launch the actual Rust binary
 exec "$DIR/Tributary-bin" "$@"
@@ -415,6 +413,16 @@ fix_rpaths() {
 fix_rpaths "$BIN"
 QUEUE=("${NEWLY_COPIED[@]+"${NEWLY_COPIED[@]}"}")
 
+# Homebrew's Soup plugin uses dlopen("libsoup-3.0.0.dylib"), so otool -L
+# cannot discover this dependency. Seed it explicitly, including its linked
+# dependency closure, before signing. The launcher's Frameworks search path
+# then supplies the exact SONAME requested by the plugin on a clean Mac.
+SOUP_RUNTIME_SRC="$(brew --prefix libsoup)/lib/libsoup-3.0.0.dylib"
+[[ -f "$SOUP_RUNTIME_SRC" ]] || error "Required libsoup runtime is missing: ${SOUP_RUNTIME_SRC}"
+if copy_dylib "$SOUP_RUNTIME_SRC"; then
+  QUEUE+=("${FRAMEWORKS_DIR}/libsoup-3.0.0.dylib")
+fi
+
 PASS=1
 while [[ ${#QUEUE[@]} -gt 0 ]]; do
   info "  Dylib pass ${PASS}: processing ${#QUEUE[@]} libraries..."
@@ -480,14 +488,12 @@ rm -f "${APP_BUNDLE}/Contents/MacOS/gst-registry.bin"
 
 # Verify critical GStreamer plugins for audio playback. Tributary explicitly
 # owns the system-default route through identity → capsfilter → osxaudiosink,
-# so those plugins are hard package contracts rather than decoder/container
-# warnings. The unguarded loop intentionally fails closed when the entire
-# plugin directory is absent; the warn-only codec inventory below does not.
-for required_route_plugin in libgstcoreelements libgstosxaudio; do
-  if [[ ! -f "$GST_PLUGIN_DEST/${required_route_plugin}.dylib" ]]; then
-    error "Missing required GStreamer audio-route plugin: ${required_route_plugin}"
-  fi
-done
+# so those plugins, playbin, and the protected HTTP runtime are hard package
+# contracts. The inventory also rejects an absent plugin directory; the
+# warn-only codec inventory below does not.
+if ! macos_validate_audio_runtime_inventory "$GST_PLUGIN_DEST" "$FRAMEWORKS_DIR"; then
+  error "$MACOS_PACKAGE_POLICY_REASON"
+fi
 if [[ -d "$GST_PLUGIN_DEST" ]]; then
   for critical_plugin in libgstisomp4 libgstlibav libgstaudioparsers libgstaudioconvert libgstaudioresample; do
     if ! ls "$GST_PLUGIN_DEST"/${critical_plugin}.dylib 1>/dev/null 2>&1; then
@@ -553,6 +559,11 @@ mkdir -p "$PROBE_PARENT"
 ditto "$APP_BUNDLE" "$PROBE_APP"
 chmod -R a-w "$PROBE_APP"
 
+# Set an inherited library path after the system shell starts: macOS SIP may
+# strip DYLD_* while launching /bin/bash and otherwise mask a launcher bug.
+# Sourcing the exact signed wrapper still execs the packaged binary normally.
+# Positional parameters in the command string must expand in the child shell.
+# shellcheck disable=SC2016
 env -u GST_REGISTRY \
     -u GST_REGISTRY_1_0 \
     -u GDK_PIXBUF_MODULE_FILE \
@@ -568,6 +579,9 @@ env -u GST_REGISTRY \
     -u GSETTINGS_SCHEMA_DIR \
     -u GTK_PATH \
     -u DYLD_LIBRARY_PATH \
+    /bin/bash -c 'export DYLD_LIBRARY_PATH="$1"; shift; source "$@"' \
+    tributary-bundle-probe \
+    "$PROBE_CACHE/User Libraries One:$PROBE_CACHE/User Libraries Two" \
     "$PROBE_APP/Contents/MacOS/${APP_NAME}" \
     --tributary-platform-runtime-probe "$PROBE_CACHE"
 

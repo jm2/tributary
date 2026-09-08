@@ -987,6 +987,8 @@ fn atomic_replace(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate icon loading, protected audio playback, and external runtime caches
+/// for the relocated macOS bundle without opening a physical audio output.
 #[cfg(target_os = "macos")]
 fn run_macos_runtime_probe(
     layout: &MacBundleLayout,
@@ -1005,7 +1007,21 @@ fn run_macos_runtime_probe(
         bail!("bundled app icon decoded to an invalid size");
     }
 
-    gstreamer::init().context("GStreamer initialization failed during bundle probe")?;
+    // Soup can be loaded with dlopen and therefore need not appear in the
+    // plugin's Mach-O imports. Require the runtime in the bundle even on a
+    // build host where Homebrew could otherwise hide a missing dependency.
+    if !layout
+        .macos_dir
+        .join("../Frameworks/libsoup-3.0.0.dylib")
+        .is_file()
+    {
+        bail!("required bundled libsoup runtime is missing");
+    }
+    // Exercise real HTTP source selection, direct proxy routing, FLAC decode,
+    // and EOS against the copied plugins before accepting the signed bundle.
+    crate::audio::run_packaged_audio_runtime_probe(
+        &layout.resources_dir.join("lib/gstreamer-1.0"),
+    )?;
     if gstreamer::ElementFactory::find("playbin3").is_none() {
         bail!("required bundled GStreamer playbin3 factory was not discovered");
     }
