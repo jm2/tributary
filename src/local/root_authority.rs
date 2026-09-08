@@ -8,7 +8,12 @@
 //! mount-generation checks to an ephemeral mounted root without requiring the
 //! removable filesystem to contain an application marker.
 
-use std::ffi::{OsStr, OsString};
+// `OsStr` is only referenced by `#[cfg(unix)]` helpers (e.g.
+// `open_unix_regular_at`); importing it unconditionally breaks the Windows
+// build with an unused-import error under `-D warnings`.
+#[cfg(unix)]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
