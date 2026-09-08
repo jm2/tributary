@@ -3,8 +3,8 @@
 - Status: design only — P2.4 equalizer design record; implementation pending
 - Decision date: 2026-07-24
 - Tracking issue: [#49](https://github.com/jm2/tributary/issues/49)
-- Backlog entry: [`task.md`](../task.md) (P2.4)
-- Roadmap rationale: [`roadmap.md`](../roadmap.md) (Audio-output plan, item 1)
+- Backlog entry: [`task.md`](task.md) (P2.4)
+- Roadmap rationale: [`roadmap.md`](roadmap.md) (Audio-output plan, item 1)
 
 This document defines the equalizer feature for Tributary: what the user can adjust, how each output
 backend is classified, where DSP runs in the pipeline, how live reconfiguration is bounded, what is
@@ -252,7 +252,7 @@ the changes take effect. The boundary is:
 | `Preamp` | yes | Buffer-boundary property-write transaction on the bin |
 | Single band `bandN` | yes | Buffer-boundary property-write transaction on the bin |
 | Multiple bands at once | yes | Buffer-boundary property-write transaction on the bin |
-| `Clip protection` | yes | Dynamic in-bin `rglimiter` insert/remove with state sync |
+| `Clip protection` | yes | Dynamic in-bin `rglimiter` insert/remove under a blocking pad probe |
 | Band centres / Q | NO | Frozen by the spec; changing requires a new contract |
 
 Live reconfiguration of `Enabled` installs or removes the equalizer bin at the
@@ -276,11 +276,17 @@ EOS-resending. `g_object_set` is atomic per property with respect to the streami
 element's object lock serializes the write against buffer processing — so a single write takes
 effect on the first buffer that element processes after the write returns.
 
-The contract does **not** claim cross-element atomicity from `g_object_freeze_notify` /
-`g_object_thaw_notify`. That pair only batches GObject `notify` signal emission, so the UI
-observes one update per transaction instead of eleven; it is a notification-batching tool, it
-provides no audio-buffer ordering guarantee, and this contract uses it only for the batching
-purpose.
+The contract does **not** use `g_object_freeze_notify` / `g_object_thaw_notify` to batch UI
+updates, and does not claim cross-element atomicity from them. Freezing a GObject only
+defers `notify` emission; on thaw every changed property still emits its own `notify`, so
+ten `bandN` writes still produce ten emissions, and the preamp lives on a separate `volume`
+GObject that the freeze does not cover at all. The one-update-per-transaction UI guarantee
+is delivered by a module-level aggregate notification instead: when the probe callback (or
+a single-property write) finishes applying a batch, the equalizer module emits exactly one
+settings-changed event carrying the applied `EqSettings` snapshot, and the UI re-renders
+from that single snapshot. Per-property `notify` signals remain connected for tests and
+diagnostics, but the UI update path is the aggregate event only. The aggregate event
+provides no audio-buffer ordering guarantee and makes none; ordering is the probe's job.
 
 The *buffer-boundary transaction* required for multi-property updates (preamp changes, preset
 loads, multi-band batched edits) is an **idle pad probe** on the bin's sink ghost pad — the
@@ -312,15 +318,30 @@ on a `Buffering` message.
 
 `Clip protection` toggles the `rglimiter` element's *presence* inside the installed bin as a
 dynamic topology change while the pipeline stays in `Playing` — an in-bin element
-insert/remove requires no pipeline pause:
+insert/remove requires no pipeline pause. The topology edit must never run on live data
+flow: between the unlink and the re-link the EQ output pad has no downstream peer, and a
+buffer pushed in that window fails with `GST_FLOW_NOT_LINKED`, which the bus surfaces as a
+pipeline error before the fallback path can run. The edit is therefore performed inside a
+*blocking pad probe*, the mechanism GStreamer provides for rewiring topology between
+buffers:
 
-1. Unlink `equalizer-10bands` from its downstream neighbor,
-2. add or remove `rglimiter` inside the bin (on add: link it, then
+1. `gst_pad_add_probe` on the `equalizer-10bands` src pad with
+   `GST_PAD_PROBE_TYPE_BLOCK_DOWNSTREAM` combined with `GST_PAD_PROBE_TYPE_IDLE`. The probe
+   blocks the next buffer (or fires immediately on an idle boundary) and holds data flow
+   stopped for as long as its callback runs, so no buffer can reach the pads being rewired.
+2. Inside the probe callback: unlink `equalizer-10bands` from its downstream neighbor, add
+   or remove `rglimiter` inside the bin (on add: link it, then
    `gst_element_sync_state_with_parent` so the element's state follows the running bin; on
-   remove: unlink it, then set it to `NULL` before dropping the reference),
-3. re-link the chain (`equalizer-10bands` ↔ `rglimiter` ↔ post-EQ `audioconvert`, or directly
-   `equalizer-10bands` ↔ post-EQ `audioconvert` when the limiter is removed),
-4. mark the change in metrics as a brief swap (≤ 100 ms by spec).
+   remove: unlink it, then set it to `NULL` before dropping the reference), and re-link the
+   chain (`equalizer-10bands` ↔ `rglimiter` ↔ post-EQ `audioconvert`, or directly
+   `equalizer-10bands` ↔ post-EQ `audioconvert` when the limiter is removed).
+3. Return `GST_PAD_PROBE_REMOVE` from the callback so the probe uninstalls itself and
+   blocked data flow resumes across the new topology.
+4. Mark the change in metrics as a brief swap (≤ 100 ms by spec).
+
+Because every step of the topology edit happens while the blocking probe holds the stream,
+no buffer ever observes the intermediate unlinked state and `GST_FLOW_NOT_LINKED` cannot
+reach the bus from this path.
 
 If the dynamic re-link fails, the implementation falls back to the pause/relink seam (pause
 the pipeline, add/remove and link, resume). If the limiter cannot be attached by either path,
@@ -370,11 +391,17 @@ The fifteen keys, in six logical groups:
 
 The writer uses an *atomic replace* protocol: it constructs the new content in memory, creates a
 uniquely named temporary file in the destination's directory (mode `0600`, owned by the user),
-writes the entire file in a single `write()`/`pwrite()` (the size is bounded by the schema — at
-most a few hundred bytes even at the maximum band precision), `fsync`s the file descriptor, then
-`close()`s it, then `rename(2)`s the temp file to `equalizer.cfg`, then `fsync`s the directory.
-After the directory `fsync` returns, the new file is durable; an on-disk reader observes either
-the prior file or the new file, never a partial one.
+writes the entire buffer with a write-all loop that keeps writing until every byte is accepted
+or a permanent error surfaces (Rust's `std::io::Write::write_all` provides exactly this
+semantics) — a single `write()`/`pwrite()` may legally complete with a short byte count even
+for a small regular file, and syncing-and-renaming after a short write would publish a
+truncated file that the next load would classify as malformed and discard — `fsync`s the file
+descriptor, then `close()`s it, then `rename(2)`s the temp file to `equalizer.cfg`, then
+`fsync`s the directory. The content is bounded by the schema — at most a few hundred bytes
+even at the maximum band precision — so the loop terminates in one pass in practice; the loop,
+not the size assumption, is what makes the published file complete. After the directory
+`fsync` returns, the new file is durable; an on-disk reader observes either the prior file or
+the new file, never a partial one.
 
 The temp name is minted fresh for every write attempt — a random segment (for example a UUID, as
 in the existing XSPF-export writer) beside the destination — and created exclusively (`O_EXCL`,
@@ -440,6 +467,13 @@ Validation rules on read:
   stale band values with fresh ones.
 - `bandN_db` values outside `[-24.0, +12.0]` are clamped to the boundary.
 - `preamp_db` outside `[-24.0, +12.0]` is clamped to the boundary.
+- A `preamp_db` or `bandN_db` value inside the range but not an exact multiple of 0.5 (for
+  example `0.1` or `3.7`) is snapped to the nearest 0.5 dB step, ties away from zero, before
+  use. The snapped value is what the runtime materializes and what the next save persists, so
+  no off-grid value crosses the read boundary into the runtime — the bounded user surface
+  would reject it, and runtime code must not be able to materialize it either. Off-grid
+  values are coerced per key exactly like the range clamps above; they do not invalidate the
+  file.
 - `preset` outside the named set (including unknown legacy values) becomes `"flat"`; the band
   vector is *not* reset, only the persisted name is coerced.
 - `enabled` not parseable as bool becomes `"false"`.
@@ -539,7 +573,11 @@ Diagnostics are bounded:
   preset name. It never carries individual band values, preamp values, or file paths.
 - A single informational log message is emitted when the `rglimiter` is inserted into or
   removed from the local-output pipeline. It carries the boolean clip-protection state.
-- The `equalizer.cfg` file path is logged at debug only, never at info or above.
+- The `equalizer.cfg` file path is logged at debug only in normal operation, with exactly two
+  deliberate exceptions: the malformed-file diagnostic and the transient-read-failure
+  diagnostic publish the full path at warn, because the path is the remediation target the
+  user must inspect or fix. Outside those two warnings, no log at info or above carries the
+  path, and the informational chain insert/remove messages never carry it.
 - Diagnostic state on a malformed file is emitted at warn with the file path, byte count, and
   bad key only. The user's prior preferences are not dumped; the file content is not dumped.
 - EQ metrics (e.g. peak amplitude per band, average gain) are deliberately not exposed in the
@@ -580,13 +618,14 @@ for this contract; new conditions require a new revision.
    buffer passes; no gapless discontinuity; new value reaches the filter on the next buffer.
 4. **Select Pop preset mid-playback.** `EqSettings` struct captures ten bands + preamp; one
    idle-pad-probe transaction on `audio-filter-sink` writes all ten bands and the preamp
-   between buffers; the UI observes one update per transaction (`notify` batching); preset
-   combo displays `Pop`.
+   between buffers; the UI observes one update per transaction via the aggregate
+   settings-changed event; preset combo displays `Pop`.
 5. **Manual band edit mid-playback.** Single property write on `bandN`; persisted `preset`
    field becomes `custom`; UI combo displays `Custom`.
-6. **Cycle clip protection Off → Soft → Off.** Dynamic in-bin insert/remove with state sync
-   each time; no pipeline pause; total swap ≤ 100 ms per toggle; pause/relink fallback
-   exercised if the dynamic re-link is forced to fail.
+6. **Cycle clip protection Off → Soft → Off.** Dynamic in-bin insert/remove under a blocking
+    pad probe, with state sync each time, so no buffer observes the intermediate topology; no
+    pipeline pause; total swap ≤ 100 ms per toggle; pause/relink fallback exercised if the
+    dynamic re-link is forced to fail.
 7. **Sine input above +6 dBFS with clip protection = Soft.** Output peak converges
    asymptotically to 0 dBFS without exceeding it; soft-knee compression engages at the −6 dBFS
    threshold; a 0 dBFS input is attenuated by approximately 1.1 dB; reflects the `rglimiter`
@@ -618,6 +657,9 @@ for this contract; new conditions require a new revision.
 19. **Unrelated playback error with EQ installed (decoder/network/sink failure).** The
     equalizer bin remains installed; equalizer state is untouched; the passthrough fallback is
     not triggered by a non-equalizer failure.
+20. **Off-grid persisted gain in saved file (e.g. `band0_db="3.7"`).** Value snapped to the
+    nearest 0.5 dB (ties away from zero); other keys remain valid; the snapped value is what
+    the runtime applies and what the next save persists.
 
 ## Implementation boundary
 
