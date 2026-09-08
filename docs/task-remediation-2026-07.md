@@ -28,32 +28,30 @@ Status summary:
 - [ ] P2 resilience and packaging complete
 - [x] P3 architecture and integration coverage complete
 
-Progress snapshot (2026-07-18, amended 2026-09-03), recounted from the literal P0–P3 task
-checkboxes to correct the earlier numerator/denominator drift. The live protected-playback
-finding recorded under P2.11 now has eight independently verifiable tasks rather than the
-original three compound boxes. The 2026-07-18 recount excluded the two then-deferred P0.7
-live-workflow verification boxes and the withdrawn P2.6 false finding; on 2026-09-03 the P0.7
-live manual-dispatch verification ran (Actions run
-[33781875201](https://github.com/jm2/tributary/actions/runs/33781875201), test workflow in PR
-#224), so those two boxes are complete and counted again, and PR #227 closed the v0.6.2 P0.8
+Progress snapshot (2026-07-18, amended 2026-09-03), recounted from the literal P0–P3 task checkboxes
+to correct the earlier numerator/denominator drift. The live protected-playback finding recorded
+under P2.11 now has eight independently verifiable tasks rather than the original three compound
+boxes. The 2026-07-18 recount excluded the two then-deferred P0.7 live-workflow verification boxes
+and the withdrawn P2.6 false finding; on 2026-09-03 the P0.7 live manual-dispatch verification ran
+(Actions run [33781875201](https://github.com/jm2/tributary/actions/runs/33781875201), test workflow
+in PR #224), so those two boxes are complete and counted again, and PR #227 closed the v0.6.2 P0.8
 re-evaluation box. The withdrawn P2.6 false finding, section-summary, and global-validation gate
-boxes are still not task progress: **223/226 (98.7%)** in-scope checklist items complete:
-**53/53 P0**, **64/64 P1**, **76/79 P2**, and **30/30 P3**. This incorporates the four P2.9
-boxes closed by PR #99 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7
-platform-cache boxes closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR
-#102, and the three P2.10 ACK/terminal/orphan-semantics boxes implemented in PR #104, the
-bounded-ingress box implemented in PR #105, the cancellable resolver box implemented in PR #106,
-and the held-ACK/slow-greeting/real-IPv6 coverage box completed by PR #107, and the final
-exclusive-control contract plus implementation record accepted in PR #112, since the earlier
-snapshot. The deterministic protected-HTTP compatibility box under P2.11 is also complete in PR
-#108. The process-isolated real-GStreamer fake-backend box under P2.11 is complete in PR #109.
-The packaged Windows plugin/source-policy/decode proof is complete in PR #110 after successful
-native x86_64 and ARM64 package executions; live Windows DAAP and Subsonic playback remains
-open. The P3.2 README claim was re-audited and closed because the document already labels its
-diagram as intended and names the shipping abstraction gaps exactly. P3.5 now reports every
-Linux-host source area in one pinned aggregate, keeps different native source sets as
-informational reports, and enforces the baseline accepted by two exact pinned PR executions in
-PR #111.
+boxes are still not task progress: **223/226 (98.7%)** in-scope checklist items complete: **53/53
+P0**, **64/64 P1**, **76/79 P2**, and **30/30 P3**. This incorporates the four P2.9 boxes closed by
+PR #99 and the seven remaining P2.6 boxes closed by PR #100, plus the five P2.7 platform-cache boxes
+closed by PR #101, the four P2.8 Chromecast-deadline boxes closed by PR #102, and the three P2.10
+ACK/terminal/orphan-semantics boxes implemented in PR #104, the bounded-ingress box implemented in
+PR #105, the cancellable resolver box implemented in PR #106, and the
+held-ACK/slow-greeting/real-IPv6 coverage box completed by PR #107, and the final exclusive-control
+contract plus implementation record accepted in PR #112, since the earlier snapshot. The
+deterministic protected-HTTP compatibility box under P2.11 is also complete in PR #108. The
+process-isolated real-GStreamer fake-backend box under P2.11 is complete in PR #109. The packaged
+Windows plugin/source-policy/decode proof is complete in PR #110 after successful native x86_64 and
+ARM64 package executions; live Windows DAAP and Subsonic playback remains open. The P3.2 README
+claim was re-audited and closed because the document already labels its diagram as intended and
+names the shipping abstraction gaps exactly. P3.5 now reports every Linux-host source area in one
+pinned aggregate, keeps different native source sets as informational reports, and enforces the
+baseline accepted by two exact pinned PR executions in PR #111.
 
 PR #123's P3.1 production cutover closed the centralized refresh/cancellation/disconnect/failure
 box while deliberately leaving the final implementation-record box unchecked, so at that cutover
@@ -232,7 +230,8 @@ unsupported by-ID track methods now resolve compact keys before narrowed SQL que
 milestone the common local integration boundary, invalid persisted `TrackId` fallback, and final
 P3.2 implementation record remained open. PR #116 subsequently closed the shared-catalogue seam
 and P3.2 record; PR #120 preserves exact persisted local IDs and replaces the random fallback with
-a frozen deterministic compatibility projection under P3.1. Static analysis passed in run 29607279056 and the complete exact-toolchain,
+a frozen deterministic compatibility projection under P3.1. Static analysis passed in run
+29607279056 and the complete exact-toolchain,
 coverage, audit, native, Flatpak, and package matrix passed in run 29607280861. The review window
 produced no code findings; Gemini posted only its service-sunset notice.
 The first documentation-head rerun, 29608292265, then exposed a pre-existing MPD worker-enqueue
@@ -667,6 +666,7 @@ media only in the app-owned proxy's immediate exact-origin upstream request.
 
 Confirmed path, end to end:
 
+<!-- markdownlint-disable MD013 -->
 | Step | Location |
 |---|---|
 | Generic catalogue | Subsonic, Jellyfin, Plex, and DAAP tracks retain stable application identity and exact bounded source-scoped `TrackId`; their registry-owned adapters keep stream/artwork locators, authentication, routes, leases, and DAAP session state private. A type-local Subsonic album/artist ID therefore cannot overwrite track art. |
@@ -675,6 +675,7 @@ Confirmed path, end to end:
 | Playback and artwork | `ui/playback.rs` asks `SourceRegistry` to resolve the exact source/track/epoch only when the item is consumed. A stale epoch fails before adapter invocation; adapter, lease, and epoch are rechecked after await, and playback/artwork generations reject completion after Stop, Next, output replacement, or a newer replay. |
 | Credential isolation | `ResolvedHttpRequest` is deliberately non-debuggable and non-serializable. Plex uses a sensitive `X-Plex-Token` header and Jellyfin a sensitive `X-Emby-Authorization` header. Subsonic protocol authentication remains private query material (`u` plus `t`/`s` or HTTPS-only `p`), and DAAP's bearer `session-id` is now private query material too; each is appended only inside the app-owned proxy immediately before the exact-origin fetch. |
 | Output boundary | `AudioOutput::load_resolved` accepts the typed request. Chromecast, MPD, local GStreamer, and AirPlay exchange it for their existing opaque, receiver-reachable tickets; none can fall back to the clean endpoint or serialized credential state. |
+<!-- markdownlint-enable MD013 -->
 
 The pathless source/track/epoch tuple and the output ticket are separate capabilities. The first is
 non-secret identity plus freshness evidence useful only inside Tributary; it does not authorize a
@@ -871,10 +872,10 @@ Acceptance criteria: playlist-entry integrity does not depend on an upstream def
   **instant**; a rule date is a **calendar day** interpreted as the half-open UTC range
   `[00:00, next 00:00)`. `Is` means "falls within that day", `IsAfter` means "after the whole of
   that day". An unparseable instant or rule date fails to match rather than matching everything.
-- [x] Validate relative-date amounts and use checked arithmetic. `Duration::days(i64::from(amount)
-  * 30)` on an editor-supplied `u32` could push the subtraction past chrono's representable range
-  and panic; the window is now computed with `checked_mul` + `try_days` + `checked_sub_signed`, and
-  a window too large to represent matches everything instead of blowing up.
+- [x] Validate relative-date amounts and use checked arithmetic. `Duration::days(i64::from(amount) *
+  30)` on an editor-supplied `u32` could push the subtraction past chrono's representable range and
+  panic; the window is now computed with `checked_mul` + `try_days` + `checked_sub_signed`, and a
+  window too large to represent matches everything instead of blowing up.
 - [x] Add date tests that use the shape production actually stores. The old tests passed *date-only*
   strings on both sides — a shape the database never produces — which is precisely why these bugs
   survived. 10 focused tests now cover day containment, both boundary days, offset normalization,
@@ -1401,7 +1402,12 @@ could not transmit to the device that was clicked.
   GTK main thread; they run synchronously under `load_uri` today. Resolved by removal: there is no
   subprocess left to probe, spawn, or tear down. The remaining teardown is a plain GStreamer
   `set_state(Null)`, identical to the local output's lifecycle.
-- [x] Add tests proving a missing `raopsink` produces a localized, non-silent refusal rather than a no-op stream. The focused tests pin the refusal at the policy seam and prove the load path emits `Error` (with the localized message) then `Stopped` — never a silent stream. The guidance intentionally names only `raopsink`; recommending `gst-plugins-bad` would be wrong because current supported GStreamer, Homebrew, and MSYS2 packages do not ship that element (see `release-component-policy.md`).
+- [x] Add tests proving a missing `raopsink` produces a localized, non-silent refusal rather than a
+  no-op stream. The focused tests pin the refusal at the policy seam and prove the load path emits
+  `Error` (with the localized message) then `Stopped` — never a silent stream. The guidance
+  intentionally names only `raopsink`; recommending `gst-plugins-bad` would be wrong because current
+  supported GStreamer, Homebrew, and MSYS2 packages do not ship that element (see
+  `release-component-policy.md`).
 - [x] Record implementation: PR #99.
 
 Acceptance criteria: superseded. The current acceptance for AirPlay 1 sending is captured by the
@@ -1721,7 +1727,8 @@ closed as a milestone.
   removable `SourceId` values; a new manual remote without a live owner persists a random ID,
   while promotion persists the discovered/environment row's existing deterministic ID through the
   strict version-1 envelope. Legacy arrays migrate atomically before publication or quarantine the
-  whole file on conflicts. Local rows retain exact SQLite IDs; Subsonic, Jellyfin, Plex, and DAAP retain exact
+  whole file on conflicts. Local rows retain exact SQLite IDs; Subsonic, Jellyfin, Plex, and DAAP
+  retain exact
   bounded song ID, item `Id`, `ratingKey`, and decimal `miid`; radio retains a bounded
   `stationuuid`; removable paths use a frozen lossless mount-relative native encoding; and
   external sessions receive independent random IDs. Queues use `MediaKey` plus a separate
@@ -2247,7 +2254,8 @@ tests. Focused coverage proves delivery-order and exact-generation state, exact 
 generation rejection, pathless random source/track identity plus exact epoch, already-open-handle
 retention across path replacement, pre/post-file-handle-clone lease checks, stale and retired
 resolution rejection, serialized cursor-based consumers, hidden-baseline ownership, same-output
-inertness, idempotent retirement, and publication-versus-shutdown rollback. Integrated review covers sequential invalid-candidate
+inertness, idempotent retirement, and publication-versus-shutdown rollback. Integrated review covers
+sequential invalid-candidate
 skipping, first-accepted selection, and embedded art after output acceptance.
 
 Automated PR review made non-authoritative leaf-name conversion tolerant of native non-UTF-8 bytes
@@ -2498,7 +2506,8 @@ Earlier local branch validation (2026-07-17, P3.1 stable-identity independent-re
 `cargo check --all-targets --all-features --locked`, strict
 `cargo clippy --all-targets --all-features --locked -- -D warnings`, and
 `cargo test --all-targets --all-features --locked` pass in debug and release. Each complete profile
-runs 20 library, 797 application, and 10 repository-metadata tests (827 total). The 49-test identity filter
+runs 20 library, 797 application, and 10 repository-metadata tests (827 total). The 49-test identity
+filter
 passes together with the production non-resolvable-origin/loopback-route promotion regression,
 exact native Subsonic/Jellyfin/Plex/DAAP assertions, saved-ID collision quarantine, production-queue
 capture, recycled-sidebar action, DAAP adversarial/expiration, and already-connected
@@ -3369,7 +3378,8 @@ Record scope or design decisions here so deferred work is explicit.
   copied plugins, and every newly copied MSYS2 runtime. The closure reads PE import tables with the
   exact architecture's absolute `llvm-readobj.exe` instead of executing plugins through `ldd`,
   inspects Soup alone for direct-edge attribution, and batches the remaining targets beneath
-  command-line, output, process, process-tree, and whole-closure limits. The exact helper is executed under a five-second deadline before GStreamer
+  command-line, output, process, process-tree, and whole-closure limits. The exact helper is
+  executed under a five-second deadline before GStreamer
   initialization so a missing dependent DLL or wrong-architecture scanner cannot be hidden by
   in-process plugin discovery. The probe is
   process-isolated, deadline-bounded, and sentinel-backed so a crash, skip, output flood, native
@@ -3469,6 +3479,7 @@ Record scope or design decisions here so deferred work is explicit.
 
 Add one line per completed task:
 
+<!-- markdownlint-disable MD013 -->
 | Date | Task | Commit/PR | Notes |
 |---|---|---|---|
 | 2026-07-10 | P0.1 | PR #68 | Transactional, deterministic, retry-safe migration with focused upgrade fixtures. |
@@ -3542,3 +3553,4 @@ Add one line per completed task:
 | 2026-07-18 | P3.1 external-file at-use adapter (partial) | PR #128 | Replaces OS-open direct-URI playback with ordered first-accepted-audio admission into hidden, ephemeral registry sources. Exact-handle parsing and bounded metadata validation precede random source/track identity; accepted tracks and queues are pathless and bind the exact session epoch. One inseparable lease-bearing file capability drives output loading and post-acceptance embedded art, with pre/post-file-handle-clone revocation checks and no path/URI diagnostics. Native non-UTF-8 leaf names use a bounded lossy parser/presentation hint without replacing handle authority. Newer OS deliveries, explicit playback intents including scrubber seek, Stop, real output transfer, and shutdown reject stale admission; queue replacement, unrepeated EOS, player/load error, output transfer, and shutdown retire the exact source idempotently while same-output reselection is inert. Automatic EOS replay/advance deliberately does not invalidate in-flight admission. Independent review tightened the admission-gate predicate, hidden UI-owner filter, shutdown/publication serialization, and nonseparable resolver lease boundary, and verified sequential invalid-candidate handling plus the post-accept art handoff. Automated review simplified optional-extension validation; shared parser defaults already admit missing artist/album tags, position-independent proxy reads isolate playback from artwork seek, and a per-capability mutex plus deterministic regression serializes overlapping cursor-based parsers. Formatting/diff, locked check, strict debug/release Clippy, and serial complete 940-test debug/release suites pass. Only the removable adapter keeps P3.1's final record open, so progress remains 219/223 overall and 29/30 P3. |
 | 2026-07-18 | P3.1 removable-media lifecycle/at-use adapter (completion) | PR #129 | Completes P3.1 by claiming each eligible mount's deterministic source identity into `SourceRegistry`, scanning beneath retained mounted-root authority on the blocking runtime, and publishing only pathless lossless relative track IDs under an exact session epoch. Deterministic no-follow, same-filesystem traversal parses bounded metadata through exact file handles; at-use resolution rejects malformed or unlisted IDs and rechecks the live epoch and lease before returning one retained file capability for playback and embedded art. Pre-unmount, relocation, confirmed removal, replacement, and shutdown disconnect authority before UI/playback invalidation; failed unmount reconnects from fresh inventory under a new epoch, and confirmed removal releases provenance. Pathless removable rows omit Properties until typed mutation authority exists. Security review hardened Unix trailing-slash/`/.` no-follow roots and Windows intermediate-junction races by pinning the root/ancestor namespace, rejecting directory symlinks, and following a final reparse root only when Windows verifies a volume mount point. Automated review also found that an inactive background scan failure was reducer-deduplicated before later row selection could display it; selection now replays the retained sanitized lifecycle failure without consuming it. Locked check, strict debug Clippy, formatting/diff checks, focused authority/adapter/registry/UI coverage, and the complete 956-test serial debug suite pass. Release validation was interrupted by temporary workspace disk quota and is not claimed. This closes P3 at 30/30 and advances total progress to 220/223 (98.7%); only three manual P2 validation records remain. |
 | 2026-09-03 | P0.7 live manual-dispatch verification | PR #224 + Actions run [33781875201](https://github.com/jm2/tributary/actions/runs/33781875201) | The dry-run/manual workflow test was dispatched live against pushed ref `polecat/tr-qcn` (`c5e9c99`) requesting tag `v0.6.2` with `dry_run: true`. "Resolve release source" and "Dry-run tag contract verification" passed: dispatching v0.6.2 resolved `build_ref` to `74b42792e42bed0b48a350c8797686ee0588a12b`, the immutable commit of `refs/tags/v0.6.2`, and the derived version matched the tag, while every artifact build and publish job stayed skipped under dry-run. This closes P0.7's two deferred verification boxes; with the P0.8 re-evaluation box closed by PR #227, P0 is complete at 53/53 and the tracker advances to 223/226 (98.7%) with only the three physical/installed P2 validation records open. |
+<!-- markdownlint-enable MD013 -->
