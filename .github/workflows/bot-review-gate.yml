@@ -1,46 +1,68 @@
 name: Bot review gate
 
-# Machine-readable merge evidence for the repository's all-green policy: this
-# check fails while the pull request still has actionable review threads that
-# were started by a bot reviewer (CodeRabbit, Codacy, or any GitHub App).
+# Machine-readable merge evidence for the repository's all-green policy. The
+# check fails while, at one exact pull-request head commit, any of the
+# following holds:
+#   1. a review thread started by a bot (a GitHub App account or a
+#      "[bot]"-suffixed login) is not explicitly resolved — including threads
+#      GitHub marks outdated, because code movement is not evidence that a
+#      finding was addressed;
+#   2. a bot reviewer's latest review requests changes: an outstanding change
+#      request blocks even when it opened no inline thread;
+#   3. a bot reviewer's latest review predates the head being evaluated:
+#      bot-review evidence must be bound to the exact commit being merged.
 #
-# Scope and semantics:
-#   * "Actionable" = the thread is neither resolved nor outdated. Outdated
-#     threads quote code that is no longer part of the diff; a fresh review
-#     opens new threads against the current head.
-#   * Resolving a thread is the machine-readable acknowledgement that its
-#     finding was addressed (fixed on the branch, or explicitly rejected by
-#     the resolution). A human reply inside the thread does not clear the
-#     gate — only resolution does.
-#   * The gate performs no review and never approves anything: it only
-#     reports whether unresolved actionable bot review threads remain.
+# Semantics:
+#   * Only explicit thread resolution or a formal review dismissal clears a
+#     finding. A human reply inside a thread does not, and GitHub's
+#     "outdated" flag does not either.
+#   * The gate performs no review and never approves anything: it reports
+#     whether machine-readable bot-review evidence is clean at the head it
+#     evaluated. That head is re-verified immediately before the green
+#     result is published, so the published evidence can never describe a
+#     commit that has already been superseded.
 #   * A pending or failing result is merge-blocking only once the live `main`
 #     ruleset marks "Bot Review Gate" as required. docs/dependency-updates.md
 #     records the exact rollout order and the live-PR verification step.
 #
+# Refresh paths — every trigger here is a documented Actions event. Resolving
+# a review thread fires no Actions event at all (`pull_request_review_thread`
+# is a webhook event, not an Actions trigger), so after resolving threads the
+# check is refreshed by re-running it or by dispatching:
+#   gh workflow run bot-review-gate.yml --ref <head branch> -f pr_number=<n>
+# The failure output prints both paths. Everything else refreshes itself:
+#   * pull_request synchronize re-evaluates at every new head;
+#   * pull_request_review submitted/edited/dismissed re-evaluates when a
+#     conclusion is made, revised, or formally withdrawn;
+#   * pull_request_review_comment created re-evaluates when a thread is
+#     opened by a single review comment (no review submission).
+#
 # Security: strictly read-only. The workflow never checks out pull-request
-# code, holds no write permission, and queries the review threads of exactly
-# the pull request that triggered the event through the GraphQL API. A query
-# failure fails the check instead of silently passing it.
+# code, holds no write permission, and queries only the pull request that
+# triggered the event through the GitHub API. A query failure, an incomplete
+# pagination, or a head mismatch fails the check instead of silently passing
+# it.
 on:
   pull_request:
     branches:
       - main
+    types: [opened, synchronize, reopened]
   pull_request_review:
-    types: [submitted]
-  # A review thread can also be opened by a single review comment (no review
-  # submission), e.g. a bot leaving an inline comment directly; that event
-  # must re-evaluate the gate too.
+    types: [submitted, edited, dismissed]
   pull_request_review_comment:
     types: [created]
-  pull_request_review_thread:
-    types: [resolved, unresolved]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to evaluate (dispatch on its head branch)
+        required: true
+        type: string
 
 permissions:
   pull-requests: read
 
 concurrency:
-  group: bot-review-gate-${{ github.repository }}-${{ github.event.pull_request.number }}
+  group: bot-review-gate-${{ github.repository }}-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: true
 
 jobs:
@@ -48,25 +70,64 @@ jobs:
     name: Bot Review Gate
     runs-on: ubuntu-latest
     # `pull_request` already restricts to the configured base branches; the
-    # review-event triggers have no branch filter, so the base is re-checked
-    # here so only `main` pull requests report the gate.
-    if: github.event_name == 'pull_request' || github.event.pull_request.base.ref == 'main'
+    # review-event triggers have no branch filter and the dispatch trigger
+    # carries no pull-request context, so the script re-derives the base from
+    # the pull request record itself and only `main` pull requests report.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.event.pull_request.base.ref == 'main'
     steps:
-      - name: Fail while unresolved actionable bot review threads remain
+      - name: Fail while bot-review evidence is unresolved or stale at the evaluated head
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
         run: |
           set -euo pipefail
-          thread_pages="${RUNNER_TEMP}/bot-review-threads.jsonl"
 
-          # Paginate every review thread of the exact triggering PR. gh's
-          # GraphQL pagination feeds the $endCursor variable automatically.
-          if ! gh api graphql --paginate -f query='
+          pages_dir="${RUNNER_TEMP}/bot-review-gate"
+          mkdir -p "${pages_dir}"
+          threads_pages="${pages_dir}/threads.jsonl"
+          reviews_pages="${pages_dir}/reviews.jsonl"
+          decisions_jq="${pages_dir}/decisions.jq"
+
+          repo_owner="${GITHUB_REPOSITORY%%/*}"
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          rest_pr="repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}"
+
+          # ── Pull-request record: existence, base branch, head binding ────
+          # workflow_dispatch carries no pull-request context, so the record —
+          # not the event — is the authority for the base branch and, when the
+          # event carries no head, for the head too.
+          if ! pr_json="$(gh api "${rest_pr}")"; then
+            echo "Pull request query failed; failing closed." >&2
+            exit 1
+          fi
+          pr_base="$(jq -r '.base.ref // ""' <<<"${pr_json}")"
+          if [ "${pr_base}" != "main" ]; then
+            echo "Pull request #${PR_NUMBER} targets ${pr_base:-<unknown>}, not main; failing closed." >&2
+            exit 1
+          fi
+          rest_head="$(jq -r '.head.sha // ""' <<<"${pr_json}")"
+          intended_head="${EVENT_HEAD_SHA:-${rest_head}}"
+          if [ -z "${intended_head}" ]; then
+            echo "Could not determine the pull request head; failing closed." >&2
+            exit 1
+          fi
+          if [ -n "${EVENT_HEAD_SHA}" ] && [ "${EVENT_HEAD_SHA}" != "${rest_head}" ]; then
+            echo "Event head ${EVENT_HEAD_SHA} no longer matches pull request head ${rest_head}; a newer event will re-evaluate; failing closed." >&2
+            exit 1
+          fi
+
+          # ── Paginated evidence: every review thread and every review ─────
+          # Two independent connections cannot share one automatic cursor, so
+          # each is paginated separately. gh's GraphQL pagination feeds the
+          # $endCursor variable automatically and emits ONE JSON DOCUMENT PER
+          # PAGE into the redirect target.
+          thread_query='
             query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
               repository(owner: $owner, name: $repo) {
                 pullRequest(number: $number) {
+                  headRefOid
                   reviewThreads(first: 100, after: $endCursor) {
                     pageInfo { hasNextPage endCursor }
                     nodes {
@@ -85,45 +146,173 @@ jobs:
                 }
               }
             }
-          ' -f owner="${GITHUB_REPOSITORY%%/*}" -f repo="${GITHUB_REPOSITORY#*/}" \
-            -F number="${PR_NUMBER}" > "${thread_pages}"; then
+          '
+          review_query='
+            query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
+              repository(owner: $owner, name: $repo) {
+                pullRequest(number: $number) {
+                  headRefOid
+                  reviews(first: 100, after: $endCursor) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      url
+                      state
+                      submittedAt
+                      databaseId
+                      commit { oid }
+                      author { __typename login }
+                    }
+                  }
+                }
+              }
+            }
+          '
+
+          if ! gh api graphql --paginate -f query="${thread_query}" \
+              -f owner="${repo_owner}" -f repo="${repo_name}" -F number="${PR_NUMBER}" \
+              > "${threads_pages}"; then
             echo "Review-thread query failed; failing closed." >&2
+            exit 1
+          fi
+          if ! gh api graphql --paginate -f query="${review_query}" \
+              -f owner="${repo_owner}" -f repo="${repo_name}" -F number="${PR_NUMBER}" \
+              > "${reviews_pages}"; then
+            echo "Review query failed; failing closed." >&2
             exit 1
           fi
 
           # A response without the pull request did not answer the question
-          # and must never read as "no open threads". `gh api graphql
-          # --paginate` emits ONE JSON DOCUMENT PER PAGE, and a plain `jq -e`
-          # derives its exit status from the LAST value only — so the guard
-          # must slurp every page and verify each one reported the pull
-          # request, not just the final page.
-          if ! jq -s -e 'all(.[]; .data.repository.pullRequest != null)' "${thread_pages}" > /dev/null; then
+          # and must never read as "no findings". `gh api graphql --paginate`
+          # emits one JSON document per page and a plain `jq -e` derives its
+          # exit status from the LAST value only — so each guard slurps every
+          # page and verifies each one reported the pull request.
+          completeness_guard='all(.[]; .data.repository.pullRequest != null)'
+          if ! jq -s -e "${completeness_guard}" "${threads_pages}" > /dev/null; then
             echo "Review-thread response omitted the pull request; failing closed." >&2
             exit 1
           fi
-
-          # Unresolved, non-outdated threads whose first comment was authored
-          # by a bot (GitHub App accounts and "[bot]"-suffixed logins) keep
-          # this check red.
-          offending="$(jq -c '
-            .data.repository.pullRequest.reviewThreads.nodes[]
-            | select(.isResolved == false and .isOutdated == false)
-            | select(
-                .comments.nodes[0].author.__typename == "Bot"
-                or ((.comments.nodes[0].author.login // "") | endswith("[bot]")))
-            | {
-                author_type: .comments.nodes[0].author.__typename,
-                author_login: .comments.nodes[0].author.login,
-                path: .path,
-                line: .line,
-                url: .comments.nodes[0].url
-              }
-          ' "${thread_pages}")"
-
-          if [ -n "${offending}" ]; then
-            printf '%s\n' "${offending}"
-            echo >&2 "Unresolved actionable bot review threads remain; address or resolve them first."
+          if ! jq -s -e "${completeness_guard}" "${reviews_pages}" > /dev/null; then
+            echo "Review response omitted the pull request; failing closed." >&2
             exit 1
           fi
 
-          echo "No unresolved actionable bot review threads."
+          # Bind pagination to the intended head: a push during pagination
+          # changes headRefOid in later pages and must fail the check instead
+          # of mixing evidence from two commits.
+          head_binding_guard='all(.[]; .data.repository.pullRequest.headRefOid == $head)'
+          if ! jq -s -e --arg head "${intended_head}" "${head_binding_guard}" "${threads_pages}" > /dev/null \
+            || ! jq -s -e --arg head "${intended_head}" "${head_binding_guard}" "${reviews_pages}" > /dev/null; then
+            echo "Paginated evidence spans a head other than ${intended_head}; a push landed mid-query; failing closed." >&2
+            exit 1
+          fi
+
+          # ── Decisions: the complete rule set, in one reviewed filter ─────
+          cat > "${decisions_jq}" <<'DECISIONS'
+            # A bot author is a GitHub App account or a "[bot]"-suffixed login.
+            def is_bot:
+              .author != null
+              and (.author.__typename == "Bot" or ((.author.login // "") | endswith("[bot]")));
+
+            # Every review thread a bot started that is NOT explicitly
+            # resolved. GitHub's "outdated" flag never substitutes for
+            # resolution: code movement is not evidence that a finding was
+            # addressed, so outdated-unresolved threads stay in the report.
+            def unresolved_bot_threads:
+              [ .[]
+                | .data.repository.pullRequest.reviewThreads.nodes[]
+                | select(.isResolved == false)
+                | select(.comments.nodes[0] | is_bot)
+                | {
+                    reason: "unresolved_bot_review_thread",
+                    author: (.comments.nodes[0].author.login // ""),
+                    path: .path,
+                    line: .line,
+                    outdated: .isOutdated,
+                    url: .comments.nodes[0].url
+                  } ];
+
+            # Per-bot-author conclusion from the complete paginated review
+            # list. The author's LATEST review (databaseId grows
+            # monotonically within one pull request) decides:
+            #   CHANGES_REQUESTED — an outstanding change request, wherever
+            #                       it was made;
+            #   DISMISSED         — formally withdrawn, no outstanding
+            #                       conclusion left;
+            #   anything else     — the review must be bound to the evaluated
+            #                       head, or the evidence is stale.
+            def bot_review_violations($head):
+              [ .[]
+                | .data.repository.pullRequest.reviews.nodes[]
+                | select(.state == "CHANGES_REQUESTED" or .state == "APPROVED" or .state == "COMMENTED" or .state == "DISMISSED")
+                | select(is_bot)
+                | {
+                    author: (.author.login // ""),
+                    state: .state,
+                    review_head: (.commit.oid // ""),
+                    database_id: .databaseId,
+                    url: .url
+                  } ]
+              | group_by(.author)[]
+              | (sort_by(.database_id) | last) as $latest
+              | if $latest.state == "CHANGES_REQUESTED" then
+                  [ { reason: "outstanding_bot_change_request",
+                      author: $latest.author,
+                      review_head: $latest.review_head,
+                      url: $latest.url } ]
+                elif $latest.state == "DISMISSED" then []
+                elif $latest.review_head != $head then
+                  [ { reason: "stale_bot_review_evidence",
+                      author: $latest.author,
+                      state: $latest.state,
+                      review_head: $latest.review_head,
+                      expected_head: $head,
+                      url: $latest.url } ]
+                else []
+                end;
+
+            {
+              evaluated_head: $head,
+              evaluated_threads: ([ $threads[].data.repository.pullRequest.reviewThreads.nodes[] ] | length),
+              evaluated_reviews: ([ $reviews[].data.repository.pullRequest.reviews.nodes[] ] | length),
+              violations: (
+                ($threads | unresolved_bot_threads)
+                + [ $reviews | bot_review_violations($head)[] ]
+              )
+            }
+          DECISIONS
+
+          evaluated="$(jq -n \
+            --slurpfile threads "${threads_pages}" \
+            --slurpfile reviews "${reviews_pages}" \
+            --arg head "${intended_head}" \
+            -f "${decisions_jq}")"
+
+          violation_count="$(jq '.violations | length' <<<"${evaluated}")"
+          if [ "${violation_count}" -gt 0 ]; then
+            jq -r '.violations[] |
+              if .reason == "unresolved_bot_review_thread" then
+                "UNRESOLVED BOT REVIEW THREAD"
+                + (if .outdated then " (outdated — movement is not resolution)" else "" end)
+                + ": " + .url + " — " + .path + ":" + ((.line // 0) | tostring) + " by " + .author
+              elif .reason == "outstanding_bot_change_request" then
+                "OUTSTANDING BOT CHANGE REQUEST by " + .author + ": " + .url
+              else
+                "STALE BOT REVIEW EVIDENCE by " + .author + " (" + .state + " at " + .review_head
+                + ", pull request head is " + .expected_head + "): " + .url
+              end' <<<"${evaluated}"
+            echo >&2 "Bot review evidence is not clean at ${intended_head}; address the findings above, explicitly resolve their threads, and dismiss or supersede outstanding change requests."
+            echo >&2 "Thread resolution fires no Actions event: after resolving, re-run this check, or run:"
+            echo >&2 "  gh workflow run bot-review-gate.yml --ref <head branch> -f pr_number=${PR_NUMBER}"
+            exit 1
+          fi
+
+          # ── Publication bound to the intended head ───────────────────────
+          # The green result must never describe a commit that was already
+          # superseded while it was being computed.
+          final_head="$(gh api "${rest_pr}" --jq '.head.sha')"
+          if [ "${final_head}" != "${intended_head}" ]; then
+            echo "Pull request head moved to ${final_head} while evaluating ${intended_head}; failing closed." >&2
+            exit 1
+          fi
+          jq -r '"Bot Review Gate: clean at \(.evaluated_head) (review threads evaluated: \(.evaluated_threads), reviews evaluated: \(.evaluated_reviews))"' \
+            <<<"${evaluated}"
