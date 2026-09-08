@@ -339,6 +339,113 @@ fn current_comment_after_a_dismissal_passes() {
 }
 
 #[test]
+fn documented_rate_limit_waives_stale_evidence_of_the_listed_reviewer() {
+    // The operator's conditional substitution: with the rate limit
+    // documented in the repo-owned policy file, the substitute reviewer's
+    // APPROVED review at the exact evaluated head, every thread resolved,
+    // and no outstanding change request, the listed reviewer's stale
+    // evidence no longer blocks — and the waiver is reported.
+    let output = run_scenario(
+        "rate-limit-substitution-granted",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert!(
+        output.status.success(),
+        "the documented substitution must waive the listed reviewer's stale evidence:\n{}",
+        report(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("RATE-LIMIT SUBSTITUTION") && stdout.contains("coderabbitai[bot]"),
+        "the granted waiver must be reported for auditability:\n{}",
+        report(&output)
+    );
+}
+
+#[test]
+fn substitution_requires_an_affirmative_substitute_outcome() {
+    // A comment-only review by the substitute reviewer is never an
+    // approval: the stale evidence of the rate-limited reviewer stays
+    // blocking.
+    let output = run_scenario(
+        "rate-limit-substitution-denied-commented",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert_blocked(
+        &output,
+        &["STALE BOT REVIEW EVIDENCE", "coderabbitai[bot]"],
+        "not clean",
+    );
+}
+
+#[test]
+fn substitution_binds_the_substitute_approval_to_the_evaluated_head() {
+    // An approval at any commit other than the evaluated head is exactly
+    // the stale evidence the gate exists to refuse.
+    let output = run_scenario(
+        "rate-limit-substitution-denied-old-approval",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert_blocked(
+        &output,
+        &["STALE BOT REVIEW EVIDENCE", "coderabbitai[bot]"],
+        "not clean",
+    );
+}
+
+#[test]
+fn substitution_requires_every_thread_resolved() {
+    // The waiver covers stale evidence only; an unresolved review thread —
+    // outdated included — blocks regardless of the substitution.
+    let output = run_scenario(
+        "rate-limit-substitution-denied-thread",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert_blocked(
+        &output,
+        &["UNRESOLVED BOT REVIEW THREAD", "u/rl-open-thread"],
+        "not clean",
+    );
+}
+
+#[test]
+fn substitution_requires_no_outstanding_change_request_from_any_author() {
+    // A human change request is preserved: the substitution never papers
+    // over an outstanding conclusion from any reviewer.
+    let output = run_scenario(
+        "rate-limit-substitution-denied-human-cr",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert_blocked(
+        &output,
+        &["STALE BOT REVIEW EVIDENCE", "coderabbitai[bot]"],
+        "not clean",
+    );
+}
+
+#[test]
+fn substitution_without_a_readable_policy_file_stays_disabled() {
+    // A repository without a policy file — or one whose policy read fails —
+    // gets no waiver: the substitution is an opt-in relaxation whose
+    // failure mode is "no waiver", never "gate passes".
+    let sandbox = GateSandbox::new("substitution-no-policy");
+    sandbox.use_scenario("rate-limit-substitution-granted");
+    std::fs::remove_file(sandbox.root.join("pages/contents.json"))
+        .expect("the policy fixture must be removable");
+    let output = sandbox.run("pull_request", Some(HEAD_SHA));
+    assert_blocked(
+        &output,
+        &["STALE BOT REVIEW EVIDENCE", "coderabbitai[bot]"],
+        "not clean",
+    );
+}
+
+#[test]
 fn comment_only_bot_review_does_not_clear_a_change_request() {
     // GitHub clears Request-changes only on a later approval or a formal
     // dismissal. A comment-only review carries no conclusion, so a bot

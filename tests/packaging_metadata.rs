@@ -1646,13 +1646,18 @@ fn bot_review_gate_is_read_only_fail_closed_and_pinned_to_main_prs() {
         .expect("workflow permissions must be a mapping");
     assert_eq!(
         permissions.len(),
-        1,
-        "the gate must declare exactly one workflow-level permission"
+        2,
+        "the gate must declare exactly its two workflow-level permissions"
     );
     assert_eq!(
         workflow["permissions"]["pull-requests"].as_str(),
         Some("read"),
         "the gate must be strictly read-only"
+    );
+    assert_eq!(
+        workflow["permissions"]["contents"].as_str(),
+        Some("read"),
+        "the only other grant is the read-only policy-file read; no write access anywhere"
     );
 
     assert_eq!(
@@ -1747,6 +1752,75 @@ fn bot_review_gate_script_binds_conclusions_to_the_evaluated_head() {
     assert!(
         script.contains("headRefOid == $head") && script.contains("Pull request head moved to"),
         "paginated evidence and the published result must be bound to one exact head"
+    );
+}
+
+#[test]
+fn bot_review_gate_rate_limit_substitution_stays_fail_closed() {
+    let script = bot_review_gate_run_script(&bot_review_gate_workflow());
+    let workflow = bot_review_gate_workflow();
+
+    // The policy file is read from `main` (never from the pull request), so
+    // a pull request cannot edit its own waiver; reading it needs a
+    // read-only contents grant.
+    let permissions = workflow["permissions"]
+        .as_mapping()
+        .expect("permissions must map");
+    assert_eq!(
+        permissions.get("contents").and_then(|value| value.as_str()),
+        Some("read"),
+        "the substitution policy read must be covered by a read-only contents grant"
+    );
+    assert!(
+        script.contains(".github/bot-review-substitution.json") && script.contains("ref=main"),
+        "the substitution policy must be read from the repository-owned file on main"
+    );
+
+    // The substitution is an opt-in relaxation: a missing file, a failed
+    // read, or a malformed document must disable the waiver — never enable
+    // it.
+    assert!(
+        script.contains("stays disabled"),
+        "every policy-fetch or policy-parse failure must keep the substitution disabled"
+    );
+    assert!(
+        script.contains("(HTTP 404)") || script.contains("Not Found"),
+        "a repository without a policy file must simply have no waiver available"
+    );
+
+    // Waiver conditions: a listed reviewer, an affirmative (APPROVED)
+    // substitute review bound to the exact evaluated head, every thread
+    // resolved, and no outstanding change request from any author. The
+    // waiver only ever removes stale_bot_review_evidence violations.
+    for fragment in [
+        "substitute_reviewer",
+        "rate_limited_reviewers",
+        "stale_bot_review_evidence",
+    ] {
+        assert!(
+            script.contains(fragment),
+            "the substitution must be keyed on {fragment}"
+        );
+    }
+    assert!(
+        script.contains("select(.state == \"APPROVED\" and .commit.oid == $head)"),
+        "the substitute approval must be affirmative and bound to the exact evaluated head"
+    );
+    assert!(
+        script.contains("select(.isResolved == false)") && script.contains("length == 0"),
+        "the waiver must require every review thread to be resolved"
+    );
+    assert!(
+        script.contains("(sort_by(.database_id) | last).state != \"CHANGES_REQUESTED\""),
+        "the waiver must require no outstanding change request from any author"
+    );
+    assert!(
+        script.contains(".reason != \"stale_bot_review_evidence\""),
+        "the waiver must only remove stale_bot_review_evidence violations"
+    );
+    assert!(
+        script.contains("RATE-LIMIT SUBSTITUTION"),
+        "every granted waiver must be reported for auditability"
     );
 }
 

@@ -200,6 +200,51 @@ one pull request's required check be satisfied by evidence evaluated at a
 different commit. The gate's failure output
 prints the dispatch path with the pull request number filled in.
 
+### Reviewer rate-limit substitution (operator fallback)
+
+When a required bot reviewer is stuck behind reviewer rate limiting, the
+operator may document it in a repository-owned policy file on `main`,
+`.github/bot-review-substitution.json`:
+
+```json
+{
+  "substitute_reviewer": "chatgpt-codex-connector[bot]",
+  "rate_limited_reviewers": [
+    {
+      "login": "coderabbitai[bot]",
+      "reason": "reviewer rate-limited",
+      "evidence": "https://github.com/jm2/tributary/pull/237#issuecomment-...",
+      "documented_at": "2026-09-08T20:00:00Z"
+    }
+  ]
+}
+```
+
+For a listed reviewer ONLY, the Bot Review Gate then waives the stale-evidence
+violation when — and only when — every one of the following holds at the exact
+head being evaluated:
+
+1. the policy file exists on `main`, is well-formed, and lists that reviewer
+   (the file is read from `main`, so a pull request can never edit its own
+   waiver; a missing file disables the waiver entirely, and a malformed file
+   warns and disables it);
+2. the policy's `substitute_reviewer` has an APPROVED review bound to the
+   exact evaluated head — a comment-only review is never an approval, and an
+   approval at any other commit is precisely the stale evidence the gate
+   refuses;
+3. every review thread is resolved (bot and human alike);
+4. no author has an outstanding change request (bot and human alike; the
+   latest decisive review per author decides);
+5. the violation being waived is `stale_bot_review_evidence` — unresolved
+   review threads and outstanding change requests always block, and the
+   waiver never extends to a reviewer the policy does not list.
+
+Every granted waiver is printed by the check with its evidence link, and the
+green result still carries the exact-head binding and the final publication
+re-check. This substitution covers reviewer availability only: it does not
+weaken the all-checks policy, does not touch human change requests, and does
+not re-enable non-Dependabot auto-merge.
+
 ### Rollout order and live validation
 
 0. Register the ruleset-reader GitHub App before the auto-merge precondition

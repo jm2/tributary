@@ -51,6 +51,29 @@ for arg in "$@"; do
 done
 
 if [ -n "${rest_path}" ]; then
+  case "${rest_path}" in
+    *contents/*)
+      # The substitution policy file read: served from contents.json; when
+      # that fixture file is absent the stub answers 404 like the real API
+      # for a repository without a policy file.
+      case "${fail_mode}" in
+        *contents*)
+          echo "stub: injected contents query failure" >&2
+          exit 1
+          ;;
+      esac
+      file="${pages}/contents.json"
+      if [ ! -f "${file}" ]; then
+        echo "gh: Not Found (HTTP 404)" >&2
+        exit 1
+      fi
+      if [ -n "${jq_filter}" ]; then
+        exec jq -r "${jq_filter}" "${file}"
+      fi
+      cat "${file}"
+      exit 0
+      ;;
+  esac
   case "${fail_mode}" in
     *pr*)
       echo "stub: injected pull request query failure" >&2
