@@ -188,7 +188,12 @@ pushes (`synchronize`), review submissions, edits, and dismissals
 (`pull_request_review`), new review comments
 (`pull_request_review_comment`), and a targeted
 `gh workflow run bot-review-gate.yml --ref <head branch> -f pr_number=<n>`
-(`workflow_dispatch`) or a plain check re-run. The gate's failure output
+(`workflow_dispatch`) or a plain check re-run. The dispatch must target the
+pull request's head branch: a dispatch run is attached to the dispatched
+ref's tip (`GITHUB_SHA`), so the gate fails closed unless that tip is exactly
+the head of the pull request named by `pr_number` — any other ref would let
+one pull request's required check be satisfied by evidence evaluated at a
+different commit. The gate's failure output
 prints the dispatch path with the pull request number filled in.
 
 ### Rollout order and live validation
