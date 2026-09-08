@@ -25,6 +25,7 @@ const MACOS_AUDIO_NATIVE: &str = include_str!("../src/audio/macos_audio_native.r
 const MACOS_AUDIO_TESTS: &str = include_str!("../src/audio/macos_audio_tests.rs");
 const PLATFORM_RUNTIME: &str = include_str!("../src/platform_runtime.rs");
 const RUST_TOOLCHAIN_ACTION_SHA: &str = "6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772";
+const FLATPAK_BUILDER_ACTION_SHA: &str = "79327416609af08178ad73b352877e51450790b3";
 const FORBIDDEN_BUNDLED_COMPONENTS: &str =
     include_str!("../build-aux/packaging/forbidden-bundled-components.txt");
 
@@ -209,12 +210,7 @@ fn assert_flatpak_artifact_boundary(
         job[build..validation].contains("upload-artifact: false"),
         "{label} must disable flatpak-builder's implicit pre-validation artifact upload"
     );
-    assert_eq!(
-        job.matches("uses: flatpak/flatpak-github-actions/flatpak-builder@v6")
-            .count(),
-        1,
-        "{label} must contain exactly one Flatpak builder action"
-    );
+    assert_flatpak_builder_pin(job, label);
     assert_eq!(
         job.matches("uses: actions/upload-artifact@v7").count(),
         1,
@@ -226,6 +222,21 @@ fn assert_flatpak_artifact_boundary(
             && upload_step.contains(&format!("path: {artifact_path}"))
             && upload_step.contains("if-no-files-found: error"),
         "{label} must upload the exact validated Flatpak and fail when it is missing"
+    );
+}
+
+fn assert_flatpak_builder_pin(job: &str, label: &str) {
+    assert_eq!(
+        job.matches("uses: flatpak/flatpak-github-actions/flatpak-builder@")
+            .count(),
+        1,
+        "{label} must contain exactly one Flatpak builder action"
+    );
+    assert!(
+        job.contains(&format!(
+            "uses: flatpak/flatpak-github-actions/flatpak-builder@{FLATPAK_BUILDER_ACTION_SHA}"
+        )),
+        "{label} must pin the Flatpak builder to the reviewed immutable revision"
     );
 }
 
@@ -250,6 +261,12 @@ fn flatpak_artifacts_publish_once_after_compliance_validation() {
 #[test]
 fn release_checksums_require_one_exact_asset_set() {
     let checksums = workflow_job(RELEASE_WORKFLOW, "checksums");
+    assert_release_asset_set(checksums);
+    assert_release_checksum_guards(checksums);
+    assert_release_checksum_guard_order(checksums);
+}
+
+fn assert_release_asset_set(checksums: &str) {
     let expected_assets = shell_array(checksums, "expected_assets");
     assert_eq!(
         expected_assets,
@@ -269,7 +286,9 @@ fn release_checksums_require_one_exact_asset_set() {
         ],
         "release checksums must cover exactly the published package set"
     );
+}
 
+fn assert_release_checksum_guards(checksums: &str) {
     for fragment in [
         "release_file_list=\"$(mktemp)\"",
         "trap 'rm -f \"$release_file_list\"' EXIT",
@@ -285,7 +304,9 @@ fn release_checksums_require_one_exact_asset_set() {
             "release checksum validation is missing its fail-closed contract: {fragment}"
         );
     }
+}
 
+fn assert_release_checksum_guard_order(checksums: &str) {
     let discovery = checksums
         .find("release_file_list=\"$(mktemp)\"")
         .expect("release artifact discovery must use a checked temporary list");

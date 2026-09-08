@@ -203,7 +203,7 @@ jobs:
             Cargo.lock -o build-aux/flatpak/cargo-sources.json
 
       - name: Build Flatpak bundle
-        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6
         with:
           bundle: tributary-linux-${{ matrix.arch }}.flatpak
           manifest-path: build-aux/flatpak/io.github.tributary.Tributary.yml
