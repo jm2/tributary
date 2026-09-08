@@ -291,6 +291,25 @@ fn dismissing_a_bot_change_request_clears_it() {
 }
 
 #[test]
+fn comment_only_bot_review_does_not_clear_a_change_request() {
+    // GitHub clears Request-changes only on a later approval or a formal
+    // dismissal. A comment-only review carries no conclusion, so a bot
+    // commenting at the evaluated head must not lift its outstanding
+    // change request — ranking every review state together would let the
+    // newest comment silence the block.
+    let output = run_scenario(
+        "change-request-then-commented",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert_blocked(
+        &output,
+        &["OUTSTANDING BOT CHANGE REQUEST", "u/ctc-cr"],
+        "not clean",
+    );
+}
+
+#[test]
 fn stale_bot_review_evidence_blocks() {
     // A bot whose latest review predates the evaluated head provides no
     // evidence about the commit being merged.

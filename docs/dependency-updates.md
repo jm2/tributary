@@ -165,11 +165,13 @@ satisfy the gate.
 pull-request head, any of the following holds: a bot-started review thread is
 not explicitly resolved (GitHub's "outdated" flag never substitutes for
 resolution — moving code is not addressing a finding); a bot reviewer's
-latest review requests changes (a change request blocks even when it opened
-no inline thread); or a bot reviewer's latest review predates the head being
-evaluated (review evidence must be bound to the commit being merged). A
-formal review dismissal or a later review by the same bot clears that bot's
-conclusion. Both the review-thread and the review queries are paginated
+latest decisive review requests changes (only a CHANGES_REQUESTED, APPROVED
+or DISMISSED review carries a conclusion, and a change request blocks even
+when it opened no inline thread); or a bot reviewer's latest review predates
+the head being evaluated (review evidence must be bound to the commit being
+merged). A later approving or dismissing review by the same bot clears that
+bot's conclusion; a comment-only review never does. Both the review-thread
+and the review queries are paginated
 completely, every page is validated, and the published result is bound to the
 exact head, which is re-verified immediately before the green result. The
 CodeQL
