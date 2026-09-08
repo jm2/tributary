@@ -189,3 +189,40 @@ fn overwrite_policy_replaces_existing_destination() {
         b"new"
     );
 }
+
+/// A successful overwrite saves the destination original in a hidden backup
+/// sibling so a later rollback can restore it. Once the transfer succeeds
+/// the backup is superseded full-size litter: the success path must remove
+/// it, leaving only the published destination behind.
+#[test]
+fn successful_overwrite_leaves_no_backup_litter() {
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    write_source_file(source_root.path(), "song.flac", b"new bytes");
+    std::fs::write(destination_root.path().join("song.flac"), b"original").expect("write existing");
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = transfer_request(
+        source,
+        destination,
+        vec![TransferItem::same(PathBuf::from("song.flac"))],
+        ConflictPolicy::Overwrite,
+    );
+    let summary = run(request);
+    assert!(summary.completed);
+    let mut names: Vec<String> = std::fs::read_dir(destination_root.path())
+        .expect("read destination root")
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["song.flac".to_string()],
+        "successful overwrite must consume its saved backup: only the destination remains"
+    );
+    assert_eq!(
+        std::fs::read(destination_root.path().join("song.flac")).expect("read final"),
+        b"new bytes"
+    );
+}

@@ -124,11 +124,14 @@ impl TransferExecutor {
         };
         let mut committed_stages: u32 = 0;
         match self.execute_plan(&mut context, &mut committed_stages) {
-            Ok(()) => Ok(TransferSummary {
-                committed_stages,
-                bytes_copied: context.bytes_so_far,
-                completed: true,
-            }),
+            Ok(()) => {
+                self.discard_superseded_backups(&context);
+                Ok(TransferSummary {
+                    committed_stages,
+                    bytes_copied: context.bytes_so_far,
+                    completed: true,
+                })
+            }
             Err(error) => {
                 self.rollback(&mut context)?;
                 Err(error)
@@ -454,6 +457,30 @@ impl TransferExecutor {
             }
         };
         Ok(Some(outcome.relative_path))
+    }
+
+    /// Remove the saved originals of successful overwrite commits.
+    ///
+    /// A completed transfer supersedes every saved original: each backup is
+    /// a full-size hidden sibling that would otherwise accumulate until
+    /// destination storage is exhausted. Removal is best-effort — a leftover
+    /// hidden backup is preferable to failing a transfer whose bytes are
+    /// already published, matching the link-based publish's policy for its
+    /// staged-leaf unlink. The backups also remain restorable on the failure
+    /// path, which never reaches this method.
+    fn discard_superseded_backups(&self, context: &RunContext<'_>) {
+        for change in &context.committed {
+            if let OwnedChange::ReplacedFile {
+                backup_relative_path,
+                ..
+            } = change
+            {
+                let _ = self
+                    .request
+                    .destination
+                    .remove_relative_file(backup_relative_path);
+            }
+        }
     }
 
     /// Reverse every owned change in reverse commit order, revalidating the
