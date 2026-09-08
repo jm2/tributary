@@ -161,11 +161,33 @@ satisfy the gate.
 | CodeRabbit | unbound (commit-status context, no app id) |
 
 `Bot Review Gate` is reported by the repository-owned
-`.github/workflows/bot-review-gate.yml`, which fails while the pull request
-has unresolved, non-outdated review threads started by a bot. The CodeQL
+`.github/workflows/bot-review-gate.yml`. It fails while, at one exact
+pull-request head, any of the following holds: a bot-started review thread is
+not explicitly resolved (GitHub's "outdated" flag never substitutes for
+resolution — moving code is not addressing a finding); a bot reviewer's
+latest review requests changes (a change request blocks even when it opened
+no inline thread); or a bot reviewer's latest review predates the head being
+evaluated (review evidence must be bound to the commit being merged). A
+formal review dismissal or a later review by the same bot clears that bot's
+conclusion. Both the review-thread and the review queries are paginated
+completely, every page is validated, and the published result is bound to the
+exact head, which is re-verified immediately before the green result. The
+CodeQL
 `Analyze (…)` contexts follow the languages configured in the CodeQL default
 setup; adding or removing a language changes those contexts and must update
 this ruleset and the auto-merge precondition in the same reviewed change.
+
+### Refreshing the gate after thread resolution
+
+Resolving a review thread fires no GitHub Actions event
+(`pull_request_review_thread` is a webhook event, not an Actions trigger), so
+the gate uses only documented Actions triggers and refreshes through:
+pushes (`synchronize`), review submissions, edits, and dismissals
+(`pull_request_review`), new review comments
+(`pull_request_review_comment`), and a targeted
+`gh workflow run bot-review-gate.yml --ref <head branch> -f pr_number=<n>`
+(`workflow_dispatch`) or a plain check re-run. The gate's failure output
+prints the dispatch path with the pull request number filled in.
 
 ### Rollout order and live validation
 
@@ -190,7 +212,10 @@ this ruleset and the auto-merge precondition in the same reviewed change.
    what the auto-merge precondition reads.
 3. Validate against a live pull request before treating the widened gate as
    authoritative: confirm all widened checks report on that PR, address and
-   resolve any actionable bot review threads, then confirm the next
+   resolve any actionable bot review threads, exercise the refresh path by
+   confirming the gate re-runs green at the same head after the last
+   resolution (via the automatic triggers or the documented re-run/dispatch
+   path), then confirm the next
    Dependabot patch/minor PR's "Dependabot auto-merge" run passes the
    "Require the live ruleset to enforce the full policy gate" step and reaches
    the guarded merge enablement. That run passing is live proof both that the
