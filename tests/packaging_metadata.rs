@@ -387,17 +387,38 @@ fn assert_release_checksum_guard_order(checksums: &str) {
 #[cfg(target_os = "linux")]
 #[test]
 fn release_checksum_hash_failure_is_terminal() {
-    let workflow: serde_yaml::Value = serde_yaml::from_str(RELEASE_WORKFLOW).unwrap();
+    let script = checksum_step_script(RELEASE_WORKFLOW);
+    let assets = shell_array(&script, "expected_assets").join("\n");
+    assert_checksum_hash_failure_is_terminal(&script, &assets, 23);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ci_checksum_hash_failure_is_terminal() {
+    assert_checksum_hash_failure_is_terminal(
+        &checksum_step_script(CI_WORKFLOW),
+        "tributary.zip",
+        1,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn checksum_step_script(source: &str) -> String {
+    let workflow: serde_yaml::Value = serde_yaml::from_str(source).unwrap();
     let steps = workflow["jobs"]["checksums"]["steps"]
         .as_sequence()
         .unwrap();
-    let script = steps
+    steps
         .iter()
         .find(|step| step["name"].as_str() == Some("Generate SHA256SUMS"))
         .unwrap()["run"]
         .as_str()
-        .unwrap();
-    let assets = shell_array(script, "expected_assets").join("\n");
+        .unwrap()
+        .to_owned()
+}
+
+#[cfg(target_os = "linux")]
+fn assert_checksum_hash_failure_is_terminal(script: &str, assets: &str, exit_code: i32) {
     let output = std::process::Command::new("bash")
         .args([
             "-e",
@@ -406,23 +427,28 @@ fn release_checksum_hash_failure_is_terminal() {
 test_dir="$(mktemp -d "${TMPDIR:-/var/tmp}/tributary-checksums.XXXXXX")"
 trap 'rm -rf "$test_dir"' EXIT
 cd "$test_dir"
-mkdir artifacts
+mkdir artifacts bin
 while IFS= read -r asset; do : > "artifacts/$asset"; done <<< "$EXPECTED_ASSETS"
-sha256sum() { return 23; }
-export -f sha256sum
+printf '#!/bin/sh\necho "injected checksum failure" >&2\nexit 23\n' > bin/sha256sum
+chmod +x bin/sha256sum
+export PATH="$test_dir/bin:$PATH"
 bash -e -c "$1"
 "#,
-            "release-checksum-test",
+            "checksum-test",
             script,
         ])
         .env("EXPECTED_ASSETS", assets)
         .output()
-        .expect("run the release checksum script with an injected hashing failure");
+        .expect("run the checksum script with an injected hashing failure");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("injected checksum failure"),
+        "hashing must run: {stderr}"
+    );
     assert_eq!(
         output.status.code(),
-        Some(23),
-        "hashing failure must prevent publication: {}",
-        String::from_utf8_lossy(&output.stderr)
+        Some(exit_code),
+        "hashing failure must prevent publication: {stderr}"
     );
 }
 

@@ -555,6 +555,7 @@ jobs:
 
       - name: Generate SHA256SUMS
         run: |
+          set -euo pipefail
           cd artifacts
           find . -type f \( -name '*.zip' -o -name '*.dmg' -o -name '*.flatpak' -o -name 'tributary' \) \
             -exec sha256sum {} + | sed 's|  \./|  |' | sort -k2 > ../SHA256SUMS.txt
