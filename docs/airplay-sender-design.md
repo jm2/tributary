@@ -13,12 +13,16 @@ assumed discovery data Tributary does not retain, and shaped the sender
 trait around `gst::Element`, which cannot represent a non-GStreamer
 process adapter. Every protocol claim below now cites a primary source:
 the maintained OwnTone sender implementation itself
-([`src/outputs/raop.c`](https://github.com/owntone/owntone-server/blob/master/src/outputs/raop.c)
+([`src/outputs/raop.c`](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/src/outputs/raop.c)
 and
-[`src/outputs/airplay.c`](https://github.com/owntone/owntone-server/blob/master/src/outputs/airplay.c)
-at master, release 29.3, 2026-07-22), the OwnTone changelog and
+[`src/outputs/airplay.c`](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/src/outputs/airplay.c)
+at release 29.3, tag commit `d6fb3edf`, 2026-07-22), the OwnTone changelog and
 installation records, and PipeWire's maintained
-[`module-raop-sink`](https://github.com/PipeWire/pipewire/blob/master/src/modules/module-raop-sink.c).
+[`module-raop-sink`](https://github.com/PipeWire/pipewire/blob/b741e0c74f5436f0c925f7741140db0efd32cf4e/src/modules/module-raop-sink.c).
+All upstream source links in this record are pinned to those immutable
+release-tag commits (PipeWire 1.6.8, tag commit `b741e0c7`), not to moving
+branches; every cited line number was verified against the pinned revision
+on 2026-09-08.
 
 Closes the P2.4 "Open and complete an AirPlay sender design investigation"
 checklist item ([`docs/task.md:1128-1132`](task.md)) and is the first
@@ -48,7 +52,7 @@ planning follows once a maintainer accepts one of the proposals below.
 
 The current seam:
 
-```
+```text
 uridecodebin ! audioconvert ! avenc_alac ! raopsink
                                               ^^^^^^^^
                        enforced by AirPlayOutput::ensure_raopsink
@@ -95,7 +99,7 @@ RAOP/AirPlay receivers advertise `_raop._tcp.local.` (and AirPlay-2-era
 devices also or instead advertise `_airplay._tcp.local.`). The TXT
 record carries capability and status flags. OwnTone's sender captures
 real examples in a comment block
-([raop.c:4174-4198](https://github.com/owntone/owntone-server/blob/master/src/outputs/raop.c)),
+([raop.c:4174-4198](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/src/outputs/raop.c)),
 e.g. `["sf=0x4" "am=AppleTV2,1" "vs=105.5" "md=0,1,2" "tp=TCP,UDP"
 "vn=65537" "pw=false" "ss=16" "sr=44100" "da=true" "sv=false" "et=0,3"
 "cn=0,1" "ch=2" "txtvers=1"]`. The fields a sender actually consumes:
@@ -156,7 +160,7 @@ classic-RAOP receiver decrypts `a=rsaaeskey` with the *well-known*
 AirPort Express RSA key pair, and every practical sender embeds the
 matching public half as a constant. OwnTone's sender carries the
 2048-bit modulus and exponent verbatim
-([raop.c:276-294](https://github.com/owntone/owntone-server/blob/master/src/outputs/raop.c));
+([raop.c:276-294](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/src/outputs/raop.c));
 receiver projects (shairport-sync and descendants) embed the private
 half. Revision 1's assertion that "fetch the public key from the
 receiver's mDNS record at runtime" is "the only correct RAOP-1 sender
@@ -182,7 +186,7 @@ recommended path avoids it entirely.
   AES-CBC payload encryption — against passive listeners, not against
   unauthenticated senders.
 - **AirPlay 2.** Pairing-first. OwnTone's AirPlay 2 sender
-  ([`src/outputs/airplay.c`](https://github.com/owntone/owntone-server/blob/master/src/outputs/airplay.c))
+  ([`src/outputs/airplay.c`](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/src/outputs/airplay.c))
   runs the pair-setup / pair-verify sequence through its `pair_ap`
   library (`pair_setup_request1/2/3`, airplay.c:2824-2910): an SRP6a
   enrollment followed by Ed25519 identity exchange and X25519-based
@@ -215,10 +219,10 @@ stereo, ALAC-encoded, one frame per UDP packet:
 - OwnTone's FIFO output uses exactly the PCM equivalent:
   `FIFO_PACKET_SIZE 1408 // 352 samples/packet * 16 bit/sample * 2
   channels` at `{ 44100, 16, 2 }`
-  ([fifo.c:41,64](https://github.com/owntone/owntone-server/blob/master/src/outputs/fifo.c)).
+  ([fifo.c:41,64](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/src/outputs/fifo.c)).
 - PipeWire's `module-raop-sink` independently pins
   `FRAMES_PER_UDP_PACKET 352`
-  ([module-raop-sink.c:135](https://github.com/PipeWire/pipewire/blob/master/src/modules/module-raop-sink.c)).
+  ([module-raop-sink.c:135](https://github.com/PipeWire/pipewire/blob/b741e0c74f5436f0c925f7741140db0efd32cf4e/src/modules/module-raop-sink.c)).
 
 Older implementations padded each ALAC frame into a fixed 4096-byte
 payload; maintained senders ship compressed ALAC instead (OwnTone
@@ -354,7 +358,7 @@ Key differences from revision 1, and why:
 - **PCM in, not ALAC in.** The contract feeds s16le 44100/2 PCM, the
   one format every candidate accepts at its boundary (OwnTone's pipe
   input: "read a PCM16 stream from a named pipe";
-  [`src/inputs/pipe.c`](https://github.com/owntone/owntone-server/blob/master/src/inputs/pipe.c);
+  [`src/inputs/pipe.c`](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/src/inputs/pipe.c);
   its fifo output quality is `{44100, 16, 2}`). Each adapter owns its
   own encoding and framing — which is where the 352-sample contract
   (§2.4) lives, inside adapters, not in the shared seam. The GStreamer
@@ -517,7 +521,7 @@ daemon, no key material in Tributary, no bundling.
 PipeWire ships a maintained AirPlay 1 sink module:
 `raop.encryption.type` of "none", "RSA" or "auth_setup", an optional
 `raop.password`, ALAC, and the same 352-frame packetization
-([module-raop-sink.c](https://github.com/PipeWire/pipewire/blob/master/src/modules/module-raop-sink.c)).
+([module-raop-sink.c](https://github.com/PipeWire/pipewire/blob/b741e0c74f5436f0c925f7741140db0efd32cf4e/src/modules/module-raop-sink.c)).
 MIT-licensed, actively maintained — but it exists inside the desktop
 audio graph: it creates a PipeWire sink that streams to one fixed
 RAOP endpoint, discovered by the companion `module-raop-discover`.
