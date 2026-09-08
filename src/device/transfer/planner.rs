@@ -150,7 +150,11 @@ impl<'a> PlanBuilder<'a> {
         Ok(())
     }
 
-    /// Plan one file discovered by the directory walk.
+    /// Plan one file discovered by the directory walk, honouring the
+    /// conflict policy exactly like [`PlanBuilder::plan_file_item`]: the
+    /// conflict is resolved first so a skipped file stages no parent
+    /// directory work, and only a file that will actually be copied emits
+    /// its `CreateDirectory` stages.
     fn plan_walked_file(
         &mut self,
         item: &TransferItem,
@@ -175,21 +179,23 @@ impl<'a> PlanBuilder<'a> {
         let Some(destination_relative) = destination_for_source_path(item, &source_relative) else {
             return Ok(());
         };
-        self.ensure_parent_directories(&destination_relative)?;
-        if let Some(resolution) = resolve_conflict(
+        let Some(resolution) = resolve_conflict(
             &self.request.destination,
             &destination_relative,
             self.request.conflict_policy,
-        )? {
-            let atomic = destination_is_atomic(&self.request.destination);
-            self.push_copy_stage(
-                source_relative,
-                destination_relative,
-                bytes,
-                resolution,
-                atomic,
-            );
-        }
+        )?
+        else {
+            return Ok(());
+        };
+        self.ensure_parent_directories(&destination_relative)?;
+        let atomic = destination_is_atomic(&self.request.destination);
+        self.push_copy_stage(
+            source_relative,
+            destination_relative,
+            bytes,
+            resolution,
+            atomic,
+        );
         Ok(())
     }
 
