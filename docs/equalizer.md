@@ -621,7 +621,8 @@ for this contract; new conditions require a new revision.
 
 ## Implementation boundary
 
-The implementation record listed in `task.md` P2.4 line 1006 lands this contract. The record is
+The [implementation record](task.md#p24--audio-processing-and-output-protocols) in `task.md` P2.4
+lands this contract. The record is
 intentionally bounded: implement the supported path and the disabled-UI path, then validate the
 acceptance matrix. Implementation is **not** covered by this design document; the design document
 is the source of truth for the contract and changes only by revision.
