@@ -1404,14 +1404,29 @@ mod tests {
         write_tags_with_mutation_target(&target, &year("2026"))
             .expect_err("a stranded staging area must refuse the commit");
 
+        assert_refused_displacement_left_files_untouched(
+            &track,
+            &displaced_album.join("silence.flac"),
+        );
+        assert_no_stranded_tag_write_siblings(&[&album, &displaced_album]);
+    }
+
+    /// Both files the displaced-parent scenario can observe must be untouched
+    /// by the refused commit: the impostor now occupying the old pathname
+    /// never receives the replacement, and the displaced admitted file keeps
+    /// its original tags.
+    #[cfg(unix)]
+    fn assert_refused_displacement_left_files_untouched(
+        impostor_track: &Path,
+        displaced_track: &Path,
+    ) {
         assert_eq!(
-            std::fs::read(&track).expect("read impostor file"),
+            std::fs::read(impostor_track).expect("read impostor file"),
             b"impostor audio",
             "the impostor directory must never receive the replacement"
         );
-        let displaced_track = displaced_album.join("silence.flac");
         let displaced_tagged =
-            lofty::read_from_path(&displaced_track).expect("reopen the displaced admitted file");
+            lofty::read_from_path(displaced_track).expect("reopen the displaced admitted file");
         assert_ne!(
             displaced_tagged
                 .primary_tag()
@@ -1420,7 +1435,13 @@ mod tests {
             Some("2026"),
             "the admitted file must be untouched by the refused commit"
         );
-        for directory_path in [&album, &displaced_album] {
+    }
+
+    /// A refused commit must clean up its stranded staging sibling in every
+    /// directory the retained parent machinery could have staged one in.
+    #[cfg(unix)]
+    fn assert_no_stranded_tag_write_siblings(directories: &[&Path]) {
+        for directory_path in directories {
             let leftovers: Vec<PathBuf> = std::fs::read_dir(directory_path)
                 .expect("list displaced directories")
                 .filter_map(|entry| entry.ok())

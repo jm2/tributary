@@ -629,10 +629,10 @@ impl MountedMutationCommit<'_> {
     /// planted at the target name.
     pub(crate) fn confirm_replacement_target(&self) -> io::Result<()> {
         validate_mounted_bound(self.target.authority.as_ref(), &self.file)?;
-        let parent = self.retained_parent();
         let leaf = self.target.relative_leaf()?;
         #[cfg(unix)]
         {
+            let parent = self.retained_parent();
             let current = open_unix_regular_at(&parent.file, &leaf)?;
             if object_identity(&current)? != self.file.object.identity {
                 return Err(authority_changed(
@@ -651,7 +651,6 @@ impl MountedMutationCommit<'_> {
             // documented discipline: revalidate the mount, then prove the
             // pathname still names the admitted object through a fresh open
             // and an exact identity comparison.
-            let _ = parent;
             let _ = leaf;
             let current = File::open(&self.target.path)?;
             if object_identity(&current)? != self.file.object.identity {
