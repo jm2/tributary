@@ -1580,7 +1580,7 @@ fn bot_review_gate_run_script(workflow: &serde_yaml::Value) -> String {
 // unit if its read-only permission, fail-closed queries, review-conclusion
 // semantics, head binding, or stable check name regresses. The decision
 // logic itself is exercised against recorded fixtures by
-// tests/bot_review_gate.rs; this test pins the workflow-level contract.
+// tests/bot_review_gate/ (fixture-driven decision tests); this test pins the workflow-level contract.
 // #lizard forgives
 fn bot_review_gate_is_read_only_fail_closed_and_pinned_to_main_prs() {
     let workflow = bot_review_gate_workflow();
@@ -1679,7 +1679,7 @@ fn bot_review_gate_is_read_only_fail_closed_and_pinned_to_main_prs() {
 
 // The gate script's decision contract, pinned as text across four focused
 // tests. The decisions themselves run against recorded fixtures in
-// tests/bot_review_gate.rs.
+// tests/bot_review_gate/ (fixture-driven decision tests).
 #[test]
 fn bot_review_gate_script_paginates_evidence_and_ranks_reviews() {
     let script = bot_review_gate_run_script(&bot_review_gate_workflow());
