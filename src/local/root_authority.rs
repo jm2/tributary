@@ -821,10 +821,24 @@ impl MountedMutationCommit<'_> {
         #[cfg(test)]
         run_pre_install_interpose(self);
         Self::install_staged_leaf_into_vacant_leaf(parent, staged_leaf, &leaf, &quarantine_leaf)?;
+        Self::prove_replacement_landed(parent, &leaf, &staged_identity)
+    }
 
-        // Prove the replacement landed on the exact directory entry.
-        let replaced = open_unix_regular_at(&parent.file, &leaf)?;
-        if object_identity(&replaced)? != staged_identity {
+    /// Prove the installed leaf names the exact object the staged copy held.
+    ///
+    /// The install renames the staged copy into the vacant leaf name, so the
+    /// entry the name points at afterwards must carry the staged copy's exact
+    /// identity. Anything else means the leaf was disturbed again after the
+    /// conditioned install; the commit refuses rather than claim a
+    /// replacement it cannot prove.
+    #[cfg(unix)]
+    fn prove_replacement_landed(
+        parent: &RetainedObject,
+        leaf: &OsStr,
+        staged_identity: &ObjectIdentity,
+    ) -> io::Result<()> {
+        let replaced = open_unix_regular_at(&parent.file, leaf)?;
+        if object_identity(&replaced)? != *staged_identity {
             return Err(authority_changed(
                 "the tagged replacement did not land on the retained mutation target",
             ));
