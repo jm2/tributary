@@ -2924,7 +2924,11 @@ fn parent_components_of(components: &[OsString]) -> PathBuf {
 /// belongs to a concurrent writer and the caller must not touch it. When
 /// either side is unknown the gate degrades to the legacy path-only
 /// behavior and the slot is reported not foreign.
-#[cfg_attr(unix, allow(unused_variables))]
+// Every parameter feeds exactly one platform's identity probe: unix reads
+// the leaf through the retained parent handle, Windows through the joined
+// path, so each cfg combination leaves the other platform's parameters
+// unused. A platform-conditional allow cannot cover both directions.
+#[allow(unused_variables)]
 fn destination_slot_is_foreign(
     root: &Path,
     parent: &RetainedWriteParent,
