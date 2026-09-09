@@ -1110,12 +1110,15 @@ impl MountedMutationCommit<'_> {
 /// `renameat2(RENAME_NOREPLACE)` — `renameatx_np(RENAME_EXCL)` on macOS —
 /// makes the refusal atomic: no separate existence check can be interleaved
 /// between the decision and the rename, which is exactly the property the
-/// conditioned install and restores need. On a kernel or filesystem with no
-/// flag support (`ENOSYS` from a pre-10.12 macOS, `EINVAL` from a filesystem
-/// that never implemented the flag) the only available primitive is the plain
-/// rename; the caller's quarantine proof then bounds the residual window to
-/// what it was before this conditioning existed, and that residual is
-/// documented at the install site. Every other error propagates fail-closed.
+/// conditioned install and restores need.
+///
+/// A kernel or filesystem with no flag support (`ENOSYS` from a pre-10.12
+/// macOS, `EINVAL` from a filesystem that never implemented the flag) fails
+/// the call closed: the only primitive left would be the plain overwriting
+/// rename, and silently degrading to it would destroy a leaf recreated
+/// inside the vacancy and report success — precisely the clobber every
+/// other conditioning in this section exists to prevent. The commit refuses
+/// instead, leaving both files untouched.
 #[cfg(unix)]
 fn rename_noreplace_at(parent: &RetainedObject, from: &OsStr, to: &OsStr) -> io::Result<()> {
     match rustix::fs::renameat_with(
@@ -1132,7 +1135,12 @@ fn rename_noreplace_at(parent: &RetainedObject, from: &OsStr, to: &OsStr) -> io:
                 error.kind(),
                 io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
             ) {
-                rustix::fs::renameat(&parent.file, from, &parent.file, to).map_err(io::Error::from)
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "this filesystem does not support the atomic no-replace rename \
+                     the conditioned replacement requires; the commit refused \
+                     without touching either file",
+                ))
             } else {
                 Err(error)
             }
