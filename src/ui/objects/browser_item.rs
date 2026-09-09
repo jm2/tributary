@@ -41,8 +41,4 @@ impl BrowserItem {
     pub fn count(&self) -> u32 {
         self.imp().count.get()
     }
-
-    pub fn display(&self) -> String {
-        format!("{} ({})", self.label(), self.count())
-    }
 }

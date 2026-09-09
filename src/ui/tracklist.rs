@@ -435,7 +435,7 @@ pub(super) fn build_tracklist(
         .model(&selection)
         .reorderable(true)
         .show_column_separators(true)
-        .show_row_separators(true)
+        .show_row_separators(false)
         .css_classes(["data-table"])
         .hexpand(true)
         .vexpand(true)
@@ -633,19 +633,16 @@ pub(super) fn build_tracklist(
     let server_playlist_status_shell = ServerPlaylistStatusShell::new(&column_view);
     let status_label = gtk::Label::builder()
         .halign(gtk::Align::End)
+        .valign(gtk::Align::Center)
         .hexpand(true)
-        .margin_start(8)
-        .margin_end(12)
-        .css_classes(["dim-label", "caption"])
+        .css_classes(["dim-label", "caption", "numeric"])
         .build();
     update_status(&status_label, initial_tracks);
 
     let status_bar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
-        .margin_start(8)
-        .margin_top(4)
-        .margin_bottom(4)
+        .valign(gtk::Align::Center)
         .css_classes(["statusbar-box"])
         .build();
     status_bar.append(server_playlist_status_shell.widget());

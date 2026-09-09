@@ -1336,7 +1336,7 @@ pub fn popover_from_menu_model(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::path::PathBuf;
 
     use super::*;
@@ -1857,33 +1857,57 @@ mod tests {
     /// menu display through `popover_from_menu_model`, which always sets a
     /// non-null child widget built from the menu's actions.
     ///
-    /// This test exercises that contract end-to-end: with a populated
+    /// This contract is exercised end-to-end: with a populated
     /// menu and matching action group, the resulting popover MUST have a
     /// bounded scrolling child containing one button per enabled action. If a
     /// future change drops the child assignment or scrolling constraint (e.g.
     /// by re-introducing `gtk::PopoverMenu::from_model` or attaching the menu
-    /// box directly), this test will fail.
+    /// box directly), the consolidated GTK test will fail.
     ///
     /// Headless CI (cargo test in the Fedora container with no X/Wayland socket)
-    /// cannot initialize GTK, so the test gates on `gtk::init()`'s
-    /// non-panicking result and skips with a printed reason when GTK
-    /// cannot acquire a display. macOS is excluded because GTK's Quartz
-    /// backend panics when initialized from the test harness worker thread.
-    /// The contract still holds on any machine with a display — the test is
-    /// therefore meaningful on a developer box and harmless in CI.
+    /// cannot initialize GTK, so the contract skips with a printed reason when
+    /// no display session is available or GTK cannot acquire a display.
+    /// macOS is excluded because GTK's Quartz backend panics when
+    /// initialized from the test harness worker thread. The contract still
+    /// holds on any machine with a display — it is therefore
+    /// meaningful on a developer box and harmless in CI.
+    ///
+    /// This contract is NOT its own `#[test]`: the
+    /// `ui::widget_test_session` mutex serializes GTK-initializing tests
+    /// but does not give them thread affinity, so a second GTK-touching
+    /// `#[test]` would run on a different libtest worker thread than the
+    /// one that ran `gtk::init` and construct widgets off the
+    /// initializing thread, tripping gtk-rs main-thread checks
+    /// (2026-09-09 review rejection, PR #179). It is instead invoked from
+    /// the crate's single consolidated GTK test in `browser.rs`, whose
+    /// `acquire` call owns the display gate, the single `gtk::init`, and
+    /// the serialization lock across this body.
     #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn popover_from_menu_model_attaches_a_visible_child_widget() {
-        if let Err(e) = gtk::init() {
-            eprintln!(
-                "popover_from_menu_model_attaches_a_visible_child_widget: \
-                 GTK unavailable ({e}); skipping. Re-run on a box with a display \
-                 session to exercise the contract."
-            );
-            return;
-        }
+    pub fn popover_from_menu_model_attaches_a_visible_child_widget() {
         assert_track_drags_start_only_from_the_data_row_area();
 
+        let harness = popover_menu_harness();
+        let parent = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let popover = popover_from_menu_model(&parent, &harness.menu, &harness.actions);
+
+        let viewport = assert_popover_wraps_scrolling_viewport(&popover);
+        let vbox = menu_box_inside(&viewport);
+        clicking_first_button_fires_only_its_action(&vbox, &harness.prop_rx, &harness.add_rx);
+    }
+
+    /// Menu model + action group backing the popover contract, with one
+    /// receiver per action so assertions can observe exactly which
+    /// action a click activated.
+    #[cfg(not(target_os = "macos"))]
+    struct PopoverMenuHarness {
+        menu: gtk::gio::Menu,
+        actions: gtk::gio::SimpleActionGroup,
+        prop_rx: async_channel::Receiver<()>,
+        add_rx: async_channel::Receiver<()>,
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn popover_menu_harness() -> PopoverMenuHarness {
         let menu = gtk::gio::Menu::new();
         menu.append(Some("Open Properties"), Some("ctx.properties"));
         menu.append(Some("Add to Playlist"), Some("ctx.add"));
@@ -1903,9 +1927,19 @@ mod tests {
         });
         actions.add_action(&add_action);
 
-        let parent = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let popover = popover_from_menu_model(&parent, &menu, &actions);
+        PopoverMenuHarness {
+            menu,
+            actions,
+            prop_rx,
+            add_rx,
+        }
+    }
 
+    /// The popover must wrap its menu in a scrolling viewport with the
+    /// documented policy/size contract; returns the viewport so callers
+    /// can descend to the menu box.
+    #[cfg(not(target_os = "macos"))]
+    fn assert_popover_wraps_scrolling_viewport(popover: &gtk::Popover) -> gtk::ScrolledWindow {
         let child = popover
             .child()
             .expect("popover must have a non-null child after construction");
@@ -1920,9 +1954,14 @@ mod tests {
             viewport.max_content_height(),
             CONTEXT_MENU_MAX_CONTENT_HEIGHT
         );
-        // The menu box is not `GtkScrollable`, so `ScrolledWindow::set_child`
-        // wraps it in an auto-added `GtkViewport`, and `child()` returns that
-        // viewport rather than the box. Look through the wrapper when present.
+        viewport
+    }
+
+    /// The menu box is not `GtkScrollable`, so `ScrolledWindow::set_child`
+    /// wraps it in an auto-added `GtkViewport`, and `child()` returns that
+    /// viewport rather than the box. Look through the wrapper when present.
+    #[cfg(not(target_os = "macos"))]
+    fn menu_box_inside(viewport: &gtk::ScrolledWindow) -> gtk::Box {
         let vbox = viewport
             .child()
             .and_then(|child| match child.downcast::<gtk::Box>() {
@@ -1940,9 +1979,17 @@ mod tests {
             2,
             "one button per enabled action"
         );
+        vbox
+    }
 
-        // Clicking the first button must activate the corresponding
-        // action and close the popover — that's the user-visible fix.
+    /// Clicking the first button must activate the corresponding
+    /// action and close the popover — that's the user-visible fix.
+    #[cfg(not(target_os = "macos"))]
+    fn clicking_first_button_fires_only_its_action(
+        vbox: &gtk::Box,
+        prop_rx: &async_channel::Receiver<()>,
+        add_rx: &async_channel::Receiver<()>,
+    ) {
         let first_button = vbox
             .observe_children()
             .item(0)
@@ -2014,10 +2061,11 @@ mod tests {
 
     /// Widget-constructing contract for the tracklist drag origin. Called from
     /// [`popover_from_menu_model_attaches_a_visible_child_widget`] rather than
-    /// being its own `#[test]`: gtk-rs allows GTK to be initialized on exactly
-    /// one thread per process, and the test harness runs tests on a pool of
-    /// threads, so a second GTK-initializing test panics whenever it lands on
-    /// a different thread from the first.
+    /// being its own `#[test]`: the harness runs tests on a pool of threads,
+    /// so a second GTK-initializing test would have to coordinate through the
+    /// `ui::widget_test_session` lock with a test in another module; folding
+    /// it into the one GTK session this module already holds keeps the
+    /// contract exercised without a cross-module handshake.
     #[cfg(not(target_os = "macos"))]
     fn assert_track_drags_start_only_from_the_data_row_area() {
         let (window, column_view, label) = realized_tracklist_for_drag_test();
