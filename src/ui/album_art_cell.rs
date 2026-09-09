@@ -70,9 +70,16 @@ impl AlbumArtCell {
 
     /// Reset the cell to its placeholder state. Used both before the
     /// artwork resolves and when the album has no artwork at all.
+    ///
+    /// This is deliberately ONE image operation. GTK4 normalizes every
+    /// `Image` representation to a paintable, so `set_icon_name(Some(..))`
+    /// alone replaces whatever texture the cell showed before; the
+    /// previous implementation followed it with `set_paintable(None)`,
+    /// which cleared the freshly installed icon paintable and rendered
+    /// the missing-art state as a blank square (2026-09-07 review
+    /// finding).
     pub(crate) fn show_placeholder(&self, label_text: &str, accessible_label: Option<&str>) {
         self.image.set_icon_name(Some(self.placeholder_icon));
-        self.image.set_paintable(None::<&gdk::Paintable>);
         self.label.set_text(label_text);
         self.label.set_tooltip_text(Some(label_text));
         if let Some(text) = accessible_label {
@@ -154,6 +161,13 @@ pub struct AlbumArtCellState {
     /// clean slate while the fetch it replaces stays gated by its stale
     /// generation token.
     pub(crate) revoked: Rc<Cell<bool>>,
+    /// Worker-side liveness token for the cell's outstanding fetch, if
+    /// any. [`AlbumArtCellState::revoke`] flips it so the persistent art
+    /// worker skips the network read and closes the reply for a fetch
+    /// the row will never see (rebind, unbind, teardown, factory swap);
+    /// [`AlbumArtController::spawn_fetch`] replaces it with a fresh
+    /// token when it schedules the next fetch.
+    pub(crate) fetch_liveness: Rc<RefCell<Option<crate::ui::album_art::ScopedArtFetch>>>,
     /// Active `paintable`-notify listener for the underlying `Image`,
     /// if any. A new bind replaces this with a new listener; the
     /// previous one is disconnected so the cache doesn't get multiple
@@ -169,6 +183,7 @@ impl AlbumArtCellState {
             bound_source: Rc::new(RefCell::new(None)),
             generation: Rc::new(Cell::new(BindGeneration::INVALID)),
             revoked: Rc::new(Cell::new(false)),
+            fetch_liveness: Rc::new(RefCell::new(None)),
             paintable_notify_id: Rc::new(RefCell::new(None)),
         }
     }
@@ -190,20 +205,30 @@ impl AlbumArtCellState {
     }
 
     /// Mark the cell as revoked. Returns the cell so the bind factory
-    /// can chain it after flipping the previous fetch's flag.
+    /// can chain it after flipping the previous fetch's flag. Also flips
+    /// the cell's outstanding fetch's worker-side token, if one is
+    /// stored, so the persistent art worker stops a fetch the row will
+    /// never observe — this is what revokes requests on virtualized
+    /// rebinds on every path (cache hit, no-art, and placeholder), not
+    /// just the paths that schedule a new fetch.
     pub(crate) fn revoke(&self) {
         self.revoked.set(true);
+        if let Some(token) = self.fetch_liveness.borrow().as_ref() {
+            token.revoke();
+        }
     }
 
-    /// Clear the revocation flag and disconnect any paintable listener
-    /// left over from the cell's previous fetch cycle. Called by
-    /// [`AlbumArtController::spawn_fetch`] so the fetch it is about to
-    /// schedule starts from a clean slate. Race-free: the reset runs
-    /// synchronously on the main loop before the new future is polled,
-    /// and the fetch it replaces is still blocked by its stale
-    /// generation token even if it resumes after the reset.
+    /// Clear the revocation flag, discard the (dead) fetch token slot,
+    /// and disconnect any paintable listener left over from the cell's
+    /// previous fetch cycle. Called by [`AlbumArtController::spawn_fetch`]
+    /// so the fetch it is about to schedule starts from a clean slate —
+    /// spawn_fetch stores a fresh token right after. Race-free: the reset
+    /// runs synchronously on the main loop before the new future is
+    /// polled, and the fetch it replaces is still blocked by its revoked
+    /// token and stale generation even if it resumes after the reset.
     pub(crate) fn clear(&self) {
         self.revoked.set(false);
+        self.fetch_liveness.borrow_mut().take();
         if let Some(handler_id) = self.paintable_notify_id.borrow_mut().take() {
             self.cell.image.disconnect(handler_id);
         }
@@ -301,5 +326,67 @@ mod tests {
         assert!(flag.get(), "revoke() flips the flag");
         flag.set(false);
         assert!(!flag.get(), "next bind resets the flag for the new fetch");
+    }
+}
+
+/// Widget-level contracts for the album-art cell, exercised from the
+/// crate's SINGLE consolidated GTK test (`browser.rs`'s
+/// `gtk_widget_contracts_hold_on_one_session`) via the process-wide
+/// `ui::widget_test_session`. Never spawn a second GTK-initializing
+/// `#[test]` — join that test's body instead (see `ui::widget_test_session`).
+#[cfg(all(test, not(target_os = "macos")))]
+pub(crate) mod widget_tests {
+    use super::*;
+    use crate::ui::album_art::ScopedArtFetch;
+
+    /// The placeholder reset must leave the missing-art state VISIBLE.
+    /// GTK4 normalizes `Image` representations to a paintable, so after
+    /// the single `set_icon_name` operation the image must expose a
+    /// non-`None` paintable — the previous implementation cleared it
+    /// again with `set_paintable(None)`, rendering a blank square where
+    /// the placeholder icon belongs (2026-09-07 review finding).
+    pub(crate) fn show_placeholder_keeps_the_missing_art_visible() {
+        let cell = AlbumArtCell::new("audio-x-generic-symbolic");
+        // Simulate a recycled row that previously painted a texture: the
+        // placeholder reset must replace — not blank — the image content.
+        cell.show_placeholder("Album", Some("Album"));
+        assert_eq!(
+            cell.image.icon_name().as_deref(),
+            Some("audio-x-generic-symbolic"),
+            "the placeholder icon name must be set"
+        );
+        assert!(
+            cell.image.paintable().is_some(),
+            "the placeholder icon must stay visible: a paintable-less Image renders blank"
+        );
+    }
+
+    /// Revoking a cell must stop its outstanding fetch at the worker,
+    /// not merely flag the local future: the stored `ScopedArtFetch`
+    /// token flips so the persistent art worker skips the network read
+    /// and closes the reply. This is the token half of the virtualized
+    /// rebind contract — it fires on every revoke path (rebind, unbind,
+    /// teardown, factory swap), and `clear` must not resurrect it.
+    pub(crate) fn revoking_a_cell_revokes_its_outstanding_fetch_token() {
+        let cell = AlbumArtCell::new("audio-x-generic-symbolic");
+        let state = AlbumArtCellState::new(cell);
+        // Mint a fetch token the way spawn_fetch does and store it.
+        let token = ScopedArtFetch::new();
+        *state.fetch_liveness.borrow_mut() = Some(token.clone());
+        assert!(token.is_live(), "a freshly minted fetch token is live");
+
+        state.revoke();
+        assert!(state.is_revoked(), "revoke flags the local future gate");
+        assert!(
+            !token.is_live(),
+            "revoke must flip the worker-side fetch token"
+        );
+
+        // The next fetch's clean-slate reset un-flags the cell for the
+        // NEW fetch but cannot resurrect the dead token; spawn_fetch
+        // replaces the slot with a fresh token afterwards.
+        state.clear();
+        assert!(!state.is_revoked());
+        assert!(!token.is_live(), "a revoked token stays revoked");
     }
 }
