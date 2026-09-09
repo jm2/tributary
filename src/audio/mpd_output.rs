@@ -2348,6 +2348,15 @@ fn handle_load<C>(
         }
         CleanupOutcome::Stale => return,
     }
+    // The cleanup is a blocking stage: its round-trips may have consumed the
+    // remaining supervision window that the worker gate passed on. Recheck
+    // authority BEFORE any state publication or connection so a supervisor
+    // that lapsed during cleanup cannot even announce Buffering, let alone
+    // reach the partition-mutating stages below.
+    if !supervision_authorizes(plan, supervision) {
+        retain_orphan_and_refuse(active, owner, intent_epoch, cache, event_tx);
+        return;
+    }
     if !publish_state(
         owner,
         PlayerState::Buffering,
@@ -2387,6 +2396,15 @@ fn handle_load<C>(
     if !is_current(owner, intent_epoch) {
         return;
     }
+    // The connection/greeting handshake is the second blocking stage: the
+    // operation deadline permits several seconds, far beyond
+    // MAX_SUPERVISION_GAP. Recheck authority before the first partition
+    // mutation — an authority-requiring `repeat` after an expired window is
+    // exactly the defect this gate closes.
+    if !supervision_authorizes(plan, supervision) {
+        retain_orphan_and_refuse(active, owner, intent_epoch, cache, event_tx);
+        return;
+    }
 
     let repeat = active
         .as_mut()
@@ -2407,6 +2425,13 @@ fn handle_load<C>(
         return;
     }
     if !is_current(owner, intent_epoch) {
+        return;
+    }
+    // Each option ACK is its own blocking round-trip, so the supervision
+    // window is re-evaluated immediately before every mutation rather than
+    // trusting the gate that preceded the previous stage.
+    if !supervision_authorizes(plan, supervision) {
+        retain_orphan_and_refuse(active, owner, intent_epoch, cache, event_tx);
         return;
     }
     // The owned item is appended after the preserved foreign queue. Disable
@@ -2432,6 +2457,10 @@ fn handle_load<C>(
     if !is_current(owner, intent_epoch) {
         return;
     }
+    if !supervision_authorizes(plan, supervision) {
+        retain_orphan_and_refuse(active, owner, intent_epoch, cache, event_tx);
+        return;
+    }
     // `single 1`/`oneshot` can pause at the queue boundary instead of
     // reporting Stopped, which would suppress Tributary's completion event.
     let single = active
@@ -2453,6 +2482,10 @@ fn handle_load<C>(
         return;
     }
     if !is_current(owner, intent_epoch) {
+        return;
+    }
+    if !supervision_authorizes(plan, supervision) {
+        retain_orphan_and_refuse(active, owner, intent_epoch, cache, event_tx);
         return;
     }
     // Keep the stable queue id available after natural completion so terminal
@@ -2533,6 +2566,12 @@ fn handle_load<C>(
         active.take();
         return;
     }
+    // The enqueue places a new entry in the shared partition queue: gate it
+    // on currently-live authority after the preceding option ACK round-trips.
+    if !supervision_authorizes(plan, supervision) {
+        retain_orphan_and_refuse(active, owner, intent_epoch, cache, event_tx);
+        return;
+    }
     let added = active
         .as_mut()
         .expect("connected MPD session recorded")
@@ -2568,6 +2607,15 @@ fn handle_load<C>(
             return;
         }
     };
+    // Once our entry is enqueued the remaining mutation is the playback
+    // start. If the addid ACK's round-trip (or the enqueue itself) consumed
+    // the supervision window, playid must not fire: the entry is retained —
+    // deleting it would be the same unauthorized mutation — and the load is
+    // refused with the localized exclusive-control error.
+    if !supervision_authorizes(plan, supervision) {
+        retain_orphan_and_refuse(active, owner, intent_epoch, cache, event_tx);
+        return;
+    }
     let played = active
         .as_mut()
         .expect("connected MPD session recorded")
@@ -2867,6 +2915,32 @@ fn delete_owned_then_fail<C>(
     }
 }
 
+/// Terminal refusal for an authority-requiring MPD mutation on a supervised
+/// output whose authority has been revoked: retain the owned queue entry —
+/// stale confirmation must never authorise even the targeted delete, and the
+/// retained orphan is the documented post-lapse state — drop the session
+/// without issuing any further MPD command, and report the localized
+/// exclusive-control refusal. Mirrors `delete_owned_then_fail`'s terminal
+/// shape (session dropped, current owner failed) without the mutation.
+fn retain_orphan_and_refuse<C>(
+    active: &mut Option<WorkerSession<C>>,
+    owner: CommandOwner,
+    intent_epoch: &AtomicU64,
+    cache: &Mutex<MpdCache>,
+    event_tx: &async_channel::Sender<PlayerEvent>,
+) where
+    C: MpdTransport,
+{
+    active.take();
+    fail_current(
+        owner,
+        MpdFailure::exclusive_control_required(),
+        intent_epoch,
+        cache,
+        event_tx,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_control<C>(
     active: &mut Option<WorkerSession<C>>,
@@ -3142,6 +3216,15 @@ fn apply_authoritative_status<C>(
     if status.state != MpdPlaybackState::Stopped {
         if status.song_id == Some(song_id) {
             if status.has_error {
+                // The observation above may itself have revoked authority
+                // (option drift in this very status, or the window its
+                // round-trip consumed). The terminal delete is an
+                // authority-requiring mutation: after a lapse the orphan is
+                // retained and the refusal reported instead.
+                if !supervision_authorizes(plan, supervision) {
+                    retain_orphan_and_refuse(active, owner, intent_epoch, cache, event_tx);
+                    return;
+                }
                 delete_owned_then_fail(
                     active,
                     owner,
@@ -3171,6 +3254,16 @@ fn apply_authoritative_status<C>(
 
     if status.song_id == Some(song_id) {
         if status.has_error {
+            // Same post-observe authority gate as the playing branch above:
+            // the very status that reported this error may have carried
+            // option drift (or its round-trip consumed the remaining
+            // window), and the targeted delete is an authority-requiring
+            // mutation. After a lapse the entry is retained and the
+            // localized refusal reported instead.
+            if !supervision_authorizes(plan, supervision) {
+                retain_orphan_and_refuse(active, owner, intent_epoch, cache, event_tx);
+                return;
+            }
             delete_owned_then_fail(
                 active,
                 owner,
@@ -3203,7 +3296,14 @@ fn apply_authoritative_status<C>(
     if status.has_error {
         // With no current pointer, atomically target only our retained queue
         // entry before reporting the remote error. Success proves ownership;
-        // failure is still safe because no foreign item is mutated.
+        // failure is still safe because no foreign item is mutated. The
+        // delete is still an authority-requiring partition mutation: the
+        // observation above may have lapsed the supervisor (option drift
+        // with the pointer cleared), so recheck before touching the queue.
+        if !supervision_authorizes(plan, supervision) {
+            retain_orphan_and_refuse(active, owner, intent_epoch, cache, event_tx);
+            return;
+        }
         delete_owned_then_fail(
             active,
             owner,
@@ -3238,6 +3338,17 @@ fn apply_authoritative_status<C>(
     }
 
     let ownership_deadline = OperationDeadline::after(timing.operation.min(IO_IDLE_TIMEOUT));
+    // The completion delete is the last authority-requiring mutation of
+    // this path, and the very status that reached it may have revoked
+    // authority (option drift observed with the current pointer cleared, or
+    // the window its round-trip consumed). After a lapse the retained entry
+    // is the documented post-lapse state — deleting it would repeat the
+    // unauthorized mutation class this module eliminates — so the terminal
+    // refusal is reported instead of a completion.
+    if !supervision_authorizes(plan, supervision) {
+        retain_orphan_and_refuse(active, owner, intent_epoch, cache, event_tx);
+        return;
+    }
     let removed = active
         .as_mut()
         .expect("active MPD session checked")
@@ -3760,10 +3871,24 @@ impl AudioOutput for MpdOutput {
     }
 
     fn supervision_lapsed(&self) -> bool {
-        self.supervision
+        // EAGER, mirroring the worker's authority gate (`SupervisionState::
+        // authority_current`): an armed supervisor whose last clean
+        // observation (or construction-time confirmation) is older than
+        // MAX_SUPERVISION_GAP is exactly as disqualified as an explicitly
+        // lapsed one — the next authority-requiring command would be
+        // refused by that same eager rule. Consulting only the stored
+        // phase here would report such an output as healthy, the selector
+        // would swallow the reselection as a non-perturbing no-op, and the
+        // next load would refuse: the user would have to reselect twice.
+        // Reporting lapsed instead routes the first reselection into the
+        // rebuild/reconfirm path. The eager check's side effect (permanently
+        // lapsing a stale supervisor) is revoke-only and identical to the
+        // worker gate's behavior.
+        let mut supervisor = self
+            .supervision
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .is_lapsed()
+            .unwrap_or_else(|poison| poison.into_inner());
+        !supervisor.authority_current(Instant::now())
     }
 
     fn load_uri(&self, uri: &str) -> bool {
