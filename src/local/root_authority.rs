@@ -3079,6 +3079,42 @@ mod tests {
         );
     }
 
+    /// Assert the refused commit returned the confirmed original to its own
+    /// name, byte-exact.
+    fn assert_confirmed_original_restored_to_its_name(leaf: &Path) {
+        assert_eq!(
+            fs::read(leaf).expect("read the leaf back"),
+            b"original audio",
+            "the refused commit must restore the confirmed original to its own name"
+        );
+    }
+
+    /// Assert the recreated newcomer survived the refused install —
+    /// displaced under exactly one fresh quarantine sibling, byte-for-byte
+    /// intact.
+    fn assert_recreated_newcomer_displaced_under_one_fresh_sibling(directory: &TestDirectory) {
+        let siblings: Vec<PathBuf> = fs::read_dir(directory.path())
+            .expect("list the directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("tributary-replaced"))
+            })
+            .collect();
+        assert_eq!(
+            siblings.len(),
+            1,
+            "exactly the recreated newcomer may remain, displaced under one fresh sibling: {siblings:?}"
+        );
+        assert_eq!(
+            fs::read(&siblings[0]).expect("read the displaced newcomer"),
+            b"newcomer audio",
+            "the preserved newcomer must be byte-for-byte intact"
+        );
+    }
+
     /// The replacement must be conditional on the confirmed leaf identity.
     /// An external writer that swaps the leaf after the confirm step has
     /// proven it — precisely what a plain rename over the name would
@@ -3196,35 +3232,11 @@ mod tests {
             },
         );
 
-        // The confirmed original is back under its own name, byte-exact.
-        assert_eq!(
-            fs::read(&song).expect("read the leaf back"),
-            b"original audio",
-            "the refused commit must restore the confirmed original to its own name"
-        );
-
-        // The newcomer survives — displaced under a fresh quarantine sibling,
+        // The confirmed original is back under its own name, byte-exact, and
+        // the newcomer survives — displaced under a fresh quarantine sibling,
         // never destroyed by the refused install.
-        let siblings: Vec<PathBuf> = fs::read_dir(directory.path())
-            .expect("list the directory")
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains("tributary-replaced"))
-            })
-            .collect();
-        assert_eq!(
-            siblings.len(),
-            1,
-            "exactly the recreated newcomer may remain, displaced under one fresh sibling: {siblings:?}"
-        );
-        assert_eq!(
-            fs::read(&siblings[0]).expect("read the displaced newcomer"),
-            b"newcomer audio",
-            "the preserved newcomer must be byte-for-byte intact"
-        );
+        assert_confirmed_original_restored_to_its_name(&song);
+        assert_recreated_newcomer_displaced_under_one_fresh_sibling(&directory);
 
         // A refused commit does not consume the staged copy; the caller
         // cleans it up.
