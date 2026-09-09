@@ -473,6 +473,11 @@ impl TransferExecutor {
     /// Flush the staged file and verify the copied byte count against the
     /// plan's declared size. A short or oversized copy is a corrupted
     /// transfer: the staged copy is discarded and the failure reported.
+    ///
+    /// Zero is a valid declared size, not an unknown-size sentinel: a file
+    /// planned as empty and grown before execution fails the comparison
+    /// like any other mismatch, so a grown source can never smuggle bytes
+    /// past a zero-byte capacity budget or skew progress totals.
     fn flush_and_verify_size(
         staged: PreparedWriteTarget,
         declared_bytes: u64,
@@ -482,7 +487,7 @@ impl TransferExecutor {
             .staged_file()
             .flush()
             .map_err(|error| TransferError::io("failed to flush staged file", error))?;
-        if declared_bytes != 0 && copied != declared_bytes {
+        if copied != declared_bytes {
             return Err(discard_staged_copy(
                 staged,
                 "source size differs from declared size",
