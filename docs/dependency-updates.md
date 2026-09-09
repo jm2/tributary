@@ -5,7 +5,12 @@ fuzz workspace, and GitHub Actions. The policy separates routine updates from
 changes which need coordinated repair:
 
 - Compatible Cargo and Actions patch/minor updates may use native GitHub
-  auto-merge, but only after every required branch-protection check is green.
+  auto-merge, but only once the live gate enforces the repository's
+  all-checks policy. Native auto-merge waits only on the checks the `main`
+  ruleset marks required, so until the widened ruleset from the
+  "Deployment gate migration" section (below) is live and verified, routine
+  auto-merge stays off: a green required-check set alone never authorizes a
+  merge while any other check or bot review is pending or failing.
 - `sea-orm` and `sea-orm-migration` always share one Dependabot group and must
   retain matching manifest requirements and resolved versions.
 - Cargo major updates remain reviewed changes and normally arrive
