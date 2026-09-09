@@ -7,9 +7,9 @@
 # Behaviour:
 #   * `gh api graphql --paginate -f query=...` — the query is fingerprinted
 #     by connection name; pages are served in order from
-#     GH_STUB_PAGES/{threads,reviews}/page.N.json, one compact JSON document
-#     per page (matching `gh api graphql --paginate` output), stopping after
-#     a page whose pageInfo.hasNextPage is false.
+#     GH_STUB_PAGES/{threads,reviews,timeline}/page.N.json, one compact JSON
+#     document per page (matching `gh api graphql --paginate` output),
+#     stopping after a page whose pageInfo.hasNextPage is false.
 #   * `gh api repos/.../pulls/N [--jq <filter>]` — the Nth REST call serves
 #     GH_STUB_PAGES/pr.N.json, falling back to pr.1.json.
 #   * A GH_STUB_PAGES/fail file injects failures: tokens "threads",
@@ -97,6 +97,7 @@ if [ "${paginate}" = true ] && [ -n "${query}" ]; then
   kind=""
   case "${query}" in
     *reviewThreads*first:*) kind="threads" ;;
+    *timelineItems*first:*) kind="timeline" ;;
     *reviews*first:*) kind="reviews" ;;
   esac
   if [ -z "${kind}" ]; then

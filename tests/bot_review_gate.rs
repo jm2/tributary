@@ -339,6 +339,27 @@ fn current_comment_after_a_dismissal_passes() {
 }
 
 #[test]
+fn comment_submitted_before_the_dismissal_is_cleared_with_it() {
+    // A dismissal mutates the dismissed review in place and keeps its
+    // database ID, so review IDs cannot order evidence around a dismissal:
+    // ranking by ID alone treats a comment submitted before the formal
+    // dismissal as post-dismissal evidence forever and blocks at every
+    // later head. The recorded dismissal time from the review timeline
+    // decides — a pre-dismissal comment is cleared with the dismissal and
+    // must not resurrect after a head change.
+    let output = run_scenario(
+        "dismissal-comment-before-dismissal-then-head-change",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert!(
+        output.status.success(),
+        "a comment submitted before the dismissal must be cleared with it:\n{}",
+        report(&output)
+    );
+}
+
+#[test]
 fn documented_rate_limit_waives_stale_evidence_of_the_listed_reviewer() {
     // The operator's conditional substitution: with the rate limit
     // documented in the repo-owned policy file, the substitute reviewer's
@@ -446,6 +467,56 @@ fn substitution_without_a_readable_policy_file_stays_disabled() {
 }
 
 #[test]
+fn gate_demands_evidence_from_a_listed_reviewer_with_no_reviews() {
+    // A policy-listed reviewer that was rate-limited before submitting any
+    // review produces no review group to derive a violation from, so a gate
+    // that only iterates existing reviews would pass with no substitute
+    // approval at all — the exact bypass the substitution contract forbids.
+    // The absence of a required reviewer is itself stale evidence: the gate
+    // synthesizes the missing stale-evidence violation and blocks.
+    let output = run_scenario(
+        "rate-limit-substitution-denied-missing-reviewer",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert_blocked(
+        &output,
+        &[
+            "STALE BOT REVIEW EVIDENCE",
+            "coderabbitai[bot]",
+            "no review submitted",
+            "u/rate-limit-evidence",
+        ],
+        "not clean",
+    );
+}
+
+#[test]
+fn documented_rate_limit_waives_a_listed_reviewers_missing_evidence() {
+    // The synthesized missing-evidence violation is waivable exactly like
+    // derived stale evidence: with the substitution eligible (substitute
+    // approval at the exact evaluated head, every thread resolved, no
+    // outstanding change request from any author), the unavailable listed
+    // reviewer no longer blocks — and the waiver is reported.
+    let output = run_scenario(
+        "rate-limit-substitution-granted-missing-reviewer",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert!(
+        output.status.success(),
+        "an eligible substitution must waive a listed reviewer's missing evidence:\n{}",
+        report(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("RATE-LIMIT SUBSTITUTION") && stdout.contains("coderabbitai[bot]"),
+        "the granted waiver must be reported for auditability:\n{}",
+        report(&output)
+    );
+}
+
+#[test]
 fn comment_only_bot_review_does_not_clear_a_change_request() {
     // GitHub clears Request-changes only on a later approval or a formal
     // dismissal. A comment-only review carries no conclusion, so a bot
@@ -539,6 +610,32 @@ fn incomplete_thread_pagination_fails_closed() {
 fn failed_graphql_query_fails_closed() {
     let output = run_scenario("query-failure", "pull_request", Some(HEAD_SHA));
     assert_blocked(&output, &[], "Review-thread query failed; failing closed.");
+}
+
+#[test]
+fn failed_timeline_query_fails_closed() {
+    // The dismissal timeline is evidence like any other: a query failure
+    // must fail the check instead of silently reading as "no dismissals".
+    let output = run_scenario("query-failure-timeline", "pull_request", Some(HEAD_SHA));
+    assert_blocked(
+        &output,
+        &[],
+        "Review-timeline query failed; failing closed.",
+    );
+}
+
+#[test]
+fn incomplete_timeline_pagination_fails_closed() {
+    let output = run_scenario(
+        "timeline-pagination-incomplete",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert_blocked(
+        &output,
+        &[],
+        "Review-timeline response omitted the pull request; failing closed.",
+    );
 }
 
 #[test]
