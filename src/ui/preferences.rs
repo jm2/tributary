@@ -1805,7 +1805,11 @@ mod tests {
 /// test (browser.rs `gtk_widget_contracts_hold_on_one_session`) — never
 /// standalone `#[test]`s — so only one test ever owns the GTK session.
 /// See `ui::widget_test_session`.
-#[cfg(test)]
+// macOS gates out the sole caller (browser.rs's consolidated GTK test
+// shares the crate's one GTK session only off-macOS); an ungated copy of
+// these symbols is dead code there and fails clippy -D warnings. Mirror
+// the caller's gate exactly, as context_menu's helper already does.
+#[cfg(all(test, not(target_os = "macos")))]
 pub mod widget_tests {
     use super::update_browser_visibility;
     use super::BrowserViewsConfig;
@@ -1851,26 +1855,21 @@ pub mod widget_tests {
         }
     }
 
-    /// The gutter contract around hidden panes, including the PR #179
-    /// review defect: a pane disabled between two enabled panes must
-    /// leave exactly one visible 1px gutter between the survivors (panes
-    /// spacing is 0 — the separator widget is the sole gutter), never
-    /// zero (survivors touching) and never two (a doubled gap). Leading
-    /// and trailing gutters must never dangle at a box edge.
-    pub fn separator_gutters_join_visible_panes_around_hidden_ones() {
-        let views_of = |genre: bool, artist: bool, album: bool, folder: bool| BrowserViewsConfig {
-            genre,
-            artist,
-            album,
-            folder,
-        };
-
-        // THE reported defect: Genre + Album on, Artist + Folder off.
-        // Exactly one gutter (the one adjacent to Album) survives between
-        // the two survivors; the carried separator from the hidden Artist
-        // collapses instead of hiding both.
+    /// THE reported defect: Genre + Album on, Artist + Folder off.
+    /// Exactly one gutter (the one adjacent to Album) survives between
+    /// the two survivors; the carried separator from the hidden Artist
+    /// collapses instead of hiding both.
+    fn interior_hidden_pane_leaves_exactly_one_gutter() {
         let row = PaneRow::build();
-        update_browser_visibility(&row.browser_box, &views_of(true, false, true, false));
+        update_browser_visibility(
+            &row.browser_box,
+            &BrowserViewsConfig {
+                genre: true,
+                artist: false,
+                album: true,
+                folder: false,
+            },
+        );
         assert!(row.panes[0].is_visible(), "genre pane must stay visible");
         assert!(!row.panes[1].is_visible(), "artist pane must hide");
         assert!(row.panes[2].is_visible(), "album pane must stay visible");
@@ -1887,47 +1886,97 @@ pub mod widget_tests {
             !row.gutters[2].is_visible(),
             "no gutter may dangle after the last visible pane"
         );
+    }
 
-        // All four panes visible: every interior gutter joins two visible
-        // panes and shows.
+    /// All four panes visible: every interior gutter joins two visible
+    /// panes and shows.
+    fn all_panes_visible_show_every_interior_gutter() {
         let row = PaneRow::build();
-        update_browser_visibility(&row.browser_box, &views_of(true, true, true, true));
+        update_browser_visibility(
+            &row.browser_box,
+            &BrowserViewsConfig {
+                genre: true,
+                artist: true,
+                album: true,
+                folder: true,
+            },
+        );
         for (i, gutter) in row.gutters.iter().enumerate() {
             assert!(
                 gutter.is_visible(),
                 "gutter {i} joins two visible panes and must show"
             );
         }
+    }
 
-        // Genre + Folder on, Artist + Album off: the two carried gutters
-        // collapse onto the single gutter adjacent to Folder.
+    /// Genre + Folder on, Artist + Album off: the two carried gutters
+    /// collapse onto the single gutter adjacent to Folder.
+    fn disjoint_survivors_collapse_onto_one_gutter() {
         let row = PaneRow::build();
-        update_browser_visibility(&row.browser_box, &views_of(true, false, false, true));
+        update_browser_visibility(
+            &row.browser_box,
+            &BrowserViewsConfig {
+                genre: true,
+                artist: false,
+                album: false,
+                folder: true,
+            },
+        );
         assert!(!row.gutters[0].is_visible());
         assert!(!row.gutters[1].is_visible());
         assert!(row.gutters[2].is_visible(), "exactly one gutter survives");
+    }
 
-        // Only the first pane visible: every gutter lacks a visible pane
-        // on one side, so none may dangle at an edge.
+    /// Only the first pane visible: every gutter lacks a visible pane
+    /// on one side, so none may dangle at an edge.
+    fn lone_leading_pane_leaves_no_dangling_gutters() {
         let row = PaneRow::build();
-        update_browser_visibility(&row.browser_box, &views_of(true, false, false, false));
+        update_browser_visibility(
+            &row.browser_box,
+            &BrowserViewsConfig {
+                genre: true,
+                artist: false,
+                album: false,
+                folder: false,
+            },
+        );
         for (i, gutter) in row.gutters.iter().enumerate() {
             assert!(!gutter.is_visible(), "leading gutter {i} must not dangle");
         }
+    }
 
-        // Only the last pane visible: same, from the other edge.
+    /// Only the last pane visible: same, from the other edge.
+    fn lone_trailing_pane_leaves_no_dangling_gutters() {
         let row = PaneRow::build();
-        update_browser_visibility(&row.browser_box, &views_of(false, false, false, true));
+        update_browser_visibility(
+            &row.browser_box,
+            &BrowserViewsConfig {
+                genre: false,
+                artist: false,
+                album: false,
+                folder: true,
+            },
+        );
         for (i, gutter) in row.gutters.iter().enumerate() {
             assert!(
                 !gutter.is_visible(),
                 "leading gutter {i} before the only visible pane must hide"
             );
         }
+    }
 
-        // All panes hidden: no gutters, and the whole browser box hides.
+    /// All panes hidden: no gutters, and the whole browser box hides.
+    fn all_panes_hidden_hide_the_browser_box() {
         let row = PaneRow::build();
-        update_browser_visibility(&row.browser_box, &views_of(false, false, false, false));
+        update_browser_visibility(
+            &row.browser_box,
+            &BrowserViewsConfig {
+                genre: false,
+                artist: false,
+                album: false,
+                folder: false,
+            },
+        );
         for (i, gutter) in row.gutters.iter().enumerate() {
             assert!(!gutter.is_visible(), "gutter {i} must hide");
         }
@@ -1935,5 +1984,20 @@ pub mod widget_tests {
             !row.browser_box.is_visible(),
             "with every pane hidden the browser box must hide"
         );
+    }
+
+    /// The gutter contract around hidden panes, including the PR #179
+    /// review defect: a pane disabled between two enabled panes must
+    /// leave exactly one visible 1px gutter between the survivors (panes
+    /// spacing is 0 — the separator widget is the sole gutter), never
+    /// zero (survivors touching) and never two (a doubled gap). Leading
+    /// and trailing gutters must never dangle at a box edge.
+    pub fn separator_gutters_join_visible_panes_around_hidden_ones() {
+        interior_hidden_pane_leaves_exactly_one_gutter();
+        all_panes_visible_show_every_interior_gutter();
+        disjoint_survivors_collapse_onto_one_gutter();
+        lone_leading_pane_leaves_no_dangling_gutters();
+        lone_trailing_pane_leaves_no_dangling_gutters();
+        all_panes_hidden_hide_the_browser_box();
     }
 }

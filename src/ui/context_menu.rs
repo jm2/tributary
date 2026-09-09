@@ -1886,6 +1886,28 @@ pub mod tests {
     pub fn popover_from_menu_model_attaches_a_visible_child_widget() {
         assert_track_drags_start_only_from_the_data_row_area();
 
+        let harness = popover_menu_harness();
+        let parent = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let popover = popover_from_menu_model(&parent, &harness.menu, &harness.actions);
+
+        let viewport = assert_popover_wraps_scrolling_viewport(&popover);
+        let vbox = menu_box_inside(&viewport);
+        clicking_first_button_fires_only_its_action(&vbox, &harness.prop_rx, &harness.add_rx);
+    }
+
+    /// Menu model + action group backing the popover contract, with one
+    /// receiver per action so assertions can observe exactly which
+    /// action a click activated.
+    #[cfg(not(target_os = "macos"))]
+    struct PopoverMenuHarness {
+        menu: gtk::gio::Menu,
+        actions: gtk::gio::SimpleActionGroup,
+        prop_rx: async_channel::Receiver<()>,
+        add_rx: async_channel::Receiver<()>,
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn popover_menu_harness() -> PopoverMenuHarness {
         let menu = gtk::gio::Menu::new();
         menu.append(Some("Open Properties"), Some("ctx.properties"));
         menu.append(Some("Add to Playlist"), Some("ctx.add"));
@@ -1905,9 +1927,19 @@ pub mod tests {
         });
         actions.add_action(&add_action);
 
-        let parent = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let popover = popover_from_menu_model(&parent, &menu, &actions);
+        PopoverMenuHarness {
+            menu,
+            actions,
+            prop_rx,
+            add_rx,
+        }
+    }
 
+    /// The popover must wrap its menu in a scrolling viewport with the
+    /// documented policy/size contract; returns the viewport so callers
+    /// can descend to the menu box.
+    #[cfg(not(target_os = "macos"))]
+    fn assert_popover_wraps_scrolling_viewport(popover: &gtk::Popover) -> gtk::ScrolledWindow {
         let child = popover
             .child()
             .expect("popover must have a non-null child after construction");
@@ -1922,9 +1954,14 @@ pub mod tests {
             viewport.max_content_height(),
             CONTEXT_MENU_MAX_CONTENT_HEIGHT
         );
-        // The menu box is not `GtkScrollable`, so `ScrolledWindow::set_child`
-        // wraps it in an auto-added `GtkViewport`, and `child()` returns that
-        // viewport rather than the box. Look through the wrapper when present.
+        viewport
+    }
+
+    /// The menu box is not `GtkScrollable`, so `ScrolledWindow::set_child`
+    /// wraps it in an auto-added `GtkViewport`, and `child()` returns that
+    /// viewport rather than the box. Look through the wrapper when present.
+    #[cfg(not(target_os = "macos"))]
+    fn menu_box_inside(viewport: &gtk::ScrolledWindow) -> gtk::Box {
         let vbox = viewport
             .child()
             .and_then(|child| match child.downcast::<gtk::Box>() {
@@ -1942,9 +1979,17 @@ pub mod tests {
             2,
             "one button per enabled action"
         );
+        vbox
+    }
 
-        // Clicking the first button must activate the corresponding
-        // action and close the popover — that's the user-visible fix.
+    /// Clicking the first button must activate the corresponding
+    /// action and close the popover — that's the user-visible fix.
+    #[cfg(not(target_os = "macos"))]
+    fn clicking_first_button_fires_only_its_action(
+        vbox: &gtk::Box,
+        prop_rx: &async_channel::Receiver<()>,
+        add_rx: &async_channel::Receiver<()>,
+    ) {
         let first_button = vbox
             .observe_children()
             .item(0)
