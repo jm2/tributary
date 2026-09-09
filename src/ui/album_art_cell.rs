@@ -335,7 +335,7 @@ mod tests {
 /// `ui::widget_test_session`. Never spawn a second GTK-initializing
 /// `#[test]` — join that test's body instead (see `ui::widget_test_session`).
 #[cfg(all(test, not(target_os = "macos")))]
-pub(crate) mod widget_tests {
+pub mod widget_tests {
     use super::*;
     use crate::ui::album_art::ScopedArtFetch;
 
@@ -345,7 +345,7 @@ pub(crate) mod widget_tests {
     /// non-`None` paintable — the previous implementation cleared it
     /// again with `set_paintable(None)`, rendering a blank square where
     /// the placeholder icon belongs (2026-09-07 review finding).
-    pub(crate) fn show_placeholder_keeps_the_missing_art_visible() {
+    pub fn show_placeholder_keeps_the_missing_art_visible() {
         let cell = AlbumArtCell::new("audio-x-generic-symbolic");
         // Simulate a recycled row that previously painted a texture: the
         // placeholder reset must replace — not blank — the image content.
@@ -367,7 +367,7 @@ pub(crate) mod widget_tests {
     /// and closes the reply. This is the token half of the virtualized
     /// rebind contract — it fires on every revoke path (rebind, unbind,
     /// teardown, factory swap), and `clear` must not resurrect it.
-    pub(crate) fn revoking_a_cell_revokes_its_outstanding_fetch_token() {
+    pub fn revoking_a_cell_revokes_its_outstanding_fetch_token() {
         let cell = AlbumArtCell::new("audio-x-generic-symbolic");
         let state = AlbumArtCellState::new(cell);
         // Mint a fetch token the way spawn_fetch does and store it.

@@ -436,12 +436,14 @@ impl AlbumArtController {
             // synchronously on the GTK main loop, so we listen for the
             // resulting `paintable` property change.
             install_cache_probe(
-                cache,
+                CacheAdmission {
+                    cache,
+                    source: album_source,
+                    source_epoch,
+                    album_key,
+                    pixel_size,
+                },
                 image,
-                album_source,
-                source_epoch,
-                album_key,
-                pixel_size,
                 cell_state,
                 generation,
                 liveness,
@@ -552,13 +554,22 @@ async fn resolve_kind(
     ResolvedArtKind::NoArtwork
 }
 
-fn install_cache_probe(
+/// Cache-admission identity for one bind: everything the cache probe
+/// needs to key and charge an admitted texture. Grouped into a struct so
+/// the probe installer takes one identity argument instead of four
+/// loose ones (clippy::too_many_arguments) and so a future key field has
+/// exactly one place to be added.
+struct CacheAdmission {
     cache: AlbumArtCache,
-    image: gtk::Image,
     source: Option<SourceId>,
     source_epoch: Option<u64>,
     album_key: String,
     pixel_size: i32,
+}
+
+fn install_cache_probe(
+    admission: CacheAdmission,
+    image: gtk::Image,
     cell_state: AlbumArtCellState,
     generation: BindGeneration,
     liveness: album_art::ScopedArtFetch,
@@ -576,9 +587,13 @@ fn install_cache_probe(
         image.disconnect(previous);
     }
 
-    let closure_album_key = album_key;
-    let closure_source = source;
-    let closure_epoch = source_epoch;
+    let CacheAdmission {
+        cache,
+        source,
+        source_epoch,
+        album_key,
+        pixel_size,
+    } = admission;
     let gen = generation;
     let state = cell_state.clone();
     let handler_id = image.connect_notify_local(Some("paintable"), move |img, _| {
@@ -591,9 +606,9 @@ fn install_cache_probe(
         if let Some(paintable) = img.paintable() {
             if let Ok(texture) = paintable.downcast::<gdk::Texture>() {
                 cache.insert(
-                    closure_source.as_ref(),
-                    closure_epoch,
-                    &closure_album_key,
+                    source.as_ref(),
+                    source_epoch,
+                    &album_key,
                     pixel_size,
                     texture,
                 );
