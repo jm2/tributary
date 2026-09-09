@@ -369,9 +369,9 @@ key="value"
 
 Where:
 
-- Every key is one of the fifteen listed below, in the listed order (the parser is
-  order-insensitive on read but the writer always emits them in the canonical order so diffs and
-  bugs are reproducible).
+- Every key is one of the fifteen listed below and appears exactly once, in the listed order
+  (the parser is order-insensitive on read but the writer always emits them in the canonical
+  order so diffs and bugs are reproducible).
 - Every value is a double-quoted UTF-8 string. Quotes inside a value are escaped as `\"`; the
   backslash is escaped as `\\`; newline characters (LF or CR) are not permitted in values.
   Floats are emitted with one decimal place and no explicit `+` sign (e.g. `"-24.0"`, `"0.0"`,
@@ -466,13 +466,25 @@ example, a user moving `Clip protection` from `Soft` back to `Off` must see `Off
 restart). The debounce timer is reset on every change so drag-induced writes are flushed on the
 trailing edge of the gesture.
 
-In addition to the debounce, the equalizer module installs a *shutdown flush* hook: on
-`gtk::main_quit` (and on `SIGTERM`/`SIGINT` via the application's main-loop signal hook), the
-module synchronously performs an atomic-replace write of the current state to disk before the
-GTK main loop exits. The shutdown flush is its own uniquely named write-temp-and-replace
-cycle; it does not wait for the debounce timer and runs even if the timer is armed. This
-guarantees that no partial write is observable on disk if the user quits while the debounce is
-pending.
+In addition to the debounce, the equalizer module registers a *shutdown flush* with the
+application's single quit seam: the window close-request drain (`connect_close_request`), the
+same handler this application already uses for module shutdown work. Both quit entry points
+route through it — a direct window close, and the in-app quit request, which dispatches
+`window.close()` from the application's quit handler with an `Application::quit` fallback only
+when no window exists — so the flush runs exactly once, inside the drain, before the GTK main
+loop exits. The flush synchronously performs an atomic-replace write of the current state to
+disk. It is its own uniquely named write-temp-and-replace cycle; it does not wait for the
+debounce timer and runs even if the timer is armed. This guarantees that no partial write is
+observable on disk if the user quits while the debounce is pending.
+
+The no-window `Application::quit` fallback requires no separate flush: the settings panel lives
+in the single window, so once that window's close-request drain has run, no equalizer state
+change can occur before process exit. Out-of-band process termination (`SIGTERM`, `SIGINT`,
+`SIGKILL`) is not hooked — the application installs no main-loop signal handlers, and this
+contract adds none. On such termination the flush does not run, and the durability guarantee
+degrades to the debounce bound: at most one 750 ms change-spell since the last completed write
+is lost, and no partial write is observable on disk, which is the atomic-replace protocol's own
+guarantee, independent of the flush.
 
 Fresh-install default state is exactly:
 
@@ -499,6 +511,12 @@ Validation rules on read:
   defaults as a whole under the rule below. There are no per-key defaults for missing keys —
   partial files are not merged with defaults, because silently filling gaps would combine
   stale band values with fresh ones.
+- A file that contains any key more than once is malformed: it is replaced with the defaults
+  as a whole, and the diagnostic names the duplicated key. No precedence between duplicate
+  lines is defined — the parser is order-insensitive, so a positional rule (first or last
+  wins) could not be stated without making the parsed state depend on line order; a duplicate
+  key indicates a corrupted or hand-edited file, and the canonical writer emits exactly one
+  line per key.
 - `bandN_db` values outside `[-24.0, +12.0]` are clamped to the boundary.
 - `preamp_db` outside `[-24.0, +12.0]` is clamped to the boundary.
 - A `preamp_db` or `bandN_db` value inside the range but not an exact multiple of 0.5 (for
@@ -682,8 +700,10 @@ for this contract; new conditions require a new revision.
    `playbin3.audio-filter` becomes `NULL`; no equalizer DSP runs.
 9. **Switch active output back to Local.** EQ module renders enabled in UI if previously
    enabled; bin re-installs at `playbin3.audio-filter` with persisted bands and preamp.
-10. **Quit while a slider drag is in progress.** Shutdown flush hook writes the current state to
-    disk via atomic replace before `gtk::main_quit` returns; no partial writes.
+10. **Quit while a slider drag is in progress.** The quit request reaches the window
+    close-request drain (a direct window close and the in-app quit request both route through
+    `window.close()`); the shutdown flush writes the current state to disk via atomic replace
+    before the drain completes; no partial writes.
 11. **Malformed `equalizer.cfg` on disk.** Defaults re-written via atomic replace; single
     warn-level diagnostic published (file path, byte count, bad key).
 12. **Preamp outside bounds in saved file.** Value clamped to range; bands remain as stored;
@@ -729,6 +749,9 @@ for this contract; new conditions require a new revision.
     durability claim is the platform's own — file contents are flushed before the replace,
     and directory-entry durability is claimed only on platforms that provide a directory
     sync.
+24. **Duplicate key in saved file (e.g. a second `band0_db` line).** The file is malformed as
+    a whole; defaults are re-written via atomic replace; the warn diagnostic names the
+    duplicated key; no precedence between the duplicate lines is defined or observed.
 
 ## Implementation boundary
 
