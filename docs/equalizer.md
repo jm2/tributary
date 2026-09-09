@@ -110,7 +110,13 @@ succeeds for every PCM source regardless of its native rate, channel count, or f
 only negotiation failure that reaches the rollback path is non-PCM upstream (typically a
 malformed source): the bin's ghost pads never agree on caps, `playbin3` posts the error on the
 bus, the implementation removes the bin, and the pipeline falls back to the existing
-passthrough layout (a single info-level diagnostic names the source URI). This is the spec's
+passthrough layout. The fallback publishes a single info-level diagnostic carrying a URI-free
+failure category (for example `equalizer-caps-negotiation-failed`) — never the source URI:
+playbin is assigned the prepared ticket URI, whose loopback ticket is a live capability grant
+for local and authenticated loads, and GStreamer error text can carry that URI (or a direct
+file path) verbatim, which is why the audio stack never surfaces GStreamer error strings. The
+diagnostic may include only a redacted, non-URI source identifier, such as the origin class of
+the source (`loopback-ticket`, `file`). This is the spec's
 only rollback path: there is no element-by-element fallback inside the bin, and a failed
 negotiation does not leave the chain half-inserted.
 
@@ -369,9 +375,11 @@ key="value"
 
 Where:
 
-- Every key is one of the fifteen listed below and appears exactly once, in the listed order
-  (the parser is order-insensitive on read but the writer always emits them in the canonical
-  order so diffs and bugs are reproducible).
+- Every key is one of the fifteen listed below and appears exactly once. The listed order is
+  canonical for the writer only: the writer emits keys in that order so diffs and bugs are
+  reproducible, while the reader is order-insensitive and accepts the fifteen keys in any
+  order. Key ordering is not a read-validation criterion — a file that contains all fifteen
+  keys exactly once is valid regardless of line order.
 - Every value is a double-quoted UTF-8 string. Quotes inside a value are escaped as `\"`; the
   backslash is escaped as `\\`; newline characters (LF or CR) are not permitted in values.
   Floats are emitted with one decimal place and no explicit `+` sign (e.g. `"-24.0"`, `"0.0"`,
@@ -481,10 +489,13 @@ The no-window `Application::quit` fallback requires no separate flush: the setti
 in the single window, so once that window's close-request drain has run, no equalizer state
 change can occur before process exit. Out-of-band process termination (`SIGTERM`, `SIGINT`,
 `SIGKILL`) is not hooked — the application installs no main-loop signal handlers, and this
-contract adds none. On such termination the flush does not run, and the durability guarantee
-degrades to the debounce bound: at most one 750 ms change-spell since the last completed write
-is lost, and no partial write is observable on disk, which is the atomic-replace protocol's own
-guarantee, independent of the flush.
+contract adds none. On such termination the flush does not run, and the pending change-spell
+is lost in its entirety: every edit since the last completed write. The debounce timer resets
+on every change and writes only on the trailing edge, so a spell of continuous activity keeps
+re-arming the timer indefinitely — the pending spell is unbounded in duration and size, and
+the 750 ms interval bounds only the idle wait after the final edit, not how much the spell
+holds. Termination still guarantees that no partial write is observable on disk, which is the
+atomic-replace protocol's own guarantee, independent of the flush.
 
 Fresh-install default state is exactly:
 
@@ -752,6 +763,15 @@ for this contract; new conditions require a new revision.
 24. **Duplicate key in saved file (e.g. a second `band0_db` line).** The file is malformed as
     a whole; defaults are re-written via atomic replace; the warn diagnostic names the
     duplicated key; no precedence between the duplicate lines is defined or observed.
+25. **Unhooked termination (`SIGTERM`/`SIGINT`/`SIGKILL`) with a change-spell pending.** The
+    shutdown flush does not run; every edit since the last completed write is lost — the
+    pending change-spell is unbounded in duration and size under continuous activity, and the
+    750 ms interval bounds only the idle wait after the final edit; no partial write is ever
+    observable on disk.
+26. **All fifteen keys present exactly once in a non-canonical order.** The file is valid: the
+    reader is order-insensitive, no ordering diagnostic exists, and the values load (with the
+    usual per-key coercions) exactly as written; the next save re-emits the keys in the
+    canonical writer order.
 
 ## Implementation boundary
 
