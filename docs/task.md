@@ -1103,7 +1103,9 @@ affected-hardware evidence. P2.1 remains the feature focus at **15/39 (38.5%)**.
   ordering, clear feedback, cancellation, and keyboard-equivalent behavior
   ([#46](https://github.com/jm2/tributary/issues/46)).
 - [ ] Design file-manager export, remote-row drops, and device-copy drops as separate authority and
-  transfer policies; implement only the variants whose target semantics are available.
+  transfer policies; implement only the variants whose target semantics are available
+  ([#46](https://github.com/jm2/tributary/issues/46);
+  [design recorded, implementation gated](drop-policies.md)).
 
 ### P2.3 — Library browsing and presentation
 
