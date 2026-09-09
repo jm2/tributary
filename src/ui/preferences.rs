@@ -1106,13 +1106,16 @@ pub fn update_browser_visibility(browser_box: &gtk::Box, views: &BrowserViewsCon
                 // its visibility once the next pane is reached.
                 pending_separators.push(widget);
             } else {
-                let visible = match pane_idx {
-                    0 => views.genre,
-                    1 => views.artist,
-                    2 => views.album,
-                    3 => views.folder,
-                    _ => true,
-                };
+                // Panes map positionally to the config flags; anything
+                // beyond the four known panes stays visible (the old
+                // `_ => true` match arm). The bounds-checked lookup
+                // keeps this function under Codacy's cyclomatic
+                // complexity threshold (PR #179 re-analysis flagged the
+                // match-driven version as its one new medium issue).
+                let visible = [views.genre, views.artist, views.album, views.folder]
+                    .get(pane_idx)
+                    .copied()
+                    .unwrap_or(true);
                 pane_idx += 1;
                 let gutter_visible = visible && previous_pane_visible;
                 for separator in std::mem::take(&mut pending_separators) {
