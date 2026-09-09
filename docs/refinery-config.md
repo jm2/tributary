@@ -99,18 +99,20 @@ three inputs are queried via the API, so review conclusions, review head
 SHAs, and review threads become machine-readable merge evidence.
 
 In-scope is fixed by enumeration, not by observation: the gate
-configuration lists every bot identity expected to review pull requests on
-this repository — currently `coderabbitai[bot]` and
-`chatgpt-codex-connector[bot]` — and every listed identity must have an
-acceptable review at the current head. A review-only bot that never posts
-— an outage, a rate limit, a rename — leaves no review record, and every
-condition above would otherwise pass vacuously; absence therefore fails
-closed exactly like a rejected review. The only sanctioned waiver is an
-operator-documented reviewer substitution: a rate-limited reviewer
-explicitly listed in the repository's substitution policy, covered by a
-substitute approval bound to the same evaluated head. A substitution entry
-never waives CI, never covers an identity the policy does not list, and
-never overrides an unresolved thread or outstanding change request.
+configuration carries an explicit list of the bot identities expected to
+review every pull request on this repository, each listed by exact bot
+login — the review-posting integrations the operator has authorized, grown
+only by the same reviewed change that enables the bot — and every listed
+identity must have an acceptable review at the current head. A review-only
+bot that never posts — an outage, a rate limit, a rename — leaves no
+review record, and every condition above would otherwise pass vacuously;
+absence therefore fails closed exactly like a rejected review. The only
+sanctioned waiver is an operator-documented reviewer substitution: a
+rate-limited reviewer explicitly listed in the repository's substitution
+policy, covered by a substitute approval bound to the same evaluated
+head. A substitution entry never waives CI, never covers an identity the
+policy does not list, and never overrides an unresolved thread or
+outstanding change request.
 
 That is a repository-settings and workflow change: it goes through its own
 bead and full CI validation, never an out-of-band ruleset edit, and it must
