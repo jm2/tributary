@@ -111,9 +111,34 @@ fn non_main_base_fails_closed() {
 }
 
 #[test]
-fn stale_event_head_fails_closed() {
-    let output = run_scenario("event-head-stale", "pull_request", Some(OTHER_SHA));
-    assert_blocked(&output, &[], "no longer matches pull request head");
+fn an_announced_commit_only_a_descendant_contains_publishes_nothing() {
+    // `commits/<sha>/pulls` also returns stacked descendants that merely
+    // CONTAIN the announced commit. Evaluating one anyway hits the
+    // head-mismatch refusal and publishes a failing verdict at the
+    // announced commit — blocking the genuine pull request headed there on
+    // every refresh. Selection by exact head SHA leaves nothing to
+    // evaluate: nothing is published and the run exits cleanly, and the
+    // genuine pull request's own announcements produce its verdict.
+    let sandbox = GateSandbox::new("descendant-not-evaluated");
+    sandbox.use_scenario("event-head-stale");
+    let output = sandbox.run("pull_request", Some(OTHER_SHA));
+    assert!(
+        output.status.success(),
+        "a commit that heads no open main pull request is not an error:\n{}",
+        report(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "No open pull request against main is headed by the announced commit {OTHER_SHA}"
+        )),
+        "the run must say why nothing was evaluated:\n{}",
+        report(&output)
+    );
+    assert!(
+        sandbox.check_runs().is_empty(),
+        "a descendant that merely contains the announced commit must never be evaluated"
+    );
 }
 
 #[test]

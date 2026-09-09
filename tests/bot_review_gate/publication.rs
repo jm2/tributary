@@ -100,32 +100,52 @@ fn a_discovery_query_failure_fails_closed_without_publishing() {
 }
 
 #[test]
-fn every_associated_pull_request_receives_its_own_verdict() {
-    // Two open main pull requests can share one head commit; each carries
-    // its own required context, so each receives its own evaluation and
-    // publication.
-    let sandbox = GateSandbox::new("publish-every-candidate");
+fn associated_pull_requests_sharing_one_head_get_one_shared_verdict() {
+    // Check runs attach to commits, not pull requests: two open main pull
+    // requests sharing one head commit would otherwise publish competing
+    // verdicts under the one required context name, and the last-published
+    // verdict would decide for both. The evaluations are recorded and
+    // exactly one shared verdict is published — here both candidates are
+    // clean, so the single shared verdict is green.
+    let sandbox = GateSandbox::new("publish-shared-clean");
     sandbox.use_scenario("two-associated-prs");
     let output = sandbox.run("pull_request", Some(HEAD_SHA));
     assert!(
         output.status.success(),
-        "clean evidence must pass for every associated pull request:\n{}",
+        "clean evidence across every associated pull request must pass:\n{}",
         report(&output)
     );
-    let check_runs = sandbox.check_runs();
-    assert_eq!(
-        check_runs.len(),
-        2,
-        "both associated pull requests must receive their verdict:\n{check_runs:?}"
+    let check_run = sandbox.single_check_run();
+    assert!(
+        check_run.contains("name=Bot Review Gate")
+            && check_run.contains(&format!("head_sha={HEAD_SHA}"))
+            && check_run.contains("conclusion=success"),
+        "the one shared verdict must be the required context at the evaluated head:\n{check_run}"
     );
-    for check_run in &check_runs {
-        assert!(
-            check_run.contains("name=Bot Review Gate")
-                && check_run.contains(&format!("head_sha={HEAD_SHA}"))
-                && check_run.contains("conclusion=success"),
-            "every published verdict must be the required context at the evaluated head:\n{check_run}"
-        );
-    }
+}
+
+#[test]
+fn one_dirty_associate_forces_the_shared_verdict_red() {
+    // A clean sibling pull request sharing the head must not be able to
+    // mask a dirty evaluation: with per-PR publications, the clean duplicate
+    // evaluated last made the dirty pull request appear green. The shared
+    // verdict fails if any candidate fails.
+    let sandbox = GateSandbox::new("publish-shared-dirty");
+    sandbox.use_scenario("two-associated-prs-dirty");
+    let output = sandbox.run("pull_request", Some(HEAD_SHA));
+    assert_blocked(&output, &[], "1 of 2 associated pull request(s) are blocked");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no longer matches pull request head"),
+        "the blocked candidate's reason must be reported:\n{}",
+        report(&output)
+    );
+    let check_run = sandbox.single_check_run();
+    assert!(
+        check_run.contains("name=Bot Review Gate")
+            && check_run.contains(&format!("head_sha={HEAD_SHA}"))
+            && check_run.contains("conclusion=failure"),
+        "the shared verdict must be red at the evaluated head despite the clean sibling:\n{check_run}"
+    );
 }
 
 #[test]
@@ -173,17 +193,19 @@ fn the_publisher_owns_the_required_context_exclusively() {
 }
 
 #[test]
-fn every_refusal_publishes_before_returning() {
+fn every_refusal_records_before_returning_and_only_the_driver_publishes() {
     // The evaluation loop swallows `set -e`, so a refusal site that merely
-    // called finish_blocked and fell through would continue evaluating —
-    // and might still publish a green verdict afterwards. Every call site
-    // must therefore be followed by an explicit `return 1` (the base
-    // mismatch included, which publishes nothing but must refuse).
+    // recorded a verdict and fell through would continue evaluating — and
+    // might still contribute a clean verdict afterwards. Every record call
+    // site must therefore be followed by an explicit `return 1`, and the
+    // shared required context must be published from exactly two call
+    // sites: the aggregated failure branch and the aggregated success
+    // branch of the driver.
     let script = super::harness::gate_run_script();
     let lines: Vec<&str> = script.lines().collect();
     let mut call_sites = 0;
     for (index, line) in lines.iter().enumerate() {
-        if line.contains("finish_blocked \"${") {
+        if line.contains("record_blocked \"${") {
             call_sites += 1;
             let next = lines[index + 1..]
                 .iter()
@@ -193,12 +215,19 @@ fn every_refusal_publishes_before_returning() {
             assert_eq!(
                 next.trim(),
                 "return 1",
-                "a finish_blocked call site must be followed by an explicit return: {line}"
+                "a record_blocked call site must be followed by an explicit return: {line}"
             );
         }
     }
     assert!(
         call_sites >= 9,
-        "every query, pagination, and head-binding refusal must publish its verdict: {call_sites}"
+        "every query, pagination, and head-binding refusal must record its verdict: {call_sites}"
+    );
+    let publications = script
+        .matches("publish_gate_check_run \"${announcer_head}\"")
+        .count();
+    assert_eq!(
+        publications, 2,
+        "exactly the aggregated failure and success branches may publish the shared verdict"
     );
 }

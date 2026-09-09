@@ -54,6 +54,15 @@ name: Bot review gate publisher
 #     are re-derived through the API from the announcing run's exact commit,
 #     and each candidate's record is the authority for its base branch and
 #     head.
+#   * Exactly ONE verdict is published per announced head. Check runs attach
+#     to commits, not pull requests, so two open main pull requests sharing
+#     one head commit would otherwise publish competing verdicts under the
+#     one required context name — and the last-published verdict would decide
+#     for both, letting a clean duplicate evaluated last make a dirty pull
+#     request appear green. Every candidate evaluation therefore only RECORDS
+#     its findings; one shared verdict — success only when every candidate is
+#     clean, failure when any of them is not (fail-if-any-fail) — is
+#     published at the end.
 #   * A pending or failing result is merge-blocking only once the live `main`
 #     ruleset marks "Bot Review Gate" as required. docs/dependency-updates.md
 #     records the exact rollout order and the live-PR verification step.
@@ -123,8 +132,9 @@ jobs:
           # ── Publication bound to the evaluated head ──────────────────────
           # The verdict is published as a completed check-run at the exact
           # evaluated commit, under the context name the live `main` ruleset
-          # requires. Nothing else in this repository writes that context:
-          # the announcer's job check-run is deliberately named differently.
+          # requires. It is called from exactly two places — the aggregated
+          # failure branch and the aggregated success branch of the driver
+          # below — so one announced head can never carry competing verdicts.
           publish_gate_check_run() {
             evaluated_head="$1"
             conclusion="$2"
@@ -142,22 +152,26 @@ jobs:
             fi
           }
 
-          # Every refusal publishes the failing verdict at the exact head it
-          # refused before returning, so the required context carries the
-          # reason instead of dangling absent. Each call site follows this
-          # with an explicit `return 1`: the loop swallows set -e, so
-          # control flow must never depend on it.
-          finish_blocked() {
-            evaluated_head="$1"
-            summary="$2"
-            publish_gate_check_run "${evaluated_head}" "failure" \
-              "Bot Review Gate: unresolved or stale bot-review evidence" "${summary}" || true
-            return 1
+          # Every refusal records the failing verdict for the shared
+          # publication at the exact head it refused before returning, so the
+          # required context carries the reason instead of dangling absent.
+          # Each call site follows this with an explicit `return 1`: the
+          # evaluation loop swallows set -e, so control flow must never
+          # depend on it.
+          record_blocked() {
+            verdict_base="$1"
+            report="$2"
+            printf '%s\n' "${report}" > "${verdict_base}.blocked"
           }
 
           evaluate_pull_request() {
           PR_NUMBER="$1"
           EVENT_HEAD_SHA="$2"
+          # Verdicts are recorded, never published here: check runs attach
+          # to commits, not pull requests, so the one shared verdict for
+          # this head is published by the driver after every candidate has
+          # been evaluated (fail-if-any-fail).
+          verdict_base="${VERDICTS_DIR}/pr-${PR_NUMBER}"
           pages_dir="${RUNNER_TEMP}/bot-review-gate"
           mkdir -p "${pages_dir}"
           threads_pages="${pages_dir}/threads.jsonl"
@@ -173,26 +187,28 @@ jobs:
           # and the head; the announcer head supplies the binding target.
           if ! pr_json="$(gh api "${rest_pr}")"; then
             echo "Pull request query failed; failing closed." >&2
-            finish_blocked "${EVENT_HEAD_SHA}" "Pull request query failed; failing closed."
+            record_blocked "${verdict_base}" "Pull request query failed; failing closed."
             return 1
           fi
           pr_base="$(jq -r '.base.ref // ""' <<<"${pr_json}")"
           if [ "${pr_base}" != "main" ]; then
             echo "Pull request #${PR_NUMBER} targets ${pr_base:-<unknown>}, not main; failing closed." >&2
             # A non-main pull request carries no required `Bot Review Gate`
-            # context at all, so no verdict is published for it here.
+            # context at all, so it contributes neither a clean nor a blocked
+            # verdict to the shared publication for this head.
+            : > "${verdict_base}.skipped"
             return 1
           fi
           rest_head="$(jq -r '.head.sha // ""' <<<"${pr_json}")"
           intended_head="${EVENT_HEAD_SHA}"
           if [ -z "${intended_head}" ] || [ -z "${rest_head}" ]; then
             echo "Could not determine the pull request head; failing closed." >&2
-            finish_blocked "${intended_head:-${rest_head}}" "Could not determine the pull request head; failing closed."
+            record_blocked "${verdict_base}" "Could not determine the pull request head; failing closed."
             return 1
           fi
           if [ "${EVENT_HEAD_SHA}" != "${rest_head}" ]; then
             echo "Announcer head ${EVENT_HEAD_SHA} no longer matches pull request head ${rest_head}; a newer event will re-evaluate; failing closed." >&2
-            finish_blocked "${EVENT_HEAD_SHA}" "Announcer head ${EVENT_HEAD_SHA} no longer matches pull request head ${rest_head}; failing closed."
+            record_blocked "${verdict_base}" "Announcer head ${EVENT_HEAD_SHA} no longer matches pull request head ${rest_head}; failing closed."
             return 1
           fi
 
@@ -273,14 +289,14 @@ jobs:
               -f owner="${repo_owner}" -f repo="${repo_name}" -F number="${PR_NUMBER}" \
               > "${threads_pages}"; then
             echo "Review-thread query failed; failing closed." >&2
-            finish_blocked "${intended_head}" "Review-thread query failed; failing closed."
+            record_blocked "${verdict_base}" "Review-thread query failed; failing closed."
             return 1
           fi
           if ! gh api graphql --paginate -f query="${review_query}" \
               -f owner="${repo_owner}" -f repo="${repo_name}" -F number="${PR_NUMBER}" \
               > "${reviews_pages}"; then
             echo "Review query failed; failing closed." >&2
-            finish_blocked "${intended_head}" "Review query failed; failing closed."
+            record_blocked "${verdict_base}" "Review query failed; failing closed."
             return 1
           fi
           timeline_pages="${pages_dir}/timeline.jsonl"
@@ -288,7 +304,7 @@ jobs:
               -f owner="${repo_owner}" -f repo="${repo_name}" -F number="${PR_NUMBER}" \
               > "${timeline_pages}"; then
             echo "Review-timeline query failed; failing closed." >&2
-            finish_blocked "${intended_head}" "Review-timeline query failed; failing closed."
+            record_blocked "${verdict_base}" "Review-timeline query failed; failing closed."
             return 1
           fi
 
@@ -300,17 +316,17 @@ jobs:
           completeness_guard='all(.[]; .data.repository.pullRequest != null)'
           if ! jq -s -e "${completeness_guard}" "${threads_pages}" > /dev/null; then
             echo "Review-thread response omitted the pull request; failing closed." >&2
-            finish_blocked "${intended_head}" "Review-thread response omitted the pull request; failing closed."
+            record_blocked "${verdict_base}" "Review-thread response omitted the pull request; failing closed."
             return 1
           fi
           if ! jq -s -e "${completeness_guard}" "${reviews_pages}" > /dev/null; then
             echo "Review response omitted the pull request; failing closed." >&2
-            finish_blocked "${intended_head}" "Review response omitted the pull request; failing closed."
+            record_blocked "${verdict_base}" "Review response omitted the pull request; failing closed."
             return 1
           fi
           if ! jq -s -e "${completeness_guard}" "${timeline_pages}" > /dev/null; then
             echo "Review-timeline response omitted the pull request; failing closed." >&2
-            finish_blocked "${intended_head}" "Review-timeline response omitted the pull request; failing closed."
+            record_blocked "${verdict_base}" "Review-timeline response omitted the pull request; failing closed."
             return 1
           fi
 
@@ -322,7 +338,7 @@ jobs:
             || ! jq -s -e --arg head "${intended_head}" "${head_binding_guard}" "${reviews_pages}" > /dev/null \
             || ! jq -s -e --arg head "${intended_head}" "${head_binding_guard}" "${timeline_pages}" > /dev/null; then
             echo "Paginated evidence spans a head other than ${intended_head}; a push landed mid-query; failing closed." >&2
-            finish_blocked "${intended_head}" "Paginated evidence spans a head other than ${intended_head}; a push landed mid-query; failing closed."
+            record_blocked "${verdict_base}" "Paginated evidence spans a head other than ${intended_head}; a push landed mid-query; failing closed."
             return 1
           fi
 
@@ -600,7 +616,7 @@ jobs:
             echo >&2 "Bot review evidence is not clean at ${intended_head}; address the findings above, explicitly resolve their threads, and dismiss or supersede outstanding change requests."
             echo >&2 "Thread resolution fires no Actions event: after resolving, re-run this check, or run:"
             echo >&2 "  gh workflow run bot-review-gate.yml --ref <head branch> -f pr_number=${PR_NUMBER}"
-            finish_blocked "${intended_head}" "${violation_report}"
+            record_blocked "${verdict_base}" "${violation_report}"
             return 1
           fi
 
@@ -610,16 +626,32 @@ jobs:
           final_head="$(gh api "${rest_pr}" --jq '.head.sha')"
           if [ "${final_head}" != "${intended_head}" ]; then
             echo "Pull request head moved to ${final_head} while evaluating ${intended_head}; failing closed." >&2
-            finish_blocked "${intended_head}" "Pull request head moved to ${final_head} while evaluating ${intended_head}; failing closed."
+            record_blocked "${verdict_base}" "Pull request head moved to ${final_head} while evaluating ${intended_head}; failing closed."
             return 1
           fi
           summary="$(jq -r '"Bot Review Gate: clean at \(.evaluated_head) (review threads evaluated: \(.evaluated_threads), reviews evaluated: \(.evaluated_reviews))"' \
             <<<"${evaluated}")"
-          if ! publish_gate_check_run "${intended_head}" "success" "${summary}" "${summary}"; then
-            return 1
-          fi
+          # The clean verdict is recorded for the shared publication below,
+          # never published here: a sibling pull request sharing this head
+          # can still turn the commit's one required context red.
           printf '%s\n' "${summary}"
+          printf '%s\n' "${summary}" > "${verdict_base}.clean"
+          return 0
           }
+
+          # ── One verdict per announced head ───────────────────────────────
+          # Check runs attach to commits, not pull requests: two open main
+          # pull requests that share the announced head would otherwise
+          # publish competing verdicts under the one required context name,
+          # and the last-published verdict would decide for both — letting a
+          # clean duplicate evaluated last make a dirty pull request appear
+          # green (or causing the reverse availability failure). The
+          # evaluations above only record their findings; exactly one shared
+          # verdict is published below, success only when every candidate is
+          # clean and failure when any of them is not.
+          VERDICTS_DIR="${RUNNER_TEMP}/bot-review-gate-verdicts"
+          rm -rf "${VERDICTS_DIR}"
+          mkdir -p "${VERDICTS_DIR}"
 
           # ── The evaluated head is the announcer run's head commit ────────
           # Never an event-carried pull request number or branch name: those
@@ -632,9 +664,15 @@ jobs:
           fi
 
           # ── Pull-request discovery, bound to the announcer's commit ──────
-          # `commits/<sha>/pulls` lists the pull requests actually headed by
-          # the announcing run's commit; only open pull requests against
-          # main carry a required `Bot Review Gate` context.
+          # `commits/<sha>/pulls` lists the pull requests *associated with*
+          # the announcing run's commit — which includes stacked descendants
+          # that merely CONTAIN it. Only a record whose own head is the
+          # announced commit is a pull request this run may evaluate: a
+          # descendant would hit the head-mismatch refusal and publish a
+          # failing verdict at the announced commit, blocking the genuine
+          # pull request headed there on every refresh. Selection therefore
+          # compares each record's head SHA to the announced SHA before any
+          # evaluation.
           if ! associated="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${announcer_head}/pulls?per_page=100")"; then
             echo "Associated-pull-request query failed; failing closed." >&2
             exit 1
@@ -649,16 +687,55 @@ jobs:
             if [ -n "${candidate_pr}" ]; then
               candidate_prs+=("${candidate_pr}")
             fi
-          done < <(jq -r '.[]
-            | select(.state == "open" and .base.ref == "main")
+          done < <(jq -r --arg announcer_head "${announcer_head}" '.[]
+            | select(.state == "open"
+                     and .base.ref == "main"
+                     and ((.head.sha // "") | ascii_downcase) == ($announcer_head | ascii_downcase))
             | .number' <<<"${associated}")
           if [ "${#candidate_prs[@]}" -eq 0 ]; then
-            echo "No open pull request against main is headed by ${announcer_head}; nothing to publish."
+            echo "No open pull request against main is headed by the announced commit ${announcer_head}; nothing to publish."
             exit 0
           fi
 
-          overall=0
           for pr_number in "${candidate_prs[@]}"; do
-            evaluate_pull_request "${pr_number}" "${announcer_head}" || overall=1
+            # The loop swallows set -e by design: a refusal records its
+            # verdict and evaluation continues, because the shared verdict
+            # needs every candidate's outcome.
+            evaluate_pull_request "${pr_number}" "${announcer_head}" || true
           done
-          exit "${overall}"
+
+          blocked_reports=()
+          clean_summaries=()
+          shopt -s nullglob
+          for verdict_file in "${VERDICTS_DIR}"/*; do
+            case "${verdict_file}" in
+              *.blocked) blocked_reports+=("$(cat "${verdict_file}")") ;;
+              *.clean) clean_summaries+=("$(cat "${verdict_file}")") ;;
+            esac
+          done
+          shopt -u nullglob
+
+          if [ "${#blocked_reports[@]}" -gt 0 ]; then
+            echo >&2 "Bot review evidence is not clean at ${announcer_head}: ${#blocked_reports[@]} of ${#candidate_prs[@]} associated pull request(s) are blocked; publishing the shared failing verdict (fail-if-any-fail)."
+            if ! publish_gate_check_run "${announcer_head}" "failure" \
+                "Bot Review Gate: unresolved or stale bot-review evidence" \
+                "$(printf '%s\n' "${blocked_reports[@]}")"; then
+              exit 1
+            fi
+            exit 1
+          fi
+
+          if [ "${#clean_summaries[@]}" -gt 0 ]; then
+            if [ "${#clean_summaries[@]}" -gt 1 ]; then
+              echo "Publishing one shared green verdict for ${#clean_summaries[@]} associated pull requests at ${announcer_head}."
+            fi
+            if ! publish_gate_check_run "${announcer_head}" "success" \
+                "${clean_summaries[0]}" \
+                "$(printf '%s\n' "${clean_summaries[@]}")"; then
+              exit 1
+            fi
+            exit 0
+          fi
+
+          echo >&2 "Every selected pull request skipped evaluation (its base is no longer main); nothing was published, the required context stays unreported, and the merge stays blocked."
+          exit 1
