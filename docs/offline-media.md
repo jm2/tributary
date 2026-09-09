@@ -316,10 +316,11 @@ between admission and publish returns the live endpoint only.
 ### Publish intent and restart recovery
 
 The six steps leave exactly one window that ordinary journal recovery
-cannot see: a crash between the step-5 rename and the step-6 commit. The
-temp file no longer exists to resume from, and the final file exists
-without a cache row. The contract closes that window with a persisted
-publish intent:
+cannot see: the rename happened and the step-6 commit did not — whether
+by a crash between the two, or by a post-rename terminal transition
+interrupted before its cleanup unlink. The temp file no longer exists to
+resume from, and the final file exists without a cache row. The contract
+closes that window with a persisted publish intent:
 
 1. **The intent precedes the rename.** The last journal record written
    before the rename is an `fsync`'d publish-intent record naming the
