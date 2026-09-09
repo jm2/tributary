@@ -86,6 +86,38 @@ fn stage_failure_rolls_back_committed_stages() {
 }
 
 #[test]
+fn zero_length_source_grown_after_plan_fails_size_verification() {
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    write_source_file(source_root.path(), "empty.flac", b"");
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = transfer_request(
+        source,
+        destination,
+        vec![TransferItem::same(PathBuf::from("empty.flac"))],
+        ConflictPolicy::Preserve,
+    );
+    let plan = TransferPlanner::new().plan(&request).expect("plan");
+    // Zero is a known declared size, not an unknown-size sentinel: a
+    // source planned as empty and grown before execution must fail the
+    // size comparison, so the grown bytes can neither slip past a
+    // zero-byte capacity budget nor skew progress totals.
+    std::fs::write(source_root.path().join("empty.flac"), b"grown")
+        .expect("grow source after planning");
+    let error = run_plan_expect_failure(request, plan);
+    assert!(
+        matches!(error, TransferError::Io { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        entry_names(destination_root.path()),
+        Vec::<String>::new(),
+        "no staged or committed litter may survive"
+    );
+}
+
+#[test]
 fn preserve_rollback_never_deletes_pre_existing_destination() {
     let source_root = tempfile::tempdir().expect("temporary source root");
     let destination_root = tempfile::tempdir().expect("temporary destination root");
