@@ -277,7 +277,10 @@ fn human_threads_stay_outside_the_bot_evidence_gate() {
 #[test]
 fn outstanding_bot_change_request_blocks_without_a_thread() {
     // The audit's P1a finding: a bot can request changes without opening an
-    // inline thread, and a threads-only query cannot see it.
+    // inline thread, and a threads-only query cannot see it. The fixture's
+    // change-request review is bound to the evaluated head, so the block is
+    // attributable to the outstanding conclusion alone — a current-head,
+    // threadless change request blocks.
     let output = run_scenario("outstanding-change-request", "pull_request", Some(HEAD_SHA));
     assert_blocked(
         &output,
