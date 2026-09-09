@@ -8100,6 +8100,34 @@ mod tests {
     }
 
     #[test]
+    fn watcher_batch_name_any_alone_demands_reconciliation_without_identity() {
+        // Standalone coverage for the backend rename shape FSEvents and kqueue
+        // emit: one unpaired Name::Any event, with no folder removal or other
+        // event that could mask the routing decision under test.
+        let mut batch = WatcherBatch::default();
+        batch.collect(rename_event(
+            notify::event::RenameMode::Any,
+            &["/music/unknown"],
+            None,
+        ));
+        batch.finish();
+
+        assert!(
+            batch.reconciliation_required,
+            "an unpaired Name::Any rename must request the guarded reconciliation scan"
+        );
+        assert!(
+            batch.rename_pairs.is_empty()
+                && batch.upsert_paths.is_empty()
+                && batch.remove_paths.is_empty()
+                && batch.deferred_paths.is_empty()
+                && batch.dirty_directory_scopes.is_empty(),
+            "Name::Any alone must never infer identity, defer, or dirty a scope"
+        );
+        assert!(!batch.requires_reconciliation_before_incrementals());
+    }
+
+    #[test]
     fn watcher_batch_queues_regular_and_missing_audio_paths_only() {
         let library = TestDirectory::new("watcher-upsert-paths");
         let regular = library.path().join("regular.flac");
@@ -10822,6 +10850,370 @@ mod tests {
             .await
             .expect("query new row after ordinary scan")
             .is_some());
+    }
+
+    /// End-to-end pending-root-trust boundary harness. Drives the real
+    /// `process_directory_events` loop: the `ConfirmRootTrust` command queues
+    /// the pending trust scan inside the loop, and the loop's own
+    /// `pending_trust_scan.take()` boundary performs the backlog discard and
+    /// the distinct ordinary authority scan. The racing event is injected
+    /// while the authority scan is provably still in flight: the library
+    /// event channel is bounded to one slot and the driver withholds draining
+    /// after the scan's per-file `ScanProgress`, so the scan's `ScanComplete`
+    /// send cannot complete until the driver resumes — which happens only
+    /// after the injection. The racing evidence is therefore mid-scan,
+    /// distinguishable from backlog that escaped the discard, and still
+    /// retained at the following boundary.
+    #[tokio::test]
+    async fn pending_root_trust_boundary_suppresses_backlog_and_keeps_racing_events() {
+        let db = Arc::new(rename_test_database().await);
+        let target = TestDirectory::new("trust-boundary-backlog");
+        // The track exists before the request-building scan so the conversion
+        // runs as a legacy enrollment of a non-empty root (no empty-root
+        // acknowledgement gate) and the authority scan can later deliver it.
+        let boundary_audio = target.path().join("boundary.wav");
+        write_minimal_wav(&boundary_audio);
+        let scan = scan_root(target.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &scan, None, false, true, false)
+            .await
+            .expect("persist non-empty legacy target root");
+        let request =
+            build_root_trust_request(&scan, &stored, RootTrustReason::LegacyEnrollment, 0)
+                .expect("build legacy-enrollment request");
+        assert!(!request.requires_empty_acknowledgement());
+        let request_id = request.request_id;
+
+        let music_dirs = vec![target.path().to_path_buf()];
+        let (event_tx, event_rx) = mpsc::channel(WATCHER_EVENT_CAPACITY);
+        let ingress_overflowed = Arc::new(AtomicBool::new(false));
+        // Synthetic watcher: a real backend with zero installed watches, fed
+        // by a deterministic channel the harness controls.
+        let idle_backend = RecommendedWatcher::new(
+            |_: notify::Result<notify::Event>| {},
+            notify::Config::default(),
+        )
+        .expect("construct idle watcher backend");
+        let watcher = DirectoryWatcher {
+            watcher: idle_backend,
+            rx: event_rx,
+            ingress_overflowed: Arc::clone(&ingress_overflowed),
+            watched_directories: HashSet::new(),
+        };
+
+        // A healthy watcher stream queues evidence for the track before the
+        // `ConfirmRootTrust` command is even processed — provably before the
+        // boundary's discard runs.
+        enqueue_watcher_result(
+            &event_tx,
+            ingress_overflowed.as_ref(),
+            Ok(
+                notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                    .add_path(boundary_audio.clone()),
+            ),
+        );
+        assert!(!ingress_overflowed.load(Ordering::Acquire));
+
+        // That evidence is actionable: processed normally it would upsert the
+        // track incrementally. The boundary must still suppress it, because
+        // the distinct ordinary authority scan — not the stale incremental —
+        // is what converts the pending trust decision into applied content.
+        let mut suppressed = WatcherDebounceBatch::default();
+        suppressed.collect(Ok(notify::Event::new(notify::EventKind::Create(
+            notify::event::CreateKind::File,
+        ))
+        .add_path(boundary_audio.clone())));
+        let suppressed_batch = suppressed.finish().expect("healthy stream stays reliable");
+        assert!(
+            suppressed_batch
+                .upsert_paths
+                .contains(boundary_audio.as_path()),
+            "the suppressed backlog is real incremental evidence, not access noise"
+        );
+
+        // The library event channel is deliberately bounded to one slot. The
+        // driver below withholds draining after the authority scan's first
+        // per-file ScanProgress, so the scan's subsequent sends back up behind
+        // the full channel and its ScanComplete send cannot complete until the
+        // driver resumes — which happens only after the racing injection. That
+        // backpressure is the acknowledgement pinning the injection mid-scan;
+        // an unbounded channel would let the scan race to completion first.
+        let (library_events, library_event_rx) = async_channel::bounded(1);
+        // Everything the driver consumes must stay visible to the final
+        // assertions, so each drain phase records its events in order.
+        let pre_injection_events: Arc<std::sync::Mutex<Vec<LibraryEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let post_injection_events: Arc<std::sync::Mutex<Vec<LibraryEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (command_tx, command_rx) = async_channel::unbounded::<LibraryCommand>();
+        command_tx
+            .send(LibraryCommand::ConfirmRootTrust(request))
+            .await
+            .expect("queue the root-trust conversion command");
+        let playlist_sidebar_refresh = test_playlist_sidebar_refresh();
+
+        let racing_audio = target.path().join("racing.wav");
+        let driver_racing_audio = racing_audio.clone();
+        let driver_flag = Arc::clone(&ingress_overflowed);
+        let driver_event_rx = &library_event_rx;
+        let driver_pre_injection = Arc::clone(&pre_injection_events);
+        let driver_post_injection = Arc::clone(&post_injection_events);
+        // Regressions in the send order this harness pins must fail the test,
+        // not hang it: if the authority scan never emits the phase-1 trigger,
+        // the driver blocks in recv() still holding the watcher ingress sender
+        // (so the loop can never close), and if the racing batch never emits
+        // its trailing PlaylistProjectionsInvalidated, the driver blocks in
+        // phase-3 recv() with the outer library_events sender keeping the
+        // receiver open. The join below is therefore bounded by a timeout, and
+        // this flag records whether the driver got past phase 1 so the
+        // timeout's panic can name which regression fired.
+        let driver_injected = Arc::new(AtomicBool::new(false));
+        let driver_injected_flag = Arc::clone(&driver_injected);
+        let driver = async move {
+            // Deterministic mid-scan synchronization, phase 1: consume library
+            // events until the conversion scan's ScanComplete has passed, then
+            // until the authority scan's first per-file ScanProgress. That
+            // event only fires after the boundary's discard ran (the discard
+            // precedes the authority scan), so the racing evidence queued
+            // below is provably distinct from suppressed backlog. Recording
+            // keeps every consumed event visible to the final assertions.
+            let mut completed_scans = 0u32;
+            loop {
+                match driver_event_rx.recv().await {
+                    Ok(LibraryEvent::ScanComplete) => {
+                        completed_scans += 1;
+                        // Record completions too — the pre-injection count of
+                        // ScanComplete events is the mid-scan proof.
+                        driver_pre_injection
+                            .lock()
+                            .expect("pre-injection record poisoned")
+                            .push(LibraryEvent::ScanComplete);
+                    }
+                    Ok(event @ LibraryEvent::ScanProgress(..)) if completed_scans >= 1 => {
+                        // Record the trigger event itself: the driver stops
+                        // draining exactly here, and the timeline must show it.
+                        driver_pre_injection
+                            .lock()
+                            .expect("pre-injection record poisoned")
+                            .push(event);
+                        break;
+                    }
+                    Ok(event) => driver_pre_injection
+                        .lock()
+                        .expect("pre-injection record poisoned")
+                        .push(event),
+                    Err(err) => {
+                        panic!("library events ended before the authority scan ran: {err}")
+                    }
+                }
+            }
+            // Phase 2: inject while the authority scan is provably still in
+            // flight. The driver has stopped draining and the channel holds at
+            // most one slot, so of the scan's remaining sequential sends
+            // (FullSync, PlaylistProjectionsInvalidated, ScanComplete) at most
+            // the first can complete before it blocks; ScanComplete — last in
+            // that order — cannot be sent until the driver resumes in phase 3.
+            // The injection therefore happens-before the authority scan's
+            // completion event. The track appears and its watcher evidence
+            // queues while the authority scan is still running: the scan
+            // itself never consumes the watcher queue, so this evidence must
+            // survive the boundary.
+            driver_injected_flag.store(true, Ordering::Release);
+            write_minimal_wav(&driver_racing_audio);
+            enqueue_watcher_result(
+                &event_tx,
+                driver_flag.as_ref(),
+                Ok(
+                    notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                        .add_path(driver_racing_audio.clone()),
+                ),
+            );
+            drop(event_tx);
+            // Phase 3: resume draining so the blocked scan can finish, the
+            // watcher boundary can apply the racing evidence, and the loop can
+            // reach its final send. The batch's trailing
+            // PlaylistProjectionsInvalidated (emitted by
+            // settle_playlist_projections_after_watcher_batch after the racing
+            // upsert commits) is the loop's last event for this scenario, so
+            // consuming it proves the loop finished mutating and can exit
+            // cleanly on its exhausted watcher stream. Events stay recorded so
+            // nothing the driver consumed is lost to the assertions.
+            let mut authority_scan_complete = false;
+            loop {
+                match driver_event_rx.recv().await {
+                    Ok(event) => {
+                        let is_scan_complete = matches!(event, LibraryEvent::ScanComplete);
+                        let is_projections =
+                            matches!(event, LibraryEvent::PlaylistProjectionsInvalidated);
+                        driver_post_injection
+                            .lock()
+                            .expect("post-injection record poisoned")
+                            .push(event);
+                        if is_scan_complete {
+                            authority_scan_complete = true;
+                        } else if is_projections && authority_scan_complete {
+                            break;
+                        }
+                    }
+                    Err(err) => panic!(
+                        "library events ended before the boundary applied the racing evidence: {err}"
+                    ),
+                }
+            }
+        };
+
+        let mut completed_commands = HashMap::new();
+        // Bound the join so the exact regressions this test exists to report
+        // fail fast instead of hanging the suite until the CI job timeout.
+        // 60s is orders of magnitude above this harness's normal sub-second
+        // run (tiny directory, real scan path, deterministic channel
+        // synchronization) yet far below any CI job timeout, and the panic
+        // names the specific regression from the driver's recorded progress.
+        const DRIVER_JOIN_TIMEOUT: Duration = Duration::from_secs(60);
+        let (loop_result, ()) = tokio::time::timeout(
+            DRIVER_JOIN_TIMEOUT,
+            // tokio::join! is itself an async expression (it polls inline and
+            // evaluates to the outputs tuple), so the timeout needs a real
+            // future here: the async block preserves the join's semantics —
+            // both futures driven concurrently to completion on this runtime.
+            async {
+                tokio::join!(
+                    process_directory_events(
+                        &db,
+                        &music_dirs,
+                        &library_events,
+                        &command_rx,
+                        &mut completed_commands,
+                        watcher,
+                        &playlist_sidebar_refresh,
+                    ),
+                    driver,
+                )
+            },
+        )
+        .await
+        .unwrap_or_else(|_: tokio::time::error::Elapsed| {
+            // The two regressions are distinguished by the driver's recorded
+            // progress at the moment of the timeout: still before the racing
+            // injection (phase 1) or already past it (phase 3).
+            assert!(
+                driver_injected.load(Ordering::Acquire),
+                "watcher-boundary harness timed out after {DRIVER_JOIN_TIMEOUT:?} in \
+                 phase 1: the authority scan never emitted its first per-file \
+                 ScanProgress trigger, so the driver is blocked in recv() still \
+                 holding the watcher ingress sender and the loop can never close — \
+                 exactly the regression this test exists to report"
+            );
+            panic!(
+                "watcher-boundary harness timed out after {DRIVER_JOIN_TIMEOUT:?} in \
+                 phase 3: the racing batch never produced its trailing \
+                 PlaylistProjectionsInvalidated (the loop stalled mid-batch, or exited \
+                 while the outer library_events sender kept the receiver open), so the \
+                 driver is blocked in recv() — exactly the regression this test exists \
+                 to report"
+            );
+        });
+        loop_result.expect("watcher loop exits cleanly");
+
+        // The injection was pinned mid-scan by the bounded channel and the
+        // withheld drain; the recorded timeline proves it. At injection time
+        // exactly one scan had completed — the conversion scan — so the
+        // authority scan's ScanComplete was emitted strictly after the racing
+        // evidence was injected, and the driver stopped draining right on the
+        // authority scan's first per-file ScanProgress.
+        assert_eq!(
+            pre_injection_events
+                .lock()
+                .expect("pre-injection record poisoned")
+                .iter()
+                .filter(|event| matches!(event, LibraryEvent::ScanComplete))
+                .count(),
+            1,
+            "the driver must inject while only the conversion scan has completed"
+        );
+        assert!(matches!(
+            pre_injection_events
+                .lock()
+                .expect("pre-injection record poisoned")
+                .last(),
+            Some(LibraryEvent::ScanProgress(..))
+        ));
+
+        // Reassemble the full timeline in channel order: everything the
+        // driver consumed before the injection, everything it consumed after,
+        // then whatever remained channel-resident (empty when the driver's
+        // final drain ran to the loop's last send).
+        let mut events: Vec<LibraryEvent> = std::mem::take(
+            &mut *pre_injection_events
+                .lock()
+                .expect("pre-injection record poisoned"),
+        );
+        events.extend(std::mem::take(
+            &mut *post_injection_events
+                .lock()
+                .expect("post-injection record poisoned"),
+        ));
+        events.extend(std::iter::from_fn(|| library_event_rx.try_recv().ok()));
+
+        let boundary_delivered = boundary_audio.to_string_lossy().into_owned();
+        let racing_delivered = racing_audio.to_string_lossy().into_owned();
+
+        // The boundary suppresses the pre-authority backlog even though the
+        // stream is healthy: no incremental upsert for the discarded evidence
+        // may appear anywhere — the authority scan is what delivered the
+        // content instead.
+        let scan_boundary = events
+            .iter()
+            .rposition(|event| matches!(event, LibraryEvent::ScanComplete))
+            .expect("the authority scan completes");
+        assert!(events[..=scan_boundary].iter().any(|event| matches!(
+            event,
+            LibraryEvent::FullSync(tracks)
+                if tracks.iter().any(|track| {
+                    track.file_path.as_deref() == Some(boundary_delivered.as_str())
+                })
+        )));
+        for event in &events {
+            assert!(
+                !matches!(
+                    event,
+                    LibraryEvent::TrackUpserted(track)
+                        if track.file_path.as_deref() == Some(boundary_delivered.as_str())
+                ),
+                "suppressed backlog must not be applied incrementally: {event:?}"
+            );
+        }
+
+        // The racing evidence was queued after the discard and during the
+        // scan, so it survived the boundary and applies at the following loop
+        // boundary — strictly after the authority scan completed.
+        assert!(
+            events[scan_boundary + 1..].iter().any(|event| matches!(
+                event,
+                LibraryEvent::TrackUpserted(track)
+                    if track.file_path.as_deref() == Some(racing_delivered.as_str())
+            )),
+            "racing evidence survives the boundary and applies after it"
+        );
+
+        let completion = completed_commands
+            .get(&request_id)
+            .expect("boundary completes the pending root-trust command");
+        assert_eq!(completion.path, target.path());
+        assert_eq!(completion.reason, RootTrustReason::LegacyEnrollment);
+        assert_eq!(completion.outcome, RootTrustOutcome::Active);
+        assert!(
+            track::Entity::find()
+                .filter(track::Column::FilePath.eq(boundary_delivered.as_str()))
+                .one(db.as_ref())
+                .await
+                .expect("query boundary audio after authority scan")
+                .is_some(),
+            "suppression loses no content: the authority scan delivers the track"
+        );
+        assert!(
+            !ingress_overflowed.load(Ordering::Acquire),
+            "a healthy stream is never marked unreliable at the trust boundary"
+        );
     }
 
     #[tokio::test]
