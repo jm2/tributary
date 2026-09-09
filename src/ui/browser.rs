@@ -1168,6 +1168,10 @@ mod tests {
     /// - the context-menu popover must attach a visible scrolling child
     ///   with one button per enabled action
     ///   ([`crate::ui::context_menu::tests::popover_from_menu_model_attaches_a_visible_child_widget`]);
+    /// - browser gutter separators must join visible panes around hidden
+    ///   ones — exactly one surviving gutter between panes that straddle
+    ///   a disabled pane, no dangling edge gutters
+    ///   ([`crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones`]);
     /// - tracklist drags must start only from the data row area (folded
     ///   into the popover contract).
     ///
@@ -1201,5 +1205,6 @@ mod tests {
         assert_unbind_reset(&list_item, &row);
 
         crate::ui::context_menu::tests::popover_from_menu_model_attaches_a_visible_child_widget();
+        crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones();
     }
 }

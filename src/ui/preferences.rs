@@ -1081,58 +1081,85 @@ pub fn read_column_order(column_view: &gtk::ColumnView) -> Vec<String> {
 /// cannot drift out of sync with the layout if gutters are added or
 /// removed (indexing raw child positions broke here once the separators
 /// became real widgets: disabling Artist hid a separator, disabling
-/// Album hid Artist, and Album/Folder could never be hidden).  A
-/// separator stays visible only when it joins two visible panes, which
-/// prevents doubled or dangling gutters around hidden panes.  If all
-/// four panes are hidden, the entire browser box is hidden.
+/// Album hid Artist, and Album/Folder could never be hidden).
+///
+/// A gutter is visible only while a pane survives on each side of it.
+/// Panes hidden between two surviving panes hand their separators to the
+/// next visible pane, which keeps exactly one (the one adjacent to it)
+/// as the gutter and collapses the rest — so with Artist disabled, Genre
+/// and Album still get their one 1px gutter instead of touching (spacing
+/// is 0; the separator widget is the sole gutter). Separators with no
+/// visible pane before or after them — leading the box or trailing the
+/// last visible pane — stay hidden so no gutter dangles at an edge. If
+/// all four panes are hidden, the entire browser box is hidden.
 pub fn update_browser_visibility(browser_box: &gtk::Box, views: &BrowserViewsConfig) {
     // The browser_box layout is: SearchEntry, panes_box (horizontal Box).
     // Find the panes_box (last child, which is a horizontal Box).
-    let panes_box = browser_box
+    if let Some(panes_box) = browser_box
         .last_child()
-        .and_then(|w| w.downcast::<gtk::Box>().ok());
+        .and_then(|w| w.downcast::<gtk::Box>().ok())
+    {
+        update_panes_box_visibility(&panes_box, views);
+    }
+    browser_box.set_visible(views.genre || views.artist || views.album || views.folder);
+}
 
-    if let Some(ref panes_box) = panes_box {
-        let mut pane_idx = 0;
-        // A separator leading the box would dangle at its edge, so the
-        // "previous pane" starts out treated as hidden.
-        let mut previous_pane_visible = false;
-        let mut pending_separators: Vec<gtk::Widget> = Vec::new();
-        let mut child = panes_box.first_child();
-        while let Some(widget) = child {
-            child = widget.next_sibling();
-            if widget.downcast_ref::<gtk::Separator>().is_some() {
-                // A gutter belongs to the pair of panes around it; decide
-                // its visibility once the next pane is reached.
-                pending_separators.push(widget);
-            } else {
-                // Panes map positionally to the config flags; anything
-                // beyond the four known panes stays visible (the old
-                // `_ => true` match arm). The bounds-checked lookup
-                // keeps this function under Codacy's cyclomatic
-                // complexity threshold (PR #179 re-analysis flagged the
-                // match-driven version as its one new medium issue).
-                let visible = [views.genre, views.artist, views.album, views.folder]
-                    .get(pane_idx)
-                    .copied()
-                    .unwrap_or(true);
-                pane_idx += 1;
-                let gutter_visible = visible && previous_pane_visible;
-                for separator in std::mem::take(&mut pending_separators) {
-                    separator.set_visible(gutter_visible);
-                }
-                widget.set_visible(visible);
-                previous_pane_visible = visible;
-            }
+/// Walk the panes_box toggling pane visibility from the config flags, and
+/// settle each gutter once a pane survives on both sides of it.
+///
+/// Split from [`update_browser_visibility`] so each function stays well
+/// under Codacy's cyclomatic complexity threshold: the separator-aware
+/// traversal was Codacy's one new medium Complexity issue on PR #179, and
+/// collapsing the pane match to an array lookup alone did not clear it
+/// (Codacy counts closures and boolean operators as decision points).
+fn update_panes_box_visibility(panes_box: &gtk::Box, views: &BrowserViewsConfig) {
+    let mut pane_idx = 0;
+    // A gutter needs a visible pane on its left; the box edge is not one,
+    // so the traversal starts with no visible pane behind it.
+    let mut seen_visible_pane = false;
+    // Separators whose right-hand pane has not been reached yet. A hidden
+    // pane leaves the queue untouched, so the next visible pane inherits
+    // the pending gutters instead of dropping them.
+    let mut pending_separators: Vec<gtk::Widget> = Vec::new();
+    let mut child = panes_box.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if widget.downcast_ref::<gtk::Separator>().is_some() {
+            // A gutter belongs to the pair of panes around it; decide
+            // its visibility once the next visible pane is reached.
+            pending_separators.push(widget);
+            continue;
         }
-        // Separators after the last pane would dangle at the box edge.
-        for separator in std::mem::take(&mut pending_separators) {
-            separator.set_visible(false);
+        // Panes map positionally to the config flags; anything
+        // beyond the four known panes stays visible (the old
+        // `_ => true` match arm).
+        let visible = [views.genre, views.artist, views.album, views.folder]
+            .get(pane_idx)
+            .copied()
+            .unwrap_or(true);
+        pane_idx += 1;
+        widget.set_visible(visible);
+        if visible {
+            settle_pending_separators(&mut pending_separators, seen_visible_pane);
+            seen_visible_pane = true;
         }
     }
+    // Separators after the last visible pane would dangle at the box edge.
+    settle_pending_separators(&mut pending_separators, false);
+}
 
-    let any_visible = views.genre || views.artist || views.album || views.folder;
-    browser_box.set_visible(any_visible);
+/// Show exactly one pending separator — the last queued, the one adjacent
+/// to the pane just reached — as the gutter back to the previous visible
+/// pane, or hide them all when no visible pane precedes them. Separators
+/// carried across hidden panes collapse onto that single gutter, so two
+/// surviving panes keep one 1px gap and never a doubled 2px one.
+fn settle_pending_separators(pending_separators: &mut Vec<gtk::Widget>, gutter_visible: bool) {
+    if let Some(gutter) = pending_separators.pop() {
+        gutter.set_visible(gutter_visible);
+    }
+    for separator in pending_separators.drain(..) {
+        separator.set_visible(false);
+    }
 }
 
 /// Build a library-folder row: the path (left, ellipsized) and its own "−"
@@ -1770,5 +1797,143 @@ mod tests {
         migrate_column_schema(&mut config);
         assert_eq!(config.visible_columns, ["Title"]);
         assert_eq!(config.column_order, ["Rating", "Title"]);
+    }
+}
+
+/// GTK-touching tests for the browser pane/gutter traversal. These are
+/// helpers folded into the crate's single consolidated GTK-initializing
+/// test (browser.rs `gtk_widget_contracts_hold_on_one_session`) — never
+/// standalone `#[test]`s — so only one test ever owns the GTK session.
+/// See `ui::widget_test_session`.
+#[cfg(test)]
+pub mod widget_tests {
+    use super::update_browser_visibility;
+    use super::BrowserViewsConfig;
+    use gtk::prelude::{BoxExt, WidgetExt};
+
+    /// Mirror of `build_browser`'s pane row: SearchEntry stand-in, then
+    /// the horizontal panes_box alternating genre, gutter, artist,
+    /// gutter, album, gutter, folder. Returns the widgets so assertions
+    /// can read each pane's and each gutter's visibility directly.
+    struct PaneRow {
+        browser_box: gtk::Box,
+        panes: [gtk::Box; 4],
+        gutters: [gtk::Separator; 3],
+    }
+
+    impl PaneRow {
+        fn build() -> Self {
+            let browser_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            browser_box.append(&gtk::Label::new(Some("search")));
+            let panes_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            let panes: [gtk::Box; 4] = [
+                gtk::Box::new(gtk::Orientation::Horizontal, 0),
+                gtk::Box::new(gtk::Orientation::Horizontal, 0),
+                gtk::Box::new(gtk::Orientation::Horizontal, 0),
+                gtk::Box::new(gtk::Orientation::Horizontal, 0),
+            ];
+            let gutters: [gtk::Separator; 3] = [
+                gtk::Separator::new(gtk::Orientation::Vertical),
+                gtk::Separator::new(gtk::Orientation::Vertical),
+                gtk::Separator::new(gtk::Orientation::Vertical),
+            ];
+            panes_box.append(&panes[0]);
+            for (i, pane) in panes.iter().enumerate().skip(1) {
+                panes_box.append(&gutters[i - 1]);
+                panes_box.append(pane);
+            }
+            browser_box.append(&panes_box);
+            Self {
+                browser_box,
+                panes,
+                gutters,
+            }
+        }
+    }
+
+    /// The gutter contract around hidden panes, including the PR #179
+    /// review defect: a pane disabled between two enabled panes must
+    /// leave exactly one visible 1px gutter between the survivors (panes
+    /// spacing is 0 — the separator widget is the sole gutter), never
+    /// zero (survivors touching) and never two (a doubled gap). Leading
+    /// and trailing gutters must never dangle at a box edge.
+    pub fn separator_gutters_join_visible_panes_around_hidden_ones() {
+        let views_of = |genre: bool, artist: bool, album: bool, folder: bool| BrowserViewsConfig {
+            genre,
+            artist,
+            album,
+            folder,
+        };
+
+        // THE reported defect: Genre + Album on, Artist + Folder off.
+        // Exactly one gutter (the one adjacent to Album) survives between
+        // the two survivors; the carried separator from the hidden Artist
+        // collapses instead of hiding both.
+        let row = PaneRow::build();
+        update_browser_visibility(&row.browser_box, &views_of(true, false, true, false));
+        assert!(row.panes[0].is_visible(), "genre pane must stay visible");
+        assert!(!row.panes[1].is_visible(), "artist pane must hide");
+        assert!(row.panes[2].is_visible(), "album pane must stay visible");
+        assert!(!row.panes[3].is_visible(), "folder pane must hide");
+        assert!(
+            !row.gutters[0].is_visible(),
+            "gutter carried across the hidden artist must collapse"
+        );
+        assert!(
+            row.gutters[1].is_visible(),
+            "genre and album must keep exactly one gutter between them"
+        );
+        assert!(
+            !row.gutters[2].is_visible(),
+            "no gutter may dangle after the last visible pane"
+        );
+
+        // All four panes visible: every interior gutter joins two visible
+        // panes and shows.
+        let row = PaneRow::build();
+        update_browser_visibility(&row.browser_box, &views_of(true, true, true, true));
+        for (i, gutter) in row.gutters.iter().enumerate() {
+            assert!(
+                gutter.is_visible(),
+                "gutter {i} joins two visible panes and must show"
+            );
+        }
+
+        // Genre + Folder on, Artist + Album off: the two carried gutters
+        // collapse onto the single gutter adjacent to Folder.
+        let row = PaneRow::build();
+        update_browser_visibility(&row.browser_box, &views_of(true, false, false, true));
+        assert!(!row.gutters[0].is_visible());
+        assert!(!row.gutters[1].is_visible());
+        assert!(row.gutters[2].is_visible(), "exactly one gutter survives");
+
+        // Only the first pane visible: every gutter lacks a visible pane
+        // on one side, so none may dangle at an edge.
+        let row = PaneRow::build();
+        update_browser_visibility(&row.browser_box, &views_of(true, false, false, false));
+        for (i, gutter) in row.gutters.iter().enumerate() {
+            assert!(!gutter.is_visible(), "leading gutter {i} must not dangle");
+        }
+
+        // Only the last pane visible: same, from the other edge.
+        let row = PaneRow::build();
+        update_browser_visibility(&row.browser_box, &views_of(false, false, false, true));
+        for (i, gutter) in row.gutters.iter().enumerate() {
+            assert!(
+                !gutter.is_visible(),
+                "leading gutter {i} before the only visible pane must hide"
+            );
+        }
+
+        // All panes hidden: no gutters, and the whole browser box hides.
+        let row = PaneRow::build();
+        update_browser_visibility(&row.browser_box, &views_of(false, false, false, false));
+        for (i, gutter) in row.gutters.iter().enumerate() {
+            assert!(!gutter.is_visible(), "gutter {i} must hide");
+        }
+        assert!(
+            !row.browser_box.is_visible(),
+            "with every pane hidden the browser box must hide"
+        );
     }
 }
