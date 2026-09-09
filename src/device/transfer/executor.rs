@@ -13,8 +13,10 @@ use std::path::{Path, PathBuf};
 use super::types::{
     Stage, TransferError, TransferPlan, TransferProgress, TransferRequest, TransferSummary,
 };
+use crate::local::root_authority::LeafIdentity;
 use crate::local::write_authority::{
-    CommitOutcome, ConflictPolicy, ConflictResolution, PreparedWriteTarget,
+    CommitError, CommitOutcome, ConflictPolicy, ConflictResolution, PreparedWriteTarget,
+    ReversalOutcome,
 };
 use crate::source_lifecycle::CancellationObserver;
 
@@ -24,22 +26,38 @@ use crate::source_lifecycle::CancellationObserver;
 /// predicted. A Preserve conflict publishes to a renamed sibling — removing
 /// the planned path would destroy the pre-existing original — and an
 /// Overwrite commit replaces an original that only a saved copy can restore.
+///
+/// Every variant also carries the no-follow leaf identity the write
+/// authority captured at publish/creation time. Before each reversal
+/// mutation the destination is re-stat'ed and the identity compared: a
+/// mismatch means a concurrent writer replaced the transfer's publication
+/// after it committed, so reversing by pathname alone would delete — or
+/// restore a backup over — a file the transfer does not own. Such a leaf is
+/// refused and the rollback fails instead. `None` degrades that reversal to
+/// the legacy path-only behavior (identity capture is best-effort).
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OwnedChange {
     /// A file the executor published at this path; rollback removes exactly
     /// this path. Fresh publishes and preserved siblings both land here.
-    PublishedFile { relative_path: PathBuf },
+    PublishedFile {
+        relative_path: PathBuf,
+        published_leaf: Option<LeafIdentity>,
+    },
     /// A pre-existing file the executor replaced; its bytes were saved at
     /// `backup_relative_path` before the replace. Rollback republishes the
     /// backup over `relative_path` and consumes the backup.
     ReplacedFile {
         relative_path: PathBuf,
         backup_relative_path: PathBuf,
+        published_leaf: Option<LeafIdentity>,
     },
-    /// A directory the executor created; it must be empty once every file
-    /// inside it has been rolled back. Recorded only when the directory was
-    /// provably absent immediately before creation.
-    CreatedDirectory { relative_path: PathBuf },
+    /// A directory (or directory ancestor) the executor created; it must be
+    /// empty once every file inside it has been rolled back. Recorded only
+    /// when the directory was provably absent immediately before creation.
+    CreatedDirectory {
+        relative_path: PathBuf,
+        created_directory: Option<LeafIdentity>,
+    },
 }
 
 /// Classify a committed copy into the owned change rollback must reverse.
@@ -56,13 +74,16 @@ fn owned_change_for_copy(outcome: CommitOutcome) -> OwnedChange {
             Some(backup_relative_path) => OwnedChange::ReplacedFile {
                 relative_path: outcome.relative_path,
                 backup_relative_path,
+                published_leaf: outcome.published_leaf,
             },
             None => OwnedChange::PublishedFile {
                 relative_path: outcome.relative_path,
+                published_leaf: outcome.published_leaf,
             },
         },
         ConflictResolution::Fresh | ConflictResolution::Preserved => OwnedChange::PublishedFile {
             relative_path: outcome.relative_path,
+            published_leaf: outcome.published_leaf,
         },
     }
 }
@@ -223,25 +244,41 @@ impl TransferExecutor {
     }
 
     /// Create one destination directory. Idempotent: an existing directory
-    /// with the same identity is not an error. When the directory was
-    /// provably absent immediately before creation, the new directory is
-    /// recorded for rollback.
+    /// with the same identity is not an error. Every component of the path
+    /// that was provably absent immediately before creation — the leaf and
+    /// any ancestors the authority had to create along the way — is
+    /// recorded for rollback, so a nested destination never leaves created
+    /// ancestor directories behind after a reversal.
     fn execute_create_directory(
         &self,
         relative: &Path,
         context: &mut RunContext<'_>,
     ) -> Result<(), TransferError> {
         let final_path = self.request.destination.root().join(relative);
-        let absent = match std::fs::symlink_metadata(&final_path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
-            Err(error) => {
-                return Err(TransferError::io(
-                    "failed to inspect destination directory",
-                    error,
-                ));
+        // Which components were absent before creation. A component that
+        // existed is not owned by this transfer and must survive rollback.
+        let mut absent_prefixes: Vec<PathBuf> = Vec::new();
+        let mut prefix = PathBuf::new();
+        for component in relative.components() {
+            if !matches!(component, std::path::Component::Normal(_)) {
+                return Err(TransferError::InvalidItemPath {
+                    path: relative.to_path_buf(),
+                });
             }
-            Ok(_) => false,
-        };
+            prefix.push(component);
+            match std::fs::symlink_metadata(self.request.destination.root().join(&prefix)) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    absent_prefixes.push(prefix.clone());
+                }
+                Err(error) => {
+                    return Err(TransferError::io(
+                        "failed to inspect destination directory",
+                        error,
+                    ));
+                }
+                Ok(_) => {}
+            }
+        }
         self.request.destination.validate().map_err(|error| {
             TransferError::authority(format!("destination not current: {error}"))
         })?;
@@ -251,9 +288,10 @@ impl TransferExecutor {
             .create_relative_directory(relative, self.request.conflict_policy)
         {
             Ok(_) => {
-                if absent {
+                for absent in absent_prefixes {
                     context.committed.push(OwnedChange::CreatedDirectory {
-                        relative_path: relative.to_path_buf(),
+                        created_directory: self.request.destination.relative_leaf_identity(&absent),
+                        relative_path: absent,
                     });
                 }
                 Ok(())
@@ -381,7 +419,10 @@ impl TransferExecutor {
     /// Copy the source into `staged`, verify the byte count, and commit.
     /// The staged file is flushed and closed inside commit before the
     /// publish; a commit collision is reported distinctly so the policy can
-    /// resolve a post-plan destination appearance.
+    /// resolve a post-plan destination appearance. A publish that landed
+    /// but failed its post-publish verification is reported as a final
+    /// failure with the outcome recorded first, so rollback can undo the
+    /// committed bytes.
     fn copy_and_commit_staged(
         staged: PreparedWriteTarget,
         declared_bytes: u64,
@@ -389,6 +430,15 @@ impl TransferExecutor {
         context: &mut RunContext<'_>,
         source_file: &mut File,
     ) -> Result<CommitOutcome, StageFailure> {
+        // The running byte count must reflect only bytes that stayed
+        // committed: a collision discards the staged copy (Skip) or forces
+        // a re-copy (Preserve), so the pre-attempt count is captured before
+        // any bytes are copied and restored before the collision is
+        // resolved — otherwise a retry double-counts and a skip leaves
+        // discarded bytes counted as copied. Each retry re-enters this
+        // function with a fresh staged target, so the entry value is that
+        // attempt's pre-attempt count.
+        let bytes_before_attempt = context.bytes_so_far;
         let copied = match copy_in_chunks(source_file, &staged, stage_index, context) {
             Ok(copied) => copied,
             Err(error) => {
@@ -403,12 +453,30 @@ impl TransferExecutor {
             .map_err(StageFailure::Final)?;
         match staged.commit() {
             Ok(outcome) => Ok(outcome),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            Err(CommitError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+                context.bytes_so_far = bytes_before_attempt;
+                context.progress.on_bytes_copied(
+                    stage_index,
+                    context.total_stages,
+                    context.bytes_so_far,
+                    context.total_bytes,
+                );
                 Err(StageFailure::Collision(error))
             }
-            Err(error) => Err(StageFailure::Final(TransferError::CommitFailed {
+            Err(CommitError::Io(error)) => Err(StageFailure::Final(TransferError::CommitFailed {
                 context: error.to_string(),
             })),
+            Err(CommitError::PublishVerification { outcome, error }) => {
+                // The publish happened; only the post-publish mount
+                // revalidation failed. Record the owned change so the outer
+                // rollback reverses (identity-verified) exactly what landed,
+                // then fail the stage — committed bytes must never be left
+                // unrecorded behind a failure.
+                context.committed.push(owned_change_for_copy(outcome));
+                Err(StageFailure::Final(TransferError::CommitFailed {
+                    context: error.to_string(),
+                }))
+            }
         }
     }
 
@@ -532,45 +600,82 @@ impl TransferExecutor {
     /// Created directories are removed deepest-first after their files are
     /// gone; an unexpected residue fails the rollback rather than deleting
     /// data the executor does not own.
+    ///
+    /// Every reversal is identity-verified first: the leaf recorded at
+    /// publish/creation time is compared against whatever currently
+    /// occupies the path. A concurrent writer that replaced a published
+    /// destination after its stage completed but before a later stage
+    /// failed must never have its file deleted or restored over by this
+    /// rollback — such a leaf is refused and the rollback fails.
     fn rollback(&self, context: &mut RunContext<'_>) -> Result<(), TransferError> {
         while let Some(change) = context.committed.pop() {
             self.request.destination.validate().map_err(|error| {
                 TransferError::authority(format!("destination not current: {error}"))
             })?;
             match change {
-                OwnedChange::PublishedFile { relative_path } => {
-                    self.request
-                        .destination
-                        .remove_relative_file(&relative_path)
-                        .map_err(|error| TransferError::RollbackFailed {
-                            path: relative_path,
-                            context: error.to_string(),
-                        })?;
+                OwnedChange::PublishedFile {
+                    relative_path,
+                    published_leaf,
+                } => {
+                    Self::reverse(
+                        &relative_path,
+                        self.request
+                            .destination
+                            .remove_relative_file_verified(&relative_path, published_leaf),
+                    )?;
                 }
                 OwnedChange::ReplacedFile {
                     relative_path,
                     backup_relative_path,
+                    published_leaf,
                 } => {
-                    self.request
-                        .destination
-                        .restore_relative_file(&backup_relative_path, &relative_path)
-                        .map_err(|error| TransferError::RollbackFailed {
-                            path: relative_path,
-                            context: error.to_string(),
-                        })?;
+                    Self::reverse(
+                        &relative_path,
+                        self.request.destination.restore_relative_file_verified(
+                            &backup_relative_path,
+                            &relative_path,
+                            published_leaf.as_ref(),
+                        ),
+                    )?;
                 }
-                OwnedChange::CreatedDirectory { relative_path } => {
-                    self.request
-                        .destination
-                        .remove_relative_directory(&relative_path)
-                        .map_err(|error| TransferError::RollbackFailed {
-                            path: relative_path,
-                            context: error.to_string(),
-                        })?;
+                OwnedChange::CreatedDirectory {
+                    relative_path,
+                    created_directory,
+                } => {
+                    Self::reverse(
+                        &relative_path,
+                        self.request
+                            .destination
+                            .remove_relative_directory_verified(&relative_path, created_directory),
+                    )?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Map one reversal outcome into the rollback result. A refused
+    /// reversal — the destination leaf was replaced by a concurrent writer
+    /// after the transfer published it — fails the rollback instead of
+    /// touching the foreign object.
+    fn reverse(
+        relative_path: &Path,
+        outcome: io::Result<ReversalOutcome>,
+    ) -> Result<(), TransferError> {
+        match outcome {
+            Ok(ReversalOutcome::Reversed | ReversalOutcome::AlreadyAbsent) => Ok(()),
+            Ok(ReversalOutcome::RefusedForeignLeaf) => Err(TransferError::RollbackFailed {
+                path: relative_path.to_path_buf(),
+                context: "destination leaf was replaced by a concurrent writer after the \
+                          transfer published it; refusing to reverse a file the transfer \
+                          does not own"
+                    .to_string(),
+            }),
+            Err(error) => Err(TransferError::RollbackFailed {
+                path: relative_path.to_path_buf(),
+                context: error.to_string(),
+            }),
+        }
     }
 }
 
@@ -586,13 +691,25 @@ fn transfer_io(context: &'static str, error: io::Error) -> TransferError {
 
 /// Roll a staged file back and translate its copy-phase failure. The
 /// staged sibling is discarded so a failed copy never leaves litter in
-/// the destination directory.
+/// the destination directory. A discard that itself fails is surfaced as a
+/// rollback failure rather than swallowed: the staged hidden file is left
+/// in the destination and the outer rollback can neither retry nor report
+/// a partial file it was never told about.
 fn discard_staged_copy(
     staged: PreparedWriteTarget,
     context: &'static str,
     error: io::Error,
 ) -> TransferError {
-    let _ = staged.rollback();
+    let staged_path = staged.staged_path().to_path_buf();
+    if let Err(discard_error) = staged.rollback() {
+        return TransferError::RollbackFailed {
+            path: staged_path,
+            context: format!(
+                "{context}: {error}; additionally the staged copy could not be discarded and \
+                 was left behind: {discard_error}"
+            ),
+        };
+    }
     transfer_io(context, error)
 }
 

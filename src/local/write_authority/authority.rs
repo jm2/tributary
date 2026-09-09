@@ -14,7 +14,9 @@ use super::staging::{
     staging_leaf_name, strict_relative_components,
 };
 use super::target::{MountedDirectory, PreparedWriteTarget};
-use crate::local::root_authority::{MountedRootAuthority, RetainedWriteParent};
+use crate::local::root_authority::{
+    LeafIdentity, MountedRootAuthority, RetainedWriteParent, ReversalOutcome,
+};
 /// Retained write authority over one exact mounted filesystem.
 ///
 /// The underlying [`MountedRootAuthority`] is shared so the read-side scans
@@ -191,6 +193,7 @@ impl MountedWriteAuthority {
             lease_token: self.mounted.token(),
             authority: Arc::clone(&self.mounted),
             relative_path: assemble_relative(&components),
+            identity: self.mounted.relative_leaf_identity(relative),
         })
     }
 
@@ -227,28 +230,67 @@ impl MountedWriteAuthority {
         backup_relative: &Path,
         destination_relative: &Path,
     ) -> io::Result<()> {
-        let backup_components = strict_relative_components(backup_relative)?;
-        let destination_components = strict_relative_components(destination_relative)?;
-        if parent_components_of(&backup_components) != parent_components_of(&destination_components)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "backup and destination must share a parent directory",
-            ));
-        }
-        let parent_components = parent_components_of(&destination_components);
-        self.mounted.validate()?;
-        let parent = self.mounted.retain_write_parent(&parent_components)?;
-        let backup_leaf = backup_components.last().expect("non-empty").clone();
-        let destination_leaf = destination_components.last().expect("non-empty").clone();
-        self.mounted.rename_within_directory(
-            &parent,
-            backup_leaf.as_os_str(),
-            self.mounted.root().join(backup_relative).as_path(),
-            destination_leaf.as_os_str(),
-            self.mounted.root().join(destination_relative).as_path(),
-            false,
-        )
+        self.restore_relative_file_verified(backup_relative, destination_relative, None)
+            .map(|_| ())
+    }
+
+    /// Restore a previously saved backup over its destination within the
+    /// same parent directory, verifying against the published-leaf identity
+    /// when one is supplied.
+    ///
+    /// A destination that still names the transfer's publication — or any
+    /// object, when no identity was recorded at publish time — is replaced
+    /// by the backup: that slot is the transfer's own. An absent
+    /// destination is restored anyway: the publication was deleted by a
+    /// concurrent writer, the slot is empty, and putting the transfer's
+    /// original back returns the destination to its pre-transfer state. A
+    /// destination occupied by a *different* object is refused with
+    /// [`ReversalOutcome::RefusedForeignLeaf`] and left untouched — a
+    /// concurrent writer owns that name now, and rolling back over it
+    /// would destroy a file the transfer does not own.
+    pub fn restore_relative_file_verified(
+        &self,
+        backup_relative: &Path,
+        destination_relative: &Path,
+        expected: Option<&LeafIdentity>,
+    ) -> io::Result<ReversalOutcome> {
+        self.mounted
+            .restore_relative_file_verified(backup_relative, destination_relative, expected)
+    }
+
+    /// Remove a regular file atomically through the retained authority,
+    /// verifying against the publish-time leaf identity when one is
+    /// supplied. See [`ReversalOutcome`] for the outcome semantics.
+    pub fn remove_relative_file_verified(
+        &self,
+        relative: &Path,
+        expected: Option<LeafIdentity>,
+    ) -> io::Result<ReversalOutcome> {
+        self.mounted
+            .remove_regular_file_within_verified(relative, expected)
+    }
+
+    /// Remove an empty directory atomically through the retained authority,
+    /// anchored to the retained root exactly like
+    /// [`Self::remove_relative_file`], verifying against the creation-time
+    /// leaf identity when one is supplied. See [`ReversalOutcome`] for the
+    /// outcome semantics.
+    pub fn remove_relative_directory_verified(
+        &self,
+        relative: &Path,
+        expected: Option<LeafIdentity>,
+    ) -> io::Result<ReversalOutcome> {
+        self.mounted
+            .remove_directory_within_verified(relative, expected)
+    }
+
+    /// Best-effort no-follow identity of the leaf at `relative` beneath the
+    /// retained root. `None` when the leaf is absent or the platform cannot
+    /// capture an identity. Used by the transfer executor to record freshly
+    /// created directories (and any ancestors it had to create) for
+    /// identity-verified rollback.
+    pub fn relative_leaf_identity(&self, relative: &Path) -> Option<LeafIdentity> {
+        self.mounted.relative_leaf_identity(relative)
     }
 }
 
