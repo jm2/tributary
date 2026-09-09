@@ -700,7 +700,11 @@ impl MountedMutationCommit<'_> {
     /// directory leaf — shared by every target for that leaf — and not to the
     /// target object.
     fn with_leaf_commit_exclusion(&self, run: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
-        with_leaf_commit_lock(self.leaf_commit_key()?, run)
+        #[cfg(unix)]
+        let key = self.leaf_commit_key()?;
+        #[cfg(not(unix))]
+        let key = self.leaf_commit_key();
+        with_leaf_commit_lock(key, run)
     }
 
     /// Identify the directory leaf this section would replace.
@@ -719,16 +723,22 @@ impl MountedMutationCommit<'_> {
     /// Windows keeps no retained parent handle; the admitted target's
     /// normalized absolute pathname is the leaf identity every target object
     /// for that leaf shares.
+    ///
+    /// Infallible by construction: the admitted path is already normalized,
+    /// so unlike the unix form there is no resolution left to fail. A
+    /// `Result` wrapper that can never hold an error fails the `-D warnings`
+    /// clippy gate on Windows (`unnecessary_wraps`).
     #[cfg(windows)]
-    fn leaf_commit_key(&self) -> io::Result<LeafCommitKey> {
-        Ok(LeafCommitKey::AdmittedPath(self.target.path.clone()))
+    fn leaf_commit_key(&self) -> LeafCommitKey {
+        LeafCommitKey::AdmittedPath(self.target.path.clone())
     }
 
     /// Non-unix, non-Windows targets have no retained parent either; the
-    /// admitted pathname identifies the leaf.
+    /// admitted pathname identifies the leaf. Direct return for the same
+    /// clippy reason as the Windows form above.
     #[cfg(not(any(unix, windows)))]
-    fn leaf_commit_key(&self) -> io::Result<LeafCommitKey> {
-        Ok(LeafCommitKey::AdmittedPath(self.target.path.clone()))
+    fn leaf_commit_key(&self) -> LeafCommitKey {
+        LeafCommitKey::AdmittedPath(self.target.path.clone())
     }
 
     /// Resolve the retained directory that must contain the replacement.
