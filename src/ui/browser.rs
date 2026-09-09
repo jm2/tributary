@@ -564,12 +564,20 @@ pub fn set_album_pane_artwork_size(browser_box: &gtk::Box, state: &BrowserState,
 /// are built at runtime: the old rows are unbound and torn down, and
 /// the new factory rebuilds them against the same model.
 ///
-/// The existing `gio::ListStore` is preserved so the album rows
-/// survive; the store is then repopulated from the shared track
-/// snapshot so the `BrowserItem`s' artwork candidates match the latest
-/// library state. The cache is cleared because every entry was decoded
-/// at the previous size and would never match a new `(album_key,
-/// pixel_size)` lookup under the recompiled bind factory.
+/// The existing `gio::ListStore` and its selection are likewise left
+/// completely untouched: this is a presentation-only factory swap, so
+/// the store keeps its CURRENT (genre/artist-filtered) content and the
+/// selected album keeps its highlight. An earlier revision repopulated
+/// the store with the filters cleared and reset the selection to "All",
+/// which expanded the pane to unrelated albums and — through the
+/// selection-changed callback — silently cleared the user's active
+/// album filter (2026-09-08 PR #171 review). Fresh artwork candidates
+/// are not a layout concern: every library change repopulates the store
+/// through [`rebuild_browser_data`].
+///
+/// The cache is cleared because every entry was decoded at the previous
+/// size and would never match a new `(album_key, pixel_size)` lookup
+/// under the recompiled bind factory.
 fn rebuild_album_pane(browser_box: &gtk::Box, state: &BrowserState) {
     let panes_box = browser_box
         .last_child()
@@ -597,12 +605,10 @@ fn rebuild_album_pane(browser_box: &gtk::Box, state: &BrowserState) {
     let Some(list_view) = pane_list_view(&album_pane) else {
         return;
     };
-    let album_store =
-        album_store_from_pane(&album_pane).unwrap_or_else(gio::ListStore::new::<BrowserItem>);
 
     // Revoke every in-flight fetch on the previous bind factory before
-    // we swap it out. The worker-side generation check stops stale
-    // results from painting, but it does not stop a fetch from
+    // we swap it out. The worker-side liveness tokens stop stale
+    // results from painting, but they do not stop a fetch from
     // running to completion and burning CPU; revoking here short-
     // circuits the future at its next poll. The `album_art_binder`
     // slot is cleared so the factory build below records the
@@ -625,84 +631,16 @@ fn rebuild_album_pane(browser_box: &gtk::Box, state: &BrowserState) {
     );
     list_view.set_factory(Some(&new_factory));
 
-    // The pane keeps the same `gio::ListStore` and the same
-    // `SingleSelection`, so the album rows and the cross-filter wiring
-    // survive the swap. Repopulate the store from the current snapshot
-    // so the BrowserItems' artwork candidates are refreshed against
-    // the latest library state — but do NOT call `rebuild_browser_data`
-    // here: that helper would replace `state.tracks` with whatever
-    // slice it is handed, and the call site would have to pass the live
-    // master track list to avoid blanking the genre and artist panes.
-    // Toggling the artwork checkbox or changing the size is a layout
-    // event, not a library sync, so the snapshot must stay put.
-    let borrowed = state.tracks.borrow();
-    let use_aa = state.use_album_artist.get();
-    populate_albums(&album_store, &borrowed, &None, &None, use_aa);
-
-    // Restore a deterministic selection after the repopulation.
-    // The swap keeps the pane's DATA (same `gio::ListStore`,
-    // repopulated from the live snapshot), but the refill resets the
-    // `SingleSelection`'s highlight; set it explicitly to the "All" row
-    // so the highlight state is defined rather than whatever autoselect
-    // happened to pick mid-refill.
-    restore_album_selection(&album_pane);
-}
-
-/// Reset the album pane's `SingleSelection` to the synthetic "All" row
-/// (index 0) after a store repopulation.
-///
-/// The BrowserState's cross-filter chain holds the selection strings;
-/// they are NOT threaded through a layout rebuild, so the pane's
-/// highlight is deliberately reset to "All" — deterministic, and the
-/// filters the user had active remain in effect in the shared
-/// snapshot. Without this reset the highlight would be whatever the
-/// model's autoselect picked mid-refill.
-fn restore_album_selection(pane: &gtk::Box) {
-    let Some(selection) = pane_selection(pane) else {
-        return;
-    };
-    let Some(model) = selection.model() else {
-        return;
-    };
-    let n_items = model.n_items();
-    if n_items <= 1 {
-        return;
-    }
-    // The selection strings live in build_browser's cross-filter chain,
-    // not in BrowserState, so index 0 ("All") is the only reset that
-    // needs no extra state. A follow-up that threads the selected album
-    // through BrowserState can promote this to a label match without
-    // touching the bind path.
-    selection.set_selected(0);
+    // Deliberately NO store repopulation and NO selection reset here:
+    // the model keeps its filtered content and the user's selected album
+    // row keeps its highlight across the swap. See the function docs.
 }
 
 /// Extract the `ListView` from an album pane Box — the shared anchor
-/// for the factory-swap path and the model-extraction helpers below.
+/// for the factory-swap path.
 fn pane_list_view(pane: &gtk::Box) -> Option<gtk::ListView> {
     let scrolled = pane.last_child()?.downcast::<gtk::ScrolledWindow>().ok()?;
     scrolled.child()?.downcast::<gtk::ListView>().ok()
-}
-
-/// Extract the `SingleSelection` model from the album pane's widget
-/// tree. Mirrors [`album_store_from_pane`] but stops at the
-/// `SingleSelection` instead of reaching into the `gio::ListStore`.
-fn pane_selection(pane: &gtk::Box) -> Option<gtk::SingleSelection> {
-    pane_list_view(pane)?
-        .model()?
-        .downcast::<gtk::SingleSelection>()
-        .ok()
-}
-
-/// Pull the underlying `gio::ListStore<BrowserItem>` out of an album
-/// pane Box so the factory swap can keep the same data.
-fn album_store_from_pane(pane: &gtk::Box) -> Option<gio::ListStore> {
-    let selection = pane_list_view(pane)?
-        .model()?
-        .downcast::<gtk::SingleSelection>()
-        .ok()?;
-    selection
-        .model()
-        .and_then(|m| m.downcast::<gio::ListStore>().ok())
 }
 
 /// Attach the live source registry to the album-art coordinator. Must
@@ -1570,6 +1508,126 @@ mod tests {
         assert_eq!(row.count().text(), "");
     }
 
+    /// Codex P2 (PR #171 discussion r3962112844): toggling album-pane
+    /// artwork or changing its thumbnail size is a presentation-only
+    /// factory swap. The rebuild must keep the album store filtered to
+    /// the active genre selection and keep the selected album row; the
+    /// previous implementation repopulated the store with the filters
+    /// cleared and reset the selection to "All", which expanded the pane
+    /// to unrelated albums and — through the selection-changed callback
+    /// — silently cleared the user's active album filter.
+    fn factory_swap_preserves_album_filters_and_selection() {
+        let tracks = vec![
+            TrackObject::new(
+                1,
+                "T1",
+                60,
+                "AR",
+                "A1",
+                "G1",
+                "",
+                0,
+                "",
+                0,
+                0,
+                0,
+                "",
+                "file:///t1.flac",
+            ),
+            TrackObject::new(
+                2,
+                "T2",
+                60,
+                "AR",
+                "A2",
+                "G1",
+                "",
+                0,
+                "",
+                0,
+                0,
+                0,
+                "",
+                "file:///t2.flac",
+            ),
+            TrackObject::new(
+                3,
+                "T3",
+                60,
+                "AR2",
+                "A3",
+                "G2",
+                "",
+                0,
+                "",
+                0,
+                0,
+                0,
+                "",
+                "file:///t3.flac",
+            ),
+        ];
+        let (browser_box, state) =
+            build_browser(&tracks, false, false, 48, Box::new(|_, _, _, _, _| {}));
+
+        // Collect the panes: browser_box = [SearchEntry, panes_box], and
+        // panes_box = [genre, artist, album] (mirrors rebuild_browser_data).
+        let panes_box = browser_box
+            .last_child()
+            .and_then(|w| w.downcast::<gtk::Box>().ok())
+            .expect("panes box");
+        let mut child = panes_box.first_child();
+        let mut panes = Vec::new();
+        while let Some(widget) = child {
+            if let Some(pane) = widget.downcast_ref::<gtk::Box>() {
+                panes.push(pane.clone());
+            }
+            child = widget.next_sibling();
+        }
+        assert_eq!(panes.len(), 3, "genre, artist and album panes");
+
+        // Filter to genre G1 (genre store: "All", "G1", "G2" → index 1).
+        // The album store narrows to G1's albums: "All", "A1", "A2".
+        get_selection(&panes[0]).set_selected(1);
+        let album_store = get_store_from_pane(&panes[2]).expect("album store");
+        assert_eq!(
+            album_store.n_items(),
+            3,
+            "the genre filter must narrow the album pane before the swap"
+        );
+        // Select the second album row ("A2").
+        get_selection(&panes[2]).set_selected(2);
+        assert_eq!(get_selection(&panes[2]).selected(), 2);
+
+        // Layout toggle: swap the artwork factory in place.
+        set_album_pane_artwork(&browser_box, &state, true);
+        assert_eq!(
+            album_store.n_items(),
+            3,
+            "an artwork toggle must keep the genre-filtered album store"
+        );
+        assert_eq!(
+            get_selection(&panes[2]).selected(),
+            2,
+            "an artwork toggle must keep the selected album row"
+        );
+
+        // Thumbnail size change: same contract.
+        set_album_pane_artwork_size(&browser_box, &state, 72);
+        assert_eq!(
+            album_store.n_items(),
+            3,
+            "a size change must keep the genre-filtered album store"
+        );
+        assert_eq!(
+            get_selection(&panes[2]).selected(),
+            2,
+            "a size change must keep the selected album row"
+        );
+        // The genre pane's own selection survives both swaps.
+        assert_eq!(get_selection(&panes[0]).selected(), 1);
+    }
+
     /// The crate's single consolidated GTK widget test, all run on the ONE
     /// thread that owns the GTK session:
     ///
@@ -1621,5 +1679,6 @@ mod tests {
         crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones();
         crate::ui::album_art_cell::widget_tests::show_placeholder_keeps_the_missing_art_visible();
         crate::ui::album_art_cell::widget_tests::revoking_a_cell_revokes_its_outstanding_fetch_token();
+        factory_swap_preserves_album_filters_and_selection();
     }
 }
