@@ -1557,17 +1557,25 @@ impl RawStatus {
     }
 }
 
-/// Parse MPD's `repeat`/`random`/`single`/`consume` option values. MPD
-/// reports `0` for the default we enforce on every load and `1` for the
-/// alternative; some daemons reply with `true`/`false` or other non-zero
-/// integers. Anything that is not an exact `0` is mapped to `true` so a
-/// foreign mutation of the partition is always detected.
+/// Parse MPD's `repeat`/`random`/`single`/`consume` option values. The
+/// official protocol (mpd.readthedocs.io, "Commands: playback options")
+/// reports `0` for the default Tributary enforces on every load and `1`
+/// for the enabled alternative; `single` and `consume` additionally accept
+/// the enabled keyword `oneshot`. Another controller may legitimately set
+/// `single oneshot` or `consume oneshot`, so the keyword parses as an
+/// enabled option — partition-option drift — never as a protocol failure:
+/// a recoverable failure would drop the session while leaving supervised
+/// authority live inside its freshness window, letting a queued load
+/// overwrite the foreign controller's settings. Values that are neither an
+/// accepted off value nor an accepted enabled value fail the parse — an
+/// unparsable option is incomplete evidence about the partition, never a
+/// clean poll.
 fn parse_option_truthy(value: &str, operation: &'static str) -> MpdResult<bool> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(MpdFailure::new(operation));
+    match value {
+        "0" => Ok(false),
+        "1" | "oneshot" => Ok(true),
+        _ => Err(MpdFailure::new(operation)),
     }
-    let parsed = parse_u64(value, operation)?;
-    Ok(parsed != 0)
 }
 
 fn parse_u64(value: &str, operation: &'static str) -> MpdResult<u64> {
@@ -2647,7 +2655,7 @@ fn handle_load<C>(
         .expect("connected MPD session recorded")
         .connection
         .status(deadline);
-    if retire_status_if_stale(&status, active, owner, intent_epoch) {
+    if retire_status_if_stale(&status, active, owner, intent_epoch, plan, supervision) {
         return;
     }
     match status {
@@ -2664,17 +2672,25 @@ fn handle_load<C>(
                 supervision,
             );
         }
-        Err(failure) => cleanup_then_fail(
-            active,
-            owner,
-            failure,
-            intent_epoch,
-            cache,
-            event_tx,
-            timing,
-            plan,
-            supervision,
-        ),
+        Err(failure) => {
+            // The post-action status could not be read or parsed: on a
+            // supervised output that is a blind window over the partition.
+            // Revoke authority BEFORE the failure cleanup so a queued
+            // newer load cannot mutate during the remaining freshness
+            // window this failure just created.
+            lapse_on_unreadable_status(plan, supervision);
+            cleanup_then_fail(
+                active,
+                owner,
+                failure,
+                intent_epoch,
+                cache,
+                event_tx,
+                timing,
+                plan,
+                supervision,
+            );
+        }
     }
 }
 
@@ -2777,6 +2793,54 @@ fn supervise_status(
     supervisor.observe(now);
 }
 
+/// Apply only the REVOKE-ONLY parts of [`supervise_status`] to a status
+/// reply that belongs to a SUPERSEDED generation — the intent epoch
+/// advanced while the request was in flight, so the reply can never
+/// authorize its own command again and the session it served is about to
+/// be retired. The reply still observed the same MPD partition, so its
+/// foreign-controller evidence is fresh: a foreign current song or
+/// partition-option drift must lapse the supervisor BEFORE the session is
+/// retired, or the queued newer load passes its authority gate on a
+/// partition this reply just proved contended. A superseded reply must
+/// never REFRESH or re-arm authority: no observation is recorded here,
+/// only revocation, and observation-gap enforcement stays with the live
+/// paths that own the current generation.
+fn lapse_on_superseded_evidence(
+    plan: MpdControlPlan,
+    supervision: &Mutex<SupervisionState>,
+    status: &MpdStatus,
+    owned_song_id: u64,
+) {
+    if !(plan.supervised && plan.mode == MpdControlMode::Exclusive) {
+        return;
+    }
+    if status_observes_foreign_song(status, owned_song_id) || status.observes_options_drift() {
+        let mut supervisor = supervision
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        supervisor.lapse();
+    }
+}
+
+/// A status reply that could not be read or parsed is incomplete evidence
+/// about the partition — the reply may have failed precisely because a
+/// foreign controller put protocol shapes on it that Tributary does not
+/// know. On a supervised output the failure must therefore revoke
+/// authority instead of leaving it live inside the freshness window: a
+/// queued load that passes the authority gate during that window would
+/// mutate the partition and overwrite the foreign controller's settings.
+/// Revocation only — only an explicit user reconfirmation (a fresh output
+/// instance) restores authority.
+fn lapse_on_unreadable_status(plan: MpdControlPlan, supervision: &Mutex<SupervisionState>) {
+    if !(plan.supervised && plan.mode == MpdControlMode::Exclusive) {
+        return;
+    }
+    let mut supervisor = supervision
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    supervisor.lapse();
+}
+
 fn observe_supervision<C>(
     active: &Option<WorkerSession<C>>,
     owner: CommandOwner,
@@ -2805,9 +2869,27 @@ fn retire_status_if_stale<C>(
     active: &mut Option<WorkerSession<C>>,
     owner: CommandOwner,
     intent_epoch: &AtomicU64,
+    plan: MpdControlPlan,
+    supervision: &Arc<Mutex<SupervisionState>>,
 ) -> bool {
     if is_current(owner, intent_epoch) {
         return false;
+    }
+    // The reply is superseded, but it still observed the same MPD
+    // partition: apply the revoke-only evidence BEFORE retiring the
+    // session. A reply that saw a foreign current song or partition-option
+    // drift must lapse the supervisor so the queued newer load cannot pass
+    // its authority gate on a partition this reply just proved contended.
+    // A superseded reply never refreshes or re-arms authority — only
+    // revocation applies here. An unreadable reply is the same blind
+    // window and revokes for the same reason.
+    match result {
+        Ok(status) => {
+            if let Some(song_id) = active.as_ref().and_then(|session| session.song_id) {
+                lapse_on_superseded_evidence(plan, supervision, status, song_id);
+            }
+        }
+        Err(_) => lapse_on_unreadable_status(plan, supervision),
     }
     let observed_foreign = result.as_ref().is_ok_and(|status| {
         active
@@ -2977,7 +3059,7 @@ fn handle_control<C>(
         .expect("active MPD session checked")
         .connection
         .status(deadline);
-    if retire_status_if_stale(&status, active, owner, intent_epoch) {
+    if retire_status_if_stale(&status, active, owner, intent_epoch, plan, supervision) {
         return;
     }
     match status {
@@ -2996,7 +3078,11 @@ fn handle_control<C>(
         }
         Err(failure) => {
             // A failed ownership query cannot authorize even a global pause.
-            // Drop the session without sending any cleanup command.
+            // Drop the session without sending any cleanup command, and —
+            // on a supervised output — revoke authority: the unreadable
+            // reply is a blind window over the partition, and a queued
+            // newer load must not mutate inside the window it leaves.
+            lapse_on_unreadable_status(plan, supervision);
             active.take();
             fail_current(owner, failure, intent_epoch, cache, event_tx);
             return;
@@ -3079,7 +3165,7 @@ fn handle_control<C>(
         .expect("active MPD session checked")
         .connection
         .status(deadline);
-    if retire_status_if_stale(&status, active, owner, intent_epoch) {
+    if retire_status_if_stale(&status, active, owner, intent_epoch, plan, supervision) {
         return;
     }
     match status {
@@ -3096,17 +3182,25 @@ fn handle_control<C>(
                 supervision,
             );
         }
-        Err(failure) => cleanup_then_fail(
-            active,
-            owner,
-            failure,
-            intent_epoch,
-            cache,
-            event_tx,
-            timing,
-            plan,
-            supervision,
-        ),
+        Err(failure) => {
+            // The post-action status could not be read or parsed: on a
+            // supervised output that is a blind window over the partition.
+            // Revoke authority BEFORE the failure cleanup so a queued
+            // newer load cannot mutate during the remaining freshness
+            // window this failure just created.
+            lapse_on_unreadable_status(plan, supervision);
+            cleanup_then_fail(
+                active,
+                owner,
+                failure,
+                intent_epoch,
+                cache,
+                event_tx,
+                timing,
+                plan,
+                supervision,
+            );
+        }
     }
 }
 
@@ -3138,7 +3232,7 @@ fn poll_active<C>(
         .expect("active MPD session checked")
         .connection
         .status(timing.deadline());
-    if retire_status_if_stale(&status, active, owner, intent_epoch) {
+    if retire_status_if_stale(&status, active, owner, intent_epoch, plan, supervision) {
         return;
     }
     if let Some(session) = active.as_mut() {
@@ -3147,6 +3241,11 @@ fn poll_active<C>(
     let status = match status {
         Ok(status) => status,
         Err(failure) => {
+            // A poll that cannot be read or parsed is a blind window over
+            // the partition: on a supervised output it revokes authority
+            // before the failure cleanup, so a queued newer load cannot
+            // mutate during the remaining freshness window.
+            lapse_on_unreadable_status(plan, supervision);
             cleanup_then_fail(
                 active,
                 owner,
@@ -3480,6 +3579,17 @@ where
     if kind == CleanupKind::StopOwned {
         let status = session.connection.status(deadline);
         if !is_current(owner, intent_epoch) {
+            // The superseded cleanup status still observed the same
+            // partition: apply the revoke-only evidence before retiring it,
+            // exactly as the poll and pre-control paths must, so the queued
+            // newer command cannot mutate on evidence this reply already
+            // invalidated. A superseded reply never refreshes authority.
+            match &status {
+                Ok(status) => {
+                    lapse_on_superseded_evidence(plan, supervision, status, song_id);
+                }
+                Err(_) => lapse_on_unreadable_status(plan, supervision),
+            }
             let can_restore = match &status {
                 Ok(status) => !status_observes_foreign_song(status, song_id),
                 Err(failure) => failure.connection_usable,
@@ -3496,6 +3606,12 @@ where
         // decision below, exactly as the poll path would.
         if let Ok(status) = &status {
             supervise_status(plan, supervision, status, song_id);
+        } else {
+            // The teardown/cleanup status could not be read or parsed: an
+            // unreadable reply is a blind window over the partition, so a
+            // supervised output revokes before the mutation decisions
+            // below instead of trusting the pre-status gate.
+            lapse_on_unreadable_status(plan, supervision);
         }
 
         match status {
@@ -3615,6 +3731,12 @@ fn cleanup_unconditionally<C>(
         // send neither the partition-global stop nor the targeted delete.
         if let Ok(status) = &status {
             supervise_status(plan, supervision, status, song_id);
+        } else {
+            // The teardown/cleanup status could not be read or parsed: an
+            // unreadable reply is a blind window over the partition, so a
+            // supervised output revokes before the mutation decisions
+            // below instead of trusting the pre-status gate.
+            lapse_on_unreadable_status(plan, supervision);
         }
         if !supervision_authorizes(plan, supervision) {
             return;
@@ -5287,6 +5409,399 @@ mod tests {
         assert_eq!(
             exclusive_errors, 2,
             "both stale-between-polls commands report the exclusive-control error"
+        );
+        harness.shutdown();
+    }
+
+    #[test]
+    fn superseded_precontrol_status_with_drift_lapses_and_blocks_queued_load() {
+        // Delayed-response regression (superseded reply, pre-control
+        // path): the pre-control `status` of a playback control observes
+        // partition-option drift, but a newer load was queued while the
+        // reply was in flight, so the reply is retired as stale. The
+        // retirement must still apply the reply's revoke-only evidence:
+        // the supervisor lapses, the superseded control never reaches MPD,
+        // and the queued load is refused at the worker authority gate
+        // instead of mutating the partition the reply just proved
+        // contended.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/clean".to_string(),
+            },
+        );
+        harness.fence(owner);
+
+        let mut drift = playing_status(0, 10_000);
+        drift.repeat = true;
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(drift);
+        let (entered, release) = shared.install_gate(Point::Status);
+
+        // The control's pre-control status enters the gate mid-flight.
+        harness.send(owner, CommandKind::Pause);
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("pre-control status entered the gate");
+
+        // While the reply is in flight, a newer load is queued: the intent
+        // epoch advances, so the reply will be retired as stale.
+        let queued = harness.next_owner(2);
+        harness.send(
+            queued,
+            CommandKind::Load {
+                uri: "https://music.test/queued".to_string(),
+            },
+        );
+        release.send(()).expect("release pre-control status");
+
+        // Fence with the queued owner itself: a higher-epoch fence would
+        // purge the pending deque and silently drop the queued load.
+        harness.fence(queued);
+
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "drift observed by a superseded status reply must lapse the supervisor"
+        );
+        assert!(
+            !shared
+                .added_uris()
+                .iter()
+                .any(|uri| uri == "https://music.test/queued"),
+            "the queued load must be refused after the superseded reply observed drift"
+        );
+        assert!(
+            !shared
+                .actions()
+                .iter()
+                .any(|action| matches!(action, Action::Pause(_))),
+            "the superseded control itself must never reach MPD"
+        );
+        assert!(
+            harness.events().iter().any(|event| matches!(
+                event,
+                PlayerEvent::Error { message, .. }
+                    if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+            )),
+            "the queued load reports the exclusive-control refusal"
+        );
+        harness.shutdown();
+    }
+
+    #[test]
+    fn superseded_poll_status_with_foreign_song_lapses_and_blocks_queued_load() {
+        // Delayed-response regression (superseded reply, poll path): a
+        // poll status observes a foreign current song, but a newer load
+        // was queued while the reply was in flight. The stale retirement
+        // must apply the foreign-ownership evidence before retiring the
+        // session, so the queued load cannot pass its authority gate on a
+        // partition another controller now owns.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/clean".to_string(),
+            },
+        );
+        harness.fence(owner);
+
+        let mut foreign = playing_status(0, 10_000);
+        foreign.song_id = Some(99);
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(foreign);
+        let (entered, release) = shared.install_gate(Point::Status);
+
+        // Deterministic poll: force the poll so its status enters the
+        // gate instead of racing the poll interval.
+        harness.send(owner, CommandKind::PollNow);
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("poll status entered the gate");
+
+        let queued = harness.next_owner(2);
+        harness.send(
+            queued,
+            CommandKind::Load {
+                uri: "https://music.test/queued".to_string(),
+            },
+        );
+        release.send(()).expect("release poll status");
+
+        // Fence with the queued owner itself: a higher-epoch fence would
+        // purge the pending deque and silently drop the queued load.
+        harness.fence(queued);
+
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "a foreign song observed by a superseded poll reply must lapse the supervisor"
+        );
+        assert!(
+            !shared
+                .added_uris()
+                .iter()
+                .any(|uri| uri == "https://music.test/queued"),
+            "the queued load must be refused after the superseded poll observed a foreign song"
+        );
+        assert!(
+            !shared
+                .actions()
+                .iter()
+                .any(|action| matches!(action, Action::Delete(42))),
+            "the stale foreign ownership proof retains the old queue id"
+        );
+        assert!(
+            harness.events().iter().any(|event| matches!(
+                event,
+                PlayerEvent::Error { message, .. }
+                    if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+            )),
+            "the queued load reports the exclusive-control refusal"
+        );
+        harness.shutdown();
+    }
+
+    #[test]
+    fn superseded_clean_status_neither_lapses_nor_refreshes_supervision() {
+        // A superseded status reply that observed a CLEAN partition must
+        // leave the supervisor exactly as it was: no revocation (the
+        // partition was uncontended) and no refresh — a stale generation
+        // must never extend or re-arm authority, so the observation
+        // instant the test pinned survives untouched.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/clean".to_string(),
+            },
+        );
+        harness.fence(owner);
+
+        let pinned = Instant::now();
+        harness
+            .supervision
+            .lock()
+            .expect("supervision lock")
+            .last_observation = Some(pinned);
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(playing_status(0, 10_000));
+        let (entered, release) = shared.install_gate(Point::Status);
+
+        harness.send(owner, CommandKind::Pause);
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("pre-control status entered the gate");
+
+        // Supersede WITHOUT queueing a command: a bare epoch bump models
+        // the retirement trigger without side effects.
+        harness.epoch.fetch_add(1, Ordering::SeqCst);
+        release.send(()).expect("release pre-control status");
+
+        let fence_owner = harness.next_owner(2);
+        harness.fence(fence_owner);
+
+        {
+            let supervision = harness.supervision.lock().expect("supervision lock");
+            assert!(
+                !supervision.is_lapsed(),
+                "a clean superseded reply carries no revoking evidence"
+            );
+            assert_eq!(
+                supervision.last_observation,
+                Some(pinned),
+                "a superseded reply must never refresh the observation instant"
+            );
+        }
+        harness.shutdown();
+    }
+
+    #[test]
+    fn supervised_poll_status_failure_lapses_and_retains_orphan() {
+        // Authority-consequence regression (the `single oneshot` class):
+        // a status reply that cannot be read or parsed used to drop the
+        // session while supervised authority stayed live inside its
+        // freshness window. The failure itself must revoke: the supervisor
+        // lapses, the failure cleanup retains the owned entry (no targeted
+        // delete), and a load issued inside the former window is refused
+        // instead of overwriting whatever the unreadable reply concealed.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/clean".to_string(),
+            },
+        );
+        harness.fence(owner);
+        shared.clear_actions();
+        let _ = harness.events();
+
+        *shared.fail_at.lock().expect("failure lock") = Some(Point::Status);
+        harness.send(owner, CommandKind::PollNow);
+        harness.fence(owner);
+
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "an unreadable status reply revokes supervised authority"
+        );
+        assert_eq!(
+            shared.actions(),
+            vec![Action::Point(Point::Status)],
+            "the failure cleanup retains the orphan: no stop, no delete"
+        );
+
+        // A load inside the former freshness window is refused too.
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/refused".to_string(),
+            },
+        );
+        harness.fence(owner);
+        assert!(
+            !shared
+                .added_uris()
+                .iter()
+                .any(|uri| uri == "https://music.test/refused"),
+            "a load after an unreadable status reply is refused"
+        );
+        assert!(
+            harness.events().iter().any(|event| matches!(
+                event,
+                PlayerEvent::Error { message, .. }
+                    if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+            )),
+            "the refused load reports the exclusive-control error"
+        );
+        harness.shutdown();
+    }
+
+    #[test]
+    fn supervised_precontrol_status_failure_lapses_and_blocks_followup_load() {
+        // Authority-consequence regression (pre-control path): a pre-
+        // control status that cannot be read must revoke supervision, not
+        // merely drop the session. No cleanup command may follow, and a
+        // load issued inside the former freshness window is refused.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/clean".to_string(),
+            },
+        );
+        harness.fence(owner);
+        shared.clear_actions();
+        let _ = harness.events();
+
+        *shared.fail_at.lock().expect("failure lock") = Some(Point::Status);
+        harness.send(owner, CommandKind::Pause);
+        harness.fence(owner);
+
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "an unreadable pre-control status revokes supervised authority"
+        );
+        assert_eq!(
+            shared.actions(),
+            vec![Action::Point(Point::Status)],
+            "no control and no cleanup follows the failed preflight"
+        );
+
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/refused".to_string(),
+            },
+        );
+        harness.fence(owner);
+        assert!(
+            !shared
+                .added_uris()
+                .iter()
+                .any(|uri| uri == "https://music.test/refused"),
+            "a load after an unreadable pre-control status is refused"
+        );
+        assert!(
+            harness.events().iter().any(|event| matches!(
+                event,
+                PlayerEvent::Error { message, .. }
+                    if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+            )),
+            "the refused load reports the exclusive-control error"
         );
         harness.shutdown();
     }
@@ -8523,6 +9038,74 @@ mod tests {
         assert!(complete.consume);
         assert!(!complete.random);
         assert!(!complete.single);
+    }
+
+    #[test]
+    fn status_parses_oneshot_single_and_consume_as_enabled_drift() {
+        // The official protocol accepts `oneshot` as an enabled value for
+        // `single` and `consume` (mpd.readthedocs.io, playback options).
+        // Another controller may legitimately set either, so both must
+        // parse as an enabled option — partition-option drift — instead of
+        // a recoverable protocol failure that leaves supervised authority
+        // live inside its freshness window.
+        let oneshot_single = parse_status_lines(&[
+            "state: play",
+            "songid: 42",
+            "elapsed: 1.0",
+            "repeat: 0",
+            "random: 0",
+            "single: oneshot",
+            "consume: 0",
+        ])
+        .expect("official `single oneshot` value parses");
+        assert!(oneshot_single.single);
+        assert!(
+            oneshot_single.observes_options_drift(),
+            "single: oneshot is partition-option drift"
+        );
+
+        let oneshot_consume = parse_status_lines(&[
+            "state: play",
+            "songid: 42",
+            "elapsed: 1.0",
+            "repeat: 0",
+            "random: 0",
+            "single: 0",
+            "consume: oneshot",
+        ])
+        .expect("official `consume oneshot` value parses");
+        assert!(oneshot_consume.consume);
+        assert!(
+            oneshot_consume.observes_options_drift(),
+            "consume: oneshot is partition-option drift"
+        );
+    }
+
+    #[test]
+    fn status_rejects_unknown_option_values_fail_closed() {
+        // Only the protocol's accepted off value (`0`) and accepted
+        // enabled values (`1`, `oneshot`) parse. Everything else — foreign
+        // spellings, unknown keywords, out-of-range integers, empty values
+        // — fails the parse: an unparsable option is incomplete evidence
+        // about the partition, never a clean poll.
+        for field in ["repeat", "random", "single", "consume"] {
+            for value in ["true", "false", "2", "oneshot1", "ON", "0 ", ""] {
+                let lines = [
+                    "state: play".to_string(),
+                    "songid: 42".to_string(),
+                    "elapsed: 1.0".to_string(),
+                    format!("repeat: {}", if field == "repeat" { value } else { "0" }),
+                    format!("random: {}", if field == "random" { value } else { "0" }),
+                    format!("single: {}", if field == "single" { value } else { "0" }),
+                    format!("consume: {}", if field == "consume" { value } else { "0" }),
+                ];
+                let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+                assert!(
+                    parse_status_lines(&refs).is_err(),
+                    "`{field}: {value}` must fail closed instead of reading as a clean poll"
+                );
+            }
+        }
     }
 
     #[test]
