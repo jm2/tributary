@@ -846,8 +846,7 @@ impl MountedMutationCommit<'_> {
         leaf: &OsStr,
     ) -> io::Result<OsString> {
         let quarantine_leaf = quarantine_name(leaf);
-        if let Err(error) =
-            rustix::fs::renameat(&parent.file, leaf, &parent.file, &quarantine_leaf)
+        if let Err(error) = rustix::fs::renameat(&parent.file, leaf, &parent.file, &quarantine_leaf)
         {
             return Err(
                 if io::Error::from(error).kind() == io::ErrorKind::NotFound {
@@ -992,8 +991,7 @@ impl MountedMutationCommit<'_> {
                 // the conditioned restore loses a second recreate race, the
                 // displaced objects stay under their quarantine names: debris,
                 // never destruction.
-                let _ =
-                    std::fs::rename(&self.target.path, parent_dir.join(quarantine_name(&leaf)));
+                let _ = std::fs::rename(&self.target.path, parent_dir.join(quarantine_name(&leaf)));
                 let _ = rename_noreplace(&quarantine_path, &self.target.path);
                 return Err(authority_changed(
                     "the mutation target leaf was recreated during the commit",
