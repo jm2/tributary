@@ -200,6 +200,19 @@ one pull request's required check be satisfied by evidence evaluated at a
 different commit. The gate's failure output
 prints the dispatch path with the pull request number filled in.
 
+Reopening a previously resolved thread fires no Actions event either —
+thread state changes are webhook-only, and `pull_request_review_comment` fires
+only for new comments — so once the Bot Review Gate has gone green at a head,
+a reopened bot thread cannot refresh the check through any trigger. Merge-time
+enforcement for that gap is GitHub's native **require-conversation-resolution**
+setting: the rollout below requires the live `main` ruleset to carry it in the
+same change that widens the required checks, so GitHub itself re-blocks the
+merge the moment any resolved review thread is reopened, independent of every
+check result. After a reopening, the check is still refreshed through the
+usual re-run or documented dispatch path so its published evidence describes
+the reopened state; the native rule is what makes the reopened state
+merge-blocking in the interim.
+
 ### Reviewer rate-limit substitution (operator fallback)
 
 When a required bot reviewer is stuck behind reviewer rate limiting, the
@@ -272,11 +285,16 @@ not re-enable non-Dependabot auto-merge.
    marked required. While the ruleset is still narrow, the gate is advisory
    and the auto-merge precondition keeps routine Dependabot auto-merge off.
 2. Edit ruleset 17650907 to add every context in the table above with the
-   listed app binding (`CodeRabbit` unbound). Verify the saved ruleset
+   listed app binding (`CodeRabbit` unbound), and switch on **require
+   conversation resolution** in the same edit — the Actions-trigger gap for
+   reopened threads (see "Refreshing the gate after thread resolution") is
+   enforced by that native rule, so it must be live before the widened gate
+   is treated as authoritative. Verify the saved ruleset
    actually lists all eighteen required checks — the seven the ruleset
    already required (Security Audit, Linux (x86_64), Linux (aarch64),
    macOS (aarch64), Windows (x86_64), Flatpak (Linux), MSRV) plus the
-   eleven additions in the table above — the save, not the intent, is
+   eleven additions in the table above — and that require-conversation-
+   resolution is enabled; the save, not the intent, is
    what the auto-merge precondition reads.
 3. Validate against a live pull request before treating the widened gate as
    authoritative: confirm all widened checks report on that PR, address and
