@@ -5577,6 +5577,572 @@ mod tests {
     }
 
     #[test]
+    fn supervised_load_lapsing_at_the_connect_gate_issues_no_partition_mutation() {
+        // Finding 1 regression (load sequence, post-connect gate): the
+        // worker gate passed on fresh evidence, but the connect/greeting
+        // round-trip consumed the supervision window. The recheck after the
+        // blocking connect stage must refuse before the first partition
+        // mutation — no option command, no enqueue, no play — and before
+        // any delete: the just-created session holds no queue entry, so
+        // there is nothing to retain and nothing to mutate.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let (entered, release) = shared.install_gate(Point::Connect);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        let owner = harness.next_owner(3);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/mid-load".to_string(),
+            },
+        );
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("connect entered the gate");
+        let stale = Instant::now()
+            .checked_sub(MAX_SUPERVISION_GAP + Duration::from_secs(1))
+            .expect("backdated observation instant");
+        harness
+            .supervision
+            .lock()
+            .expect("supervision lock")
+            .last_observation = Some(stale);
+        release.send(()).expect("release connect");
+        harness.fence(owner);
+
+        let actions = shared.actions();
+        assert!(
+            actions.contains(&Action::Point(Point::Connect)),
+            "the connect stage itself ran before the lapse"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::Point(point) if *point != Point::Connect)),
+            "no option or playback command may follow a mid-load lapse"
+        );
+        assert!(
+            shared.added_uris().is_empty(),
+            "a mid-load lapse must never enqueue into the shared partition queue"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::Delete(_))),
+            "a mid-load lapse must not delete anything"
+        );
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the eager post-connect recheck lapses the stale supervisor"
+        );
+        let events = harness.events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::Error { message, .. }
+                if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+        )));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Playing,
+                    ..
+                }
+            )),
+            "the refused load must never reach Playing"
+        );
+        harness.shutdown();
+    }
+
+    #[test]
+    fn supervised_load_lapsing_between_option_stages_issues_no_further_mutation() {
+        // Finding 1 regression (between-stage gate): repeat's ACK round-trip
+        // consumed the remaining supervision window, so the recheck before
+        // `random` must refuse. The option sequence stops mid-flight: no
+        // single/consume, no enqueue, no play, no delete.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let (entered, release) = shared.install_gate(Point::Random);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        let owner = harness.next_owner(3);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/mid-options".to_string(),
+            },
+        );
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("random entered the gate");
+        let stale = Instant::now()
+            .checked_sub(MAX_SUPERVISION_GAP + Duration::from_secs(1))
+            .expect("backdated observation instant");
+        harness
+            .supervision
+            .lock()
+            .expect("supervision lock")
+            .last_observation = Some(stale);
+        release.send(()).expect("release random");
+        harness.fence(owner);
+
+        let actions = shared.actions();
+        for ran in [Point::Connect, Point::Repeat, Point::Random] {
+            assert!(
+                actions.contains(&Action::Point(ran)),
+                "stages before the lapse ran: {:?}",
+                ran
+            );
+        }
+        for refused in [Point::Single, Point::Consume] {
+            assert!(
+                !actions.contains(&Action::Point(refused)),
+                "no option command may follow a mid-load lapse: {:?}",
+                refused
+            );
+        }
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::Play(_))),
+            "a mid-load lapse must never start playback"
+        );
+        assert!(
+            shared.added_uris().is_empty(),
+            "a mid-load lapse must never enqueue into the shared partition queue"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::Delete(_))),
+            "a mid-load lapse must not delete anything"
+        );
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the eager between-stages recheck lapses the stale supervisor"
+        );
+        harness.shutdown();
+    }
+
+    #[test]
+    fn supervised_load_lapsing_after_enqueue_retains_entry_and_never_plays() {
+        // Finding 1 regression (pre-play gate): the addid round-trip
+        // consumed the supervision window after our entry was enqueued.
+        // `playid` must not fire, and the retained entry must NOT be
+        // deleted — deleting it would be the same unauthorized mutation
+        // class. The orphan stays and the load is refused.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let (entered, release) = shared.install_gate(Point::Add);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        let owner = harness.next_owner(3);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/enqueued-then-lapsed".to_string(),
+            },
+        );
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("add entered the gate");
+        let stale = Instant::now()
+            .checked_sub(MAX_SUPERVISION_GAP + Duration::from_secs(1))
+            .expect("backdated observation instant");
+        harness
+            .supervision
+            .lock()
+            .expect("supervision lock")
+            .last_observation = Some(stale);
+        release.send(()).expect("release add");
+        harness.fence(owner);
+
+        assert_eq!(
+            shared
+                .added_uris()
+                .iter()
+                .filter(|uri| *uri == "https://music.test/enqueued-then-lapsed")
+                .count(),
+            1,
+            "the enqueue itself happened before the lapse"
+        );
+        let actions = shared.actions();
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::Play(_))),
+            "a post-enqueue lapse must never start playback"
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Delete(42)))
+                .count(),
+            0,
+            "the retained entry must not be deleted after a lapse — retention IS the safe state"
+        );
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the eager pre-play recheck lapses the stale supervisor"
+        );
+        assert!(harness.events().iter().any(|event| matches!(
+            event,
+            PlayerEvent::Error { message, .. }
+                if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+        )));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn supervised_playing_status_with_drift_and_remote_error_retains_orphan() {
+        // Finding 2 regression (playing + owned + error branch): the
+        // end-of-load status itself carries option drift while reporting
+        // Tributary's own song with a remote error flag. The observation
+        // lapses the supervisor, and the terminal delete that used to follow
+        // unconditionally must be replaced by retain-and-refuse.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        let mut lapsed = playing_status(0, 10_000);
+        lapsed.repeat = true;
+        lapsed.has_error = true;
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(lapsed);
+        let owner = harness.next_owner(3);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/playing-drift-error".to_string(),
+            },
+        );
+        harness.fence(owner);
+
+        let actions = shared.actions();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Delete(42)))
+                .count(),
+            0,
+            "the very status that lapsed the supervisor must not be followed by a delete"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::Point(Point::Stop))),
+            "no partition-global stop may follow the lapse either"
+        );
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the drift in the authoritative status must lapse the supervisor"
+        );
+        let events = harness.events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::Error { message, .. }
+                if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::TrackEnded { .. })),
+            "a lapsed terminal path must not report completion"
+        );
+        harness.shutdown();
+    }
+
+    #[test]
+    fn supervised_stopped_owned_status_with_drift_and_error_retains_orphan() {
+        // Finding 2 regression (stopped + owned + error branch): same
+        // post-observe gate on the stopped variant — the drift observed by
+        // the very status that reported the remote error revokes authority
+        // before the targeted delete fires.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        let mut lapsed = stopped_status(0, 10_000);
+        lapsed.single = true;
+        lapsed.has_error = true;
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(lapsed);
+        let owner = harness.next_owner(3);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/stopped-drift-error".to_string(),
+            },
+        );
+        harness.fence(owner);
+
+        assert_eq!(
+            shared
+                .actions()
+                .iter()
+                .filter(|action| matches!(action, Action::Delete(42)))
+                .count(),
+            0,
+            "the drift observed by the error status must retain the orphan, not delete it"
+        );
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the drift in the authoritative status must lapse the supervisor"
+        );
+        assert!(harness.events().iter().any(|event| matches!(
+            event,
+            PlayerEvent::Error { message, .. }
+                if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+        )));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn supervised_cleared_pointer_status_with_drift_and_error_retains_orphan() {
+        // Finding 2 regression (cleared-pointer + error branch): the status
+        // reports no current song but carries option drift and a remote
+        // error. The observation lapses the supervisor, so the atomic
+        // targeted delete of our retained entry must NOT fire.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        let mut lapsed = stopped_status(0, 10_000);
+        lapsed.song_id = None;
+        lapsed.repeat = true;
+        lapsed.has_error = true;
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(lapsed);
+        let owner = harness.next_owner(3);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/cleared-drift-error".to_string(),
+            },
+        );
+        harness.fence(owner);
+
+        assert_eq!(
+            shared
+                .actions()
+                .iter()
+                .filter(|action| matches!(action, Action::Delete(42)))
+                .count(),
+            0,
+            "option drift observed with the pointer cleared must retain the entry"
+        );
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the drift in the authoritative status must lapse the supervisor"
+        );
+        assert!(harness.events().iter().any(|event| matches!(
+            event,
+            PlayerEvent::Error { message, .. }
+                if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+        )));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn supervised_completion_status_with_drift_retains_entry_and_refuses() {
+        // Finding 2 regression (completion-delete branch): the queue drained
+        // naturally (pointer cleared, no error) but the very status that
+        // reports completion carries option drift. The observation lapses
+        // the supervisor, so the completion delete must not fire and the
+        // load must NOT report TrackEnded — the retained entry is the
+        // documented post-lapse state.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        let mut lapsed = stopped_status(0, 10_000);
+        lapsed.song_id = None;
+        lapsed.repeat = true;
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(lapsed);
+        let owner = harness.next_owner(3);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/completion-drift".to_string(),
+            },
+        );
+        harness.fence(owner);
+
+        assert_eq!(
+            shared
+                .actions()
+                .iter()
+                .filter(|action| matches!(action, Action::Delete(42)))
+                .count(),
+            0,
+            "drift observed by the completion status must retain the entry, not delete it"
+        );
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the drift in the completion status must lapse the supervisor"
+        );
+        let events = harness.events();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::TrackEnded { .. })),
+            "a lapsed completion must not report TrackEnded"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::Error { message, .. }
+                if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+        )));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn supervision_lapsed_reports_stale_armed_supervisor_eagerly_for_reselection() {
+        // Finding 3 regression: the selector consults
+        // `supervision_lapsed()` to decide whether same-target reselection
+        // must rebuild the output. The accessor has to apply the same eager
+        // freshness rule as the worker's authority gate: an Armed supervisor
+        // whose last observation predates MAX_SUPERVISION_GAP is equally
+        // disqualified. Consulting only the stored phase reported such an
+        // output as healthy, the reselection was swallowed as a no-op, and
+        // the next load refused — forcing the user to reselect twice.
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let (worker_tx, _worker_rx) = worker_command_channel(MAX_PENDING_WORKER_COMMANDS);
+        let output = MpdOutput {
+            display_name: "supervised".to_string(),
+            event_tx,
+            event_generation: AtomicU64::new(5),
+            volume: 1.0,
+            plan: control_plan(true, true),
+            intent_epoch: Arc::new(AtomicU64::new(0)),
+            cache: Arc::new(Mutex::new(MpdCache::default())),
+            proxy: ProxyServices::production(),
+            worker_tx,
+            supervision: Arc::new(Mutex::new(SupervisionState::new())),
+        };
+
+        assert!(
+            !output.supervision_lapsed(),
+            "a freshly confirmed supervisor reports healthy"
+        );
+
+        // The evidence goes stale without any poll observing it — exactly
+        // the "newly selected or naturally completed output" shape from the
+        // finding: phase still Armed, but the eager age rule already
+        // disqualifies it.
+        let stale = Instant::now()
+            .checked_sub(MAX_SUPERVISION_GAP + Duration::from_secs(1))
+            .expect("backdated observation instant");
+        output
+            .supervision
+            .lock()
+            .expect("supervision lock")
+            .last_observation = Some(stale);
+
+        assert!(
+            output.supervision_lapsed(),
+            "an Armed-but-stale supervisor must report lapsed eagerly so same-target \
+             reselection takes the rebuild path"
+        );
+        assert!(
+            output
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the eager check materializes the lapse, matching the worker gate's semantics"
+        );
+        assert!(
+            output.supervision_lapsed(),
+            "the lapse is terminal: subsequent consultations agree"
+        );
+    }
+
+    #[test]
     fn unsupervised_exclusive_shutdown_still_deletes_owned_orphan() {
         // The retain-on-lapse rule is supervision-specific: an
         // unsupervised `Exclusive` output keeps its pre-existing
