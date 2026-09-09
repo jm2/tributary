@@ -798,14 +798,56 @@ impl MountedMutationCommit<'_> {
         let staged_identity = object_identity(&staged_file)?;
         drop(staged_file);
 
-        // Displace whatever occupies the leaf. This rename is atomic and its
-        // destination is a fresh unique name, so it cannot destroy anything:
-        // afterwards the confirmed object — or whatever replaced it since the
-        // confirm step — sits under the quarantine name and the leaf is
-        // vacant.
-        let quarantine_leaf = quarantine_name(&leaf);
+        // Displace whatever occupies the leaf under a fresh quarantine name,
+        // then prove the displaced entry is the exact object the confirm step
+        // verified. Anything else means the leaf was swapped between confirm
+        // and quarantine: the newcomer is put back — byte-exact, under its
+        // own name, through the conditioned restore — and the commit refuses.
+        let quarantine_leaf = Self::displace_leaf_under_fresh_quarantine_name(parent, &leaf)?;
+        Self::refuse_unless_displaced_entry_is_confirmed(
+            parent,
+            &quarantine_leaf,
+            &leaf,
+            &self.file.object.identity,
+        )?;
+
+        // Install the staged copy into the vacant leaf name. The install
+        // itself is conditioned: a no-replace rename refuses an occupied
+        // destination atomically, so an external writer that recreates the
+        // leaf inside the quarantine-to-install window is preserved and
+        // refuses the commit exactly like every earlier disturbance — the
+        // write is authorized for the file the authority admitted, not for
+        // whatever now occupies the name.
+        #[cfg(test)]
+        run_pre_install_interpose(self);
+        Self::install_staged_leaf_into_vacant_leaf(parent, staged_leaf, &leaf, &quarantine_leaf)?;
+
+        // Prove the replacement landed on the exact directory entry.
+        let replaced = open_unix_regular_at(&parent.file, &leaf)?;
+        if object_identity(&replaced)? != staged_identity {
+            return Err(authority_changed(
+                "the tagged replacement did not land on the retained mutation target",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Displace whatever occupies `leaf` under a fresh unique quarantine
+    /// sibling and return that name.
+    ///
+    /// The rename is atomic and its destination is a fresh unique name, so it
+    /// cannot destroy anything: afterwards the confirmed object — or whatever
+    /// replaced it since the confirm step — sits under the quarantine name
+    /// and the leaf is vacant. A leaf that vanished after the confirm step
+    /// refuses without touching anything.
+    #[cfg(unix)]
+    fn displace_leaf_under_fresh_quarantine_name(
+        parent: &RetainedObject,
+        leaf: &OsStr,
+    ) -> io::Result<OsString> {
+        let quarantine_leaf = quarantine_name(leaf);
         if let Err(error) =
-            rustix::fs::renameat(&parent.file, &leaf, &parent.file, &quarantine_leaf)
+            rustix::fs::renameat(&parent.file, leaf, &parent.file, &quarantine_leaf)
         {
             return Err(
                 if io::Error::from(error).kind() == io::ErrorKind::NotFound {
@@ -817,31 +859,51 @@ impl MountedMutationCommit<'_> {
                 },
             );
         }
+        Ok(quarantine_leaf)
+    }
 
-        // Prove the displaced entry is the exact object the confirm step
-        // verified. Anything else means the leaf was swapped between confirm
-        // and quarantine: put the newcomer back — byte-exact, under its own
-        // name, through the conditioned restore — and refuse.
-        let displaced_is_confirmed = open_unix_regular_at(&parent.file, &quarantine_leaf)
+    /// Prove the displaced entry is the exact object the confirm step
+    /// verified; restore a swapped newcomer — byte-exact, under its own
+    /// name, through the conditioned restore — and refuse otherwise.
+    #[cfg(unix)]
+    fn refuse_unless_displaced_entry_is_confirmed(
+        parent: &RetainedObject,
+        quarantine_leaf: &OsStr,
+        leaf: &OsStr,
+        expected: &ObjectIdentity,
+    ) -> io::Result<()> {
+        let displaced_is_confirmed = open_unix_regular_at(&parent.file, quarantine_leaf)
             .and_then(|displaced| object_identity(&displaced))
-            .is_ok_and(|identity| identity == self.file.object.identity);
+            .is_ok_and(|identity| identity == *expected);
         if !displaced_is_confirmed {
-            Self::restore_displaced_entry(parent, &quarantine_leaf, &leaf)?;
+            Self::restore_displaced_entry(parent, quarantine_leaf, leaf)?;
             return Err(authority_changed(
                 "the confirmed mutation target was replaced before the commit",
             ));
         }
+        Ok(())
+    }
 
-        // Install the staged copy into the vacant leaf name. The install
-        // itself is conditioned: a no-replace rename refuses an occupied
-        // destination atomically, so an external writer that recreates the
-        // leaf inside the quarantine-to-install window is preserved and
-        // refuses the commit exactly like every earlier disturbance — the
-        // write is authorized for the file the authority admitted, not for
-        // whatever now occupies the name.
-        #[cfg(test)]
-        run_pre_install_interpose(self);
-        match rename_noreplace_at(parent, staged_leaf, &leaf) {
+    /// Install the staged copy into the vacant leaf name through the
+    /// conditioned no-replace rename, then retire the displaced original.
+    ///
+    /// A no-replace rename refuses an occupied destination atomically, so an
+    /// external writer that recreates the leaf inside the quarantine-to-
+    /// install window is preserved under a fresh sibling and the commit
+    /// refuses exactly like every earlier disturbance — the write is
+    /// authorized for the file the authority admitted, not for whatever now
+    /// occupies the name. The install consumes the staging entry, so only
+    /// the displaced original remains to retire; the replacement has already
+    /// landed, so a removal failure there leaves it under the quarantine
+    /// sibling rather than failing the committed write.
+    #[cfg(unix)]
+    fn install_staged_leaf_into_vacant_leaf(
+        parent: &RetainedObject,
+        staged_leaf: &OsStr,
+        leaf: &OsStr,
+        quarantine_leaf: &OsStr,
+    ) -> io::Result<()> {
+        match rename_noreplace_at(parent, staged_leaf, leaf) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 // A newcomer recreated the leaf after the quarantine proof.
@@ -852,8 +914,8 @@ impl MountedMutationCommit<'_> {
                 // displaced objects stay under their quarantine names: debris,
                 // never destruction.
                 let _ =
-                    rustix::fs::renameat(&parent.file, &leaf, &parent.file, quarantine_name(&leaf));
-                let _ = Self::restore_displaced_entry(parent, &quarantine_leaf, &leaf);
+                    rustix::fs::renameat(&parent.file, leaf, &parent.file, quarantine_name(leaf));
+                let _ = Self::restore_displaced_entry(parent, quarantine_leaf, leaf);
                 return Err(authority_changed(
                     "the mutation target leaf was recreated during the commit",
                 ));
@@ -863,26 +925,12 @@ impl MountedMutationCommit<'_> {
                 // Return the confirmed original to its name (best effort —
                 // the caller sees the install error either way) and fail
                 // closed rather than stranding it under the quarantine name.
-                let _ = Self::restore_displaced_entry(parent, &quarantine_leaf, &leaf);
+                let _ = Self::restore_displaced_entry(parent, quarantine_leaf, leaf);
                 return Err(error);
             }
         }
 
-        // The install rename consumed the staging entry — rename moves the
-        // source name onto the destination — so only the displaced original,
-        // the same directory entry a plain rename over the leaf would have
-        // consumed, remains to retire. The replacement has already landed,
-        // so a removal failure here leaves the prior object under the
-        // quarantine sibling rather than failing the committed write.
-        let _ = rustix::fs::unlinkat(&parent.file, &quarantine_leaf, rustix::fs::AtFlags::empty());
-
-        // Prove the replacement landed on the exact directory entry.
-        let replaced = open_unix_regular_at(&parent.file, &leaf)?;
-        if object_identity(&replaced)? != staged_identity {
-            return Err(authority_changed(
-                "the tagged replacement did not land on the retained mutation target",
-            ));
-        }
+        let _ = rustix::fs::unlinkat(&parent.file, quarantine_leaf, rustix::fs::AtFlags::empty());
         Ok(())
     }
 
