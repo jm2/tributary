@@ -11,6 +11,8 @@ const RUST_TOOLCHAIN_MANIFEST: &str = include_str!("../.github/rust-toolchain.to
 const DEPENDABOT_CONFIG: &str = include_str!("../.github/dependabot.yml");
 const DEPENDABOT_AUTOMERGE: &str = include_str!("../.github/workflows/dependabot-automerge.yml");
 const BOT_REVIEW_GATE: &str = include_str!("../.github/workflows/bot-review-gate.yml");
+const BOT_REVIEW_GATE_PUBLISHER: &str =
+    include_str!("../.github/workflows/bot-review-gate-publisher.yml");
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
 const REFINERY_CONFIG: &str = include_str!("../docs/refinery-config.md");
 const COVERAGE_BASELINE: &str = include_str!("../coverage-baseline.txt");
@@ -1552,45 +1554,48 @@ fn dependabot_automerge_writer_is_action_free_concurrent_and_exact_head_guarded(
 }
 
 fn bot_review_gate_workflow() -> serde_yaml::Value {
-    serde_yaml::from_str(BOT_REVIEW_GATE).expect("bot review gate workflow must parse")
+    serde_yaml::from_str(BOT_REVIEW_GATE).expect("bot review gate announcer workflow must parse")
+}
+
+fn bot_review_gate_publisher_workflow() -> serde_yaml::Value {
+    serde_yaml::from_str(BOT_REVIEW_GATE_PUBLISHER)
+        .expect("bot review gate publisher workflow must parse")
 }
 
 fn bot_review_gate_run_script(workflow: &serde_yaml::Value) -> String {
-    let job_steps = workflow["jobs"]["bot-review-gate"]["steps"]
+    let job_steps = workflow["jobs"]["publish"]["steps"]
         .as_sequence()
-        .expect("gate steps must be a sequence");
+        .expect("publisher steps must be a sequence");
     assert_eq!(
         job_steps.len(),
         1,
-        "the gate must stay a single API-only step"
+        "the publisher must stay a single API-only step"
     );
     assert!(
         job_steps.iter().all(|step| step.get("uses").is_none()),
-        "the gate must not execute any third-party action or checkout"
+        "the publisher must not execute any third-party action or checkout"
     );
     job_steps[0]["run"]
         .as_str()
-        .expect("the gate step must inline its script")
+        .expect("the publisher step must inline its script")
         .to_owned()
 }
 
 #[test]
-// These assertions jointly prove the gate's one privileged boundary — it is
-// the machine-readable merge evidence for bot reviews — and should fail as a
-// unit if its read-only permission, fail-closed queries, review-conclusion
-// semantics, head binding, or stable check name regresses. The decision
-// logic itself is exercised against recorded fixtures by
-// tests/bot_review_gate/ (fixture-driven decision tests); this test pins the workflow-level contract.
-// #lizard forgives
-fn bot_review_gate_is_read_only_fail_closed_and_pinned_to_main_prs() {
+// The announcer runs pull-request-controlled content, so it may contribute
+// nothing but refresh events. These assertions jointly prove it declares the
+// documented triggers, holds no token scopes, evaluates nothing, and names
+// its own check-run so it can never collide with the required context.
+fn bot_review_gate_announcer_declares_only_trusted_noop_refresh_events() {
     let workflow = bot_review_gate_workflow();
 
-    // The check name is the required-check context the live ruleset must
-    // reference; it is a deployment contract and must not drift silently.
+    // The required-check context belongs to the default-branch publisher;
+    // the announcer's job check-run must carry a different name so a
+    // pull request can never satisfy the context from this file.
     assert_eq!(
         workflow["jobs"]["bot-review-gate"]["name"].as_str(),
-        Some("Bot Review Gate"),
-        "the gate's check-run name is referenced by the live ruleset and must stay stable"
+        Some("Bot Review Gate Trigger"),
+        "the announcer's check-run name must stay distinct from the required context"
     );
 
     // YAML 1.1 parses the bare `on:` key as boolean true, so look up both
@@ -1598,35 +1603,34 @@ fn bot_review_gate_is_read_only_fail_closed_and_pinned_to_main_prs() {
     let on = workflow
         .get("on")
         .or_else(|| workflow.get(serde_yaml::Value::Bool(true)))
-        .expect("the gate workflow must declare its triggers");
+        .expect("the announcer workflow must declare its triggers");
     assert!(
         on.get("pull_request_target").is_none(),
-        "the gate must never use pull_request_target"
+        "the announcer must never use pull_request_target"
     );
+    let pull_request_branches = yaml_string_list(&on["pull_request"], "branches");
     assert_eq!(
-        on["pull_request"]["branches"]
-            .as_sequence()
-            .map(std::vec::Vec::len),
-        Some(1),
-        "the gate reports only on pull requests targeting main"
+        pull_request_branches,
+        ["main"],
+        "the announcer fires only for pull requests targeting main"
     );
     let pull_request_types = yaml_string_list(&on["pull_request"], "types");
     assert_eq!(
         pull_request_types,
         ["opened", "synchronize", "reopened"],
-        "every push to a pull request must re-evaluate the gate at the new head"
+        "every push to a pull request must re-announce the gate at the new head"
     );
     let review_types = yaml_string_list(&on["pull_request_review"], "types");
     assert_eq!(
         review_types,
         ["submitted", "edited", "dismissed"],
-        "review conclusions and their formal withdrawal must re-evaluate the gate"
+        "review conclusions and their formal withdrawal must re-announce the gate"
     );
     let review_comment_types = yaml_string_list(&on["pull_request_review_comment"], "types");
     assert_eq!(
         review_comment_types,
         ["created"],
-        "a thread opened by a single review comment (no review submission) must re-evaluate the gate"
+        "a thread opened by a single review comment (no review submission) must re-announce the gate"
     );
     // `pull_request_review_thread` is a webhook event, not an Actions
     // trigger: declaring it here would make the workflow invalid. Thread
@@ -1634,96 +1638,179 @@ fn bot_review_gate_is_read_only_fail_closed_and_pinned_to_main_prs() {
     // workflow_dispatch paths.
     assert!(
         on.get("pull_request_review_thread").is_none(),
-        "the gate must declare only documented Actions events, not webhooks"
+        "the announcer must declare only documented Actions events, not webhooks"
     );
     assert!(
         on["workflow_dispatch"]["inputs"]["pr_number"]["required"].as_bool() == Some(true),
         "the dispatch refresh path must name exactly the pull request it evaluates"
     );
+    assert!(
+        on.get("workflow_run").is_none(),
+        "only the publisher may react to workflow_run events"
+    );
 
-    let permissions = workflow["permissions"]
-        .as_mapping()
-        .expect("workflow permissions must be a mapping");
     assert_eq!(
-        permissions.len(),
-        2,
-        "the gate must declare exactly its two workflow-level permissions"
-    );
-    assert_eq!(
-        workflow["permissions"]["pull-requests"].as_str(),
-        Some("read"),
-        "the gate must be strictly read-only"
-    );
-    assert_eq!(
-        workflow["permissions"]["contents"].as_str(),
-        Some("read"),
-        "the only other grant is the read-only policy-file read; no write access anywhere"
+        workflow["permissions"],
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        "the announcer evaluates nothing and must hold no token scopes at all"
     );
 
     assert_eq!(
         workflow["concurrency"]["cancel-in-progress"].as_bool(),
         Some(true),
-        "a newer review event must cancel the gate's stale run"
+        "a newer review event must cancel the announcer's stale run"
     );
     assert!(
         workflow["concurrency"]["group"].as_str().is_some_and(
             |group| group.contains("github.event.pull_request.number || inputs.pr_number")
         ),
-        "gate concurrency must be scoped to the exact pull request across event kinds"
+        "announcer concurrency must be scoped to the exact pull request across event kinds"
+    );
+
+    // The announcer body must be a single trivial step: no checkout, no
+    // third-party action, and no API evaluation of any kind.
+    let job_steps = workflow["jobs"]["bot-review-gate"]["steps"]
+        .as_sequence()
+        .expect("announcer steps must be a sequence");
+    assert_eq!(
+        job_steps.len(),
+        1,
+        "the announcer must stay a single no-op step"
+    );
+    assert!(
+        job_steps.iter().all(|step| step.get("uses").is_none()),
+        "the announcer must not execute any third-party action or checkout"
+    );
+    let run = job_steps[0]["run"]
+        .as_str()
+        .expect("the announcer step must inline its script");
+    assert!(
+        !run.contains("gh api") && !run.contains("graphql") && !run.contains("check-runs"),
+        "the announcer must not query or publish anything itself"
+    );
+}
+
+#[test]
+// The publisher is the only writer of the required `Bot Review Gate`
+// context, and its entire evaluation runs from the default-branch revision
+// GitHub executes for `workflow_run` events. These assertions jointly prove
+// that trust boundary: the trigger, the permission set, the event fields it
+// refuses to trust, and the check-run it publishes.
+fn bot_review_gate_publisher_publishes_the_required_context_from_default_branch_content() {
+    let workflow = bot_review_gate_publisher_workflow();
+
+    let on = workflow
+        .get("on")
+        .or_else(|| workflow.get(serde_yaml::Value::Bool(true)))
+        .expect("the publisher workflow must declare its triggers");
+    assert!(
+        on.get("pull_request").is_none()
+            && on.get("pull_request_target").is_none()
+            && on.get("push").is_none()
+            && on.get("workflow_dispatch").is_none(),
+        "the publisher must run exclusively on announcer completions"
+    );
+    assert_eq!(
+        yaml_string_list(&on["workflow_run"], "workflows"),
+        ["Bot review gate"],
+        "the publisher must react only to the bot review gate announcer"
+    );
+    assert_eq!(
+        yaml_string_list(&on["workflow_run"], "types"),
+        ["completed"],
+        "every announcer completion — including a cancellation — must re-evaluate the current state"
+    );
+
+    let permissions = workflow["permissions"]
+        .as_mapping()
+        .expect("publisher permissions must be a mapping");
+    assert_eq!(
+        permissions.len(),
+        3,
+        "the publisher must declare exactly its three workflow-level permissions"
+    );
+    assert_eq!(
+        workflow["permissions"]["checks"].as_str(),
+        Some("write"),
+        "publishing the required check-run is the publisher's one write"
+    );
+    assert_eq!(
+        workflow["permissions"]["pull-requests"].as_str(),
+        Some("read"),
+        "review evidence is read through a read-only grant"
+    );
+    assert_eq!(
+        workflow["permissions"]["contents"].as_str(),
+        Some("read"),
+        "the only other grant is the read-only policy-file read"
+    );
+
+    // The event's pull-request fields are derived from branch-name matches
+    // and are never trusted: the binding head comes from the announcing
+    // run's commit, and the pull requests are re-derived through the API.
+    let steps = workflow["jobs"]["publish"]["steps"]
+        .as_sequence()
+        .expect("publisher steps must be a sequence");
+    assert!(
+        steps[0]["env"]["EVENT_HEAD_SHA"].as_str()
+            == Some("${{ github.event.workflow_run.head_sha }}"),
+        "the evaluated head must be the announcing run's head commit"
+    );
+    assert!(
+        !steps[0]["run"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("github.event.workflow_run.pull_requests"),
+        "the event's pull-request fields must never be used as authority"
+    );
+
+    assert_eq!(
+        workflow["concurrency"]["cancel-in-progress"].as_bool(),
+        Some(true),
+        "a newer announcement for the same head must cancel the stale evaluation"
+    );
+    assert!(
+        workflow["concurrency"]["group"]
+            .as_str()
+            .is_some_and(|group| group.contains("github.event.workflow_run.head_sha")),
+        "publisher concurrency must be scoped to the exact announcing head"
     );
 
     // Extracting the run script also proves the step shape: exactly one
     // API-only step, no checkout, no third-party actions.
-    let _script = bot_review_gate_run_script(&workflow);
-}
+    let script = bot_review_gate_run_script(&workflow);
 
-// The gate script's decision contract, pinned as text across four focused
-// tests. The decisions themselves run against recorded fixtures in
-// tests/bot_review_gate/ (fixture-driven decision tests).
-#[test]
-fn bot_review_gate_script_paginates_evidence_and_ranks_reviews() {
-    let script = bot_review_gate_run_script(&bot_review_gate_workflow());
+    // Pull-request discovery is API-derived from the announcing run's
+    // commit, filtered to open pull requests against main.
+    assert!(
+        script.contains("commits/${announcer_head}/pulls")
+            && script.contains(".base.ref == \"main\"")
+            && script.contains(".state == \"open\""),
+        "pull requests must be re-derived from the announcer's exact commit, open against main"
+    );
 
-    // Complete paginated evidence: review conclusions (a change request can
-    // exist without any inline thread) and review threads alike.
+    // The published verdict is a completed check-run under the required
+    // context name, bound to the evaluated head.
     assert!(
-        script.contains("reviewThreads(first: 100") && script.contains("reviews(first: 100"),
-        "the gate must paginate both review threads and reviews completely"
-    );
-    assert!(
-        script.contains("group_by(.author)") && script.contains("sort_by(.database_id)"),
-        "review conclusions must be evaluated per bot author from their latest review"
-    );
-}
-
-#[test]
-fn bot_review_gate_script_requires_explicit_thread_resolution() {
-    let script = bot_review_gate_run_script(&bot_review_gate_workflow());
-
-    // Thread semantics: only explicit resolution clears a thread. GitHub's
-    // "outdated" flag is reported but never substitutes for resolution —
-    // code movement is not evidence that a finding was addressed.
-    assert!(
-        script.contains("select(.isResolved == false)"),
-        "the gate must fail on bot review threads that are not explicitly resolved"
-    );
-    assert!(
-        !script.contains(".isOutdated == false"),
-        "an outdated unresolved thread must stay blocking: movement is not resolution"
-    );
-    assert!(
-        script.contains("isOutdated"),
-        "the report must disclose whether a blocking thread is outdated"
-    );
-    assert!(
-        script.contains("endswith(\"[bot]\")"),
-        "the gate must recognise both GitHub App accounts and [bot]-suffixed logins"
+        script.contains("-F name=\"Bot Review Gate\"")
+            && script.contains("-F head_sha=")
+            && script.contains("-F status=completed")
+            && script.contains("-F conclusion="),
+        "the publisher must publish its verdict as the required check-run at the evaluated head"
     );
 }
 
 #[test]
-fn bot_review_gate_script_binds_conclusions_to_the_evaluated_head() {
-    let script = bot_review_gate_run_script(&bot_review_gate_workflow());
+// These assertions jointly prove the gate's one privileged boundary — it is
+// the machine-readable merge evidence for bot reviews — and should fail as a
+// unit if its fail-closed queries, review-conclusion semantics, head
+// binding, or stable check name regresses. The decision logic itself is
+// exercised against recorded fixtures by tests/bot_review_gate/
+// (fixture-driven decision tests); the two tests above pin the workflow
+// contracts. #lizard forgives
+fn bot_review_gate_script_fails_closed_and_binds_evidence_to_one_head() {
+    let script = bot_review_gate_run_script(&bot_review_gate_publisher_workflow());
+    let workflow = bot_review_gate_publisher_workflow();
 
     // Review-conclusion semantics: an outstanding change request blocks even
     // without an inline thread, a formal dismissal clears it, and otherwise
@@ -1747,22 +1834,78 @@ fn bot_review_gate_script_binds_conclusions_to_the_evaluated_head() {
         "bot review evidence must be bound to the exact evaluated head"
     );
 
+    // Thread semantics: only explicit resolution clears a thread. GitHub's
+    // "outdated" flag is reported but never substitutes for resolution —
+    // code movement is not evidence that a finding was addressed.
+    assert!(
+        script.contains("select(.isResolved == false)"),
+        "the gate must fail on bot review threads that are not explicitly resolved"
+    );
+    assert!(
+        !script.contains(".isOutdated == false"),
+        "an outdated unresolved thread must stay blocking: movement is not resolution"
+    );
+    assert!(
+        script.contains("isOutdated"),
+        "the report must disclose whether a blocking thread is outdated"
+    );
+    assert!(
+        script.contains("endswith(\"[bot]\")"),
+        "the gate must recognise both GitHub App accounts and [bot]-suffixed logins"
+    );
+
+    // Complete paginated evidence: review conclusions (a change request can
+    // exist without any inline thread) and review threads alike.
+    assert!(
+        script.contains("reviewThreads(first: 100") && script.contains("reviews(first: 100"),
+        "the gate must paginate both review threads and reviews completely"
+    );
+    assert!(
+        script.contains("group_by(.author)") && script.contains("sort_by(.database_id)"),
+        "review conclusions must be evaluated per bot author from their latest review"
+    );
+
     // Head binding: pagination and the published result are bound to one
     // exact head, re-verified immediately before publication.
     assert!(
         script.contains("headRefOid == $head") && script.contains("Pull request head moved to"),
         "paginated evidence and the published result must be bound to one exact head"
     );
-}
+    assert!(
+        script.contains("no longer matches pull request head"),
+        "an announcer head other than the pull request head must be refused"
+    );
 
-#[test]
-fn bot_review_gate_substitution_policy_is_read_from_main_under_read_only_grant() {
-    let script = bot_review_gate_run_script(&bot_review_gate_workflow());
-    let workflow = bot_review_gate_workflow();
+    // Every query failure, incomplete pagination, or wrong base must fail
+    // the check instead of passing it.
+    for fragment in [
+        "Pull request query failed; failing closed.",
+        "Review-thread query failed; failing closed.",
+        "Review query failed; failing closed.",
+        "Review-thread response omitted the pull request; failing closed.",
+        "Review response omitted the pull request; failing closed.",
+        "Review-timeline response omitted the pull request; failing closed.",
+    ] {
+        assert!(
+            script.contains(fragment),
+            "a failed or incomplete query must fail the check: {fragment}"
+        );
+    }
+    // `gh api graphql --paginate` emits one JSON document per page and a
+    // plain `jq -e` derives its exit status from the last value only, so the
+    // incompleteness guard must slurp every page and validate each one.
+    assert!(
+        script.contains("all(.[]; .data.repository.pullRequest != null)"),
+        "the fail-closed guard must validate every paginated page, not just the last one"
+    );
+    assert!(
+        script.contains("!= \"main\"") || script.contains("!= 'main'"),
+        "the gate must re-derive and require the main base branch"
+    );
 
-    // The policy file is read from `main` (never from the pull request), so
-    // a pull request cannot edit its own waiver; reading it needs a
-    // read-only contents grant.
+    // The substitution policy is read from `main` (never from the pull
+    // request), so a pull request cannot edit its own waiver; reading it
+    // needs a read-only contents grant.
     let permissions = workflow["permissions"]
         .as_mapping()
         .expect("permissions must map");
@@ -1779,7 +1922,7 @@ fn bot_review_gate_substitution_policy_is_read_from_main_under_read_only_grant()
 
 #[test]
 fn bot_review_gate_substitution_defaults_to_disabled_on_policy_failures() {
-    let script = bot_review_gate_run_script(&bot_review_gate_workflow());
+    let script = bot_review_gate_run_script(&bot_review_gate_publisher_workflow());
 
     // The substitution is an opt-in relaxation: a missing file, a failed
     // read, or a malformed document must disable the waiver — never enable
@@ -1796,7 +1939,7 @@ fn bot_review_gate_substitution_defaults_to_disabled_on_policy_failures() {
 
 #[test]
 fn bot_review_gate_substitution_waiver_is_scoped_and_audited() {
-    let script = bot_review_gate_run_script(&bot_review_gate_workflow());
+    let script = bot_review_gate_run_script(&bot_review_gate_publisher_workflow());
 
     // Waiver conditions: a listed reviewer, an affirmative (APPROVED)
     // substitute review bound to the exact evaluated head, every thread
@@ -1831,37 +1974,6 @@ fn bot_review_gate_substitution_waiver_is_scoped_and_audited() {
     assert!(
         script.contains("RATE-LIMIT SUBSTITUTION"),
         "every granted waiver must be reported for auditability"
-    );
-}
-
-#[test]
-fn bot_review_gate_script_fails_closed_on_incomplete_or_wrong_base_queries() {
-    let script = bot_review_gate_run_script(&bot_review_gate_workflow());
-
-    // Every query failure, incomplete pagination, or wrong base must fail
-    // the check instead of passing it.
-    for fragment in [
-        "Pull request query failed; failing closed.",
-        "Review-thread query failed; failing closed.",
-        "Review query failed; failing closed.",
-        "Review-thread response omitted the pull request; failing closed.",
-        "Review response omitted the pull request; failing closed.",
-    ] {
-        assert!(
-            script.contains(fragment),
-            "a failed or incomplete query must fail the check: {fragment}"
-        );
-    }
-    // `gh api graphql --paginate` emits one JSON document per page and a
-    // plain `jq -e` derives its exit status from the last value only, so the
-    // incompleteness guard must slurp every page and validate each one.
-    assert!(
-        script.contains("all(.[]; .data.repository.pullRequest != null)"),
-        "the fail-closed guard must validate every paginated page, not just the last one"
-    );
-    assert!(
-        script.contains("!= \"main\"") || script.contains("!= 'main'"),
-        "the gate must re-derive and require the main base branch"
     );
 }
 
@@ -2025,6 +2137,7 @@ fn hosted_ai_reviewer_remains_decommissioned() {
     assert_eq!(
         workflows,
         [
+            "bot-review-gate-publisher.yml",
             "bot-review-gate.yml",
             "ci.yml",
             "dependabot-automerge.yml",
