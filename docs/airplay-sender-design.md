@@ -2,6 +2,28 @@
 
 Status: design record, no implementation in this bead.
 
+Revision 3 (2026-09-09, corrective pass). This revision answers the
+operator corrective review of revision 2 at `2cae166` with three
+design-gap fixes, each grounded in primary sources rechecked live on
+2026-09-09: (1) §4.3 now requires a dedicated, Tributary-owned OwnTone
+instance — or, for any documented exception, enforceable exclusive
+ownership with continuous output/queue revalidation and safe
+restoration — because the JSON API has no sender-session isolation:
+one player, one current queue, and a server-wide enabled-output set
+([`docs/json-api.md`](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/docs/json-api.md)
+at release 29.3, added to the pinned sources below); (2) §4.1 adds a
+nonblocking position/duration observation seam and cache on
+`SenderSession` — with generation, paused, and disconnected semantics
+— instead of UI-timer events as the only position evidence (§4.4/§7);
+(3) §8 replaces platform scoping inherited from OwnTone's channel
+list with an explicit availability decision for every actual
+Tributary package target (Fedora RPM/COPR, `.rpm`/`.deb` releases,
+Arch AUR, Flatpak, macOS `.dmg`, Windows winget/installer/zip), based
+on documented OwnTone acquisition and the dedicated-instance runtime
+path, with honest fail-closed behavior elsewhere. The draft/operator
+review hold on PR #170 is preserved untouched by this revision; it
+changes the design record only.
+
 Revision 2 (2026-09-04, source-backed rewrite). This revision replaces the
 2026-07-27 survey after an independent exact-head review rejected it. The
 rejected text misstated the classic RAOP model (it confused the `pw` TXT
@@ -16,7 +38,9 @@ the maintained OwnTone sender implementation itself
 ([`src/outputs/raop.c`](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/src/outputs/raop.c)
 and
 [`src/outputs/airplay.c`](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/src/outputs/airplay.c)
-at release 29.3, tag commit `d6fb3edf`, 2026-07-22), the OwnTone changelog and
+at release 29.3, tag commit `d6fb3edf`, 2026-07-22 — including its
+JSON API reference, [`docs/json-api.md`](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/docs/json-api.md)),
+the OwnTone changelog and
 installation records, and PipeWire's maintained
 [`module-raop-sink`](https://github.com/PipeWire/pipewire/blob/b741e0c74f5436f0c925f7741140db0efd32cf4e/src/modules/module-raop-sink.c).
 All upstream source links in this record are pinned to those immutable
@@ -324,9 +348,33 @@ trait SenderSession: Send {
     fn resume(&mut self);
     /// Flush buffered audio without tearing down the receiver session.
     fn flush(&mut self);
+    /// Nonblocking position/duration observation. Implementations
+    /// maintain the snapshot on their own task — the GStreamer
+    /// adapter samples its pipeline there, the daemon adapter samples
+    /// the JSON API player progress — and this method only reads the
+    /// latest cached snapshot. It performs no I/O and must never
+    /// block the caller: the 500 ms UI timer (§4.4) publishes from
+    /// this cache; the timer is not the position source.
+    fn observe(&self) -> SenderPosition;
     /// Tear down the receiver session and local resources. Consumes
     /// self so a closed session is unrepresentable.
     fn close(self: Box<Self>);
+}
+
+/// The latest position/duration snapshot a session has published.
+/// Values are meaningful only for the generation the session was
+/// opened for; the publisher (§4.4) drops snapshots from any other
+/// generation.
+struct SenderPosition {
+    generation: PlayerEventGeneration,
+    /// `None` while the adapter has no trustworthy value: before the
+    /// first confirmed sample, or once the snapshot went stale.
+    position_ms: Option<u64>,
+    duration_ms: Option<u64>,
+    /// Set once the underlying source can no longer be confirmed
+    /// (receiver lost, daemon unreachable). A stale snapshot freezes
+    /// at its last confirmed values and must never be extrapolated.
+    stale: bool,
 }
 
 /// A selectable transmission path. One immutable instance per
@@ -391,6 +439,17 @@ Key differences from revision 1, and why:
   (reconnect exhaustion, auth refusal) surface through the exact same
   `PlayerEvent::Error` + `Stopped` shape the tests pin today
   (§9).
+- **A position/duration observation seam, not timer-only evidence.**
+  `SenderSession::observe` returns the session's cached snapshot
+  without I/O. Each adapter owns how the cache is produced — the
+  GStreamer adapter samples pipeline state on a session-owned task,
+  the daemon adapter samples the JSON API player progress
+  (`item_progress_ms`/`item_length_ms`, §7) — while the seam owns the
+  semantics: paused sessions freeze their position instead of
+  advancing it, disconnected sessions set `stale` instead of
+  extrapolating, and snapshots from a foreign generation are dropped
+  by the publisher. The UI's 500 ms timer remains the *publisher*
+  (§4.4); it reads the cache rather than being the only measurement.
 
 ### 4.2 GStreamer adapter (`raopsink`)
 
@@ -399,8 +458,10 @@ Wraps today's path: `probe` is `raopsink_available`
 (:279-285) semantics; the session consumes the `prepared_uri` carried
 through the seam and runs the whole existing
 `uridecodebin ! audioconvert ! some-alac-enc ! raopsink` pipeline,
-reusing today's bus watch (:307-376) and position timer (:384-412)
-unchanged. **Decode-and-pump ownership is the pipeline's:**
+reusing today's bus watch (:307-376) unchanged, with the position
+timer (:384-412) becoming the producer of the session's §4.1
+observation cache at the same 500 ms cadence. **Decode-and-pump
+ownership is the pipeline's:**
 `uridecodebin` fetches and decodes the prepared URI inside the
 session, so this session never consumes `write_pcm` — the trait
 documents a pipeline-sourced session's `write_pcm` as an unsupported
@@ -438,11 +499,46 @@ Tributary talks to an OwnTone instance as a transmission service:
   which output(s) receive the stream; the adapter maps
   `{ display_name, host, port }` onto the daemon's device list at
   open time and re-checks it, so a receiver that vanished or renamed
-  fails loudly instead of playing to the wrong device.
-- **Lifecycle:** Tributary prefers a user-scope daemon (spawned
-  instance with its own config/cache directories, or a documented
-  system service) and treats "daemon unreachable / version too old /
-  pipe missing" as probe-time failures with actionable guidance.
+  fails loudly instead of playing to the wrong device. The enabled
+  set is server-wide — `PUT /api/outputs/set` "enables all outputs
+  with the given ids and disables the remaining outputs" — so
+  isolating one receiver reconfigures the whole instance; the
+  ownership and restoration rules below are what make that safe.
+- **Lifecycle — a dedicated, Tributary-owned daemon instance.** The
+  adapter requires an OwnTone instance of its own: spawned and
+  supervised by Tributary (or a documented per-user service the
+  implementation record installs), with its own config, cache and
+  database directories, and its own loopback JSON API port. A normal
+  shared system service is **not** an acceptable target. The reason
+  is isolation, and the JSON API provides none
+  ([`docs/json-api.md`](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/docs/json-api.md),
+  pinned 29.3): there is exactly **one player** (`PUT /api/player/*`
+  drives the server's single playback state) and **one current
+  queue** (`/api/queue`), so any other client — the user's own web
+  UI, a mobile remote, another integration — can take either at any
+  moment. A dedicated instance removes that contention by
+  construction. "Daemon unreachable / version too old / pipe missing
+  / API port taken" remain probe-time failures with actionable
+  guidance.
+- **Exclusivity is enforced, revalidated, and restored — never
+  assumed.** A dedicated instance is the default posture, not a
+  substitute for the adapter treating the daemon as shared state,
+  because the API offers no session boundary an adapter could lean
+  on. At open, the session: records the current enabled output set,
+  verifies the player is stopped with an empty (or already-ours)
+  queue, then takes control — enable exactly the selected receiver,
+  clear the queue, start our pipe item — refusing with actionable
+  guidance if the player is active, and never preempting audible
+  playback. While open, every publication cycle (§4.4) revalidates
+  that the enabled set still selects exactly our receiver and that
+  the player state still reflects our session; a mismatch is session
+  loss surfaced through the §9.4 contract, not a silent re-takeover.
+  At close or failure, the session stops the player, removes our
+  queue items, and restores the recorded enabled set. Should a future
+  record ever attach to a pre-existing shared instance instead, it
+  inherits every one of these as hard, tested requirements plus a
+  written justification — that is the exception path, not the
+  default.
 
 ### 4.4 What must NOT change in this refactor
 
@@ -451,14 +547,18 @@ Tributary talks to an OwnTone instance as a transmission service:
   `protected_load_fails_closed_before_any_pipeline_sees_the_secret`
   (`src/audio/airplay_output.rs:783-838`) must still pass without
   modification.
-- **Position/duration evidence** continues to flow on the same 500 ms
-  generation-scoped timer (`src/audio/airplay_output.rs:384-429`);
-  GStreamer-backed adapters sample pipeline state as today. A daemon
-  adapter reports position from the amount of audio it has accepted
-  and confirmed playing — the position source is the adapter's
-  contract, the publication cadence and event shape are not negotiable
-  ([`docs/playback-history.md`](playback-history.md) pins the 500 ms
-  contract).
+- **Position/duration evidence** keeps the same 500 ms
+  generation-scoped publication cadence and event shape
+  (`src/audio/airplay_output.rs:384-429`;
+  [`docs/playback-history.md`](playback-history.md) pins the
+  contract), but the timer is the **publisher, not the only source**:
+  sessions expose their measurement through the nonblocking
+  `SenderSession::observe` cache (§4.1), maintained by each adapter's
+  own task — GStreamer adapters sample pipeline state there, the
+  daemon adapter samples the JSON API player progress
+  (`item_progress_ms`/`item_length_ms`). Paused sessions freeze,
+  disconnected ones set `stale` instead of extrapolating, and
+  snapshots from a foreign generation are dropped, per §4.1.
 - **Localization:** the honest unavailable message stays user-visible
   in every catalog; renaming away from the `raopsink` identifier is
   acceptable only once the selected replacement actually ships
@@ -532,7 +632,10 @@ Tributary needs:
   must therefore document per-platform acquisition the way the
   release-component policy treats all external dependencies: pinned
   or documented package sources, never an incidental download, and
-  never a bundle inside Tributary's artifacts.
+  never a bundle inside Tributary's artifacts. These channels are
+  OwnTone's, not Tributary's: §8 turns them into an explicit
+  availability decision per actual Tributary package target, and
+  most Tributary targets have none.
 - **Licensing:** GPL-2.0-or-later. The §4.3 design is a process
   boundary — OwnTone runs as its own program, integrated through a
   FIFO and an HTTP JSON API, with no linking and no combined work.
@@ -601,12 +704,17 @@ scope; revisit only if the OwnTone path fails in validation.**
 
 **Adopt the OwnTone 29.3 process adapter (§4.3, §5.4) as the first
 shipping path, behind the §4.1 seam, with the `raopsink` adapter (§4.2)
-retained for user-supplied elements — on the platforms §5.4's channels
-cover.** Tributary's Windows and macOS packages (install matrix,
-[`README.md`](../README.md)) have no OwnTone acquisition channel, and
-§11 forbids bundling the daemon into release artifacts: on those
-platforms this design ships the fail-closed unavailable state — the
-localized guidance names the platform limitation — and implies no
+retained for user-supplied elements — on exactly the package targets
+the §8 availability matrix marks available.** The matrix is decided
+per actual Tributary package target (install matrix,
+[`README.md`](../README.md)) against documented OwnTone acquisition
+and the §4.3 dedicated-instance runtime path — never inherited from
+OwnTone's own channel list, most of which (Docker, OpenWrt, FreeBSD)
+serves platforms where Tributary ships nothing. Today the matrix
+marks the `.deb` target on Debian/Ubuntu-family systems available;
+Fedora RPM/COPR, Arch AUR, Flatpak, macOS `.dmg`, and Windows
+(winget/installer/zip) ship the fail-closed unavailable state — the
+localized guidance names the platform limitation — and imply no
 sender behavior. Sender support there requires a future supported
 acquisition/integration path, which this investigation deliberately
 does not promise (§8, §9).
@@ -646,13 +754,17 @@ What the implementation record must nail down, per §4.3:
   bound to loopback only in the adapter's generated config.
 - **Audio:** s16le 44100 Hz stereo into the pipe (§2.4, §4.3);
   encoding, framing, and per-device quirks are the daemon's.
-- **Timing/position:** Tributary publishes position from accepted and
-  confirmed audio (§4.4); the 500 ms publication cadence is
-  unchanged. Receiver latency is invisible to the UI, as today —
-  documented, not hidden.
+- **Timing/position:** the daemon session publishes position and
+  duration through the §4.1 observation cache, sampled from the JSON
+  API player progress (`item_progress_ms`/`item_length_ms`); the
+  500 ms publication cadence is unchanged (§4.4), and paused and
+  disconnected behavior follow the seam's contract. Receiver latency
+  is invisible to the UI, as today — documented, not hidden.
 - **Multi-room:** out of scope unless separately approved (task.md
-  P2.4); the adapter selects exactly the one discovered device the
-  user activated.
+  P2.4); the adapter enables exactly the one discovered device the
+  user activated — which, given the server-wide enabled-output set
+  (§4.3), means the dedicated instance streams to that receiver
+  alone, and close or failure restores the set recorded at takeover.
 
 ## 8. Packaging consequence
 
@@ -663,19 +775,42 @@ What the implementation record must nail down, per §4.3:
   macOS, native Linux, Flatpak gates) still runs on the
   implementation PR and records artifact evidence, per
   [`docs/release-component-policy.md`](release-component-policy.md).
-- **Dependency documentation, scoped to real channels.** Platforms
-  with an OwnTone channel (§5.4: Debian/Ubuntu, Raspberry Pi OS,
-  Docker, OpenWrt, FreeBSD) gain a "for AirPlay output, install
+- **Dependency documentation, decided per actual Tributary package
+  target — never per OwnTone channel.** Tributary ships: Fedora RPM
+  (COPR), `.rpm` and `.deb` release artifacts, Arch AUR packages
+  (`tributary`, `tributary-bin`, `tributary-git`), Flatpak, macOS
+  `.dmg`, and Windows (winget, Inno installer, zip)
+  ([`README.md`](../README.md) install section). OwnTone's documented
+  acquisition channels (§5.4, rechecked 2026-09-09: Raspberry Pi OS,
+  Debian/Ubuntu amd64, Docker, OpenWrt, FreeBSD) are upstream's, not
+  Tributary platforms — Docker, OpenWrt, and FreeBSD are not Tributary
+  package targets and confer no availability here. The matrix below
+  is the design's availability decision for every Tributary target;
+  each row was checked against the documented channel on 2026-09-09:
+
+  | Tributary package target | Documented OwnTone acquisition + §4.3 dedicated-instance runtime | Sender availability |
+  |---|---|---|
+  | `.deb` (Debian/Ubuntu-family installs) | Upstream-documented Debian/Ubuntu amd64 packages; user-native daemon Tributary can own and supervise | **Available** |
+  | Fedora RPM (COPR, `.rpm` releases) | No OwnTone channel documented upstream | **Unavailable — fail-closed** |
+  | Arch AUR (`tributary`, `-bin`, `-git`) | Only the community AUR `owntone-server` package; not an upstream-documented channel | **Unavailable — fail-closed** |
+  | Flatpak | No OwnTone app or runtime extension on Flathub; the sandbox cannot own a host daemon (§4.3); bundling forbidden (§11) | **Unavailable — fail-closed** |
+  | macOS `.dmg` | No channel documented upstream (no Homebrew formula); bundling forbidden (§11) | **Unavailable — fail-closed** |
+  | Windows (winget, installer, zip) | No channel documented upstream; bundling forbidden (§11) | **Unavailable — fail-closed** |
+
+  Rows marked available gain the "for AirPlay output, install
   OwnTone ≥ 29.x" install-docs entry with the pinned source (upstream
-  releases page, FreeBSD port, OpenWrt package); where OwnTone is
-  unavailable even on a covered platform (no official Debian
-  archive), the docs say so and the probe error repeats it.
-  Tributary's Windows and macOS packages have no OwnTone channel and
-  §11 forbids bundling: their install docs state that AirPlay output
-  requires an OwnTone-capable platform, with no acquisition path
-  implied, and the probe fails closed with the same honest localized
-  unavailable state as today's `raopsink` message. The acceptance
-  matrix (§9) scopes to match.
+  releases page); where OwnTone is absent even from a covered
+  distro's own archives (no official Debian archive), the docs say so
+  and the probe error repeats it. Unavailable rows ship the honest
+  fail-closed state: install docs state that AirPlay output requires
+  an OwnTone-capable target with no acquisition path implied, and the
+  probe fails closed with the same localized unavailable contract as
+  today's `raopsink` message. The Arch row names the community AUR
+  `owntone-server` package honestly but does not treat it as a
+  supported acquisition path, because it fails the
+  dependency-documentation discipline above (community-maintained,
+  not upstream-documented, no pinned channel). The acceptance matrix
+  (§9) scopes to match.
 - **Probe reflects reality:** `AirplaySender::probe` for the daemon
   adapter checks: binary/service present (documented discovery only —
   no PATH guessing beyond the documented locations), daemon
@@ -701,19 +836,23 @@ record for the selected path must add, at minimum:
    `find_feature` lookup remains the source of truth; a
    pretending/fake factory must still trip `probe`.
 4. **Reconnect acceptance:** with the receiver restarted mid-track
-   (or the daemon's session dropped), the failure is surfaced within
-   the event contract, the loopback ticket is revoked
+   (or the daemon's session dropped, or a §4.3 revalidation mismatch
+   detected — the enabled set no longer selects exactly our receiver,
+   or foreign player/queue activity appears), the failure is surfaced
+   within the event contract, the loopback ticket is revoked
    (`revoke_if_current` ordering, as in today's bus watch
    `src/audio/airplay_output.rs:325-352`), and an explicit re-load
    recovers — no zombie session, no silent stall, no automatic
-   reconnect storm.
+   reconnect storm, no silent re-takeover.
 5. **Cancellation acceptance:** stopping or switching output
    mid-stream tears the receiver session down in order (audio path
    stopped before the loopback route is invalidated — the ordering
    bug class `close_session`'s doc comment warns about,
    `src/audio/airplay_output.rs:293-305`), leaves no receiver-side
    playback continuing, and returns `Stopped` for the exact load
-   generation.
+   generation; on the daemon adapter it also restores the state
+   recorded at takeover — player stopped, our queue items removed,
+   the recorded enabled-output set re-applied (§4.3).
 6. **Authentication-failure acceptance:** a password-protected
    receiver with no configured password, and a wrong-password case,
    each surface a distinct, localized, actionable error (pointing at
@@ -733,12 +872,13 @@ record for the selected path must add, at minimum:
    receiver (HomePod/Apple TV class) for any record that flips the
    §3 discovery filter.
 
-**Platform scope:** items 1-8 run on the platforms §5.4's channels
-cover. On Windows and macOS packaged deployments — no OwnTone
-channel, bundling forbidden (§11) — the acceptance contract is the
-fail-closed path itself: §9.1's probe refusal with localized guidance
-naming the platform limitation. No sender playback is claimed there
-until a supported acquisition path exists.
+**Platform scope:** items 1-8 run on the package targets the §8
+matrix marks available (today: `.deb` on Debian/Ubuntu-family
+systems). On every unavailable target — Fedora, Arch/AUR, Flatpak,
+macOS, Windows — the acceptance contract is the fail-closed path
+itself: §9.1's probe refusal with localized guidance naming the
+platform limitation. No sender playback is claimed there until a
+supported acquisition path exists.
 
 ## 10. Proposed next-record plan
 
