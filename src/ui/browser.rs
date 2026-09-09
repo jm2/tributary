@@ -1619,5 +1619,7 @@ mod tests {
 
         crate::ui::context_menu::tests::popover_from_menu_model_attaches_a_visible_child_widget();
         crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones();
+        crate::ui::album_art_cell::widget_tests::show_placeholder_keeps_the_missing_art_visible();
+        crate::ui::album_art_cell::widget_tests::revoking_a_cell_revokes_its_outstanding_fetch_token();
     }
 }

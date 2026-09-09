@@ -6,8 +6,8 @@
 //! - A persistent background worker thread with generation-based staleness detection
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use gtk::glib;
 
@@ -44,10 +44,83 @@ pub fn invalidate() {
     next_generation();
 }
 
+/// Liveness gate carried by one in-flight album-art request.
+///
+/// Two scopes share the persistent worker:
+///
+/// * [`RequestLiveness::GlobalGeneration`] — the now-playing header. A
+///   fetch is live only while its captured generation equals
+///   [`ART_GENERATION`]; [`invalidate`] bumps the counter so a track
+///   change silently drops every stale header fetch.
+/// * [`RequestLiveness::Scoped`] — browser album-pane rows. These must
+///   NOT share the header's counter: every visible row minting from
+///   [`ART_GENERATION`] would invalidate the previous row's in-flight
+///   fetch (and the header's), so concurrent thumbnails cancelled one
+///   another and most rows never resolved (2026-09-08 PR #171 review).
+///   A scoped request instead carries a private [`ScopedArtFetch`] token
+///   that the owning widget revokes on rebind, unbind, teardown, and
+///   factory swaps.
+#[derive(Clone)]
+enum RequestLiveness {
+    /// Valid only while [`ART_GENERATION`] equals this generation.
+    GlobalGeneration(u64),
+    /// Valid until the owning widget revokes the token.
+    Scoped(ScopedArtFetch),
+}
+
+impl RequestLiveness {
+    /// `true` while the owning fetch may still run, reply, and paint.
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::GlobalGeneration(generation) => generation_is_current(*generation),
+            Self::Scoped(token) => token.is_live(),
+        }
+    }
+}
+
+/// Revocable liveness token for one non-header album-art request.
+///
+/// The album pane mints one token per scheduled fetch and stores it on
+/// the row's cell state; revoking the cell (rebind, unbind, teardown,
+/// factory swap) revokes the token, which stops the persistent worker
+/// *before* the network read and closes the reply before the result can
+/// reach the widget. Tokens are `Send + Sync`, so the worker thread can
+/// hold one across a fetch without pinning GTK state.
+#[derive(Clone)]
+pub struct ScopedArtFetch {
+    valid: Arc<AtomicBool>,
+}
+
+impl Default for ScopedArtFetch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScopedArtFetch {
+    pub fn new() -> Self {
+        Self {
+            valid: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Stop the fetch this token was minted for. Idempotent and safe to
+    /// call from any thread; every future [`ScopedArtFetch::is_live`]
+    /// observation on this token returns `false`.
+    pub fn revoke(&self) {
+        self.valid.store(false, Ordering::Relaxed);
+    }
+
+    /// `true` while the fetch may still run, reply, and paint.
+    pub fn is_live(&self) -> bool {
+        self.valid.load(Ordering::Relaxed)
+    }
+}
+
 /// Request sent to the album art worker thread.
 struct ArtRequest {
     source: ArtSource,
-    generation: u64,
+    liveness: RequestLiveness,
     reply_tx: async_channel::Sender<Vec<u8>>,
 }
 
@@ -102,8 +175,12 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
                 >::new();
                 while let Ok(req) = rx.recv() {
                     // Check if this request is still current before fetching.
-                    if ART_GENERATION.load(Ordering::Relaxed) != req.generation {
-                        continue; // Stale — user already changed tracks.
+                    // A stale header generation or a revoked scoped token
+                    // closes the request without touching the network —
+                    // this is what keeps cancelled rows (and superseded
+                    // tracks) from burning worker time.
+                    if !req.liveness.is_valid() {
+                        continue;
                     }
 
                     if !req.source.is_active() {
@@ -145,8 +222,7 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
                                 Ok(bytes)
                                     if !bytes.is_empty()
                                         && req.source.is_active()
-                                        && ART_GENERATION.load(Ordering::Relaxed)
-                                            == req.generation =>
+                                        && req.liveness.is_valid() =>
                                 {
                                     let _ = req.reply_tx.send_blocking(bytes);
                                 }
@@ -190,25 +266,53 @@ fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
 /// instead.
 pub fn update_direct_file_album_art(image: &gtk::Image, uri: &str) {
     let generation = next_generation();
-    let path = match url::Url::parse(uri) {
-        Ok(u) if u.scheme() == "file" => match u.to_file_path() {
-            Ok(p) => p,
-            Err(()) => {
-                image.set_icon_name(Some("audio-x-generic-symbolic"));
-                return;
-            }
-        },
-        _ => {
-            image.set_icon_name(Some("audio-x-generic-symbolic"));
-            return;
-        }
+    let Some(path) = direct_file_art_target(uri) else {
+        image.set_icon_name(Some("audio-x-generic-symbolic"));
+        return;
     };
 
     image.set_icon_name(Some("audio-x-generic-symbolic"));
-    let reply_rx = enqueue_local_art_job(generation, move || {
+    let reply_rx =
+        enqueue_local_art_job(RequestLiveness::GlobalGeneration(generation), move || {
+            extract_direct_file_album_art_bytes(&path)
+        });
+    display_local_album_art_reply(
+        image,
+        reply_rx,
+        RequestLiveness::GlobalGeneration(generation),
+    );
+}
+
+/// Scoped variant of [`update_direct_file_album_art`] for the browser
+/// album pane: identical extraction path, but the job's liveness is the
+/// supplied per-request token instead of the process-wide header
+/// generation, so concurrent pane rows never cancel one another and a
+/// re-bound row's token stops its extractor before the file read.
+pub fn update_direct_file_album_art_scoped(
+    image: &gtk::Image,
+    uri: &str,
+    liveness: &ScopedArtFetch,
+) {
+    let Some(path) = direct_file_art_target(uri) else {
+        image.set_icon_name(Some("audio-x-generic-symbolic"));
+        return;
+    };
+
+    image.set_icon_name(Some("audio-x-generic-symbolic"));
+    let reply_rx = enqueue_local_art_job(RequestLiveness::Scoped(liveness.clone()), move || {
         extract_direct_file_album_art_bytes(&path)
     });
-    display_local_album_art_reply(image, reply_rx, generation);
+    display_local_album_art_reply(image, reply_rx, RequestLiveness::Scoped(liveness.clone()));
+}
+
+/// Resolve the filesystem path behind a `file://` URI for embedded-art
+/// extraction. `None` for every other scheme and for URIs that cannot be
+/// converted to a host path.
+fn direct_file_art_target(uri: &str) -> Option<std::path::PathBuf> {
+    match url::Url::parse(uri) {
+        Ok(u) if u.scheme() == "file" => u.to_file_path().ok(),
+        _ => None,
+    }
 }
 
 /// Extract embedded art through an exact retained local-file capability.
@@ -223,25 +327,40 @@ pub fn update_resolved_file_album_art(
 ) {
     let generation = next_generation();
     image.set_icon_name(Some("audio-x-generic-symbolic"));
-    let reply_rx = enqueue_local_art_job(generation, move || {
-        extract_resolved_file_album_art_bytes(&media)
-    });
-    display_local_album_art_reply(image, reply_rx, generation);
+    let reply_rx =
+        enqueue_local_art_job(RequestLiveness::GlobalGeneration(generation), move || {
+            extract_resolved_file_album_art_bytes(&media)
+        });
+    display_local_album_art_reply(
+        image,
+        reply_rx,
+        RequestLiveness::GlobalGeneration(generation),
+    );
 }
 
-fn enqueue_local_art_job<F>(generation: u64, extract: F) -> async_channel::Receiver<Vec<u8>>
+fn enqueue_local_art_job<F>(
+    liveness: RequestLiveness,
+    extract: F,
+) -> async_channel::Receiver<Vec<u8>>
 where
     F: FnOnce() -> Option<Vec<u8>> + Send + 'static,
 {
     let (tx, rx) = async_channel::bounded::<Vec<u8>>(1);
+    // Never spawn extraction for an already-revoked request: the row was
+    // re-bound (or the track superseded) between scheduling and the first
+    // poll, and the thread would exit at its first liveness check anyway.
+    // This is the spawn-side half of bounding per-request thread work.
+    if !liveness.is_valid() {
+        return rx;
+    }
     let spawn_result = std::thread::Builder::new()
         .name("local-art-worker".into())
         .spawn(move || {
-            if !generation_is_current(generation) {
+            if !liveness.is_valid() {
                 return;
             }
             if let Some(bytes) = extract() {
-                if generation_is_current(generation) {
+                if liveness.is_valid() {
                     let _ = tx.send_blocking(bytes);
                 }
             }
@@ -255,12 +374,12 @@ where
 fn display_local_album_art_reply(
     image: &gtk::Image,
     reply_rx: async_channel::Receiver<Vec<u8>>,
-    generation: u64,
+    liveness: RequestLiveness,
 ) {
     let image = image.clone();
     glib::MainContext::default().spawn_local(async move {
         if let Ok(data) = reply_rx.recv().await {
-            if generation_is_current(generation) {
+            if liveness.is_valid() {
                 let bytes = glib::Bytes::from_owned(data);
                 if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
                     image.set_paintable(Some(&texture));
@@ -552,7 +671,27 @@ fn extract_mp4_covr_atom(data: &[u8], max_art_bytes: usize) -> Option<Vec<u8>> {
 /// thread does not have).
 pub fn fetch_remote_album_art(image: &gtk::Image, cover_art_url: &str) {
     let generation = begin_remote_album_art(image);
-    enqueue_remote_album_art(image, ArtSource::Url(cover_art_url.to_string()), generation);
+    enqueue_remote_album_art(
+        image,
+        ArtSource::Url(cover_art_url.to_string()),
+        RequestLiveness::GlobalGeneration(generation),
+    );
+}
+
+/// Scoped variant of [`fetch_remote_album_art`] for the browser album
+/// pane: the fetch's liveness is the supplied per-request token instead
+/// of the process-wide header generation, so one row's fetch can never
+/// cancel another row's (or the header's) in-flight request.
+pub fn fetch_remote_album_art_scoped(
+    image: &gtk::Image,
+    cover_art_url: &str,
+    liveness: &ScopedArtFetch,
+) {
+    enqueue_remote_album_art(
+        image,
+        ArtSource::Url(cover_art_url.to_string()),
+        RequestLiveness::Scoped(liveness.clone()),
+    );
 }
 
 /// Begin resolving protected artwork without allowing an older resolver to
@@ -573,7 +712,30 @@ pub fn fetch_resolved_album_art(
     if !generation_is_current(generation) || !request.is_active() {
         return;
     }
-    enqueue_remote_album_art(image, ArtSource::Resolved(Box::new(request)), generation);
+    enqueue_remote_album_art(
+        image,
+        ArtSource::Resolved(Box::new(request)),
+        RequestLiveness::GlobalGeneration(generation),
+    );
+}
+
+/// Scoped variant of [`fetch_resolved_album_art`] for the browser album
+/// pane: the request's liveness is the supplied per-request token instead
+/// of the process-wide header generation. The lease and activity checks
+/// are unchanged — only the staleness scope differs.
+pub fn fetch_resolved_album_art_scoped(
+    image: &gtk::Image,
+    request: crate::architecture::media::ResolvedHttpRequest,
+    liveness: &ScopedArtFetch,
+) {
+    if !liveness.is_live() || !request.is_active() {
+        return;
+    }
+    enqueue_remote_album_art(
+        image,
+        ArtSource::Resolved(Box::new(request)),
+        RequestLiveness::Scoped(liveness.clone()),
+    );
 }
 
 fn build_routed_art_client(
@@ -622,17 +784,18 @@ fn build_resolved_art_request(
         .headers(resolved.sensitive_headers().clone())
 }
 
-fn enqueue_remote_album_art(image: &gtk::Image, source: ArtSource, generation: u64) {
+fn enqueue_remote_album_art(image: &gtk::Image, source: ArtSource, liveness: RequestLiveness) {
     let image = image.clone();
 
-    let reply_rx = enqueue_art_request(source, generation);
+    let reply_rx = enqueue_art_request(source, liveness.clone());
 
     // Receive on the GTK main thread.
     glib::MainContext::default().spawn_local(async move {
         if let Ok(data) = reply_rx.recv().await {
-            // Double-check generation in case another track was selected
-            // while we were waiting for the channel.
-            if generation_is_current(generation) {
+            // Double-check liveness in case the request was superseded
+            // (header: newer generation; pane: revoked token) while we
+            // were waiting for the channel.
+            if liveness.is_valid() {
                 let bytes = glib::Bytes::from_owned(data);
                 if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
                     image.set_paintable(Some(&texture));
@@ -644,9 +807,12 @@ fn enqueue_remote_album_art(image: &gtk::Image, source: ArtSource, generation: u
 
 /// Submit one request through the production persistent worker and return its
 /// one-shot completion. Keeping this GTK-independent makes the full
-/// request/fetch/generation boundary deterministic under headless CI; the UI
-/// callback above adds the final generation check before mutating the widget.
-fn enqueue_art_request(source: ArtSource, generation: u64) -> async_channel::Receiver<Vec<u8>> {
+/// request/fetch/liveness boundary deterministic under headless CI; the UI
+/// callback above adds the final liveness check before mutating the widget.
+fn enqueue_art_request(
+    source: ArtSource,
+    liveness: RequestLiveness,
+) -> async_channel::Receiver<Vec<u8>> {
     let (reply_tx, reply_rx) = async_channel::bounded::<Vec<u8>>(1);
 
     // Send the request to the persistent art worker thread.
@@ -658,7 +824,7 @@ fn enqueue_art_request(source: ArtSource, generation: u64) -> async_channel::Rec
     if let Some(tx) = art_worker_tx() {
         let _ = tx.send(ArtRequest {
             source,
-            generation,
+            liveness,
             reply_tx,
         });
     }
@@ -785,20 +951,25 @@ mod tests {
         let (request_seen_tx, request_seen_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
         let stale_generation = next_generation();
-        let stale_reply = enqueue_local_art_job(stale_generation, move || {
-            request_seen_tx.send(()).expect("report delayed local read");
-            release_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("release delayed local read");
-            Some(b"stale-local-art".to_vec())
-        });
+        let stale_reply = enqueue_local_art_job(
+            RequestLiveness::GlobalGeneration(stale_generation),
+            move || {
+                request_seen_tx.send(()).expect("report delayed local read");
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release delayed local read");
+                Some(b"stale-local-art".to_vec())
+            },
+        );
         request_seen_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("local artwork worker started");
 
         let current_generation = next_generation();
-        let current_reply =
-            enqueue_local_art_job(current_generation, || Some(b"current-local-art".to_vec()));
+        let current_reply = enqueue_local_art_job(
+            RequestLiveness::GlobalGeneration(current_generation),
+            || Some(b"current-local-art".to_vec()),
+        );
         release_tx.send(()).expect("release stale local read");
 
         assert!(stale_reply.recv_blocking().is_err());
@@ -962,13 +1133,19 @@ mod tests {
         let (current_url, current_server) = spawn_art_fixture(b"current-art", || {});
 
         let stale_generation = next_generation();
-        let stale_reply = enqueue_art_request(ArtSource::Url(stale_url), stale_generation);
+        let stale_reply = enqueue_art_request(
+            ArtSource::Url(stale_url),
+            RequestLiveness::GlobalGeneration(stale_generation),
+        );
         request_seen_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("production worker started delayed request");
 
         let current_generation = next_generation();
-        let current_reply = enqueue_art_request(ArtSource::Url(current_url), current_generation);
+        let current_reply = enqueue_art_request(
+            ArtSource::Url(current_url),
+            RequestLiveness::GlobalGeneration(current_generation),
+        );
         release_tx.send(()).expect("release stale response");
 
         assert!(
@@ -985,6 +1162,89 @@ mod tests {
 
         stale_server.join().expect("join delayed artwork fixture");
         current_server.join().expect("join current artwork fixture");
+    }
+
+    /// A scoped (album-pane) request revoked before it is handed to the
+    /// worker must never be extracted or fetched: the local job path
+    /// refuses to spawn its extractor, and the remote worker closes the
+    /// request at its first liveness check without touching the network.
+    /// Together with [`scoped_fetch_revoked_mid_flight_drops_the_reply`]
+    /// this pins both halves of the pre-fetch gate.
+    #[test]
+    fn scoped_fetch_revoked_before_enqueue_never_runs() {
+        let liveness = ScopedArtFetch::new();
+        liveness.revoke();
+
+        let local_reply = enqueue_local_art_job(RequestLiveness::Scoped(liveness.clone()), || {
+            panic!("a revoked scoped job must not spawn its extractor");
+        });
+        let remote_reply = enqueue_art_request(
+            ArtSource::Url("http://127.0.0.1:1/art".to_string()),
+            RequestLiveness::Scoped(liveness),
+        );
+
+        assert!(
+            local_reply.recv_blocking().is_err(),
+            "revoked local job must publish nothing"
+        );
+        assert!(
+            remote_reply.recv_blocking().is_err(),
+            "revoked remote request must publish nothing"
+        );
+    }
+
+    /// The worker must consult the scoped token again after the response
+    /// arrives: a row revoked while its fetch was in flight gets a closed
+    /// reply, so neither the widget callback nor the pane's cache probe
+    /// can observe bytes the user will never see. This is the scoped
+    /// counterpart of
+    /// [`delayed_worker_result_cannot_cross_a_newer_artwork_generation`].
+    #[test]
+    fn scoped_fetch_revoked_mid_flight_drops_the_reply() {
+        let (request_seen_tx, request_seen_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let liveness = ScopedArtFetch::new();
+        let (stale_url, server) = spawn_art_fixture(b"late-scoped-art", move || {
+            request_seen_tx.send(()).expect("report scoped request");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release scoped response");
+        });
+
+        let reply = enqueue_art_request(
+            ArtSource::Url(stale_url),
+            RequestLiveness::Scoped(liveness.clone()),
+        );
+        request_seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("production worker started scoped request");
+
+        // The row is re-bound while the fetch is on the wire.
+        liveness.revoke();
+        release_tx.send(()).expect("release scoped response");
+
+        assert!(
+            reply.recv_blocking().is_err(),
+            "a revoked scoped request must not publish its bytes"
+        );
+        server.join().expect("join scoped artwork fixture");
+    }
+
+    /// The local extractor thread must honor the scoped token after the
+    /// extraction completed, too: bytes extracted for a row that was
+    /// revoked mid-read are dropped instead of published.
+    #[test]
+    fn scoped_local_job_revoked_during_extract_publishes_nothing() {
+        let liveness = ScopedArtFetch::new();
+        let revoker = liveness.clone();
+        let reply = enqueue_local_art_job(RequestLiveness::Scoped(liveness), move || {
+            revoker.revoke();
+            Some(b"mid-flight-local-art".to_vec())
+        });
+        assert!(
+            reply.recv_blocking().is_err(),
+            "bytes extracted under a revoked token must be dropped"
+        );
     }
 
     #[test]
