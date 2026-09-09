@@ -249,6 +249,7 @@ jobs:
           # The per-ruleset detail endpoint is the authoritative source for
           # the required-check parameters, so each active ruleset that
           # applies to main is fetched individually.
+          unmet=0
           for rule_id in ${rule_ids}; do
             if ! gh api "repos/${GITHUB_REPOSITORY}/rulesets/${rule_id}" \
               > "${RUNNER_TEMP}/ruleset-${rule_id}.json"; then
@@ -260,9 +261,29 @@ jobs:
               | .parameters.required_status_checks[]
               | "\(.context)|\(.integration_id // "")"' \
               "${RUNNER_TEMP}/ruleset-${rule_id}.json" >> "${required_contexts}"
+            # Require-conversation-resolution lives in the ruleset detail as
+            # the `pull_request` rule's `required_review_thread_resolution`
+            # parameter. The same edit that widens the required checks must
+            # switch it on (docs/dependency-updates.md rollout step 2): the
+            # native rule is the only merge-time backstop for a reopened
+            # review thread, which fires no Actions event and therefore
+            # cannot refresh the gate. Assert it on every applicable
+            # ruleset — an absent or false flag is a coverage gap exactly
+            # like a missing required check, and keeps auto-merge off.
+            enforcement="$(jq -r '
+              [.rules[]?
+                | select(.type == "pull_request")
+                | .parameters.required_review_thread_resolution]
+              | if length == 0 then "absent"
+                elif all then "enforced"
+                else "off" end' \
+              "${RUNNER_TEMP}/ruleset-${rule_id}.json")"
+            if [ "${enforcement}" != "enforced" ]; then
+              echo >&2 "ruleset ${rule_id} does not enforce require-conversation-resolution (found: ${enforcement})"
+              unmet=1
+            fi
           done
           sort -u -o "${required_contexts}" "${required_contexts}"
-          unmet=0
           for expected in "${expected_checks[@]}"; do
             app_id="${expected##*|}"
             if ! grep -Fxq "${expected}" "${required_contexts}"; then
@@ -271,7 +292,7 @@ jobs:
             fi
           done
           if [ "${unmet}" -ne 0 ]; then
-            echo >&2 "Refusing to enable auto-merge: the live main ruleset does not yet enforce the full policy check set."
+            echo >&2 "Refusing to enable auto-merge: the live main ruleset does not yet enforce the full policy check set with require-conversation-resolution."
             exit 1
           fi
 
