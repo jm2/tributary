@@ -1038,31 +1038,23 @@ fn rename_noreplace_at(parent: &RetainedObject, from: &OsStr, to: &OsStr) -> io:
 
 /// Rename `from` to `to`, refusing an existing destination.
 ///
-/// `std::fs::rename` always passes `MOVEFILE_REPLACE_EXISTING` on Windows, so
-/// the conditioned install and restores call `MoveFileExW` directly without
-/// that flag: the rename then fails with `ERROR_ALREADY_EXISTS` when the
-/// destination exists — the same atomic refusal `RENAME_NOREPLACE` provides
-/// on Unix. `MOVEFILE_WRITE_THROUGH` matches the durability `std::fs::rename`
-/// already provides.
+/// Windows has no no-replace rename primitive in the standard library, and
+/// reaching `MoveFileExW` directly would put raw FFI `unsafe` into the
+/// authority's publish path. `std::fs::hard_link` provides the same
+/// conditioned refusal: it fails atomically with `AlreadyExists` when the
+/// destination exists — the same refusal `RENAME_NOREPLACE` provides on
+/// Unix — and because a hard link names the very same file object, the
+/// published destination carries the source's exact identity, which the
+/// replacement proof re-verifies after the install. The source name is then
+/// retired best effort: a failure there only strands a second name for the
+/// already-published object (debris, never destruction). On filesystems
+/// without hard-link support the only available primitive is the plain
+/// rename, and the caller's quarantine proof bounds the residual window
+/// exactly as it does for the flagless unix fallback documented below.
 #[cfg(windows)]
 fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
-
-    fn wide_path(path: &Path) -> Vec<u16> {
-        let mut encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
-        encoded.push(0);
-        encoded
-    }
-
-    let from_wide = wide_path(from);
-    let to_wide = wide_path(to);
-    // SAFETY: both pointers are null-terminated wide strings that outlive the
-    // call; MoveFileExW only reads them.
-    let ok = unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), MOVEFILE_WRITE_THROUGH) };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
+    std::fs::hard_link(from, to)?;
+    let _ = std::fs::remove_file(from);
     Ok(())
 }
 
