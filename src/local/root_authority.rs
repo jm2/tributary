@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -613,9 +613,20 @@ impl MountedMutationCommit<'_> {
     /// The clone is taken from the retained handle, never from the pathname,
     /// so the copied bytes are the bytes the authority admitted even if the
     /// pathname was disturbed while the section was preparing.
+    ///
+    /// The clone is rewound to offset zero before it is returned. A
+    /// `try_clone` handle shares the retained handle's underlying file
+    /// description, so it inherits the retained read cursor: a copy attempt
+    /// that consumed the cursor — a failed flush, a refused commit, a batch
+    /// retry — leaves it at end-of-file, and a clone taken from there would
+    /// stage an empty or partial file instead of rereading the admitted
+    /// audio. The cursor is a read cursor only; nothing reads the retained
+    /// handle positionally, so rewinding the shared description is safe.
     pub(crate) fn source_file(&self) -> io::Result<File> {
         self.file.object.validate_live()?;
-        self.file.object.file.try_clone()
+        let mut source = self.file.object.file.try_clone()?;
+        source.seek(SeekFrom::Start(0))?;
+        Ok(source)
     }
 
     /// Prove the replacement target immediately before an atomic rename.
@@ -3182,6 +3193,40 @@ mod tests {
             "the staged copy must survive a refused commit for the caller to clean up"
         );
         fs::remove_file(&staged).expect("remove the staged copy");
+    }
+
+    /// A cloned read source shares the retained handle's underlying file
+    /// description, so a copy attempt that consumed the cursor must not leave
+    /// the next retry staging bytes from end-of-file: every `source_file()`
+    /// clone is returned rewound to offset zero.
+    #[test]
+    fn source_file_starts_at_zero_after_a_prior_copy_consumed_the_cursor() {
+        let directory = TestDirectory::new("mutation-source-cursor");
+        let song = directory.path().join("song.flac");
+        fs::write(&song, b"original audio").expect("write song");
+
+        let authority =
+            Arc::new(MountedRootAuthority::acquire(directory.path()).expect("acquire authority"));
+        let target = authority
+            .open_mutation_target(Path::new("song.flac"))
+            .expect("open mutation target");
+
+        let commit = target.begin_commit().expect("begin commit section");
+        let mut first = commit.source_file().expect("clone the retained source");
+        let mut consumed = Vec::new();
+        std::io::Read::read_to_end(&mut first, &mut consumed).expect("consume the first copy");
+        assert_eq!(consumed, b"original audio");
+        drop(first);
+
+        // The shared cursor now sits at end-of-file; the next clone must
+        // still read the full admitted bytes.
+        let mut second = commit.source_file().expect("re-clone the retained source");
+        let mut retried = Vec::new();
+        std::io::Read::read_to_end(&mut second, &mut retried).expect("read the retry copy");
+        assert_eq!(
+            retried, b"original audio",
+            "a retry must stage the full admitted bytes, not a cursor-at-EOF tail"
+        );
     }
 
     /// Two targets admitted for the same leaf at different times must
