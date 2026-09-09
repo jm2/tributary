@@ -15,7 +15,9 @@ use super::policy::{CommitError, CommitOutcome, ConflictPolicy, ConflictResoluti
 use super::staging::discard_staged_file;
 #[cfg(not(unix))]
 use super::staging::{discard_staged_file, rollback_staged};
-use crate::local::root_authority::{LeafIdentity, MountedRootAuthority, RetainedWriteParent};
+use crate::local::root_authority::{
+    LandedPublish, LeafIdentity, MountedRootAuthority, RetainedWriteParent,
+};
 
 /// A staged write below a [`MountedWriteAuthority`](super::MountedWriteAuthority)
 /// ready for commit/rollback.
@@ -132,10 +134,12 @@ impl PreparedWriteTarget {
     ///
     /// Errors are typed: [`CommitError::Io`] means nothing was published,
     /// while [`CommitError::PublishVerification`] means the staged bytes
-    /// WERE published but the post-publish mount revalidation failed. The
-    /// verification variant carries the [`CommitOutcome`] so the caller can
-    /// record the publication for rollback before surfacing the failure —
-    /// a committed file whose outcome is dropped can never be undone.
+    /// WERE published but a post-publish verification failed — either the
+    /// retained-parent revalidation reported by the publish step itself or
+    /// the trailing authority revalidation here. The verification variant
+    /// carries the [`CommitOutcome`] so the caller can record the
+    /// publication for rollback before surfacing the failure — a committed
+    /// file whose outcome is dropped can never be undone.
     pub fn commit(mut self) -> Result<CommitOutcome, CommitError> {
         self.authority.validate().map_err(CommitError::from)?;
         self.parent
@@ -150,35 +154,41 @@ impl PreparedWriteTarget {
             })?
             .to_os_string();
         self.flush_and_close_staged().map_err(CommitError::from)?;
-        let (replaced_original, published_leaf) =
-            if self.resolution == ConflictResolution::Overwrite {
-                self.publish_overwrite_with_backup(&final_leaf, &final_path)
-                    .map_err(CommitError::from)?
-            } else {
-                let published_leaf = self
-                    .authority
-                    .rename_within_directory(
-                        &self.parent,
-                        &self.staged_leaf,
-                        &self.staged_path,
-                        &final_leaf,
-                        &final_path,
-                        true,
-                    )
-                    .map_err(CommitError::from)?;
-                (None, published_leaf)
-            };
+        let (replaced_original, landed) = if self.resolution == ConflictResolution::Overwrite {
+            self.publish_overwrite_with_backup(&final_leaf, &final_path)
+                .map_err(CommitError::from)?
+        } else {
+            let landed = self
+                .authority
+                .publish_within_directory(
+                    &self.parent,
+                    &self.staged_leaf,
+                    &self.staged_path,
+                    &final_leaf,
+                    &final_path,
+                    true,
+                )
+                .map_err(CommitError::from)?;
+            (None, landed)
+        };
         let outcome = CommitOutcome {
             relative_path: self.final_relative_path.clone(),
             resolution: self.resolution,
             replaced_original,
-            published_leaf,
+            published_leaf: landed.published_leaf,
         };
         // The bytes are now at the destination no matter what happens next:
         // a failed post-publish verification must not discard the outcome,
         // or the published file (and a replaced occupant's saved backup)
-        // would be unrecorded and unreachable from rollback.
-        if let Err(error) = self.authority.validate() {
+        // would be unrecorded and unreachable from rollback. This includes
+        // the trailing retained-parent revalidation reported by the publish
+        // step itself: the rename landed, so that failure is a verification
+        // failure about an existing publication, never an unpublished I/O
+        // failure.
+        if let Err(error) = landed
+            .post_validate
+            .and_then(|()| self.authority.validate())
+        {
             return Err(CommitError::PublishVerification { outcome, error });
         }
         self.committed = true;
@@ -204,13 +214,14 @@ impl PreparedWriteTarget {
     /// backup sibling at commit time (a hard link where the filesystem supports
     /// them, else a verified commit-time copy), and the backup's relative
     /// path is returned so the caller can restore exactly the bytes that
-    /// were destroyed. The published leaf's identity is returned alongside
-    /// for identity-verified rollback.
+    /// were destroyed. The landed publish — the published leaf's identity
+    /// plus the reported trailing revalidation — is returned alongside for
+    /// identity-verified, verification-preserving rollback.
     fn publish_overwrite_with_backup(
         &self,
         final_leaf: &OsStr,
         final_path: &Path,
-    ) -> io::Result<(Option<PathBuf>, Option<LeafIdentity>)> {
+    ) -> io::Result<(Option<PathBuf>, LandedPublish)> {
         let backup_leaf = backup_leaf_name();
         let mut backup_relative = self
             .final_relative_path
@@ -219,7 +230,7 @@ impl PreparedWriteTarget {
             .unwrap_or_default();
         backup_relative.push(backup_leaf.as_os_str());
         let backup_absolute = self.authority.root().join(&backup_relative);
-        let (replaced, published_leaf) = self.authority.replace_within_directory(
+        let (replaced, landed) = self.authority.replace_within_directory(
             &self.parent,
             &self.staged_leaf,
             &self.staged_path,
@@ -228,8 +239,7 @@ impl PreparedWriteTarget {
             backup_leaf.as_os_str(),
             &backup_absolute,
         )?;
-        let replaced_original = replaced.then_some(backup_relative);
-        Ok((replaced_original, published_leaf))
+        Ok((replaced.then_some(backup_relative), landed))
     }
 
     /// Discard the staged file and any partial writes.

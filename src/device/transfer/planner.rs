@@ -65,16 +65,11 @@ impl<'a> PlanBuilder<'a> {
         }
     }
 
-    /// Plan one request item: an empty-path guard, authority validation,
-    /// then dispatch on the source entry's file type.
+    /// Plan one request item: authority validation, then dispatch on the
+    /// source entry's file type. Item paths were fully validated (non-empty,
+    /// relative, normal components only) for the whole request by
+    /// [`validate_request`] before planning began.
     fn plan_item(&mut self, item: &TransferItem) -> Result<(), TransferError> {
-        if item.source_relative_path.as_os_str().is_empty()
-            || item.destination_relative_path.as_os_str().is_empty()
-        {
-            return Err(TransferError::InvalidItemPath {
-                path: item.source_relative_path.clone(),
-            });
-        }
         self.validate_authorities()?;
         let source_absolute = self.request.source.root().join(&item.source_relative_path);
         let metadata = read_source_metadata(&source_absolute, &item.source_relative_path)?;
