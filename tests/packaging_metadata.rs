@@ -1951,6 +1951,19 @@ fn assert_precondition_enforces_the_full_policy() {
             && DEPENDABOT_AUTOMERGE.contains("rulesets/${rule_id}"),
         "the precondition must fetch each active ruleset's actual required checks"
     );
+    // Require-conversation-resolution is the native merge-time backstop for
+    // a reopened review thread (reopening fires no Actions event), so the
+    // rollout mandates it in the same edit that widens the checks; the
+    // precondition must read the saved ruleset — not the intent — and
+    // refuse auto-merge unless every applicable ruleset carries the flag.
+    assert!(
+        DEPENDABOT_AUTOMERGE
+            .contains("select(.type == \"pull_request\")")
+            && DEPENDABOT_AUTOMERGE.contains("required_review_thread_resolution")
+            && DEPENDABOT_AUTOMERGE
+                .contains("with require-conversation-resolution"),
+        "the precondition must refuse auto-merge unless the live ruleset enforces require-conversation-resolution"
+    );
     assert!(
         DEPENDABOT_AUTOMERGE.contains("Refusing to enable auto-merge")
             && DEPENDABOT_AUTOMERGE.contains("refusing auto-merge"),
