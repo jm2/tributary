@@ -1073,10 +1073,18 @@ pub fn read_column_order(column_view: &gtk::ColumnView) -> Vec<String> {
 
 /// Update browser pane visibility based on config.
 ///
-/// The browser `Box` now has a vertical layout: SearchEntry at the top,
-/// then a horizontal panes_box containing three children (genre, artist,
-/// album pane `Box` widgets).  If all three panes are hidden, hide the
-/// entire browser box.  The search entry visibility follows the browser.
+/// The browser `Box` has a vertical layout: SearchEntry at the top, then
+/// a horizontal panes_box whose children alternate pane and gutter:
+/// genre, `.browser-separator`, artist, separator, album, separator,
+/// folder.  Panes are recognized structurally — any non-`Separator`
+/// child, mapped in that order to the config flags — so this traversal
+/// cannot drift out of sync with the layout if gutters are added or
+/// removed (indexing raw child positions broke here once the separators
+/// became real widgets: disabling Artist hid a separator, disabling
+/// Album hid Artist, and Album/Folder could never be hidden).  A
+/// separator stays visible only when it joins two visible panes, which
+/// prevents doubled or dangling gutters around hidden panes.  If all
+/// four panes are hidden, the entire browser box is hidden.
 pub fn update_browser_visibility(browser_box: &gtk::Box, views: &BrowserViewsConfig) {
     // The browser_box layout is: SearchEntry, panes_box (horizontal Box).
     // Find the panes_box (last child, which is a horizontal Box).
@@ -1085,19 +1093,38 @@ pub fn update_browser_visibility(browser_box: &gtk::Box, views: &BrowserViewsCon
         .and_then(|w| w.downcast::<gtk::Box>().ok());
 
     if let Some(ref panes_box) = panes_box {
-        let mut child_idx = 0;
+        let mut pane_idx = 0;
+        // A separator leading the box would dangle at its edge, so the
+        // "previous pane" starts out treated as hidden.
+        let mut previous_pane_visible = false;
+        let mut pending_separators: Vec<gtk::Widget> = Vec::new();
         let mut child = panes_box.first_child();
         while let Some(widget) = child {
-            let visible = match child_idx {
-                0 => views.genre,
-                1 => views.artist,
-                2 => views.album,
-                3 => views.folder,
-                _ => true,
-            };
-            widget.set_visible(visible);
             child = widget.next_sibling();
-            child_idx += 1;
+            if widget.downcast_ref::<gtk::Separator>().is_some() {
+                // A gutter belongs to the pair of panes around it; decide
+                // its visibility once the next pane is reached.
+                pending_separators.push(widget);
+            } else {
+                let visible = match pane_idx {
+                    0 => views.genre,
+                    1 => views.artist,
+                    2 => views.album,
+                    3 => views.folder,
+                    _ => true,
+                };
+                pane_idx += 1;
+                let gutter_visible = visible && previous_pane_visible;
+                for separator in std::mem::take(&mut pending_separators) {
+                    separator.set_visible(gutter_visible);
+                }
+                widget.set_visible(visible);
+                previous_pane_visible = visible;
+            }
+        }
+        // Separators after the last pane would dangle at the box edge.
+        for separator in std::mem::take(&mut pending_separators) {
+            separator.set_visible(false);
         }
     }
 
