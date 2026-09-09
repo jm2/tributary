@@ -94,23 +94,45 @@ name: Bot review gate publisher
 # event head.
 #
 # Security: strictly read-only over repository content. The workflow never
-# checks out any commit, holds no third-party actions, and queries only the
-# pull requests the API associates with the announcing run's commit — plus
-# the repository-owned substitution policy file (below), read from `main`.
-# The single write grant is `checks: write`, used only to publish the
-# `Bot Review Gate` check-run itself. A query failure, an incomplete
-# pagination, or a head mismatch publishes a failing check instead of
-# silently passing it; a publication failure leaves the required context
-# unreported, which also blocks the merge.
+# checks out any commit, holds no third-party action except the pinned
+# GitHub-org app-token minter, and queries only the pull requests the API
+# associates with the announcing run's commit — plus the repository-owned
+# substitution policy file (below), read from `main`.
+#
+# The required context carries an identity no pull-request-controlled job
+# can produce. Every Actions workflow job — including anything a pull
+# request adds, or renames this file's jobs into — publishes its check runs
+# under the shared GitHub Actions integration (app 15368), and required-check
+# matching is by check-run name on the head SHA. A publisher that posted its
+# verdict with the workflow token would therefore be forgeable: a pull
+# request could add a same-named job in any PR-controlled workflow (or
+# rename this file's job) and satisfy the required context from the very
+# integration the ruleset matches on, while suppressing the announcer so the
+# trusted publisher never runs. The workflow token here structurally cannot
+# publish at all — it holds no `checks` grant — and the required context is
+# published only under a minted installation token of the dedicated
+# gate-publisher GitHub App (`BOT_REVIEW_GATE_APP_ID` /
+# `BOT_REVIEW_GATE_PRIVATE_KEY` repository secrets; missing credentials fail
+# the job before anything can be published, leaving the required context
+# unreported and the merge blocked). The live `main` ruleset entry and
+# dependabot-automerge.yml require the context from that App's integration
+# id (the repository variable `BOT_REVIEW_GATE_APP_ID`), which no
+# pull-request job can author a check run under.
+#
+# A query failure, an incomplete pagination, or a head mismatch publishes a
+# failing check instead of silently passing it; a publication failure leaves
+# the required context unreported, which also blocks the merge.
 on:
   workflow_run:
     workflows: ["Bot review gate"]
     types: [completed]
 
 permissions:
-  checks: write
   contents: read
   pull-requests: read
+  # Deliberately no `checks: write`: the workflow token must be structurally
+  # unable to publish the required context. Only the minted gate-publisher
+  # App token below can.
 
 concurrency:
   group: bot-review-gate-publisher-${{ github.event.workflow_run.head_sha }}
@@ -121,10 +143,26 @@ jobs:
     name: Bot Review Gate Publisher
     runs-on: ubuntu-latest
     steps:
+      # The single identity allowed to publish the required context. The
+      # action is GitHub-org-owned, pinned to a full commit SHA, and
+      # executes no repository code — it only signs a JWT and exchanges it
+      # for an installation token whose check runs are authored by the
+      # gate-publisher App's integration instead of the shared GitHub
+      # Actions integration every pull-request job shares.
+      - name: Mint the gate-publisher App token
+        id: gate_publisher_token
+        # v2.2.1, pinned to the full commit.
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf
+        with:
+          app-id: ${{ secrets.BOT_REVIEW_GATE_APP_ID }}
+          private-key: ${{ secrets.BOT_REVIEW_GATE_PRIVATE_KEY }}
+          permission-checks: write
+
       - name: Publish the Bot Review Gate verdict from trusted base-branch content
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GATE_TOKEN: ${{ steps.gate_publisher_token.outputs.token }}
           EVENT_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
@@ -132,15 +170,28 @@ jobs:
           # ── Publication bound to the evaluated head ──────────────────────
           # The verdict is published as a completed check-run at the exact
           # evaluated commit, under the context name the live `main` ruleset
-          # requires. It is called from exactly two places — the aggregated
+          # requires, authenticated as the gate-publisher App so the check
+          # run is authored by that App's integration — never by the shared
+          # GitHub Actions integration a pull-request job could publish
+          # under. It is called from exactly two places — the aggregated
           # failure branch and the aggregated success branch of the driver
-          # below — so one announced head can never carry competing verdicts.
+          # below — so one announced head can never carry competing
+          # verdicts.
           publish_gate_check_run() {
             evaluated_head="$1"
             conclusion="$2"
             title="$3"
             summary="$4"
-            if ! gh api "repos/${GITHUB_REPOSITORY}/check-runs" \
+            # Defense in depth against a future refactor dropping the mint
+            # step: publishing under the shared workflow identity would
+            # reopen the forged-context hole, so a missing gate token must
+            # fail closed. The context stays unreported and the merge stays
+            # blocked.
+            if [ -z "${GATE_TOKEN:-}" ]; then
+              echo "The gate-publisher App token is missing; refusing to publish the required context under any shared identity. The context stays unreported and the merge stays blocked." >&2
+              return 1
+            fi
+            if ! GH_TOKEN="${GATE_TOKEN}" gh api "repos/${GITHUB_REPOSITORY}/check-runs" \
                 -F name="Bot Review Gate" \
                 -F head_sha="${evaluated_head}" \
                 -F status=completed \

@@ -65,6 +65,34 @@ fn check_run_publication_failure_fails_the_publisher() {
 }
 
 #[test]
+fn a_missing_gate_app_identity_refuses_to_publish() {
+    // The required context must never be published under the shared
+    // workflow identity: every pull-request-controlled job publishes its
+    // check runs under that same GitHub Actions integration, so a
+    // same-named forged check would satisfy the context. A missing
+    // gate-publisher App token (the mint step failed) must leave the
+    // context unreported — merge blocked — instead of degrading.
+    let sandbox = GateSandbox::new("publish-no-gate-identity");
+    sandbox.use_scenario("clean");
+    let output = sandbox.run_without_gate_token("pull_request", Some(HEAD_SHA));
+    assert!(
+        !output.status.success(),
+        "publishing without the gate identity must fail closed:\n{}",
+        report(&output)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refusing to publish the required context under any shared identity"),
+        "the identity refusal must be explicit:\n{}",
+        report(&output)
+    );
+    assert!(
+        sandbox.check_runs().is_empty(),
+        "no verdict may be published under the shared workflow identity"
+    );
+}
+
+#[test]
 fn a_commit_without_an_open_main_pull_request_publishes_nothing() {
     // The announcer can be dispatched on any ref; a run whose commit heads
     // no open main pull request has no required context to publish, and the
@@ -133,7 +161,11 @@ fn one_dirty_associate_forces_the_shared_verdict_red() {
     let sandbox = GateSandbox::new("publish-shared-dirty");
     sandbox.use_scenario("two-associated-prs-dirty");
     let output = sandbox.run("pull_request", Some(HEAD_SHA));
-    assert_blocked(&output, &[], "1 of 2 associated pull request(s) are blocked");
+    assert_blocked(
+        &output,
+        &[],
+        "1 of 2 associated pull request(s) are blocked",
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("no longer matches pull request head"),
         "the blocked candidate's reason must be reported:\n{}",
@@ -174,12 +206,17 @@ fn the_announcers_own_check_name_never_collides_with_the_required_context() {
 #[test]
 fn the_publisher_owns_the_required_context_exclusively() {
     // Within the publisher, the required context name appears only in the
-    // publication call — the one write the `checks: write` grant covers.
+    // publication call — the one write the minted gate-publisher App token
+    // covers.
     let workflow: serde_yaml::Value =
         serde_yaml::from_str(super::harness::BOT_REVIEW_GATE_PUBLISHER_YAML)
             .expect("bot review gate publisher workflow must parse");
-    let run = workflow["jobs"]["publish"]["steps"][0]["run"]
-        .as_str()
+    let steps = workflow["jobs"]["publish"]["steps"]
+        .as_sequence()
+        .expect("the publisher workflow must define its job steps");
+    let run = steps
+        .iter()
+        .find_map(|step| step["run"].as_str())
         .expect("the publisher step must inline its run script");
     let occurrences = run.matches("\"Bot Review Gate\"").count();
     assert_eq!(
