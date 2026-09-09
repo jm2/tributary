@@ -12,10 +12,9 @@ use std::path::PathBuf;
 use super::executor_rollback_tests::{entry_names, run_plan_expect_failure};
 use super::executor_tests::transfer_request;
 use super::test_support::{authority_pair, read_authority, write_source_file};
-use super::types::{Stage, TransferError, TransferItem, TransferProgress};
-use super::{TransferExecutor, TransferPlanner};
+use super::types::TransferItem;
+use super::TransferPlanner;
 use crate::local::write_authority::ConflictPolicy;
-use crate::source_lifecycle::CancellationObserver;
 
 #[test]
 fn directory_rollback_removes_created_directories() {
@@ -86,6 +85,13 @@ fn pre_existing_directory_survives_rollback() {
 #[cfg(unix)]
 #[test]
 fn mount_swap_during_execution_fails_closed() {
+    // Unix-only imports: the swap scenario itself cannot exist behind the
+    // retained Windows handles, and module-level imports here would be
+    // unused — a hard error under `-D warnings` — on Windows.
+    use super::types::{Stage, TransferError, TransferProgress};
+    use super::TransferExecutor;
+    use crate::source_lifecycle::CancellationObserver;
+
     let source_root = tempfile::tempdir().expect("temporary source root");
     let destination_root = tempfile::tempdir().expect("temporary destination root");
     write_source_file(source_root.path(), "one.flac", b"one");
