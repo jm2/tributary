@@ -639,7 +639,17 @@ jobs:
             echo "Associated-pull-request query failed; failing closed." >&2
             exit 1
           fi
-          mapfile -t candidate_prs < <(jq -r '.[]
+          # The publisher script is also materialized and executed by
+          # tests/bot_review_gate/harness.rs on the test host, whose /bin/bash
+          # can be the macOS bash 3.2 — so this script must stay free of
+          # bash-4-only builtins (mapfile/readarray). A while-read loop
+          # fills the same array portably.
+          candidate_prs=()
+          while IFS= read -r candidate_pr; do
+            if [ -n "${candidate_pr}" ]; then
+              candidate_prs+=("${candidate_pr}")
+            fi
+          done < <(jq -r '.[]
             | select(.state == "open" and .base.ref == "main")
             | .number' <<<"${associated}")
           if [ "${#candidate_prs[@]}" -eq 0 ]; then
