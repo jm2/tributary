@@ -86,17 +86,36 @@ checks the ruleset already requires, coordinated with the dependency-updates
 gate migration so both documents demand the same context set. The GitHub
 reviews API returns a bot's full review history, and a later review never
 deletes an earlier one, so the gate evaluates exactly one review per bot:
-its latest submitted review. The gate fails closed unless all three of the
-following hold: the latest submitted review of every in-scope bot has
-reached an acceptable conclusion — a later review supersedes the bot's own
-earlier reviews (a bot whose newest review is APPROVED is green even if an
-older review requested changes), a pending latest review blocks, and a
-CHANGES_REQUESTED latest review blocks even when its threads are resolved;
-that latest review was submitted against the pull request's current head
-SHA — a review of an older head does not count and leaves the bot unproven
-at this head; and no actionable bot review thread remains unresolved. All
-three inputs are queried via the API, so review conclusions, review head
-SHAs, and review threads become machine-readable merge evidence.
+its latest submitted review. Submitted is the operative word: the
+[reviews API](https://docs.github.com/en/rest/pulls/reviews) lists
+submitted reviews only — a review still in pending state has no
+`submitted_at` timestamp and is visible solely to the credential that
+created it, so the gate can never observe another integration's draft
+review and must not claim to. Whether a re-review is in flight is
+therefore knowable only through a gate-visible, trusted handshake: a
+re-review request addressed to the bot, acknowledged by a bot-owned
+gate-visible signal — the bot's status context or a machine-readable
+comment — bound to the current head SHA and the specific review attempt.
+An outstanding handshake at the current head invalidates that bot's
+earlier clean result at the same head: the prior approval stops counting
+until the new attempt is submitted at this head. A missing or untrusted
+handshake signal fails closed — the bot counts as unproven at this head,
+exactly like a bot with no acceptable review, never as "no re-review in
+progress".
+
+The gate fails closed unless all three of the following hold: the latest
+submitted review of every in-scope bot has reached an acceptable
+conclusion — supersession within a bot's own history is
+conclusion-sensitive, because an outstanding change request survives
+comments: a newer APPROVED review or an explicit dismissal of the
+change-request review through the API clears it, a later COMMENTED review
+alone never does, and a CHANGES_REQUESTED latest review blocks even when
+its threads are resolved; that latest review was submitted against the
+pull request's current head SHA — a review of an older head does not
+count and leaves the bot unproven at this head; and no actionable bot
+review thread remains unresolved. All three inputs are queried via the
+API, so review conclusions, review head SHAs, and review threads become
+machine-readable merge evidence.
 
 In-scope is fixed by enumeration, not by observation: the gate
 configuration carries an explicit list of the bot identities expected to
@@ -129,8 +148,9 @@ When a bot leaves findings on your pull request:
 3. Push the fixes to the same `polecat/<bead-id>` branch — never a side
    branch or a second PR. The bots re-review the new head automatically.
 4. Repeat until every bot check and review is green. The refinery gate is
-   fail-closed ("pending is never green"), so a re-review still running at
-   poll time simply keeps the merge waiting.
+   fail-closed: a requested re-review invalidates the bot's earlier clean
+   result at that head until the new review is submitted, and until then
+   the bot counts as unproven — the merge simply waits.
 
 Operational review is performed out of band by Gas City's locally configured
 GLM 5.3 reviewer. Its admission and evidence belong to the rollout manifests,
