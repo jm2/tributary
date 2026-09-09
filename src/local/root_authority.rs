@@ -1159,24 +1159,52 @@ fn rename_noreplace_at(parent: &RetainedObject, from: &OsStr, to: &OsStr) -> io:
 /// published destination carries the source's exact identity, which the
 /// replacement proof re-verifies after the install. The source name is then
 /// retired best effort: a failure there only strands a second name for the
-/// already-published object (debris, never destruction). On filesystems
-/// without hard-link support the only available primitive is the plain
-/// rename, and the caller's quarantine proof bounds the residual window
-/// exactly as it does for the flagless unix fallback documented below.
+/// already-published object (debris, never destruction).
+///
+/// There is deliberately no fallback for filesystems without hard-link
+/// support (FAT/exFAT removable media): the only primitive left would be
+/// the plain overwriting rename, and silently degrading to it would destroy
+/// a leaf recreated inside the vacancy — the exact clobber this section
+/// refuses to commit. Such a filesystem fails the commit closed instead,
+/// with an error that names the platform limitation. The OS payload is
+/// dropped when rebuilding that error: it embeds the native pathnames,
+/// which must never leak into logs (see `replacement_path`).
 #[cfg(windows)]
 fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    std::fs::hard_link(from, to)?;
-    let _ = std::fs::remove_file(from);
-    Ok(())
+    match std::fs::hard_link(from, to) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(from);
+            Ok(())
+        }
+        // The destination exists: the conditioned refusal itself. Propagated
+        // unchanged so the install and restore callers keep their
+        // AlreadyExists contract.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(error),
+        // No hard links available (or any other failure): the conditioned
+        // no-replace publish cannot happen, so nothing happens — fail closed
+        // with a path-free error.
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            "this filesystem does not support the atomic no-replace publish \
+             the conditioned replacement requires; the commit refused \
+             without touching either file",
+        )),
+    }
 }
 
 /// Platforms with neither retained parent handles nor a no-replace rename
-/// primitive keep the plain rename. The caller's quarantine proof bounds the
-/// residual recreate window exactly as it does for the flagless unix
-/// fallback; the residual is documented at the install site.
+/// primitive have no way to publish a replacement without first refusing an
+/// occupied destination, and a plain overwriting rename would destroy a leaf
+/// recreated inside the vacancy. They fail every conditioned publish closed
+/// rather than silently degrade to that rename.
 #[cfg(not(any(unix, windows)))]
-fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    std::fs::rename(from, to)
+fn rename_noreplace(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this platform does not provide the atomic no-replace rename \
+         the conditioned replacement requires; the commit refused \
+         without touching either file",
+    ))
 }
 
 /// The key that identifies one replaceable directory leaf across every
