@@ -1234,11 +1234,17 @@ fn build_properties_action(
         let failure_context = failure_context_for_props.clone();
         let (tx, rx) = async_channel::bounded::<
             Option<
-                std::collections::HashMap<String, crate::source_registry::RemovableMutationTarget>,
+                std::collections::HashMap<
+                    (SourceId, String),
+                    crate::source_registry::RemovableMutationTarget,
+                >,
             >,
         >(1);
         rt_handle.spawn(async move {
-            let mut resolved = std::collections::HashMap::new();
+            let mut resolved: std::collections::HashMap<
+                (SourceId, String),
+                crate::source_registry::RemovableMutationTarget,
+            > = std::collections::HashMap::new();
             for mutation in &pending {
                 match registry
                     .resolve_mutation_target(
@@ -1249,7 +1255,10 @@ fn build_properties_action(
                     .await
                 {
                     Ok(target) => {
-                        resolved.insert(mutation.track_id.as_str().to_owned(), target);
+                        resolved.insert(
+                            (mutation.source_id, mutation.track_id.as_str().to_owned()),
+                            target,
+                        );
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -1278,7 +1287,9 @@ fn build_properties_action(
             let mut infos = track_infos_for_resolve;
             for info in &mut infos {
                 if let SaveTarget::PendingRemovable(pending) = &info.target {
-                    if let Some(target) = resolved.get(pending.track_id.as_str()) {
+                    if let Some(target) =
+                        resolved.get(&(pending.source_id, pending.track_id.as_str().to_owned()))
+                    {
                         info.target = SaveTarget::Removable(target.clone());
                     }
                 }
@@ -1380,6 +1391,12 @@ fn properties_save_target(
 ///
 /// Repeated playlist rows may refer to the same removable file; resolving
 /// the identity twice would retain two authorities over one exact object.
+///
+/// The identity is the complete `(source, track)` pair, not the track alone:
+/// `TrackId::removable_relative` is scoped to one source's mount root, so two
+/// devices exposing the same relative path produce equal track IDs. Keying on
+/// the track string alone would drop one device's pending resolution and
+/// rebind its rows to the surviving device's authority.
 fn distinct_pending_mutations(
     track_infos: &[super::properties_dialog::TrackInfo],
 ) -> Vec<super::properties_dialog::PendingRemovableMutation> {
@@ -1387,7 +1404,7 @@ fn distinct_pending_mutations(
     let mut pending = Vec::new();
     for info in track_infos {
         if let SaveTarget::PendingRemovable(mutation) = &info.target {
-            if seen.insert(mutation.track_id.as_str().to_owned()) {
+            if seen.insert((mutation.source_id, mutation.track_id.as_str().to_owned())) {
                 pending.push(mutation.clone());
             }
         }
@@ -1508,6 +1525,9 @@ pub mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    // `super` inside this test module is `context_menu`, so the sibling
+    // dialog module must be named from the `ui` parent directly.
+    use crate::ui::properties_dialog;
 
     fn remote_catalogue_track(
         track_id: TrackId,
@@ -1602,6 +1622,75 @@ pub mod tests {
         assert!(candidates
             .iter()
             .all(|candidate| matches!(candidate, PlaylistAddCandidate::Local(_))));
+    }
+
+    /// A pending removable mutation is identified by the complete
+    /// `(source, track)` pair. `TrackId::removable_relative` is scoped to one
+    /// source's mount root, so two devices exposing the same relative path
+    /// produce equal track IDs; keying on the track string alone would drop
+    /// one device's pending resolution and rebind its rows to the surviving
+    /// device's authority.
+    #[test]
+    fn distinct_pending_mutations_key_on_source_and_track_not_track_alone() {
+        fn info_with_target(target: SaveTarget) -> properties_dialog::TrackInfo {
+            properties_dialog::TrackInfo {
+                target,
+                title: "Title".to_string(),
+                artist: "Artist".to_string(),
+                album: "Album".to_string(),
+                genre: String::new(),
+                composer: String::new(),
+                year: String::new(),
+                track_number: String::new(),
+                disc_number: String::new(),
+                format: "FLAC".to_string(),
+                bitrate: String::new(),
+                sample_rate: String::new(),
+                duration: String::new(),
+            }
+        }
+
+        let pending_on = |source_id: SourceId| properties_dialog::PendingRemovableMutation {
+            source_id,
+            session_epoch: 1,
+            track_id: TrackId::new("unix:616c62756d2f736f6e67").expect("track id"),
+        };
+        let device_one = SourceId::random();
+        let device_two = SourceId::random();
+        let shared_track_on_device_one = pending_on(device_one);
+
+        // Two devices exposing the same relative path, plus a repeat of the
+        // first device's row: two distinct identities, not one.
+        let infos = vec![
+            info_with_target(SaveTarget::PendingRemovable(
+                shared_track_on_device_one.clone(),
+            )),
+            info_with_target(SaveTarget::PendingRemovable(pending_on(device_two))),
+            info_with_target(SaveTarget::PendingRemovable(
+                shared_track_on_device_one.clone(),
+            )),
+        ];
+        let pending = distinct_pending_mutations(&infos);
+        assert_eq!(
+            pending.len(),
+            2,
+            "the same relative path on two devices must stay distinct"
+        );
+        assert_eq!(pending[0].source_id, device_one);
+        assert_eq!(pending[1].source_id, device_two);
+
+        // The same source and track repeated still collapses to one.
+        let repeated = vec![
+            info_with_target(SaveTarget::PendingRemovable(
+                shared_track_on_device_one.clone(),
+            )),
+            info_with_target(SaveTarget::PendingRemovable(shared_track_on_device_one)),
+        ];
+        assert_eq!(
+            distinct_pending_mutations(&repeated).len(),
+            1,
+            "repeated rows over one identity must still deduplicate"
+        );
     }
 
     #[test]
