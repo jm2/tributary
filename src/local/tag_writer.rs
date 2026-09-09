@@ -701,11 +701,25 @@ fn atomic_tag_replacement(
     #[cfg(not(target_os = "windows"))]
     let mut destination = destination;
     let copy_result = copy_source_into_destination(&mut source, &mut destination, target_path);
+    // Capture the replacement's Unix permissions from the exact source
+    // object while the handle is still open. A target_path lookup here would
+    // read whatever occupies the name at commit time — not necessarily the
+    // file whose bytes were just copied — so an external writer that
+    // temporarily swaps the pathname to a permissive file could launder those
+    // permissions onto the committed replacement.
+    #[cfg(unix)]
+    let retained_permissions = source
+        .metadata()
+        .ok()
+        .map(|metadata| metadata.permissions());
     drop(source);
     drop(destination);
     copy_result?;
 
     write_tags_to(temp.path(), edits)?;
+    #[cfg(unix)]
+    flush_and_prepare_tagged_copy(&temp, target_path, retained_permissions)?;
+    #[cfg(not(unix))]
     flush_and_prepare_tagged_copy(&temp, target_path)?;
     commit_replacement(&mut temp)?;
 
@@ -755,7 +769,7 @@ fn copy_source_into_destination(
         .with_context(|| format!("Failed to copy {} for tag writing", target_path.display()))
 }
 
-/// Flush the tagged copy and carry over the replaced file's Unix permissions
+/// Flush the tagged copy and carry over the source file's Unix permissions
 /// before the caller's final replacement gate runs.
 ///
 /// The flush happens *before* the permission copy: replacing a read-only file
@@ -763,7 +777,15 @@ fn copy_source_into_destination(
 /// be flushed. Windows installs the complete DACL before the first copied
 /// byte; its std Permissions value represents only the DOS read-only
 /// attribute, so the permission carry-over is Unix-only.
-fn flush_and_prepare_tagged_copy(temp: &TempFile, target_path: &Path) -> Result<()> {
+///
+/// `retained_permissions` is captured from the source file handle — the exact
+/// object whose bytes were copied — never from a `target_path` lookup, which
+/// an external writer can retarget between admission and commit.
+fn flush_and_prepare_tagged_copy(
+    temp: &TempFile,
+    target_path: &Path,
+    #[cfg(unix)] retained_permissions: Option<std::fs::Permissions>,
+) -> Result<()> {
     // Flush the tagged copy before it becomes the user's file. Without this a
     // crash between rename and writeback can leave a truncated file where the
     // original used to be.
@@ -774,10 +796,13 @@ fn flush_and_prepare_tagged_copy(temp: &TempFile, target_path: &Path) -> Result<
         )
     })?;
 
-    // Best-effort: match the Unix permissions of the file being replaced.
+    // Best-effort: match the Unix permissions of the exact file object the
+    // bytes were copied from. A capture failure skips the carry-over rather
+    // than failing the write; the replacement never invents permissions it
+    // could not prove.
     #[cfg(unix)]
-    if let Ok(metadata) = std::fs::metadata(target_path) {
-        let _ = std::fs::set_permissions(temp.path(), metadata.permissions());
+    if let Some(permissions) = retained_permissions {
+        let _ = std::fs::set_permissions(temp.path(), permissions);
     }
 
     Ok(())
@@ -1079,6 +1104,60 @@ mod tests {
             "writer-owned copies must not be readable or writable by group/other"
         );
         drop(file);
+        temp.remove().expect("remove private sibling");
+    }
+
+    /// The replacement must carry the permissions of the exact file object
+    /// the bytes were copied from — captured from the source handle — not
+    /// whatever the target pathname names when the carry-over runs: an
+    /// external writer that temporarily swaps the pathname to a permissive
+    /// file during the commit must not launder those permissions onto the
+    /// replacement.
+    #[cfg(unix)]
+    #[test]
+    fn tagged_copy_carries_permissions_from_the_source_handle_not_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("permissions-from-handle");
+        let track = directory.audio_file("song.flac", b"original audio");
+        std::fs::set_permissions(&track, std::fs::Permissions::from_mode(0o600))
+            .expect("make the admitted file private");
+
+        // The source handle is the exact object being copied. The pathname
+        // meanwhile names a world-readable stranger, as a mid-commit swap
+        // would present it.
+        let source = std::fs::File::open(&track).expect("open the source handle");
+        let stranger = directory.audio_file("stranger.flac", b"stranger audio");
+        std::fs::set_permissions(&stranger, std::fs::Permissions::from_mode(0o644))
+            .expect("make the stranger permissive");
+
+        let (temp, destination) = TempFile::create_beside(&track).expect("create the staging copy");
+        drop(destination);
+
+        // Swap the pathname to the permissive stranger for the carry-over,
+        // as the race would, then prepare the copy with the permissions
+        // captured from the retained handle.
+        let displaced = directory.path.join("displaced.flac");
+        std::fs::rename(&track, &displaced).expect("displace the admitted file");
+        std::fs::rename(&stranger, &track).expect("put the stranger at the target name");
+
+        let retained_permissions = source
+            .metadata()
+            .expect("stat the retained source handle")
+            .permissions();
+        flush_and_prepare_tagged_copy(&temp, &track, Some(retained_permissions))
+            .expect("prepare the tagged copy");
+
+        let mode = std::fs::metadata(temp.path())
+            .expect("read the tagged copy's metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the tagged copy must carry the source handle's permissions, not the swapped pathname's"
+        );
+        drop(source);
         temp.remove().expect("remove private sibling");
     }
 
