@@ -292,7 +292,11 @@ impl TempFile {
     /// rename fails with `EXDEV`). The name is randomized and created with
     /// `create_new` (`O_EXCL`) so it cannot collide with a concurrent save or
     /// follow a symlink an attacker planted at a predictable path.
-    fn create_beside(target: &Path) -> Result<(Self, std::fs::File)> {
+    ///
+    /// Error contexts name the target by `target_label`, never by `target`:
+    /// an authority-based caller's target is a native mount path that must
+    /// not leak into logs (see `replacement_path`).
+    fn create_beside(target: &Path, target_label: &str) -> Result<(Self, std::fs::File)> {
         let directory = target.parent().unwrap_or_else(|| Path::new("."));
         let extension = target
             .extension()
@@ -349,16 +353,13 @@ impl TempFile {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
                     return Err(error).with_context(|| {
-                        format!("Failed to create a temp file beside {}", target.display())
+                        format!("Failed to create a temp file beside {target_label}")
                     })
                 }
             }
         }
 
-        anyhow::bail!(
-            "Failed to create a unique temp file beside {}",
-            target.display()
-        )
+        anyhow::bail!("Failed to create a unique temp file beside {target_label}")
     }
 
     fn path(&self) -> &Path {
@@ -507,8 +508,8 @@ pub fn preflight_tag_write_target_access(path: &Path) -> Result<(), TagWritePref
             WindowsDacl::read_from(&source).map_err(|_| TagWritePreflightError::Unavailable)?;
         drop(source);
 
-        let (probe, creation_file) =
-            TempFile::create_beside(path).map_err(|_| TagWritePreflightError::Unavailable)?;
+        let (probe, creation_file) = TempFile::create_beside(path, &path.to_string_lossy())
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
         let dacl_result = source_dacl.apply_to(&creation_file);
         drop(creation_file);
         dacl_result.map_err(|_| TagWritePreflightError::Unavailable)?;
@@ -542,13 +543,14 @@ pub fn preflight_tag_write_directory(path: &Path) -> Result<(), TagWritePrefligh
     // create two exclusive siblings, flush them, replace an existing sibling,
     // and require explicit cleanup. The user's audio file is never modified.
     let (mut replacement, replacement_file) =
-        TempFile::create_beside(path).map_err(|_| TagWritePreflightError::Unavailable)?;
+        TempFile::create_beside(path, &path.to_string_lossy())
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
     let replacement_result = replacement_file.sync_all();
     drop(replacement_file);
     replacement_result.map_err(|_| TagWritePreflightError::Unavailable)?;
 
-    let (destination, destination_file) =
-        TempFile::create_beside(path).map_err(|_| TagWritePreflightError::Unavailable)?;
+    let (destination, destination_file) = TempFile::create_beside(path, &path.to_string_lossy())
+        .map_err(|_| TagWritePreflightError::Unavailable)?;
     let destination_result = destination_file.sync_all();
     drop(destination_file);
     destination_result.map_err(|_| TagWritePreflightError::Unavailable)?;
@@ -597,9 +599,14 @@ pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
         }
     }
 
+    // The local pathname is user-visible, so naming it in error contexts is
+    // fine here — unlike the authority-based writer below.
+    let target_label = path.to_string_lossy();
     let source = std::fs::File::open(path)
         .with_context(|| format!("Failed to open {} for tag writing", path.display()))?;
-    atomic_tag_replacement(source, path, edits, |temp| temp.persist_to(path))
+    atomic_tag_replacement(source, path, &target_label, edits, |temp| {
+        temp.persist_to(path)
+    })
 }
 
 /// Write tag edits to one exact file beneath a retained mounted authority.
@@ -638,36 +645,38 @@ pub fn write_tags_with_mutation_target(
     // Open the serialized commit section first: it revalidates the mount,
     // the retained ancestry, and the exact retained file before any byte is
     // read, and holds the target's commit lock through the replacement.
-    let commit = target.begin_commit().map_err(|error| {
+    let mut commit = target.begin_commit().map_err(|error| {
         anyhow::anyhow!("The retained mutation authority is no longer valid: {error}")
     })?;
     let source = commit
         .source_file()
         .with_context(|| "Failed to read the exact retained mutation target".to_string())?;
-    atomic_tag_replacement(source, target.replacement_path(), edits, |temp| {
-        commit.commit_replacement(temp.path()).map_err(|error| {
-            anyhow::Error::new(error)
-                .context("The exact file to replace changed before the tagged copy was committed")
-        })?;
-        // The retained authority renamed the staged copy into place; the
-        // staging name no longer exists for the drop guard to remove.
-        temp.disarm_cleanup();
-        Ok(())
-    })?;
-
-    // A successful replacement retired the object this section copied from.
-    // Re-anchor the retained evidence to the exact current object so a
-    // follow-up commit (a batch retry, or a second edit) is authorized for
-    // the file that exists now. Failure is advisory: the next commit section
-    // revalidates fail-closed regardless.
-    //
-    // The commit section's guard must be released before rebind: rebind
-    // serializes on the same target lock this section is still holding, and
-    // a std Mutex is not reentrant — relocking it here would deadlock the
-    // writer thread forever.
-    drop(commit);
-    let _ = target.rebind();
-    Ok(())
+    // The replacement path is a native mount path whose contract forbids
+    // logging or formatting it, so every error context below names the
+    // target by a redacted label instead of the path — the removable-media
+    // error branch surfaces the whole chain to the user.
+    atomic_tag_replacement(
+        source,
+        target.replacement_path(),
+        "the retained mutation target",
+        edits,
+        |temp| {
+            // The replacement and the re-anchor of the retained evidence to the
+            // installed object both happen inside this commit section, while its
+            // guard still holds the target's commit lock — the re-anchor is
+            // identity-conditioned on the proven landing, so no pathname is ever
+            // opened outside the guard and no leaf swap between the landing and
+            // the re-anchor can be silently adopted.
+            commit.commit_replacement(temp.path()).map_err(|error| {
+                anyhow::Error::new(error)
+                    .context("The retained mutation authority refused the tagged replacement")
+            })?;
+            // The retained authority renamed the staged copy into place; the
+            // staging name no longer exists for the drop guard to remove.
+            temp.disarm_cleanup();
+            Ok(())
+        },
+    )
 }
 
 /// Copy `source` to an exclusively created sibling of `target_path`, tag the
@@ -680,27 +689,29 @@ pub fn write_tags_with_mutation_target(
 /// Path-based callers have no retained identity to compare and simply rename
 /// the staged copy into place; the rename itself is their point-in-time
 /// replacement.
+///
+/// Error contexts never format `target_path`: an authority-based caller's
+/// target is a native mount path that must not leak into logs, so contexts
+/// name the target by `target_label` instead. Path-based callers pass the
+/// user-visible pathname's own text.
 fn atomic_tag_replacement(
     source: File,
     target_path: &Path,
+    target_label: &str,
     edits: &TagEdits,
     commit_replacement: impl FnOnce(&mut TempFile) -> Result<()>,
 ) -> Result<()> {
     let mut source = source;
     #[cfg(target_os = "windows")]
-    let source_dacl = WindowsDacl::read_from(&source).with_context(|| {
-        format!(
-            "Failed to read the Windows DACL of {}",
-            target_path.display()
-        )
-    })?;
+    let source_dacl = WindowsDacl::read_from(&source)
+        .with_context(|| format!("Failed to read the Windows DACL of {target_label}",))?;
 
-    let (mut temp, destination) = TempFile::create_beside(target_path)?;
+    let (mut temp, destination) = TempFile::create_beside(target_path, target_label)?;
     #[cfg(target_os = "windows")]
-    let mut destination = open_tag_copy_destination(source_dacl, destination, &temp, target_path)?;
+    let mut destination = open_tag_copy_destination(source_dacl, destination, &temp, target_label)?;
     #[cfg(not(target_os = "windows"))]
     let mut destination = destination;
-    let copy_result = copy_source_into_destination(&mut source, &mut destination, target_path);
+    let copy_result = copy_source_into_destination(&mut source, &mut destination, target_label);
     // Capture the replacement's Unix permissions from the exact source
     // object while the handle is still open. A target_path lookup here would
     // read whatever occupies the name at commit time — not necessarily the
@@ -718,9 +729,9 @@ fn atomic_tag_replacement(
 
     write_tags_to(temp.path(), edits)?;
     #[cfg(unix)]
-    flush_and_prepare_tagged_copy(&temp, target_path, retained_permissions)?;
+    flush_and_prepare_tagged_copy(&temp, target_label, retained_permissions)?;
     #[cfg(not(unix))]
-    flush_and_prepare_tagged_copy(&temp, target_path)?;
+    flush_and_prepare_tagged_copy(&temp, target_label)?;
     commit_replacement(&mut temp)?;
 
     tracing::debug!("Tags written successfully");
@@ -739,20 +750,18 @@ fn open_tag_copy_destination(
     source_dacl: WindowsDacl,
     destination: File,
     temp: &TempFile,
-    target_path: &Path,
+    target_label: &str,
 ) -> Result<File> {
     let security_result = source_dacl.apply_to(&destination).with_context(|| {
         format!(
-            "Failed to protect the tagged copy of {} with its original Windows DACL",
-            target_path.display()
+            "Failed to protect the tagged copy of {target_label} with its original Windows DACL",
         )
     });
     drop(destination);
     security_result?;
     temp.reopen_exclusive_for_tagging().with_context(|| {
         format!(
-            "The original Windows DACL of {} does not permit writing the tagged copy",
-            target_path.display()
+            "The original Windows DACL of {target_label} does not permit writing the tagged copy",
         )
     })
 }
@@ -762,11 +771,11 @@ fn open_tag_copy_destination(
 fn copy_source_into_destination(
     source: &mut File,
     destination: &mut File,
-    target_path: &Path,
+    target_label: &str,
 ) -> Result<()> {
     std::io::copy(source, destination)
         .map(|_| ())
-        .with_context(|| format!("Failed to copy {} for tag writing", target_path.display()))
+        .with_context(|| format!("Failed to copy {target_label} for tag writing"))
 }
 
 /// Flush the tagged copy and carry over the source file's Unix permissions
@@ -779,22 +788,19 @@ fn copy_source_into_destination(
 /// attribute, so the permission carry-over is Unix-only.
 ///
 /// `retained_permissions` is captured from the source file handle — the exact
-/// object whose bytes were copied — never from a `target_path` lookup, which
-/// an external writer can retarget between admission and commit.
+/// object whose bytes were copied — never from a lookup at the target's name,
+/// which an external writer can retarget between admission and commit. Error
+/// contexts name the target by `target_label`, never by its native pathname.
 fn flush_and_prepare_tagged_copy(
     temp: &TempFile,
-    target_path: &Path,
+    target_label: &str,
     #[cfg(unix)] retained_permissions: Option<std::fs::Permissions>,
 ) -> Result<()> {
     // Flush the tagged copy before it becomes the user's file. Without this a
     // crash between rename and writeback can leave a truncated file where the
     // original used to be.
-    flush_to_disk(temp.path()).with_context(|| {
-        format!(
-            "Failed to flush the tagged copy of {}",
-            target_path.display()
-        )
-    })?;
+    flush_to_disk(temp.path())
+        .with_context(|| format!("Failed to flush the tagged copy of {target_label}"))?;
 
     // Best-effort: match the Unix permissions of the exact file object the
     // bytes were copied from. A capture failure skips the carry-over rather
@@ -1092,7 +1098,8 @@ mod tests {
 
         let directory = TestDirectory::new("private-mode");
         let track = directory.path.join("song.flac");
-        let (temp, file) = TempFile::create_beside(&track).expect("create private sibling");
+        let (temp, file) = TempFile::create_beside(&track, &track.to_string_lossy())
+            .expect("create private sibling");
         let mode = std::fs::metadata(temp.path())
             .expect("read sibling metadata")
             .permissions()
@@ -1131,7 +1138,8 @@ mod tests {
         std::fs::set_permissions(&stranger, std::fs::Permissions::from_mode(0o644))
             .expect("make the stranger permissive");
 
-        let (temp, destination) = TempFile::create_beside(&track).expect("create the staging copy");
+        let (temp, destination) = TempFile::create_beside(&track, &track.to_string_lossy())
+            .expect("create the staging copy");
         drop(destination);
 
         // Swap the pathname to the permissive stranger for the carry-over,
@@ -1145,7 +1153,7 @@ mod tests {
             .metadata()
             .expect("stat the retained source handle")
             .permissions();
-        flush_and_prepare_tagged_copy(&temp, &track, Some(retained_permissions))
+        flush_and_prepare_tagged_copy(&temp, &track.to_string_lossy(), Some(retained_permissions))
             .expect("prepare the tagged copy");
 
         let mode = std::fs::metadata(temp.path())
@@ -1170,7 +1178,8 @@ mod tests {
         let track = directory.audio_file("song.flac", b"readable fixture bytes");
         let source = std::fs::File::open(&track).expect("open source");
         let source_dacl = WindowsDacl::read_from(&source).expect("read source DACL");
-        let (temp, destination) = TempFile::create_beside(&track).expect("create private sibling");
+        let (temp, destination) = TempFile::create_beside(&track, &track.to_string_lossy())
+            .expect("create private sibling");
 
         source_dacl
             .apply_to(&destination)
@@ -1285,7 +1294,8 @@ mod tests {
     fn probe_cleanup_failure_is_reported_before_success() {
         let directory = TestDirectory::new("preflight-cleanup-failure");
         let track = directory.path.join("song.flac");
-        let (temp, file) = TempFile::create_beside(&track).expect("create private sibling");
+        let (temp, file) = TempFile::create_beside(&track, &track.to_string_lossy())
+            .expect("create private sibling");
         let temp_path = temp.path().to_path_buf();
         drop(file);
 
@@ -1357,8 +1367,8 @@ mod tests {
     }
 
     /// A removable-media write through a retained mutation target must
-    /// succeed exactly like the path-based happy path, and the rebind after
-    /// the atomic rename must authorize a follow-up write through the same
+    /// succeed exactly like the path-based happy path, and the in-section
+    /// re-anchor must authorize a follow-up write through the same
     /// target object.
     #[test]
     fn a_mutation_target_write_round_trips_and_reanchors_for_a_follow_up() {
@@ -1385,8 +1395,8 @@ mod tests {
             "a successful write must not leave its sibling temp file behind"
         );
 
-        // The replacement retired the copied-from object; the rebind in the
-        // write must have re-anchored the target, so a second edit through
+        // The replacement retired the copied-from object; the in-section
+        // re-anchor must have re-bound the target, so a second edit through
         // the same retained authority is still authorized.
         write_tags_with_mutation_target(&target, &year("2027"))
             .expect("follow-up write after the re-anchor");
@@ -1562,8 +1572,10 @@ mod tests {
         let directory = TestDirectory::new("exclusive");
         let track = directory.path.join(format!("{}.FLAC", "x".repeat(220)));
 
-        let (first, first_handle) = TempFile::create_beside(&track).expect("first temp");
-        let (second, second_handle) = TempFile::create_beside(&track).expect("second temp");
+        let (first, first_handle) =
+            TempFile::create_beside(&track, &track.to_string_lossy()).expect("first temp");
+        let (second, second_handle) =
+            TempFile::create_beside(&track, &track.to_string_lossy()).expect("second temp");
 
         assert_ne!(first.path(), second.path());
         assert!(first.path().exists());

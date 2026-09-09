@@ -550,27 +550,6 @@ impl MountedMutationTarget {
             .ok_or_else(|| invalid_input("mutation target has no leaf file name"))
     }
 
-    /// Re-bind the retained exact file to the object now admitted at this
-    /// target's accepted mount-relative path.
-    ///
-    /// A successful atomic replacement deliberately retires the object the
-    /// commit section copied from: the pathname names the replacement. A
-    /// follow-up commit (a batch retry, or a second edit) must anchor to that
-    /// exact current object instead of failing against the displaced one.
-    /// Failure here is not a commit failure; the next commit section
-    /// revalidates fail-closed regardless.
-    pub(crate) fn rebind(&self) -> io::Result<()> {
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| io::Error::other("mutation target commit section is unavailable"))?;
-        let rebound = self
-            .authority
-            .open_relative_regular_file(&self.relative_path)?;
-        *file = rebound;
-        Ok(())
-    }
-
     /// Revalidate the retained mount binding and exact file object.
     ///
     /// Every error is a loss of authority. This reopens the mount path and
@@ -590,7 +569,7 @@ impl MountedMutationTarget {
     /// The retained mount binding and exact file object are revalidated
     /// before the section starts and the section holds the target's commit
     /// lock until the guard is dropped, so overlapping commits observe either
-    /// the pre-commit or post-rebind object — never a mixed one.
+    /// the pre-commit or re-anchored object — never a mixed one.
     pub(crate) fn begin_commit(&self) -> io::Result<MountedMutationCommit<'_>> {
         let file = self
             .file
@@ -679,10 +658,10 @@ impl MountedMutationCommit<'_> {
     ///
     /// The whole section — validation and rename together — first excludes
     /// every other Tributary-side committer for the same directory leaf (see
-    /// [`Self::with_leaf_commit_exclusion`]): the per-target commit lock
-    /// serializes one [`MountedMutationTarget`] object, but two targets
-    /// admitted at different times can name the same leaf, and their
-    /// confirm-and-rename spans must never interleave.
+    /// [`with_leaf_commit_lock`]): the per-target commit lock serializes one
+    /// [`MountedMutationTarget`] object, but two targets admitted at
+    /// different times can name the same leaf, and their confirm-and-rename
+    /// spans must never interleave.
     ///
     /// Confirmation then proves the mount, the retained ancestry, and the
     /// exact leaf identity (see [`Self::confirm_replacement_target`]). On
@@ -697,27 +676,96 @@ impl MountedMutationCommit<'_> {
     /// the exact retained parent directory; anything else is a lost staging
     /// area and is refused rather than re-resolved by path. Any uncertainty
     /// fails closed and leaves both files untouched.
-    pub(crate) fn commit_replacement(&self, staged: &Path) -> io::Result<()> {
-        self.with_leaf_commit_exclusion(|| {
-            self.confirm_replacement_target()?;
-            #[cfg(test)]
-            run_post_confirm_interpose(self);
-            self.replace_confirmed_staging(staged)
-        })
-    }
-
-    /// Run one replacement section while holding the process-wide exclusion
-    /// for this target's leaf.
     ///
-    /// See [`with_leaf_commit_lock`] for why the lock is scoped to the
-    /// directory leaf — shared by every target for that leaf — and not to the
-    /// target object.
-    fn with_leaf_commit_exclusion(&self, run: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    /// After the replacement is proven landed, the section re-anchors the
+    /// target's retained binding to the exact installed object — reopened
+    /// through the retained parent and identity-checked against the proven
+    /// landing — while the section's guard is still held (see
+    /// [`Self::reanchor_target_to_installed`]). A pathname is never opened
+    /// for the re-anchor outside this guard.
+    pub(crate) fn commit_replacement(&mut self, staged: &Path) -> io::Result<()> {
         #[cfg(unix)]
         let key = self.leaf_commit_key()?;
         #[cfg(not(unix))]
         let key = self.leaf_commit_key();
-        with_leaf_commit_lock(key, run)
+        with_leaf_commit_lock(key, || {
+            self.confirm_replacement_target()?;
+            #[cfg(test)]
+            run_post_confirm_interpose(self);
+            let staged_identity = self.replace_confirmed_staging(staged)?;
+            #[cfg(test)]
+            run_pre_reanchor_interpose(self);
+            self.reanchor_target_to_installed(staged_identity)
+        })
+    }
+
+    /// Re-anchor the target's retained binding to the installed replacement.
+    ///
+    /// A successful replacement deliberately retires the object this section
+    /// copied from; the pathname names the replacement now. The retained
+    /// evidence must follow it, or the next commit section would revalidate
+    /// against the retired object and refuse a legitimate follow-up write.
+    ///
+    /// The re-anchor happens inside the commit section — while this guard
+    /// still holds the target's commit lock — so it can never interleave
+    /// with another section, and it is identity-conditioned: the installed
+    /// object is reopened and the reopened object must be the exact object
+    /// whose landing was just proven. Anything else means a leaf swap
+    /// landed between the landing proof and this reopen; anchoring it would
+    /// authorize a later commit to overwrite a file the user never
+    /// selected. The section therefore refuses to install the stranger and
+    /// leaves the retained binding pointing at the retired pre-commit
+    /// object, which makes every later revalidation fail closed: the target
+    /// invalidates itself.
+    ///
+    /// The reopen goes through the same evidence the landing proof used —
+    /// the retained parent directory where the section installed the
+    /// replacement — never through the mount-relative pathname, which a
+    /// parent displaced mid-commit would resolve to an impostor directory.
+    fn reanchor_target_to_installed(&mut self, expected: ObjectIdentity) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let parent = self.retained_parent();
+            let leaf = self.target.relative_leaf()?;
+            let reopened = open_unix_regular_at(&parent.file, &leaf)?;
+            if object_identity(&reopened)? != expected {
+                return Err(authority_changed(
+                    "the replaced leaf changed again before the target could re-anchor",
+                ));
+            }
+            let rebound = BoundFile {
+                lease_token: self.target.authority.token,
+                path: self.target.path.clone(),
+                object: RetainedObject::new(reopened)?,
+                // The reopened object's retained directory is this section's
+                // retained parent, so pin that directory: later revalidations
+                // keep proving the object through the exact directory it was
+                // anchored from.
+                parent_guards: vec![RetainedObject::new(parent.file.try_clone()?)?],
+            };
+            *self.file = rebound;
+        }
+        #[cfg(not(unix))]
+        {
+            // Platforms without retained parent handles keep their documented
+            // discipline: the landing proof and this re-anchor both reopen the
+            // admitted pathname, and the re-anchor accepts only the exact
+            // identity the landing proved.
+            let reopened = File::open(&self.target.path)?;
+            if object_identity(&reopened)? != expected {
+                return Err(authority_changed(
+                    "the replaced leaf changed again before the target could re-anchor",
+                ));
+            }
+            let rebound = BoundFile {
+                lease_token: self.target.authority.token,
+                path: self.target.path.clone(),
+                object: RetainedObject::new(reopened)?,
+                parent_guards: Vec::new(),
+            };
+            *self.file = rebound;
+        }
+        Ok(())
     }
 
     /// Identify the directory leaf this section would replace.
@@ -767,7 +815,9 @@ impl MountedMutationCommit<'_> {
 
     /// Rename the staged copy over the confirmed target through the retained
     /// parent, conditioning the destination on its confirmed identity, then
-    /// prove the replacement landed on that exact entry.
+    /// prove the replacement landed on that exact entry. Returns the exact
+    /// identity of the object the section published, for the caller's
+    /// re-anchor step.
     ///
     /// A plain rename over the leaf would silently overwrite whatever an
     /// external writer swapped into the name after the confirm step proved
@@ -791,7 +841,7 @@ impl MountedMutationCommit<'_> {
     /// means the quarantined original is still intact; it is restored
     /// (conditioned) to its name and the stranger is displaced to a sibling.
     #[cfg(unix)]
-    fn replace_confirmed_staging(&self, staged: &Path) -> io::Result<()> {
+    fn replace_confirmed_staging(&self, staged: &Path) -> io::Result<ObjectIdentity> {
         let parent = self.retained_parent();
         let leaf = self.target.relative_leaf()?;
         let staged_leaf = staged
@@ -846,7 +896,7 @@ impl MountedMutationCommit<'_> {
         // quarantine sibling — debris, never destruction.
         drop(staged_file);
         let _ = rustix::fs::unlinkat(&parent.file, quarantine_leaf, rustix::fs::AtFlags::empty());
-        Ok(())
+        Ok(staged_identity)
     }
 
     /// Recover the admitted original after a failed landing proof.
@@ -863,7 +913,7 @@ impl MountedMutationCommit<'_> {
         leaf: &OsStr,
         quarantine_leaf: &OsStr,
     ) {
-        let _ = rustix::fs::renameat(&parent.file, leaf, &parent.file, &quarantine_name(leaf));
+        let _ = rustix::fs::renameat(&parent.file, leaf, &parent.file, quarantine_name(leaf));
         let _ = Self::restore_displaced_entry(parent, quarantine_leaf, leaf);
     }
 
@@ -999,8 +1049,19 @@ impl MountedMutationCommit<'_> {
     /// copy into the vacancy through a no-replace rename, so a leaf recreated
     /// inside the install window is preserved and refuses the commit exactly
     /// like the unix form.
+    ///
+    /// The staged object's evidence is retained through the install, the
+    /// landing is proved against it exactly like the unix form, and the
+    /// displaced admitted original is retired only after that proof
+    /// succeeds — mirroring the unix fix for the staged-entry swap window.
+    /// Returns the exact identity of the object the section published, for
+    /// the caller's re-anchor step.
+    ///
+    /// Errors surfaced here are rebuilt path-free: the std payloads embed
+    /// the native pathnames, which must never leak into logs (see
+    /// `replacement_path`).
     #[cfg(not(unix))]
-    fn replace_confirmed_staging(&self, staged: &Path) -> io::Result<()> {
+    fn replace_confirmed_staging(&self, staged: &Path) -> io::Result<ObjectIdentity> {
         let leaf = self.target.relative_leaf()?;
         let quarantine_leaf = quarantine_name(&leaf);
         let Some(parent_dir) = self.target.path.parent() else {
@@ -1010,6 +1071,16 @@ impl MountedMutationCommit<'_> {
         };
         let quarantine_path = parent_dir.join(&quarantine_leaf);
 
+        // Retain the staged object's evidence through the install and the
+        // landing proof, exactly like the unix form.
+        let staged_file = std::fs::File::open(staged).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                "the staged tag replacement could not be opened",
+            )
+        })?;
+        let staged_identity = object_identity(&staged_file)?;
+
         // Displace the confirmed entry under the fresh quarantine name. A
         // rename to a name that did not exist a moment ago never replaces an
         // existing entry, so this cannot clobber anything.
@@ -1017,7 +1088,11 @@ impl MountedMutationCommit<'_> {
             return Err(if error.kind() == io::ErrorKind::NotFound {
                 authority_changed("the confirmed mutation target no longer exists")
             } else {
-                error
+                io::Error::new(
+                    error.kind(),
+                    "the confirmed mutation target could not be displaced under \
+                     its quarantine name",
+                )
             });
         }
 
@@ -1065,12 +1140,35 @@ impl MountedMutationCommit<'_> {
             }
         }
 
-        // Retire the displaced original — the entry a plain rename over the
-        // target would have consumed. The replacement has already landed, so
-        // a removal failure here leaves the prior object under the
-        // quarantine sibling rather than failing the committed write.
+        // Prove the landing on the exact staged object before anything is
+        // retired, mirroring the unix form. A failed proof means a stranger
+        // was swapped over the staging name or the leaf; the admitted
+        // original is still intact under its quarantine name — put it back
+        // (conditioned) and refuse with both objects preserved.
+        let replaced = std::fs::File::open(&self.target.path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                "the installed replacement could not be re-opened for its landing proof",
+            )
+        });
+        let landed = match replaced {
+            Ok(file) => object_identity(&file),
+            Err(error) => Err(error),
+        };
+        if !landed.is_ok_and(|identity| identity == staged_identity) {
+            let _ = std::fs::rename(&self.target.path, parent_dir.join(quarantine_name(&leaf)));
+            let _ = rename_noreplace(&quarantine_path, &self.target.path);
+            return Err(authority_changed(
+                "the tagged replacement did not land on the retained mutation target",
+            ));
+        }
+
+        // The landing is proven; only now retire the admitted original under
+        // its quarantine name. A removal failure here leaves it as a
+        // quarantine sibling — debris, never destruction.
+        drop(staged_file);
         let _ = std::fs::remove_file(&quarantine_path);
-        Ok(())
+        Ok(staged_identity)
     }
 
     /// Return one displaced entry to `leaf` through the retained parent
@@ -1361,6 +1459,38 @@ fn with_pre_install_interpose(interpose: Box<PreInstallInterpose>, run: impl FnO
 
 #[cfg(test)]
 static PRE_INSTALL_INTERPOSE_SERIAL: Mutex<()> = Mutex::new(());
+
+/// Test-only seam: run the registered pre-re-anchor interposition, if any.
+///
+/// The re-anchor refusal is only reachable when the leaf is swapped between
+/// the landing proof and the re-anchor's authority reopen — nanoseconds wide
+/// in production. A regression test registers a closure here that swaps the
+/// leaf deterministically in that window. Never compiled outside `cargo
+/// test`.
+#[cfg(test)]
+fn run_pre_reanchor_interpose(commit: &MountedMutationCommit<'_>) {
+    if let Some(interpose) = PRE_REANCHOR_INTERPOSE.lock().unwrap().as_ref() {
+        interpose(commit);
+    }
+}
+
+#[cfg(test)]
+type PreReanchorInterpose = dyn Fn(&MountedMutationCommit<'_>) + Send + Sync;
+
+#[cfg(test)]
+static PRE_REANCHOR_INTERPOSE: Mutex<Option<Box<PreReanchorInterpose>>> = Mutex::new(None);
+
+/// Serialize tests that use the pre-re-anchor interposition seam.
+#[cfg(test)]
+fn with_pre_reanchor_interpose(interpose: Box<PreReanchorInterpose>, run: impl FnOnce()) {
+    let _serial = PRE_REANCHOR_INTERPOSE_SERIAL.lock().unwrap();
+    *PRE_REANCHOR_INTERPOSE.lock().unwrap() = Some(interpose);
+    run();
+    *PRE_REANCHOR_INTERPOSE.lock().unwrap() = None;
+}
+
+#[cfg(test)]
+static PRE_REANCHOR_INTERPOSE_SERIAL: Mutex<()> = Mutex::new(());
 
 /// Verify a mounted bound against its retained mount authority.
 fn validate_mounted_bound(authority: &MountedRootAuthority, bound: &BoundFile) -> io::Result<()> {
@@ -2601,8 +2731,8 @@ mod tests {
     }
 
     #[test]
-    fn mutation_target_rebind_anchors_to_the_object_now_at_its_path() {
-        let directory = TestDirectory::new("mutation-rebind");
+    fn commit_replacement_reanchors_the_target_to_the_installed_object() {
+        let directory = TestDirectory::new("mutation-reanchor-success");
         let song = directory.path().join("song.flac");
         fs::write(&song, b"original audio").expect("write song");
 
@@ -2612,22 +2742,111 @@ mod tests {
             .open_mutation_target(Path::new("song.flac"))
             .expect("open mutation target");
 
-        let displaced = directory.path().join("displaced.flac");
-        fs::rename(&song, &displaced).expect("displace the admitted file");
-        fs::write(&song, b"replacement audio").expect("install different bytes");
+        // The staged copy sits beside the target, as the tag writer stages it.
+        let staged = directory.path().join(".song.tributary-tag-tmp.flac");
+        fs::write(&staged, b"tagged audio").expect("stage the replacement");
 
         // A successful replacement retires the object the section copied
-        // from; rebind anchors the evidence to the object now at the path so
-        // a follow-up commit is authorized for the file that exists now.
-        target.rebind().expect("rebind to the replacement");
-        let commit = target.begin_commit().expect("begin section after rebind");
-        commit
+        // from; the section re-anchors the retained evidence to the exact
+        // installed object — identity-checked against the proven landing,
+        // inside the commit guard — so a follow-up commit is authorized for
+        // the file that exists now, without ever reopening the leaf by path
+        // outside the section.
+        // The commit section holds the target's commit lock until its guard
+        // is dropped, so the first section must end before the follow-up
+        // section begins — a nested begin_commit on the same target would
+        // self-deadlock on the non-reentrant Mutex.
+        {
+            let mut commit = target.begin_commit().expect("begin commit section");
+            commit
+                .commit_replacement(&staged)
+                .expect("the replacement commits and re-anchors the target");
+            assert!(
+                !staged.exists(),
+                "a successful install consumes the staging name"
+            );
+        }
+
+        let follow_up = target.begin_commit().expect("begin the follow-up section");
+        follow_up
             .confirm_replacement_target()
-            .expect("the rebound object is the admitted one");
-        let mut source = commit.source_file().expect("clone rebound source");
+            .expect("the re-anchored object is the admitted one");
+        let mut source = follow_up.source_file().expect("clone re-anchored source");
         let mut contents = Vec::new();
         source.read_to_end(&mut contents).expect("read source");
-        assert_eq!(contents, b"replacement audio");
+        assert_eq!(
+            contents, b"tagged audio",
+            "the re-anchored evidence must read the installed replacement"
+        );
+    }
+
+    /// The re-anchor must stay conditional on the proven landing: an external
+    /// writer that swaps the leaf between the landing proof and the
+    /// re-anchor's authority reopen must not be adopted as the retained
+    /// evidence — a later commit anchored to that stranger would overwrite a
+    /// file the user never selected. The section must refuse, and the target
+    /// must invalidate itself: its binding still names the retired pre-commit
+    /// object, so every later revalidation fails closed.
+    #[test]
+    fn commit_replacement_refuses_a_leaf_swapped_after_the_landing_proof_and_invalidates_the_target(
+    ) {
+        let directory = TestDirectory::new("mutation-reanchor-swap");
+        let song = directory.path().join("song.flac");
+        fs::write(&song, b"original audio").expect("write song");
+
+        let authority =
+            Arc::new(MountedRootAuthority::acquire(directory.path()).expect("acquire authority"));
+        let target = authority
+            .open_mutation_target(Path::new("song.flac"))
+            .expect("open mutation target");
+
+        // The staged copy sits beside the target, as the tag writer stages it.
+        let staged = directory.path().join(".song.tributary-tag-tmp.flac");
+        fs::write(&staged, b"tagged audio").expect("stage the replacement");
+        let watched_leaf = song.clone();
+
+        with_pre_reanchor_interpose(
+            Box::new(move |commit| {
+                if commit.target.path != watched_leaf {
+                    return;
+                }
+                // The landing proof has already passed on the staged copy.
+                // Swap the leaf now — unlink plus recreate, a different
+                // object — exactly where a stranger would be adopted by an
+                // unconstrained post-commit rebind.
+                let path = commit.target.path.clone();
+                fs::remove_file(&path).expect("unlink the installed replacement");
+                fs::write(&path, b"stranger audio").expect("install a stranger at the leaf");
+            }),
+            || {
+                let mut commit = target.begin_commit().expect("begin commit section");
+                commit
+                    .commit_replacement(&staged)
+                    .expect_err("a leaf swapped before the re-anchor must refuse the commit");
+            },
+        );
+
+        // The stranger keeps the name: the refused re-anchor must not touch
+        // the leaf, and the retired original must not be resurrected over it.
+        assert_eq!(
+            fs::read(&song).expect("read the leaf back"),
+            b"stranger audio",
+            "the refused re-anchor must leave the leaf exactly as the external writer left it"
+        );
+        // The landing was proven, so the section retired the quarantined
+        // original and consumed the staged copy before the swap.
+        assert!(
+            !staged.exists(),
+            "the landing preceded the swap, so the staged copy was consumed"
+        );
+        assert_no_quarantine_sibling_remains(&directory);
+
+        // The target invalidated itself: the binding still names the retired
+        // pre-commit object, so the follow-up section must refuse.
+        let follow_up = target.begin_commit().expect("begin the follow-up section");
+        follow_up
+            .confirm_replacement_target()
+            .expect_err("the target must fail closed after a refused re-anchor");
     }
 
     /// The replacement must be performed relative to the retained parent
@@ -2663,7 +2882,7 @@ mod tests {
         let staged = displaced_album.join(".tributary-tag-staged.flac");
         fs::write(&staged, b"tagged audio").expect("stage the replacement");
 
-        let commit = target.begin_commit().expect("begin commit section");
+        let mut commit = target.begin_commit().expect("begin commit section");
         commit
             .commit_replacement(&staged)
             .expect("commit through the retained parent");
@@ -3251,7 +3470,7 @@ mod tests {
                 fs::write(&path, b"newcomer audio").expect("install a newcomer at the leaf");
             }),
             || {
-                let commit = target.begin_commit().expect("begin commit section");
+                let mut commit = target.begin_commit().expect("begin commit section");
                 commit
                     .commit_replacement(&staged)
                     .expect_err("a leaf swapped after confirm must refuse the commit");
@@ -3320,7 +3539,7 @@ mod tests {
                     .expect("recreate the leaf in the install window");
             }),
             || {
-                let commit = target.begin_commit().expect("begin commit section");
+                let mut commit = target.begin_commit().expect("begin commit section");
                 commit
                     .commit_replacement(&staged)
                     .expect_err("a leaf recreated in the install window must refuse the commit");
@@ -3387,7 +3606,7 @@ mod tests {
                     .expect("install a stranger at the staging name");
             }),
             || {
-                let commit = target.begin_commit().expect("begin commit section");
+                let mut commit = target.begin_commit().expect("begin commit section");
                 commit
                     .commit_replacement(&staged)
                     .expect_err("a stranger swapped over the staging name must refuse the commit");
@@ -3467,7 +3686,7 @@ mod tests {
         let staged = directory.path().join(".staged-one.flac");
         fs::write(&staged, b"tagged audio").expect("stage the first replacement");
         {
-            let commit = first
+            let mut commit = first
                 .begin_commit()
                 .expect("begin the first commit section");
             commit
@@ -3485,7 +3704,7 @@ mod tests {
         let staged_second = directory.path().join(".staged-two.flac");
         fs::write(&staged_second, b"second audio").expect("stage the second replacement");
         {
-            let commit = second
+            let mut commit = second
                 .begin_commit()
                 .expect("begin the second commit section");
             commit
