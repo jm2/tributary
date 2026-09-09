@@ -1,11 +1,13 @@
 //! Shared harness for the bot review gate decision tests: the extracted
-//! workflow script, a stubbed `gh` on PATH, and a throwaway sandbox per run.
+//! publisher script, a stubbed `gh` on PATH, and a throwaway sandbox per run.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 pub const BOT_REVIEW_GATE_YAML: &str = include_str!("../../.github/workflows/bot-review-gate.yml");
+pub const BOT_REVIEW_GATE_PUBLISHER_YAML: &str =
+    include_str!("../../.github/workflows/bot-review-gate-publisher.yml");
 pub const GH_STUB_SCRIPT: &str = include_str!("../fixtures/bot_review_gate/gh_stub.sh");
 pub const GATE_REPOSITORY: &str = "jm2/tributary";
 pub const GATE_PR_NUMBER: &str = "42";
@@ -16,20 +18,22 @@ pub fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bot_review_gate")
 }
 
+/// The publisher's evaluation script: the bytes Actions executes from the
+/// trusted default-branch workflow.
 pub fn gate_run_script() -> String {
-    let workflow: serde_yaml::Value =
-        serde_yaml::from_str(BOT_REVIEW_GATE_YAML).expect("bot review gate workflow must parse");
-    let steps = workflow["jobs"]["bot-review-gate"]["steps"]
+    let workflow: serde_yaml::Value = serde_yaml::from_str(BOT_REVIEW_GATE_PUBLISHER_YAML)
+        .expect("bot review gate publisher workflow must parse");
+    let steps = workflow["jobs"]["publish"]["steps"]
         .as_sequence()
-        .expect("the gate workflow must define its job steps");
+        .expect("the publisher workflow must define its job steps");
     let run = steps
         .first()
-        .expect("the gate job must define its evaluation step")["run"]
+        .expect("the publisher job must define its publication step")["run"]
         .as_str()
-        .expect("the gate evaluation step must inline its run script");
+        .expect("the publisher step must inline its run script");
     assert!(
         !run.trim().is_empty(),
-        "the gate run script must not be empty"
+        "the publisher run script must not be empty"
     );
     run.to_owned()
 }
@@ -63,8 +67,8 @@ pub fn copy_tree(source: &Path, destination: &Path) {
     }
 }
 
-/// A throwaway directory holding the extracted gate script, the `gh` stub on
-/// PATH, and the copied fixture pages for one run.
+/// A throwaway directory holding the extracted publisher script, the `gh`
+/// stub on PATH, and the copied fixture pages for one run.
 pub struct GateSandbox {
     pub root: PathBuf,
 }
@@ -120,42 +124,53 @@ impl GateSandbox {
         copy_tree(&source, &self.root.join("pages"));
     }
 
-    pub fn run(&self, event_name: &str, event_head_sha: Option<&str>) -> Output {
-        self.run_with_github_sha(event_name, event_head_sha, None)
-    }
-
-    /// Runs the gate with an explicit `GITHUB_SHA`, the runner-injected tip
-    /// of the ref an event (notably `workflow_dispatch`) executed against.
-    pub fn run_with_github_sha(
-        &self,
-        event_name: &str,
-        event_head_sha: Option<&str>,
-        github_sha: Option<&str>,
-    ) -> Output {
+    /// Runs the publisher with the announcing run's head commit.
+    ///
+    /// `event_name` records which announcer event produced the run (all
+    /// announcer completions fire the publisher identically); the binding
+    /// input is always `announcer_head_sha` — the announcing run's head, the
+    /// only commit the publisher is willing to evaluate.
+    pub fn run(&self, event_name: &str, announcer_head_sha: Option<&str>) -> Output {
         let script_path = self.root.join("gate.sh");
         std::fs::write(&script_path, gate_run_script()).expect("gate script must be writable");
 
         let system_path = std::env::var("PATH").unwrap_or_default();
         let path = format!("{}:{system_path}", self.root.join("bin").display());
 
-        let mut command = Command::new("bash");
-        command
+        Command::new("bash")
             .arg(&script_path)
             .env("PATH", path)
             .env("GH_TOKEN", "stub-token")
             .env("GITHUB_REPOSITORY", GATE_REPOSITORY)
             .env("GITHUB_EVENT_NAME", event_name)
-            .env("PR_NUMBER", GATE_PR_NUMBER)
-            .env("EVENT_HEAD_SHA", event_head_sha.unwrap_or(""))
+            .env("EVENT_HEAD_SHA", announcer_head_sha.unwrap_or(""))
             .env("RUNNER_TEMP", self.root.join("runner-temp"))
             .env("GH_STUB_PAGES", self.root.join("pages"))
-            .env("GH_STUB_STATE", self.root.join("state"));
-        if let Some(sha) = github_sha {
-            command.env("GITHUB_SHA", sha);
-        }
-        command
+            .env("GH_STUB_STATE", self.root.join("state"))
             .output()
-            .expect("the gate script must be runnable under bash")
+            .expect("the publisher script must be runnable under bash")
+    }
+
+    /// Every check-run the publisher published during the run, in
+    /// publication order: one line per `CHECK-RUN name=... head_sha=...
+    /// status=... conclusion=...` record the stub logged.
+    pub fn check_runs(&self) -> Vec<String> {
+        std::fs::read_to_string(self.root.join("state/check-runs.log")).map_or_else(
+            |_| Vec::new(),
+            |log| log.lines().map(str::to_owned).collect(),
+        )
+    }
+
+    /// The single check-run the publisher must have published, with the
+    /// `field=value` fields following the `CHECK-RUN` marker.
+    pub fn single_check_run(&self) -> String {
+        let check_runs = self.check_runs();
+        assert_eq!(
+            check_runs.len(),
+            1,
+            "the publisher must publish exactly one check-run:\n{check_runs:?}"
+        );
+        check_runs[0].clone()
     }
 }
 
@@ -174,10 +189,10 @@ pub fn report(output: &Output) -> String {
     )
 }
 
-pub fn run_scenario(scenario: &str, event_name: &str, event_head_sha: Option<&str>) -> Output {
+pub fn run_scenario(scenario: &str, event_name: &str, announcer_head_sha: Option<&str>) -> Output {
     let sandbox = GateSandbox::new(scenario);
     sandbox.use_scenario(scenario);
-    sandbox.run(event_name, event_head_sha)
+    sandbox.run(event_name, announcer_head_sha)
 }
 
 pub fn assert_blocked(output: &Output, expected_stdout: &[&str], expected_stderr: &str) {

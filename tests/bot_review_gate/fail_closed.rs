@@ -1,32 +1,33 @@
-//! Fail-closed and head-binding behavior: dispatches, pagination
-//! completeness, query failures, and the documented refresh paths.
+//! Fail-closed and head-binding behavior: the announcer-head binding,
+//! pagination completeness, query failures, and the documented refresh paths.
 
 use super::harness::{
     assert_blocked, report, run_scenario, GateSandbox, GATE_PR_NUMBER, HEAD_SHA, OTHER_SHA,
 };
 
 #[test]
-fn dispatch_on_a_ref_other_than_the_head_is_refused() {
-    // A workflow_dispatch run is attached to the dispatched ref's tip
-    // (GITHUB_SHA) while pr_number only names the pull request to evaluate.
-    // A dispatch on any other ref — another branch, or main — would attach
-    // this pull request's required check to a run whose evidence was
-    // evaluated at a different commit, so the gate must refuse it before
-    // evaluating anything.
-    let sandbox = GateSandbox::new("dispatch-cross-bound");
+fn the_publisher_requires_the_announcing_runs_head() {
+    // The publisher binds its verdict to the announcing run's head commit.
+    // Without that commit there is nothing it is willing to evaluate — and
+    // no check-run it could honestly publish.
+    let sandbox = GateSandbox::new("announcer-head-missing");
     sandbox.use_scenario("clean");
-    let output = sandbox.run_with_github_sha("workflow_dispatch", None, Some(OTHER_SHA));
-    assert_blocked(&output, &[], "is not pull request head");
+    let output = sandbox.run("workflow_dispatch", None);
+    assert_blocked(&output, &[], "requires the announcing run's head commit");
+    assert!(
+        sandbox.check_runs().is_empty(),
+        "no verdict may be published without a binding head"
+    );
 }
 
 #[test]
-fn dispatch_on_the_head_branch_publishes_evidence_at_that_head() {
-    // The documented refresh path dispatches on the head branch, whose tip
-    // equals the pull request head, so the run must proceed and publish its
-    // result bound to exactly that head.
-    let sandbox = GateSandbox::new("dispatch-head-bound");
+fn an_announcer_run_at_the_pull_request_head_publishes_evidence_at_that_head() {
+    // The documented refresh path dispatches the announcer on the head
+    // branch, whose tip equals the pull request head, so the publisher
+    // proceeds and publishes its verdict bound to exactly that head.
+    let sandbox = GateSandbox::new("announcer-head-bound");
     sandbox.use_scenario("clean");
-    let output = sandbox.run_with_github_sha("workflow_dispatch", None, Some(HEAD_SHA));
+    let output = sandbox.run("workflow_dispatch", Some(HEAD_SHA));
     assert!(
         output.status.success(),
         "the documented dispatch refresh path must pass on the head branch:\n{}",
@@ -35,13 +36,24 @@ fn dispatch_on_the_head_branch_publishes_evidence_at_that_head() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(&format!("clean at {HEAD_SHA}")),
-        "the dispatched run must publish evidence at the pull request head:\n{}",
+        "the published verdict must bind to the pull request head:\n{}",
         report(&output)
+    );
+    assert!(
+        sandbox
+            .single_check_run()
+            .contains(&format!("head_sha={HEAD_SHA}"))
+            && sandbox.single_check_run().contains("conclusion=success"),
+        "the green verdict must be published as the required context at the evaluated head"
     );
 }
 
 #[test]
 fn incomplete_thread_pagination_fails_closed() {
+    // The incomplete page is page 1 of 2, and page 2 is valid: only
+    // validation that inspects every page can catch the violation, so a
+    // regression to validating the last page alone would let this scenario
+    // pass and fail this test.
     let output = run_scenario(
         "thread-pagination-incomplete",
         "pull_request",
@@ -93,30 +105,8 @@ fn head_moved_during_evaluation_fails_closed() {
 }
 
 #[test]
-fn workflow_dispatch_derives_the_head_from_the_pull_request() {
-    // workflow_dispatch carries no pull-request context, so the head comes
-    // from the pull request record itself, bound to the dispatched ref's
-    // tip — the documented resolution refresh path dispatches on the head
-    // branch, whose tip is the pull request head.
-    let sandbox = GateSandbox::new("dispatch");
-    sandbox.use_scenario("dispatch");
-    let output = sandbox.run_with_github_sha("workflow_dispatch", None, Some(HEAD_SHA));
-    assert!(
-        output.status.success(),
-        "a dispatched refresh of clean evidence must pass:\n{}",
-        report(&output)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains(&format!("clean at {HEAD_SHA}")),
-        "the dispatched result must bind to the recorded head:\n{}",
-        report(&output)
-    );
-}
-
-#[test]
 fn non_main_base_fails_closed() {
-    let output = run_scenario("non-main-base", "workflow_dispatch", None);
+    let output = run_scenario("non-main-base", "pull_request", Some(HEAD_SHA));
     assert_blocked(&output, &[], "not main");
 }
 
@@ -130,7 +120,7 @@ fn stale_event_head_fails_closed() {
 fn thread_failure_prints_the_documented_refresh_paths() {
     // Thread resolution fires no Actions event, so the failure output must
     // point at the supported refresh paths: a check re-run or a targeted
-    // workflow_dispatch on the pull request's head branch.
+    // announcer dispatch on the pull request's head branch.
     let output = run_scenario("unresolved-current-thread", "pull_request", Some(HEAD_SHA));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
