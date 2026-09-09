@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use super::executor_rollback_tests::{entry_names, run_plan_expect_failure};
 use super::executor_tests::transfer_request;
 use super::test_support::{authority_pair, read_authority, write_source_file};
-use super::types::TransferItem;
+use super::types::{Stage, TransferItem};
 use super::TransferPlanner;
 use crate::local::write_authority::ConflictPolicy;
 
@@ -139,5 +139,61 @@ fn mount_swap_during_execution_fails_closed() {
             TransferError::AuthorityLost { .. } | TransferError::RollbackFailed { .. }
         ),
         "unexpected error: {error:?}"
+    );
+}
+
+/// A directory item mapped to a nested destination stages every missing
+/// ancestor before its leaf, and the executor records each created
+/// component: a failed transfer must remove the whole created chain
+/// instead of leaving created ancestor directories behind.
+#[test]
+fn nested_directory_item_rolls_back_every_created_ancestor() {
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    std::fs::create_dir(source_root.path().join("album")).expect("create empty source directory");
+    write_source_file(source_root.path(), "song.flac", b"song");
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = transfer_request(
+        source,
+        destination,
+        vec![
+            TransferItem::new(PathBuf::from("album"), PathBuf::from("x/y/z")),
+            TransferItem::same(PathBuf::from("song.flac")),
+        ],
+        ConflictPolicy::Preserve,
+    );
+    let plan = TransferPlanner::new().plan(&request).expect("plan");
+    let created_directory_stages: Vec<std::path::PathBuf> = plan
+        .stages()
+        .iter()
+        .filter_map(|stage| match stage {
+            Stage::CreateDirectory {
+                destination_relative_path,
+            } => Some(destination_relative_path.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        created_directory_stages,
+        vec![
+            std::path::PathBuf::from("x"),
+            std::path::PathBuf::from("x/y"),
+            std::path::PathBuf::from("x/y/z"),
+        ],
+        "the plan must stage every missing ancestor before the leaf"
+    );
+    // The later file stage fails after all three directory stages
+    // committed; rollback must remove z, then y, then x.
+    std::fs::remove_file(source_root.path().join("song.flac")).expect("remove source song");
+    let _error = run_plan_expect_failure(request, plan);
+    assert!(
+        !destination_root.path().join("x").exists(),
+        "the entire created ancestor chain must be removed"
+    );
+    assert_eq!(
+        entry_names(destination_root.path()),
+        Vec::<String>::new(),
+        "no created directory may survive the rollback"
     );
 }

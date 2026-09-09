@@ -1,6 +1,11 @@
 //! Conflict and outcome types for the mounted write authority.
 
+use std::io;
 use std::path::PathBuf;
+
+use thiserror::Error;
+
+use crate::local::root_authority::LeafIdentity;
 
 /// What the write authority should do when the destination of a write already
 /// exists beneath the mount.
@@ -48,4 +53,38 @@ pub struct CommitOutcome {
     /// and destroyed. `None` when nothing pre-existing was replaced (a
     /// fresh publish or a preserved sibling).
     pub replaced_original: Option<PathBuf>,
+    /// No-follow identity of the published leaf, captured immediately after
+    /// the winning publish by the write authority. Rollback reversals
+    /// compare this against whatever occupies the path before removing or
+    /// restoring over it, so a concurrent writer's replacement is detected
+    /// and refused instead of destroyed by pathname alone. `None` when the
+    /// identity could not be captured (the leaf vanished in the instant
+    /// after publishing, or the platform has no identity primitive); a
+    /// reversal of an identity-less record degrades to the legacy
+    /// path-only behavior.
+    pub published_leaf: Option<LeafIdentity>,
+}
+
+/// Failure of a staged-write commit.
+#[derive(Debug, Error)]
+pub enum CommitError {
+    /// The publish itself never happened: the staged file was not renamed
+    /// to its destination and nothing was changed there.
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    /// The publish DID happen — the staged bytes were renamed to the
+    /// destination — but the post-publish mount revalidation failed. The
+    /// outcome is carried so the caller can record the publication for
+    /// rollback before surfacing the failure: dropping it would leave
+    /// committed bytes unrecorded, so a failed transfer could never undo
+    /// them.
+    #[error("staged file was published but post-publish verification failed: {error}")]
+    PublishVerification {
+        /// What was published, including the backup bind of a replaced
+        /// occupant and the published leaf's identity.
+        outcome: CommitOutcome,
+        /// The verification failure.
+        #[source]
+        error: io::Error,
+    },
 }

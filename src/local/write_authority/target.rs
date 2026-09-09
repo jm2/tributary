@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use super::policy::{CommitOutcome, ConflictPolicy, ConflictResolution};
+use super::policy::{CommitError, CommitOutcome, ConflictPolicy, ConflictResolution};
 #[cfg(unix)]
 use super::staging::discard_staged_file;
 #[cfg(not(unix))]
 use super::staging::{discard_staged_file, rollback_staged};
-use crate::local::root_authority::{MountedRootAuthority, RetainedWriteParent};
+use crate::local::root_authority::{LeafIdentity, MountedRootAuthority, RetainedWriteParent};
 
 /// A staged write below a [`MountedWriteAuthority`](super::MountedWriteAuthority)
 /// ready for commit/rollback.
@@ -129,9 +129,18 @@ impl PreparedWriteTarget {
     /// is revalidated immediately before and after the rename so a binder
     /// swap or remount between staging and commit cannot authorise a
     /// partial publish.
-    pub fn commit(mut self) -> io::Result<CommitOutcome> {
-        self.authority.validate()?;
-        self.parent.validate_with(&self.authority)?;
+    ///
+    /// Errors are typed: [`CommitError::Io`] means nothing was published,
+    /// while [`CommitError::PublishVerification`] means the staged bytes
+    /// WERE published but the post-publish mount revalidation failed. The
+    /// verification variant carries the [`CommitOutcome`] so the caller can
+    /// record the publication for rollback before surfacing the failure —
+    /// a committed file whose outcome is dropped can never be undone.
+    pub fn commit(mut self) -> Result<CommitOutcome, CommitError> {
+        self.authority.validate().map_err(CommitError::from)?;
+        self.parent
+            .validate_with(&self.authority)
+            .map_err(CommitError::from)?;
         let final_path = self.authority.root().join(&self.final_relative_path);
         let final_leaf = self
             .final_relative_path
@@ -140,27 +149,40 @@ impl PreparedWriteTarget {
                 io::Error::new(io::ErrorKind::InvalidInput, "final path is missing a leaf")
             })?
             .to_os_string();
-        self.flush_and_close_staged()?;
-        let replaced_original = if self.resolution == ConflictResolution::Overwrite {
-            self.publish_overwrite_with_backup(&final_leaf, &final_path)?
-        } else {
-            self.authority.rename_within_directory(
-                &self.parent,
-                &self.staged_leaf,
-                &self.staged_path,
-                &final_leaf,
-                &final_path,
-                true,
-            )?;
-            None
-        };
-        self.authority.validate()?;
-        self.committed = true;
-        Ok(CommitOutcome {
+        self.flush_and_close_staged().map_err(CommitError::from)?;
+        let (replaced_original, published_leaf) =
+            if self.resolution == ConflictResolution::Overwrite {
+                self.publish_overwrite_with_backup(&final_leaf, &final_path)
+                    .map_err(CommitError::from)?
+            } else {
+                let published_leaf = self
+                    .authority
+                    .rename_within_directory(
+                        &self.parent,
+                        &self.staged_leaf,
+                        &self.staged_path,
+                        &final_leaf,
+                        &final_path,
+                        true,
+                    )
+                    .map_err(CommitError::from)?;
+                (None, published_leaf)
+            };
+        let outcome = CommitOutcome {
             relative_path: self.final_relative_path.clone(),
             resolution: self.resolution,
             replaced_original,
-        })
+            published_leaf,
+        };
+        // The bytes are now at the destination no matter what happens next:
+        // a failed post-publish verification must not discard the outcome,
+        // or the published file (and a replaced occupant's saved backup)
+        // would be unrecorded and unreachable from rollback.
+        if let Err(error) = self.authority.validate() {
+            return Err(CommitError::PublishVerification { outcome, error });
+        }
+        self.committed = true;
+        Ok(outcome)
     }
 
     /// Flush the staged handle to disk and close it before any publish
@@ -179,15 +201,16 @@ impl PreparedWriteTarget {
 
     /// Publish the staged file over an existing occupant by replace, never
     /// unbacked: the occupant of the destination name is bound to a hidden
-    /// backup sibling at commit time (a hard link where the filesystem
-    /// supports them, else a verified commit-time copy), and the backup's
-    /// relative path is returned so the caller can restore exactly the
-    /// bytes that were destroyed.
+    /// backup sibling at commit time (a hard link where the filesystem supports
+    /// them, else a verified commit-time copy), and the backup's relative
+    /// path is returned so the caller can restore exactly the bytes that
+    /// were destroyed. The published leaf's identity is returned alongside
+    /// for identity-verified rollback.
     fn publish_overwrite_with_backup(
         &self,
         final_leaf: &OsStr,
         final_path: &Path,
-    ) -> io::Result<Option<PathBuf>> {
+    ) -> io::Result<(Option<PathBuf>, Option<LeafIdentity>)> {
         let backup_leaf = backup_leaf_name();
         let mut backup_relative = self
             .final_relative_path
@@ -196,7 +219,7 @@ impl PreparedWriteTarget {
             .unwrap_or_default();
         backup_relative.push(backup_leaf.as_os_str());
         let backup_absolute = self.authority.root().join(&backup_relative);
-        let replaced = self.authority.replace_within_directory(
+        let (replaced, published_leaf) = self.authority.replace_within_directory(
             &self.parent,
             &self.staged_leaf,
             &self.staged_path,
@@ -205,7 +228,8 @@ impl PreparedWriteTarget {
             backup_leaf.as_os_str(),
             &backup_absolute,
         )?;
-        Ok(replaced.then_some(backup_relative))
+        let replaced_original = replaced.then_some(backup_relative);
+        Ok((replaced_original, published_leaf))
     }
 
     /// Discard the staged file and any partial writes.
@@ -280,12 +304,24 @@ pub struct MountedDirectory {
     pub(super) lease_token: Uuid,
     pub(super) authority: Arc<MountedRootAuthority>,
     pub(super) relative_path: PathBuf,
+    /// Best-effort no-follow identity of the created directory, captured at
+    /// bind time for identity-verified rollback. `None` when the identity
+    /// could not be captured; such directories degrade to the legacy
+    /// path-only reversal.
+    pub(super) identity: Option<LeafIdentity>,
 }
 
 impl MountedDirectory {
     /// Return the relative path of this directory.
     pub fn relative_path(&self) -> &Path {
         &self.relative_path
+    }
+
+    /// The no-follow identity captured for this directory at creation, if
+    /// the platform could capture one. Rollback compares this against the
+    /// directory before removing it.
+    pub fn identity(&self) -> Option<LeafIdentity> {
+        self.identity
     }
 
     /// Prepare a writable file directly inside this directory.

@@ -36,8 +36,10 @@ mod tests;
 // transfer planner and the upcoming sync callers; until then the re-export
 // carries the intended public surface.
 #[allow(unused_imports)]
+pub use crate::local::root_authority::{LeafIdentity, ReversalOutcome};
+#[allow(unused_imports)]
 pub use authority::MountedWriteAuthority;
 #[allow(unused_imports)]
-pub use policy::{CommitOutcome, ConflictPolicy, ConflictResolution};
+pub use policy::{CommitError, CommitOutcome, ConflictPolicy, ConflictResolution};
 #[allow(unused_imports)]
 pub use target::{MountedDirectory, PreparedWriteTarget};

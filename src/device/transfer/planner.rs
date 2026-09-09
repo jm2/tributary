@@ -79,7 +79,17 @@ impl<'a> PlanBuilder<'a> {
         let source_absolute = self.request.source.root().join(&item.source_relative_path);
         let metadata = read_source_metadata(&source_absolute, &item.source_relative_path)?;
         if metadata.is_dir() {
-            self.ensure_directory_stage(&item.destination_relative_path);
+            // A directory item mapped to a nested destination must stage
+            // every missing ancestor before its leaf, exactly once each:
+            // the executor records each created component for rollback, so
+            // a failed transfer removes the whole created chain instead of
+            // leaving ancestors behind.
+            ensure_ancestor_directory_stages(
+                &item.destination_relative_path,
+                &mut self.stages,
+                &mut self.directory_count,
+                &mut self.created_directories,
+            )?;
             if self.request.recurse_directories {
                 self.collect_directory_stages(item)?;
             }
@@ -234,19 +244,6 @@ impl<'a> PlanBuilder<'a> {
             &mut self.directory_count,
             &mut self.created_directories,
         )
-    }
-
-    /// Stage one directory creation exactly once.
-    fn ensure_directory_stage(&mut self, directory_path: &Path) {
-        if self
-            .created_directories
-            .insert(directory_path.to_path_buf())
-        {
-            self.stages.push(Stage::CreateDirectory {
-                destination_relative_path: directory_path.to_path_buf(),
-            });
-            self.directory_count = self.directory_count.saturating_add(1);
-        }
     }
 
     /// Apply the capacity budget and freeze the accumulated plan.
