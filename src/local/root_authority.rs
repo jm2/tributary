@@ -2824,6 +2824,26 @@ mod tests {
         assert!(parse_fdinfo_mount_generation("mnt_id:\t1\nmnt_id:\t2\n").is_err());
     }
 
+    /// Assert that a refused commit left no quarantine sibling behind: the
+    /// caller's staging name must already be cleaned up so only replacement
+    /// debris could match.
+    fn assert_no_quarantine_sibling_remains(directory: &TestDirectory) {
+        let leftovers: Vec<PathBuf> = fs::read_dir(directory.path())
+            .expect("list the directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("tributary-replaced"))
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a refused commit must restore the displaced leaf and leave no quarantine sibling: {leftovers:?}"
+        );
+    }
+
     /// The replacement must be conditional on the confirmed leaf identity.
     /// An external writer that swaps the leaf after the confirm step has
     /// proven it — precisely what a plain rename over the name would
@@ -2894,20 +2914,7 @@ mod tests {
             "the staged copy must survive a refused commit for the caller to clean up"
         );
         fs::remove_file(&staged).expect("remove the staged copy");
-        let leftovers: Vec<PathBuf> = fs::read_dir(directory.path())
-            .expect("list the directory")
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains("tributary-replaced"))
-            })
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "a refused commit must restore the swapped leaf and leave no quarantine sibling: {leftovers:?}"
-        );
+        assert_no_quarantine_sibling_remains(&directory);
     }
 
     /// Two targets admitted for the same leaf at different times must
