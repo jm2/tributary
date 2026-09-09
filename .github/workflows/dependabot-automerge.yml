@@ -195,6 +195,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ steps.ruleset_reader.outputs.token }}
+          GATE_PUBLISHER_APP_ID: ${{ vars.BOT_REVIEW_GATE_APP_ID }}
         run: |
           set -euo pipefail
           # Native auto-merge waits only on the checks the live main ruleset
@@ -207,8 +208,22 @@ jobs:
           # refuse auto-merge until each policy context below is required with
           # its expected app binding ("15368" GitHub Actions, "57789" GitHub
           # Advanced Security/CodeQL, "56611" Codacy, empty = unbound commit
-          # status context). Fail closed: a query failure or coverage gap
+          # status context, and the Bot Review Gate from the dedicated
+          # gate-publisher App). Fail closed: a query failure or coverage gap
           # keeps routine auto-merge off.
+          # The Bot Review Gate must be required from the dedicated
+          # gate-publisher App — never from the shared GitHub Actions
+          # integration (15368), whose check runs ANY pull-request-controlled
+          # workflow job can publish under any name, letting a forged green
+          # `Bot Review Gate` satisfy the required context. The app id is
+          # owned by repository administration via the repository variable,
+          # and an unset or non-numeric value refuses auto-merge.
+          case "${GATE_PUBLISHER_APP_ID}" in
+            ''|*[!0-9]*)
+              echo >&2 "vars.BOT_REVIEW_GATE_APP_ID is not set to a numeric app id (found: '${GATE_PUBLISHER_APP_ID:-}'); refusing auto-merge."
+              exit 1
+              ;;
+          esac
           expected_checks=(
             "Security Audit|15368"
             "Linux (x86_64)|15368"
@@ -221,7 +236,7 @@ jobs:
             "Coverage (Linux x86_64)|15368"
             "Desktop Metadata|15368"
             "SHA256 Checksums|15368"
-            "Bot Review Gate|15368"
+            "Bot Review Gate|${GATE_PUBLISHER_APP_ID}"
             "CodeQL|57789"
             "Analyze (python)|57789"
             "Analyze (rust)|57789"

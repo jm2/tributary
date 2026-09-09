@@ -29,9 +29,12 @@ name: Bot review gate
 #
 # Fail-closed posture: tampering with this announcer can only SUPPRESS the
 # refresh (deleting or never completing it leaves the required check
-# unreported, which blocks the merge) — it can never produce a passing
-# `Bot Review Gate` result, because that context is created only by the
-# default-branch publisher.
+# unreported, which blocks the merge). Nor can a pull request forge a
+# passing result: the live `main` ruleset requires the context from the
+# dedicated gate-publisher App integration (see the publisher workflow), and
+# every check run a pull-request-controlled job can publish — this file's
+# own job included — is authored by the shared GitHub Actions integration,
+# which the ruleset does not match.
 on:
   pull_request:
     branches:
