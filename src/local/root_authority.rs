@@ -945,7 +945,7 @@ impl MountedMutationCommit<'_> {
                 // displaced objects stay under their quarantine names: debris,
                 // never destruction.
                 let _ =
-                    std::fs::rename(&self.target.path, &parent_dir.join(quarantine_name(&leaf)));
+                    std::fs::rename(&self.target.path, parent_dir.join(quarantine_name(&leaf)));
                 let _ = rename_noreplace(&quarantine_path, &self.target.path);
                 return Err(authority_changed(
                     "the mutation target leaf was recreated during the commit",
