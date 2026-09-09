@@ -346,18 +346,34 @@ buffers:
    remove: unlink it, then set it to `NULL` before dropping the reference), and re-link the
    chain (`equalizer-10bands` ↔ `rglimiter` ↔ post-EQ `audioconvert`, or directly
    `equalizer-10bands` ↔ post-EQ `audioconvert` when the limiter is removed).
-3. Return `GST_PAD_PROBE_REMOVE` from the callback so the probe uninstalls itself and
-   blocked data flow resumes across the new topology.
+3. Return `GST_PAD_PROBE_REMOVE` from the callback only over a valid topology. On success
+   the re-linked chain is valid, and the return uninstalls the probe so blocked data flow
+   resumes across the new topology. On a re-link failure the callback must not resume flow
+   across the broken chain: it first restores the pre-edit layout — undoing the partial
+   `rglimiter` insert/remove (a half-added element is set to `NULL` before dropping it) and
+   re-linking the exact pad pair that was linked when the edit began, a chain that was valid
+   and flowing immediately before the edit — and only then returns `GST_PAD_PROBE_REMOVE`,
+   so flow resumes across the restored known-good layout while the pending toggle is retried
+   by the fallback. The callback never uninstalls the probe while the `equalizer-10bands`
+   src pad has no linked downstream peer.
 4. Mark the change in metrics as a brief swap (≤ 100 ms by spec).
 
-Because every step of the topology edit happens while the blocking probe holds the stream,
-no buffer ever observes the intermediate unlinked state and `GST_FLOW_NOT_LINKED` cannot
-reach the bus from this path.
+Because every step of the topology edit — including the failure path — happens while the
+blocking probe holds the stream, no buffer ever observes an intermediate unlinked state: the
+probe is uninstalled only over a validated topology (the new layout on success, the restored
+pre-edit layout on failure), so `GST_FLOW_NOT_LINKED` cannot reach the bus from this path.
+If even the restoration fails, no valid playback topology exists: the probe stays installed,
+the stream stays stopped, and the implementation posts an explicit error diagnostic; the
+wedged pipeline is discarded by the ordinary teardown seams (output switch or application
+shutdown), never resumed — no buffer is ever pushed across an unlinked pad, so this path
+produces no `GST_FLOW_NOT_LINKED` message.
 
-If the dynamic re-link fails, the implementation falls back to the pause/relink seam (pause
-the pipeline, add/remove and link, resume). If the limiter cannot be attached by either path,
-the failure is a recoverable error: the chain degrades to the no-limiter layout and the
-user-visible status becomes the same as `Clip protection = Off`. When the playing track is a
+If the dynamic re-link fails, the pre-edit layout is restored under the probe (step 3) and
+playback continues across it while the implementation retries the toggle with the
+pause/relink seam (pause the pipeline, add/remove and link, resume). If the limiter cannot
+be attached by either path, the failure is a recoverable error: the chain degrades to the
+no-limiter layout and the user-visible status becomes the same as
+`Clip protection = Off`. When the playing track is a
 live stream with no `gapless` table (e.g. a remote radio URL), the same dynamic seam is used,
 a one-time metadata-free "reconfiguring audio output" diagnostic is published, and element
 insert/remove at the bin boundary does not disturb the upstream decoder's buffering.
@@ -701,8 +717,10 @@ for this contract; new conditions require a new revision.
    field becomes `custom`; UI combo displays `Custom`.
 6. **Cycle clip protection Off → Soft → Off.** Dynamic in-bin insert/remove under a blocking
     pad probe, with state sync each time, so no buffer observes the intermediate topology; no
-    pipeline pause; total swap ≤ 100 ms per toggle; pause/relink fallback exercised if the
-    dynamic re-link is forced to fail.
+    pipeline pause; total swap ≤ 100 ms per toggle. With the dynamic re-link forced to fail,
+    the probe callback restores the pre-edit link before unblocking and flow resumes across
+    the restored layout, the pause/relink fallback completes the toggle at the pause
+    boundary, and no `GST_FLOW_NOT_LINKED` error reaches the bus.
 7. **Sine input above +6 dBFS with clip protection = Soft.** Output peak converges
    asymptotically to 0 dBFS without exceeding it; soft-knee compression engages at the −6 dBFS
    threshold; a 0 dBFS input is attenuated by approximately 1.1 dB; reflects the `rglimiter`
