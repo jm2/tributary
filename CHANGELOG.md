@@ -49,6 +49,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Release verification** — Verify that manual releases build the requested tag and stop
   artifact publication when checksum generation fails.
 
+### Security
+
+- **Bot review gate check-run trust boundary** — Split the required `Bot Review Gate`
+  check into a no-op announcer and a `workflow_run` publisher that GitHub always
+  executes from its default-branch revision, so a pull request can no longer no-op the
+  gate under the required name with pull-request-controlled workflow content. The
+  publisher binds every verdict to the announcing run's head commit, re-derives the
+  associated pull requests through the API from that exact commit, and publishes the
+  check-run itself under a `checks: write` grant; every refusal publishes its failing
+  verdict before returning, and a publication failure leaves the required context
+  unreported, which still blocks the merge.
+
 ## [0.6.2] — 2026-09-01
 
 ### Changed

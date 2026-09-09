@@ -163,7 +163,22 @@ satisfy the gate.
 | CodeRabbit | unbound (commit-status context, no app id) |
 
 `Bot Review Gate` is reported by the repository-owned
-`.github/workflows/bot-review-gate.yml`. It fails while, at one exact
+`.github/workflows/bot-review-gate-publisher.yml` — the trusted publisher —
+and refreshed by the announcer `.github/workflows/bot-review-gate.yml`. The
+split is the enforcement boundary: GitHub executes a `pull_request`-triggered
+workflow's pull-request revision, so the announcer deliberately contributes
+nothing but the refresh events (it evaluates nothing and holds no token
+scopes, and its job check-run carries a different name). The publisher is
+triggered by the announcer's `workflow_run` completions, and GitHub always
+executes a `workflow_run` workflow's default-branch revision — so a pull
+request cannot alter the evaluation or publication logic, cannot no-op the
+gate under the required name, and can only suppress its own refresh, which
+leaves the required check unreported and the merge blocked. The publisher
+binds its verdict to the announcing run's head commit, re-derives the
+associated pull requests through the API from that exact commit (the event's
+branch-derived pull-request fields are never trusted), and never checks out
+any commit; its only write grant is `checks: write` for the required
+context itself. It fails while, at one exact
 pull-request head, any of the following holds: a bot-started review thread is
 not explicitly resolved (GitHub's "outdated" flag never substitutes for
 resolution — moving code is not addressing a finding); a bot reviewer's
@@ -190,14 +205,16 @@ Resolving a review thread fires no GitHub Actions event
 the gate uses only documented Actions triggers and refreshes through:
 pushes (`synchronize`), review submissions, edits, and dismissals
 (`pull_request_review`), new review comments
-(`pull_request_review_comment`), and a targeted
+(`pull_request_review_comment`), a targeted
 `gh workflow run bot-review-gate.yml --ref <head branch> -f pr_number=<n>`
-(`workflow_dispatch`) or a plain check re-run. The dispatch must target the
-pull request's head branch: a dispatch run is attached to the dispatched
-ref's tip (`GITHUB_SHA`), so the gate fails closed unless that tip is exactly
-the head of the pull request named by `pr_number` — any other ref would let
-one pull request's required check be satisfied by evidence evaluated at a
-different commit. The gate's failure output
+(`workflow_dispatch`), or a plain check re-run — every announcer completion,
+a cancellation included, fires the publisher, which re-evaluates the current
+state. A dispatch must target the
+pull request's head branch: the publisher binds its verdict to the
+announcing run's head commit (`workflow_run.head_sha`), so a run announced
+from any other ref is refused exactly like a stale head — no evaluation can
+be bound to one pull request's required check from another commit. The
+publisher's failure output
 prints the dispatch path with the pull request number filled in.
 
 Reopening a previously resolved thread fires no Actions event either —
@@ -280,9 +297,12 @@ not re-enable non-Dependabot auto-merge.
    GitHub-org `actions/create-github-app-token` action; without this
    prerequisite the precondition fails closed and routine Dependabot
    auto-merge stays off, which is the safe direction.
-1. Land `.github/workflows/bot-review-gate.yml` first (this change) so the
-   `Bot Review Gate` check actually reports on pull requests before it can be
-   marked required. While the ruleset is still narrow, the gate is advisory
+1. Land the gate pair first (this change): the announcer
+   `.github/workflows/bot-review-gate.yml` and the trusted publisher
+   `.github/workflows/bot-review-gate-publisher.yml`, so the
+   `Bot Review Gate` check actually reports on pull requests from
+   default-branch content before it can be marked required. While the
+   ruleset is still narrow, the gate is advisory
    and the auto-merge precondition keeps routine Dependabot auto-merge off.
 2. Edit ruleset 17650907 to add every context in the table above with the
    listed app binding (`CodeRabbit` unbound), and switch on **require
