@@ -2978,6 +2978,38 @@ fn copy_bind_occupant_backup(
     }
 }
 
+/// Bind the current occupant of `to_absolute` to `backup_absolute` with a
+/// hard link, then rename the staged file over it. `Ok(Some(true))` means
+/// the occupant was replaced and backed up; `Ok(None)` means the occupant
+/// vanished between the typing and the bind and the caller must re-bind
+/// from the top.
+#[cfg(windows)]
+fn hard_link_bind_and_replace(
+    from_absolute: &Path,
+    to_absolute: &Path,
+    backup_absolute: &Path,
+) -> io::Result<Option<bool>> {
+    match std::fs::hard_link(to_absolute, backup_absolute) {
+        Ok(()) => {
+            if let Err(error) = std::fs::rename(from_absolute, to_absolute) {
+                // The publish failed; release our backup so the parent is
+                // not polluted with a hidden copy.
+                let _ = std::fs::remove_file(backup_absolute);
+                return Err(error);
+            }
+            Ok(Some(true))
+        }
+        // The occupant vanished between the typing and the bind.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        // No hard-link support (or an unbindable occupant): fail
+        // closed rather than replacing unbacked.
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot bind the destination occupant for backup; refusing an unbacked replace",
+        )),
+    }
+}
+
 /// Windows Overwrite publish loop. See [`replace_publish_loop`] for the
 /// contract; the operations are absolute-path based after the caller
 /// revalidated and pinned the retained parent, mirroring the established
@@ -3003,27 +3035,15 @@ fn replace_publish_loop(
                     "refusing to replace a directory with a file",
                 ));
             }
-            Ok(_) => match std::fs::hard_link(to_absolute, backup_absolute) {
-                Ok(()) => {
-                    if let Err(error) = std::fs::rename(from_absolute, to_absolute) {
-                        // The publish failed; release our backup so the
-                        // parent is not polluted with a hidden copy.
-                        let _ = std::fs::remove_file(backup_absolute);
-                        return Err(error);
-                    }
-                    return Ok(true);
+            Ok(_) => {
+                if let Some(replaced) =
+                    hard_link_bind_and_replace(from_absolute, to_absolute, backup_absolute)?
+                {
+                    return Ok(replaced);
                 }
-                // The occupant vanished between the typing and the bind.
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                // No hard-link support (or an unbindable occupant): fail
-                // closed rather than replacing unbacked.
-                Err(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "cannot bind the destination occupant for backup; refusing an unbacked replace",
-                    ));
-                }
-            },
+                // The occupant vanished between the typing and the bind;
+                // loop back and re-type before the next bind attempt.
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 match rename_no_replace_within_parent(
                     parent,
