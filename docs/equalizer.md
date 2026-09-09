@@ -248,10 +248,10 @@ the changes take effect. The boundary is:
 | Knob | Mid-playback? | Mechanism |
 | --- | --- | --- |
 | `Enabled` | yes | Pause → bin install/remove → resume |
-| `Preset` | yes | Buffer-boundary property-write transaction on the bin |
-| `Preamp` | yes | Buffer-boundary property-write transaction on the bin |
-| Single band `bandN` | yes | Buffer-boundary property-write transaction on the bin |
-| Multiple bands at once | yes | Buffer-boundary property-write transaction on the bin |
+| `Preset` | yes | Idle pad-probe buffer-boundary transaction (multi-property) |
+| `Preamp` | yes | Direct single-property write (no probe) |
+| Single band `bandN` | yes | Direct single-property write (no probe) |
+| Multiple bands at once | yes | Idle pad-probe buffer-boundary transaction (multi-property) |
 | `Clip protection` | yes | Dynamic in-bin `rglimiter` insert/remove under a blocking pad probe |
 | Band centres / Q | NO | Frozen by the spec; changing requires a new contract |
 
@@ -288,9 +288,9 @@ from that single snapshot. Per-property `notify` signals remain connected for te
 diagnostics, but the UI update path is the aggregate event only. The aggregate event
 provides no audio-buffer ordering guarantee and makes none; ordering is the probe's job.
 
-The *buffer-boundary transaction* required for multi-property updates (preamp changes, preset
-loads, multi-band batched edits) is an **idle pad probe** on the bin's sink ghost pad — the
-mechanism GStreamer actually provides for running code between buffers:
+The *buffer-boundary transaction* required for multi-property updates (preset loads, multi-band
+batched edits) is an **idle pad probe** on the bin's sink ghost pad — the mechanism GStreamer
+actually provides for running code between buffers:
 
 1. Capture the new band vector and preamp into a single typed struct (`EqSettings`).
 2. `gst_pad_add_probe` on `audio-filter-sink` with `GST_PAD_PROBE_TYPE_IDLE`. When the
@@ -305,7 +305,12 @@ already past the boundary inside the chain renders with the old coefficients whi
 lands. The contract accepts exactly one buffer of intermediate gain combination (≈ 21 ms at
 the default 1024-sample buffer and 48 kHz) as the defined transient; it is strictly bounded
 and inaudible in practice. Single-property writes (one band, or the preamp alone) skip the
-probe and write directly.
+probe and write directly: exactly one property changes, so there is no intermediate
+combination of gains to bound — every buffer renders with the old value until the write
+returns, and with the new value from the first buffer that element processes afterwards.
+This is the one update mechanism for a preamp-only or single-band edit; no probe variant
+exists for it, and the timing expectations in the acceptance matrix are stated against this
+paragraph.
 
 No configuration write produces, waits for, or requires any bus message. `GST_EVENT_CAPS` and
 `GST_EVENT_SEGMENT` are pad events serialized with the stream; they are not acknowledgements,
@@ -389,37 +394,65 @@ The fifteen keys, in six logical groups:
 `equalizer.cfg` lives in the existing `dirs::data_dir()/tributary/` directory beside
 `volume`. The file is owned by the equalizer module; no other module reads or writes it.
 
-The writer uses an *atomic replace* protocol: it constructs the new content in memory, creates a
-uniquely named temporary file in the destination's directory (mode `0600`, owned by the user),
-writes the entire buffer with a write-all loop that keeps writing until every byte is accepted
-or a permanent error surfaces (Rust's `std::io::Write::write_all` provides exactly this
-semantics) — a single `write()`/`pwrite()` may legally complete with a short byte count even
-for a small regular file, and syncing-and-renaming after a short write would publish a
-truncated file that the next load would classify as malformed and discard — `fsync`s the file
-descriptor, then `close()`s it, then `rename(2)`s the temp file to `equalizer.cfg`, then
-`fsync`s the directory. The content is bounded by the schema — at most a few hundred bytes
-even at the maximum band precision — so the loop terminates in one pass in practice; the loop,
-not the size assumption, is what makes the published file complete. After the directory
-`fsync` returns, the new file is durable; an on-disk reader observes either the prior file or
-the new file, never a partial one.
+The writer uses an *atomic replace* protocol. The steps are normative and platform-neutral;
+each platform maps them onto its own operations as specified below:
+
+1. Construct the new content in memory.
+2. Create a uniquely named temporary file in the destination's directory, with permissions
+   restricted to the invoking user (mode `0600` on platforms that expose per-file modes).
+3. Write the entire buffer with a write-all loop that keeps writing until every byte is
+   accepted or a permanent error surfaces (Rust's `std::io::Write::write_all` provides exactly
+   this semantics). A single `write()` may legally complete with a short byte count even for a
+   small regular file, and replacing after a short write would publish a truncated file that
+   the next load would classify as malformed and discard.
+4. Flush the file's contents to stable storage (`sync_all` — `fsync(2)` on Unix,
+   `FlushFileBuffers` on Windows) and close the file.
+5. Atomically replace `equalizer.cfg` with the temporary file using the platform's
+   rename-within-directory operation (per-platform below).
+6. On platforms that provide a directory-sync operation (POSIX platforms), `fsync` the
+   destination directory so the new directory entry is durable.
+
+The content is bounded by the schema — at most a few hundred bytes even at the maximum band
+precision — so the loop terminates in one pass in practice; the loop, not the size assumption,
+is what makes the published file complete. On every supported platform, an on-disk reader
+observes either the prior file or the complete new file, never a partial one. Durability
+claims are exactly the ones each platform can make, no more:
+
+- **Unix (Linux, macOS).** The replace in step 5 is `rename(2)` within the destination
+  directory, which is atomic with respect to readers. After the file sync in step 4 and the
+  directory sync in step 6 return, the new content is durable across a power loss. On
+  filesystems that do not honor a directory `fsync` (some macOS configurations), the replace
+  remains atomic for readers, and durability of the newest directory entry degrades to what
+  the filesystem itself guarantees; the contract does not claim more than the platform
+  delivers.
+- **Windows.** The replace in step 5 is `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` and
+  `MOVEFILE_WRITE_THROUGH` — the operation `tempfile::NamedTempFile::persist` performs on
+  that platform, the same persist-after-sync pattern the repository already uses for XSPF
+  export and preference writes. NTFS metadata journaling makes the replace atomic with
+  respect to readers and crash-consistent; the file contents were flushed in step 4, and
+  write-through covers the replacement itself. Windows has no directory-handle sync
+  operation, so step 6 does not apply and no directory-entry durability is claimed beyond
+  the write-through semantics of the replace call.
 
 The temp name is minted fresh for every write attempt — a random segment (for example a UUID, as
-in the existing XSPF-export writer) beside the destination — and created exclusively (`O_EXCL`,
-as `tempfile::NamedTempFile` provides). A fixed sibling name such as `equalizer.cfg.tmp` is
+in the existing XSPF-export writer) beside the destination — and created exclusively (a
+no-overwrite create: `O_EXCL` on Unix, `CREATE_NEW` on Windows, as `tempfile::NamedTempFile`
+provides). A fixed sibling name such as `equalizer.cfg.tmp` is
 explicitly rejected: exclusive creation with a fixed name does not serialize writers, it makes
-the second writer's create fail with `AlreadyExists`, and a crash between create and rename
+the second writer's create fail with `AlreadyExists`, and a crash between create and replace
 would wedge every later save behind a stale temp the next writer must not delete. With a unique
 name, every writer owns a private staging path, so interleaved or crash-interrupted writes can
-never corrupt each other's temp file; `rename(2)` itself is atomic with respect to the
-destination and publishes that writer's complete content or nothing. Within the application the
-equalizer module is the sole writer — the debounced save and the shutdown flush both run on the
-GTK main loop — so completed renames are ordered and last-writer-wins by construction.
+never corrupt each other's temp file; the replace operation itself is atomic with respect to
+the destination on every supported platform and publishes that writer's complete content or
+nothing. Within the application the equalizer module is the sole writer — the debounced save
+and the shutdown flush both run on the GTK main loop — so completed replaces are ordered and
+last-writer-wins by construction.
 
 Recovery edges are specified, not incidental: if exclusive creation reports `AlreadyExists`
 (name collision, vanishingly unlikely with a random segment), the writer mints a new unique
-name and retries rather than deleting the existing file. If any step fails before the rename,
+name and retries rather than deleting the existing file. If any step fails before the replace,
 the writer removes only the temp file it created for that attempt and leaves the destination
-untouched. A temp file orphaned by a crash between creation and rename is inert garbage:
+untouched. A temp file orphaned by a crash between creation and replace is inert garbage:
 readers only ever open `equalizer.cfg` itself, and no code path deletes a temp whose name it
 did not mint, so no recovery sweep is required or permitted.
 
@@ -436,9 +469,10 @@ trailing edge of the gesture.
 In addition to the debounce, the equalizer module installs a *shutdown flush* hook: on
 `gtk::main_quit` (and on `SIGTERM`/`SIGINT` via the application's main-loop signal hook), the
 module synchronously performs an atomic-replace write of the current state to disk before the
-GTK main loop exits. The shutdown flush is its own uniquely named write-temp-and-rename cycle; it
-does not wait for the debounce timer and runs even if the timer is armed. This guarantees that no
-partial write is observable on disk if the user quits while the debounce is pending.
+GTK main loop exits. The shutdown flush is its own uniquely named write-temp-and-replace
+cycle; it does not wait for the debounce timer and runs even if the timer is armed. This
+guarantees that no partial write is observable on disk if the user quits while the debounce is
+pending.
 
 Fresh-install default state is exactly:
 
@@ -474,10 +508,23 @@ Validation rules on read:
   would reject it, and runtime code must not be able to materialize it either. Off-grid
   values are coerced per key exactly like the range clamps above; they do not invalidate the
   file.
-- `preset` outside the named set (including unknown legacy values) becomes `"flat"`; the band
-  vector is *not* reset, only the persisted name is coerced.
+- `preset` outside the named set (including unknown legacy values) is first coerced to
+  `"flat"`; the band vector is *not* reset by this coercion, only the persisted name is
+  rewritten, and the combined result is then subject to the preset-truth reconciliation below.
 - `enabled` not parseable as bool becomes `"false"`.
 - `clip_protect` outside `"off"` / `"soft"` becomes `"off"`.
+- *Preset-truth reconciliation.* After the per-key coercions above, if the persisted `preset`
+  names one of the five canonical presets, the coerced band vector and preamp are compared
+  against that preset's canonical definition (the appendix): an exact match keeps the name,
+  and any difference moves the persisted preset to `"custom"`. Canonical values are never
+  substituted for stored values — the coerced values are what the runtime applies and what
+  the next save persists. For example, `preset="pop"` with `band0_db="3.7"` snaps to 3.5 dB,
+  which is not Pop's canonical +1.0 dB, so the persisted preset becomes `"custom"` and the UI
+  displays `Custom`. The same reconciliation covers a named preset whose preamp was clamped
+  or snapped away from its canonical recommended value. A preset coerced from an unknown
+  name to `"flat"` survives as `Flat` only if the resulting vector and preamp match canonical
+  Flat (all zeros); otherwise it too becomes `"custom"`. This reconciliation is a
+  name-side transition only: it never alters any stored or coerced value.
 
 A malformed file is replaced with the default state via the same atomic-replace protocol above,
 the user's prior preferences are recorded in a typed diagnostic with file path, byte count, and
@@ -595,8 +642,9 @@ five named values listed above; `Custom` is shown in the combo but is *not* sele
 The settings UI is localized in the same locale set as the rest of the application (see the
 files under `locales/`). The five named preset names are translated, but the keys stored in
 `equalizer.cfg` remain English (`flat`, `pop`, `rock`, `jazz`, `classical`, `custom`). The
-migration of older non-English keys is not expected; an unknown preset value is treated as
-`flat`.
+migration of older non-English keys is not expected; an unknown preset value is coerced to
+`flat` and then follows the same validation rules as any other value, including the
+preset-truth reconciliation in *Persistence*.
 
 When the active output does not support the equalizer, the panel's explanation of that
 limitation is rendered as visible, localizable text associated with the disabled controls via
@@ -638,12 +686,15 @@ for this contract; new conditions require a new revision.
     disk via atomic replace before `gtk::main_quit` returns; no partial writes.
 11. **Malformed `equalizer.cfg` on disk.** Defaults re-written via atomic replace; single
     warn-level diagnostic published (file path, byte count, bad key).
-12. **Preamp outside bounds in saved file.** Value clamped to range; preset and bands remain
-    valid.
+12. **Preamp outside bounds in saved file.** Value clamped to range; bands remain as stored;
+    the preset-truth reconciliation applies — a named preset whose clamped preamp differs from
+    that preset's canonical recommended preamp becomes `custom`.
 13. **Band value outside bounds in saved file.** Value clamped to range; other bands remain
-    valid.
+    as stored; the preset-truth reconciliation applies — a named preset whose clamped vector
+    no longer matches its canonical definition becomes `custom`.
 14. **Preset name not in the named set on disk.** Coerced to `flat`; band vector remains as
-    written on disk.
+    written on disk; the preset-truth reconciliation then keeps `flat` only when the vector
+    and preamp match canonical Flat, and otherwise moves the persisted preset to `custom`.
 15. **Hardware sink with 8-channel layout (macOS).** Pre-EQ `capsfilter` caps remain
     `channels=2`; `audioconvert` performs the downmix conversion work; EQ runs in stereo; same
     cap fix as existing module.
@@ -659,7 +710,25 @@ for this contract; new conditions require a new revision.
     not triggered by a non-equalizer failure.
 20. **Off-grid persisted gain in saved file (e.g. `band0_db="3.7"`).** Value snapped to the
     nearest 0.5 dB (ties away from zero); other keys remain valid; the snapped value is what
-    the runtime applies and what the next save persists.
+    the runtime applies and what the next save persists. When the persisted preset is a named
+    one, the preset-truth reconciliation applies (condition 21).
+21. **Named preset with off-grid persisted gain (`preset="pop"`, `band0_db="3.7"`).** The band
+    snaps to 3.5 dB; Pop's canonical band 0 is +1.0 dB, so the coerced vector does not match
+    the appendix definition; the persisted preset becomes `custom`; the UI combo displays
+    `Custom`; the runtime applies the coerced values, and the next save persists `custom`
+    with them (no canonical value is substituted).
+22. **Preamp-only edit mid-playback.** Direct single-property write on the `volume` element
+    with no pad probe; the new gain applies from the first buffer that element processes
+    after the write returns; no multi-value transient is defined or observed; the UI observes
+    one aggregate settings-changed event; a manual edit moves the persisted preset to
+    `custom` per *Band and preamp mechanics*.
+23. **Save on any supported platform, including Windows.** The write completes through the
+    platform's atomic-replace path (Unix: `rename(2)` after file and directory sync;
+    Windows: `NamedTempFile::persist` with write-through); a concurrent or subsequent reader
+    observes either the prior file or the complete new file, never a partial one; the
+    durability claim is the platform's own — file contents are flushed before the replace,
+    and directory-entry durability is claimed only on platforms that provide a directory
+    sync.
 
 ## Implementation boundary
 
