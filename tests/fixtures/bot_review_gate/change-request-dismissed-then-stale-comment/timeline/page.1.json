@@ -1,0 +1,1 @@
+{"data": {"repository": {"pullRequest": {"headRefOid": "1111111111111111111111111111111111111111", "timelineItems": {"pageInfo": {"hasNextPage": false, "endCursor": "cursor-stale-comment-timeline-page.1.json"}, "nodes": [{"createdAt": "2026-09-07T11:30:00Z", "review": {"databaseId": 4}}]}}}}}

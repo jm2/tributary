@@ -14,7 +14,12 @@ name: Bot review gate
 #   3. a bot reviewer's latest review predates the head being evaluated:
 #      bot-review evidence must be bound to the exact commit being merged.
 #      A formal dismissal clears the dismissed conclusion, but it does not
-#      exempt reviews submitted afterwards from this head binding.
+#      exempt reviews submitted afterwards from this head binding. Whether
+#      a review is "after the dismissal" is decided against the recorded
+#      dismissal time from the review timeline: a dismissal mutates the
+#      dismissed review in place and keeps its database ID, so review IDs
+#      alone cannot order evidence around a dismissal, and reviews
+#      submitted before the dismissal are cleared with it.
 #
 # Semantics:
 #   * Only explicit thread resolution or a formal review dismissal clears a
@@ -36,12 +41,24 @@ name: Bot review gate
 #     every review thread is resolved, and no author has an outstanding
 #     change request. A missing policy file disables the waiver entirely;
 #     the waiver never touches unresolved threads or outstanding change
-#     requests, and a comment-only review is never an approval.
+#     requests, and a comment-only review is never an approval. A listed
+#     reviewer with no review on the pull request at all has no evidence
+#     group to derive a violation from, so the gate synthesizes the
+#     missing stale-evidence violation for every policy-listed reviewer
+#     without reviews: the absence of a required reviewer is exactly the
+#     stale evidence the substitution exists to waive, never a silent
+#     pass.
 #
 # Refresh paths — every trigger here is a documented Actions event. Resolving
 # a review thread fires no Actions event at all (`pull_request_review_thread`
-# is a webhook event, not an Actions trigger), so after resolving threads the
-# check is refreshed by re-running it or by dispatching:
+# is a webhook event, not an Actions trigger), and neither does reopening a
+# resolved thread, so once this check has gone green a reopened bot thread
+# cannot refresh it through any trigger below. The merge-time enforcement
+# for that gap is GitHub's native require-conversation-resolution rule,
+# which the rollout (docs/dependency-updates.md) requires the live `main`
+# ruleset to carry: GitHub re-blocks the merge itself the moment a resolved
+# thread is reopened. The check itself is refreshed by re-running it or by
+# dispatching:
 #   gh workflow run bot-review-gate.yml --ref <head branch> -f pr_number=<n>
 #   (a dispatch is bound to the pull request head: the run is attached to the
 #   dispatched ref's tip, so any ref whose tip is not the pull request head
@@ -197,6 +214,29 @@ jobs:
               }
             }
           '
+          # The dismissal timeline: review dismissals mutate the dismissed
+          # review in place (same database ID, original submission time), so
+          # ordering evidence around a dismissal needs the dismissal events
+          # themselves. Each event carries the instant of the dismissal and
+          # the review it dismissed.
+          timeline_query='
+            query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
+              repository(owner: $owner, name: $repo) {
+                pullRequest(number: $number) {
+                  headRefOid
+                  timelineItems(first: 100, after: $endCursor, itemTypes: [REVIEW_DISMISSED_EVENT]) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      ... on ReviewDismissedEvent {
+                        createdAt
+                        review { databaseId }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          '
 
           if ! gh api graphql --paginate -f query="${thread_query}" \
               -f owner="${repo_owner}" -f repo="${repo_name}" -F number="${PR_NUMBER}" \
@@ -208,6 +248,13 @@ jobs:
               -f owner="${repo_owner}" -f repo="${repo_name}" -F number="${PR_NUMBER}" \
               > "${reviews_pages}"; then
             echo "Review query failed; failing closed." >&2
+            exit 1
+          fi
+          timeline_pages="${pages_dir}/timeline.jsonl"
+          if ! gh api graphql --paginate -f query="${timeline_query}" \
+              -f owner="${repo_owner}" -f repo="${repo_name}" -F number="${PR_NUMBER}" \
+              > "${timeline_pages}"; then
+            echo "Review-timeline query failed; failing closed." >&2
             exit 1
           fi
 
@@ -225,13 +272,18 @@ jobs:
             echo "Review response omitted the pull request; failing closed." >&2
             exit 1
           fi
+          if ! jq -s -e "${completeness_guard}" "${timeline_pages}" > /dev/null; then
+            echo "Review-timeline response omitted the pull request; failing closed." >&2
+            exit 1
+          fi
 
           # Bind pagination to the intended head: a push during pagination
           # changes headRefOid in later pages and must fail the check instead
           # of mixing evidence from two commits.
           head_binding_guard='all(.[]; .data.repository.pullRequest.headRefOid == $head)'
           if ! jq -s -e --arg head "${intended_head}" "${head_binding_guard}" "${threads_pages}" > /dev/null \
-            || ! jq -s -e --arg head "${intended_head}" "${head_binding_guard}" "${reviews_pages}" > /dev/null; then
+            || ! jq -s -e --arg head "${intended_head}" "${head_binding_guard}" "${reviews_pages}" > /dev/null \
+            || ! jq -s -e --arg head "${intended_head}" "${head_binding_guard}" "${timeline_pages}" > /dev/null; then
             echo "Paginated evidence spans a head other than ${intended_head}; a push landed mid-query; failing closed." >&2
             exit 1
           fi
@@ -325,8 +377,18 @@ jobs:
             # lift an outstanding change request. A dismissal clears the
             # dismissed conclusion but exempts only itself from the head
             # binding: any review submitted AFTER the dismissal is ordinary
-            # evidence again and must sit at the evaluated head.
-            def bot_review_violations($head):
+            # evidence again and must sit at the evaluated head — and "after"
+            # is decided against the recorded dismissal time ($dismissals,
+            # from the review timeline), because a dismissal keeps the
+            # dismissed review's database ID and submission timestamp, so
+            # review IDs alone misorder evidence around a dismissal and
+            # would hold pre-dismissal comments against the head forever.
+            # Reviews submitted before the dismissal are cleared with it.
+            # If the timeline records no dismissal event for a DISMISSED
+            # decisive review, the around-dismissal ordering cannot be
+            # verified and the branch fails closed into the ordinary
+            # stale-evidence check below.
+            def bot_review_violations($head; $dismissals):
               [ .[]
                 | .data.repository.pullRequest.reviews.nodes[]
                 | select(.state == "CHANGES_REQUESTED" or .state == "APPROVED" or .state == "COMMENTED" or .state == "DISMISSED")
@@ -335,6 +397,7 @@ jobs:
                     author: (.author.login // ""),
                     state: .state,
                     review_head: (.commit.oid // ""),
+                    submitted_at: (.submittedAt // ""),
                     database_id: .databaseId,
                     url: .url
                   } ]
@@ -345,8 +408,16 @@ jobs:
                      or .state == "DISMISSED"))
                  | sort_by(.database_id)
                  | last) as $decisive
-              | (map(select(.database_id > ($decisive.database_id // 0)))
-                 | sort_by(.database_id)
+              | ($decisive.database_id as $dismissed_id
+                 | [ $dismissals[]
+                     | select(.review_id == $dismissed_id)
+                     | .dismissed_at ]
+                   | max // "") as $dismissed_at
+              | (map(select((.database_id > ($decisive.database_id // 0))
+                            and (($decisive.state != "DISMISSED")
+                                 or ($dismissed_at != ""
+                                     and (.submitted_at > $dismissed_at)))))
+                 | sort_by(.submitted_at, .database_id)
                  | last) as $after_decisive
               | if $decisive.state == "CHANGES_REQUESTED" then
                   [ { reason: "outstanding_bot_change_request",
@@ -354,6 +425,7 @@ jobs:
                       review_head: $decisive.review_head,
                       url: $decisive.url } ]
                 elif $decisive.state == "DISMISSED"
+                  and $dismissed_at != ""
                   and (($after_decisive.review_head // $head) == $head)
                 then []
                 elif $latest.review_head != $head then
@@ -365,6 +437,31 @@ jobs:
                       url: $latest.url } ]
                 else []
                 end;
+
+            # The substitution contract presupposes that a policy-listed
+            # reviewer's missing evidence manifests as a waivable
+            # stale-evidence violation. bot_review_violations can only
+            # derive violations from reviews that exist, so a listed
+            # reviewer with NO review on the pull request — the reviewer
+            # being unavailable before ever reviewing — would otherwise
+            # leave the gate green with no substitute approval at all.
+            # Synthesize the missing stale-evidence violation for every
+            # listed login absent from the review list; it is waivable
+            # exactly like derived stale evidence, only under an eligible
+            # substitution.
+            def missing_evidence_violations($head; $policy):
+              [ $reviews[].data.repository.pullRequest.reviews.nodes[]
+                | (.author.login // "") ] as $reviewed
+              | [ $policy.rate_limited_reviewers[]?
+                  | . as $entry
+                  | select($reviewed | index($entry.login) | not)
+                  | { reason: "stale_bot_review_evidence",
+                      author: $entry.login,
+                      state: "no review submitted",
+                      review_head: "none",
+                      expected_head: $head,
+                      url: $entry.evidence } ]
+              | unique_by(.author);
 
             # Operator rate-limit substitution: for a reviewer documented in
             # the repo-owned policy file, the stale-evidence violation may
@@ -396,9 +493,14 @@ jobs:
                      | select(.author.login == $policy.substitute_reviewer)
                      | select(.state == "APPROVED" and .commit.oid == $head) ] | length > 0);
 
-            ( ($threads | unresolved_bot_threads)
-            + [ $reviews | bot_review_violations($head)[] ] ) as $all_violations
-            | $policy[0] as $policy
+            $policy[0] as $policy
+            | ([ $timeline[].data.repository.pullRequest.timelineItems.nodes[]
+                 | select(.review != null)
+                 | { review_id: .review.databaseId,
+                     dismissed_at: .createdAt } ]) as $dismissals
+            | ( ($threads | unresolved_bot_threads)
+              + [ $reviews | bot_review_violations($head; $dismissals)[] ]
+              + missing_evidence_violations($head; $policy) ) as $all_violations
             | substitution_eligible($head; $policy) as $eligible
             | (($policy.rate_limited_reviewers // []) | map(.login)) as $waivable_logins
             | {
@@ -434,6 +536,7 @@ jobs:
           evaluated="$(jq -n \
             --slurpfile threads "${threads_pages}" \
             --slurpfile reviews "${reviews_pages}" \
+            --slurpfile timeline "${timeline_pages}" \
             --slurpfile policy "${policy_file}" \
             --arg head "${intended_head}" \
             -f "${decisions_jq}")"
