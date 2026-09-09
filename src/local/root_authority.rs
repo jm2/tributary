@@ -163,6 +163,15 @@ pub(crate) struct ObjectIdentity;
 /// fail-closed: the reversal is skipped and the caller reports a rollback
 /// failure rather than touching the foreign object.
 ///
+/// Device/inode (or volume/file-index) equality alone does not survive a
+/// replacement that lands while the path is unlinked: filesystems may hand
+/// the just-freed index straight back to the new occupant, which would
+/// make the foreign object compare equal. Each identity therefore also
+/// carries a creation-sensitive instant — the inode change time on Unix,
+/// the creation timestamp on Windows — captured from the same object as
+/// the index. A recreated object cannot inherit the recorded instant, so
+/// a same-index replacement still compares unequal and is refused.
+///
 /// The fields are deliberately private: only this module captures and
 /// compares identities; every other crate treats the value as an opaque
 /// equality token.
@@ -172,12 +181,40 @@ pub struct LeafIdentity {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    change_secs: i64,
+    #[cfg(unix)]
+    change_nanos: i64,
     #[cfg(windows)]
     volume: u64,
     #[cfg(windows)]
     file_id: WindowsFileId,
+    #[cfg(windows)]
+    created: u64,
     #[cfg(not(any(unix, windows)))]
     _unsupported: (),
+}
+
+impl LeafIdentity {
+    /// Whether both identities name the same underlying object, ignoring
+    /// the creation-sensitive instant. Only the replace-publish machinery
+    /// compares captures taken across its own atomic exchange, which
+    /// legitimately updates the displaced object's change time between the
+    /// bind capture and the post-swap verification capture; there the
+    /// looser object check restores the intended coupling. Reversal
+    /// verification compares full equality, where the instant is what
+    /// defeats a same-path index reuse.
+    #[cfg(any(unix, windows))]
+    fn same_object(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.device == other.device && self.inode == other.inode
+        }
+        #[cfg(windows)]
+        {
+            self.volume == other.volume && self.file_id == other.file_id
+        }
+    }
 }
 
 /// The outcome of an identity-checked reversal mutation.
@@ -196,6 +233,81 @@ pub enum ReversalOutcome {
     RefusedForeignLeaf,
 }
 
+/// The device number of an already-captured no-follow `stat` as the
+/// identity's platform-neutral `u64` token. Linux reports `st_dev` as
+/// `u64`; other Unix platforms report it signed, so the conversion is
+/// explicit and maps out-of-range values to `0` rather than wrapping.
+#[cfg(unix)]
+fn leaf_device_number(stat: &rustix::fs::Stat) -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        stat.st_dev
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        u64::try_from(stat.st_dev).unwrap_or(0)
+    }
+}
+
+/// Widen an ABI-specific stat field to `i64` exactly. The concrete integer
+/// type differs per Unix ABI (signed and unsigned, 32- and 64-bit), so the
+/// conversion is kept generic: stat timestamps and nanosecond remainders
+/// always fit `i64`, making the `0` fallback unreachable in practice.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn stat_field_i64<T>(value: T) -> i64
+where
+    i64: TryFrom<T>,
+{
+    i64::try_from(value).unwrap_or(0)
+}
+
+/// The inode-change instant of an already-captured no-follow `stat` as
+/// (seconds, nanoseconds). This is the creation-sensitive half of
+/// [`LeafIdentity`]: a recreated object cannot inherit the recorded
+/// instant of the object it replaced, so same-path index reuse still
+/// compares unequal. Unix nanosecond field types differ per platform, so
+/// each is converted explicitly.
+#[cfg(unix)]
+fn leaf_change_instant(stat: &rustix::fs::Stat) -> (i64, i64) {
+    #[cfg(target_os = "macos")]
+    {
+        let spec = stat.st_ctimespec;
+        (spec.tv_sec, spec.tv_nsec)
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        (
+            stat_field_i64(stat.st_ctime),
+            stat_field_i64(stat.st_ctime_nsec),
+        )
+    }
+}
+
+/// Build a leaf identity from an already-captured no-follow `stat`. The
+/// change instant is recorded only for non-directory leaves: a directory's
+/// own change time legitimately moves while the transfer populates it (and
+/// while the reversal empties it again), so pinning it would refuse every
+/// legitimate directory reversal; a directory leaf is still protected by
+/// its device/inode pair. A replaced non-directory leaf cannot inherit the
+/// recorded change instant, so same-path index reuse still compares
+/// unequal for files.
+#[cfg(unix)]
+fn leaf_identity_from_stat(stat: &rustix::fs::Stat) -> LeafIdentity {
+    let is_directory =
+        rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Directory;
+    let (change_secs, change_nanos) = if is_directory {
+        (0, 0)
+    } else {
+        leaf_change_instant(stat)
+    };
+    LeafIdentity {
+        device: leaf_device_number(stat),
+        inode: stat.st_ino,
+        change_secs,
+        change_nanos,
+    }
+}
+
 /// Capture the no-follow identity of `leaf` inside the open `parent`
 /// directory. `Ok(None)` means the leaf is absent; a capture that cannot
 /// stat for any other reason is an error so callers never silently lose a
@@ -203,10 +315,7 @@ pub enum ReversalOutcome {
 #[cfg(unix)]
 fn leaf_identity_at(parent: &File, leaf: &OsStr) -> io::Result<Option<LeafIdentity>> {
     match rustix::fs::statat(parent, leaf, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => Ok(Some(LeafIdentity {
-            device: stat.st_dev,
-            inode: stat.st_ino,
-        })),
+        Ok(stat) => Ok(Some(leaf_identity_from_stat(&stat))),
         Err(rustix::io::Errno::NOENT) => Ok(None),
         Err(error) => Err(io::Error::from(error)),
     }
@@ -214,29 +323,71 @@ fn leaf_identity_at(parent: &File, leaf: &OsStr) -> io::Result<Option<LeafIdenti
 
 /// Capture the no-follow identity of the entry at `path`. `Ok(None)` means
 /// the path is absent; anything else is an error.
+///
+/// The identity is read through an attributes-only handle instead of
+/// directory metadata: the `Metadata` volume/index extensions are
+/// nightly-only (`windows_by_handle`), while `GetFileInformationByHandle`
+/// is stable through `windows-sys` and, with `FILE_FLAG_BACKUP_SEMANTICS`,
+/// covers directory leaves as well. The handle also yields the creation
+/// timestamp, the creation-sensitive half of [`LeafIdentity`] that keeps a
+/// same-index replacement from comparing equal.
 #[cfg(windows)]
 fn leaf_identity_at_path(path: &Path) -> io::Result<Option<LeafIdentity>> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => Ok(Some(windows_leaf_identity(&metadata))),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
+    use std::mem::MaybeUninit;
+    use std::os::windows::ffi::OsStrExt;
 
-/// Extract the platform leaf identity from already-captured no-follow
-/// metadata. Filesystems without a durable 64-bit index report `0`, which
-/// is still a stable equality token for a verify-between-two-instants
-/// comparison on the same volume (an index reuse between publish and
-/// rollback is possible only after deletion, and a deleted leaf reports
-/// absent rather than a reused index).
-#[cfg(windows)]
-fn windows_leaf_identity(metadata: &std::fs::Metadata) -> LeafIdentity {
-    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
 
-    LeafIdentity {
-        volume: metadata.volume_serial_number().unwrap_or(0),
-        file_id: WindowsFileId::Legacy(metadata.file_index().unwrap_or(0)),
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path valid for the call;
+    // every other argument is null or a constant. The attributes-only,
+    // fully shared access cannot disturb a concurrent writer, and
+    // `FILE_FLAG_BACKUP_SEMANTICS` admits directory leaves.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error)
+        };
     }
+    let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: `handle` is live and `info` is a correctly sized, aligned
+    // output buffer that the API fully initializes on success.
+    let filled = unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) };
+    // SAFETY: `handle` was created above and is closed exactly once on
+    // every path.
+    unsafe { CloseHandle(handle) };
+    if filled == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful call above initialized the complete structure.
+    let info = unsafe { info.assume_init() };
+    Ok(Some(LeafIdentity {
+        volume: u64::from(info.dwVolumeSerialNumber),
+        file_id: WindowsFileId::Legacy(
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ),
+        created: (u64::from(info.ftCreationTime.dwHighDateTime) << 32)
+            | u64::from(info.ftCreationTime.dwLowDateTime),
+    }))
 }
 
 #[cfg(target_os = "linux")]
@@ -819,10 +970,7 @@ impl MountedRootAuthority {
                 Err(rustix::io::Errno::NOENT) => return Ok(ReversalOutcome::AlreadyAbsent),
                 Err(error) => return Err(io::Error::from(error)),
             };
-            let found = LeafIdentity {
-                device: stat.st_dev,
-                inode: stat.st_ino,
-            };
+            let found = leaf_identity_from_stat(&stat);
             if expected.is_some_and(|expected| expected != found) {
                 return Ok(ReversalOutcome::RefusedForeignLeaf);
             }
@@ -851,7 +999,10 @@ impl MountedRootAuthority {
                 }
                 Err(error) => return Err(error),
             };
-            let found = windows_leaf_identity(&metadata);
+            let found = match leaf_identity_at_path(&final_path)? {
+                Some(found) => found,
+                None => return Ok(ReversalOutcome::AlreadyAbsent),
+            };
             if expected.is_some_and(|expected| expected != found) {
                 return Ok(ReversalOutcome::RefusedForeignLeaf);
             }
@@ -929,7 +1080,7 @@ impl MountedRootAuthority {
         #[cfg(unix)]
         let current = leaf_identity_at(parent.handle(), &destination_leaf)?;
         #[cfg(windows)]
-        let current = leaf_identity_at_path(join_components(&self.root, &destination_components))?;
+        let current = leaf_identity_at_path(&join_components(&self.root, &destination_components))?;
         #[cfg(not(any(unix, windows)))]
         let current: Option<LeafIdentity> = None;
         if let (Some(expected), Some(current)) = (expected, current) {
@@ -968,7 +1119,7 @@ impl MountedRootAuthority {
         }
         #[cfg(windows)]
         {
-            leaf_identity_at_path(join_components(&self.root, &components))
+            leaf_identity_at_path(&join_components(&self.root, &components))
                 .ok()
                 .flatten()
         }
@@ -1003,10 +1154,7 @@ impl MountedRootAuthority {
                 Err(rustix::io::Errno::NOENT) => return Ok(ReversalOutcome::AlreadyAbsent),
                 Err(error) => return Err(io::Error::from(error)),
             };
-            let found = LeafIdentity {
-                device: stat.st_dev,
-                inode: stat.st_ino,
-            };
+            let found = leaf_identity_from_stat(&stat);
             if expected.is_some_and(|expected| expected != found) {
                 return Ok(ReversalOutcome::RefusedForeignLeaf);
             }
@@ -1030,7 +1178,10 @@ impl MountedRootAuthority {
                 }
                 Err(error) => return Err(error),
             };
-            let found = windows_leaf_identity(&metadata);
+            let found = match leaf_identity_at_path(&final_path)? {
+                Some(found) => found,
+                None => return Ok(ReversalOutcome::AlreadyAbsent),
+            };
             if expected.is_some_and(|expected| expected != found) {
                 return Ok(ReversalOutcome::RefusedForeignLeaf);
             }
@@ -3139,7 +3290,11 @@ fn replace_publish_loop(
         match renameat_with(parent, from_leaf, parent, to_leaf, RenameFlags::EXCHANGE) {
             Ok(()) => {
                 match leaf_identity_at(parent, from_leaf) {
-                    Ok(Some(displaced)) if displaced == bound_identity => {
+                    // Same object check, not full equality: the exchange
+                    // itself updates the displaced object's change time,
+                    // so the post-swap capture cannot equal the bind-time
+                    // capture on the instant fields.
+                    Ok(Some(displaced)) if displaced.same_object(&bound_identity) => {
                         // The swap displaced exactly the object the backup
                         // names. The displaced bytes live on in the backup;
                         // drop the now-redundant link at the staged name.
@@ -3319,10 +3474,7 @@ fn copy_bind_occupant_backup(
         Err(rustix::io::Errno::NOENT) => return Ok(OccupantBackup::Vanished),
         Err(error) => return Err(io::Error::from(error)),
     };
-    let before_identity = LeafIdentity {
-        device: before.st_dev,
-        inode: before.st_ino,
-    };
+    let before_identity = leaf_identity_from_stat(&before);
     classify_copy_bind_occupant(before.st_mode)?;
     let occupant = openat(
         parent,
