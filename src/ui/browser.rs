@@ -1060,13 +1060,19 @@ fn get_store_from_pane(pane: &gtk::Box) -> Option<gio::ListStore> {
 // function instead would leave `use super::*` unused on macOS and fail the
 // `-D warnings` clippy pass there (observed in run 33921896331).
 //
-// The contract under test stays in ONE `#[test]` function (GTK must be
-// exercised from a single thread, and `gtk::init` must not race itself);
-// its sections live in small helpers below, which also keeps each function
-// under Codacy's 50-lines-of-code method limit. The test funnels its
-// display gate, `gtk::init`, and the whole widget-exercising body through
-// the crate-wide `ui::widget_test_session` lock so it cannot race the
-// context_menu widget test on libtest's worker threads.
+// This module holds the crate's SINGLE GTK-initializing `#[test]` (GTK
+// must be exercised from a single thread, and `gtk::init` must not race
+// itself). The `ui::widget_test_session` mutex serializes GTK-initializing
+// tests but does not give them thread affinity, so a second GTK-touching
+// `#[test]` would still run on a different libtest worker thread than the
+// one that ran `gtk::init` and construct widgets off the initializing
+// thread (2026-09-09 review rejection, PR #179). Every GTK-touching
+// contract in the crate — including the context-menu ones — therefore runs
+// inside that one test's body, via small helpers here and in
+// `context_menu::tests`, which also keeps each function under Codacy's
+// 50-lines-of-code method limit. The test funnels its display gate, the
+// single `gtk::init`, and the whole widget-exercising body through the
+// crate-wide `ui::widget_test_session` lock.
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
@@ -1151,23 +1157,38 @@ mod tests {
         assert_eq!(row.count().text(), "");
     }
 
-    /// The combined row label ("Label, (Count)") must be exposed on the
-    /// `GtkListItem` — the list-row boundary — not on an inner widget, the
-    /// child labels must be presentational so the row is announced as a
-    /// single utterance ("Artist Name, (123)"), zero-count rows must
-    /// announce only the label, and unbind must reset everything.
+    /// The crate's single consolidated GTK widget test, all run on the ONE
+    /// thread that owns the GTK session:
+    ///
+    /// - the combined browser-row label ("Label, (Count)") must be exposed
+    ///   on the `GtkListItem` — the list-row boundary — not on an inner
+    ///   widget; the child labels must be presentational so the row is
+    ///   announced as a single utterance ("Artist Name, (123)"); zero-count
+    ///   rows must announce only the label; unbind must reset everything;
+    /// - the context-menu popover must attach a visible scrolling child
+    ///   with one button per enabled action
+    ///   ([`crate::ui::context_menu::tests::popover_from_menu_model_attaches_a_visible_child_widget`]);
+    /// - tracklist drags must start only from the data row area (folded
+    ///   into the popover contract).
+    ///
+    /// This is deliberately the only GTK-initializing `#[test]` in the
+    /// crate: the `ui::widget_test_session` mutex serializes but does not
+    /// give thread affinity, so a second GTK-touching `#[test]` would
+    /// construct widgets off the initializing thread and trip gtk-rs
+    /// main-thread checks (2026-09-09 review rejection, PR #179).
     ///
     /// Asserts on the `GtkListItem:accessible-label` property (GTK 4.12),
     /// which GTK uses as the row's accessible name — the widget-level
     /// equivalent of an Orca row-announcement smoke test.
     #[test]
-    fn browser_row_accessible_label_exposed_on_list_item_boundary() {
+    fn gtk_widget_contracts_hold_on_one_session() {
         // Hold the process-wide GTK test session (display gate + single
         // `gtk::init` + serialization lock) across every widget
-        // construction and assertion below; libtest runs each `#[test]`
-        // on its own worker thread, and GTK requires single-threaded use
-        // after initialization. See `ui::widget_test_session`.
-        let Some(_gtk_session) = crate::ui::widget_test_session::acquire("browser_row widget test")
+        // construction and assertion below, including the context-menu
+        // helpers: GTK requires single-threaded use after initialization.
+        // See `ui::widget_test_session`.
+        let Some(_gtk_session) =
+            crate::ui::widget_test_session::acquire("gtk widget contracts test")
         else {
             return;
         };
@@ -1178,5 +1199,7 @@ mod tests {
         assert_unbind_reset(&list_item, &row);
         assert_zero_count_contract(&list_item, &row);
         assert_unbind_reset(&list_item, &row);
+
+        crate::ui::context_menu::tests::popover_from_menu_model_attaches_a_visible_child_widget();
     }
 }

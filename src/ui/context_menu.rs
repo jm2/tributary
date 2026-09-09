@@ -1336,7 +1336,7 @@ pub fn popover_from_menu_model(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::path::PathBuf;
 
     use super::*;
@@ -1857,35 +1857,33 @@ mod tests {
     /// menu display through `popover_from_menu_model`, which always sets a
     /// non-null child widget built from the menu's actions.
     ///
-    /// This test exercises that contract end-to-end: with a populated
+    /// This contract is exercised end-to-end: with a populated
     /// menu and matching action group, the resulting popover MUST have a
     /// bounded scrolling child containing one button per enabled action. If a
     /// future change drops the child assignment or scrolling constraint (e.g.
     /// by re-introducing `gtk::PopoverMenu::from_model` or attaching the menu
-    /// box directly), this test will fail.
+    /// box directly), the consolidated GTK test will fail.
     ///
     /// Headless CI (cargo test in the Fedora container with no X/Wayland socket)
-    /// cannot initialize GTK, so the test skips with a printed reason when
+    /// cannot initialize GTK, so the contract skips with a printed reason when
     /// no display session is available or GTK cannot acquire a display.
     /// macOS is excluded because GTK's Quartz backend panics when
     /// initialized from the test harness worker thread. The contract still
-    /// holds on any machine with a display — the test is therefore
+    /// holds on any machine with a display — it is therefore
     /// meaningful on a developer box and harmless in CI.
     ///
-    /// The display gate, `gtk::init`, and every widget construction and
-    /// assertion below run while holding the crate-wide
-    /// `ui::widget_test_session` lock: libtest runs each `#[test]` on its
-    /// own worker thread, and GTK requires single-threaded use after
-    /// initialization, so the browser.rs widget test must not be able to
-    /// touch GTK state while this one is mid-flight (or vice versa).
+    /// This contract is NOT its own `#[test]`: the
+    /// `ui::widget_test_session` mutex serializes GTK-initializing tests
+    /// but does not give them thread affinity, so a second GTK-touching
+    /// `#[test]` would run on a different libtest worker thread than the
+    /// one that ran `gtk::init` and construct widgets off the
+    /// initializing thread, tripping gtk-rs main-thread checks
+    /// (2026-09-09 review rejection, PR #179). It is instead invoked from
+    /// the crate's single consolidated GTK test in `browser.rs`, whose
+    /// `acquire` call owns the display gate, the single `gtk::init`, and
+    /// the serialization lock across this body.
     #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn popover_from_menu_model_attaches_a_visible_child_widget() {
-        let Some(_gtk_session) = crate::ui::widget_test_session::acquire(
-            "popover_from_menu_model_attaches_a_visible_child_widget",
-        ) else {
-            return;
-        };
+    pub fn popover_from_menu_model_attaches_a_visible_child_widget() {
         assert_track_drags_start_only_from_the_data_row_area();
 
         let menu = gtk::gio::Menu::new();

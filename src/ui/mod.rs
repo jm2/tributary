@@ -46,6 +46,15 @@ pub mod window_state;
 // serializes them behind one process-wide mutex held across `gtk::init()`
 // AND all widget construction/assertions, while keeping the display-gated
 // skip messages on machines without a display session.
+//
+// Note that the mutex SERIALIZES but does not give THREAD AFFINITY: a
+// second GTK-initializing `#[test]` still runs on its own worker thread
+// and, seeing `gtk::is_initialized()` already true, would skip init and
+// construct widgets off the initializing thread — tripping gtk-rs
+// main-thread checks (2026-09-09 review rejection, PR #179). The crate
+// therefore keeps exactly ONE GTK-initializing `#[test]` (the consolidated
+// widget-contracts test in `browser.rs`); a new GTK-touching contract must
+// join that test's body as a helper, never become a second `#[test]`.
 #[cfg(all(test, not(target_os = "macos")))]
 pub mod widget_test_session {
     use std::sync::{Mutex, MutexGuard, OnceLock};
