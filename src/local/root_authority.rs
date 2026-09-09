@@ -781,6 +781,15 @@ impl MountedMutationCommit<'_> {
     /// is not the admitted file, the newcomer is returned byte-exact to its
     /// own name — through the same conditioned primitive — and the commit
     /// refuses with every object untouched.
+    ///
+    /// The staged object's evidence stays retained through the install and
+    /// the landing proof, and the displaced admitted original is retired only
+    /// after that proof succeeds: an external rename over the staging name in
+    /// the capture-to-install window would otherwise install the stranger,
+    /// destroy the admitted original inside the install, and only then fail
+    /// the proof — the loss detected after it happened. Here a failed proof
+    /// means the quarantined original is still intact; it is restored
+    /// (conditioned) to its name and the stranger is displaced to a sibling.
     #[cfg(unix)]
     fn replace_confirmed_staging(&self, staged: &Path) -> io::Result<()> {
         let parent = self.retained_parent();
@@ -793,10 +802,11 @@ impl MountedMutationCommit<'_> {
         // directory. Opening it here — rather than trusting the staging
         // pathname — proves the install below will publish the object this
         // section created, and refuses a parent that was disturbed enough to
-        // strand the staging area elsewhere.
+        // strand the staging area elsewhere. The handle is retained through
+        // the install and the landing proof as the evidence for the object
+        // this section is publishing.
         let staged_file = open_unix_regular_at(&parent.file, staged_leaf)?;
         let staged_identity = object_identity(&staged_file)?;
-        drop(staged_file);
 
         // Displace whatever occupies the leaf under a fresh quarantine name,
         // then prove the displaced entry is the exact object the confirm step
@@ -821,7 +831,40 @@ impl MountedMutationCommit<'_> {
         #[cfg(test)]
         run_pre_install_interpose(self);
         Self::install_staged_leaf_into_vacant_leaf(parent, staged_leaf, &leaf, &quarantine_leaf)?;
-        Self::prove_replacement_landed(parent, &leaf, &staged_identity)
+        if let Err(error) = Self::prove_replacement_landed(parent, &leaf, &staged_identity) {
+            // The landing proof failed: an external writer swapped a stranger
+            // over the staging name before the install, or over the leaf
+            // after it. The admitted original is still intact under its
+            // quarantine name — the install no longer retires it — so put it
+            // back (conditioned) and refuse with both objects preserved.
+            Self::recover_original_after_failed_landing_proof(parent, &leaf, &quarantine_leaf);
+            return Err(error);
+        }
+
+        // The landing is proven; only now retire the admitted original under
+        // its quarantine name. A removal failure here leaves it as a
+        // quarantine sibling — debris, never destruction.
+        drop(staged_file);
+        let _ = rustix::fs::unlinkat(&parent.file, quarantine_leaf, rustix::fs::AtFlags::empty());
+        Ok(())
+    }
+
+    /// Recover the admitted original after a failed landing proof.
+    ///
+    /// Whatever the failed install left at the leaf is displaced under a
+    /// fresh unique quarantine sibling — a rename to a fresh name cannot
+    /// clobber anything — and the original is returned to its name through
+    /// the conditioned restore. Best effort by design: if an external writer
+    /// wins a recreate race during the recovery, the displaced objects stay
+    /// under their quarantine names — debris, never destruction.
+    #[cfg(unix)]
+    fn recover_original_after_failed_landing_proof(
+        parent: &RetainedObject,
+        leaf: &OsStr,
+        quarantine_leaf: &OsStr,
+    ) {
+        let _ = rustix::fs::renameat(&parent.file, leaf, &parent.file, &quarantine_name(leaf));
+        let _ = Self::restore_displaced_entry(parent, quarantine_leaf, leaf);
     }
 
     /// Prove the installed leaf names the exact object the staged copy held.
@@ -898,17 +941,20 @@ impl MountedMutationCommit<'_> {
     }
 
     /// Install the staged copy into the vacant leaf name through the
-    /// conditioned no-replace rename, then retire the displaced original.
+    /// conditioned no-replace rename.
     ///
     /// A no-replace rename refuses an occupied destination atomically, so an
     /// external writer that recreates the leaf inside the quarantine-to-
     /// install window is preserved under a fresh sibling and the commit
     /// refuses exactly like every earlier disturbance — the write is
     /// authorized for the file the authority admitted, not for whatever now
-    /// occupies the name. The install consumes the staging entry, so only
-    /// the displaced original remains to retire; the replacement has already
-    /// landed, so a removal failure there leaves it under the quarantine
-    /// sibling rather than failing the committed write.
+    /// occupies the name.
+    ///
+    /// The install deliberately does not retire the displaced original under
+    /// its quarantine name: the landing proof has not run yet, so retiring
+    /// here would destroy the admitted original before the section knows
+    /// whether the installed object is the one it staged. The caller retires
+    /// the quarantined original only after the landing proof succeeds.
     #[cfg(unix)]
     fn install_staged_leaf_into_vacant_leaf(
         parent: &RetainedObject,
@@ -942,8 +988,6 @@ impl MountedMutationCommit<'_> {
                 return Err(error);
             }
         }
-
-        let _ = rustix::fs::unlinkat(&parent.file, quarantine_leaf, rustix::fs::AtFlags::empty());
         Ok(())
     }
 
@@ -3104,7 +3148,10 @@ mod tests {
     /// Assert the recreated newcomer survived the refused install —
     /// displaced under exactly one fresh quarantine sibling, byte-for-byte
     /// intact.
-    fn assert_recreated_newcomer_displaced_under_one_fresh_sibling(directory: &TestDirectory) {
+    fn assert_recreated_newcomer_displaced_under_one_fresh_sibling(
+        directory: &TestDirectory,
+        expected: &[u8],
+    ) {
         let siblings: Vec<PathBuf> = fs::read_dir(directory.path())
             .expect("list the directory")
             .filter_map(|entry| entry.ok())
@@ -3118,12 +3165,12 @@ mod tests {
         assert_eq!(
             siblings.len(),
             1,
-            "exactly the recreated newcomer may remain, displaced under one fresh sibling: {siblings:?}"
+            "exactly the displaced stranger may remain, under one fresh sibling: {siblings:?}"
         );
         assert_eq!(
-            fs::read(&siblings[0]).expect("read the displaced newcomer"),
-            b"newcomer audio",
-            "the preserved newcomer must be byte-for-byte intact"
+            fs::read(&siblings[0]).expect("read the displaced object"),
+            expected,
+            "the preserved object must be byte-for-byte intact"
         );
     }
 
@@ -3248,7 +3295,7 @@ mod tests {
         // the newcomer survives — displaced under a fresh quarantine sibling,
         // never destroyed by the refused install.
         assert_confirmed_original_restored_to_its_name(&song);
-        assert_recreated_newcomer_displaced_under_one_fresh_sibling(&directory);
+        assert_recreated_newcomer_displaced_under_one_fresh_sibling(&directory, b"newcomer audio");
 
         // A refused commit does not consume the staged copy; the caller
         // cleans it up.
@@ -3257,6 +3304,74 @@ mod tests {
             "the staged copy must survive a refused commit for the caller to clean up"
         );
         fs::remove_file(&staged).expect("remove the staged copy");
+    }
+
+    /// The staged object's evidence must stay retained through the install,
+    /// and the admitted original must be retired only after the landing
+    /// proof succeeds. An external rename over the staging name inside the
+    /// capture-to-install window makes the install publish a stranger; the
+    /// commit must detect that at the landing proof, restore the admitted
+    /// original byte-exact to its own name, and refuse — not destroy the
+    /// original inside the install and only then discover the loss.
+    #[cfg(unix)]
+    #[test]
+    fn commit_replacement_refuses_a_staging_name_swapped_before_the_install_and_restores_the_original(
+    ) {
+        let directory = TestDirectory::new("mutation-staging-swap");
+        let song = directory.path().join("song.flac");
+        fs::write(&song, b"original audio").expect("write song");
+
+        let authority =
+            Arc::new(MountedRootAuthority::acquire(directory.path()).expect("acquire authority"));
+        let target = authority
+            .open_mutation_target(Path::new("song.flac"))
+            .expect("open mutation target");
+
+        // The staged copy sits beside the target, as the tag writer stages it.
+        let staged = directory.path().join(".song.tributary-tag-tmp.flac");
+        fs::write(&staged, b"tagged audio").expect("stage the replacement");
+        let stolen = directory.path().join("stolen.flac");
+        let stolen_for_closure = stolen.clone();
+        let watched_staged = staged.clone();
+        let watched_leaf = song.clone();
+
+        with_pre_install_interpose(
+            Box::new(move |commit| {
+                if commit.target.path != watched_leaf {
+                    return;
+                }
+                // The quarantine step displaced the confirmed original and
+                // proved it, and the staged identity has already been
+                // captured. Swap the staging name now — exactly the window
+                // where a stranger would be installed and the original
+                // destroyed before the landing proof could run.
+                fs::rename(&watched_staged, &stolen_for_closure)
+                    .expect("move the staged copy aside");
+                fs::write(&watched_staged, b"stranger audio")
+                    .expect("install a stranger at the staging name");
+            }),
+            || {
+                let commit = target.begin_commit().expect("begin commit section");
+                commit
+                    .commit_replacement(&staged)
+                    .expect_err("a stranger swapped over the staging name must refuse the commit");
+            },
+        );
+
+        // The admitted original is back under its own name, byte-exact: the
+        // refused install must never destroy the displaced original.
+        assert_confirmed_original_restored_to_its_name(&song);
+        // The true staged copy survives where the external writer moved it.
+        assert_eq!(
+            fs::read(&stolen).expect("read the moved staged copy"),
+            b"tagged audio",
+            "the true staged copy must survive the refused commit untouched"
+        );
+        fs::remove_file(&stolen).expect("remove the moved staged copy");
+        // The stranger the install briefly published survives displaced
+        // under exactly one fresh quarantine sibling — debris, never
+        // destruction.
+        assert_recreated_newcomer_displaced_under_one_fresh_sibling(&directory, b"stranger audio");
     }
 
     /// A cloned read source shares the retained handle's underlying file
