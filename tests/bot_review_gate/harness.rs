@@ -19,7 +19,9 @@ pub fn fixtures_root() -> PathBuf {
 }
 
 /// The publisher's evaluation script: the bytes Actions executes from the
-/// trusted default-branch workflow.
+/// trusted default-branch workflow. The job's first step mints the
+/// gate-publisher App token (an action); the tested script is the inline
+/// publication step.
 pub fn gate_run_script() -> String {
     let workflow: serde_yaml::Value = serde_yaml::from_str(BOT_REVIEW_GATE_PUBLISHER_YAML)
         .expect("bot review gate publisher workflow must parse");
@@ -27,10 +29,9 @@ pub fn gate_run_script() -> String {
         .as_sequence()
         .expect("the publisher workflow must define its job steps");
     let run = steps
-        .first()
-        .expect("the publisher job must define its publication step")["run"]
-        .as_str()
-        .expect("the publisher step must inline its run script");
+        .iter()
+        .find_map(|step| step["run"].as_str())
+        .expect("the publisher job must inline its run script");
     assert!(
         !run.trim().is_empty(),
         "the publisher run script must not be empty"
@@ -131,13 +132,34 @@ impl GateSandbox {
     /// input is always `announcer_head_sha` — the announcing run's head, the
     /// only commit the publisher is willing to evaluate.
     pub fn run(&self, event_name: &str, announcer_head_sha: Option<&str>) -> Output {
+        self.run_with_gate_token(event_name, announcer_head_sha, Some("stub-gate-token"))
+    }
+
+    /// Runs the publisher with the gate-publisher App identity withheld,
+    /// as when the mint step failed: the script must refuse to publish the
+    /// required context rather than degrade to the shared workflow token.
+    pub fn run_without_gate_token(
+        &self,
+        event_name: &str,
+        announcer_head_sha: Option<&str>,
+    ) -> Output {
+        self.run_with_gate_token(event_name, announcer_head_sha, None)
+    }
+
+    fn run_with_gate_token(
+        &self,
+        event_name: &str,
+        announcer_head_sha: Option<&str>,
+        gate_token: Option<&str>,
+    ) -> Output {
         let script_path = self.root.join("gate.sh");
         std::fs::write(&script_path, gate_run_script()).expect("gate script must be writable");
 
         let system_path = std::env::var("PATH").unwrap_or_default();
         let path = format!("{}:{system_path}", self.root.join("bin").display());
 
-        Command::new("bash")
+        let mut command = Command::new("bash");
+        command
             .arg(&script_path)
             .env("PATH", path)
             .env("GH_TOKEN", "stub-token")
@@ -146,7 +168,13 @@ impl GateSandbox {
             .env("EVENT_HEAD_SHA", announcer_head_sha.unwrap_or(""))
             .env("RUNNER_TEMP", self.root.join("runner-temp"))
             .env("GH_STUB_PAGES", self.root.join("pages"))
-            .env("GH_STUB_STATE", self.root.join("state"))
+            .env("GH_STUB_STATE", self.root.join("state"));
+        if let Some(token) = gate_token {
+            // The publication path must be authenticated as the
+            // gate-publisher App; the script refuses to publish without it.
+            command.env("GATE_TOKEN", token);
+        }
+        command
             .output()
             .expect("the publisher script must be runnable under bash")
     }

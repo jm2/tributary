@@ -1391,6 +1391,10 @@ fn dependabot_automerge_workflow() -> serde_yaml::Value {
 
 // The full policy check-context set the live main ruleset must require, each
 // entry as "check context|app id" (empty app id = unbound commit status).
+// The Bot Review Gate is required from the dedicated gate-publisher App —
+// never from the shared GitHub Actions integration (15368), whose check runs
+// any pull-request-controlled workflow job can publish under any name — so
+// its app id comes from the repository variable the precondition reads.
 const fn required_policy_check_contexts() -> [&'static str; 18] {
     [
         "Security Audit|15368",
@@ -1404,7 +1408,7 @@ const fn required_policy_check_contexts() -> [&'static str; 18] {
         "Coverage (Linux x86_64)|15368",
         "Desktop Metadata|15368",
         "SHA256 Checksums|15368",
-        "Bot Review Gate|15368",
+        "Bot Review Gate|${GATE_PUBLISHER_APP_ID}",
         "CodeQL|57789",
         "Analyze (python)|57789",
         "Analyze (rust)|57789",
@@ -1568,14 +1572,22 @@ fn bot_review_gate_run_script(workflow: &serde_yaml::Value) -> String {
         .expect("publisher steps must be a sequence");
     assert_eq!(
         job_steps.len(),
-        1,
-        "the publisher must stay a single API-only step"
+        2,
+        "the publisher must stay two steps: the pinned app-token mint and the inline publication"
+    );
+    // The one allowed action is the GitHub-org app-token minter, pinned to a
+    // full commit SHA; it executes no repository code. The publication step
+    // itself stays inline and action-free.
+    assert!(
+        job_steps[0]["uses"].as_str()
+            == Some("actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf"),
+        "the publisher's first step must mint the gate-publisher App token with the pinned GitHub-org action"
     );
     assert!(
-        job_steps.iter().all(|step| step.get("uses").is_none()),
-        "the publisher must not execute any third-party action or checkout"
+        job_steps[1..].iter().all(|step| step.get("uses").is_none()),
+        "the publication step must not execute any third-party action or checkout"
     );
-    job_steps[0]["run"]
+    job_steps[1]["run"]
         .as_str()
         .expect("the publisher step must inline its script")
         .to_owned()
@@ -1727,13 +1739,15 @@ fn bot_review_gate_publisher_publishes_the_required_context_from_default_branch_
     let workflow = bot_review_gate_publisher_workflow();
 
     assert_publisher_runs_exclusively_on_announcer_completions(&workflow);
-    assert_publisher_declares_exactly_three_read_only_grants(&workflow);
+    assert_publisher_declares_exactly_two_read_only_grants(&workflow);
     assert_publisher_binds_the_evaluation_to_the_announcing_head(&workflow);
 
-    // Extracting the run script also proves the step shape: exactly one
-    // API-only step, no checkout, no third-party actions.
+    // Extracting the run script also proves the step shape: the pinned
+    // app-token mint plus exactly one API-only publication step, no
+    // checkout, no other actions.
     let script = bot_review_gate_run_script(&workflow);
     assert_publisher_publishes_the_verdict_at_the_evaluated_head(&script);
+    assert_publisher_publishes_only_under_the_gate_app_identity(&workflow, &script);
 }
 
 // The publisher is the only writer of the required context, so it must run
@@ -1763,21 +1777,24 @@ fn assert_publisher_runs_exclusively_on_announcer_completions(workflow: &serde_y
     );
 }
 
-// Publishing the required check-run is the publisher's one write; review
-// evidence and the policy file are read through read-only grants.
-fn assert_publisher_declares_exactly_three_read_only_grants(workflow: &serde_yaml::Value) {
+// Publishing the required check-run is the gate-publisher App's one write;
+// the workflow token itself holds only read-only grants and structurally
+// cannot publish a check run, so no pull-request-controlled job's identity
+// (the shared GitHub Actions integration) can be mistaken for the
+// publisher's.
+fn assert_publisher_declares_exactly_two_read_only_grants(workflow: &serde_yaml::Value) {
     let permissions = workflow["permissions"]
         .as_mapping()
         .expect("publisher permissions must be a mapping");
     assert_eq!(
         permissions.len(),
-        3,
-        "the publisher must declare exactly its three workflow-level permissions"
+        2,
+        "the publisher must declare exactly its two workflow-level permissions"
     );
-    assert_eq!(
-        workflow["permissions"]["checks"].as_str(),
-        Some("write"),
-        "publishing the required check-run is the publisher's one write"
+    assert!(
+        workflow["permissions"].get("checks").is_none(),
+        "the workflow token must structurally be unable to publish check runs; \
+         the required context is published only under the minted gate-publisher App token"
     );
     assert_eq!(
         workflow["permissions"]["pull-requests"].as_str(),
@@ -1791,6 +1808,63 @@ fn assert_publisher_declares_exactly_three_read_only_grants(workflow: &serde_yam
     );
 }
 
+// The required context must be bound to an identity no pull-request job can
+// produce. The publisher mints the dedicated gate-publisher App token with
+// the pinned GitHub-org action and publishes exclusively under it, refusing
+// to publish when that identity is missing.
+fn assert_publisher_publishes_only_under_the_gate_app_identity(
+    workflow: &serde_yaml::Value,
+    script: &str,
+) {
+    let steps = workflow["jobs"]["publish"]["steps"]
+        .as_sequence()
+        .expect("publisher steps must be a sequence");
+    let mint = steps.first().expect("the mint step must exist");
+    assert_eq!(
+        mint["name"].as_str(),
+        Some("Mint the gate-publisher App token"),
+        "the gate-publisher App token must be minted in its own step"
+    );
+    assert_eq!(
+        mint["uses"].as_str(),
+        Some("actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf"),
+        "the minter must be the GitHub-org action pinned to its full commit SHA"
+    );
+    assert_eq!(
+        mint["with"]["app-id"].as_str(),
+        Some("${{ secrets.BOT_REVIEW_GATE_APP_ID }}"),
+        "the gate-publisher App id must come from a repository secret"
+    );
+    assert_eq!(
+        mint["with"]["private-key"].as_str(),
+        Some("${{ secrets.BOT_REVIEW_GATE_PRIVATE_KEY }}"),
+        "the gate-publisher App key must come from a repository secret"
+    );
+    assert_eq!(
+        mint["with"]["permission-checks"].as_str(),
+        Some("write"),
+        "the minted token must carry exactly the checks:write publication grant"
+    );
+    let publish = steps.get(1).expect("the publication step must exist");
+    assert_eq!(
+        publish["env"]["GATE_TOKEN"].as_str(),
+        Some("${{ steps.gate_publisher_token.outputs.token }}"),
+        "the publication step must authenticate with the minted gate-publisher App token"
+    );
+    assert!(
+        script.contains("GH_TOKEN=\"${GATE_TOKEN}\" gh api"),
+        "the shared verdict must be published under the gate-publisher App token, never the workflow token"
+    );
+    assert!(
+        script.contains("[ -z \"${GATE_TOKEN:-}\" ]"),
+        "publication must refuse when the gate-publisher App identity is missing (fail closed)"
+    );
+    assert!(
+        script.contains("refusing to publish the required context under any shared identity"),
+        "the identity refusal must explain the forged-context threat"
+    );
+}
+
 // The event's pull-request fields are derived from branch-name matches
 // and are never trusted: the binding head comes from the announcing
 // run's commit, and the pull requests are re-derived through the API.
@@ -1798,13 +1872,14 @@ fn assert_publisher_binds_the_evaluation_to_the_announcing_head(workflow: &serde
     let steps = workflow["jobs"]["publish"]["steps"]
         .as_sequence()
         .expect("publisher steps must be a sequence");
+    let publish = steps.get(1).expect("the publication step must exist");
     assert!(
-        steps[0]["env"]["EVENT_HEAD_SHA"].as_str()
+        publish["env"]["EVENT_HEAD_SHA"].as_str()
             == Some("${{ github.event.workflow_run.head_sha }}"),
         "the evaluated head must be the announcing run's head commit"
     );
     assert!(
-        !steps[0]["run"]
+        !publish["run"]
             .as_str()
             .unwrap_or_default()
             .contains("github.event.workflow_run.pull_requests"),
@@ -1824,15 +1899,22 @@ fn assert_publisher_binds_the_evaluation_to_the_announcing_head(workflow: &serde
 }
 
 // Pull-request discovery is API-derived from the announcing run's commit,
-// filtered to open pull requests against main, and the published verdict is
-// a completed check-run under the required context name, bound to the
-// evaluated head.
+// filtered to open main pull requests actually HEADED by that commit (the
+// association endpoint also returns stacked descendants that merely contain
+// it), and the published verdict is one shared completed check-run under the
+// required context name, bound to the evaluated head.
 fn assert_publisher_publishes_the_verdict_at_the_evaluated_head(script: &str) {
     assert!(
         script.contains("commits/${announcer_head}/pulls")
             && script.contains(".base.ref == \"main\"")
-            && script.contains(".state == \"open\""),
-        "pull requests must be re-derived from the announcer's exact commit, open against main"
+            && script.contains(".state == \"open\"")
+            && script.contains("($announcer_head | ascii_downcase)"),
+        "pull requests must be re-derived from the announcer's exact commit, open against main, and selected by exact head SHA"
+    );
+    assert!(
+        script.contains("publish_gate_check_run \"${announcer_head}\" \"failure\"")
+            && script.contains("publish_gate_check_run \"${announcer_head}\" \"success\""),
+        "exactly one shared verdict — aggregated failure or success — must be published per announced head"
     );
 
     assert!(
@@ -2109,6 +2191,22 @@ fn assert_precondition_enforces_the_full_policy() {
             "the auto-merge precondition must require live ruleset context {expected}"
         );
     }
+    // The Bot Review Gate context must be required from the dedicated
+    // gate-publisher App, never from the shared Actions integration a
+    // pull-request job can forge a same-named check under: the app id comes
+    // from a repository variable, the literal 15368 binding must be gone,
+    // and an unset or non-numeric value must refuse auto-merge.
+    assert!(
+        DEPENDABOT_AUTOMERGE.contains("\"Bot Review Gate|${GATE_PUBLISHER_APP_ID}\"")
+            && !DEPENDABOT_AUTOMERGE.contains("\"Bot Review Gate|15368\"")
+            && DEPENDABOT_AUTOMERGE
+                .contains("GATE_PUBLISHER_APP_ID: ${{ vars.BOT_REVIEW_GATE_APP_ID }}"),
+        "the gate context must be bound to the repository-variable gate-publisher App id"
+    );
+    assert!(
+        DEPENDABOT_AUTOMERGE.contains("''|*[!0-9]*"),
+        "an unset or non-numeric gate app id must refuse auto-merge"
+    );
     // The ruleset list endpoint ignores a ref parameter and returns rulesets
     // for every branch, so the precondition must read the branch-rules
     // endpoint to know which rulesets actually apply to main. That endpoint
