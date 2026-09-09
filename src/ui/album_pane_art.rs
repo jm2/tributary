@@ -251,12 +251,15 @@ impl AlbumArtBinder {
             cell_state.revoke();
 
             // Cache hit: paint straight from the cache. The cache is
-            // keyed by (source, album_key, pixel_size), so two remote
-            // sources that happen to expose the same track id never
-            // collide on the same texture.
+            // keyed by (source, source_epoch, album_key, pixel_size), so
+            // two remote sources that happen to expose the same track id
+            // never collide on the same texture, and a source reactivated
+            // under a new session epoch never serves artwork decoded
+            // under a previous epoch's identity.
             if let Some(ref candidate) = candidate {
                 if let Some(texture) = controller.cache.get(
                     candidate.source_id.as_ref(),
+                    candidate.source_session_epoch,
                     &candidate.track_id,
                     pixel_size,
                 ) {
@@ -380,9 +383,19 @@ impl AlbumArtController {
         // listener) so THIS fetch runs un-revoked. This is race-free:
         // everything up to this point ran synchronously on the main
         // loop, so the previous fetch can only resume after this reset
-        // — where its stale generation token still blocks it from
-        // painting or caching (checked at every resume point below).
+        // — where its stale generation token and revoked liveness token
+        // still block it from painting or caching (checked at every
+        // resume point below).
         cell_state.clear();
+
+        // Mint this fetch's worker-side liveness token and store it on
+        // the cell. Rebind/unbind/teardown/factory-swap revokes flip it,
+        // which stops the persistent art worker before the network read
+        // and closes the reply — independently scoped per row, so
+        // concurrent visible rows (and the now-playing header) never
+        // cancel one another.
+        let liveness = album_art::ScopedArtFetch::new();
+        *cell_state.fetch_liveness.borrow_mut() = Some(liveness.clone());
 
         glib::MainContext::default().spawn_local(async move {
             // Step 1: resolve the artwork path. The decision tree mirrors
@@ -416,7 +429,7 @@ impl AlbumArtController {
                 return;
             }
 
-            paint_resolved_art(resolved, &image);
+            paint_resolved_art(resolved, &image, &liveness);
 
             // Cache the texture only once the worker publishes it. The
             // worker delivers bytes through `gdk::Texture::from_bytes`
@@ -426,10 +439,12 @@ impl AlbumArtController {
                 cache,
                 image,
                 album_source,
+                source_epoch,
                 album_key,
                 pixel_size,
                 cell_state,
                 generation,
+                liveness,
             );
         });
     }
@@ -438,25 +453,31 @@ impl AlbumArtController {
 /// Paint one resolved artwork outcome onto the row's image. Extracted
 /// from `spawn_fetch` so the spawned future stays a thin orchestration
 /// shell: each arm maps one [`ResolvedArtKind`] variant onto the
-/// matching album-art worker entry point, and the no-artwork case
+/// matching album-art worker entry point — always through the supplied
+/// per-request liveness token, never the process-wide header generation,
+/// so concurrent rows fetch independently — and the no-artwork case
 /// leaves the existing placeholder visible.
-fn paint_resolved_art(resolved: ResolvedArtKind, image: &gtk::Image) {
+fn paint_resolved_art(
+    resolved: ResolvedArtKind,
+    image: &gtk::Image,
+    liveness: &album_art::ScopedArtFetch,
+) {
     match resolved {
         ResolvedArtKind::NoArtwork => {
             // Leave the placeholder visible.
         }
         ResolvedArtKind::DirectFile { uri } => {
-            // Embedded extraction goes through the album-art
-            // worker; the worker's own generation check prevents
-            // late results from racing newer rows.
-            album_art::update_direct_file_album_art(image, &uri);
+            // Embedded extraction goes through the album-art worker;
+            // the fetch's scoped token stops the extractor and drops
+            // the reply if the row is re-bound mid-flight.
+            album_art::update_direct_file_album_art_scoped(image, &uri, liveness);
         }
         ResolvedArtKind::DirectUrl { url } => {
-            album_art::fetch_remote_album_art(image, &url);
+            album_art::fetch_remote_album_art_scoped(image, &url, liveness);
         }
         ResolvedArtKind::ResolvedRequest(request) => {
-            let gen = album_art::begin_remote_album_art(image);
-            album_art::fetch_resolved_album_art(image, *request, gen);
+            image.set_icon_name(Some(FALLBACK_PLACEHOLDER_ICON));
+            album_art::fetch_resolved_album_art_scoped(image, *request, liveness);
         }
     }
 }
@@ -535,10 +556,12 @@ fn install_cache_probe(
     cache: AlbumArtCache,
     image: gtk::Image,
     source: Option<SourceId>,
+    source_epoch: Option<u64>,
     album_key: String,
     pixel_size: i32,
     cell_state: AlbumArtCellState,
     generation: BindGeneration,
+    liveness: album_art::ScopedArtFetch,
 ) {
     // The album-art worker calls `set_paintable` synchronously from the
     // GTK main thread when its fetch succeeds. Listening for the
@@ -555,19 +578,21 @@ fn install_cache_probe(
 
     let closure_album_key = album_key;
     let closure_source = source;
+    let closure_epoch = source_epoch;
     let gen = generation;
     let state = cell_state.clone();
     let handler_id = image.connect_notify_local(Some("paintable"), move |img, _| {
-        // Both gates must agree before we cache: a stale generation or
-        // a revoked fetch must not pollute the cache with a texture the
-        // user never sees.
-        if state.is_revoked() || state.current_generation() != gen {
+        // All three gates must agree before we cache: a stale generation,
+        // a revoked fetch, or a revoked worker-side token must not
+        // pollute the cache with a texture the user never sees.
+        if state.is_revoked() || state.current_generation() != gen || !liveness.is_live() {
             return;
         }
         if let Some(paintable) = img.paintable() {
             if let Ok(texture) = paintable.downcast::<gdk::Texture>() {
                 cache.insert(
                     closure_source.as_ref(),
+                    closure_epoch,
                     &closure_album_key,
                     pixel_size,
                     texture,
