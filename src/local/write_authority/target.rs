@@ -1,7 +1,7 @@
 //! The staged-write handle ([`PreparedWriteTarget`]) and the bound
 //! directory handle ([`MountedDirectory`]) produced by the write authority.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
@@ -16,8 +16,14 @@ use super::staging::discard_staged_file;
 #[cfg(not(unix))]
 use super::staging::{discard_staged_file, rollback_staged};
 use crate::local::root_authority::{
-    LeafIdentity, MountedRootAuthority, RestoreFailure, RetainedWriteParent,
+    LandedPublish, LeafIdentity, MountedRootAuthority, RetainedWriteParent,
 };
+// The displaced-occupant marker exists only where the atomic exchange does
+// (Unix; see `root_authority::RestoreFailure`). The Windows replace loop
+// re-binds on verification mismatch and fails with an ordinary I/O error,
+// so the commit-time downcast below is gated with it.
+#[cfg(unix)]
+use crate::local::root_authority::RestoreFailure;
 
 /// A staged write below a [`MountedWriteAuthority`](super::MountedWriteAuthority)
 /// ready for commit/rollback.
@@ -154,74 +160,8 @@ impl PreparedWriteTarget {
         self.parent
             .validate_with(&self.authority)
             .map_err(CommitError::from)?;
-        let final_path = self.authority.root().join(&self.final_relative_path);
-        let final_leaf = self
-            .final_relative_path
-            .file_name()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "final path is missing a leaf")
-            })?
-            .to_os_string();
         self.flush_and_close_staged().map_err(CommitError::from)?;
-        let backup_leaf = backup_leaf_name();
-        let mut backup_relative = self
-            .final_relative_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-        backup_relative.push(backup_leaf.as_os_str());
-        let (replaced_original, landed) = if self.resolution == ConflictResolution::Overwrite {
-            match self.authority.replace_within_directory(
-                &self.parent,
-                &self.staged_leaf,
-                &self.staged_path,
-                &final_leaf,
-                &final_path,
-                backup_leaf.as_os_str(),
-                &self.authority.root().join(&backup_relative),
-            ) {
-                Ok((replaced, landed)) => (replaced.then_some(backup_relative), landed),
-                Err(error) => {
-                    // A landed atomic exchange whose displaced-occupant
-                    // restore failed: the transfer's bytes ARE published at
-                    // the destination, the bind-time backup is retained for
-                    // restoration, and the displaced object survives at the
-                    // staged leaf. Shield the staged leaf from cleanup and
-                    // surface the publication as a verified-publication
-                    // failure so the caller records it for rollback — a
-                    // committed file whose outcome is dropped can never be
-                    // undone.
-                    let displaced = error
-                        .get_ref()
-                        .and_then(|payload| payload.downcast_ref::<RestoreFailure>())
-                        .map(|failure| failure.payload.published_leaf);
-                    if let Some(published_leaf) = displaced {
-                        self.staged_leaf_holds_displaced_occupant = true;
-                        let outcome = CommitOutcome {
-                            relative_path: self.final_relative_path.clone(),
-                            resolution: self.resolution,
-                            replaced_original: Some(backup_relative),
-                            published_leaf,
-                        };
-                        return Err(CommitError::PublishVerification { outcome, error });
-                    }
-                    return Err(CommitError::from(error));
-                }
-            }
-        } else {
-            let landed = self
-                .authority
-                .publish_within_directory(
-                    &self.parent,
-                    &self.staged_leaf,
-                    &self.staged_path,
-                    &final_leaf,
-                    &final_path,
-                    true,
-                )
-                .map_err(CommitError::from)?;
-            (None, landed)
-        };
+        let (replaced_original, landed) = self.publish_staged()?;
         let outcome = CommitOutcome {
             relative_path: self.final_relative_path.clone(),
             resolution: self.resolution,
@@ -244,6 +184,115 @@ impl PreparedWriteTarget {
         }
         self.committed = true;
         Ok(outcome)
+    }
+
+    /// Publish the flushed-and-closed staged leaf under the planned
+    /// resolution.
+    ///
+    /// Returns the replaced-occupant backup path — `Some` only when an
+    /// Overwrite publish actually replaced an occupant — plus the landing
+    /// data whose trailing retained-parent revalidation the caller reports
+    /// as a verified-publication failure.
+    fn publish_staged(&mut self) -> Result<(Option<PathBuf>, LandedPublish), CommitError> {
+        let final_path = self.authority.root().join(&self.final_relative_path);
+        let final_leaf = self.final_leaf_name().map_err(CommitError::from)?;
+        if self.resolution != ConflictResolution::Overwrite {
+            // Fresh and Preserved resolutions publish with no-replace
+            // semantics: a destination that appeared after staging —
+            // including the original file of a Preserve conflict — fails
+            // the commit instead of being replaced, and is never touched.
+            let landed = self
+                .authority
+                .publish_within_directory(
+                    &self.parent,
+                    &self.staged_leaf,
+                    &self.staged_path,
+                    &final_leaf,
+                    &final_path,
+                    true,
+                )
+                .map_err(CommitError::from)?;
+            return Ok((None, landed));
+        }
+        self.publish_by_replace(final_leaf, final_path)
+    }
+
+    /// The Overwrite publish: bind the current occupant of the destination
+    /// name to a hidden backup sibling and replace atomically, never
+    /// unbacked. If the destination turned out to be absent at commit, the
+    /// publish degrades to the no-replace cascade — a concurrent creation
+    /// is bypassed or backed up, never silently replaced-and-deleted.
+    fn publish_by_replace(
+        &mut self,
+        final_leaf: OsString,
+        final_path: PathBuf,
+    ) -> Result<(Option<PathBuf>, LandedPublish), CommitError> {
+        let backup_leaf = backup_leaf_name();
+        let mut backup_relative = self
+            .final_relative_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        backup_relative.push(backup_leaf.as_os_str());
+        match self.authority.replace_within_directory(
+            &self.parent,
+            &self.staged_leaf,
+            &self.staged_path,
+            &final_leaf,
+            &final_path,
+            backup_leaf.as_os_str(),
+            &self.authority.root().join(&backup_relative),
+        ) {
+            Ok((replaced, landed)) => Ok((replaced.then_some(backup_relative), landed)),
+            Err(error) => {
+                #[cfg(not(unix))]
+                return Err(CommitError::from(error));
+                #[cfg(unix)]
+                Err(self.map_replace_failure(error, backup_relative))
+            }
+        }
+    }
+
+    /// Classify a failed replace publish. A landed atomic exchange whose
+    /// displaced-occupant restore failed means the transfer's bytes ARE
+    /// published at the destination, the bind-time backup is retained for
+    /// restoration, and the displaced object survives at the staged leaf:
+    /// shield the staged leaf from cleanup and surface the publication as a
+    /// verified-publication failure carrying the outcome, so the caller
+    /// records it for rollback — a committed file whose outcome is dropped
+    /// can never be undone. Any other failure published nothing.
+    ///
+    /// Unix only: the atomic exchange — and so the landed-but-unrestorable
+    /// displaced occupant — exists only on platforms with a swap primitive.
+    /// The Windows replace loop re-binds on verification mismatch and
+    /// surfaces an ordinary I/O error, so there is nothing to downcast.
+    #[cfg(unix)]
+    fn map_replace_failure(&mut self, error: io::Error, backup_relative: PathBuf) -> CommitError {
+        let displaced = error
+            .get_ref()
+            .and_then(|payload| payload.downcast_ref::<RestoreFailure>())
+            .map(|failure| failure.payload.published_leaf);
+        if let Some(published_leaf) = displaced {
+            self.staged_leaf_holds_displaced_occupant = true;
+            let outcome = CommitOutcome {
+                relative_path: self.final_relative_path.clone(),
+                resolution: self.resolution,
+                replaced_original: Some(backup_relative),
+                published_leaf,
+            };
+            return CommitError::PublishVerification { outcome, error };
+        }
+        CommitError::from(error)
+    }
+
+    /// The leaf name the staged bytes publish under.
+    fn final_leaf_name(&self) -> io::Result<OsString> {
+        self.final_relative_path
+            .file_name()
+            .map(OsStr::to_os_string)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "final path is missing a leaf")
+            })
     }
 
     /// Flush the staged handle to disk and close it before any publish

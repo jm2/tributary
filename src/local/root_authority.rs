@@ -4276,6 +4276,7 @@ pub(crate) struct DisplacedOccupantFailure {
     pub(crate) published_leaf: Option<LeafIdentity>,
 }
 
+#[cfg(unix)]
 impl fmt::Debug for DisplacedOccupantFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -4285,6 +4286,7 @@ impl fmt::Debug for DisplacedOccupantFailure {
     }
 }
 
+#[cfg(unix)]
 impl fmt::Display for DisplacedOccupantFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -4296,6 +4298,7 @@ impl fmt::Display for DisplacedOccupantFailure {
     }
 }
 
+#[cfg(unix)]
 impl std::error::Error for DisplacedOccupantFailure {}
 
 /// Build the marker-carrying error for a displaced occupant the publish
@@ -4326,6 +4329,7 @@ pub(crate) struct RestoreFailure {
     detail: Option<io::Error>,
 }
 
+#[cfg(unix)]
 impl fmt::Debug for RestoreFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -4336,6 +4340,7 @@ impl fmt::Debug for RestoreFailure {
     }
 }
 
+#[cfg(unix)]
 impl fmt::Display for RestoreFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.detail {
@@ -4349,6 +4354,7 @@ impl fmt::Display for RestoreFailure {
     }
 }
 
+#[cfg(unix)]
 impl std::error::Error for RestoreFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.cause)
