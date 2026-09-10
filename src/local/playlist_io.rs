@@ -307,9 +307,7 @@ fn parse_xspf(content: &str) -> anyhow::Result<Vec<ImportedTrack>> {
                 }
             }
             Event::Text(text) => {
-                let value = text
-                    .xml10_content()
-                    .map_err(|error| anyhow!("malformed XSPF text: {error}"))?;
+                let value = text.xml10_content();
                 if !saw_root {
                     declaration_must_be_next = false;
                 }
@@ -318,9 +316,7 @@ fn parse_xspf(content: &str) -> anyhow::Result<Vec<ImportedTrack>> {
             }
             Event::CData(text) => {
                 reject_markup_outside_root(&stack, saw_root, root_closed, "CDATA")?;
-                let value = text
-                    .xml10_content()
-                    .map_err(|error| anyhow!("malformed XSPF CDATA: {error}"))?;
+                let value = text.xml10_content();
                 validate_xml_10_text(&value)?;
                 append_xspf_text(&mut stack, &value);
                 reject_text_outside_root(&stack, saw_root, root_closed, &value)?;
@@ -366,8 +362,7 @@ fn parse_xspf(content: &str) -> anyhow::Result<Vec<ImportedTrack>> {
 fn is_xspf_namespace(namespace: &ResolveResult<'_>) -> anyhow::Result<bool> {
     match namespace {
         ResolveResult::Bound(value) => {
-            let raw = std::str::from_utf8(value.as_ref())
-                .map_err(|error| anyhow!("malformed XSPF namespace encoding: {error}"))?;
+            let raw = value.as_ref();
             let normalized = quick_xml::escape::unescape(raw)
                 .map_err(|error| anyhow!("malformed XSPF namespace: {error}"))?;
             validate_xml_10_text(&normalized)?;
@@ -401,8 +396,7 @@ fn validate_element_attributes(
 }
 
 fn validate_xml_declaration(declaration: &quick_xml::events::BytesDecl<'_>) -> anyhow::Result<()> {
-    let raw = std::str::from_utf8(declaration)
-        .map_err(|error| anyhow!("malformed XSPF XML declaration encoding: {error}"))?;
+    let raw: &str = declaration;
     let declaration = BytesStart::from_content(raw, 3);
     let mut stage = 0u8;
 
@@ -415,15 +409,15 @@ fn validate_xml_declaration(declaration: &quick_xml::events::BytesDecl<'_>) -> a
         validate_xml_10_text(&value)?;
 
         match attribute.key.as_ref() {
-            b"version" if stage == 0 && value == "1.0" => stage = 1,
-            b"version" if stage == 0 => {
+            "version" if stage == 0 && value == "1.0" => stage = 1,
+            "version" if stage == 0 => {
                 bail!("unsupported XSPF XML declaration: version must be 1.0")
             }
-            b"encoding" if stage == 1 && value.eq_ignore_ascii_case("utf-8") => stage = 2,
-            b"encoding" if stage == 1 => {
+            "encoding" if stage == 1 && value.eq_ignore_ascii_case("utf-8") => stage = 2,
+            "encoding" if stage == 1 => {
                 bail!("unsupported XSPF XML declaration: encoding must be UTF-8")
             }
-            b"standalone"
+            "standalone"
                 if (stage == 1 || stage == 2) && matches!(value.as_ref(), "yes" | "no") =>
             {
                 stage = 3;
@@ -439,7 +433,7 @@ fn validate_xml_declaration(declaration: &quick_xml::events::BytesDecl<'_>) -> a
 }
 
 fn validate_playlist_root(element: &BytesStart<'_>, is_xspf: bool) -> anyhow::Result<()> {
-    if element.local_name().as_ref() != b"playlist" {
+    if element.local_name().as_ref() != "playlist" {
         bail!("unsupported playlist document: expected an XSPF v1 <playlist> root");
     }
     if !is_xspf {
@@ -449,7 +443,7 @@ fn validate_playlist_root(element: &BytesStart<'_>, is_xspf: bool) -> anyhow::Re
     let mut version = None;
     for attribute in element.attributes().with_checks(true) {
         let attribute = attribute.map_err(|error| anyhow!("malformed XSPF attribute: {error}"))?;
-        if attribute.key.as_ref() == b"version" {
+        if attribute.key.as_ref() == "version" {
             if version.is_some() {
                 bail!("malformed XSPF: duplicate playlist version attribute");
             }
@@ -471,7 +465,7 @@ fn validate_playlist_root(element: &BytesStart<'_>, is_xspf: bool) -> anyhow::Re
 fn classify_xspf_node(
     parent: Option<&XspfNode>,
     is_xspf: bool,
-    local_name: &[u8],
+    local_name: &str,
     saw_track_list: &mut bool,
     current_track: &mut Option<ImportedTrack>,
 ) -> anyhow::Result<XspfNode> {
@@ -480,14 +474,14 @@ fn classify_xspf_node(
     }
 
     match parent {
-        Some(XspfNode::Playlist) if local_name == b"trackList" => {
+        Some(XspfNode::Playlist) if local_name == "trackList" => {
             if *saw_track_list {
                 bail!("malformed XSPF: multiple direct <trackList> children");
             }
             *saw_track_list = true;
             Ok(XspfNode::TrackList)
         }
-        Some(XspfNode::TrackList) if local_name == b"track" => {
+        Some(XspfNode::TrackList) if local_name == "track" => {
             if current_track.is_some() {
                 bail!("malformed XSPF: nested playlist track state");
             }
@@ -501,13 +495,13 @@ fn classify_xspf_node(
     }
 }
 
-fn xspf_field(local_name: &[u8]) -> Option<XspfField> {
+fn xspf_field(local_name: &str) -> Option<XspfField> {
     match local_name {
-        b"location" => Some(XspfField::Location),
-        b"title" => Some(XspfField::Title),
-        b"creator" => Some(XspfField::Creator),
-        b"album" => Some(XspfField::Album),
-        b"duration" => Some(XspfField::Duration),
+        "location" => Some(XspfField::Location),
+        "title" => Some(XspfField::Title),
+        "creator" => Some(XspfField::Creator),
+        "album" => Some(XspfField::Album),
+        "duration" => Some(XspfField::Duration),
         _ => None,
     }
 }
@@ -550,9 +544,7 @@ fn resolve_xml_reference(reference: &quick_xml::events::BytesRef<'_>) -> anyhow:
         return Ok(value.to_string());
     }
 
-    let name = reference
-        .decode()
-        .map_err(|error| anyhow!("malformed XSPF entity reference: {error}"))?;
+    let name = reference.xml10_content();
     quick_xml::escape::resolve_xml_entity(&name)
         .map(str::to_string)
         .ok_or_else(|| anyhow!("unsupported XSPF entity reference: &{name};"))
@@ -894,6 +886,27 @@ mod tests {
         assert_eq!(tracks[0].title, "Tom & Jerry");
         assert_eq!(tracks[0].artist, "A &amp; <Artist>");
         assert_eq!(tracks[0].album, "");
+    }
+
+    #[test]
+    fn xml_10_end_of_line_normalization_matches_quick_xml_0_42_content_api() {
+        let tracks = import_document(concat!(
+            "<playlist version='1' xmlns='http://xspf.org/ns/0/'>",
+            "<trackList><track>",
+            "<title>one&#13;two</title>",
+            "<creator><![CDATA[A\r\nB\rC]]></creator>",
+            "</track></trackList></playlist>"
+        ))
+        .expect("parse XSPF with XML 1.0 end-of-line variants");
+
+        assert_eq!(tracks.len(), 1);
+        // Literal CR-LF and lone CR in text/CDATA content are normalized to
+        // LF (XML 1.0 section 2.11) by quick-xml 0.42's infallible
+        // xml10_content(); the XSPF import stores the normalized value.
+        assert_eq!(tracks[0].artist, "A\nB\nC");
+        // A carriage return delivered through a character reference is
+        // content, not an end-of-line, so it survives normalization.
+        assert_eq!(tracks[0].title, "one\rtwo");
     }
 
     #[test]
