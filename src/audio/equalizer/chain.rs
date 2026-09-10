@@ -200,25 +200,53 @@ impl EqChain {
     }
 
     /// Buffer-boundary property-write transaction: capture the full
-    /// `EqSettings` into one typed write, wrap the ten band writes and
-    /// the preamp write in a notification freeze (RAII guard thawing on
-    /// drop) so the bus sees exactly one `properties-changed` per
-    /// element, not eleven.
+    /// `EqSettings` into one typed write and land the ten band writes
+    /// and the preamp write as a single batch (contract:
+    /// *Live-reconfiguration boundary*).
+    ///
+    /// While the bin runs, the batch is delivered through an **idle pad
+    /// probe** on the bin's sink ghost pad — the mechanism GStreamer
+    /// provides for running code between buffers — so no buffer crosses
+    /// the bin boundary while the eleven writes are in flight. The
+    /// probe uninstalls itself (`PadProbeReturn::Remove`) once the batch
+    /// has landed. When the bin is not running (build time, behind the
+    /// pause seam, or at READY with no data flow) the writes land
+    /// directly: there is no streaming thread to serialize against.
+    ///
+    /// GObject notify freezing is deliberately not used: freezing only
+    /// defers `notify` emission and carries no cross-element atomicity,
+    /// so it neither bounds nor batches the audio effect of the writes.
     pub fn apply_band_transaction(&self, settings: &EqSettings) {
-        {
-            // The freeze guard thaws notifications when dropped.
-            let _frozen = self.preamp.freeze_notify();
-            self.preamp.set_property(
-                "volume",
-                EqSettings::preamp_db_to_factor(settings.preamp_db),
-            );
-        }
-        {
-            let _frozen = self.eq.freeze_notify();
-            for (index, gain) in settings.bands_db.iter().enumerate() {
-                // `equalizer-10bands` band properties are gdouble.
-                self.eq.set_property(&format!("band{index}"), *gain);
+        let preamp_factor = EqSettings::preamp_db_to_factor(settings.preamp_db);
+        let bands = settings.bands_db;
+        let running = self.bin.current_state() != gst::State::Null;
+        let sink_pad = self.bin.static_pad("audio-filter-sink");
+        match (running, sink_pad) {
+            (true, Some(sink_pad)) => {
+                let preamp = self.preamp.clone();
+                let eq = self.eq.clone();
+                sink_pad.add_probe(gst::PadProbeType::IDLE, move |_, _| {
+                    Self::write_band_properties_on(&preamp, &eq, preamp_factor, &bands);
+                    // The transaction is one-shot: uninstall the probe
+                    // so the next batch gets a fresh boundary write.
+                    gst::PadProbeReturn::Remove
+                });
             }
+            _ => Self::write_band_properties_on(&self.preamp, &self.eq, preamp_factor, &bands),
+        }
+    }
+
+    /// The raw batch: one preamp write, then the ten band writes.
+    fn write_band_properties_on(
+        preamp: &gst::Element,
+        eq: &gst::Element,
+        preamp_factor: f64,
+        bands: &[f64; 10],
+    ) {
+        preamp.set_property("volume", preamp_factor);
+        for (index, gain) in bands.iter().enumerate() {
+            // `equalizer-10bands` band properties are gdouble.
+            eq.set_property(&format!("band{index}"), *gain);
         }
     }
 
@@ -530,5 +558,63 @@ mod tests {
             let written: f64 = eq.property(&format!("band{index}"));
             assert!((written - *expected).abs() < 1e-9, "band{index}");
         }
+    }
+
+    /// Regression (review thread: preset gains must land at an actual
+    /// buffer boundary): on a chain that is not in `NULL`, the batch is
+    /// delivered through the idle probe on the bin's sink ghost pad
+    /// instead of a bare property storm. On an idle bin (READY, no data
+    /// flow) the probe fires synchronously, so the batch has landed by
+    /// the time the call returns — and returned `Remove`, so the next
+    /// batch lands through a fresh probe too.
+    #[test]
+    fn band_transaction_on_a_running_bin_lands_through_the_sink_pad_probe() {
+        if !bin_requires_plugins() {
+            return;
+        }
+        let chain = EqChain::build(&EqSettings {
+            enabled: true,
+            ..EqSettings::default()
+        })
+        .expect("eq-bin builds");
+        chain
+            .bin
+            .set_state(gst::State::Ready)
+            .expect("a no-data bin reaches READY synchronously");
+        assert_ne!(chain.bin.current_state(), gst::State::Null);
+
+        let first = EqSettings {
+            enabled: true,
+            preset: Preset::Custom,
+            preamp_db: -3.0,
+            bands_db: [-2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 2.0, 1.0, 0.0, -1.0],
+            clip_protection: ClipProtection::Off,
+        };
+        chain.apply_band_transaction(&first);
+        let preamp = chain.bin.by_name("eq-preamp").unwrap();
+        assert!(
+            (preamp.property::<f64>("volume") - EqSettings::preamp_db_to_factor(-3.0)).abs() < 1e-6
+        );
+        let eq = chain.bin.by_name("eq").unwrap();
+        for (index, expected) in first.bands_db.iter().enumerate() {
+            let written: f64 = eq.property(&format!("band{index}"));
+            assert!((written - *expected).abs() < 1e-9, "band{index}");
+        }
+
+        // The probe removed itself: a second batch lands just as fully.
+        let second = EqSettings {
+            preamp_db: 6.0,
+            bands_db: [0.5; 10],
+            ..first
+        };
+        chain.apply_band_transaction(&second);
+        assert!(
+            (preamp.property::<f64>("volume") - EqSettings::preamp_db_to_factor(6.0)).abs() < 1e-6
+        );
+        for (index, expected) in second.bands_db.iter().enumerate() {
+            let written: f64 = eq.property(&format!("band{index}"));
+            assert!((written - *expected).abs() < 1e-9, "band{index}");
+        }
+        chain.bin.set_state(gst::State::Null).expect("bin to NULL");
     }
 }
