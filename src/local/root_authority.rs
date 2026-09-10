@@ -3813,7 +3813,7 @@ fn request_object_deletion(handle: windows_sys::Win32::Foundation::HANDLE) -> io
     if !unsupported {
         return Err(error);
     }
-    let request_basic = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    let request_basic = FILE_DISPOSITION_INFO { DeleteFile: true };
     // SAFETY: `handle` is a live file handle and the buffer is a correctly
     // initialized structure of exactly the class' expected size.
     let requested_basic = unsafe {
