@@ -1,23 +1,28 @@
 # Tributary implementation roadmap
 
-Last audited: 2026-09-01
+Last audited: 2026-09-09
 
 This document explains the product and engineering work that remains **after** the holistic-review
 remediation. [`task.md`](task.md) is the countable active implementation backlog; the completed
 remediation record is preserved separately in
 [`task-remediation-2026-07.md`](task-remediation-2026-07.md) at **223/226 (98.7%)**, with only three
-real-environment validation records left. The active backlog is now **15/39 (38.5%)** complete.
+real-environment validation records left. The expanded backlog is **16/57 (28.1%)** complete:
+the corrected original baseline is 16/39, with eleven corrective and seven engineering records
+added. No feature acceptance was closed by this documentation reconciliation.
 Neither percentage estimates equal engineering effort, and the historical percentage is not a
 claim that Tributary has implemented every requested product feature.
 
 The entries below are candidates, not release promises. With
 [#149](https://github.com/jm2/tributary/pull/149) having closed the completed server-playlist issue
 [#143](https://github.com/jm2/tributary/issues/143), and the completed Rhythmbox migration closing
-[#57](https://github.com/jm2/tributary/issues/57), 8 GitHub issues remain open. Candidates should
-receive acceptance criteria, dependencies, and a milestone before work starts. Historical
-holistic-review documents are point-in-time findings, not active roadmaps.
+[#57](https://github.com/jm2/tributary/issues/57), eight feature requests remain open. The September
+review additionally filed bugs #248–#258. [task.md](task.md) maps them to acceptance, existing Gas
+City work, dependencies and separate release/operator evidence. Candidates need a scoped issue,
+owner/bead and accepted design before activation. Historical reviews are point-in-time evidence.
 
-The current implementation focus is Last.fm [#50](https://github.com/jm2/tributary/issues/50).
+The immediate corrective priorities are local tag-write safety (#248) and diagnostic privacy
+(#249); these do not revoke current Gas City claims. Last.fm
+[#50](https://github.com/jm2/tributary/issues/50) remains the ongoing listening integration.
 Its accepted [`lastfm-scrobbling.md`](lastfm-scrobbling.md) contract fixes the product, privacy,
 authority, offline queue, and lifecycle boundaries. The internal implementation now supplies the
 bounded signed transport, native protected-session boundary, strict queue schema, transactional
@@ -65,11 +70,16 @@ teardown. Startup still leaves the coordinator `Dormant`: no application caller 
 activation request or connects live enablement and per-source policy, consent, authorization,
 vault recovery, or UI. Dormant accepted authority is consumed only through the exact metadata-free
 discard closure. Exact local/authenticated-remote profiles, production remote-source opt-in,
-persisted policy and activation issuance, successor-policy ownership plus typed runtime
+integration of the existing durable policy with activation, successor-policy ownership and runtime
 status/disconnect/reauthorization/recovery controls, consent and browser invocation,
 authorization-owner construction plus atomic vault/account transition, localized
 account/recovery/status UI, packaged credentials, and live final acceptance testing remain the next
 slices.
+
+Durable policy generations and strict migration 20 landed in `e7b07c1`; the remaining work is
+live policy/application composition, not another storage implementation. The detailed pre-expansion
+acceptance and delivery narrative is preserved in
+[the implementation history](task-implementation-history-2026-09-09.md).
 
 ## Current baseline
 
@@ -279,8 +289,8 @@ slices.
   Remaining work is production integration rather than a claim that this internal slice is
   available. The complete inventory lives in the
   [dated contract boundary](lastfm-scrobbling.md#dated-implementation-boundary); it includes a
-  persisted immutable policy generation shared by queue capture and bridge dispatch plus explicit
-  activation issuance; exact local and authenticated-remote profiles and production remote-source
+  shared live use of the existing durable policy generation at queue capture and bridge dispatch,
+  with explicit activation; exact local and authenticated-remote profiles and production remote-source
   opt-in;
   consent/browser invocation and construction of the completed
   authorization core; atomic staged-session vault/account transitions;
@@ -481,7 +491,8 @@ The playback-history contract makes the remaining Last.fm behavior much less amb
    capture asks the registry to mint its exact current-session proof. Lock-linearized freshness
    makes delayed accepted loads and older NowPlaying inert after a successor; an owed predecessor
    Clear survives source rejection or runtime Busy until successor NowPlaying is admitted, while a
-   qualified Enqueue remains owned through its supervised durable result. Ineligible or rejected replacements retire and clear their
+   qualified Enqueue remains owned through its supervised durable result. Ineligible or rejected
+   replacements retire and clear their
    predecessor at most once. The runtime now owns latest-only, synchronously
    cancelling, never-retried now-playing plus an explicit reserved clear; only an exact code-9
    generation/account/epoch claim
@@ -570,9 +581,10 @@ the macOS pipeline now listens for the exact CoreAudio default-output property a
 2. **AirPlay 2/HomeKit sender.** Complete a design investigation before choosing a dependency or
    implementation. At minimum this requires pairing, encrypted control, and the expected encoded
    audio/timing path. Multi-device clock synchronization is required only if simultaneous
-   multi-room output becomes an explicit goal. See [AirPlay 2](#airplay-2).
-3. **Chromecast IPv6 publication.** The current receiver-facing ticket listener is IPv4-only, so an
-   IPv6-only Cast control endpoint is omitted rather than given an unreachable media URL.
+   multi-room output becomes an explicit goal. See [AirPlay senders](#airplay-senders).
+3. **Chromecast IPv6 publication.** PR #174 already added target-routed receiver-facing IPv6
+   tickets. Reconcile full acceptance/docs/changelog in P2.4-F; omit unusable endpoints, including
+   scoped addresses that cannot be safely published. Media representation is separate work (#255).
 4. **MPD detectable exclusive-control mode.** Safe automatic orphan cleanup remains coupled to a
    stronger ownership mode that must also account for MPD's partition-global pause, stop, repeat,
    random, single, and consume operations. The current explicit exclusive-control confirmation and
@@ -593,20 +605,26 @@ the macOS pipeline now listens for the exact CoreAudio default-output property a
 
 ## Live open issues
 
-This is a snapshot of the remaining open issue set on 2026-07-22. GitHub remains authoritative for
-whether an issue is open; this table records the implementation assessment so a feature request is
-not mistaken for work already underway.
+The September 9 snapshot has eight open feature requests and eleven filed bugs. GitHub remains
+authoritative; [task.md](task.md) supplies the current acceptance and Gas City dependency map.
+The [review](backlog-review-proposal-2026-09-09.md) distinguishes reproduced defects, static
+findings, accepted historical limits, and remaining platform validation.
 
-| Issue | Current implementation state | Likely implementation shape |
-|---|---|---|
-| [#50 — Last.fm scrobbling](https://github.com/jm2/tributary/issues/50) | Accepted [contract](lastfm-scrobbling.md), bounded client with zeroizing strict auth parsing, latest-only desktop-authorization core, native-vault authority, migrations 17/18, transactional private FIFO, durable delivery/cleanup gate, standalone playback-evidence observer, GTK-free move-only accepted-output owner/handoffs with `PlaybackSession`-private minting and corrected Clear/NowPlaying freshness, registry-bound real-tag external/removable attribution with exact removable queue capture, internal delivery/lifecycle/latest-only-now-playing runtime with request-scoped hard-abort-safe shared vault exclusion, an exactly-once process coordinator with epoch-bound production ingress plus a sealed operation-drained Active bridge, and a headless application-owner core for transactional runtime/bridge activation and ordered drain. Shipping startup constructs that owner, conditionally attaches the database after successful initialization, and joins it before downstream shutdown, but remains Dormant because it issues no activation authority. | Add exact local/authenticated-remote profiles and one persisted policy generation shared by queue capture and bridge dispatch, resolve successor-policy ownership and typed runtime lifecycle/status controls, then issue activation only from explicit consent/enablement; wrap the completed authorization core in consent, browser launch, and atomic vault/account transition; add localized account/recovery/status UI, package credentials, and live final acceptance coverage. |
-| [#49 — Equalizer](https://github.com/jm2/tributary/issues/49) | No equalizer or audio-filter configuration. | GStreamer DSP design plus explicit behavior for every output backend. |
-| [#46 — Drag and drop](https://github.com/jm2/tributary/issues/46) | Column-header reordering exists; track/file drag-and-drop does not. | Local playlist DnD first; file export, remote rows, and device copies as distinct policies. |
-| [#39 — Album art in browser](https://github.com/jm2/tributary/issues/39) | Artwork is shown for now-playing, not in the Genre/Artist/Album browser. | Virtualized art UI with bounded async cache, cancellation, accessibility, and authenticated art. |
-| [#29 — UI refinement](https://github.com/jm2/tributary/issues/29) | Requested separators/alignment changes are not implemented. | Split into independently reviewable visual changes after current-theme design review. |
-| [#14 — Browse by folder](https://github.com/jm2/tributary/issues/14) | Browser panes expose Genre, Artist, and Album only. | Root-relative folder model and lazy UI with multiple-root and unavailable-root semantics. |
-| [#11 — Offline cache/download](https://github.com/jm2/tributary/issues/11) | No remote download or offline catalogue subsystem. | Large persistent cache/download epic with quota, retry, reconciliation, and secure auth handling. |
-| [#8 — Android synchronization](https://github.com/jm2/tributary/issues/8) | Mounted-device browse/play exists; transfer, sync, automount, and MTP do not. | Large transfer/sync epic with MTP, write authority, planning, progress, conflicts, and rollback. |
+| Feature issue | Current state and next acceptance |
+| --- | --- |
+| [#50 Last.fm](https://github.com/jm2/tributary/issues/50) | Internal lifecycle/runtime and durable policy storage exist; production is Dormant. Integrate shared policy, attribution, successor/account controls, consent/browser UI and package/live acceptance. |
+| [#49 Equalizer](https://github.com/jm2/tributary/issues/49) | Design #183 then implementation #220; accept the actual DSP contract and application/output behavior. |
+| [#46 Drag/drop](https://github.com/jm2/tributary/issues/46) | Local-playlist implementation merged in #182/#242; reconcile acceptance. #221 designs remaining export/device-copy destinations. |
+| [#39 Browser artwork](https://github.com/jm2/tributary/issues/39) | #171 remains a draft redesign with bounded work/cache, cancellation, authority and row-reuse obligations. |
+| [#29 UI refinement](https://github.com/jm2/tributary/issues/29) | #179 merged; reconcile actual visual/accessibility evidence and user docs/changelog. |
+| [#14 Folder browsing](https://github.com/jm2/tributary/issues/14) | Model/pane implemented; #250–#253 track filter, activation, Windows path and lifecycle corrections. |
+| [#11 Offline media](https://github.com/jm2/tributary/issues/11) | Existing #181/#228/#231/#230 chain needs accepted design, shared engine/persistence/resolver and real application wiring. |
+| [#8 Android sync](https://github.com/jm2/tributary/issues/8) | Existing #175/#178/#180 chain needs real MTP transport, native packaging, attachment/UI integration and device proof. |
+
+Corrective records R1–R11 link bugs #248–#258. Engineering records Q1–Q7 add real-display GTK
+verification, independent fuzz-lock audit, broader parser fuzzing, measured library budgets,
+relay/catalogue resource contracts and backlog consistency. Release/operator evidence is tracked
+separately, including the unresolved out-of-band versus proposed hosted-review policy.
 
 ## AirPlay senders
 
@@ -652,8 +670,9 @@ license, distribution, key-material provenance, and interoperability review.
   change after an upstream fix is available in the supported runtime floor and has been validated
   on affected multi-channel hardware. Default-output following must not inherit or silently remove
   that guard when GStreamer changes.
-- A direct end-to-end watcher-backlog/root-confirmation ordering harness would strengthen existing
-  component and engine-loop coverage, although the remediation acceptance record is already closed.
+- Direct watcher-backlog/root-confirmation ordering is covered by the real-loop harness, with
+  further trust-boundary/Name::Any evidence merged in #222. P3.4-D is complete; preserve physical
+  watcher/device validation as release evidence rather than dispatching another harness.
 - Evaluate replacing the broad Windows/macOS GStreamer plugin copy with a capability-derived audio
   allowlist and narrowing native Linux's broad plugin-package relationships after a cross-platform
   playback/output matrix can prove all supported containers, remote sources, local sinks, and
@@ -700,7 +719,6 @@ When an item becomes active:
 [#47]: https://github.com/jm2/tributary/issues/47
 [#49]: https://github.com/jm2/tributary/issues/49
 [#50]: https://github.com/jm2/tributary/issues/50
-[#57]: https://github.com/jm2/tributary/issues/57
 [#140]: https://github.com/jm2/tributary/pull/140
 [#141]: https://github.com/jm2/tributary/pull/141
 [#142]: https://github.com/jm2/tributary/pull/142

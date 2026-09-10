@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Implementation backlog** — Reconcile completed slices and Gas City dependencies, add eleven
+  corrective and seven engineering records, and expose operator/release acceptance separately.
+  Preserve the prior detailed contracts and delivery history in an archive; no feature is marked
+  complete by this documentation update.
+
 ### Fixed
 
 - **macOS local playback** — Bundle the dynamically loaded libsoup runtime and its
