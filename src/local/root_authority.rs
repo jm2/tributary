@@ -770,12 +770,15 @@ impl MountedMutationCommit<'_> {
     ///   recently freed identities to the next created file); on platforms
     ///   without a link-count primitive, holding the handle open already
     ///   keeps the object alive and its identity unrecyclable;
-    /// * the leaf is reopened and must carry the published object's exact
-    ///   identity. A live object's identity is unique, so with the handle
-    ///   still open the match can only name that same object. Anything else
-    ///   means a leaf swap landed between the landing proof and this
-    ///   reopen; anchoring it would authorize a later commit to overwrite a
-    ///   file the user never selected.
+    /// * the leaf is reopened while the published object's handle is still
+    ///   held — the order matters, because only an open handle keeps the
+    ///   published object alive and its identity unrecyclable — and must
+    ///   carry the published object's exact identity. A live object's
+    ///   identity is unique, so with the handle still open the match can
+    ///   only name that same object. Anything else means a leaf swap landed
+    ///   between the landing proof and this reopen; anchoring it would
+    ///   authorize a later commit to overwrite a file the user never
+    ///   selected.
     ///
     /// Either failure leaves the retained binding pointing at the retired
     /// pre-commit object, which makes every later revalidation fail closed:
@@ -786,12 +789,12 @@ impl MountedMutationCommit<'_> {
     /// replacement — never through the mount-relative pathname, which a
     /// parent displaced mid-commit would resolve to an impostor directory.
     fn reanchor_target_to_installed(&mut self, installed: InstalledReplacement) -> io::Result<()> {
-        let expected = installed.proven_identity()?;
         #[cfg(unix)]
         {
             let parent = self.retained_parent();
             let leaf = self.target.relative_leaf()?;
             let reopened = open_unix_regular_at(&parent.file, &leaf)?;
+            let expected = installed.proven_identity()?;
             if object_identity(&reopened)? != expected {
                 return Err(authority_changed(
                     "the replaced leaf changed again before the target could re-anchor",
@@ -814,10 +817,13 @@ impl MountedMutationCommit<'_> {
             // Platforms without retained parent handles keep their documented
             // discipline: the landing proof and this re-anchor both reopen the
             // admitted pathname, and the re-anchor accepts only the exact
-            // identity the landing proved — whose handle is still open, so a
-            // deleted replacement holds its identity against the stranger the
-            // pathname may name now.
+            // identity the landing proved. The leaf is reopened while the
+            // published handle is still held — the order matters, because
+            // only an open handle keeps the published object alive and its
+            // identity unrecyclable — so a deleted replacement holds its
+            // identity against the stranger the pathname may name now.
             let reopened = File::open(&self.target.path)?;
+            let expected = installed.proven_identity()?;
             if object_identity(&reopened)? != expected {
                 return Err(authority_changed(
                     "the replaced leaf changed again before the target could re-anchor",
