@@ -173,8 +173,15 @@ name). The publisher is triggered by the announcer's `workflow_run`
 completions, and GitHub always executes a `workflow_run` workflow's
 default-branch revision — so a pull request cannot alter the evaluation or
 publication logic, cannot no-op the gate under the required name, and can
-only suppress its own refresh, which leaves the required check unreported
-and the merge blocked.
+only suppress its own refresh. A suppressed (or dying) refresh is not
+itself fail-safe, though: check runs attach to the head SHA and the latest
+completed run under the required name decides, so a head that already
+carries a green verdict would keep it. The publisher therefore never exits
+without publishing at a known head — every discovery-level refusal (a
+failed discovery query, an announcement with no candidate pull request, an
+announcement whose every candidate was skipped) publishes the superseding
+failing verdict at the announced head. An unreported required check blocks
+the merge only at a head that has never been evaluated.
 
 The split alone does not make the context unforgeable, though: every
 Actions workflow job — including anything a pull request adds to a
@@ -189,18 +196,21 @@ App's integration, which no pull-request-controlled job can produce a check
 run under. The ruleset entry and the auto-merge precondition both require
 the context from that App's id (the repository variable
 `BOT_REVIEW_GATE_APP_ID`, never 15368), and the publisher refuses to
-publish anything if the App credentials are missing — the context stays
-unreported and the merge stays blocked. The publisher binds its verdict to
+publish anything if the App credentials are missing — the head's verdict
+keeps its previous value and the failed job is the re-run signal. The
+publisher binds its verdict to
 the announcing run's head commit, re-derives the associated pull requests
 through the API from that exact commit (the event's branch-derived
 pull-request fields are never trusted), selects only pull requests actually
 headed by that commit (a stacked descendant that merely contains it is not
-evaluated — its mismatch would otherwise publish a false failure at the
-announced commit), never checks out any commit, and publishes exactly ONE
+evaluated — evaluating one would refuse on its head mismatch on every
+refresh), never checks out any commit, and publishes exactly ONE
 shared verdict per announced head (check runs attach to commits, not pull
 requests, so a head shared by several open pull requests gets one
 fail-if-any-fail verdict instead of competing per-PR publications whose
-last write would decide for all of them). It fails while, at one exact
+last write would decide for all of them; when no candidate exists or every
+candidate was skipped, the one shared verdict is the superseding
+not-evaluated failure described above). It fails while, at one exact
 pull-request head, any of the following holds: a bot-started review thread is
 not explicitly resolved (GitHub's "outdated" flag never substitutes for
 resolution — moving code is not addressing a finding); a bot reviewer's
@@ -334,10 +344,10 @@ not re-enable non-Dependabot auto-merge.
    secrets — not Dependabot secrets — are the right store here), and set
    the repository variable `BOT_REVIEW_GATE_APP_ID` to the App's numeric
    id. Without the App credentials the publisher fails before it can
-   publish anything — the required context stays unreported, which is the
-   same fail-closed outcome as the gate being red; the publisher must
-   never fall back to the shared workflow token, because every
-   pull-request-controlled job publishes check runs under that same
+   publish anything — the head's verdict keeps its previous value and the
+   failed job is the re-run signal after the credentials are fixed; the
+   publisher must never fall back to the shared workflow token, because
+   every pull-request-controlled job publishes check runs under that same
    GitHub Actions integration and a forged same-named check would then
    satisfy the required context. While the ruleset is still narrow, the
    gate is advisory

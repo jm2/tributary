@@ -27,6 +27,10 @@ set -u
 
 pages="${GH_STUB_PAGES:?GH_STUB_PAGES must be set}"
 state="${GH_STUB_STATE:?GH_STUB_STATE must be set}"
+# Every invocation is logged so tests can assert what the publisher did or
+# did not query (e.g. that a not-evaluated announcement never ran the
+# GraphQL evidence queries).
+printf '%s\n' "$*" >> "${state}/invocations.log"
 fail_mode=""
 if [ -f "${pages}/fail" ]; then
   fail_mode="$(cat "${pages}/fail")"
@@ -94,6 +98,21 @@ if [ -n "${rest_path}" ]; then
       esac
       printf 'CHECK-RUN%s\n' "${checkrun_fields}" >> "${state}/check-runs.log"
       printf '%s\n' '{"id": 1, "html_url": "stub://check-runs/1"}'
+      exit 0
+      ;;
+    *actions/runs/*)
+      # The publisher's run-record fallback for a completion event that
+      # carried no head commit; served from actions-run.json, or answered
+      # with an API-style failure when the scenario stages none.
+      file="${pages}/actions-run.json"
+      if [ ! -f "${file}" ]; then
+        echo "gh: Not Found (HTTP 404)" >&2
+        exit 1
+      fi
+      if [ -n "${jq_filter}" ]; then
+        exec jq -r "${jq_filter}" "${file}"
+      fi
+      cat "${file}"
       exit 0
       ;;
     *contents/*)

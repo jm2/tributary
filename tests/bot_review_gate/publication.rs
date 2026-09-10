@@ -93,10 +93,16 @@ fn a_missing_gate_app_identity_refuses_to_publish() {
 }
 
 #[test]
-fn a_commit_without_an_open_main_pull_request_publishes_nothing() {
+fn a_commit_without_an_open_main_pull_request_publishes_the_not_evaluated_verdict() {
     // The announcer can be dispatched on any ref; a run whose commit heads
-    // no open main pull request has no required context to publish, and the
-    // publisher must exit cleanly without stamping anything.
+    // no open main pull request merges nowhere, so the run itself is not
+    // an error. But an empty candidate list is not evidence of cleanliness
+    // either — a read-after-write lag on the discovery endpoint, a
+    // just-closed pull request, or a branch without a pull request all
+    // land here — so the not-evaluated verdict is published red at the
+    // announced commit, superseding any earlier verdict; opening or
+    // retargeting a pull request headed there fires its own announcement,
+    // which publishes the fresh verdict.
     let sandbox = GateSandbox::new("publish-nothing");
     sandbox.use_scenario("no-associated-pr");
     let output = sandbox.run("workflow_dispatch", Some(HEAD_SHA));
@@ -105,25 +111,35 @@ fn a_commit_without_an_open_main_pull_request_publishes_nothing() {
         "an announcement without a main pull request is not an error:\n{}",
         report(&output)
     );
+    let check_run = sandbox.single_check_run();
     assert!(
-        sandbox.check_runs().is_empty(),
-        "no required context may be published without an associated pull request"
+        check_run.contains("name=Bot Review Gate")
+            && check_run.contains(&format!("head_sha={HEAD_SHA}"))
+            && check_run.contains("conclusion=failure"),
+        "the not-evaluated verdict must supersede any earlier one at the announced head:\n{check_run}"
     );
 }
 
 #[test]
-fn a_discovery_query_failure_fails_closed_without_publishing() {
+fn a_discovery_query_failure_publishes_the_superseding_failure_at_the_announced_head() {
     // When the API cannot say which pull requests the announcing commit
-    // heads, no verdict can be honestly bound, so the run fails and
-    // publishes nothing; the unreported required check keeps the merge
-    // blocked until a refreshed announcement re-fires the publisher.
+    // heads, no verdict can be honestly bound — but exiting without a
+    // publication would NOT block the merge at a refresh: the latest
+    // completed run under the required name decides, so the head's
+    // previous verdict (including a green one predating a bot change
+    // request submitted at this same head, or kept alive by this very
+    // failure) would stand. The refresh therefore publishes the
+    // superseding failure at the announced head before failing.
     let sandbox = GateSandbox::new("discovery-fails");
     sandbox.use_scenario("discovery-query-failure");
     let output = sandbox.run("pull_request", Some(HEAD_SHA));
     assert_blocked(&output, &[], "Associated-pull-request query failed");
+    let check_run = sandbox.single_check_run();
     assert!(
-        sandbox.check_runs().is_empty(),
-        "a discovery failure must not guess a pull request to publish for"
+        check_run.contains("name=Bot Review Gate")
+            && check_run.contains(&format!("head_sha={HEAD_SHA}"))
+            && check_run.contains("conclusion=failure"),
+        "a discovery failure must supersede any earlier verdict at the announced head:\n{check_run}"
     );
 }
 
@@ -234,10 +250,12 @@ fn every_refusal_records_before_returning_and_only_the_driver_publishes() {
     // The evaluation loop swallows `set -e`, so a refusal site that merely
     // recorded a verdict and fell through would continue evaluating — and
     // might still contribute a clean verdict afterwards. Every record call
-    // site must therefore be followed by an explicit `return 1`, and the
-    // shared required context must be published from exactly two call
-    // sites: the aggregated failure branch and the aggregated success
-    // branch of the driver.
+    // site must therefore be followed by an explicit `return 1`, the
+    // evaluator must never publish (it only records verdicts), and the
+    // shared required context must be published exclusively by the driver:
+    // the aggregated failure branch, the aggregated success branch, and
+    // the three discovery-level supersession paths (discovery failure, no
+    // candidate, all candidates skipped).
     let script = super::harness::gate_run_script();
     let lines: Vec<&str> = script.lines().collect();
     let mut call_sites = 0;
@@ -260,11 +278,24 @@ fn every_refusal_records_before_returning_and_only_the_driver_publishes() {
         call_sites >= 9,
         "every query, pagination, and head-binding refusal must record its verdict: {call_sites}"
     );
+    let driver_marker = "One verdict per announced head";
+    let driver_start = script
+        .find(driver_marker)
+        .expect("the driver must carry the shared-verdict marker");
+    assert_eq!(
+        script[..driver_start]
+            .matches("publish_gate_check_run \"")
+            .count(),
+        0,
+        "the evaluator must never publish: it records verdicts, the driver publishes"
+    );
     let publications = script
         .matches("publish_gate_check_run \"${announcer_head}\"")
         .count();
     assert_eq!(
-        publications, 2,
-        "exactly the aggregated failure and success branches may publish the shared verdict"
+        publications, 5,
+        "exactly the driver's five terminal paths may publish the shared verdict: \
+         aggregated failure, aggregated success, discovery failure, no candidate, \
+         all candidates skipped"
     );
 }
