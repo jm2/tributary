@@ -20,6 +20,21 @@ const MAX_ROUTED_ART_CLIENTS: usize = 64;
 /// allocation merely because the format-specific fallback was reached.
 const MAX_RAW_MP4_FALLBACK_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_LOCAL_EMBEDDED_ART_BYTES: usize = 32 * 1024 * 1024;
+/// Requests a virtualized album pane may have pending in the pane lane at
+/// once. Beyond this bound a newly scheduled pane request is dropped at
+/// enqueue time (its reply closes; the row keeps its placeholder and
+/// re-requests on the next bind), so a pathological catalog cannot queue
+/// unbounded work behind the now-playing header (2026-09-10 review finding).
+const MAX_PENDING_PANE_ART_REQUESTS: usize = 32;
+/// Fixed worker count for local embedded-art extraction. A virtualized pane
+/// can schedule one extraction per visible row per rebind; without a shared
+/// pool that is one OS thread per bind (2026-09-10 review finding). Two
+/// workers keep a slow local file from blocking the next row while still
+/// bounding total extraction concurrency.
+const MAX_LOCAL_ART_WORKERS: usize = 2;
+/// Local extraction jobs may sit in the pool queue before new jobs are
+/// refused. This bounds pending work independently of the worker count.
+const MAX_PENDING_LOCAL_ART_JOBS: usize = 64;
 
 /// Global generation counter for album art requests.  Incremented on
 /// every track change; the worker checks this before sending results
@@ -142,119 +157,195 @@ impl ArtSource {
     }
 }
 
-/// Get (or lazily create) the sender for the persistent art worker.
+/// Senders for the two isolated remote-artwork lanes.
 ///
-/// Returns `None` if the worker thread could not be spawned. Callers
+/// The now-playing header and the browser album pane used to share ONE
+/// serial worker: a pane thumbnail stuck on a slow (10-second-timeout)
+/// response delayed every header fetch behind it, so track changes showed
+/// stale artwork for the whole pane backlog (2026-09-10 review finding).
+/// Each lane now has its own dedicated worker thread:
+///
+/// * `header_tx` — unbounded; header volume is one request per track
+///   change, and its worker serves nothing else, so the header can never
+///   queue behind pane work.
+/// * `pane_tx` — bounded at [`MAX_PENDING_PANE_ART_REQUESTS`]; a saturated
+///   pane lane drops new pane requests at enqueue time instead of growing
+///   pending work without bound.
+struct ArtWorkerHandle {
+    header_tx: std::sync::mpsc::Sender<ArtRequest>,
+    pane_tx: std::sync::mpsc::SyncSender<ArtRequest>,
+}
+
+/// Get (or lazily create) the senders for the persistent art workers.
+///
+/// Returns `None` if a worker thread could not be spawned. Callers
 /// should treat that as "remote album art unavailable" and skip
 /// fetching — the local-tag-extraction path still works regardless.
-fn art_worker_tx() -> Option<&'static std::sync::mpsc::Sender<ArtRequest>> {
-    static TX: OnceLock<Option<std::sync::mpsc::Sender<ArtRequest>>> = OnceLock::new();
-    TX.get_or_init(|| {
-        // Build before spawning so a policy-construction failure disables
-        // remote artwork instead of silently restoring reqwest's permissive
-        // default redirect and Referer behavior.
-        let default_client = match crate::http_security::authenticated_blocking_client_builder()
-            .timeout(REMOTE_ART_TIMEOUT)
-            .build()
-        {
-            Ok(client) => client,
-            Err(error) => {
-                let error = crate::http_security::strip_request_url(error);
-                tracing::warn!(%error, "Failed to build secure album art HTTP client");
-                return None;
-            }
-        };
+fn art_workers() -> Option<&'static ArtWorkerHandle> {
+    static WORKERS: OnceLock<Option<ArtWorkerHandle>> = OnceLock::new();
+    WORKERS
+        .get_or_init(|| {
+            // Build before spawning so a policy-construction failure disables
+            // remote artwork instead of silently restoring reqwest's permissive
+            // default redirect and Referer behavior.
+            let default_client = build_default_art_client()?;
 
-        let (tx, rx) = std::sync::mpsc::channel::<ArtRequest>();
-        let spawn_result = std::thread::Builder::new()
-            .name("art-worker".into())
-            .spawn(move || {
-                let mut routed_clients = HashMap::<
-                    crate::architecture::AdvertisedHttpRoute,
-                    reqwest::blocking::Client,
-                >::new();
-                while let Ok(req) = rx.recv() {
-                    // Check if this request is still current before fetching.
-                    // A stale header generation or a revoked scoped token
-                    // closes the request without touching the network —
-                    // this is what keeps cancelled rows (and superseded
-                    // tracks) from burning worker time.
-                    if !req.liveness.is_valid() {
-                        continue;
-                    }
+            let (header_tx, header_rx) = std::sync::mpsc::channel::<ArtRequest>();
+            let (pane_tx, pane_rx) =
+                std::sync::mpsc::sync_channel::<ArtRequest>(MAX_PENDING_PANE_ART_REQUESTS);
 
-                    if !req.source.is_active() {
-                        continue;
-                    }
+            let spawn_header = spawn_art_lane("art-worker", header_rx, &default_client);
+            let spawn_pane = spawn_art_lane("art-worker-pane", pane_rx, &default_client);
 
-                    let request = match &req.source {
-                        ArtSource::Url(url) => default_client.get(url),
-                        ArtSource::Resolved(resolved) => {
-                            let client = match resolved.advertised_route() {
-                                None => default_client.clone(),
-                                Some(route) => match routed_clients.get(route) {
-                                    Some(client) => client.clone(),
-                                    None => {
-                                        let Some(client) =
-                                            build_routed_art_client(resolved.endpoint(), route)
-                                        else {
-                                            continue;
-                                        };
-                                        if routed_clients.len() >= MAX_ROUTED_ART_CLIENTS {
-                                            routed_clients.clear();
-                                        }
-                                        routed_clients.insert(route.clone(), client.clone());
-                                        client
-                                    }
-                                },
-                            };
-                            build_resolved_art_request(&client, resolved)
-                        }
-                    };
-
-                    match request.timeout(REMOTE_ART_TIMEOUT).send() {
-                        Ok(resp) if resp.status().is_success() => {
-                            match crate::http_body::read_limited_blocking(
-                                resp,
-                                MAX_REMOTE_ART_BYTES,
-                                REMOTE_ART_TIMEOUT,
-                            ) {
-                                Ok(bytes)
-                                    if !bytes.is_empty()
-                                        && req.source.is_active()
-                                        && req.liveness.is_valid() =>
-                                {
-                                    let _ = req.reply_tx.send_blocking(bytes);
-                                }
-                                Ok(_) => {}
-                                Err(error) => {
-                                    tracing::debug!(%error, "Failed to read remote album art body");
-                                }
-                            }
-                        }
-                        Ok(resp) => {
-                            tracing::debug!(status = %resp.status(), "Remote album art HTTP error");
-                        }
-                        Err(error) => {
-                            let error = crate::http_security::strip_request_url(error);
-                            tracing::debug!(%error, "Failed to fetch remote album art");
-                        }
-                    }
+            match (spawn_header, spawn_pane) {
+                (Ok(_), Ok(_)) => Some(ArtWorkerHandle { header_tx, pane_tx }),
+                (header, pane) => {
+                    tracing::warn!(
+                        header = header.is_err(),
+                        pane = pane.is_err(),
+                        "Failed to spawn album art worker thread; remote album art will be skipped"
+                    );
+                    None
                 }
-            });
+            }
+        })
+        .as_ref()
+}
 
-        match spawn_result {
-            Ok(_) => Some(tx),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to spawn art-worker thread; remote album art will be skipped"
-                );
-                None
+/// Build the shared secure HTTP client both remote-artwork lanes fetch
+/// through. A policy-construction failure returns `None`, which disables
+/// remote artwork instead of silently restoring reqwest's permissive
+/// default redirect and Referer behavior.
+fn build_default_art_client() -> Option<reqwest::blocking::Client> {
+    match crate::http_security::authenticated_blocking_client_builder()
+        .timeout(REMOTE_ART_TIMEOUT)
+        .build()
+    {
+        Ok(client) => Some(client),
+        Err(error) => {
+            let error = crate::http_security::strip_request_url(error);
+            tracing::warn!(%error, "Failed to build secure album art HTTP client");
+            None
+        }
+    }
+}
+
+/// Spawn one persistent remote-artwork worker lane that consumes `rx`
+/// until the sender side is dropped. Both lanes run identical fetch
+/// semantics; only their queues differ (header unbounded, pane bounded).
+fn spawn_art_lane(
+    name: &str,
+    rx: std::sync::mpsc::Receiver<ArtRequest>,
+    default_client: &reqwest::blocking::Client,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new().name(name.into()).spawn({
+        let default_client = default_client.clone();
+        move || {
+            let mut routed_clients = HashMap::new();
+            while let Ok(req) = rx.recv() {
+                process_art_request(req, &default_client, &mut routed_clients);
             }
         }
     })
-    .as_ref()
+}
+
+/// Execute one queued remote-artwork request on a worker lane.
+///
+/// Extracted verbatim from the former single-worker loop so the header and
+/// pane lanes run identical fetch semantics (liveness gate, activity gate,
+/// per-route client reuse, bounded body read).
+fn process_art_request(
+    req: ArtRequest,
+    default_client: &reqwest::blocking::Client,
+    routed_clients: &mut HashMap<
+        crate::architecture::AdvertisedHttpRoute,
+        reqwest::blocking::Client,
+    >,
+) {
+    // Check if this request is still current before fetching.
+    // A stale header generation or a revoked scoped token
+    // closes the request without touching the network —
+    // this is what keeps cancelled rows (and superseded
+    // tracks) from burning worker time.
+    if !req.liveness.is_valid() {
+        return;
+    }
+
+    if !req.source.is_active() {
+        return;
+    }
+
+    let request = match &req.source {
+        ArtSource::Url(url) => default_client.get(url),
+        ArtSource::Resolved(resolved) => {
+            let Some(client) = resolved_art_client(resolved, default_client, routed_clients) else {
+                return;
+            };
+            build_resolved_art_request(&client, resolved)
+        }
+    };
+
+    send_and_deliver_art(request, req);
+}
+
+/// Resolve the HTTP client for one resolved remote source: the advertised
+/// route's dedicated client when the request advertises a route (built and
+/// cached on first use, bounded at [`MAX_ROUTED_ART_CLIENTS`]), otherwise
+/// the shared default client. `None` drops the request — the route's
+/// client could not be built within policy.
+fn resolved_art_client(
+    resolved: &crate::architecture::media::ResolvedHttpRequest,
+    default_client: &reqwest::blocking::Client,
+    routed_clients: &mut HashMap<
+        crate::architecture::AdvertisedHttpRoute,
+        reqwest::blocking::Client,
+    >,
+) -> Option<reqwest::blocking::Client> {
+    let Some(route) = resolved.advertised_route() else {
+        return Some(default_client.clone());
+    };
+    if let Some(client) = routed_clients.get(route) {
+        return Some(client.clone());
+    }
+    let client = build_routed_art_client(resolved.endpoint(), route)?;
+    if routed_clients.len() >= MAX_ROUTED_ART_CLIENTS {
+        routed_clients.clear();
+    }
+    routed_clients.insert(route.clone(), client.clone());
+    Some(client)
+}
+
+/// Perform one remote-artwork HTTP fetch and deliver the body to the
+/// request's reply channel on success. The post-response liveness and
+/// activity re-checks keep a cancelled row (or superseded track) from
+/// receiving bytes fetched after its revocation.
+fn send_and_deliver_art(request: reqwest::blocking::RequestBuilder, req: ArtRequest) {
+    match request.timeout(REMOTE_ART_TIMEOUT).send() {
+        Ok(resp) if resp.status().is_success() => {
+            match crate::http_body::read_limited_blocking(
+                resp,
+                MAX_REMOTE_ART_BYTES,
+                REMOTE_ART_TIMEOUT,
+            ) {
+                Ok(bytes)
+                    if !bytes.is_empty() && req.source.is_active() && req.liveness.is_valid() =>
+                {
+                    let _ = req.reply_tx.send_blocking(bytes);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::debug!(%error, "Failed to read remote album art body");
+                }
+            }
+        }
+        Ok(resp) => {
+            tracing::debug!(status = %resp.status(), "Remote album art HTTP error");
+        }
+        Err(error) => {
+            let error = crate::http_security::strip_request_url(error);
+            tracing::debug!(%error, "Failed to fetch remote album art");
+        }
+    }
 }
 
 /// Extract embedded album art from a direct file URI and display it on the
@@ -284,10 +375,12 @@ pub fn update_direct_file_album_art(image: &gtk::Image, uri: &str) {
 }
 
 /// Scoped variant of [`update_direct_file_album_art`] for the browser
-/// album pane: identical extraction path, but the job's liveness is the
-/// supplied per-request token instead of the process-wide header
-/// generation, so concurrent pane rows never cancel one another and a
-/// re-bound row's token stops its extractor before the file read.
+/// album pane's TRANSITIONAL arm: rows with no retained authority chain
+/// (e.g., OS-opened external files) have no capability to resolve, so the
+/// extraction opens the exact `file://` target behind the supplied
+/// per-request token. Rows that carry a source identity never take this
+/// path — [`update_resolved_file_album_art_scoped`] is their only local
+/// entry point (2026-09-10 review finding).
 pub fn update_direct_file_album_art_scoped(
     image: &gtk::Image,
     uri: &str,
@@ -301,6 +394,28 @@ pub fn update_direct_file_album_art_scoped(
     image.set_icon_name(Some("audio-x-generic-symbolic"));
     let reply_rx = enqueue_local_art_job(RequestLiveness::Scoped(liveness.clone()), move || {
         extract_direct_file_album_art_bytes(&path)
+    });
+    display_local_album_art_reply(image, reply_rx, RequestLiveness::Scoped(liveness.clone()));
+}
+
+/// Scoped variant of [`update_resolved_file_album_art`] for the browser
+/// album pane: identical retained-authority extraction path, but the job's
+/// liveness is the supplied per-request token instead of the process-wide
+/// header generation, so concurrent pane rows never cancel one another and
+/// a re-bound row's token stops its extractor before the file read.
+///
+/// This is the pane's ONLY local-file entry point: the extraction consumes
+/// an exact retained capability and never reopens a database or URI
+/// pathname (2026-09-10 review finding — the former raw-`file://` path
+/// bypassed retained removable-media authority).
+pub fn update_resolved_file_album_art_scoped(
+    image: &gtk::Image,
+    media: crate::local::resolver::ResolvedLocalMedia,
+    liveness: &ScopedArtFetch,
+) {
+    image.set_icon_name(Some("audio-x-generic-symbolic"));
+    let reply_rx = enqueue_local_art_job(RequestLiveness::Scoped(liveness.clone()), move || {
+        extract_resolved_file_album_art_bytes(&media)
     });
     display_local_album_art_reply(image, reply_rx, RequestLiveness::Scoped(liveness.clone()));
 }
@@ -338,6 +453,55 @@ pub fn update_resolved_file_album_art(
     );
 }
 
+/// One queued local embedded-art extraction.
+struct LocalArtJob {
+    liveness: RequestLiveness,
+    extract: Box<dyn FnOnce() -> Option<Vec<u8>> + Send>,
+    reply_tx: async_channel::Sender<Vec<u8>>,
+}
+
+/// Get (or lazily create) the bounded job queue for the local-art pool.
+///
+/// The pool runs a fixed [`MAX_LOCAL_ART_WORKERS`] threads fed by one
+/// queue bounded at [`MAX_PENDING_LOCAL_ART_JOBS`]. The former design
+/// spawned one OS thread per scheduled extraction — one per visible-row
+/// bind in a virtualized pane — so a fast scroll could mint dozens of
+/// threads (2026-09-10 review finding). Jobs beyond the queue bound are
+/// refused at enqueue time and their receivers observe a closed channel.
+fn local_art_queue() -> Option<&'static async_channel::Sender<LocalArtJob>> {
+    static QUEUE: OnceLock<Option<async_channel::Sender<LocalArtJob>>> = OnceLock::new();
+    QUEUE
+        .get_or_init(|| {
+            let (job_tx, job_rx) =
+                async_channel::bounded::<LocalArtJob>(MAX_PENDING_LOCAL_ART_JOBS);
+            let mut spawned = 0;
+            for worker_index in 0..MAX_LOCAL_ART_WORKERS {
+                let job_rx = job_rx.clone();
+                let spawn_result = std::thread::Builder::new()
+                    .name(format!("local-art-worker-{worker_index}"))
+                    .spawn(move || {
+                        while let Ok(job) = job_rx.recv_blocking() {
+                            if !job.liveness.is_valid() {
+                                continue;
+                            }
+                            if let Some(bytes) = (job.extract)() {
+                                if job.liveness.is_valid() {
+                                    let _ = job.reply_tx.send_blocking(bytes);
+                                }
+                            }
+                        }
+                    });
+                if let Err(error) = spawn_result {
+                    tracing::warn!(%error, "Failed to spawn local album-art worker");
+                    break;
+                }
+                spawned += 1;
+            }
+            (spawned > 0).then_some(job_tx)
+        })
+        .as_ref()
+}
+
 fn enqueue_local_art_job<F>(
     liveness: RequestLiveness,
     extract: F,
@@ -346,27 +510,27 @@ where
     F: FnOnce() -> Option<Vec<u8>> + Send + 'static,
 {
     let (tx, rx) = async_channel::bounded::<Vec<u8>>(1);
-    // Never spawn extraction for an already-revoked request: the row was
+    // Never schedule extraction for an already-revoked request: the row was
     // re-bound (or the track superseded) between scheduling and the first
-    // poll, and the thread would exit at its first liveness check anyway.
-    // This is the spawn-side half of bounding per-request thread work.
+    // poll, and the worker would exit at its first liveness check anyway.
+    // Dropping `tx` closes the channel, so the awaiting reply observes a
+    // closed receiver instead of waiting forever.
     if !liveness.is_valid() {
         return rx;
     }
-    let spawn_result = std::thread::Builder::new()
-        .name("local-art-worker".into())
-        .spawn(move || {
-            if !liveness.is_valid() {
-                return;
-            }
-            if let Some(bytes) = extract() {
-                if liveness.is_valid() {
-                    let _ = tx.send_blocking(bytes);
-                }
-            }
-        });
-    if let Err(error) = spawn_result {
-        tracing::warn!(%error, "Failed to spawn local album-art worker");
+    let queued = local_art_queue().is_some_and(|queue| {
+        queue
+            .try_send(LocalArtJob {
+                liveness,
+                extract: Box::new(extract),
+                reply_tx: tx,
+            })
+            .is_ok()
+    });
+    if !queued {
+        // The job was refused (pool queue full) or the pool is gone; the
+        // job — including its reply sender — is dropped and the awaiting
+        // reply observes a closed channel.
     }
     rx
 }
@@ -805,28 +969,45 @@ fn enqueue_remote_album_art(image: &gtk::Image, source: ArtSource, liveness: Req
     });
 }
 
-/// Submit one request through the production persistent worker and return its
+/// Submit one request through the production persistent workers and return its
 /// one-shot completion. Keeping this GTK-independent makes the full
 /// request/fetch/liveness boundary deterministic under headless CI; the UI
 /// callback above adds the final liveness check before mutating the widget.
+///
+/// The now-playing header and the album pane are routed to isolated lanes:
+/// the header's request is served by its dedicated worker, while the pane's
+/// request lands in a bounded queue — a full pane queue drops the request at
+/// enqueue time, which closes the returned receiver instead of growing
+/// pending work without bound (2026-09-10 review finding).
 fn enqueue_art_request(
     source: ArtSource,
     liveness: RequestLiveness,
 ) -> async_channel::Receiver<Vec<u8>> {
     let (reply_tx, reply_rx) = async_channel::bounded::<Vec<u8>>(1);
 
-    // Send the request to the persistent art worker thread.
-    // This reuses a single HTTP client with connection pooling,
-    // avoiding the overhead of spawning a new thread + TLS handshake
-    // for every track change. If the worker isn't available (thread
-    // spawn failed at startup), silently skip — there's nothing to
-    // fetch with and the placeholder icon will show instead.
-    if let Some(tx) = art_worker_tx() {
-        let _ = tx.send(ArtRequest {
-            source,
-            liveness,
-            reply_tx,
-        });
+    let Some(workers) = art_workers() else {
+        // No worker is available (thread spawn failed at startup):
+        // silently skip — there's nothing to fetch with and the
+        // placeholder icon will show instead. `reply_tx` is dropped so
+        // the awaiting receiver observes a closed channel.
+        return reply_rx;
+    };
+
+    let request = ArtRequest {
+        source,
+        liveness,
+        reply_tx,
+    };
+    let is_header_request = matches!(request.liveness, RequestLiveness::GlobalGeneration(_));
+    let queued = if is_header_request {
+        workers.header_tx.send(request).is_ok()
+    } else {
+        workers.pane_tx.try_send(request).is_ok()
+    };
+    if !queued {
+        // The request — and with it its reply sender — was refused
+        // (pane lane full) or the lane is gone; the receiver observes a
+        // closed channel rather than waiting forever.
     }
 
     reply_rx
@@ -836,6 +1017,7 @@ fn enqueue_art_request(
 mod tests {
     use super::*;
 
+    use async_channel::TryRecvError;
     use reqwest::header::{HeaderName, HeaderValue, ACCEPT, AUTHORIZATION};
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, TcpListener};
@@ -1164,6 +1346,292 @@ mod tests {
         current_server.join().expect("join current artwork fixture");
     }
 
+    /// Wait for a one-shot artwork reply with a deadline, without
+    /// blocking forever: `Ok(bytes)` when published, `None` when the
+    /// channel closed (dropped request) or the deadline passed.
+    fn wait_for_reply(
+        reply: &async_channel::Receiver<Vec<u8>>,
+        deadline: Duration,
+    ) -> Option<Vec<u8>> {
+        let start = std::time::Instant::now();
+        loop {
+            match reply.try_recv() {
+                Ok(bytes) => return Some(bytes),
+                Err(TryRecvError::Closed) => return None,
+                Err(TryRecvError::Empty) => {}
+            }
+            if start.elapsed() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Occupy the pane lane deterministically: one pane request blocked
+    /// inside its fixture server (so the pane worker cannot advance) plus
+    /// enough queued requests to fill the bounded lane. The guard
+    /// releases the blocked request on drop and joins its server; the
+    /// queued fillers carry pre-revoked tokens, so at release the worker
+    /// skips them at the dequeue-time liveness gate and the lane drains
+    /// instantly.
+    struct PaneLaneSaturation {
+        release_tx: Option<mpsc::SyncSender<()>>,
+        server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for PaneLaneSaturation {
+        fn drop(&mut self) {
+            if let Some(release_tx) = self.release_tx.take() {
+                let _ = release_tx.send(());
+            }
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+
+    fn saturate_pane_lane() -> PaneLaneSaturation {
+        let (request_seen_tx, request_seen_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let (blocked_url, server) = spawn_art_fixture(b"blocked-pane-art", move || {
+            request_seen_tx
+                .send(())
+                .expect("report blocked pane request");
+            release_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("release blocked pane request");
+        });
+        // Occupy the pane worker with the blocked request. request_seen
+        // fires only after the worker dispatched it on the wire, so from
+        // here on the pane worker is provably busy.
+        let occupying = enqueue_art_request(
+            ArtSource::Url(blocked_url),
+            RequestLiveness::Scoped(ScopedArtFetch::new()),
+        );
+        request_seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pane worker took the blocked request");
+
+        // Fill the bounded lane to capacity. Every filler carries an
+        // already-revoked token: it is never contacted while the lane
+        // stays saturated, and at release the worker skips it at the
+        // dequeue-time liveness gate with no network attempt, so the
+        // lane drains instantly regardless of proxy or resolver state.
+        let workers = art_workers().expect("art workers initialized");
+        for _ in 0..MAX_PENDING_PANE_ART_REQUESTS {
+            let filler_token = ScopedArtFetch::new();
+            filler_token.revoke();
+            let (reply_tx, _reply_rx) = async_channel::bounded::<Vec<u8>>(1);
+            workers
+                .pane_tx
+                .try_send(ArtRequest {
+                    source: ArtSource::Url("http://127.0.0.1:1/art".to_string()),
+                    liveness: RequestLiveness::Scoped(filler_token),
+                    reply_tx,
+                })
+                .expect("fill bounded pane lane");
+        }
+        let _ = occupying; // the blocked request's bytes go nowhere
+        PaneLaneSaturation {
+            release_tx: Some(release_tx),
+            server: Some(server),
+        }
+    }
+
+    /// The now-playing header must never wait behind album-pane work:
+    /// with every pane slot blocked or queued, a fresh header request is
+    /// still served promptly. On the former single serial worker the
+    /// header queued behind the blocked pane fetch and starved for its
+    /// full duration (2026-09-10 review finding).
+    #[test]
+    fn pane_lane_saturation_cannot_starve_the_header_lane() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _saturation = saturate_pane_lane();
+
+        let (url, server) = spawn_art_fixture(b"header-art", || {});
+        let header_reply = enqueue_art_request(
+            ArtSource::Url(url),
+            RequestLiveness::GlobalGeneration(next_generation()),
+        );
+        assert_eq!(
+            wait_for_reply(&header_reply, Duration::from_secs(5)).as_deref(),
+            Some(b"header-art".as_slice()),
+            "the header lane must be served while the pane lane is fully saturated"
+        );
+        server.join().expect("join header fixture");
+    }
+
+    /// The pane lane is bounded: one more request than the bound allows
+    /// must be refused at enqueue time — its receiver closes immediately
+    /// (no bytes ever flow), so a pathological catalog cannot grow the
+    /// pending backlog without limit (2026-09-10 review finding).
+    #[test]
+    fn saturated_pane_lane_drops_new_requests_without_network() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _saturation = saturate_pane_lane();
+
+        // The probe targets a working fixture: if it were accepted (bug),
+        // it would eventually deliver; refused (correct), the receiver is
+        // closed at once and the fixture is never contacted.
+        let (url, _never_contacted) = spawn_art_fixture(b"overflow-art", || {});
+        let overflow = enqueue_art_request(
+            ArtSource::Url(url),
+            RequestLiveness::Scoped(ScopedArtFetch::new()),
+        );
+        assert!(
+            matches!(overflow.try_recv(), Err(TryRecvError::Closed)),
+            "a pane request beyond the lane bound must be dropped at enqueue"
+        );
+    }
+
+    /// The local extraction pool bounds BOTH its worker count and its
+    /// pending backlog: with the pool's two workers held by blocking
+    /// extractions, a third blocking job must not start (the former
+    /// design spawned one OS thread per bind, so it started immediately),
+    /// a full pending queue must refuse further jobs, and a queued job
+    /// must run once a worker frees (2026-09-10 review finding).
+    /// Enqueue one blocking extraction job that reports on `seen_tx` and
+    /// then parks until `release_rx` receives, modelling a slow worker.
+    /// Returns the job's reply receiver so the caller can assert the
+    /// admitted bytes arrive.
+    fn enqueue_blocking_pool_job(
+        liveness: RequestLiveness,
+        seen_tx: mpsc::SyncSender<()>,
+        release_rx: mpsc::Receiver<()>,
+        payload: &'static [u8],
+    ) -> async_channel::Receiver<Vec<u8>> {
+        enqueue_local_art_job(liveness, move || {
+            seen_tx.send(()).expect("report pool worker");
+            release_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("release pool worker");
+            Some(payload.to_vec())
+        })
+    }
+
+    /// Enqueue one blocking extraction job and wait until a pool worker
+    /// is occupied by it. Returns the job's reply receiver and the handle
+    /// that releases the worker.
+    fn occupy_pool_worker(
+        liveness: RequestLiveness,
+        payload: &'static [u8],
+    ) -> (async_channel::Receiver<Vec<u8>>, mpsc::SyncSender<()>) {
+        let (seen_tx, seen_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let reply = enqueue_blocking_pool_job(liveness, seen_tx, release_rx, payload);
+        expect_worker_occupied(seen_rx);
+        (reply, release_tx)
+    }
+
+    /// Wait until one pool worker reports it is occupied by its blocking
+    /// job (bounded wait so a regression fails instead of hanging).
+    fn expect_worker_occupied(seen_rx: mpsc::Receiver<()>) {
+        seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pool worker occupied");
+    }
+
+    /// Fill the local art pool's pending backlog to capacity, leaving
+    /// `reserved` slots for jobs already in flight, asserting each filler
+    /// is admitted.
+    fn fill_pending_backlog(queue: &async_channel::Sender<LocalArtJob>, reserved: usize) {
+        for pending in reserved..MAX_PENDING_LOCAL_ART_JOBS {
+            let (reply_tx, _reply_rx) = async_channel::bounded::<Vec<u8>>(1);
+            queue
+                .try_send(LocalArtJob {
+                    liveness: RequestLiveness::Scoped(ScopedArtFetch::new()),
+                    extract: Box::new(move || {
+                        let _ = pending;
+                        Some(b"filler".to_vec())
+                    }),
+                    reply_tx,
+                })
+                .expect("fill local art queue");
+        }
+    }
+
+    #[test]
+    fn local_art_pool_bounds_workers_and_pending_jobs() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Scoped tokens (not generations): they stay live until revoked,
+        // so queued jobs are not invalidated by unrelated liveness churn.
+        let scoped = || RequestLiveness::Scoped(ScopedArtFetch::new());
+
+        let (reply1, release1_tx) = occupy_pool_worker(scoped(), b"one");
+        let (reply2, release2_tx) = occupy_pool_worker(scoped(), b"two");
+
+        let (seen3_tx, seen3_rx) = mpsc::sync_channel(0);
+        let (release3_tx, release3_rx) = mpsc::sync_channel(0);
+        let reply3 = enqueue_blocking_pool_job(scoped(), seen3_tx, release3_rx, b"three");
+        assert!(
+            seen3_rx.recv_timeout(Duration::from_millis(400)).is_err(),
+            "the pool must not grow a third worker for a third blocking job"
+        );
+
+        // Fill the pending backlog to capacity (job three occupies one
+        // pending slot), then refuse one more.
+        let queue = local_art_queue().expect("local art pool initialized");
+        fill_pending_backlog(queue, 1);
+        let (seen4_tx, _seen4_rx) = mpsc::sync_channel(0);
+        let refused = enqueue_local_art_job(scoped(), move || {
+            seen4_tx.send(()).expect("a refused job must never run");
+            None
+        });
+        assert!(
+            matches!(refused.try_recv(), Err(TryRecvError::Closed)),
+            "a job beyond the pending bound must be refused at enqueue"
+        );
+
+        // Free both workers: the queued job must then run on the freed
+        // worker, and every admitted job's bytes must arrive.
+        release1_tx.send(()).expect("release worker one");
+        release2_tx.send(()).expect("release worker two");
+        seen3_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("queued job ran after a worker freed");
+        release3_tx.send(()).expect("release worker three");
+        assert_eq!(reply1.recv_blocking().expect("worker one reply"), b"one");
+        assert_eq!(reply2.recv_blocking().expect("worker two reply"), b"two");
+        assert_eq!(
+            reply3.recv_blocking().expect("worker three reply"),
+            b"three"
+        );
+    }
+
+    /// The pane's scoped retained-authority entry point must publish the
+    /// ORIGINAL authorized file's bytes through the extraction pool: the
+    /// media carries the retained capability, so a pathname replacement
+    /// cannot swap the artwork (2026-09-10 review finding — the raw
+    /// file:// path freshly opened whatever the pathname then pointed to).
+    #[cfg(unix)]
+    #[test]
+    fn scoped_resolved_extraction_publishes_retained_handle_bytes() {
+        let root = tempfile::tempdir().expect("temporary authority root");
+        let original = mp4_with_cover_art(b"original-retained-art");
+        let replacement = mp4_with_cover_art(b"replacement-path-art");
+        let media = authorized_media(root.path(), "track.m4a", &original);
+        let path = root.path().join("track.m4a");
+        std::fs::rename(&path, root.path().join("displaced.m4a")).expect("move admitted file");
+        std::fs::write(&path, replacement).expect("install path replacement");
+
+        let liveness = ScopedArtFetch::new();
+        let reply = enqueue_local_art_job(RequestLiveness::Scoped(liveness.clone()), move || {
+            extract_resolved_file_album_art_bytes(&media)
+        });
+        assert_eq!(
+            reply.recv_blocking().expect("retained-handle art bytes"),
+            b"original-retained-art",
+            "extraction must read the retained capability, not the replaced path"
+        );
+    }
+
     /// A scoped (album-pane) request revoked before it is handed to the
     /// worker must never be extracted or fetched: the local job path
     /// refuses to spawn its extractor, and the remote worker closes the
@@ -1201,6 +1669,11 @@ mod tests {
     /// [`delayed_worker_result_cannot_cross_a_newer_artwork_generation`].
     #[test]
     fn scoped_fetch_revoked_mid_flight_drops_the_reply() {
+        // Serializes against the lane-saturation tests: this request
+        // needs a free pane-lane slot to reach its fixture.
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (request_seen_tx, request_seen_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
         let liveness = ScopedArtFetch::new();
