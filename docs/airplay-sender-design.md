@@ -712,15 +712,28 @@ Tributary needs:
   OwnTone's, not Tributary's: §8 turns them into an explicit
   availability decision per actual Tributary package target, and
   most Tributary targets have none.
-- **Licensing:** GPL-2.0-or-later. The §4.3 design is a process
-  boundary — OwnTone runs as its own program, integrated through a
-  FIFO and an HTTP JSON API, with no linking and no combined work.
-  Tributary ships no OwnTone code and no OwnTone binaries; the GPL
-  obligations attach to OwnTone's distribution, which is upstream's
-  own packaging, not ours. This must be stated in the implementation
-  record's review note (the policy's review-boundary section governs
-  *bundled* components and embedded key material; neither occurs on
-  this path — Tributary embeds no key at all here, §2.2).
+- **Licensing:** GPL-2.0-or-later. The §4.3 design *intends* a
+  process boundary: OwnTone would run as its own program, integrated
+  through a FIFO and an HTTP JSON API, with no linking and no
+  bundling. That architecture is a necessary input to a "no combined
+  work" conclusion — it is not the conclusion. Whether the GPL
+  obligations in fact stay entirely upstream is a fact-specific
+  design-and-distribution question (what ships in Tributary's
+  artifacts, from which sources, with which install instructions)
+  that this investigation surveys but does not adjudicate. The
+  implementation record must therefore complete and record that
+  review before any sender code lands: it confirms distributor and
+  distribution mode for the daemon (upstream, via the §5.4
+  channels), that Tributary ships no OwnTone code or binaries, that
+  install documentation points at upstream channels, and — only
+  after that record exists — may state the boundary conclusions this
+  paragraph sketches. Until then this document claims the mechanics,
+  not the legal result: no bundling, no linking, no embedded key
+  material (§2.2), and an open review obligation. The policy's
+  review-boundary section governs *bundled* components and embedded
+  key material; neither occurs on this path (§2.2), which is what
+  keeps this path reviewable without an exception — it does not
+  itself settle the combined-work question.
 
 **This is the candidate revision 1 should have found.** It answers
 every acceptance dimension the task sets: maintained (29.3),
