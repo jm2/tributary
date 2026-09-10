@@ -415,22 +415,54 @@ struct SenderPosition {
     stale: bool,
 }
 
+/// Stable, machine-distinguishable seam failures. The load path's
+/// deadline, dependency, authentication, and receiver-failure
+/// contracts (§9.1, §9.6) are error *kinds* callers must branch on,
+/// and a bare `String` cannot carry a kind. Every variant still
+/// carries the user-actionable, localized message the load path
+/// surfaces verbatim (today's
+/// `errors.playback.airplay_raopsink_missing` contract,
+/// generalized): the kind routes behavior, the message informs the
+/// user.
+enum SenderError {
+    /// A documented probe/open deadline (a named constant in the
+    /// implementation record) was exceeded. Everything the attempt
+    /// created was torn down through the restoration path before
+    /// this variant is returned (§4.1).
+    Deadline(String),
+    /// The dependency is absent, unreachable, unsupported on this
+    /// platform, or not the dedicated Tributary-owned instance the
+    /// daemon adapter requires (§4.3). Includes today's
+    /// missing-`raopsink` refusal.
+    Dependency(String),
+    /// The receiver requires pairing, a password, or PIN
+    /// verification that has not succeeded (§9.6).
+    Authentication(String),
+    /// The receiver-side session failed after negotiation began:
+    /// the device vanished, refused the stream, or the daemon
+    /// reported a session error.
+    Receiver(String),
+}
+
 /// A selectable transmission path. One immutable instance per
 /// protocol/backend, chosen at load time by configuration — never
 /// silently, never per-track.
 trait AirplaySender: Send + Sync {
     fn name(&self) -> &'static str;
     /// `Ok(())` when this sender can transmit on this host. `Err`
-    /// must carry the user-actionable guidance that the load path
-    /// surfaces verbatim (this is today's localized
+    /// is a `SenderError`: the variant tells callers which failure
+    /// kind fired, and its payload is the user-actionable guidance
+    /// the load path surfaces verbatim (this is today's localized
     /// `airplay_raopsink_missing` contract, generalized).
     ///
     /// Bounded by contract: `probe` performs only the documented
-    /// discovery/health checks of §8 ("Probe reflects reality"),
-    /// enforces the adapter's documented probe deadline (a named
-    /// constant the implementation record states; the seam never
-    /// leaves a load pending on an unbounded check), and surfaces a
-    /// deadline overrun as its own error variant — never by
+    /// discovery/health checks of §8 ("Probe reflects reality",
+    /// including the §4.3 dedicated-instance ownership check, which
+    /// runs before any receiver state is read), enforces the
+    /// adapter's documented probe deadline (a named constant the
+    /// implementation record states; the seam never leaves a load
+    /// pending on an unbounded check), and surfaces a deadline
+    /// overrun as `SenderError::Deadline` — never by
     /// blocking. It holds no receiver-session resources, so
     /// cancellation (the load being dropped or its generation
     /// superseded) needs no protocol cleanup: dropping the call in
@@ -440,7 +472,11 @@ trait AirplaySender: Send + Sync {
     /// audio from the prepared media at `prepared_uri`, and return
     /// it. Called only after `probe` succeeded and after media
     /// preparation, so a failure here is a receiver-side failure, not
-    /// a missing dependency. The seam must carry `prepared_uri`
+    /// a missing dependency. Ownership of the dedicated instance
+    /// (§4.3) is re-verified from the same supervision record before
+    /// the lock is taken, so a daemon swapped in after probe fails
+    /// closed before any state is read or mutated. The seam must
+    /// carry `prepared_uri`
     /// because a sender is one immutable instance per backend — never
     /// per track — so it cannot capture the URI anywhere else; it is
     /// the same loopback URL today's `open_prepared_session` passes
@@ -459,15 +495,16 @@ trait AirplaySender: Send + Sync {
     /// changes) through the same restoration path as failure (§4.3)
     /// before the error surfaces. The method never returns a
     /// half-open session, and a load can never remain pending on it
-    /// indefinitely; after timeout the load fails with an explicit,
-    /// localized deadline error (§9.1 contract).
+    /// indefinitely; after timeout the load fails with
+    /// `SenderError::Deadline` carrying explicit, localized
+    /// guidance (§9.1 contract).
     fn open_session(
         &self,
         target: &AirplayTarget,
         prepared_uri: &str,
         event_tx: async_channel::Sender<PlayerEvent>,
         generation: PlayerEventGeneration,
-    ) -> Result<Box<dyn SenderSession>, String>;
+    ) -> Result<Box<dyn SenderSession>, SenderError>;
 }
 ```
 
@@ -587,7 +624,18 @@ Tributary talks to an OwnTone instance as a transmission service:
   moment. A dedicated instance removes that contention by
   construction. "Daemon unreachable / version too old / pipe missing
   / API port taken" remain probe-time failures with actionable
-  guidance.
+  guidance. Ownership of the instance is verified, not assumed:
+  `probe` and `open_session` confirm out of band — against the
+  adapter's own supervision/installation record and the instance's
+  state directory, the same trust domain as the lock file below —
+  that the answering daemon is the dedicated Tributary-owned
+  instance, and fail closed before reading or mutating any receiver
+  state. The JSON API cannot make that distinction: it exposes no
+  instance identity (`GET /api/config` returns only `version`,
+  `websocket_port` and `buildoptions` — pinned
+  [`docs/json-api.md`](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/docs/json-api.md),
+  §Server info), so a shared instance that merely looks healthy can
+  never pass.
 - **Exclusivity is locked before the first state read, revalidated,
   and restored — never assumed.** A dedicated instance is the default
   posture, not a substitute for the adapter treating the daemon as
@@ -609,8 +657,21 @@ Tributary talks to an OwnTone instance as a transmission service:
   existing actionable-guidance path instead of interleaving with the
   holder. The lock is released only after restoration completes —
   player stopped, our queue items removed, the recorded enabled set
-  re-applied — and a crashed holder releases it by OS semantics;
-  the §4.4 revalidation remains the backstop for external clients
+  re-applied. A crashed holder releases the lock by OS semantics,
+  and what happens next is defined, not incidental: before the
+  first mutating step (the first output, queue, or player change),
+  the session persists an incomplete-takeover record next to the
+  lock file — the pre-takeover enabled-output set, which queue
+  items are ours, and which takeover steps already ran. The record
+  survives the crash, so the supervisor — or the next opener,
+  before its own takeover — detects it and runs recovery: stop the
+  player if it is playing, remove Tributary-owned queue items,
+  re-apply the recorded enabled set, verify, and only then remove
+  the record and admit the new session. If a restoration step
+  fails, the acquirer refuses with its own localized actionable
+  error and leaves the record in place for the supervisor to
+  retry; a half-taken-over daemon is never adopted silently. The
+  §4.4 revalidation remains the backstop for external clients
   the lock cannot see. Open-time behavior is otherwise unchanged:
   refusing with actionable guidance if the player is active, and
   never preempting audible playback. A revalidation mismatch is
@@ -959,7 +1020,16 @@ What the implementation record must nail down, per §4.3:
 - **Probe reflects reality:** `AirplaySender::probe` for the daemon
   adapter checks: binary/service present (documented discovery only —
   no PATH guessing beyond the documented locations), daemon
-  reachable, API version compatible, pipe creatable. Each failure
+  reachable, API version compatible, pipe creatable, and — before
+  any player, queue, or output state is read — that the answering
+  daemon is the dedicated Tributary-owned instance of §4.3,
+  verified out of band against the adapter's
+  supervision/installation record and the instance's state
+  directory. The JSON API exposes no instance identity
+  (`GET /api/config` returns only `version`, `websocket_port` and
+  `buildoptions` — pinned `docs/json-api.md` §Server info), so a
+  shared instance — or any daemon the record does not own — can
+  never pass by looking healthy; it fails closed. Each failure
   mode has its own localized message.
 
 ## 9. Real-device tests and acceptance
@@ -975,7 +1045,8 @@ record for the selected path must add, at minimum:
    per-track proxy work, regardless of configuration.
 2. **Adapter-injection stub** (mirrors
    `a_missing_raopsink_load_fails_loudly_not_silently`): a stub
-   `AirplaySender` returning `Err` makes `finish_load` emit the
+   `AirplaySender` returning `Err(SenderError::Dependency(..))`
+   makes `finish_load` emit the
    generation-tagged `PlayerEvent::Error` followed by `Stopped`.
 3. **Registry-attribute regression** for the GStreamer adapter: the
    `find_feature` lookup remains the source of truth; a
@@ -1016,8 +1087,16 @@ record for the selected path must add, at minimum:
    hardware. AirPlay 2 validation additionally requires a real AP2
    receiver (HomePod/Apple TV class) for any record that flips the
    §3 discovery filter.
+9. **Process-death acceptance:** the lock holder is killed
+   mid-playback (SIGKILL, no cleanup path) after takeover; the
+   supervisor or the next opener detects the persisted
+   incomplete-takeover record (§4.3) and restores the daemon before
+   admitting the new session — player stopped, our queue items
+   removed, the recorded enabled-output set re-applied. A
+   restoration failure refuses the new session with localized
+   guidance instead of proceeding over a half-taken-over daemon.
 
-**Platform scope:** items 1-8 run on the package targets the §8
+**Platform scope:** items 1-9 run on the package targets the §8
 matrix marks available for the OwnTone adapter (today: the `.deb`
 target on Debian/Ubuntu **amd64**). On every OwnTone-unavailable
 target — the arm64 `.deb`, Fedora, Arch/AUR, Flatpak, macOS,
