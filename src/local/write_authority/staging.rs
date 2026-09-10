@@ -121,43 +121,6 @@ pub(super) fn preserved_sibling_path(
     ))
 }
 
-/// Create each missing directory of a component chain, refusing any
-/// intermediate collision with a non-directory, and report the indexes of
-/// the components this invocation actually created. An existing component
-/// is adopted, not created — its index is absent from the report, so
-/// callers can record ownership of exactly what they created and a
-/// concurrently created directory is never recorded (or rolled back) as
-/// the transfer's own.
-///
-/// Only used on non-Unix platforms; Unix walks and creates the chain
-/// no-follow from the retained root handle through
-/// [`MountedRootAuthority::create_directories_within`].
-#[cfg(not(unix))]
-pub(super) fn create_directory_atomic(
-    root: &Path,
-    components: &[OsString],
-) -> io::Result<Vec<usize>> {
-    let mut path = root.to_path_buf();
-    let mut created = Vec::new();
-    for (index, component) in components.iter().enumerate() {
-        path.push(component);
-        match std::fs::create_dir(&path) {
-            Ok(()) => created.push(index),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let metadata = std::fs::symlink_metadata(&path)?;
-                if !metadata.is_dir() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "intermediate path is not a directory",
-                    ));
-                }
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(created)
-}
-
 /// Create the staged file exclusively with `O_CREAT | O_EXCL | O_NOFOLLOW`
 /// and mode 0600, relative to the retained parent directory handle so a
 /// replaced or symlinked parent cannot redirect the staged write.
