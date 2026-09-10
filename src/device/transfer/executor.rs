@@ -254,7 +254,11 @@ impl TransferExecutor {
     /// reversal. Ownership is never inferred from a pre-creation absence
     /// scan: a component that already existed, including one a concurrent
     /// writer created moments before the creation call, is adopted rather
-    /// than owned and must survive rollback.
+    /// than owned and must survive rollback. The recorded identity of each
+    /// created component is the one the authority captured during the
+    /// exclusive creation itself — never a post-hoc lookup of the path,
+    /// which a newcomer replacing the just-created directory between
+    /// creation and capture would poison into an owned record.
     fn execute_create_directory(
         &self,
         relative: &Path,
@@ -273,11 +277,8 @@ impl TransferExecutor {
             Ok((_, created)) => {
                 for created_directory in created {
                     context.committed.push(OwnedChange::CreatedDirectory {
-                        created_directory: self
-                            .request
-                            .destination
-                            .relative_leaf_identity(&created_directory),
-                        relative_path: created_directory,
+                        created_directory: created_directory.identity,
+                        relative_path: created_directory.relative_path,
                     });
                 }
                 Ok(())

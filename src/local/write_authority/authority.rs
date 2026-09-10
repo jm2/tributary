@@ -8,8 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::policy::{ConflictPolicy, ConflictResolution};
-#[cfg(not(unix))]
-use super::staging::create_directory_atomic;
 use super::staging::{
     assemble_relative, create_exclusive_staged_file, parent_components_of, preserved_sibling_path,
     staging_leaf_name, strict_relative_components,
@@ -172,17 +170,20 @@ impl MountedWriteAuthority {
 
     /// Create a directory beneath the mount and bind it for further writes.
     ///
-    /// Returns the bound directory together with the relative paths of the
-    /// components this call actually created, leaf inclusive (empty when the
-    /// leaf already existed and was adopted). Ownership recording for
-    /// rollback MUST use this list: a component that already existed —
+    /// Returns the bound directory together with a report of the components
+    /// this call actually created, leaf inclusive (empty when the leaf
+    /// already existed and was adopted). Ownership recording for rollback
+    /// MUST use this list, including the per-component identities captured
+    /// during the exclusive creation: a component that already existed —
     /// including one a concurrent writer created moments before the
-    /// creation call — is adopted, not owned, and must survive rollback.
+    /// creation call — is adopted, not owned, and must survive rollback,
+    /// and a component replaced after its creation must never be recorded
+    /// under the newcomer's identity.
     pub fn create_relative_directory(
         &self,
         relative: &Path,
         policy: ConflictPolicy,
-    ) -> io::Result<(MountedDirectory, Vec<PathBuf>)> {
+    ) -> io::Result<(MountedDirectory, Vec<CreatedDirectoryEntry>)> {
         let components = strict_relative_components(relative)?;
         self.mounted.validate()?;
         let final_path = self.mounted.root().join(assemble_relative(&components));
@@ -309,6 +310,24 @@ impl MountedWriteAuthority {
     }
 }
 
+/// One directory component a creation call actually created, paired with
+/// the no-follow identity captured from the created object itself during
+/// the exclusive creation. Ownership recording MUST use this report: the
+/// identity names the object the creation call produced, so a concurrent
+/// writer that replaces a just-created component before the ownership
+/// record is written is never matched — and never destroyed — by the
+/// eventual identity-verified rollback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatedDirectoryEntry {
+    /// Relative path of the created component, leaf inclusive.
+    pub relative_path: PathBuf,
+    /// Identity of the created object, captured during the exclusive
+    /// creation from the creation-time handle. `None` only when the
+    /// platform cannot capture an identity; such an entry degrades the
+    /// eventual reversal to the legacy path-only behavior.
+    pub identity: Option<LeafIdentity>,
+}
+
 /// Reconcile an existing destination directory with the conflict policy:
 /// the entry must be a real directory, and Skip/Fail reject it outright
 /// while Overwrite/Preserve adopt it as-is.
@@ -330,28 +349,24 @@ fn adopt_existing_directory(metadata: std::fs::Metadata, policy: ConflictPolicy)
 
 /// Create every component of a not-yet-existing directory path through the
 /// retained authority: walked and created no-follow from the retained root
-/// handle on Unix, path-based per-component creation elsewhere. Returns the
-/// relative paths of the components this invocation actually created, leaf
-/// inclusive — an adopted (already existing) component is not reported, so
-/// ownership recording never claims a directory the transfer did not
-/// create.
+/// handle on Unix, per-component creation with an object-anchored identity
+/// capture elsewhere. Returns the components this invocation actually
+/// created, leaf inclusive, each with the identity captured during its
+/// exclusive creation — an adopted (already existing) component is not
+/// reported, so ownership recording never claims a directory the transfer
+/// did not create, and no reported identity is read from a lookup a later
+/// replacement could influence.
 fn create_missing_directory(
     authority: &MountedRootAuthority,
     components: &[OsString],
-) -> io::Result<Vec<PathBuf>> {
-    let created = {
-        #[cfg(unix)]
-        {
-            authority.create_directories_within(components)?
-        }
-        #[cfg(not(unix))]
-        {
-            create_directory_atomic(authority.root(), components)?
-        }
-    };
+) -> io::Result<Vec<CreatedDirectoryEntry>> {
+    let created = authority.create_directories_within(components)?;
     Ok(created
         .into_iter()
-        .map(|index| assemble_relative(&components[..=index]))
+        .map(|component| CreatedDirectoryEntry {
+            relative_path: assemble_relative(&components[..=component.index]),
+            identity: component.identity,
+        })
         .collect())
 }
 

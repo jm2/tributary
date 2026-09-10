@@ -5,7 +5,7 @@ use std::io;
 use std::path::Path;
 
 use super::authority;
-use crate::local::write_authority::{ConflictPolicy, ConflictResolution};
+use crate::local::write_authority::{ConflictPolicy, ConflictResolution, ReversalOutcome};
 
 #[test]
 fn fresh_write_commits_atomically() {
@@ -140,7 +140,10 @@ fn directory_creation_and_file_writes_combine() {
         .expect("create album dir");
     assert_eq!(bound.relative_path(), Path::new("album"));
     assert_eq!(
-        created,
+        created
+            .iter()
+            .map(|entry| entry.relative_path.clone())
+            .collect::<Vec<_>>(),
         vec![Path::new("album").to_path_buf()],
         "the created-component report must name exactly what this call created"
     );
@@ -190,12 +193,69 @@ fn created_component_report_names_only_created_components() {
         .create_relative_directory(Path::new("x/y/z"), ConflictPolicy::Preserve)
         .expect("create nested chain under adopted x");
     assert_eq!(
-        created,
+        created
+            .iter()
+            .map(|entry| entry.relative_path.clone())
+            .collect::<Vec<_>>(),
         vec![
             Path::new("x/y").to_path_buf(),
             Path::new("x/y/z").to_path_buf(),
         ],
         "the adopted ancestor must be absent from the report: {created:?}"
+    );
+}
+
+/// The identity carried by a created-component report is captured during
+/// the exclusive creation itself — from the created object's own handle —
+/// and never from a lookup of the component's path after the call. A
+/// newcomer that replaces a just-created directory therefore never matches
+/// the recorded identity: the identity-verified reversal refuses the
+/// foreign directory fail-closed and it survives. This is the
+/// interposition guarantee the transfer audit requires for created
+/// directories.
+#[test]
+fn created_directory_identity_survives_newcomer_interposition() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let authority = authority(&root);
+
+    // The newcomer is a pre-created donor directory renamed over the
+    // just-created leaf, so its identity is independent of index reuse:
+    // its inode was allocated before the transfer's directory existed.
+    std::fs::create_dir(root.path().join("donor")).expect("create donor directory");
+    std::fs::write(root.path().join("donor/foreign.txt"), b"foreign").expect("write foreign entry");
+
+    let (_, created) = authority
+        .create_relative_directory(Path::new("x/y"), ConflictPolicy::Preserve)
+        .expect("create nested chain");
+    assert_eq!(created.len(), 2, "both missing components must be reported");
+    for entry in &created {
+        let identity = entry
+            .identity
+            .expect("the creation report must capture an identity");
+        assert_eq!(
+            authority.relative_leaf_identity(&entry.relative_path),
+            Some(identity),
+            "the reported identity must name the object the call created"
+        );
+    }
+
+    // A newcomer replaces the just-created leaf between the creation call
+    // and the ownership record the caller would write.
+    std::fs::remove_dir_all(root.path().join("x/y")).expect("remove created leaf");
+    std::fs::rename(root.path().join("donor"), root.path().join("x/y"))
+        .expect("newcomer replaces the created leaf");
+
+    // The reversal armed with the recorded creation-time identity must
+    // refuse the newcomer instead of removing it.
+    let leaf = created.last().expect("leaf entry");
+    let outcome = authority
+        .remove_relative_directory_verified(&leaf.relative_path, leaf.identity)
+        .expect("verify the removal outcome");
+    assert_eq!(outcome, ReversalOutcome::RefusedForeignLeaf);
+    assert_eq!(
+        std::fs::read(root.path().join("x/y/foreign.txt")).expect("read foreign entry"),
+        b"foreign",
+        "the newcomer must survive a reversal armed with the creation-time identity"
     );
 }
 
