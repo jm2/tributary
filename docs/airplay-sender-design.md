@@ -333,13 +333,31 @@ whole class of candidate unrepresentable.
 /// and control. `Send` because sessions outlive the UI thread.
 trait SenderSession: Send {
     /// Push interleaved s16le 44100 Hz stereo PCM into the session.
-    /// Returns the number of bytes accepted so callers can apply
-    /// backpressure; a session that cannot accept audio without
-    /// stalling returns 0. A session that sources its own decoder
-    /// from the prepared URI (§4.2) owns its decode internally,
-    /// never consumes pushed audio, and documents `write_pcm` as an
-    /// unsupported no-op for its type.
-    fn write_pcm(&mut self, samples: &[u8]) -> usize;
+    /// The outcome separates retryable backpressure from terminal
+    /// session loss — a byte count cannot express both, and the
+    /// daemon adapter's FIFO produces hard write errors (a closed
+    /// reader fails with `EPIPE`) that must never be retried:
+    ///
+    /// - `Accepted(n)` — `n` bytes consumed; the caller continues
+    ///   with the remainder.
+    /// - `Backpressure` — the session is healthy but temporarily
+    ///   unable to accept audio (full adapter buffer, or an open
+    ///   FIFO whose reader is momentarily slow). The decode pump
+    ///   wakes and retries; this is today's `0` shape, unchanged.
+    /// - `Terminal(reason)` — the session can never accept audio
+    ///   again (FIFO reader closed, daemon gone, receiver session
+    ///   failed). Before returning, the adapter publishes the
+    ///   generation-tagged `PlayerEvent::Error` + `Stopped` pair
+    ///   (§4.1 events; §9.4 session-loss contract) and wakes the
+    ///   decode pump exactly once; the pump stops feeding this
+    ///   session and drops it through `close`. A terminal outcome
+    ///   is never retried and never reported as `0`.
+    ///
+    /// A session that sources its own decoder from the prepared URI
+    /// (§4.2) owns its decode internally, never consumes pushed
+    /// audio, and documents `write_pcm` as an unsupported no-op for
+    /// its type.
+    fn write_pcm(&mut self, samples: &[u8]) -> SenderWriteOutcome;
     /// Receiver-facing volume in [0.0, 1.0]; the adapter owns the
     /// mapping to its protocol's convention (§2.2: RAOP dB, mute at
     /// 0.0).
@@ -359,6 +377,21 @@ trait SenderSession: Send {
     /// Tear down the receiver session and local resources. Consumes
     /// self so a closed session is unrepresentable.
     fn close(self: Box<Self>);
+}
+
+/// Outcome of one `write_pcm` call (§4.1). The decode pump (§4.3)
+/// treats `Backpressure` as retryable and `Terminal` as final; the
+/// distinction is the pump's only guarantee that it will not spin
+/// forever on a session that has already died.
+enum SenderWriteOutcome {
+    /// `n` bytes accepted; continue with the remainder.
+    Accepted(usize),
+    /// Healthy but momentarily full; wake and retry.
+    Backpressure,
+    /// The session failed terminally. The adapter has already
+    /// published the generation-tagged error + `Stopped` events and
+    /// woken the pump exactly once before this value is returned.
+    Terminal(String),
 }
 
 /// The latest position/duration snapshot a session has published.
@@ -386,6 +419,17 @@ trait AirplaySender: Send + Sync {
     /// must carry the user-actionable guidance that the load path
     /// surfaces verbatim (this is today's localized
     /// `airplay_raopsink_missing` contract, generalized).
+    ///
+    /// Bounded by contract: `probe` performs only the documented
+    /// discovery/health checks of §8 ("Probe reflects reality"),
+    /// enforces the adapter's documented probe deadline (a named
+    /// constant the implementation record states; the seam never
+    /// leaves a load pending on an unbounded check), and surfaces a
+    /// deadline overrun as its own error variant — never by
+    /// blocking. It holds no receiver-session resources, so
+    /// cancellation (the load being dropped or its generation
+    /// superseded) needs no protocol cleanup: dropping the call in
+    /// flight is the whole cleanup.
     fn probe(&self) -> Result<(), String>;
     /// Negotiate a session with the receiver at `host:port`, sourcing
     /// audio from the prepared media at `prepared_uri`, and return
@@ -399,6 +443,19 @@ trait AirplaySender: Send + Sync {
     /// (`src/audio/airplay_output.rs:231-241`). Ticket revocation on
     /// failure stays in the load path (`open_prepared_media`,
     /// :199-208), exactly as today.
+    ///
+    /// Bounded and cancellable by contract: the call enforces the
+    /// adapter's documented open deadline (again a named constant
+    /// the implementation record states), and cancellation — the
+    /// load being dropped or its generation superseded mid-call —
+    /// aborts any in-flight negotiation. On a deadline miss or a
+    /// cancellation the implementation tears down everything it
+    /// created so far (receiver session, queue items, enabled-output
+    /// changes) through the same restoration path as failure (§4.3)
+    /// before the error surfaces. The method never returns a
+    /// half-open session, and a load can never remain pending on it
+    /// indefinitely; after timeout the load fails with an explicit,
+    /// localized deadline error (§9.1 contract).
     fn open_session(
         &self,
         target: &AirplayTarget,
@@ -482,12 +539,18 @@ Tributary talks to an OwnTone instance as a transmission service:
   PCM16, startable by selecting it or autostarted
   (`src/inputs/pipe.c`: "This module will read a PCM16 stream from a
   named pipe"; `pipe_autostart`). The adapter's `write_pcm` is a FIFO
-  write; backpressure is natural. **Decode-and-pump ownership is the
-  adapter's:** it owns a headless decode pipeline
+  write: backpressure is natural and stays retryable
+  (`SenderWriteOutcome::Backpressure`, §4.1), while a closed reader
+  (`EPIPE`) or a dead daemon is `Terminal` — the pump stops and the
+  §9.4 session-loss contract fires, never a retried `0`. **Decode
+  and pump ownership is the adapter's:** it owns a headless decode
+  pipeline
   (`uridecodebin ! audioconvert ! appsink`, caps
   `audio/x-raw, format=s16le, rate=44100, channels=2`) sourcing the
   same `prepared_uri` the seam carries, and pumps the decoded PCM
-  into `write_pcm`. This reuses the GStreamer decoder stack
+  into `write_pcm`. The pump wakes on backpressure and stops on the
+  first terminal outcome; it holds no retry loop across a terminal
+  session. This reuses the GStreamer decoder stack
   Tributary already requires — no new dependency — and it keeps the
   protected loopback ticket URI entirely inside Tributary's process:
   the daemon never receives the URL, only the decoded bytes.
