@@ -14,6 +14,13 @@ pub const GATE_PR_NUMBER: &str = "42";
 pub const HEAD_SHA: &str = "1111111111111111111111111111111111111111";
 pub const OTHER_SHA: &str = "2222222222222222222222222222222222222222";
 
+/// The publisher workflow's `EXPECTED_BOT_REVIEWERS` step env, mirrored here
+/// so the extracted script runs under the same environment Actions gives it:
+/// the trusted expected-reviewer set, fixed by enumeration on the default
+/// branch. The policy authorizes exactly one review integration —
+/// `CodeRabbit` — so out-of-band reviewers stay deliberately absent.
+pub const EXPECTED_BOT_REVIEWERS: &str = "coderabbitai";
+
 pub fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bot_review_gate")
 }
@@ -135,6 +142,23 @@ impl GateSandbox {
         self.run_with_gate_token(event_name, announcer_head_sha, Some("stub-gate-token"))
     }
 
+    /// Runs the publisher with an overridden `EXPECTED_BOT_REVIEWERS` value
+    /// (the workflow pins it by enumeration; the override exists to exercise
+    /// the set's own failure modes — an absent reviewer, an empty set).
+    pub fn run_with_expected_reviewers(
+        &self,
+        event_name: &str,
+        announcer_head_sha: Option<&str>,
+        expected_reviewers: &str,
+    ) -> Output {
+        self.run_inner(
+            event_name,
+            announcer_head_sha,
+            Some("stub-gate-token"),
+            Some(expected_reviewers),
+        )
+    }
+
     /// Runs the publisher with the gate-publisher App identity withheld,
     /// as when the mint step failed: the script must refuse to publish the
     /// required context rather than degrade to the shared workflow token.
@@ -151,6 +175,16 @@ impl GateSandbox {
         event_name: &str,
         announcer_head_sha: Option<&str>,
         gate_token: Option<&str>,
+    ) -> Output {
+        self.run_inner(event_name, announcer_head_sha, gate_token, None)
+    }
+
+    fn run_inner(
+        &self,
+        event_name: &str,
+        announcer_head_sha: Option<&str>,
+        gate_token: Option<&str>,
+        expected_reviewers: Option<&str>,
     ) -> Output {
         let script_path = self.root.join("gate.sh");
         std::fs::write(&script_path, gate_run_script()).expect("gate script must be writable");
@@ -174,7 +208,15 @@ impl GateSandbox {
             .env("EVENT_RUN_ID", "4711")
             .env("RUNNER_TEMP", self.root.join("runner-temp"))
             .env("GH_STUB_PAGES", self.root.join("pages"))
-            .env("GH_STUB_STATE", self.root.join("state"));
+            .env("GH_STUB_STATE", self.root.join("state"))
+            // The workflow applies this step env by enumeration; a test
+            // override replaces it (including with an empty string, to
+            // exercise the empty-set failure), the default mirrors the
+            // workflow.
+            .env(
+                "EXPECTED_BOT_REVIEWERS",
+                expected_reviewers.unwrap_or(EXPECTED_BOT_REVIEWERS),
+            );
         if let Some(token) = gate_token {
             // The publication path must be authenticated as the
             // gate-publisher App; the script refuses to publish without it.
@@ -185,9 +227,10 @@ impl GateSandbox {
             .expect("the publisher script must be runnable under bash")
     }
 
-    /// Every check-run the publisher published during the run, in
-    /// publication order: one line per `CHECK-RUN name=... head_sha=...
-    /// status=... conclusion=...` record the stub logged.
+    /// Every check-run API call the publisher made during the run, in call
+    /// order: one line per `CHECK-RUN target=... name=... head_sha=...
+    /// status=... conclusion=...` record the stub logged. The opening POST
+    /// targets `.../check-runs`, the terminal PATCH `.../check-runs/<id>`.
     pub fn check_runs(&self) -> Vec<String> {
         std::fs::read_to_string(self.root.join("state/check-runs.log")).map_or_else(
             |_| Vec::new(),
@@ -195,16 +238,49 @@ impl GateSandbox {
         )
     }
 
-    /// The single check-run the publisher must have published, with the
-    /// `field=value` fields following the `CHECK-RUN` marker.
-    pub fn single_check_run(&self) -> String {
+    /// The one shared verdict: asserts the refresh opened the required
+    /// context as a single in-progress check-run at a head and finalized THAT
+    /// run (the terminal PATCH targets the created run's id) with a
+    /// conclusion, and returns the finalizing record for verdict assertions.
+    pub fn opened_and_finalized_verdict(&self) -> String {
         let check_runs = self.check_runs();
         assert_eq!(
             check_runs.len(),
-            1,
-            "the publisher must publish exactly one check-run:\n{check_runs:?}"
+            2,
+            "the refresh must open the context once and finalize that one run:\n{check_runs:?}"
         );
-        check_runs[0].clone()
+        let (open, finish) = (check_runs[0].clone(), check_runs[1].clone());
+        assert!(
+            open.contains("target=repos/jm2/tributary/check-runs ")
+                && open.contains("status=in_progress")
+                && !open.contains("conclusion="),
+            "the refresh must open the required context as an in-progress run:\n{open}"
+        );
+        assert!(
+            open.contains("name=Bot Review Gate")
+                && finish.contains("target=repos/jm2/tributary/check-runs/1 ")
+                && finish.contains("status=completed")
+                && finish.contains("conclusion="),
+            "the terminal update must finalize the run the refresh opened:\n{open}\n{finish}"
+        );
+        // The head field sits mid-line on the opening POST and end-of-line
+        // on the terminal PATCH, so the extraction must stop at the next
+        // field boundary instead of consuming the rest of the line.
+        let head_of = |line: &str| -> String {
+            line.split("head_sha=")
+                .nth(1)
+                .unwrap_or_default()
+                .split(' ')
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert_eq!(
+            head_of(&open),
+            head_of(&finish),
+            "the opened and finalized runs must bind the same head:\n{open}\n{finish}"
+        );
+        finish
     }
 }
 

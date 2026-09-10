@@ -160,3 +160,33 @@ fn documented_rate_limit_waives_a_listed_reviewers_missing_evidence() {
         report(&output)
     );
 }
+
+#[test]
+fn substitution_waiver_matching_is_login_normalized_on_both_sides() {
+    // The policy file is operator-authored and may spell a login with
+    // different case or without GitHub's "[bot]" suffix, while the review
+    // list carries the API spelling — here the policy lists "CoderabbitAI"
+    // and the API surfaces "coderabbitai[bot]". The waiver must match the
+    // two spellings as one identity on BOTH sides: the synthesized absence
+    // violations and the derived stale-evidence violation of the same
+    // reviewer must be waivable through the same normalized matching, or
+    // the same reviewer would be blocking or waivable depending on which
+    // check happened to see the absence first.
+    let output = run_scenario(
+        "rate-limit-substitution-granted-normalized-policy",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert!(
+        output.status.success(),
+        "the normalized policy must waive the listed reviewer's stale evidence:\n{}",
+        report(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("RATE-LIMIT SUBSTITUTION")
+            && stdout.contains(&format!("clean at {HEAD_SHA}")),
+        "the waived result must disclose the substitution and pass:\n{}",
+        report(&output)
+    );
+}

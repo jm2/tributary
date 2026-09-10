@@ -1,7 +1,7 @@
 //! Review-evidence decisions: threads, change requests, dismissals, and the
 //! exact-head binding of bot review evidence.
 
-use super::harness::{assert_blocked, report, run_scenario, HEAD_SHA, OTHER_SHA};
+use super::harness::{assert_blocked, report, run_scenario, GateSandbox, HEAD_SHA, OTHER_SHA};
 
 #[test]
 fn clean_evidence_at_the_evaluated_head_passes() {
@@ -18,7 +18,7 @@ fn clean_evidence_at_the_evaluated_head_passes() {
         report(&output)
     );
     assert!(
-        stdout.contains("review threads evaluated: 2") && stdout.contains("reviews evaluated: 2"),
+        stdout.contains("review threads evaluated: 2") && stdout.contains("reviews evaluated: 3"),
         "the published result must report the paginated evidence it evaluated:\n{}",
         report(&output)
     );
@@ -187,6 +187,67 @@ fn reviews_beyond_the_first_pagination_page_reach_the_decisions() {
     assert_blocked(
         &output,
         &["OUTSTANDING BOT CHANGE REQUEST", "u/pg-cr"],
+        "not clean",
+    );
+}
+
+#[test]
+fn a_pending_review_attempt_blocks_and_suspends_the_author_s_earlier_conclusion() {
+    // A PENDING review is an attempt in flight: while it exists, none of the
+    // author's earlier conclusions count at this head — the pending attempt
+    // may overturn them. The scenario carries an APPROVED review by the bot
+    // at the exact evaluated head plus a newer PENDING attempt by the same
+    // bot: the gate must block, and the report must name the attempt (its
+    // database id and commit) so the block is bound to exactly what is in
+    // flight. Without this rule, a review being rewritten — the one state
+    // the submitted-reviews API cannot surface — would leave the old green
+    // verdict mergeable.
+    let output = run_scenario("pending-bot-review", "pull_request", Some(HEAD_SHA));
+    assert_blocked(
+        &output,
+        &[
+            "PENDING BOT REVIEW ATTEMPT",
+            "database id 21",
+            &format!("at {HEAD_SHA}"),
+        ],
+        "not clean",
+    );
+}
+
+#[test]
+fn a_listed_trusted_reviewer_with_no_review_at_all_fails_closed() {
+    // The expected-reviewer set is fixed by enumeration, not observation:
+    // every listed identity must have a review on the pull request, and a
+    // listed identity with zero reviews — an outage, a rate limit, a rename
+    // — fails closed exactly like a rejected review, threads or no threads.
+    // The scenario's only reviews are a human comment and no review by the
+    // listed reviewer at all.
+    let output = run_scenario("missing-expected-reviewer", "pull_request", Some(HEAD_SHA));
+    assert_blocked(
+        &output,
+        &[
+            "STALE BOT REVIEW EVIDENCE by coderabbitai",
+            "no review submitted",
+        ],
+        "not clean",
+    );
+}
+
+#[test]
+fn an_empty_trusted_reviewer_set_is_a_configuration_failure_not_a_pass() {
+    // The expected set comes from the publisher's enumerated env. An EMPTY
+    // configured set would leave the all-green policy with nobody expected
+    // and pass vacuously on any pull request, so it emits its own
+    // non-waivable blocking violation instead.
+    let sandbox = GateSandbox::new("empty-expected-reviewers");
+    sandbox.use_scenario("clean");
+    let output = sandbox.run_with_expected_reviewers("pull_request", Some(HEAD_SHA), "");
+    assert_blocked(
+        &output,
+        &[
+            "TRUSTED REVIEWER SET EMPTY",
+            "EXPECTED_BOT_REVIEWERS in bot-review-gate-publisher.yml",
+        ],
         "not clean",
     );
 }
