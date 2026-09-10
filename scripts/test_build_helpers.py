@@ -189,9 +189,11 @@ class BuildHelperTests(unittest.TestCase):
             self.assertEqual([call[0] for call in calls], ["rustc"])
 
     def test_linux_default_build_does_not_launch(self):
-        """Keep the existing build-only behavior when --run is absent."""
+        """Validate the default release artifact without launching it."""
         result, calls = self.run_helper("linux")
         self.assertEqual(result.returncode, 0, result.stderr)
+        validation = [call[2] for call in calls if call[0] == "artifact-policy"]
+        self.assertEqual(validation, [["--elf", str(self.root / "target/release/tributary")]])
         self.assertNotIn("tributary", [call[0] for call in calls])
 
 
