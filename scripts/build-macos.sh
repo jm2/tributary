@@ -146,7 +146,7 @@ fi
 info "All system dependencies satisfied."
 
 BREW_PREFIX="$(brew --prefix)"
-export PKG_CONFIG_PATH="${BREW_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+export PKG_CONFIG_PATH="${BREW_PREFIX}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
 
 # ── Quick-exit modes: --check, --clippy ─────────────────────────────────────
 if $CHECK; then
