@@ -3,8 +3,8 @@
 # Tributary — Linux release build helper
 set -euo pipefail
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 PACKAGE_VALIDATOR="${REPO_ROOT}/build-aux/linux/validate-package-compliance.sh"
 PACKAGE_METADATA_VALIDATOR="${REPO_ROOT}/build-aux/linux/validate-package-metadata.sh"
@@ -19,7 +19,12 @@ Usage:
 
 With no options, performs a full release build (cargo build --release).
 
-Quick-exit modes (run one task and exit):
+Launch:
+  --run             Build the native release binary with locked dependencies,
+                    validate it, then launch it in this terminal. Cannot be
+                    combined with quick-exit or packaging modes.
+
+Quick-exit modes (choose at most one):
   --fmt             Run `cargo fmt`.
   --check           Run `cargo check`.
   --clippy          Run cargo clippy in --all-targets (debug, with tests) and
@@ -47,6 +52,13 @@ Other:
 EOF
 }
 
+# Report conflicting command-line selections before dependency or build work.
+usage_error() {
+  echo "$*" >&2
+  print_usage >&2
+  exit 2
+}
+
 FLATPAK=false
 DEB=false
 RPM=false
@@ -55,6 +67,7 @@ CHECK=false
 FMT=false
 CLIPPY=false
 COVERAGE=false
+RUN=false
 
 for arg in "$@"; do
   case "$arg" in
@@ -67,6 +80,7 @@ for arg in "$@"; do
     --fmt)       FMT=true ;;
     --clippy)    CLIPPY=true ;;
     --coverage)  COVERAGE=true ;;
+    --run)       RUN=true ;;
     *)           echo "Unknown option: $arg" >&2; print_usage >&2; exit 2 ;;
   esac
 done
@@ -76,9 +90,34 @@ info()  { echo -e "${GREEN}[tributary]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[tributary]${NC} $*"; }
 error() { echo -e "${RED}[tributary]${NC} $*" >&2; exit 1; }
 
+QUICK_MODE_COUNT=0
+for selected in "$CHECK" "$FMT" "$CLIPPY" "$COVERAGE"; do
+  if "$selected"; then QUICK_MODE_COUNT=$((QUICK_MODE_COUNT + 1)); fi
+done
+[[ "$QUICK_MODE_COUNT" -le 1 ]] || usage_error "Choose at most one quick-exit mode"
+
 if { $CHECK || $FMT || $CLIPPY || $COVERAGE; } && \
    { $FLATPAK || $DEB || $RPM || $ARCH_PKG; }; then
-  error "Quick-exit and packaging modes cannot be combined"
+  usage_error "Quick-exit and packaging modes cannot be combined"
+fi
+if "$RUN" && { "$CHECK" || "$FMT" || "$CLIPPY" || "$COVERAGE" || "$FLATPAK" || "$DEB" || "$RPM" || "$ARCH_PKG"; }; then
+  usage_error "--run cannot be combined with quick-exit or packaging modes"
+fi
+
+if $FMT; then
+  command -v cargo &>/dev/null || error "cargo not found. Install Rust from https://rustup.rs"
+  info "Running cargo fmt..."
+  cargo fmt
+  info "Formatting complete."
+  exit 0
+fi
+
+BINARY="${REPO_ROOT}/target/release/tributary"
+if "$RUN"; then
+  command -v rustc &>/dev/null || error "rustc not found. Install Rust from https://rustup.rs"
+  RUN_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+  [[ "$RUN_TARGET" == *-linux-* ]] || error "--run requires a native Linux Rust toolchain"
+  BINARY="${REPO_ROOT}/target/${RUN_TARGET}/release/tributary"
 fi
 
 require_validator_tool() {
@@ -170,14 +209,7 @@ check_pkg "dbus-1"        "libdbus-1-dev"         "dbus-devel"          "dbus"
 
 info "All system dependencies satisfied."
 
-# ── Quick-exit modes: --check, --fmt, --clippy ───────────────────────────────
-if $FMT; then
-  info "Running cargo fmt..."
-  cargo fmt
-  info "Formatting complete."
-  exit 0
-fi
-
+# ── Quick-exit modes: --check, --clippy ─────────────────────────────────────
 if $CHECK; then
   info "Running cargo check..."
   cargo check
@@ -213,9 +245,18 @@ fi
 # ── Rust Build ───────────────────────────────────────────────────────────────
 "$PACKAGE_METADATA_VALIDATOR"
 info "Building Tributary (release)..."
-cargo build --release
-"$PACKAGE_VALIDATOR" --elf target/release/tributary
-info "Binary: $(pwd)/target/release/tributary"
+if "$RUN"; then
+  cargo build --release --locked --target "$RUN_TARGET" --target-dir "${REPO_ROOT}/target"
+else
+  cargo build --release
+fi
+"$PACKAGE_VALIDATOR" --elf "$BINARY"
+info "Binary: $BINARY"
+
+if "$RUN"; then
+  info "Launching Tributary..."
+  exec "$BINARY"
+fi
 
 # ── Install Icons (if running with --install or as root) ─────────────────────
 ICON_PREFIX="${DESTDIR:-/usr/local}/share/icons/hicolor"

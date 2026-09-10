@@ -13,7 +13,13 @@ Usage:
 With no options, performs a full release build, creates the .app bundle,
 fixes dylib rpaths, and ad-hoc code-signs the bundle.
 
-Quick-exit modes (run one task and exit):
+Launch:
+  --run             Build the native release binary with locked dependencies,
+                    validate its Mach-O imports, then launch it in this terminal
+                    using Homebrew libraries. Skips .app and .dmg packaging;
+                    cannot be combined with quick-exit or packaging modes.
+
+Quick-exit modes (choose at most one):
   --fmt             Run `cargo fmt`.
   --check           Run `cargo check`.
   --clippy          Run cargo clippy in --all-targets (debug, with tests) and
@@ -30,11 +36,19 @@ Other:
 EOF
 }
 
+# Report conflicting command-line selections before dependency or build work.
+usage_error() {
+  echo "$*" >&2
+  print_usage >&2
+  exit 2
+}
+
 MAKE_DMG=false
 CHECK=false
 FMT=false
 CLIPPY=false
 COVERAGE=false
+RUN=false
 for arg in "$@"; do
   case "$arg" in
     -h|--help)  print_usage; exit 0 ;;
@@ -43,6 +57,7 @@ for arg in "$@"; do
     --fmt)      FMT=true ;;
     --clippy)   CLIPPY=true ;;
     --coverage) COVERAGE=true ;;
+    --run)      RUN=true ;;
     *)          echo "Unknown option: $arg" >&2; print_usage >&2; exit 2 ;;
   esac
 done
@@ -52,7 +67,35 @@ info()  { echo -e "${GREEN}[tributary]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[tributary]${NC} $*"; }
 error() { echo -e "${RED}[tributary]${NC} $*" >&2; exit 1; }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+QUICK_MODE_COUNT=0
+for selected in "$CHECK" "$FMT" "$CLIPPY" "$COVERAGE"; do
+  if "$selected"; then QUICK_MODE_COUNT=$((QUICK_MODE_COUNT + 1)); fi
+done
+[[ "$QUICK_MODE_COUNT" -le 1 ]] || usage_error "Choose at most one quick-exit mode"
+if [[ "$QUICK_MODE_COUNT" -gt 0 ]] && "$MAKE_DMG"; then
+  usage_error "Quick-exit and packaging modes cannot be combined"
+fi
+if "$RUN" && { "$CHECK" || "$FMT" || "$CLIPPY" || "$COVERAGE" || "$MAKE_DMG"; }; then
+  usage_error "--run cannot be combined with quick-exit or packaging modes"
+fi
+
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd)"
+cd "$REPO_ROOT"
+
+command -v cargo &>/dev/null || error "cargo not found. Install Rust: https://rustup.rs"
+if $FMT; then
+  info "Running cargo fmt..."
+  cargo fmt
+  info "Formatting complete."
+  exit 0
+fi
+if "$RUN"; then
+  command -v rustc &>/dev/null || error "rustc not found. Install Rust: https://rustup.rs"
+  RUN_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+  [[ "$RUN_TARGET" == *-apple-darwin ]] || error "--run requires a native macOS Rust toolchain"
+fi
+
 MACOS_PACKAGE_POLICY_HELPER="${SCRIPT_DIR}/macos-package-policy.sh"
 MACOS_ICON_POLICY_HELPER="${SCRIPT_DIR}/macos-icon-bundle-policy.sh"
 [[ -f "$MACOS_PACKAGE_POLICY_HELPER" ]] \
@@ -87,7 +130,6 @@ info "Version: ${CARGO_VERSION}"
 # ── Dependency Checks ────────────────────────────────────────────────────────
 info "Checking build dependencies..."
 
-command -v cargo &>/dev/null || error "cargo not found. Install Rust: https://rustup.rs"
 command -v brew  &>/dev/null || error "Homebrew not found. Install: https://brew.sh"
 
 for formula in gtk4 libadwaita pkg-config gstreamer gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav libsoup adwaita-icon-theme; do
@@ -106,14 +148,7 @@ info "All system dependencies satisfied."
 BREW_PREFIX="$(brew --prefix)"
 export PKG_CONFIG_PATH="${BREW_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
-# ── Quick-exit modes: --check, --fmt, --clippy ───────────────────────────────
-if $FMT; then
-  info "Running cargo fmt..."
-  cargo fmt
-  info "Formatting complete."
-  exit 0
-fi
-
+# ── Quick-exit modes: --check, --clippy ─────────────────────────────────────
 if $CHECK; then
   info "Running cargo check..."
   cargo check
@@ -142,6 +177,22 @@ if $COVERAGE; then
   info "Running comprehensive platform-native code coverage..."
   cargo llvm-cov --all-targets --all-features --locked --summary-only
   exit 0
+fi
+
+if "$RUN"; then
+  if ! macos_package_policy_load "$MACOS_BUNDLED_COMPONENT_POLICY"; then
+    error "$MACOS_PACKAGE_POLICY_REASON"
+  fi
+  BINARY="${REPO_ROOT}/target/${RUN_TARGET}/release/tributary"
+  info "Building Tributary (release)..."
+  cargo build --release --locked --target "$RUN_TARGET" --target-dir "${REPO_ROOT}/target"
+  if ! macos_validate_macho_copy_control "$BINARY"; then
+    error "$MACOS_PACKAGE_POLICY_REASON"
+  fi
+  # Match the selected Homebrew runtime for bare-name dlopen dependencies.
+  export DYLD_LIBRARY_PATH="${BREW_PREFIX}/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+  info "Launching Tributary..."
+  exec "$BINARY"
 fi
 
 for policy_tool in "$MACOS_FIND_COMMAND" "$MACOS_OTOOL_COMMAND" "$MACOS_OD_COMMAND"; do
