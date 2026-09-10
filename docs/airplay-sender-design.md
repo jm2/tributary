@@ -780,20 +780,27 @@ scope; revisit only if the OwnTone path fails in validation.**
 
 **Adopt the OwnTone 29.3 process adapter (§4.3, §5.4) as the first
 shipping path, behind the §4.1 seam, with the `raopsink` adapter (§4.2)
-retained for user-supplied elements — on exactly the package targets
-the §8 availability matrix marks available.** The matrix is decided
+retained for user-supplied elements — probe-gated independently of
+packaging. The §8 availability matrix gates the OwnTone adapter's
+acquisition only; it never restricts the user-supplied-element path,
+which stays available wherever `probe` finds a working `raopsink`
+(§4.2, §5.1).** The matrix is decided
 per actual Tributary package target (install matrix,
 [`README.md`](../README.md)) against documented OwnTone acquisition
 and the §4.3 dedicated-instance runtime path — never inherited from
 OwnTone's own channel list, most of which (Docker, OpenWrt, FreeBSD)
 serves platforms where Tributary ships nothing. Today the matrix
-marks the `.deb` target on Debian/Ubuntu-family systems available;
-Fedora RPM/COPR, Arch AUR, Flatpak, macOS `.dmg`, and Windows
-(winget/installer/zip) ship the fail-closed unavailable state — the
-localized guidance names the platform limitation — and imply no
-sender behavior. Sender support there requires a future supported
-acquisition/integration path, which this investigation deliberately
-does not promise (§8, §9).
+marks the `.deb` target on Debian/Ubuntu **amd64** available; the
+arm64 `.deb` Tributary also publishes has no documented OwnTone
+acquisition and ships fail-closed (§8). Fedora RPM/COPR, Arch AUR,
+Flatpak, macOS `.dmg`, and Windows
+(winget/installer/zip) ship the fail-closed unavailable state for the
+OwnTone adapter — the localized guidance names the platform
+limitation — and confer no OwnTone sender behavior; a user-supplied
+`raopsink` element keeps its independent §4.2 probe-gated path
+there. Sender support on the unavailable targets requires a future
+supported acquisition/integration path, which this investigation
+deliberately does not promise (§8, §9).
 
 Ordering rationale:
 
@@ -883,9 +890,19 @@ What the implementation record must nail down, per §4.3:
   availability decision for every Tributary target follows; each
   entry was checked against the documented channel on 2026-09-09:
 
-  - `.deb` (Debian/Ubuntu-family installs) — **Available.** Upstream
+  - `.deb` on Debian/Ubuntu **amd64** — **Available.** Upstream
     documents Debian/Ubuntu amd64 packages; the user-native daemon is
     one Tributary can own and supervise (§4.3).
+  - `.deb` on Debian/Ubuntu **arm64** — **Unavailable —
+    fail-closed.** Tributary's release workflow publishes
+    `tributary-arm64.deb`, but the documented OwnTone channels above
+    cover amd64 only on this package's targets: no upstream Debian/
+    Ubuntu arm64 package is documented. Upstream's Raspberry Pi OS
+    apt repository is recorded honestly (§5.4) but is not treated as
+    acquisition for generic arm64 Debian/Ubuntu installs — same
+    discipline as the Arch AUR entry below — so absent documented
+    acquisition this target ships the fail-closed unavailable state
+    until an evidence-backed arm64 channel is recorded.
   - Fedora RPM (COPR, `.rpm` releases) — **Unavailable —
     fail-closed.** No OwnTone channel is documented upstream.
   - Arch AUR (`tributary`, `tributary-bin`, `tributary-git`) —
@@ -905,7 +922,9 @@ What the implementation record must nail down, per §4.3:
   OwnTone ≥ 29.x" install-docs entry with the pinned source (upstream
   releases page); where OwnTone is absent even from a covered
   distro's own archives (no official Debian archive), the docs say so
-  and the probe error repeats it. Unavailable targets ship the honest
+  and the probe error repeats it. The arm64 `.deb` install entry
+  names the absent arm64 acquisition explicitly, mirroring the
+  fail-closed row above. Unavailable targets ship the honest
   fail-closed state: install docs state that AirPlay output requires
   an OwnTone-capable target with no acquisition path implied, and the
   probe fails closed with the same localized unavailable contract as
@@ -913,7 +932,10 @@ What the implementation record must nail down, per §4.3:
   `owntone-server` package honestly but does not treat it as a
   supported acquisition path, because it fails the
   dependency-documentation discipline above (community-maintained,
-  not upstream-documented, no pinned channel). The acceptance matrix
+  not upstream-documented, no pinned channel). This matrix — including
+  its amd64/arm64 split — gates the OwnTone adapter's acquisition
+  only; the user-supplied `raopsink` adapter (§4.2, §5.1) stays
+  independently probe-gated on every target. The acceptance matrix
   (§9) scopes to match.
 - **Probe reflects reality:** `AirplaySender::probe` for the daemon
   adapter checks: binary/service present (documented discovery only —
@@ -977,12 +999,17 @@ record for the selected path must add, at minimum:
    §3 discovery filter.
 
 **Platform scope:** items 1-8 run on the package targets the §8
-matrix marks available (today: `.deb` on Debian/Ubuntu-family
-systems). On every unavailable target — Fedora, Arch/AUR, Flatpak,
-macOS, Windows — the acceptance contract is the fail-closed path
-itself: §9.1's probe refusal with localized guidance naming the
-platform limitation. No sender playback is claimed there until a
-supported acquisition path exists.
+matrix marks available for the OwnTone adapter (today: the `.deb`
+target on Debian/Ubuntu **amd64**). On every OwnTone-unavailable
+target — the arm64 `.deb`, Fedora, Arch/AUR, Flatpak, macOS,
+Windows — the acceptance contract for the OwnTone path is the
+fail-closed path itself: §9.1's probe refusal with localized guidance
+naming the platform limitation. No OwnTone sender playback is claimed
+there until a supported acquisition path exists. The user-supplied
+`raopsink` adapter (§4.2, §5.1) is not governed by this scope: it
+remains independently probe-gated on every target, so where a user
+supplies a working element, today's probe-then-open behavior and its
+already-pinned tests (§1) are unchanged.
 
 ## 10. Proposed next-record plan
 
