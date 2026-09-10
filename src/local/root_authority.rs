@@ -89,14 +89,14 @@ struct RetainedObject {
 
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct ObjectIdentity {
+pub(crate) struct ObjectIdentity {
     device: u64,
     inode: u64,
 }
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct ObjectIdentity {
+pub(crate) struct ObjectIdentity {
     volume: u64,
     file_id: WindowsFileId,
 }
@@ -110,7 +110,7 @@ enum WindowsFileId {
 
 #[cfg(not(any(unix, windows)))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct ObjectIdentity;
+pub(crate) struct ObjectIdentity;
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -767,7 +767,21 @@ impl MountedMutationCommit<'_> {
     /// be live (see [`Self::reanchor_target_to_installed`]) — while the
     /// section's guard is still held. A pathname is never opened for the
     /// re-anchor outside this guard.
-    pub(crate) fn commit_replacement(&mut self, staged: &Path) -> io::Result<()> {
+    ///
+    /// `expected_staged_identity` carries the identity of the exact object
+    /// the caller tagged, captured from its retained handle before the
+    /// staging pathname is consulted again. When supplied, the commit
+    /// verifies that the staged leaf still names that exact object before
+    /// anything is displaced, so a stranger swapped over the staging name
+    /// in the tag-to-commit window refuses the commit instead of being
+    /// installed with the tagged identity. Callers without a retained
+    /// staging handle (the documented path-based flows) pass `None` and
+    /// keep their pathname-identity proof.
+    pub(crate) fn commit_replacement(
+        &mut self,
+        staged: &Path,
+        expected_staged_identity: Option<&ObjectIdentity>,
+    ) -> io::Result<()> {
         #[cfg(unix)]
         let key = self.leaf_commit_key()?;
         #[cfg(not(unix))]
@@ -776,7 +790,7 @@ impl MountedMutationCommit<'_> {
             self.confirm_replacement_target()?;
             #[cfg(test)]
             run_post_confirm_interpose(self);
-            let installed = self.replace_confirmed_staging(staged)?;
+            let installed = self.replace_confirmed_staging(staged, expected_staged_identity)?;
             #[cfg(test)]
             run_pre_reanchor_interpose(self);
             self.reanchor_target_to_installed(installed)
@@ -947,7 +961,11 @@ impl MountedMutationCommit<'_> {
     /// The published object's handle is returned with its identity so the
     /// re-anchor can prove the published object is still live and linked.
     #[cfg(unix)]
-    fn replace_confirmed_staging(&self, staged: &Path) -> io::Result<InstalledReplacement> {
+    fn replace_confirmed_staging(
+        &self,
+        staged: &Path,
+        expected_staged_identity: Option<&ObjectIdentity>,
+    ) -> io::Result<InstalledReplacement> {
         let parent = self.retained_parent();
         let leaf = self.target.relative_leaf()?;
         let staged_leaf = staged
@@ -963,6 +981,19 @@ impl MountedMutationCommit<'_> {
         // this section is publishing.
         let staged_file = open_unix_regular_at(&parent.file, staged_leaf)?;
         let staged_identity = object_identity(&staged_file)?;
+
+        // The opened object must be the exact object the caller tagged.
+        // The tagging half captured this identity from its retained handle
+        // before dropping it, so a stranger swapped over the staging name
+        // in the tag-to-commit window is detected here — before anything
+        // is displaced — and the commit refuses with every file untouched.
+        if let Some(expected) = expected_staged_identity {
+            if staged_identity != *expected {
+                return Err(authority_changed(
+                    "the staged tag copy was disturbed before the commit",
+                ));
+            }
+        }
 
         // Displace whatever occupies the leaf under a fresh quarantine name,
         // then prove the displaced entry is the exact object the confirm step
@@ -1172,7 +1203,11 @@ impl MountedMutationCommit<'_> {
     /// the native pathnames, which must never leak into logs (see
     /// `replacement_path`).
     #[cfg(not(unix))]
-    fn replace_confirmed_staging(&self, staged: &Path) -> io::Result<InstalledReplacement> {
+    fn replace_confirmed_staging(
+        &self,
+        staged: &Path,
+        expected_staged_identity: Option<&ObjectIdentity>,
+    ) -> io::Result<InstalledReplacement> {
         let leaf = self.target.relative_leaf()?;
         let quarantine_leaf = quarantine_name(&leaf);
         let Some(parent_dir) = self.target.path.parent() else {
@@ -1191,6 +1226,39 @@ impl MountedMutationCommit<'_> {
             )
         })?;
         let staged_identity = object_identity(&staged_file)?;
+
+        // The opened object must be the exact object the caller tagged (the
+        // anchored callers capture this identity from their retained handle
+        // before the staging name is consulted again). Like every refusal
+        // below, this happens before anything is displaced.
+        if let Some(expected) = expected_staged_identity {
+            if staged_identity != *expected {
+                return Err(authority_changed(
+                    "the staged tag copy was disturbed before the commit",
+                ));
+            }
+        }
+
+        // Probe the no-replace publish primitive before the first
+        // displacement. On volumes without hard-link support (FAT/exFAT
+        // removable media) every `rename_noreplace` below would fail, and a
+        // post-quarantine failure of the conditioned restore would strand
+        // the admitted original under its quarantine name with its leaf
+        // vacant. Linking the staged copy to a fresh throwaway name is the
+        // exact primitive and volume the install uses: if the probe fails,
+        // the commit refuses while the admitted file still sits untouched
+        // at its own name. The probe link is removed before the commit
+        // proceeds; a failed removal leaves only a private debris sibling.
+        let probe_leaf = quarantine_name(&leaf);
+        if let Err(error) = std::fs::hard_link(staged, parent_dir.join(&probe_leaf)) {
+            return Err(io::Error::new(
+                error.kind(),
+                "this filesystem cannot publish the conditioned no-replace \
+                 replacement; the commit refused before displacing the \
+                 admitted file",
+            ));
+        }
+        let _ = std::fs::remove_file(parent_dir.join(&probe_leaf));
 
         // Displace the confirmed entry under the fresh quarantine name. A
         // rename to a name that did not exist a moment ago never replaces an
@@ -1962,7 +2030,7 @@ fn join_components(root: &Path, components: &[OsString]) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn object_identity(file: &File) -> io::Result<ObjectIdentity> {
+pub(crate) fn object_identity(file: &File) -> io::Result<ObjectIdentity> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = file.metadata()?;
@@ -1973,7 +2041,7 @@ fn object_identity(file: &File) -> io::Result<ObjectIdentity> {
 }
 
 #[cfg(windows)]
-fn object_identity(file: &File) -> io::Result<ObjectIdentity> {
+pub(crate) fn object_identity(file: &File) -> io::Result<ObjectIdentity> {
     use std::mem::{size_of, MaybeUninit};
     use std::os::windows::io::AsRawHandle;
 
@@ -2072,7 +2140,7 @@ fn windows_published_link_count(file: &File) -> io::Result<u32> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn object_identity(_file: &File) -> io::Result<ObjectIdentity> {
+pub(crate) fn object_identity(_file: &File) -> io::Result<ObjectIdentity> {
     Err(unsupported_platform())
 }
 
@@ -2907,7 +2975,7 @@ mod tests {
         {
             let mut commit = target.begin_commit().expect("begin commit section");
             commit
-                .commit_replacement(&staged)
+                .commit_replacement(&staged, None)
                 .expect("the replacement commits and re-anchors the target");
             assert!(
                 !staged.exists(),
@@ -2969,7 +3037,7 @@ mod tests {
             || {
                 let mut commit = target.begin_commit().expect("begin commit section");
                 commit
-                    .commit_replacement(&staged)
+                    .commit_replacement(&staged, None)
                     .expect_err("a leaf swapped before the re-anchor must refuse the commit");
             },
         );
@@ -3042,7 +3110,7 @@ mod tests {
             || {
                 let mut commit = target.begin_commit().expect("begin commit section");
                 let error = commit
-                    .commit_replacement(&staged)
+                    .commit_replacement(&staged, None)
                     .expect_err("the re-anchor must refuse a removed replacement");
                 assert!(
                     error
@@ -3113,7 +3181,7 @@ mod tests {
 
         let mut commit = target.begin_commit().expect("begin commit section");
         commit
-            .commit_replacement(&staged)
+            .commit_replacement(&staged, None)
             .expect("commit through the retained parent");
 
         assert_eq!(
@@ -3701,7 +3769,7 @@ mod tests {
             || {
                 let mut commit = target.begin_commit().expect("begin commit section");
                 commit
-                    .commit_replacement(&staged)
+                    .commit_replacement(&staged, None)
                     .expect_err("a leaf swapped after confirm must refuse the commit");
             },
         );
@@ -3770,7 +3838,7 @@ mod tests {
             || {
                 let mut commit = target.begin_commit().expect("begin commit section");
                 commit
-                    .commit_replacement(&staged)
+                    .commit_replacement(&staged, None)
                     .expect_err("a leaf recreated in the install window must refuse the commit");
             },
         );
@@ -3837,7 +3905,7 @@ mod tests {
             || {
                 let mut commit = target.begin_commit().expect("begin commit section");
                 commit
-                    .commit_replacement(&staged)
+                    .commit_replacement(&staged, None)
                     .expect_err("a stranger swapped over the staging name must refuse the commit");
             },
         );
@@ -3856,6 +3924,99 @@ mod tests {
         // under exactly one fresh quarantine sibling — debris, never
         // destruction.
         assert_recreated_newcomer_displaced_under_one_fresh_sibling(&directory, b"stranger audio");
+    }
+
+    /// The tagged staging object's identity is conditioned into the commit:
+    /// when a stranger replaces the staging name after the tagged handle's
+    /// identity was captured — the tag-to-commit window — the commit refuses
+    /// before anything is displaced, and both the admitted original and the
+    /// stranger's victims stay untouched.
+    #[test]
+    fn commit_replacement_refuses_when_the_opened_staging_object_is_not_the_expected_identity() {
+        let directory = TestDirectory::new("mutation-staged-identity-mismatch");
+        let song = directory.path().join("song.flac");
+        fs::write(&song, b"original audio").expect("write song");
+
+        let authority =
+            Arc::new(MountedRootAuthority::acquire(directory.path()).expect("acquire authority"));
+        let target = authority
+            .open_mutation_target(Path::new("song.flac"))
+            .expect("open mutation target");
+
+        // The tagged copy sits beside the target; its identity is captured
+        // from the handle, exactly as the anchored tag writer captures it.
+        let staged = directory.path().join(".song.tributary-tag-tmp.flac");
+        fs::write(&staged, b"tagged audio").expect("stage the replacement");
+        let expected = object_identity(&fs::File::open(&staged).expect("open the staged copy"))
+            .expect("identity of the tagged staging object");
+
+        // A stranger takes over the staging name after the capture.
+        let moved = directory.path().join("moved.flac");
+        fs::rename(&staged, &moved).expect("move the true staged copy aside");
+        fs::write(&staged, b"stranger audio").expect("plant a stranger at the staging name");
+
+        let mut commit = target.begin_commit().expect("begin commit section");
+        let error = commit
+            .commit_replacement(&staged, Some(&expected))
+            .expect_err("a disturbed staging object must refuse the commit");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::PermissionDenied,
+            "the staged-object conditioning must refuse like every other disturbance"
+        );
+
+        // The refusal happened before the displacement: the admitted
+        // original is untouched at its own name, and the stranger still sits
+        // at the staging name it stole.
+        assert_eq!(
+            fs::read(&song).expect("read the leaf back"),
+            b"original audio",
+            "a staged-object refusal must leave the admitted original untouched"
+        );
+        assert_eq!(
+            fs::read(&staged).expect("read the stranger back"),
+            b"stranger audio",
+            "a staged-object refusal must leave the staging name alone"
+        );
+        assert_eq!(
+            fs::read(&moved).expect("read the true staged copy back"),
+            b"tagged audio",
+            "the true staged copy must survive the refusal untouched"
+        );
+    }
+
+    /// Supplying the exact tagged identity does not disturb the happy path:
+    /// the commit installs the staged copy that matches it.
+    #[test]
+    fn commit_replacement_accepts_a_staged_object_matching_the_expected_identity() {
+        let directory = TestDirectory::new("mutation-staged-identity-match");
+        let song = directory.path().join("song.flac");
+        fs::write(&song, b"original audio").expect("write song");
+
+        let authority =
+            Arc::new(MountedRootAuthority::acquire(directory.path()).expect("acquire authority"));
+        let target = authority
+            .open_mutation_target(Path::new("song.flac"))
+            .expect("open mutation target");
+
+        let staged = directory.path().join(".song.tributary-tag-tmp.flac");
+        fs::write(&staged, b"tagged audio").expect("stage the replacement");
+        let expected = object_identity(&fs::File::open(&staged).expect("open the staged copy"))
+            .expect("identity of the tagged staging object");
+
+        let mut commit = target.begin_commit().expect("begin commit section");
+        commit
+            .commit_replacement(&staged, Some(&expected))
+            .expect("the matching staged copy commits");
+        assert_eq!(
+            fs::read(&song).expect("read the leaf back"),
+            b"tagged audio",
+            "the conditioned commit must install the exact staged object"
+        );
+        assert!(
+            !staged.exists(),
+            "a successful install consumes the staging name"
+        );
     }
 
     /// A cloned read source shares the retained handle's underlying file
@@ -3919,7 +4080,7 @@ mod tests {
                 .begin_commit()
                 .expect("begin the first commit section");
             commit
-                .commit_replacement(&staged)
+                .commit_replacement(&staged, None)
                 .expect("the first replacement commits");
         }
         assert!(
@@ -3937,7 +4098,7 @@ mod tests {
                 .begin_commit()
                 .expect("begin the second commit section");
             commit
-                .commit_replacement(&staged_second)
+                .commit_replacement(&staged_second, None)
                 .expect_err("the displaced target must refuse the commit");
         }
         assert_eq!(

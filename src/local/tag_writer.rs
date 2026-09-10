@@ -40,7 +40,9 @@ use lofty::file::{TaggedFile, TaggedFileExt};
 use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem};
 use uuid::Uuid;
 
-use super::root_authority::{MountedMutationCommit, MountedMutationTarget};
+use super::root_authority::{
+    MountedMutationCommit, MountedMutationTarget, ObjectIdentity, object_identity,
+};
 
 /// Reserved filename prefix for the private sibling used by atomic tag writes.
 const TAG_WRITE_TEMP_PREFIX: &str = ".tributary-tag-";
@@ -768,7 +770,7 @@ fn write_tag_edits_for_commit(
         &staged_leaf,
         "the retained mutation target",
         edits,
-        |temp| finish_committed_tag_replacement(commit, temp),
+        |temp, expected_staged| finish_committed_tag_replacement(commit, temp, Some(expected_staged)),
     )
 }
 
@@ -789,7 +791,7 @@ fn write_tag_edits_for_commit(
         &replacement_path,
         "the retained mutation target",
         edits,
-        |temp| finish_committed_tag_replacement(commit, temp),
+        |temp| finish_committed_tag_replacement(commit, temp, None),
     )
 }
 
@@ -802,14 +804,23 @@ fn write_tag_edits_for_commit(
 /// identity-conditioned on the proven landing, so no pathname is ever
 /// opened outside the guard and no leaf swap between the landing and the
 /// re-anchor can be silently adopted.
+///
+/// `expected_staged_identity` is the identity captured from the tagged
+/// staging handle before the commit reopens the staging leaf: the commit
+/// verifies the leaf still names that exact object before anything is
+/// displaced. Path-based staging flows have no retained handle and pass
+/// `None`.
 fn finish_committed_tag_replacement(
     commit: &mut MountedMutationCommit<'_>,
     temp: &mut TempFile,
+    expected_staged_identity: Option<&ObjectIdentity>,
 ) -> Result<()> {
-    commit.commit_replacement(temp.path()).map_err(|error| {
-        anyhow::Error::new(error)
-            .context("The retained mutation authority refused the tagged replacement")
-    })?;
+    commit
+        .commit_replacement(temp.path(), expected_staged_identity)
+        .map_err(|error| {
+            anyhow::Error::new(error)
+                .context("The retained mutation authority refused the tagged replacement")
+        })?;
     // The retained authority renamed the staged copy into place; the
     // staging name no longer exists for the drop guard to remove.
     temp.disarm_cleanup();
@@ -837,7 +848,7 @@ fn anchored_atomic_tag_replacement(
     staged_leaf: &OsStr,
     target_label: &str,
     edits: &TagEdits,
-    commit_replacement: impl FnOnce(&mut TempFile) -> Result<()>,
+    commit_replacement: impl FnOnce(&mut TempFile, &ObjectIdentity) -> Result<()>,
 ) -> Result<()> {
     let (mut temp, mut staged) =
         TempFile::create_beside_retained(staging_parent, staged_leaf, target_label)?;
@@ -855,8 +866,17 @@ fn anchored_atomic_tag_replacement(
 
     write_tags_to_retained(&mut staged, target_label, edits)?;
     flush_and_prepare_tagged_copy_retained(&staged, target_label, retained_permissions)?;
+    // Capture the tagged staging object's identity from its retained
+    // handle before the handle is dropped. The commit reopens the staging
+    // leaf by name and verifies it still names this exact object before
+    // anything is displaced, so a stranger swapped over the staging name
+    // in the drop-to-commit window refuses the commit instead of being
+    // installed as if it were the tagged copy.
+    let staged_identity = object_identity(&staged).with_context(|| {
+        format!("The tagged staging copy of {target_label} could not be identified for the commit")
+    })?;
     drop(staged);
-    commit_replacement(&mut temp)?;
+    commit_replacement(&mut temp, &staged_identity)?;
 
     tracing::debug!("Tags written successfully");
     Ok(())
