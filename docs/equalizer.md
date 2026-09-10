@@ -341,21 +341,27 @@ buffers:
    blocks the next buffer (or fires immediately on an idle boundary) and holds data flow
    stopped for as long as its callback runs, so no buffer can reach the pads being rewired.
 2. Inside the probe callback: unlink `equalizer-10bands` from its downstream neighbor, add
-   or remove `rglimiter` inside the bin (on add: link it, then
-   `gst_element_sync_state_with_parent` so the element's state follows the running bin; on
-   remove: unlink it, then set it to `NULL` before dropping the reference), and re-link the
-   chain (`equalizer-10bands` ↔ `rglimiter` ↔ post-EQ `audioconvert`, or directly
-   `equalizer-10bands` ↔ post-EQ `audioconvert` when the limiter is removed).
+    or remove `rglimiter` inside the bin (on add: link it, then
+    `gst_element_sync_state_with_parent` so the element's state follows the running bin; on
+    remove: unlink it and retain it — the removed element stays under a strong reference and
+    is *not* finalized during the edit, so the exact pre-edit pad pair stays restorable on
+    failure; finalizing it (setting it to `NULL` and dropping the last reference) is deferred
+    until the replacement link has succeeded, per step 3), and re-link the
+    chain (`equalizer-10bands` ↔ `rglimiter` ↔ post-EQ `audioconvert`, or directly
+    `equalizer-10bands` ↔ post-EQ `audioconvert` when the limiter is removed).
 3. Return `GST_PAD_PROBE_REMOVE` from the callback only over a valid topology. On success
-   the re-linked chain is valid, and the return uninstalls the probe so blocked data flow
-   resumes across the new topology. On a re-link failure the callback must not resume flow
-   across the broken chain: it first restores the pre-edit layout — undoing the partial
-   `rglimiter` insert/remove (a half-added element is set to `NULL` before dropping it) and
-   re-linking the exact pad pair that was linked when the edit began, a chain that was valid
-   and flowing immediately before the edit — and only then returns `GST_PAD_PROBE_REMOVE`,
-   so flow resumes across the restored known-good layout while the pending toggle is retried
-   by the fallback. The callback never uninstalls the probe while the `equalizer-10bands`
-   src pad has no linked downstream peer.
+    the re-linked chain is valid, and the return uninstalls the probe so blocked data flow
+    resumes across the new topology; on a remove edit this success point is also where the
+    retained limiter is finalized (set to `NULL`, last reference dropped), only after the
+    replacement link is known good. On a re-link failure the callback must not resume flow
+    across the broken chain: it first restores the pre-edit layout — undoing the partial
+    `rglimiter` insert/remove (a half-added element is set to `NULL` before dropping it; a
+    removed-but-retained limiter is re-linked into its pre-edit position and is not
+    finalized) and re-linking the exact pad pair that was linked when the edit began, a chain
+    that was valid and flowing immediately before the edit — and only then returns
+    `GST_PAD_PROBE_REMOVE`, so flow resumes across the restored known-good layout while the
+    pending toggle is retried by the fallback. The callback never uninstalls the probe while
+    the `equalizer-10bands` src pad has no linked downstream peer.
 4. Mark the change in metrics as a brief swap (≤ 100 ms by spec).
 
 Because every step of the topology edit — including the failure path — happens while the
@@ -533,7 +539,9 @@ Validation rules on read:
 
 - `schema_version` must equal `"1"`; any other value replaces the file with defaults.
 - Each line must match the `key="value"` grammar; a malformed line replaces the file with
-  defaults and the parser remembers which line failed for the diagnostic below.
+  defaults and the parser remembers which line failed for the diagnostic below. When the line
+  has no parseable `key=` prefix, the recorded failure carries the line number and a failure
+  category instead of a key — a line the grammar cannot split has no key to report.
 - A file that parses but omits any of the fifteen keys is malformed: it is replaced with the
   defaults as a whole under the rule below. There are no per-key defaults for missing keys —
   partial files are not merged with defaults, because silently filling gaps would combine
@@ -573,7 +581,9 @@ Validation rules on read:
 
 A malformed file is replaced with the default state via the same atomic-replace protocol above,
 the user's prior preferences are recorded in a typed diagnostic with file path, byte count, and
-the bad key, and the change is not silent.
+a key-or-line locator — the offending key when one is parseable, otherwise the failing line
+number and failure category when parsing fails before any key exists — and the change is not
+silent.
 
 A *transient read failure* is not a malformed file. If `equalizer.cfg` exists but cannot be
 opened or read (for example `EACCES`, `EBUSY`, or `EIO`), the module runs with in-memory
@@ -671,7 +681,9 @@ Diagnostics are bounded:
   user must inspect or fix. Outside those two warnings, no log at info or above carries the
   path, and the informational chain insert/remove messages never carry it.
 - Diagnostic state on a malformed file is emitted at warn with the file path, byte count, and
-  bad key only. The user's prior preferences are not dumped; the file content is not dumped.
+  the key-or-line locator only — the bad key when one is parseable, otherwise the failing line
+  number and failure category. The user's prior preferences are not dumped; the file content is
+  not dumped.
 - EQ metrics (e.g. peak amplitude per band, average gain) are deliberately not exposed in the
   UI or logs. Surfacing them would invite user-visible polish without a contract owner.
 
@@ -734,7 +746,8 @@ for this contract; new conditions require a new revision.
     `window.close()`); the shutdown flush writes the current state to disk via atomic replace
     before the drain completes; no partial writes.
 11. **Malformed `equalizer.cfg` on disk.** Defaults re-written via atomic replace; single
-    warn-level diagnostic published (file path, byte count, bad key).
+    warn-level diagnostic published (file path, byte count, and the bad key — or the failing
+    line number and failure category when the malformed line has no parseable key).
 12. **Preamp outside bounds in saved file.** Value clamped to range; bands remain as stored;
     the preset-truth reconciliation applies — a named preset whose clamped preamp differs from
     that preset's canonical recommended preamp becomes `custom`.
