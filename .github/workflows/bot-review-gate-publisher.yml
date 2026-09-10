@@ -793,6 +793,7 @@ jobs:
                      dismissed_at: .createdAt } ]) as $dismissals
             | ( ($threads | unresolved_bot_threads)
               + [ $reviews | bot_review_violations($head; $dismissals)[] ]
+              + expected_reviewer_violations($head)
               + missing_evidence_violations($head; $policy) ) as $all_violations
             | substitution_eligible($head; $policy) as $eligible
             | (($policy.rate_limited_reviewers // []) | map(.login)) as $waivable_logins
@@ -832,6 +833,7 @@ jobs:
             --slurpfile timeline "${timeline_pages}" \
             --slurpfile policy "${policy_file}" \
             --arg head "${intended_head}" \
+            --arg expected "${EXPECTED_BOT_REVIEWERS:-}" \
             -f "${decisions_jq}")"
 
           jq -r '.waived[] |
@@ -918,6 +920,24 @@ jobs:
             exit 1
           fi
 
+          # ── The refresh opens the required context before evaluating ─────
+          # The latest completed run under the required name decides
+          # mergeability, so an old green verdict stays mergeable for as
+          # long as the refresh runs. Opening the context as an in-progress
+          # App-authored check run at the announced head BEFORE any
+          # discovery or evaluation immediately supersedes that old verdict
+          # — the pending run blocks the merge for the whole refresh — and
+          # every terminal path below UPDATES this same run to its
+          # conclusion. A refresh that dies mid-flight leaves the pending
+          # run standing (a blocked merge, and the failed job as the re-run
+          # signal) instead of resurrecting a stale green. If the start
+          # itself fails, nothing was superseded and nothing is finalized:
+          # the previous verdict keeps standing and the failed job is the
+          # re-run signal.
+          if ! start_gate_check_run "${announcer_head}"; then
+            exit 1
+          fi
+
           # ── Pull-request discovery, bound to the announcer's commit ──────
           # `commits/<sha>/pulls` lists the pull requests *associated with*
           # the announcing run's commit — which includes stacked descendants
@@ -928,21 +948,45 @@ jobs:
           # pull request headed there on every refresh. Selection therefore
           # compares each record's head SHA to the announced SHA before any
           # evaluation.
-          if ! associated="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${announcer_head}/pulls?per_page=100")"; then
-            echo "Associated-pull-request query failed; failing closed." >&2
-            # A refresh that exits here would leave the head's previous
-            # verdict standing — including a green one that predates a bot
-            # change request submitted at this same head, or one kept alive
-            # by a transient discovery failure. The latest completed run
-            # under the required name decides, so publish the superseding
-            # failure before exiting.
-            if ! publish_gate_check_run "${announcer_head}" "failure" \
-                "Bot Review Gate: refresh failed before evaluation" \
-                "The associated-pull-request discovery query failed, so bot-review evidence at this commit could not be re-evaluated. This failing result supersedes any earlier verdict published at this commit; a later announcer completion publishes the current verdict."; then
+          # The association endpoint PAGINATES: pulling only the first page
+          # would silently shrink the candidate set for a commit shared by
+          # more pull requests than one page holds, and a dropped candidate's
+          # refusal would never reach the shared verdict. Walk every page and
+          # aggregate the records into one array before selection. The script
+          # must stay free of bash-4-only builtins (see below), so the pages
+          # are collected as JSON Lines and slurped into one array.
+          associated_dir="${RUNNER_TEMP}/bot-review-gate-associated"
+          rm -rf "${associated_dir}"
+          mkdir -p "${associated_dir}"
+          associated_jsonl="${associated_dir}/associated.jsonl"
+          : > "${associated_jsonl}"
+          page=1
+          while :; do
+            if ! gh api "repos/${GITHUB_REPOSITORY}/commits/${announcer_head}/pulls?per_page=100&page=${page}" \
+                > "${associated_dir}/page-${page}.json"; then
+              echo "Associated-pull-request query failed; failing closed." >&2
+              # A refresh that exits here would leave the head's previous
+              # verdict standing — including a green one that predates a bot
+              # change request submitted at this same head, or one kept alive
+              # by a transient discovery failure. The in-progress run opened
+              # above is finalized to the superseding failure before exiting.
+              if ! finish_gate_check_run "${announcer_head}" "failure" \
+                  "Bot Review Gate: refresh failed before evaluation" \
+                  "The associated-pull-request discovery query failed, so bot-review evidence at this commit could not be re-evaluated. This failing result supersedes any earlier verdict published at this commit; a later announcer completion publishes the current verdict."; then
+                exit 1
+              fi
               exit 1
             fi
-            exit 1
-          fi
+            page_count="$(jq 'length' "${associated_dir}/page-${page}.json")"
+            if [ "${page_count}" -gt 0 ]; then
+              jq -c '.[]' "${associated_dir}/page-${page}.json" >> "${associated_jsonl}"
+            fi
+            if [ "${page_count}" -lt 100 ]; then
+              break
+            fi
+            page=$((page + 1))
+          done
+          associated="$(jq -s '.' "${associated_jsonl}")"
           # The publisher script is also materialized and executed by
           # tests/bot_review_gate/harness.rs on the test host, whose /bin/bash
           # can be the macOS bash 3.2 — so this script must stay free of
@@ -971,7 +1015,7 @@ jobs:
             # nowhere — and opening or retargeting a pull request onto this
             # commit fires its own announcement, which publishes the fresh
             # verdict.
-            if ! publish_gate_check_run "${announcer_head}" "failure" \
+            if ! finish_gate_check_run "${announcer_head}" "failure" \
                 "Bot Review Gate: no open main pull request at this commit" \
                 "No open pull request against main is headed by this commit, so no bot-review evidence was evaluated here. This failing result supersedes any earlier verdict published at this commit; opening or retargeting a pull request headed here re-announces the gate."; then
               exit 1
@@ -999,7 +1043,7 @@ jobs:
 
           if [ "${#blocked_reports[@]}" -gt 0 ]; then
             echo >&2 "Bot review evidence is not clean at ${announcer_head}: ${#blocked_reports[@]} of ${#candidate_prs[@]} associated pull request(s) are blocked; publishing the shared failing verdict (fail-if-any-fail)."
-            if ! publish_gate_check_run "${announcer_head}" "failure" \
+            if ! finish_gate_check_run "${announcer_head}" "failure" \
                 "Bot Review Gate: unresolved or stale bot-review evidence" \
                 "$(printf '%s\n' "${blocked_reports[@]}")"; then
               exit 1
@@ -1011,7 +1055,7 @@ jobs:
             if [ "${#clean_summaries[@]}" -gt 1 ]; then
               echo "Publishing one shared green verdict for ${#clean_summaries[@]} associated pull requests at ${announcer_head}."
             fi
-            if ! publish_gate_check_run "${announcer_head}" "success" \
+            if ! finish_gate_check_run "${announcer_head}" "success" \
                 "${clean_summaries[0]}" \
                 "$(printf '%s\n' "${clean_summaries[@]}")"; then
               exit 1
@@ -1025,7 +1069,7 @@ jobs:
           # sees: publishing nothing would leave its previous verdict —
           # possibly green — standing at the commit, ready to apply again
           # after a retarget back to main, which fires no refresh either.
-          if ! publish_gate_check_run "${announcer_head}" "failure" \
+          if ! finish_gate_check_run "${announcer_head}" "failure" \
               "Bot Review Gate: every associated pull request skipped evaluation" \
               "Every open pull request headed by this commit now targets a branch other than main, so none was evaluated. This failing result supersedes any earlier verdict published at this commit; retargeting a pull request back to main fires its own announcement, which publishes the fresh verdict."; then
             exit 1
