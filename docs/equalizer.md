@@ -455,14 +455,21 @@ claims are exactly the ones each platform can make, no more:
   remains atomic for readers, and durability of the newest directory entry degrades to what
   the filesystem itself guarantees; the contract does not claim more than the platform
   delivers.
-- **Windows.** The replace in step 5 is `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` and
-  `MOVEFILE_WRITE_THROUGH` — the operation `tempfile::NamedTempFile::persist` performs on
-  that platform, the same persist-after-sync pattern the repository already uses for XSPF
-  export and preference writes. NTFS metadata journaling makes the replace atomic with
-  respect to readers and crash-consistent; the file contents were flushed in step 4, and
-  write-through covers the replacement itself. Windows has no directory-handle sync
-  operation, so step 6 does not apply and no directory-entry durability is claimed beyond
-  the write-through semantics of the replace call.
+- **Windows.** The replace in step 5 is `MoveFileExW` with both `MOVEFILE_REPLACE_EXISTING` and
+  `MOVEFILE_WRITE_THROUGH`, invoked explicitly on the temp path. It is deliberately *not*
+  `tempfile::NamedTempFile::persist`: the locked `tempfile` 3.27.0 passes
+  `MOVEFILE_REPLACE_EXISTING` only (`src/file/imp/windows.rs` never sets
+  `MOVEFILE_WRITE_THROUGH`), so a persist-based replace would not deliver the durability this
+  paragraph claims. `tempfile` still stages the write: after the step 4 flush,
+  `NamedTempFile::into_temp_path()` releases the file handle and `TempPath::keep()` detaches
+  the path from cleanup, and the writer then calls `MoveFileExW` on that path itself.
+  `MOVEFILE_WRITE_THROUGH` means the call does not return until the move is actually on disk,
+  so the replacement — destination directory entry included — is durable when the call
+  returns; this is the Windows counterpart of the POSIX directory sync in step 6, which
+  therefore does not apply on this platform. NTFS keeps the replace atomic and
+  crash-consistent for readers. If the replace fails, the destination still holds the
+  previous `equalizer.cfg`, and the writer removes the temp path it minted; a reader observes
+  either the prior file or the complete new one, never a partial one.
 
 The temp name is minted fresh for every write attempt — a random segment (for example a UUID, as
 in the existing XSPF-export writer) beside the destination — and created exclusively (a
@@ -786,11 +793,12 @@ for this contract; new conditions require a new revision.
     `custom` per *Band and preamp mechanics*.
 23. **Save on any supported platform, including Windows.** The write completes through the
     platform's atomic-replace path (Unix: `rename(2)` after file and directory sync;
-    Windows: `NamedTempFile::persist` with write-through); a concurrent or subsequent reader
-    observes either the prior file or the complete new file, never a partial one; the
-    durability claim is the platform's own — file contents are flushed before the replace,
-    and directory-entry durability is claimed only on platforms that provide a directory
-    sync.
+    Windows: explicit `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`,
+    not `NamedTempFile::persist`, which passes the replacement flag only); a concurrent or
+    subsequent reader observes either the prior file or the complete new file, never a
+    partial one; the durability claim is the platform's own — file contents are flushed
+    before the replace, and directory-entry durability is claimed only where the platform
+    provides it (POSIX directory sync; the Windows write-through move).
 24. **Duplicate key in saved file (e.g. a second `band0_db` line).** The file is malformed as
     a whole; defaults are re-written via atomic replace; the warn diagnostic names the
     duplicated key; no precedence between the duplicate lines is defined or observed.
