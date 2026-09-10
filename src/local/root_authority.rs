@@ -607,6 +607,66 @@ impl MountedMutationTarget {
         parent.validate_live()?;
         Ok((parent.file.try_clone()?, self.relative_leaf()?))
     }
+
+    /// Point-in-time proof that the retained parent's leaf name still names
+    /// the admitted object — the advisory preflight's twin of the commit
+    /// section's leaf proof (see
+    /// [`MountedMutationCommit::confirm_replacement_target`]).
+    ///
+    /// [`Self::validate`] deliberately checks only the retained object, the
+    /// parent guards, and the root authority: a leaf renamed or replaced
+    /// while its retained inode stays open keeps validating, and the swap is
+    /// proven only inside the commit section. A preflight built on validate
+    /// alone would therefore report a write-capable target whose every
+    /// future commit is guaranteed to refuse. This check opens the leaf name
+    /// through the retained parent directory — never an absolute pathname
+    /// lookup, which a replaced parent could retarget — and compares exact
+    /// identity against the admitted object.
+    #[cfg(unix)]
+    pub(crate) fn confirm_leaf_names_admitted_object(&self) -> io::Result<()> {
+        let file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("mutation target commit section is unavailable"))?;
+        validate_mounted_bound(self.authority.as_ref(), &file)?;
+        let leaf = self.relative_leaf()?;
+        let parent = if let Some(guard) = file.parent_guards.last() {
+            guard
+        } else {
+            self.authority.root_handle()
+        };
+        let current = open_unix_regular_at(&parent.file, &leaf)?;
+        if object_identity(&current)? != file.object.identity {
+            return Err(authority_changed(
+                "mutation target no longer names the retained file",
+            ));
+        }
+        // Close the check window on the authority side, mirroring the
+        // double-validation discipline of every other retained-evidence
+        // path.
+        parent.validate_live()?;
+        self.authority.validate()
+    }
+
+    /// Windows twin of [`Self::confirm_leaf_names_admitted_object`]:
+    /// platforms without retained parent handles prove the pathname still
+    /// names the admitted object through a fresh open and an exact identity
+    /// comparison, exactly as the commit-side confirmation does.
+    #[cfg(not(unix))]
+    pub(crate) fn confirm_leaf_names_admitted_object(&self) -> io::Result<()> {
+        let file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("mutation target commit section is unavailable"))?;
+        validate_mounted_bound(self.authority.as_ref(), &file)?;
+        let current = File::open(&self.path)?;
+        if object_identity(&current)? != file.object.identity {
+            return Err(authority_changed(
+                "mutation target no longer names the retained file",
+            ));
+        }
+        self.authority.validate()
+    }
 }
 
 /// One serialized commit section over a [`MountedMutationTarget`].

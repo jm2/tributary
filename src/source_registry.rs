@@ -131,6 +131,16 @@ impl RemovableMutationTarget {
         self.inner
             .validate()
             .map_err(|_| TagWritePreflightError::Unavailable)?;
+        // A leaf renamed or replaced while its retained inode stays open
+        // keeps validate() passing — the swap is proven only inside the
+        // commit section — yet the next write is guaranteed to refuse in
+        // the commit's replacement confirmation. The preflight runs the
+        // same leaf-identity proof so a permanently stale target reports
+        // unavailable before the user edits and saves into a doomed
+        // dialog.
+        self.inner
+            .confirm_leaf_names_admitted_object()
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
         // The format check reads only the file extension — exactly like the
         // writer itself; the retained file's liveness and regularity are
         // already proven by the validate() above.
@@ -7649,6 +7659,67 @@ mod tests {
                 "a write refused at admission must leave the admitted file untouched"
             );
         }
+        registry.shutdown().wait().await;
+    }
+
+    /// A leaf renamed or replaced while its retained inode stays open keeps
+    /// `validate()` passing — the swap is proven only inside the commit
+    /// section — so the advisory preflight must run the same leaf-identity
+    /// proof the commit does. A target whose accepted leaf was swapped after
+    /// admission reports unavailable before the user edits and saves into a
+    /// dialog whose every future commit is guaranteed to refuse, and the
+    /// preflight's refusal must predict the commit's refusal exactly.
+    #[tokio::test]
+    async fn removable_preflight_refuses_a_leaf_replaced_after_admission() {
+        let registry = registry();
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let path = mount.path().join("tagged.flac");
+        write_tagged_removable_fixture(&path, "Admitted Title", "Admitted Artist", None);
+        let source_id = SourceId::removable("registry:test:preflight-leaf-swap")
+            .expect("removable source identity");
+        let claim = registry
+            .claim_provenance(source_id, SourceProvenance::Removable)
+            .expect("claim removable source");
+        registry
+            .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+            .expect("removable connection admitted");
+        let (_, session_epoch) = wait_for_catalogue(&registry, source_id).await;
+        let track_id = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .and_then(|catalogue| catalogue.value.tracks().first().cloned())
+            .and_then(|track| track.native_track_id)
+            .expect("accepted track identity");
+
+        let target = registry
+            .resolve_mutation_target(source_id, session_epoch, track_id)
+            .await
+            .expect("resolve retained mutation target");
+        assert!(
+            target.preflight_write_capability().is_ok(),
+            "the untouched admitted target is write-capable"
+        );
+
+        // Swap the accepted leaf for a different object while the retained
+        // inode stays open, exactly like an external writer would.
+        let impostor = mount.path().join("impostor.flac");
+        write_tagged_removable_fixture(&impostor, "Impostor Title", "Impostor Artist", None);
+        std::fs::rename(&impostor, &path).expect("swap the accepted leaf");
+
+        assert!(matches!(
+            target.preflight_write_capability(),
+            Err(crate::local::tag_writer::TagWritePreflightError::Unavailable)
+        ));
+
+        target
+            .write_tags(&crate::local::tag_writer::TagEdits {
+                title: Some("Post Swap".to_string()),
+                ..Default::default()
+            })
+            .expect_err("a swapped leaf must refuse the commit");
+
+        assert!(registry.release_provenance(source_id, claim));
+        wait_until_pruned(&registry, source_id).await;
         registry.shutdown().wait().await;
     }
 
