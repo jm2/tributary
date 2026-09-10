@@ -1299,12 +1299,12 @@ impl MountedRootAuthority {
         {
             let created = create_directory_tree_by_path(&self.root, components)?;
             self.validate()?;
-            return Ok(created);
+            Ok(created)
         }
         #[cfg(not(any(unix, windows)))]
         {
             let _ = components;
-            return Err(unsupported_platform());
+            Err(unsupported_platform())
         }
     }
 

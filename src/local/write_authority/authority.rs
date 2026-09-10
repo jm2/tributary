@@ -1,6 +1,7 @@
 //! The [`MountedWriteAuthority`] type: retained, validated write operations
 //! beneath one exact mounted filesystem.
 
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -165,7 +166,7 @@ impl MountedWriteAuthority {
             staged_file: Some(staged_file),
             resolution: resolved.resolution,
             committed: false,
-            staged_leaf_holds_displaced_occupant: false,
+            staged_leaf_holds_displaced_occupant: Cell::new(false),
         })
     }
 
