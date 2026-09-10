@@ -41,7 +41,7 @@ use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem};
 use uuid::Uuid;
 
 use super::root_authority::{
-    MountedMutationCommit, MountedMutationTarget, ObjectIdentity, object_identity,
+    object_identity, MountedMutationCommit, MountedMutationTarget, ObjectIdentity,
 };
 
 /// Reserved filename prefix for the private sibling used by atomic tag writes.
@@ -674,7 +674,7 @@ pub fn preflight_tag_write(path: &Path) -> Result<(), TagWritePreflightError> {
 /// This performs blocking filesystem I/O and must not run on the GTK
 /// thread.
 #[cfg(unix)]
-pub(crate) fn preflight_tag_write_directory_retained(
+pub fn preflight_tag_write_directory_retained(
     parent: &std::fs::File,
     leaf: &OsStr,
     target_label: &str,
@@ -836,7 +836,9 @@ fn write_tag_edits_for_commit(
         &staged_leaf,
         "the retained mutation target",
         edits,
-        |temp, expected_staged| finish_committed_tag_replacement(commit, temp, Some(expected_staged)),
+        |temp, expected_staged| {
+            finish_committed_tag_replacement(commit, temp, Some(expected_staged))
+        },
     )
 }
 

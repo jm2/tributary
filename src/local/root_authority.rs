@@ -89,14 +89,14 @@ struct RetainedObject {
 
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct ObjectIdentity {
+pub struct ObjectIdentity {
     device: u64,
     inode: u64,
 }
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct ObjectIdentity {
+pub struct ObjectIdentity {
     volume: u64,
     file_id: WindowsFileId,
 }
@@ -2059,7 +2059,7 @@ fn join_components(root: &Path, components: &[OsString]) -> PathBuf {
 }
 
 #[cfg(unix)]
-pub(crate) fn object_identity(file: &File) -> io::Result<ObjectIdentity> {
+pub fn object_identity(file: &File) -> io::Result<ObjectIdentity> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = file.metadata()?;
@@ -2070,7 +2070,7 @@ pub(crate) fn object_identity(file: &File) -> io::Result<ObjectIdentity> {
 }
 
 #[cfg(windows)]
-pub(crate) fn object_identity(file: &File) -> io::Result<ObjectIdentity> {
+pub fn object_identity(file: &File) -> io::Result<ObjectIdentity> {
     use std::mem::{size_of, MaybeUninit};
     use std::os::windows::io::AsRawHandle;
 
