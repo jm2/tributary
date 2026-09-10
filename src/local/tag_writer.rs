@@ -862,6 +862,24 @@ fn anchored_atomic_tag_replacement(
     Ok(())
 }
 
+/// Rewind the staged copy and parse it through its retained handle, guessing
+/// the format from the content — the anchored twin of the path-based read
+/// half of [`write_tags_to`], never touching a pathname.
+#[cfg(unix)]
+fn read_tagged_file_retained(staged: &mut File, target_label: &str) -> Result<TaggedFile> {
+    use std::io::Seek;
+
+    staged
+        .rewind()
+        .with_context(|| format!("Failed to read tags from {target_label}"))?;
+    lofty::probe::Probe::new(&mut *staged)
+        .guess_file_type()
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("Failed to read tags from {target_label}"))?
+        .read()
+        .with_context(|| format!("Failed to read tags from {target_label}"))
+}
+
 /// Probe, edit, and save the staged copy through its retained handle — the
 /// anchored twin of [`write_tags_to`], never touching a pathname.
 ///
@@ -874,16 +892,7 @@ fn anchored_atomic_tag_replacement(
 fn write_tags_to_retained(staged: &mut File, target_label: &str, edits: &TagEdits) -> Result<()> {
     use std::io::Seek;
 
-    staged
-        .rewind()
-        .with_context(|| format!("Failed to read tags from {target_label}"))?;
-    let probe = lofty::probe::Probe::new(&mut *staged)
-        .guess_file_type()
-        .map_err(anyhow::Error::from)
-        .with_context(|| format!("Failed to read tags from {target_label}"))?;
-    let mut tagged_file = probe
-        .read()
-        .with_context(|| format!("Failed to read tags from {target_label}"))?;
+    let mut tagged_file = read_tagged_file_retained(staged, target_label)?;
 
     let tag = ensure_primary_tag(&mut tagged_file, target_label)?;
     apply_tag_edits(tag, edits)?;
@@ -1792,16 +1801,12 @@ mod tests {
         );
     }
 
-    /// A parent directory displaced between selection and commit must not
-    /// strand the staging area inside whatever now occupies the old
-    /// pathname: the retained authority stages and replaces only through its
-    /// retained parent object, so the write lands beside the admitted file
-    /// in the retained directory and the impostor never receives anything
-    /// at all — not the staged sibling, not the tagged copy.
+    /// Create an album directory holding the silence.flac fixture — the
+    /// common arrangement of the anchored-staging regression tests, whose
+    /// retained authority admits `album/silence.flac` through its parent.
     #[cfg(unix)]
-    #[test]
-    fn a_mutation_target_write_lands_beside_the_retained_parent_when_it_was_displaced() {
-        let directory = TestDirectory::new("mutation-parent-e2e");
+    fn anchored_album_fixture(name: &str) -> (TestDirectory, PathBuf, PathBuf) {
+        let directory = TestDirectory::new(name);
         let album = directory.path.join("album");
         std::fs::create_dir(&album).expect("create album");
         let track = album.join("silence.flac");
@@ -1813,11 +1818,48 @@ mod tests {
             )),
         )
         .expect("write fixture");
+        (directory, album, track)
+    }
 
-        let authority = std::sync::Arc::new(
+    /// Acquire the mounted root authority over a test directory.
+    #[cfg(unix)]
+    fn mounted_root_authority(
+        directory: &TestDirectory,
+    ) -> std::sync::Arc<crate::local::root_authority::MountedRootAuthority> {
+        std::sync::Arc::new(
             crate::local::root_authority::MountedRootAuthority::acquire(&directory.path)
                 .expect("acquire mounted authority"),
+        )
+    }
+
+    /// Assert the replacement landed beside the admitted file in the
+    /// retained (displaced) directory, carrying the written year.
+    #[cfg(unix)]
+    fn assert_replacement_landed_beside_admitted_file(displaced_album: &Path) {
+        let tagged_file = lofty::read_from_path(displaced_album.join("silence.flac"))
+            .expect("reopen the replaced admitted file");
+        assert_eq!(
+            tagged_file
+                .primary_tag()
+                .expect("primary tag")
+                .get_string(ItemKey::Year),
+            Some("2026"),
+            "the replacement must land beside the admitted file in the retained directory"
         );
+    }
+
+    /// A parent directory displaced between selection and commit must not
+    /// strand the staging area inside whatever now occupies the old
+    /// pathname: the retained authority stages and replaces only through its
+    /// retained parent object, so the write lands beside the admitted file
+    /// in the retained directory and the impostor never receives anything
+    /// at all — not the staged sibling, not the tagged copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_mutation_target_write_lands_beside_the_retained_parent_when_it_was_displaced() {
+        let (directory, album, track) = anchored_album_fixture("mutation-parent-e2e");
+
+        let authority = mounted_root_authority(&directory);
         let target = authority
             .open_mutation_target(Path::new("album/silence.flac"))
             .expect("open mutation target");
@@ -1832,16 +1874,7 @@ mod tests {
 
         // The replacement landed beside the admitted file in the retained
         // (displaced) directory.
-        let tagged_file = lofty::read_from_path(displaced_album.join("silence.flac"))
-            .expect("reopen the replaced admitted file");
-        assert_eq!(
-            tagged_file
-                .primary_tag()
-                .expect("primary tag")
-                .get_string(ItemKey::Year),
-            Some("2026"),
-            "the replacement must land beside the admitted file in the retained directory"
-        );
+        assert_replacement_landed_beside_admitted_file(&displaced_album);
 
         // The impostor keeps exactly what it had. Under path-resolved
         // staging it transiently received the staged sibling and the
@@ -1881,25 +1914,10 @@ mod tests {
     ) {
         use std::os::unix::fs::symlink;
 
-        let directory = TestDirectory::new("mutation-stage-anchor");
-        let album = directory.path.join("album");
-        std::fs::create_dir(&album).expect("create album");
-        let track = album.join("silence.flac");
-        std::fs::write(
-            &track,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/audio/silence.flac"
-            )),
-        )
-        .expect("write fixture");
-
+        let (directory, album, track) = anchored_album_fixture("mutation-stage-anchor");
         let outside = TestDirectory::new("mutation-stage-outside");
 
-        let authority = std::sync::Arc::new(
-            crate::local::root_authority::MountedRootAuthority::acquire(&directory.path)
-                .expect("acquire mounted authority"),
-        );
+        let authority = mounted_root_authority(&directory);
         let target = authority
             .open_mutation_target(Path::new("album/silence.flac"))
             .expect("open mutation target");
@@ -1932,16 +1950,7 @@ mod tests {
 
         // The replacement landed beside the admitted file in the retained
         // (displaced) directory.
-        let tagged_file = lofty::read_from_path(displaced_album.join("silence.flac"))
-            .expect("reopen the replaced admitted file");
-        assert_eq!(
-            tagged_file
-                .primary_tag()
-                .expect("primary tag")
-                .get_string(ItemKey::Year),
-            Some("2026"),
-            "the replacement must land beside the admitted file in the retained directory"
-        );
+        assert_replacement_landed_beside_admitted_file(&displaced_album);
 
         // Nothing — staged sibling or tagged copy — may ever have crossed
         // the symlink into the impostor's target.
