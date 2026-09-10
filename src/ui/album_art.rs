@@ -1403,11 +1403,15 @@ mod tests {
         });
         // Occupy the pane worker with the blocked request. request_seen
         // fires only after the worker dispatched it on the wire, so from
-        // here on the pane worker is provably busy.
-        let occupying = enqueue_art_request(
-            ArtSource::Url(blocked_url),
+        // here on the pane worker is provably busy. Admission is retried
+        // because the lock handoff does not guarantee the lane has
+        // drained a predecessor test's blocked fetch and revoked fillers
+        // (2026-09-10 arm64 CI + local reproductions).
+        let occupying = enqueue_admitted_pane_request(
+            blocked_url,
             RequestLiveness::Scoped(ScopedArtFetch::new()),
-        );
+        )
+        .expect("pane lane admitted the blocked request before the deadline");
         request_seen_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("pane worker took the blocked request");
@@ -1417,19 +1421,26 @@ mod tests {
         // stays saturated, and at release the worker skips it at the
         // dequeue-time liveness gate with no network attempt, so the
         // lane drains instantly regardless of proxy or resolver state.
+        // `Full` ends the fill instead of panicking: the bounded lane is
+        // then saturated by definition, and the extra occupant can only
+        // be a request from a sender outside this test's control — which
+        // is itself revoked-and-skipped or refused exactly like a filler.
         let workers = art_workers().expect("art workers initialized");
         for _ in 0..MAX_PENDING_PANE_ART_REQUESTS {
             let filler_token = ScopedArtFetch::new();
             filler_token.revoke();
             let (reply_tx, _reply_rx) = async_channel::bounded::<Vec<u8>>(1);
-            workers
+            if workers
                 .pane_tx
                 .try_send(ArtRequest {
                     source: ArtSource::Url("http://127.0.0.1:1/art".to_string()),
                     liveness: RequestLiveness::Scoped(filler_token),
                     reply_tx,
                 })
-                .expect("fill bounded pane lane");
+                .is_err()
+            {
+                break;
+            }
         }
         let _ = occupying; // the blocked request's bytes go nowhere
         PaneLaneSaturation {
@@ -1638,8 +1649,17 @@ mod tests {
     /// request at its first liveness check without touching the network.
     /// Together with [`scoped_fetch_revoked_mid_flight_drops_the_reply`]
     /// this pins both halves of the pre-fetch gate.
+    ///
+    /// Holds [`GENERATION_TEST_LOCK`] because the remote half lands in the
+    /// shared bounded pane lane: an unsynchronized send can steal a lane
+    /// slot mid-saturation from a lock-holding test and turn its exact
+    /// fill into a spurious `TrySendError::Full` (2026-09-10 local
+    /// reproduction).
     #[test]
     fn scoped_fetch_revoked_before_enqueue_never_runs() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let liveness = ScopedArtFetch::new();
         liveness.revoke();
 
@@ -1661,6 +1681,32 @@ mod tests {
         );
     }
 
+    /// Enqueue one pane-lane request, retrying while the bounded lane
+    /// refuses admission. The [`GENERATION_TEST_LOCK`] handoff does not
+    /// wait for the pane worker to resume and drain a predecessor test's
+    /// blocked fetch plus its revoked fillers (the saturation guards join
+    /// the fixture server, not the worker), so a lock successor can observe
+    /// a transiently full lane. A refusal closes the reply immediately —
+    /// distinguishable from admission, whose reply stays open — so retry
+    /// until the request is admitted or the deadline passes; `None` means
+    /// the lane never admitted the request, which is a real scheduling bug.
+    fn enqueue_admitted_pane_request(
+        url: String,
+        liveness: RequestLiveness,
+    ) -> Option<async_channel::Receiver<Vec<u8>>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let reply = enqueue_art_request(ArtSource::Url(url.clone()), liveness.clone());
+            if matches!(reply.try_recv(), Err(TryRecvError::Empty)) {
+                return Some(reply);
+            }
+            if std::time::Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// The worker must consult the scoped token again after the response
     /// arrives: a row revoked while its fetch was in flight gets a closed
     /// reply, so neither the widget callback nor the pane's cache probe
@@ -1670,7 +1716,12 @@ mod tests {
     #[test]
     fn scoped_fetch_revoked_mid_flight_drops_the_reply() {
         // Serializes against the lane-saturation tests: this request
-        // needs a free pane-lane slot to reach its fixture.
+        // needs a free pane-lane slot to reach its fixture. The lock
+        // alone does not guarantee one — the predecessor's lane may
+        // still be draining — so admission is retried (see
+        // [`enqueue_admitted_pane_request`]; the 2026-09-10 arm64 CI
+        // run refused the enqueue and burned the full wait budget on a
+        // request the worker would never see).
         let _guard = GENERATION_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1684,10 +1735,9 @@ mod tests {
                 .expect("release scoped response");
         });
 
-        let reply = enqueue_art_request(
-            ArtSource::Url(stale_url),
-            RequestLiveness::Scoped(liveness.clone()),
-        );
+        let reply =
+            enqueue_admitted_pane_request(stale_url, RequestLiveness::Scoped(liveness.clone()))
+                .expect("pane lane admitted the scoped request before the deadline");
         request_seen_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("production worker started scoped request");
