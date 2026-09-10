@@ -31,8 +31,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use lofty::config::WriteOptions;
-use lofty::file::TaggedFileExt;
-use lofty::tag::{Accessor, ItemKey, ItemValue, TagExt, TagItem};
+use lofty::file::{TaggedFile, TaggedFileExt};
+use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem};
 use uuid::Uuid;
 
 use super::root_authority::MountedMutationTarget;
@@ -838,21 +838,49 @@ fn write_tags_to(temp_path: &Path, target_label: &str, edits: &TagEdits) -> Resu
     let mut tagged_file = lofty::read_from_path(temp_path)
         .with_context(|| format!("Failed to read tags from {target_label}"))?;
 
-    // Get or create the primary tag for this file type. Files with no
-    // existing primary tag (e.g. a stripped MP3, or a FLAC without a Vorbis
-    // comment block) need a fresh tag of the file's primary type so new
-    // metadata can be authored on them — primary_tag_mut() alone never
-    // creates one.
+    let tag = ensure_primary_tag(&mut tagged_file, target_label)?;
+    apply_tag_edits(tag, edits)?;
+
+    // Save back to the temp file.
+    tag.save_to_path(temp_path, WriteOptions::default())
+        .with_context(|| format!("Failed to write tags to {target_label}"))?;
+
+    Ok(())
+}
+
+/// Get or create the primary tag for this file type. Files with no
+/// existing primary tag (e.g. a stripped MP3, or a FLAC without a Vorbis
+/// comment block) need a fresh tag of the file's primary type so new
+/// metadata can be authored on them — primary_tag_mut() alone never
+/// creates one.
+///
+/// Errors name the target by `target_label`, never by any path.
+fn ensure_primary_tag<'a>(
+    tagged_file: &'a mut TaggedFile,
+    target_label: &str,
+) -> Result<&'a mut Tag> {
     if tagged_file.primary_tag_mut().is_none() {
         let tag_type = tagged_file.primary_tag_type();
-        tagged_file.insert_tag(lofty::tag::Tag::new(tag_type));
+        tagged_file.insert_tag(Tag::new(tag_type));
     }
 
-    let tag = tagged_file.primary_tag_mut().ok_or_else(|| {
+    tagged_file.primary_tag_mut().ok_or_else(|| {
         anyhow::anyhow!("No primary tag found and cannot create one for {target_label}")
-    })?;
+    })
+}
 
-    // Apply edits — only touch fields that are Some.
+/// Apply every requested edit to `tag` — only touch fields that are Some —
+/// in the order the edits were declared, so field application order stays
+/// stable across refactors.
+fn apply_tag_edits(tag: &mut Tag, edits: &TagEdits) -> Result<()> {
+    apply_core_text_edits(tag, edits);
+    apply_contributor_and_genre_edits(tag, edits);
+    apply_number_edits(tag, edits)?;
+    apply_comment_edit(tag, edits);
+    Ok(())
+}
+
+fn apply_core_text_edits(tag: &mut Tag, edits: &TagEdits) {
     if let Some(ref title) = edits.title {
         if title.is_empty() {
             tag.remove_title();
@@ -876,7 +904,9 @@ fn write_tags_to(temp_path: &Path, target_label: &str, edits: &TagEdits) -> Resu
             tag.set_album(album.clone());
         }
     }
+}
 
+fn apply_contributor_and_genre_edits(tag: &mut Tag, edits: &TagEdits) {
     // The album-artist edit was previously declared and counted toward
     // `is_empty()`, but never applied — the file was rewritten and the field
     // silently ignored.
@@ -909,9 +939,11 @@ fn write_tags_to(temp_path: &Path, target_label: &str, edits: &TagEdits) -> Resu
             ));
         }
     }
+}
 
-    // These re-parse rather than trusting the caller: an unparseable value must
-    // fail the write, never vanish.
+/// These re-parse rather than trusting the caller: an unparseable value must
+/// fail the write, never vanish.
+fn apply_number_edits(tag: &mut Tag, edits: &TagEdits) -> Result<()> {
     match parse_tag_number("Year", edits.year.as_deref())? {
         NumberEdit::Unchanged => {}
         NumberEdit::Clear => tag.remove_key(ItemKey::Year),
@@ -935,6 +967,10 @@ fn write_tags_to(temp_path: &Path, target_label: &str, edits: &TagEdits) -> Resu
         NumberEdit::Set(disc) => tag.set_disk(disc),
     }
 
+    Ok(())
+}
+
+fn apply_comment_edit(tag: &mut Tag, edits: &TagEdits) {
     if let Some(ref comment) = edits.comment {
         if comment.is_empty() {
             tag.remove_comment();
@@ -942,12 +978,6 @@ fn write_tags_to(temp_path: &Path, target_label: &str, edits: &TagEdits) -> Resu
             tag.set_comment(comment.clone());
         }
     }
-
-    // Save back to the temp file.
-    tag.save_to_path(temp_path, WriteOptions::default())
-        .with_context(|| format!("Failed to write tags to {target_label}"))?;
-
-    Ok(())
 }
 
 #[cfg(test)]
