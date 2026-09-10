@@ -1886,6 +1886,11 @@ fn assert_publisher_binds_the_evaluation_to_the_announcing_head(workflow: &serde
         "the evaluated head must be the announcing run's head commit"
     );
     assert!(
+        publish["env"]["EVENT_RUN_ID"].as_str() == Some("${{ github.event.workflow_run.id }}"),
+        "a completion event without a head commit must allow recovering it from the \
+         announcing run record, or a dead refresh would leave a stale verdict standing"
+    );
+    assert!(
         !publish["run"]
             .as_str()
             .unwrap_or_default()
