@@ -3792,7 +3792,7 @@ fn request_object_deletion(handle: windows_sys::Win32::Foundation::HANDLE) -> io
         SetFileInformationByHandle(
             handle,
             FileDispositionInfoEx,
-            &request_ex as *const _ as *const core::ffi::c_void,
+            core::ptr::from_ref(&request_ex).cast::<core::ffi::c_void>(),
             size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
         )
     };
@@ -3820,7 +3820,7 @@ fn request_object_deletion(handle: windows_sys::Win32::Foundation::HANDLE) -> io
         SetFileInformationByHandle(
             handle,
             FileDispositionInfo,
-            &request_basic as *const _ as *const core::ffi::c_void,
+            core::ptr::from_ref(&request_basic).cast::<core::ffi::c_void>(),
             size_of::<FILE_DISPOSITION_INFO>() as u32,
         )
     };
