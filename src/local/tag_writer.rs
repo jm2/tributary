@@ -704,7 +704,7 @@ fn atomic_tag_replacement(
     let mut source = source;
     #[cfg(target_os = "windows")]
     let source_dacl = WindowsDacl::read_from(&source)
-        .with_context(|| format!("Failed to read the Windows DACL of {target_label}",))?;
+        .with_context(|| format!("Failed to read the Windows DACL of {target_label}"))?;
 
     let (mut temp, destination) = TempFile::create_beside(target_path, target_label)?;
     #[cfg(target_os = "windows")]
