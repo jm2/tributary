@@ -51,7 +51,7 @@ the download/cache engine must satisfy.
 | Identity | Cache entries use the same `SourceId` + `TrackId` shape as live playback. The download engine adopts the live per-source `MediaKey`; it never invents a new identity kind. | New persisted identifier types, new schema migrations, on-disk naming conventions beyond `task.md` and the credential-boundary section. |
 | Authority | Every cached media entry remains owned by its source. The source registry's exact-snapshot capability gates download admission, reconciliation, and retirement. A committed snapshot renders offline without a live registry round-trip; disconnect and refresh never gate playback of committed bytes. No offline bypass of the registry for admission. | Concurrent access contracts for the registry's offline catalogue; specific read-side materialisation policies. |
 | Download jobs | A bounded resumable job model keyed by exact `(SourceId, TrackId)` with a durable, `fsync`'d progress journal, entity validators (`If-Range`) on every range request, opaque server caps, deterministic cancellation, and structured redacted failures. Job state survives restart; it is never memory-only. | Concrete worker pool scheduling, threading model, runtime selection, telemetry. |
-| Storage | Verify-then-publish: the temp file lives in the same directory (same filesystem) as its final cache path, integrity is verified on the temp file before any rename, and publish is an atomic rename with a parent-directory `fsync`. The final path is snapshot-scoped, so a refresh publishes a sibling instead of overwriting a predecessor's bytes; a journaled publish intent makes the rename-to-commit window crash-recoverable and is the durable delete owner for a file published without a row. Cross-filesystem publish is refused at admission, never emulated with copy+sync+delete. A `tracks` row may link to a cache path only when integrity passed and the file is current. | Database migrations, schema, table layout, index choice, cache placement, encryption. |
+| Storage | Verify-then-publish: the temp file lives in the same directory (same filesystem) as its final cache path, integrity is verified on the temp file before any rename, and publish is an atomic rename with a parent-directory `fsync`. The final path is snapshot-scoped, so a refresh publishes a sibling instead of overwriting a predecessor's bytes; a journaled publish intent makes the rename-to-commit window crash-recoverable, and a durable delete intent — the publish intent itself, or the `fsync`'d terminal-verdict record that supersedes it on a post-rename terminal transition — is the delete owner for a file published without a row. Cross-filesystem publish is refused at admission, never emulated with copy+sync+delete. A `tracks` row may link to a cache path only when integrity passed and the file is current. | Database migrations, schema, table layout, index choice, cache placement, encryption. |
 | Integrity | SHA-256 is computed over the bytes on disk and compared against an expected digest whose provenance is declared per backend (capability matrix below). A backend that advertises no digest is verified by independent double-fetch; the absence of any verification path is terminal, never a silent pass. Verification completes before publish. | Hashing algorithm extension, content-defined chunking, content-addressable stores. |
 | Capabilities | The remote source owns a default-deny `OfflineSnapshot` capability. Only the same set of backends that opt into live `ServerPlaylist`-style read authority may opt in. Radio-Browser, removable, external-file, and built-in local sources cannot. | Adapter-specific download strategies beyond HTTP(S) `Range` and Subsonic/Jellyfin/Plex/DAAP download endpoints. |
 | Credentials | Cached media may carry no credential, password, signed URL, or session cookie in metadata, file name, sidecar, log, or GTK-visible row. Bearer URLs are minted only by the existing exact-origin proxy and consumed through the same opaque revocable ticket used by live playback. | New credential storage paths, new vault tables, package or build-credential integration, distribution-time-key loading. |
@@ -320,7 +320,9 @@ cannot see: the rename happened and the step-6 commit did not — whether
 by a crash between the two, or by a post-rename terminal transition
 interrupted before its cleanup unlink. The temp file no longer exists to
 resume from, and the final file exists without a cache row. The contract
-closes that window with a persisted publish intent:
+closes that window with a persisted publish intent, a verdict-first
+terminal rule, and a crash-point matrix enumerating every kill point in
+the window and its single recovery resolution:
 
 1. **The intent precedes the rename.** The last journal record written
    before the rename is an `fsync`'d publish-intent record naming the
@@ -334,22 +336,44 @@ closes that window with a persisted publish intent:
    file is cleaned up by the job's ordinary exit rules. A terminal state
    reached after the rename may not clear the intent on its own; the
    published final file would outlive the only record that explains it.
-   That transition must first unlink the published file through the same
-   validated cache-unlink path eviction uses — idempotently — and record
-   the terminal state and the intent-clear only after the unlink
-   succeeds. If the process dies before that unlink completes, the intent
-   deliberately survives: it is the durable delete owner that startup
-   recovery uses to finish the cleanup.
+   That transition is itself journalled, in verdict-first order: it
+   first appends an `fsync`'d terminal-verdict record — naming the
+   terminal state, its redacted reason, the published final path, and a
+   durable delete intent for that path — and only then touches the
+   filesystem. The unlink of the published file goes through the same
+   validated cache-unlink path eviction uses, idempotently, and the
+   intent-clear is recorded only after the unlink succeeds. A step-6
+   commit that fails after the rename is the same post-rename failure
+   under the same rule: the verdict is durable before any cleanup runs.
+   The verdict record survives every later crash: it is the durable
+   delete owner that startup recovery consults and preserves until the
+   cleanup it owns completes. A crash before the verdict record is
+   durable is the ordinary journal-admission window every state
+   transition shares — no destructive step has run, so the job resolves
+   by the same rules the crash-point matrix below assigns to a rename
+   with no recorded verdict, and a licence or capability revocation
+   stays independently visible to the adoption guard through the
+   registry's own durable state.
 3. **Startup resolves a pending intent by inspection.** A job whose journal
    ends in a publish intent is resolved by examining the intent's final
-   path — but only a publication-eligible job may adopt. Adoption
-   completes step 6 only when the journaled state still permits
-   publication (`Committing`); a job whose durable state records `Failed`,
-   `Cancelled`, a superseding verdict, or a licence or capability revoked
-   between the rename and the restart is never adopted as playable. Its
-   intent resolves as recorded-file cleanup — idempotent unlink of the
-   published file, then the intent clear, with the terminal state
-   standing. For an eligible job:
+   path — but only a publication-eligible job may adopt, and a matching
+   digest alone is never authorization. Recovery consults the
+   terminal-verdict record first: a journal that carries a post-rename
+   verdict — `Failed`, `Cancelled`, a superseding verdict, or a licence
+   or capability revocation — together with a pending delete intent is
+   never adopted as playable, whatever the surrounding job state claims.
+   Recovery completes the interrupted cleanup that record owns —
+   idempotent unlink of the published file if it survives, then the
+   intent clear — and preserves the verdict until the intent-clear
+   lands, with the terminal state standing. Adoption completes step 6
+   only when every gate holds: no terminal verdict is recorded, the
+   journaled state still permits publication (`Committing`), the job's
+   `capability_epoch` is still the source's accepted generation at
+   restart — a stale epoch retires the job, never adopts it — and no
+   licence or capability revocation is visible in the registry's durable
+   state. A job failing any gate resolves as recorded-file cleanup —
+   idempotent unlink of the published file, then the intent clear, with
+   the terminal state standing. For an eligible job:
    - The file is present and its SHA-256 matches the journaled digest: the
      rename happened. The engine completes step 6 — inserting the cache
      row; the `(source_key, track_key, snapshot_key)` key makes the insert
@@ -367,6 +391,23 @@ closes that window with a persisted publish intent:
    per-track quota as any committed snapshot, and its lifetime ends at the
    post-rename terminal transition or the first recovery pass, whichever
    comes first.
+5. **The crash-point matrix.** Every kill point in the publish window has
+   exactly one durable observable state and one recovery resolution. The
+   matrix is normative: an implementation may not introduce a resolution
+   that is not a row of this table, and the verdict-first ordering of
+   rule 2 is what keeps the last three rows unreachable by any
+   destructive step.
+
+   | Crash point | Durable state at restart | Startup resolution | Invariant |
+   | --- | --- | --- | --- |
+   | Verify passed, publish-intent record not yet durable | No intent; temp present; final absent; job pre-`Committing`. | Ordinary journal recovery; the job proceeds from its journaled state. | Nothing was published; no recovery protocol engages. |
+   | Intent `fsync`'d, before the rename | Intent present; temp present; final absent; job `Committing`. | File absent → clear the intent; resume or restart per the journal. | No publish without a commit; temp resume intact. |
+   | Rename applied, before the step-6 commit | Intent present; final present with the intent's digest; temp gone; job `Committing`; no verdict record. | Adoption path: digest match → idempotent row insert completes step 6; intent cleared. | A row exists only after a verified rename; no orphan beyond one pass. |
+   | Crash during the step-6 commit (row inserted, intent not yet cleared) | Intent present; row present; final present. | Re-run the adoption resolution: the insert is an idempotent no-op; clear the intent. | Completion is idempotent. |
+   | Post-rename terminal decided, verdict record not yet `fsync`'d | Indistinguishable from the rename-applied row — no durable verdict exists. | Ordinary adoption gates, including the registry's durable licence/capability state and the `capability_epoch` check, which independently refuse adoption for a revocation or stale generation. | The journal-admission window every state transition shares; verdict-first ordering means no destructive step has run. |
+   | Verdict record `fsync`'d, before the unlink | Intent present; verdict present; final present. | Cleanup path: never adopt; idempotent unlink; then intent clear. | The verdict is durable before any destructive step. |
+   | Unlink done, intent-clear not yet recorded | Intent present; verdict present; final absent. | Cleanup path: never adopt; clear the intent. | The verdict outlives the file; no resurrection. |
+   | Pre-rename terminal decided, intent-clear not yet recorded | Intent present; temp present; final absent. | File absent → clear the intent; continue per the journal; the temp is cleaned by the ordinary exit rules. | The decision had not reached the journal; no destructive effect preceded its durability. |
 
 Restart recovery and the staged delete of
 [Eviction](#cancellation-quota-and-eviction) are the two crash-recovery
@@ -563,10 +604,13 @@ policy:
    same atomicity footprint as a `QuotaExceeded` failure: temp file
    unlinked, no cache row created. A cancel that lands in the
    rename-to-commit window is a post-rename terminal state under the
-   publish-intent protocol: the published file is unlinked before the
-   `Cancelled` state is recorded, or the surviving intent drives startup
-   recovery to finish that unlink. A cancelled job is never adopted as a
-   playable row.
+   publish-intent protocol: the `Cancelled` verdict — with its durable
+   delete intent — is journalled and `fsync`'d first, the published file
+   is unlinked through the validated cache-unlink path second, and the
+   intent-clear is recorded last. A crash anywhere in that sequence
+   leaves the verdict record as the durable delete owner that startup
+   recovery consults to finish the cleanup. A cancelled job is never
+   adopted as a playable row.
 
 ## UI contract
 
@@ -606,7 +650,7 @@ This contract fixes the following failure cases:
 | Radio-Browser adapter receives an offline request | `Err(Denied)` from the capability; no network work. |
 | Local file is requested for offline | `None` from the capability; no offline layer is created; the file is already local. |
 | Crash between the publish rename and the row commit | Startup recovery resolves the journaled publish intent: adopt (complete the commit) only for a publication-eligible job, otherwise unlink. Never a playable row without verified bytes, never a stranded orphan beyond one recovery pass. |
-| Failure, cancellation, or supersession lands after the publish rename | Post-rename terminal rule: the published file is unlinked through the validated cache-unlink path before the terminal state is recorded; a crash before that unlink leaves the intent in place as the durable delete owner and startup recovery finishes the cleanup. |
+| Failure, cancellation, supersession, or a commit error lands after the publish rename | Post-rename terminal rule, verdict-first: the terminal verdict and its delete intent are journalled and `fsync`'d before any destructive step; the published file is then unlinked through the validated cache-unlink path; the intent is cleared last. A crash before the unlink leaves the verdict record in place as the durable delete owner; startup recovery consults it, never adopts the job as playable, and finishes the cleanup. |
 | Licence or capability revoked between the rename and the commit | The job is not publication-eligible: the pending intent resolves to recorded-file cleanup, never adoption. No playable row. |
 | Crash between a delete tombstone and its unlink | The row stays non-playable throughout; the recovery pass re-attempts the idempotent unlink for tombstoned rows that still record a path. |
 
@@ -626,13 +670,16 @@ implementation record. The migration:
    snapshot exists independent of any local `tracks` row.
 2. Creates the download-job table carrying the full job model — including
    the journaled offset, the captured `resume_validator`, the pending
-   publish intent, and the digest provenance in use — so that job state is
+   publish intent, the terminal-verdict record with its delete intent,
+   and the digest provenance in use — so that job state is
    durable across process restarts. No offline job is memory-only.
 3. Persists no row that points at a missing or partial file. Promotion to a
    cached row is exactly the moment the step-6 commit (of Atomic storage)
-   succeeds — or a pending publish intent is idempotently adopted at
-   startup, which completes that same step. The verified rename (step 5)
-   publishes the bytes only; it creates no row.
+   succeeds — or a pending publish intent passes every adoption gate at
+   startup (no terminal verdict, `Committing`, current
+   `capability_epoch`, no revocation) and is idempotently adopted, which
+   completes that same step. The verified rename (step 5) publishes the
+   bytes only; it creates no row.
 4. Is reversible in the same way as migration 13: any error restores the
    complete predecessor schema and data so the upgrade remains retryable.
 
@@ -647,13 +694,13 @@ Each slice lands with its own focused regression suite. The slices are:
 | Identity | Same `SourceId` + `TrackId` semantics as live; no second identity kind minted. Derived cache keys: fixed hex charset and width, no separators or traversal, byte-exact identifier input. |
 | Capability | Default-deny behaviour for adapters that opt out; Subsonic/Jellyfin/Plex/DAAP opt in. |
 | Resumable job | Bounded, `If-Range`-validated range requests; `200`/`412` restarts from zero; journal survives crash (offset truncation, last-segment digest re-check); no-validator jobs restart only. |
-| Atomic storage | Same-directory temp reservation; verify-before-publish ordering; same-filesystem rename with parent-directory `fsync`; cross-filesystem publish refused; publish-intent recovery across the kill points between intent, rename, and commit. |
+| Atomic storage | Same-directory temp reservation; verify-before-publish ordering; same-filesystem rename with parent-directory `fsync`; cross-filesystem publish refused; publish-intent recovery across every kill point of the crash-point matrix, including the verdict-first post-rename terminal transition and its adoption gates. |
 | Digest provenance | Advertised digest compared exactly; double-fetch fallback equality; no-tier backends fail `IntegrityUnverifiable` before publish. |
 | Credential boundary | No credential in metadata, file name, sidecar, log, or GTK row. Isolation scope per `task-remediation-2026-07.md` P1.6; redaction mechanics per P1.4. |
 | Redirect policy | Per `task-remediation-2026-07.md` P1.4 matrix; HTTPS-only, no `Referer`, no HTTPS→HTTP downgrade. |
 | Licensing | Default-deny; revocation retires rows but preserves files. |
 | Reconciliation | Refresh creates a sibling with its own snapshot-scoped path; no in-place mutation; staged-delete unlink with idempotent recovery. |
-| Cancellation | Lifecycle supersession cancels in-flight jobs. |
+| Cancellation | Lifecycle supersession cancels in-flight jobs; a cancel landing in the rename-to-commit window follows the verdict-first post-rename terminal rule and is never adopted as playable. |
 | Quota and eviction | Eviction walks sources oldest-cache-first, newest-first within a source; staged tombstone-then-unlink; recovery completes interrupted deletes. |
 | UI | Credential-free GTK rows; localised progress and failure. |
 
