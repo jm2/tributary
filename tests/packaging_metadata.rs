@@ -1747,7 +1747,8 @@ fn bot_review_gate_publisher_publishes_the_required_context_from_default_branch_
     // checkout, no other actions.
     let script = bot_review_gate_run_script(&workflow);
     assert_publisher_publishes_the_verdict_at_the_evaluated_head(&script);
-    assert_publisher_publishes_only_under_the_gate_app_identity(&workflow, &script);
+    assert_publisher_mints_the_gate_app_token(&workflow);
+    assert_publication_uses_the_minted_gate_token(&workflow, &script);
 }
 
 // The publisher is the only writer of the required context, so it must run
@@ -1809,13 +1810,9 @@ fn assert_publisher_declares_exactly_two_read_only_grants(workflow: &serde_yaml:
 }
 
 // The required context must be bound to an identity no pull-request job can
-// produce. The publisher mints the dedicated gate-publisher App token with
-// the pinned GitHub-org action and publishes exclusively under it, refusing
-// to publish when that identity is missing.
-fn assert_publisher_publishes_only_under_the_gate_app_identity(
-    workflow: &serde_yaml::Value,
-    script: &str,
-) {
+// produce. The publisher's first step mints the dedicated gate-publisher App
+// token with the pinned GitHub-org action.
+fn assert_publisher_mints_the_gate_app_token(workflow: &serde_yaml::Value) {
     let steps = workflow["jobs"]["publish"]["steps"]
         .as_sequence()
         .expect("publisher steps must be a sequence");
@@ -1845,6 +1842,16 @@ fn assert_publisher_publishes_only_under_the_gate_app_identity(
         Some("write"),
         "the minted token must carry exactly the checks:write publication grant"
     );
+}
+
+// Publication happens exclusively under the minted gate-publisher App token,
+// and the publisher refuses to publish anything when that identity is
+// missing — a verdict from the shared GitHub Actions integration would be
+// forgeable by any pull-request-controlled job.
+fn assert_publication_uses_the_minted_gate_token(workflow: &serde_yaml::Value, script: &str) {
+    let steps = workflow["jobs"]["publish"]["steps"]
+        .as_sequence()
+        .expect("publisher steps must be a sequence");
     let publish = steps.get(1).expect("the publication step must exist");
     assert_eq!(
         publish["env"]["GATE_TOKEN"].as_str(),
