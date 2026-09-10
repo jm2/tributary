@@ -40,9 +40,12 @@ use lofty::file::{TaggedFile, TaggedFileExt};
 use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem};
 use uuid::Uuid;
 
-use super::root_authority::{
-    object_identity, MountedMutationCommit, MountedMutationTarget, ObjectIdentity,
-};
+use super::root_authority::{MountedMutationCommit, MountedMutationTarget, ObjectIdentity};
+// Only the unix anchored staging flow captures a staged object identity;
+// the Windows and fallback authorities prove staging identity from the
+// pathname-side commit, so the helper import must not gate their builds.
+#[cfg(unix)]
+use super::root_authority::object_identity;
 
 /// Reserved filename prefix for the private sibling used by atomic tag writes.
 const TAG_WRITE_TEMP_PREFIX: &str = ".tributary-tag-";
