@@ -44,7 +44,23 @@ name: Bot review gate publisher
 #      dismissal time from the review timeline: a dismissal mutates the
 #      dismissed review in place and keeps its database ID, so review IDs
 #      alone cannot order evidence around a dismissal, and reviews
-#      submitted before the dismissal are cleared with it.
+#      submitted before the dismissal are cleared with it;
+#   4. a bot reviewer has a review still in PENDING state: a pending review
+#      is an attempt in flight, and while it exists none of the author's
+#      earlier conclusions count at this head — even an approval already
+#      bound to the exact head stops counting until the pending attempt is
+#      submitted or discarded, and the block is bound to the attempt's
+#      database ID and its commit so the report names exactly what is in
+#      flight;
+#   5. a trusted expected reviewer has no review on the pull request at
+#      all. In-scope is fixed by enumeration, not observation: the
+#      EXPECTED_BOT_REVIEWERS list below (default-branch content, grown only
+#      by the reviewed change that enables each bot) names every review
+#      integration the repository requires on every pull request, and a
+#      listed identity with zero reviews — an outage, a rate limit, a
+#      rename — fails closed exactly like a rejected review, threads or no
+#      threads. The only sanctioned waiver is the operator-documented
+#      substitution below.
 #
 # Semantics:
 #   * Only explicit thread resolution or a formal review dismissal clears a
@@ -62,7 +78,16 @@ name: Bot review gate publisher
 #     are re-derived through the API from the announcing run's exact commit,
 #     and each candidate's record is the authority for its base branch and
 #     head.
-#   * Exactly ONE verdict is published per announced head. Check runs attach
+#   * Exactly ONE verdict is published per announced head — as ONE check
+#     run: the refresh OPENS the required context as an in-progress check
+#     run at the announced head before any discovery or evaluation, and
+#     every terminal path UPDATES that same run to its conclusion. The
+#     latest run under the required name decides mergeability, so the
+#     pending run immediately supersedes any earlier green verdict and
+#     keeps the merge blocked for the whole refresh; a refresh that dies
+#     mid-flight leaves the pending run standing (a blocked merge and the
+#     failed job as the re-run signal), never a resurrected stale green.
+#     Check runs attach
 #     to commits, not pull requests, so two open main pull requests sharing
 #     one head commit would otherwise publish competing verdicts under the
 #     one required context name — and the last-published verdict would decide
@@ -104,8 +129,15 @@ name: Bot review gate publisher
 # Security: strictly read-only over repository content. The workflow never
 # checks out any commit, holds no third-party action except the pinned
 # GitHub-org app-token minter, and queries only the pull requests the API
-# associates with the announcing run's commit — plus the repository-owned
-# substitution policy file (below), read from `main`.
+# associates with the announcing run's commit (every page of that
+# association — the endpoint pages, and dropping later pages would silently
+# shrink the candidate set) — plus the repository-owned
+# substitution policy file (below), read from `main`. The App private key
+# that mints the publishing identity is reachable only through this job's
+# protected environment (see the job block): pull-request-controlled
+# workflows — which receive repository secrets on same-repository pull
+# requests — can neither read environment-scoped secrets nor pass the
+# environment's main-only branch policy.
 #
 # The required context carries an identity no pull-request-controlled job
 # can produce. Every Actions workflow job — including anything a pull
@@ -155,6 +187,16 @@ jobs:
   publish:
     name: Bot Review Gate Publisher
     runs-on: ubuntu-latest
+    # The publishing key must be reachable ONLY from trusted default-branch
+    # execution. The gate-publisher App credentials are stored exclusively as
+    # secrets of this GitHub environment — never also as repository-level
+    # secrets, which every same-repository pull-request workflow can read —
+    # and the environment itself is locked down on the repository side with
+    # a protected-branch deployment policy restricted to `main` (and no
+    # required reviewers, which would strand the automation). A
+    # pull-request-controlled workflow that named this environment would
+    # fail its branch policy and get no secrets.
+    environment: bot-review-gate-publisher
     steps:
       # The single identity allowed to publish the required context. The
       # action is GitHub-org-owned, pinned to a full commit SHA, and
@@ -178,27 +220,45 @@ jobs:
           GATE_TOKEN: ${{ steps.gate_publisher_token.outputs.token }}
           EVENT_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           EVENT_RUN_ID: ${{ github.event.workflow_run.id }}
+          # The trusted expected-reviewer set, fixed by enumeration (never by
+          # observation): every review-posting integration the repository
+          # requires on every pull request, listed by exact bot login and
+          # matched case-insensitively with or without GitHub's "[bot]"
+          # suffix. This list is default-branch content: it grows only by the
+          # reviewed change that enables the bot. A listed identity with no
+          # review on the pull request fails the gate — an outage, a rate
+          # limit, or a rename is unproven, never clean — waivable only by
+          # the operator-documented substitution below.
+          EXPECTED_BOT_REVIEWERS: "coderabbitai,chatgpt-codex-connector"
         run: |
           set -euo pipefail
 
           # ── Publication bound to the evaluated head ──────────────────────
-          # The verdict is published as a completed check-run at the exact
-          # evaluated commit, under the context name the live `main` ruleset
-          # requires, authenticated as the gate-publisher App so the check
-          # run is authored by that App's integration — never by the shared
+          # The verdict is published as ONE check run at the exact evaluated
+          # commit, under the context name the live `main` ruleset requires,
+          # authenticated as the gate-publisher App so the check run is
+          # authored by that App's integration — never by the shared
           # GitHub Actions integration a pull-request job could publish
-          # under. It is called only from the driver below — the aggregated
-          # failure branch, the aggregated success branch, and the three
+          # under. The refresh OPENS the context as an in-progress check
+          # run at the announced head before any discovery or evaluation
+          # (a pending required check immediately supersedes any earlier
+          # green verdict and blocks the merge for the whole refresh), and
+          # every terminal path UPDATES that same run to its conclusion —
+          # so no evaluation window and no dead refresh can leave an old
+          # verdict standing. The functions are called only from the
+          # driver — the single in-progress start, the aggregated failure
+          # branch, the aggregated success branch, and the three
           # discovery-level supersession paths (discovery failure, no
           # candidate, all candidates skipped) — so one announced head can
           # never carry competing verdicts: every refresh ends in exactly
           # one publication at the head, green only when every candidate is
           # clean.
-          publish_gate_check_run() {
+          gate_context="Bot Review Gate"
+          gate_check_run_id=""
+          gate_check_run_head=""
+
+          start_gate_check_run() {
             evaluated_head="$1"
-            conclusion="$2"
-            title="$3"
-            summary="$4"
             # Defense in depth against a future refactor dropping the mint
             # step: publishing under the shared workflow identity would
             # reopen the forged-context hole, so a missing gate token must
@@ -208,9 +268,42 @@ jobs:
               echo "The gate-publisher App token is missing; refusing to publish the required context under any shared identity. The head's verdict keeps its previous value and the failed job is the re-run signal." >&2
               return 1
             fi
-            if ! GH_TOKEN="${GATE_TOKEN}" gh api "repos/${GITHUB_REPOSITORY}/check-runs" \
-                -F name="Bot Review Gate" \
+            if ! gate_check_run_id="$(GH_TOKEN="${GATE_TOKEN}" gh api "repos/${GITHUB_REPOSITORY}/check-runs" \
+                -F name="${gate_context}" \
                 -F head_sha="${evaluated_head}" \
+                -F status=in_progress \
+                -F output.title="Bot Review Gate: evidence refresh in progress" \
+                -F output.summary="A refresh is re-evaluating bot-review evidence at this commit. This pending check supersedes the previous verdict until the refresh finishes, so no earlier result is mergeable while evidence is being re-read." \
+                --jq '.id' 2>/dev/null)" \
+              || [ -z "${gate_check_run_id}" ]; then
+              echo "Check-run publication failed: the in-progress refresh check could not be created; the head's verdict keeps its previous value and the failed job is the re-run signal." >&2
+              return 1
+            fi
+            gate_check_run_head="${evaluated_head}"
+          }
+
+          finish_gate_check_run() {
+            evaluated_head="$1"
+            conclusion="$2"
+            title="$3"
+            summary="$4"
+            if [ -z "${GATE_TOKEN:-}" ]; then
+              echo "The gate-publisher App token is missing; refusing to publish the required context under any shared identity. The head's verdict keeps its previous value and the failed job is the re-run signal." >&2
+              return 1
+            fi
+            if [ -z "${gate_check_run_id}" ]; then
+              echo "Check-run publication failed: no in-progress check run exists to finalize; the head's verdict keeps its previous value and the failed job is the re-run signal." >&2
+              return 1
+            fi
+            if [ "${gate_check_run_head}" != "${evaluated_head}" ]; then
+              echo "Check-run publication failed: the in-progress check was opened at ${gate_check_run_head}, not ${evaluated_head}; refusing to finalize it at a different head." >&2
+              return 1
+            fi
+            # A check run cannot move to another commit after creation, so
+            # finalizing at a different head is impossible by construction —
+            # the guard above refuses the impossible instead of silently
+            # mis-reporting. The update carries only the terminal state.
+            if ! GH_TOKEN="${GATE_TOKEN}" gh api -X PATCH "repos/${GITHUB_REPOSITORY}/check-runs/${gate_check_run_id}" \
                 -F status=completed \
                 -F conclusion="${conclusion}" \
                 -F output.title="${title}" \
@@ -513,7 +606,7 @@ jobs:
             def bot_review_violations($head; $dismissals):
               [ .[]
                 | .data.repository.pullRequest.reviews.nodes[]
-                | select(.state == "CHANGES_REQUESTED" or .state == "APPROVED" or .state == "COMMENTED" or .state == "DISMISSED")
+                | select(.state == "CHANGES_REQUESTED" or .state == "APPROVED" or .state == "COMMENTED" or .state == "DISMISSED" or .state == "PENDING")
                 | select(is_bot)
                 | {
                     author: (.author.login // ""),
@@ -524,10 +617,23 @@ jobs:
                     url: .url
                   } ]
               | group_by(.author)[]
-              | (sort_by(.database_id) | last) as $latest
-              | (map(select(.state == "CHANGES_REQUESTED"
-                     or .state == "APPROVED"
-                     or .state == "DISMISSED"))
+              # A PENDING review is an attempt in flight: while one exists
+              # (at most one per author per pull request), none of the
+              # author's earlier conclusions count at this head — the
+              # pending attempt may overturn them — so the terminal-state
+              # analysis below runs on the author's submitted reviews only
+              # and the pending attempt itself is reported as its own
+              # blocking violation, bound to the attempt's commit and
+              # database ID. A pending attempt at any commit — the
+              # evaluated head included — blocks: only a submitted or
+              # discarded attempt lets the author's evidence count again.
+              | (map(select(.state == "PENDING")) | sort_by(.database_id) | last) as $pending
+              | (map(select(.state != "PENDING"))) as $terminal
+              | ($terminal | sort_by(.database_id) | last) as $latest
+              | ($terminal
+                 | map(select(.state == "CHANGES_REQUESTED"
+                        or .state == "APPROVED"
+                        or .state == "DISMISSED"))
                  | sort_by(.database_id)
                  | last) as $decisive
               | ($decisive.database_id as $dismissed_id
@@ -541,26 +647,91 @@ jobs:
                                      and (.submitted_at > $dismissed_at)))))
                  | sort_by(.submitted_at, .database_id)
                  | last) as $after_decisive
-              | if $decisive.state == "CHANGES_REQUESTED" then
-                  [ { reason: "outstanding_bot_change_request",
-                      author: $decisive.author,
-                      review_head: $decisive.review_head,
-                      url: $decisive.url } ]
-                elif $decisive.state == "DISMISSED"
-                  and $dismissed_at != ""
-                  and (($after_decisive.review_head // $head) == $head)
-                then []
-                elif $latest.review_head != $head then
-                  [ { reason: "stale_bot_review_evidence",
-                      author: $latest.author,
-                      state: $latest.state,
-                      review_head: $latest.review_head,
+              | ( if ($decisive == null) or ($latest == null) then
+                    # The author has no submitted review at all (their only
+                    # review, if any, is the pending attempt above): the
+                    # terminal-state rules have nothing to decide, and the
+                    # absence itself is reported by the expected-reviewer
+                    # check below.
+                    []
+                  elif $decisive.state == "CHANGES_REQUESTED" then
+                    [ { reason: "outstanding_bot_change_request",
+                        author: $decisive.author,
+                        review_head: $decisive.review_head,
+                        url: $decisive.url } ]
+                  elif $decisive.state == "DISMISSED"
+                    and $dismissed_at != ""
+                    and (($after_decisive.review_head // $head) == $head)
+                  then []
+                  elif $latest.review_head != $head then
+                    [ { reason: "stale_bot_review_evidence",
+                        author: $latest.author,
+                        state: $latest.state,
+                        review_head: $latest.review_head,
+                        expected_head: $head,
+                        url: $latest.url } ]
+                  else []
+                  end )
+                + ( if $pending == null then []
+                    else [ { reason: "pending_bot_review",
+                             author: $pending.author,
+                             review_head: ($pending.review_head // "none"),
+                             database_id: $pending.database_id,
+                             url: $pending.url } ]
+                    end );
+
+            # Logins are matched case-insensitively, with GitHub's "[bot]"
+            # suffix stripped from both sides: the expected list carries the
+            # plain integration login, while the API may surface it with or
+            # without the suffix.
+            def normalize_login:
+              ascii_downcase | sub("\\[bot\\]$"; "");
+
+            # The trusted expected-reviewer set from the publisher's
+            # EXPECTED_BOT_REVIEWERS: split on commas, trimmed, suffix- and
+            # case-normalized, empties dropped. An EMPTY configured set is a
+            # configuration failure, never a vacuous pass — with nobody
+            # expected the all-green policy would be unenforceable — so it
+            # emits its own non-waivable blocking violation.
+            def expected_reviewers:
+              [ ($expected | split(","))
+                | .[]
+                | gsub("^\\s+|\\s+$"; "")
+                | select(length > 0)
+                | normalize_login ];
+
+            # Every expected reviewer with NO review on the pull request —
+            # any state, pending included, counts as present for this check;
+            # a pending-only reviewer is reported by the pending rule above,
+            # and a submitted-reviewer staleness by the decisive rules —
+            # yields the same waivable stale-evidence violation the
+            # substitution contract knows how to waive. Absence of a
+            # required reviewer is unproven, never clean: an outage, a rate
+            # limit, or a rename fails closed exactly like a rejected
+            # review, threads or no threads.
+            def expected_reviewer_violations($head):
+              expected_reviewers as $expected_set
+              | [ $reviews[].data.repository.pullRequest.reviews.nodes[]
+                  | ((.author.login // "") | normalize_login) ] as $reviewed
+              | if ($expected_set | length) == 0 then
+                  [ { reason: "trusted_reviewer_set_empty",
+                      author: "(configuration)",
+                      state: "no trusted reviewers configured",
+                      review_head: "none",
                       expected_head: $head,
-                      url: $latest.url } ]
-                else []
+                      url: "EXPECTED_BOT_REVIEWERS in bot-review-gate-publisher.yml" } ]
+                else
+                  [ $expected_set[]
+                    | select($reviewed | index(.) | not)
+                    | { reason: "stale_bot_review_evidence",
+                        author: .,
+                        state: "no review submitted",
+                        review_head: "none",
+                        expected_head: $head,
+                        url: "trusted reviewer set in bot-review-gate-publisher.yml (EXPECTED_BOT_REVIEWERS)" } ]
                 end;
 
-            # The substitution contract presupposes that a policy-listed
+
             # reviewer's missing evidence manifests as a waivable
             # stale-evidence violation. bot_review_violations can only
             # derive violations from reviews that exist, so a listed
