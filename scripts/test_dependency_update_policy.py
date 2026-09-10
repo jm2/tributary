@@ -1028,6 +1028,84 @@ class FuzzLockPolicyTests(unittest.TestCase):
                 [sync_fuzz_lock.Transition("lofty", "0.24.0", "0.25.1")],
             )
 
+    def test_bounded_repair_rejects_unused_unification_replacement(self):
+        #lizard forgives
+        # The removed shared 1.0.0 record is unused: no before edge targets
+        # it, and the upgraded facade merely gains a new shared 2.0.0
+        # dependency. A newly reachable survivor that only shares the removed
+        # record's name and source does not authorize the removal — no edge
+        # rebind consumes the mapping — so the proof must fail closed.
+        base = lock(
+            ["facade 1.0.0"],
+            {"facade": ["1.0.0"], "shared": ["1.0.0"]},
+        )
+        stale_fuzz = lock(
+            ["facade 1.0.0"],
+            {"facade": ["1.0.0"], "shared": ["1.0.0"]},
+        )
+        current = lock(
+            ["facade 2.0.0"],
+            {"facade": ["2.0.0"], "shared": ["2.0.0"]},
+        )
+        current["package"][1]["dependencies"] = ["shared 2.0.0"]
+        repaired_fuzz = lock(
+            ["facade 2.0.0"],
+            {"facade": ["2.0.0"], "shared": ["2.0.0"]},
+        )
+        repaired_fuzz["package"][1]["dependencies"] = ["shared 2.0.0"]
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError, "no observed exact edge rebind"
+        ):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                current,
+                stale_fuzz,
+                repaired_fuzz,
+                [sync_fuzz_lock.Transition("facade", "1.0.0", "2.0.0")],
+            )
+
+    def test_bounded_repair_rejects_independently_dropped_last_edge(self):
+        # The helper's last edge targeting shared 1.0.0 is dropped without a
+        # rebind, while the upgraded facade independently introduces
+        # shared 2.0.0. The edge drop itself is bounded, but no observed
+        # exact rebind consumes the unification mapping, so the removed
+        # record's deletion must still fail closed.
+        base = lock(
+            ["facade 1.0.0"],
+            {"facade": ["1.0.0"], "helper": ["1.0.0"], "shared": ["1.0.0"]},
+        )
+        base["package"][2]["dependencies"] = ["shared 1.0.0"]
+        stale_fuzz = lock(
+            ["facade 1.0.0"],
+            {"facade": ["1.0.0"], "helper": ["1.0.0"], "shared": ["1.0.0"]},
+        )
+        stale_fuzz["package"][2]["dependencies"] = ["shared 1.0.0"]
+        current = lock(
+            ["facade 2.0.0"],
+            {"facade": ["2.0.0"], "helper": ["1.0.0"], "shared": ["2.0.0"]},
+        )
+        current["package"][1]["dependencies"] = ["helper 1.0.0", "shared 2.0.0"]
+        repaired_fuzz = lock(
+            ["facade 2.0.0"],
+            {"facade": ["2.0.0"], "helper": ["1.0.0"], "shared": ["2.0.0"]},
+        )
+        repaired_fuzz["package"][1]["dependencies"] = [
+            "helper 1.0.0",
+            "shared 2.0.0",
+        ]
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError, "no observed exact edge rebind"
+        ):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                current,
+                stale_fuzz,
+                repaired_fuzz,
+                [sync_fuzz_lock.Transition("facade", "1.0.0", "2.0.0")],
+            )
+
     def test_check_mode_rejects_raw_rebind_after_direct_transition_is_repaired(self):
         base = lock(
             ["facade 1.0.0"],

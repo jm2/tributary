@@ -349,6 +349,43 @@ def is_exact_unification_rebind(
     return remapped == after_targets and remapped != before_targets
 
 
+def observed_unification_rebinds(
+    before_records: dict[tuple[str, str], dict[str, Any]],
+    after_records: dict[tuple[str, str], dict[str, Any]],
+    replacements: dict[tuple[str, str], tuple[str, str]],
+) -> set[tuple[str, str]]:
+    """
+    Return the removed identities whose mapping an edge rebind consumes.
+
+    A unification mapping justifies its removal only when at least one
+    retained consumer exhibits the exact before-edge to after-edge rebind:
+    cargo deleted the old record because that consumer now resolves onto the
+    surviving record. A survivor that merely shares the removed record's
+    name and source — for example a newly reachable dependency of an
+    upgraded facade — never consumes the mapping, and neither does a
+    consumer whose last old edge was dropped without a rebind. Unused
+    mappings stay unauthorized.
+    """
+    observed: set[tuple[str, str]] = set()
+    for identity in sorted(before_records.keys() & after_records.keys()):
+        before_edges = resolved_dependency_edges(
+            before_records[identity], before_records
+        )
+        after_edges = resolved_dependency_edges(after_records[identity], after_records)
+        for dependency_name in before_edges.keys() & after_edges.keys():
+            before_targets = before_edges[dependency_name]
+            after_targets = after_edges[dependency_name]
+            if before_targets == after_targets:
+                continue
+            if is_exact_unification_rebind(
+                before_targets, after_targets, replacements
+            ):
+                observed.update(
+                    target for target in before_targets if target in replacements
+                )
+    return observed
+
+
 # The explicit fail-closed branches mirror distinct lockfile invariants; folding
 # them together would make the safety proof harder to audit.
 def validate_dependency_edges(
@@ -507,6 +544,21 @@ def validate_bounded_package_changes(
     replacements = unification_replacements(
         before_records, after_records, old_identities, after_identities
     )
+    # A unification mapping authorizes its removal only when the repaired
+    # lock actually exhibits the exact edge rebind consuming it. A survivor
+    # that merely shares the removed record's name and source — or a last
+    # edge dropped without any rebind — leaves the mapping unused, so the
+    # removal stays outside the reviewed dependency surface.
+    observed = observed_unification_rebinds(
+        before_records, after_records, replacements
+    )
+    unused_replacements = replacements.keys() - observed
+    if unused_replacements:
+        raise PolicyError(
+            "fuzz lock repair removed package identities outside the exact "
+            "old dependency closure with no observed exact edge rebind onto "
+            f"the unified survivor: {sorted(unused_replacements)}"
+        )
     unexpected_removed = (
         removed_identities - old_identities - replacements.keys()
     )
