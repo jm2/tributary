@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# New revisions replace obsolete runs of the same PR. Main pushes use their
+# own run IDs so pending main validation is never evicted by another push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -323,6 +329,9 @@ jobs:
         # Production must pin the repository policy and platform inspectors,
         # ignoring the helper's deliberately injectable test hooks.
         env:
+          # Reuse the target-specific release build above when the packaging
+          # helper verifies it, instead of compiling a second host-layout tree.
+          CARGO_BUILD_TARGET: ${{ matrix.rust_target }}
           TRIBUTARY_FORBIDDEN_COMPONENTS_FILE: /dev/null
           MACOS_FIND_COMMAND: /usr/bin/true
           MACOS_OTOOL_COMMAND: /usr/bin/false
