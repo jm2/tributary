@@ -586,6 +586,57 @@ pub struct MountedMutationCommit<'a> {
     file: MutexGuard<'a, BoundFile>,
 }
 
+/// The exact object a commit section published, together with its retained
+/// handle.
+///
+/// The handle is kept open from the staged copy through the landing proof
+/// into the re-anchor. An identity alone cannot distinguish the installed
+/// object from a later stranger whose creation recycled the unlinked
+/// object's identity — ext4 hands recently freed inodes to the next file
+/// created in the same directory, so an unlink-plus-recreate swap can
+/// produce a different object with the same `(device, inode)` pair. The
+/// open handle pins the published object: on unix it exposes the link
+/// count that proves the object was not unlinked, and on every platform
+/// an object with an open handle still exists and holds its identity, so
+/// no later creation can alias it.
+struct InstalledReplacement {
+    identity: ObjectIdentity,
+    published: File,
+}
+
+impl InstalledReplacement {
+    /// Prove the published object is still live and linked, returning the
+    /// identity the re-anchor may condition on.
+    ///
+    /// On unix a handle to an unlinked object reports zero links: without
+    /// this check, a leaf swap whose stranger recycled the published
+    /// object's identity would pass the re-anchor's identity comparison
+    /// and anchor the target to a file the user never selected.
+    ///
+    /// On every platform the handle is still open here, and an object with
+    /// an open handle still exists and holds its identity — deletion
+    /// completes only at the last handle close — so no later creation can
+    /// recycle the identity. A handle whose metadata can no longer be read
+    /// has lost its object: fail closed rather than trust the identity.
+    fn proven_identity(self) -> io::Result<ObjectIdentity> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            if self.published.metadata()?.nlink() == 0 {
+                return Err(authority_changed(
+                    "the proven replacement was removed before the target could re-anchor",
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.published.metadata()?;
+        }
+        Ok(self.identity)
+    }
+}
+
 impl MountedMutationCommit<'_> {
     /// Clone the exact admitted file object as the mutation's read source.
     ///
@@ -680,9 +731,10 @@ impl MountedMutationCommit<'_> {
     /// After the replacement is proven landed, the section re-anchors the
     /// target's retained binding to the exact installed object — reopened
     /// through the retained parent and identity-checked against the proven
-    /// landing — while the section's guard is still held (see
-    /// [`Self::reanchor_target_to_installed`]). A pathname is never opened
-    /// for the re-anchor outside this guard.
+    /// landing, whose handle is still held so the proven object must still
+    /// be live (see [`Self::reanchor_target_to_installed`]) — while the
+    /// section's guard is still held. A pathname is never opened for the
+    /// re-anchor outside this guard.
     pub(crate) fn commit_replacement(&mut self, staged: &Path) -> io::Result<()> {
         #[cfg(unix)]
         let key = self.leaf_commit_key()?;
@@ -692,10 +744,10 @@ impl MountedMutationCommit<'_> {
             self.confirm_replacement_target()?;
             #[cfg(test)]
             run_post_confirm_interpose(self);
-            let staged_identity = self.replace_confirmed_staging(staged)?;
+            let installed = self.replace_confirmed_staging(staged)?;
             #[cfg(test)]
             run_pre_reanchor_interpose(self);
-            self.reanchor_target_to_installed(staged_identity)
+            self.reanchor_target_to_installed(installed)
         })
     }
 
@@ -708,21 +760,33 @@ impl MountedMutationCommit<'_> {
     ///
     /// The re-anchor happens inside the commit section — while this guard
     /// still holds the target's commit lock — so it can never interleave
-    /// with another section, and it is identity-conditioned: the installed
-    /// object is reopened and the reopened object must be the exact object
-    /// whose landing was just proven. Anything else means a leaf swap
-    /// landed between the landing proof and this reopen; anchoring it would
-    /// authorize a later commit to overwrite a file the user never
-    /// selected. The section therefore refuses to install the stranger and
-    /// leaves the retained binding pointing at the retired pre-commit
-    /// object, which makes every later revalidation fail closed: the target
-    /// invalidates itself.
+    /// with another section, and it is conditioned on the exact object the
+    /// landing proved, through two independent checks:
+    ///
+    /// * the published object's retained handle must still be linked — an
+    ///   unlinked object reports zero links, and a leaf swap that unlinked
+    ///   the replacement must refuse even when the stranger's creation
+    ///   recycled the replacement's identity (filesystems such as ext4 hand
+    ///   recently freed identities to the next created file); on platforms
+    ///   without a link-count primitive, holding the handle open already
+    ///   keeps the object alive and its identity unrecyclable;
+    /// * the leaf is reopened and must carry the published object's exact
+    ///   identity. A live object's identity is unique, so with the handle
+    ///   still open the match can only name that same object. Anything else
+    ///   means a leaf swap landed between the landing proof and this
+    ///   reopen; anchoring it would authorize a later commit to overwrite a
+    ///   file the user never selected.
+    ///
+    /// Either failure leaves the retained binding pointing at the retired
+    /// pre-commit object, which makes every later revalidation fail closed:
+    /// the target invalidates itself.
     ///
     /// The reopen goes through the same evidence the landing proof used —
     /// the retained parent directory where the section installed the
     /// replacement — never through the mount-relative pathname, which a
     /// parent displaced mid-commit would resolve to an impostor directory.
-    fn reanchor_target_to_installed(&mut self, expected: ObjectIdentity) -> io::Result<()> {
+    fn reanchor_target_to_installed(&mut self, installed: InstalledReplacement) -> io::Result<()> {
+        let expected = installed.proven_identity()?;
         #[cfg(unix)]
         {
             let parent = self.retained_parent();
@@ -750,7 +814,9 @@ impl MountedMutationCommit<'_> {
             // Platforms without retained parent handles keep their documented
             // discipline: the landing proof and this re-anchor both reopen the
             // admitted pathname, and the re-anchor accepts only the exact
-            // identity the landing proved.
+            // identity the landing proved — whose handle is still open, so a
+            // deleted replacement holds its identity against the stranger the
+            // pathname may name now.
             let reopened = File::open(&self.target.path)?;
             if object_identity(&reopened)? != expected {
                 return Err(authority_changed(
@@ -840,8 +906,10 @@ impl MountedMutationCommit<'_> {
     /// the proof — the loss detected after it happened. Here a failed proof
     /// means the quarantined original is still intact; it is restored
     /// (conditioned) to its name and the stranger is displaced to a sibling.
+    /// The published object's handle is returned with its identity so the
+    /// re-anchor can prove the published object is still live and linked.
     #[cfg(unix)]
-    fn replace_confirmed_staging(&self, staged: &Path) -> io::Result<ObjectIdentity> {
+    fn replace_confirmed_staging(&self, staged: &Path) -> io::Result<InstalledReplacement> {
         let parent = self.retained_parent();
         let leaf = self.target.relative_leaf()?;
         let staged_leaf = staged
@@ -893,10 +961,14 @@ impl MountedMutationCommit<'_> {
 
         // The landing is proven; only now retire the admitted original under
         // its quarantine name. A removal failure here leaves it as a
-        // quarantine sibling — debris, never destruction.
-        drop(staged_file);
+        // quarantine sibling — debris, never destruction. The published
+        // object's handle stays open and moves to the re-anchor as its
+        // liveness evidence.
         let _ = rustix::fs::unlinkat(&parent.file, quarantine_leaf, rustix::fs::AtFlags::empty());
-        Ok(staged_identity)
+        Ok(InstalledReplacement {
+            identity: staged_identity,
+            published: staged_file,
+        })
     }
 
     /// Recover the admitted original after a failed landing proof.
@@ -1054,14 +1126,15 @@ impl MountedMutationCommit<'_> {
     /// landing is proved against it exactly like the unix form, and the
     /// displaced admitted original is retired only after that proof
     /// succeeds — mirroring the unix fix for the staged-entry swap window.
-    /// Returns the exact identity of the object the section published, for
-    /// the caller's re-anchor step.
+    /// The published object's handle is returned with its identity so the
+    /// re-anchor can hold the published object open while it re-proves the
+    /// leaf.
     ///
     /// Errors surfaced here are rebuilt path-free: the std payloads embed
     /// the native pathnames, which must never leak into logs (see
     /// `replacement_path`).
     #[cfg(not(unix))]
-    fn replace_confirmed_staging(&self, staged: &Path) -> io::Result<ObjectIdentity> {
+    fn replace_confirmed_staging(&self, staged: &Path) -> io::Result<InstalledReplacement> {
         let leaf = self.target.relative_leaf()?;
         let quarantine_leaf = quarantine_name(&leaf);
         let Some(parent_dir) = self.target.path.parent() else {
@@ -1165,10 +1238,14 @@ impl MountedMutationCommit<'_> {
 
         // The landing is proven; only now retire the admitted original under
         // its quarantine name. A removal failure here leaves it as a
-        // quarantine sibling — debris, never destruction.
-        drop(staged_file);
+        // quarantine sibling — debris, never destruction. The published
+        // object's handle stays open and moves to the re-anchor as its
+        // liveness evidence.
         let _ = std::fs::remove_file(&quarantine_path);
-        Ok(staged_identity)
+        Ok(InstalledReplacement {
+            identity: staged_identity,
+            published: staged_file,
+        })
     }
 
     /// Return one displaced entry to `leaf` through the retained parent
@@ -2847,6 +2924,87 @@ mod tests {
         follow_up
             .confirm_replacement_target()
             .expect_err("the target must fail closed after a refused re-anchor");
+    }
+
+    /// An identity match alone cannot prove the leaf is the installed
+    /// replacement: once the section unlinks a file, a stranger created in
+    /// the same directory can receive the recycled identity — ext4 hands
+    /// recently freed inodes to the next created file — so an identity-only
+    /// re-anchor would adopt a file the user never selected. The section
+    /// therefore holds the published object's handle open and refuses when
+    /// it reports zero links: the replacement was removed after its landing
+    /// was proven, whatever the leaf's identity says now. The target must
+    /// invalidate itself.
+    #[test]
+    fn commit_replacement_refuses_when_the_installed_replacement_was_unlinked_before_the_re_anchor()
+    {
+        let directory = TestDirectory::new("mutation-reanchor-unlinked");
+        let song = directory.path().join("song.flac");
+        fs::write(&song, b"original audio").expect("write song");
+
+        let authority =
+            Arc::new(MountedRootAuthority::acquire(directory.path()).expect("acquire authority"));
+        let target = authority
+            .open_mutation_target(Path::new("song.flac"))
+            .expect("open mutation target");
+
+        // The staged copy sits beside the target, as the tag writer stages it.
+        let staged = directory.path().join(".song.tributary-tag-tmp.flac");
+        fs::write(&staged, b"tagged audio").expect("stage the replacement");
+        let watched_leaf = song.clone();
+
+        with_pre_reanchor_interpose(
+            Box::new(move |commit| {
+                if commit.target.path != watched_leaf {
+                    return;
+                }
+                // The landing proof has already passed on the installed
+                // replacement. Unlink it and recreate the leaf with the
+                // replacement's own bytes — the hostile case where a
+                // stranger's creation can recycle the replacement's identity
+                // and an identity-only re-anchor would adopt it.
+                let path = commit.target.path.clone();
+                fs::remove_file(&path).expect("unlink the installed replacement");
+                fs::write(&path, b"tagged audio")
+                    .expect("recreate the leaf over the unlinked replacement");
+            }),
+            || {
+                let mut commit = target.begin_commit().expect("begin commit section");
+                let error = commit
+                    .commit_replacement(&staged)
+                    .expect_err("the re-anchor must refuse a removed replacement");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("removed before the target could re-anchor"),
+                    "the refusal must come from the published object's liveness proof, not a \
+                     later check: {error}"
+                );
+            },
+        );
+
+        // The recreated leaf keeps the name: the refused re-anchor must not
+        // touch it, and the retired original must not be resurrected over it.
+        assert_eq!(
+            fs::read(&song).expect("read the leaf back"),
+            b"tagged audio",
+            "the refused re-anchor must leave the leaf exactly as the external writer left it"
+        );
+        // The landing was proven, so the section retired the quarantined
+        // original and consumed the staged copy before the unlink.
+        assert!(
+            !staged.exists(),
+            "the landing preceded the unlink, so the staged copy was consumed"
+        );
+        assert_no_quarantine_sibling_remains(&directory);
+
+        // The target invalidated itself: the binding still names the retired
+        // pre-commit object, so the follow-up section must refuse even though
+        // the leaf now holds the replacement's exact bytes.
+        let follow_up = target.begin_commit().expect("begin the follow-up section");
+        follow_up
+            .confirm_replacement_target()
+            .expect_err("the target must fail closed after the replacement was unlinked");
     }
 
     /// The replacement must be performed relative to the retained parent
