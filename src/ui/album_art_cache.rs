@@ -47,11 +47,13 @@ pub struct AlbumArtCache {
 
 pub struct AlbumArtCacheInner {
     /// Map from the source-qualified cache key to its decoded texture.
-    /// The key bundles `(source, source_epoch, album_key, pixel_size)` so
-    /// a track that resolves through two different remote sources is not
-    /// aliased to a single texture, and a source that is reactivated
+    /// The key bundles
+    /// `(source, source_epoch, content_generation, album_key, pixel_size)`
+    /// so a track that resolves through two different remote sources is
+    /// not aliased to a single texture, a source that is reactivated
     /// under a new session epoch never serves artwork decoded under a
-    /// previous epoch's identity.
+    /// previous epoch's identity, and artwork decoded before a library
+    /// content change is never served afterwards.
     pub(crate) entries: HashMap<String, CacheEntry>,
     /// Insertion order for FIFO eviction; hits bump entries to the tail
     /// so a hot row doesn't get evicted under memory pressure.
@@ -60,6 +62,14 @@ pub struct AlbumArtCacheInner {
     /// Used to enforce [`MAX_CACHE_BYTES`] even when the entry count is
     /// well under [`MAX_CACHED_ALBUM_ARTS`].
     pub(crate) total_bytes: u64,
+    /// Library content generation. Bumped whenever the browser's track
+    /// set is rebuilt (FullSync, source switch): entries keyed under an
+    /// older generation become unqueryable, so a changed cover is
+    /// re-resolved within the same source session instead of serving the
+    /// pre-sync pixels (2026-09-10 review finding — the key previously
+    /// carried the source epoch but no artwork/content generation, and a
+    /// same-session FullSync left changed covers stale).
+    pub(crate) content_generation: u64,
 }
 
 /// One entry in [`AlbumArtCache`]. Stores the texture alongside the
@@ -83,14 +93,32 @@ impl AlbumArtCache {
                 entries: HashMap::new(),
                 order: VecDeque::new(),
                 total_bytes: 0,
+                content_generation: 0,
             })),
         }
     }
 
+    /// Invalidate every cached entry by advancing the content
+    /// generation. Old-generation entries stay resident only until
+    /// bounded eviction drops them; no future lookup can ever query
+    /// them. Called by the browser rebuild path on FullSync / source
+    /// switches.
+    pub fn bump_content_generation(&self) {
+        self.inner.borrow_mut().content_generation += 1;
+    }
+
+    /// Current library content generation. Test seam for the rebuild
+    /// path's invalidation contract.
+    #[allow(dead_code)] // exercised by the widget-test build and cache tests
+    pub fn content_generation(&self) -> u64 {
+        self.inner.borrow().content_generation
+    }
+
     /// Look up a cached texture for
-    /// `(source, source_epoch, album_key, pixel_size)`. Returns `None` on
-    /// miss; a hit also bumps the entry to the most-recent position so a
-    /// hot row doesn't get evicted under memory pressure.
+    /// `(source, source_epoch, content_generation, album_key, pixel_size)`
+    /// at the CURRENT content generation. Returns `None` on miss; a hit
+    /// also bumps the entry to the most-recent position so a hot row
+    /// doesn't get evicted under memory pressure.
     pub fn get(
         &self,
         source: Option<&SourceId>,
@@ -98,8 +126,14 @@ impl AlbumArtCache {
         album_key: &str,
         pixel_size: i32,
     ) -> Option<gdk::Texture> {
-        let key = cache_key(source, source_epoch, album_key, pixel_size);
         let mut inner = self.inner.borrow_mut();
+        let key = cache_key(
+            source,
+            source_epoch,
+            inner.content_generation,
+            album_key,
+            pixel_size,
+        );
         let entry = inner.entries.get(&key)?;
         let texture = entry.texture.clone();
         if let Some(position) = inner.order.iter().position(|existing| existing == &key) {
@@ -109,23 +143,39 @@ impl AlbumArtCache {
         Some(texture)
     }
 
-    /// Insert a new texture, evicting the oldest entry if either bound
+    /// Insert a new texture, evicting the oldest entries if either bound
     /// would be exceeded. The eviction is FIFO with a recency-bump on
     /// read so a long-running scroll session never displaces hot
     /// entries. Both the count cap and the byte cap are enforced on
-    /// every insert so a single very large thumbnail cannot dominate
-    /// the working set.
+    /// every insert. A single texture whose decoded surface exceeds the
+    /// ENTIRE budget is refused outright: no eviction order can make
+    /// room for it, so admitting it would leave the cache permanently
+    /// over budget (2026-09-10 review finding — the former loop stopped
+    /// at one entry precisely to avoid that state, which let one oversized
+    /// decoded texture pin the cache over its cap). The row keeps
+    /// displaying the refused texture; only its cache retention is
+    /// declined, and the next bind simply re-resolves it.
     pub fn insert(
         &self,
         source: Option<&SourceId>,
         source_epoch: Option<u64>,
+        content_generation: u64,
         album_key: &str,
         pixel_size: i32,
         texture: gdk::Texture,
     ) {
-        let key = cache_key(source, source_epoch, album_key, pixel_size);
         let bytes = approximate_texture_bytes(&texture);
+        if bytes > MAX_CACHE_BYTES {
+            return;
+        }
         let mut inner = self.inner.borrow_mut();
+        let key = cache_key(
+            source,
+            source_epoch,
+            content_generation,
+            album_key,
+            pixel_size,
+        );
         if let Some(existing) = inner.entries.remove(&key) {
             inner.total_bytes = inner.total_bytes.saturating_sub(existing.bytes);
             if let Some(position) = inner.order.iter().position(|existing| existing == &key) {
@@ -137,23 +187,14 @@ impl AlbumArtCache {
             .insert(key.clone(), CacheEntry { texture, bytes });
         inner.order.push_back(key.clone());
         inner.total_bytes = inner.total_bytes.saturating_add(bytes);
-        // Evict until both bounds hold. Stop early only if the cache is
-        // already empty — at that point the incoming entry itself is the
-        // largest single resident.
-        while (inner.entries.len() > MAX_CACHED_ALBUM_ARTS || inner.total_bytes > MAX_CACHE_BYTES)
-            && inner.entries.len() > 1
-        {
+        // Evict until both bounds hold. No admitted entry can exceed the
+        // byte cap on its own (oversized inserts are refused above), so
+        // this loop always reaches a compliant state before it could
+        // touch the just-inserted key.
+        while inner.entries.len() > MAX_CACHED_ALBUM_ARTS || inner.total_bytes > MAX_CACHE_BYTES {
             let Some(oldest) = inner.order.pop_front() else {
                 break;
             };
-            if oldest == key {
-                // The new entry is the oldest after a full rotation;
-                // keep it and accept that one bound will be temporarily
-                // exceeded rather than silently dropping the just-inserted
-                // texture.
-                inner.order.push_front(oldest);
-                break;
-            }
             if let Some(evicted) = inner.entries.remove(&oldest) {
                 inner.total_bytes = inner.total_bytes.saturating_sub(evicted.bytes);
             }
@@ -194,6 +235,7 @@ impl AlbumArtCache {
 fn cache_key(
     source: Option<&SourceId>,
     source_epoch: Option<u64>,
+    content_generation: u64,
     album_key: &str,
     pixel_size: i32,
 ) -> String {
@@ -202,17 +244,26 @@ fn cache_key(
     // collide with a different key tuple. `SourceId` displays as its
     // underlying UUID, so the source-qualified key is opaque without
     // exposing the Uuid type at the call site. The source session epoch
-    // sits between the source identity and the album key: a source that
-    // is reactivated under a new epoch gets fresh keys, so stale artwork
-    // from the previous session can never be served (2026-09-07 review
-    // finding). Local rows have no epoch; their keys omit the field.
+    // sits between the source identity and the content generation: a
+    // source that is reactivated under a new epoch gets fresh keys, so
+    // stale artwork from the previous session can never be served
+    // (2026-09-07 review finding), and a library content change inside
+    // one session gets fresh keys through the generation field
+    // (2026-09-10 review finding). Local rows have no epoch; their keys
+    // omit that field but still carry the generation.
     let epoch = match source_epoch {
         Some(epoch) => epoch.to_string(),
         None => String::from("-"),
     };
     match source {
-        Some(id) => format!("src:{}\x1f{}\x1f{}\x1f{}", id, epoch, album_key, pixel_size),
-        None => format!("src:local\x1f{}\x1f{}", album_key, pixel_size),
+        Some(id) => format!(
+            "src:{}\x1f{}\x1f{}\x1f{}\x1f{}",
+            id, epoch, content_generation, album_key, pixel_size
+        ),
+        None => format!(
+            "src:local\x1f{}\x1f{}\x1f{}",
+            content_generation, album_key, pixel_size
+        ),
     }
 }
 
@@ -254,7 +305,14 @@ mod tests {
         let cache = AlbumArtCache::new();
         let texture = fake_texture();
         for i in 0..(MAX_CACHED_ALBUM_ARTS + 4) {
-            cache.insert(None, None, &format!("album-{i}"), 48, texture.clone());
+            cache.insert(
+                None,
+                None,
+                cache.content_generation(),
+                &format!("album-{i}"),
+                48,
+                texture.clone(),
+            );
         }
         assert_eq!(cache.len(), MAX_CACHED_ALBUM_ARTS);
         // Earliest entries must have been evicted.
@@ -272,12 +330,26 @@ mod tests {
         let cache = AlbumArtCache::new();
         let texture = fake_texture();
         for i in 0..MAX_CACHED_ALBUM_ARTS {
-            cache.insert(None, None, &format!("album-{i}"), 48, texture.clone());
+            cache.insert(
+                None,
+                None,
+                cache.content_generation(),
+                &format!("album-{i}"),
+                48,
+                texture.clone(),
+            );
         }
         // Touch the earliest entry — it should survive a follow-up
         // insert that would otherwise evict it.
         assert!(cache.get(None, None, "album-0", 48).is_some());
-        cache.insert(None, None, "newcomer", 48, texture.clone());
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            "newcomer",
+            48,
+            texture.clone(),
+        );
         assert_eq!(cache.len(), MAX_CACHED_ALBUM_ARTS);
         assert!(cache.get(None, None, "album-0", 48).is_some());
         assert!(cache.get(None, None, "album-1", 48).is_none());
@@ -287,10 +359,24 @@ mod tests {
     fn cache_pixel_size_distinguishes_entries() {
         let cache = AlbumArtCache::new();
         let texture = fake_texture();
-        cache.insert(None, None, "album-a", 32, texture.clone());
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            "album-a",
+            32,
+            texture.clone(),
+        );
         assert!(cache.get(None, None, "album-a", 32).is_some());
         assert!(cache.get(None, None, "album-a", 48).is_none());
-        cache.insert(None, None, "album-a", 48, texture);
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            "album-a",
+            48,
+            texture,
+        );
         assert!(cache.get(None, None, "album-a", 32).is_some());
         assert!(cache.get(None, None, "album-a", 48).is_some());
     }
@@ -309,8 +395,22 @@ mod tests {
         let source_a = SourceId::local();
         let source_b = SourceId::radio_browser();
         // Same track id, same size, different sources.
-        cache.insert(Some(&source_a), None, "shared-id", 48, texture_a.clone());
-        cache.insert(Some(&source_b), None, "shared-id", 48, texture_b.clone());
+        cache.insert(
+            Some(&source_a),
+            None,
+            cache.content_generation(),
+            "shared-id",
+            48,
+            texture_a.clone(),
+        );
+        cache.insert(
+            Some(&source_b),
+            None,
+            cache.content_generation(),
+            "shared-id",
+            48,
+            texture_b.clone(),
+        );
         // Both must be independently retrievable. We can only assert
         // hit/miss from the public surface — `gdk::Texture` doesn't
         // expose identity — but the count must reflect both.
@@ -318,7 +418,14 @@ mod tests {
         assert!(cache.get(Some(&source_a), None, "shared-id", 48).is_some());
         assert!(cache.get(Some(&source_b), None, "shared-id", 48).is_some());
         // And a local-only row never aliases to a remote-source row.
-        cache.insert(None, None, "shared-id", 48, texture_a.clone());
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            "shared-id",
+            48,
+            texture_a.clone(),
+        );
         assert_eq!(cache.len(), 3);
         assert!(cache.get(None, None, "shared-id", 48).is_some());
     }
@@ -333,7 +440,14 @@ mod tests {
         let cache = AlbumArtCache::new();
         let texture = fake_texture();
         let key = "\x1f";
-        cache.insert(None, None, key, 48, texture.clone());
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            key,
+            48,
+            texture.clone(),
+        );
         assert!(cache.get(None, None, key, 48).is_some());
         // A different pixel size must not match this key.
         assert!(cache.get(None, None, key, 49).is_none());
@@ -351,10 +465,17 @@ mod tests {
         let cache = AlbumArtCache::new();
         let texture = fake_texture();
         let huge = "a".repeat(8 * 1024);
-        cache.insert(None, None, &huge, 48, texture.clone());
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            &huge,
+            48,
+            texture.clone(),
+        );
         assert!(cache.get(None, None, &huge, 48).is_some());
         // Bumping the same key with a different size stays distinct.
-        cache.insert(None, None, &huge, 64, texture);
+        cache.insert(None, None, cache.content_generation(), &huge, 64, texture);
         assert_eq!(cache.len(), 2);
     }
 
@@ -388,7 +509,14 @@ mod tests {
         let cache = AlbumArtCache::new();
         // A 2048×2048 RGBA cover retains 16 MiB no matter that the row
         // asked for a 48-px thumbnail; the budget must see all of it.
-        cache.insert(None, None, "big-album", 48, solid_texture(2048, 2048));
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            "big-album",
+            48,
+            solid_texture(2048, 2048),
+        );
         assert_eq!(
             cache.approximate_byte_total(),
             2048_u64 * 2048 * 4,
@@ -402,6 +530,7 @@ mod tests {
             cache.insert(
                 None,
                 None,
+                cache.content_generation(),
                 &format!("album-{i}"),
                 48,
                 solid_texture(1024, 1024),
@@ -413,12 +542,9 @@ mod tests {
             cache.approximate_byte_total()
         );
         assert!(
-            cache.get(None, None, "big-album", 48).is_none(),
-            "the oversized 16-MiB entry must be evicted first"
-        );
-        assert!(
-            cache.get(None, None, "album-0", 48).is_none(),
-            "the oldest 4-MiB entry must be evicted to admit newer ones"
+            cache.get(None, None, "big-album", 48).is_none()
+                && cache.get(None, None, "album-0", 48).is_none(),
+            "the oversized 16-MiB entry and the oldest 4-MiB entry must be evicted"
         );
         assert!(cache.get(None, None, "album-8", 48).is_some());
         assert_eq!(
@@ -434,8 +560,22 @@ mod tests {
     fn cache_clear_resets_count_and_bytes() {
         let cache = AlbumArtCache::new();
         let texture = fake_texture();
-        cache.insert(None, None, "album-a", 48, texture.clone());
-        cache.insert(None, None, "album-b", 48, texture.clone());
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            "album-a",
+            48,
+            texture.clone(),
+        );
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            "album-b",
+            48,
+            texture.clone(),
+        );
         assert_eq!(cache.len(), 2);
         assert!(cache.approximate_byte_total() > 0);
         cache.clear();
@@ -444,7 +584,14 @@ mod tests {
         assert_eq!(cache.approximate_byte_total(), 0);
         // The cleared cache is reusable: a fresh insert hits and grows
         // the byte counter back up.
-        cache.insert(None, None, "album-c", 48, texture.clone());
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            "album-c",
+            48,
+            texture.clone(),
+        );
         assert!(cache.get(None, None, "album-c", 48).is_some());
     }
 
@@ -460,8 +607,22 @@ mod tests {
         let texture = fake_texture();
         // Insert two keys that differ only by the separator byte and
         // confirm both round-trip independently.
-        cache.insert(None, None, "abc", 48, texture.clone());
-        cache.insert(None, None, "a\x1fbc", 48, texture.clone());
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            "abc",
+            48,
+            texture.clone(),
+        );
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            "a\x1fbc",
+            48,
+            texture.clone(),
+        );
         assert_eq!(cache.len(), 2);
         assert!(cache.get(None, None, "abc", 48).is_some());
         assert!(cache.get(None, None, "a\x1fbc", 48).is_some());
@@ -485,7 +646,14 @@ mod tests {
         let source = SourceId::radio_browser();
         let texture = fake_texture();
 
-        cache.insert(Some(&source), Some(1), "shared-album", 48, texture.clone());
+        cache.insert(
+            Some(&source),
+            Some(1),
+            cache.content_generation(),
+            "shared-album",
+            48,
+            texture.clone(),
+        );
         assert!(cache
             .get(Some(&source), Some(1), "shared-album", 48)
             .is_some());
@@ -498,7 +666,14 @@ mod tests {
 
         // The reactivated source re-fetches under epoch 2; both entries
         // coexist as distinct keys until bounded eviction drops the old one.
-        cache.insert(Some(&source), Some(2), "shared-album", 48, texture);
+        cache.insert(
+            Some(&source),
+            Some(2),
+            cache.content_generation(),
+            "shared-album",
+            48,
+            texture,
+        );
         assert_eq!(cache.len(), 2);
         assert!(cache
             .get(Some(&source), Some(1), "shared-album", 48)
@@ -510,5 +685,111 @@ mod tests {
         // An un-epoched row never aliases an epoched remote row for the
         // same album key.
         assert!(cache.get(Some(&source), None, "shared-album", 48).is_none());
+    }
+
+    /// A single decoded texture larger than the ENTIRE byte budget must
+    /// be refused outright. The former eviction loop stopped at one
+    /// entry, so exactly such a texture was admitted with the cache
+    /// pinned permanently over its cap (2026-09-10 review finding).
+    /// No eviction order can make room for it, so `insert` declines
+    /// retention while the row keeps displaying the texture it painted.
+    #[test]
+    fn cache_rejects_a_single_texture_larger_than_the_whole_budget() {
+        let cache = AlbumArtCache::new();
+        // Derive the fixtures from the budget itself: 4096-wide RGBA
+        // rows of exactly `cap_height` fill the whole budget, one extra
+        // row exceeds it. (4096×2048 RGBA = 33 554 432 = MAX_CACHE_BYTES.)
+        let width = 4096_i32;
+        let cap_height = (MAX_CACHE_BYTES / 4 / width as u64) as i32;
+        let cap_surface = width as u64 * cap_height as u64 * 4;
+        assert_eq!(cap_surface, MAX_CACHE_BYTES);
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            "huge-album",
+            48,
+            solid_texture(width, cap_height + 1),
+        );
+        assert_eq!(cache.len(), 0, "the oversized texture must not be retained");
+        assert_eq!(cache.approximate_byte_total(), 0);
+        assert!(cache.get(None, None, "huge-album", 48).is_none());
+
+        // The exact-budget texture is the largest admissible single entry.
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            "cap-album",
+            48,
+            solid_texture(width, cap_height),
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.approximate_byte_total(), MAX_CACHE_BYTES);
+        assert!(cache.get(None, None, "cap-album", 48).is_some());
+
+        // A subsequent small insert evicts the cap-sized entry cleanly:
+        // the cache never rests above its budget.
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            "small-album",
+            48,
+            fake_texture(),
+        );
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(None, None, "cap-album", 48).is_none());
+        assert!(cache.get(None, None, "small-album", 48).is_some());
+        assert!(cache.approximate_byte_total() <= MAX_CACHE_BYTES);
+    }
+
+    /// The cache key must bind an artwork/content generation: a library
+    /// rebuild (FullSync) inside the SAME source session bumps the
+    /// generation, so covers changed by the new data are re-resolved
+    /// instead of serving the pre-sync pixels (2026-09-10 review
+    /// finding — the key carried the source epoch but no content
+    /// generation, so a same-session FullSync left changed covers
+    /// stale). Old-generation entries stay resident only until bounded
+    /// eviction drops them; no lookup can ever query them.
+    #[test]
+    fn cache_content_generation_bump_invalidates_changed_covers() {
+        let cache = AlbumArtCache::new();
+        let texture = fake_texture();
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            "same-album",
+            48,
+            texture.clone(),
+        );
+        assert!(cache.get(None, None, "same-album", 48).is_some());
+
+        // FullSync lands: the browser rebuild bumps the generation.
+        cache.bump_content_generation();
+        assert!(
+            cache.get(None, None, "same-album", 48).is_none(),
+            "after a content bump the previous cover must not be served"
+        );
+
+        // The changed cover re-resolves and re-enters under the new
+        // generation; the old-generation entry is unreachable but still
+        // resident until bounded eviction drops it (same contract as the
+        // epoch test above).
+        cache.insert(
+            None,
+            None,
+            cache.content_generation(),
+            "same-album",
+            48,
+            texture,
+        );
+        assert!(cache.get(None, None, "same-album", 48).is_some());
+        assert_eq!(cache.len(), 2);
+
+        // A fresh cache starts at generation 0 and never aliases across
+        // a bump even for local (epoch-less) rows.
+        assert_eq!(AlbumArtCache::new().content_generation(), 0);
     }
 }
