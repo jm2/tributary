@@ -142,10 +142,15 @@ fn directory_creation_and_file_writes_combine() {
     let root = tempfile::tempdir().expect("temporary root");
     let authority = authority(&root);
 
-    let bound = authority
+    let (bound, created) = authority
         .create_relative_directory(Path::new("album"), ConflictPolicy::Fail)
         .expect("create album dir");
     assert_eq!(bound.relative_path(), Path::new("album"));
+    assert_eq!(
+        created,
+        vec![Path::new("album").to_path_buf()],
+        "the created-component report must name exactly what this call created"
+    );
 
     let mut staged = bound
         .prepare_write_in_directory("song.flac", ConflictPolicy::Fail)
@@ -156,6 +161,48 @@ fn directory_creation_and_file_writes_combine() {
     assert_eq!(
         std::fs::read(root.path().join("album/song.flac")).expect("read nested"),
         b"nested"
+    );
+}
+
+/// An adopted directory is never reported as created: the created-component
+/// report of a creation over an existing leaf is empty, so a concurrently
+/// created (or pre-existing) directory can never be recorded — or rolled
+/// back — as the transfer's own.
+#[test]
+fn adopted_directory_is_not_reported_as_created() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let authority = authority(&root);
+    std::fs::create_dir(root.path().join("album")).expect("pre-create album dir");
+
+    let (_, created) = authority
+        .create_relative_directory(Path::new("album"), ConflictPolicy::Overwrite)
+        .expect("adopt existing album dir");
+    assert!(
+        created.is_empty(),
+        "an adopted leaf owns nothing: {created:?}"
+    );
+}
+
+/// Only the components the authority actually created are reported: an
+/// existing intermediate component is adopted silently while the missing
+/// components below it are named exactly, so ownership recording claims
+/// neither more nor less than the transfer created.
+#[test]
+fn created_component_report_names_only_created_components() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let authority = authority(&root);
+    std::fs::create_dir(root.path().join("x")).expect("pre-create intermediate x");
+
+    let (_, created) = authority
+        .create_relative_directory(Path::new("x/y/z"), ConflictPolicy::Preserve)
+        .expect("create nested chain under adopted x");
+    assert_eq!(
+        created,
+        vec![
+            Path::new("x/y").to_path_buf(),
+            Path::new("x/y/z").to_path_buf(),
+        ],
+        "the adopted ancestor must be absent from the report: {created:?}"
     );
 }
 

@@ -1,7 +1,7 @@
 //! The staged-write handle ([`PreparedWriteTarget`]) and the bound
 //! directory handle ([`MountedDirectory`]) produced by the write authority.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
@@ -16,7 +16,7 @@ use super::staging::discard_staged_file;
 #[cfg(not(unix))]
 use super::staging::{discard_staged_file, rollback_staged};
 use crate::local::root_authority::{
-    LandedPublish, LeafIdentity, MountedRootAuthority, RetainedWriteParent,
+    LeafIdentity, MountedRootAuthority, RestoreFailure, RetainedWriteParent,
 };
 
 /// A staged write below a [`MountedWriteAuthority`](super::MountedWriteAuthority)
@@ -50,6 +50,15 @@ pub struct PreparedWriteTarget {
     pub(super) staged_file: Option<File>,
     pub(super) resolution: ConflictResolution,
     pub(super) committed: bool,
+    /// Set when an Overwrite publish landed its atomic exchange but could
+    /// not restore the displaced occupant it captured: the transfer's bytes
+    /// ARE published at the destination, the bind-time backup is retained
+    /// for restoration, and the displaced object survives at the staged
+    /// leaf. The staged leaf must be shielded from every cleanup path —
+    /// unlinking it would destroy the displaced object's last reachable
+    /// link — and the caller recovers the published outcome from the
+    /// `PublishVerification` error to record it for rollback.
+    pub(super) staged_leaf_holds_displaced_occupant: bool,
 }
 
 impl fmt::Debug for PreparedWriteTarget {
@@ -154,9 +163,51 @@ impl PreparedWriteTarget {
             })?
             .to_os_string();
         self.flush_and_close_staged().map_err(CommitError::from)?;
+        let backup_leaf = backup_leaf_name();
+        let mut backup_relative = self
+            .final_relative_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        backup_relative.push(backup_leaf.as_os_str());
         let (replaced_original, landed) = if self.resolution == ConflictResolution::Overwrite {
-            self.publish_overwrite_with_backup(&final_leaf, &final_path)
-                .map_err(CommitError::from)?
+            match self.authority.replace_within_directory(
+                &self.parent,
+                &self.staged_leaf,
+                &self.staged_path,
+                &final_leaf,
+                &final_path,
+                backup_leaf.as_os_str(),
+                &self.authority.root().join(&backup_relative),
+            ) {
+                Ok((replaced, landed)) => (replaced.then_some(backup_relative), landed),
+                Err(error) => {
+                    // A landed atomic exchange whose displaced-occupant
+                    // restore failed: the transfer's bytes ARE published at
+                    // the destination, the bind-time backup is retained for
+                    // restoration, and the displaced object survives at the
+                    // staged leaf. Shield the staged leaf from cleanup and
+                    // surface the publication as a verified-publication
+                    // failure so the caller records it for rollback — a
+                    // committed file whose outcome is dropped can never be
+                    // undone.
+                    let displaced = error
+                        .get_ref()
+                        .and_then(|payload| payload.downcast_ref::<RestoreFailure>())
+                        .map(|failure| failure.payload.published_leaf);
+                    if let Some(published_leaf) = displaced {
+                        self.staged_leaf_holds_displaced_occupant = true;
+                        let outcome = CommitOutcome {
+                            relative_path: self.final_relative_path.clone(),
+                            resolution: self.resolution,
+                            replaced_original: Some(backup_relative),
+                            published_leaf,
+                        };
+                        return Err(CommitError::PublishVerification { outcome, error });
+                    }
+                    return Err(CommitError::from(error));
+                }
+            }
         } else {
             let landed = self
                 .authority
@@ -209,42 +260,13 @@ impl PreparedWriteTarget {
         Ok(())
     }
 
-    /// Publish the staged file over an existing occupant by replace, never
-    /// unbacked: the occupant of the destination name is bound to a hidden
-    /// backup sibling at commit time (a hard link where the filesystem supports
-    /// them, else a verified commit-time copy), and the backup's relative
-    /// path is returned so the caller can restore exactly the bytes that
-    /// were destroyed. The landed publish — the published leaf's identity
-    /// plus the reported trailing revalidation — is returned alongside for
-    /// identity-verified, verification-preserving rollback.
-    fn publish_overwrite_with_backup(
-        &self,
-        final_leaf: &OsStr,
-        final_path: &Path,
-    ) -> io::Result<(Option<PathBuf>, LandedPublish)> {
-        let backup_leaf = backup_leaf_name();
-        let mut backup_relative = self
-            .final_relative_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-        backup_relative.push(backup_leaf.as_os_str());
-        let backup_absolute = self.authority.root().join(&backup_relative);
-        let (replaced, landed) = self.authority.replace_within_directory(
-            &self.parent,
-            &self.staged_leaf,
-            &self.staged_path,
-            final_leaf,
-            final_path,
-            backup_leaf.as_os_str(),
-            &backup_absolute,
-        )?;
-        Ok((replaced.then_some(backup_relative), landed))
-    }
-
-    /// Discard the staged file and any partial writes.
+    /// Discard the staged file and any partial writes. A displaced-occupant
+    /// failure leaves the staged leaf deliberately in place: it preserves
+    /// the object the publish displaced, and unlinking it would destroy a
+    /// concurrent writer's (or the original occupant's) last reachable
+    /// link.
     pub fn rollback(mut self) -> io::Result<()> {
-        if self.committed {
+        if self.committed || self.staged_leaf_holds_displaced_occupant {
             return Ok(());
         }
         drop(self.staged_file.take());
@@ -274,7 +296,10 @@ impl PreparedWriteTarget {
 
 impl Drop for PreparedWriteTarget {
     fn drop(&mut self) {
-        if self.committed {
+        if self.committed || self.staged_leaf_holds_displaced_occupant {
+            // A displaced-occupant failure keeps the staged leaf: it holds
+            // the displaced object's last reachable link, not staged
+            // garbage. See `staged_leaf_holds_displaced_occupant`.
             return;
         }
         // Close the staged handle before removal: Windows refuses to delete

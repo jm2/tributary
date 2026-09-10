@@ -165,36 +165,50 @@ impl MountedWriteAuthority {
             staged_file: Some(staged_file),
             resolution: resolved.resolution,
             committed: false,
+            staged_leaf_holds_displaced_occupant: false,
         })
     }
 
     /// Create a directory beneath the mount and bind it for further writes.
+    ///
+    /// Returns the bound directory together with the relative paths of the
+    /// components this call actually created, leaf inclusive (empty when the
+    /// leaf already existed and was adopted). Ownership recording for
+    /// rollback MUST use this list: a component that already existed —
+    /// including one a concurrent writer created moments before the
+    /// creation call — is adopted, not owned, and must survive rollback.
     pub fn create_relative_directory(
         &self,
         relative: &Path,
         policy: ConflictPolicy,
-    ) -> io::Result<MountedDirectory> {
+    ) -> io::Result<(MountedDirectory, Vec<PathBuf>)> {
         let components = strict_relative_components(relative)?;
         self.mounted.validate()?;
         let final_path = self.mounted.root().join(assemble_relative(&components));
 
-        match std::fs::symlink_metadata(&final_path) {
-            Ok(metadata) => adopt_existing_directory(metadata, policy)?,
+        let created = match std::fs::symlink_metadata(&final_path) {
+            Ok(metadata) => {
+                adopt_existing_directory(metadata, policy)?;
+                Vec::new()
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                create_missing_directory(&self.mounted, &components)?;
+                create_missing_directory(&self.mounted, &components)?
             }
             Err(error) => return Err(error),
-        }
+        };
         self.mounted.validate()?;
         let _bound = self
             .mounted
             .open_relative_directory(&assemble_relative(&components))?;
-        Ok(MountedDirectory {
-            lease_token: self.mounted.token(),
-            authority: Arc::clone(&self.mounted),
-            relative_path: assemble_relative(&components),
-            identity: self.mounted.relative_leaf_identity(relative),
-        })
+        Ok((
+            MountedDirectory {
+                lease_token: self.mounted.token(),
+                authority: Arc::clone(&self.mounted),
+                relative_path: assemble_relative(&components),
+                identity: self.mounted.relative_leaf_identity(relative),
+            },
+            created,
+        ))
     }
 
     /// Remove a regular file atomically through the retained authority.
@@ -315,16 +329,29 @@ fn adopt_existing_directory(metadata: std::fs::Metadata, policy: ConflictPolicy)
 
 /// Create every component of a not-yet-existing directory path through the
 /// retained authority: walked and created no-follow from the retained root
-/// handle on Unix, path-based per-component creation elsewhere.
+/// handle on Unix, path-based per-component creation elsewhere. Returns the
+/// relative paths of the components this invocation actually created, leaf
+/// inclusive — an adopted (already existing) component is not reported, so
+/// ownership recording never claims a directory the transfer did not
+/// create.
 fn create_missing_directory(
     authority: &MountedRootAuthority,
     components: &[OsString],
-) -> io::Result<()> {
-    #[cfg(unix)]
-    authority.create_directories_within(components)?;
-    #[cfg(not(unix))]
-    create_directory_atomic(authority.root(), components)?;
-    Ok(())
+) -> io::Result<Vec<PathBuf>> {
+    let created = {
+        #[cfg(unix)]
+        {
+            authority.create_directories_within(components)?
+        }
+        #[cfg(not(unix))]
+        {
+            create_directory_atomic(authority.root(), components)?
+        }
+    };
+    Ok(created
+        .into_iter()
+        .map(|index| assemble_relative(&components[..=index]))
+        .collect())
 }
 
 /// Resolve the conflict policy against the live filesystem and decide where

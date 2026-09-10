@@ -247,20 +247,21 @@ impl TransferExecutor {
     }
 
     /// Create one destination directory. Idempotent: an existing directory
-    /// with the same identity is not an error. Every component of the path
-    /// that was provably absent immediately before creation — the leaf and
-    /// any ancestors the authority had to create along the way — is
-    /// recorded for rollback, so a nested destination never leaves created
-    /// ancestor directories behind after a reversal.
+    /// with the same identity is not an error. Exactly the components the
+    /// authority reports as created by this call — leaf and any ancestors it
+    /// had to create along the way — are recorded for rollback, so a nested
+    /// destination never leaves created ancestor directories behind after a
+    /// reversal. Ownership is never inferred from a pre-creation absence
+    /// scan: a component that already existed, including one a concurrent
+    /// writer created moments before the creation call, is adopted rather
+    /// than owned and must survive rollback.
     fn execute_create_directory(
         &self,
         relative: &Path,
         context: &mut RunContext<'_>,
     ) -> Result<(), TransferError> {
         let final_path = self.request.destination.root().join(relative);
-        // Which components were absent before creation. A component that
-        // existed is not owned by this transfer and must survive rollback.
-        let absent_prefixes = absent_directory_prefixes(self.request.destination.root(), relative)?;
+        ensure_normal_item_path(relative)?;
         self.request.destination.validate().map_err(|error| {
             TransferError::authority(format!("destination not current: {error}"))
         })?;
@@ -269,11 +270,14 @@ impl TransferExecutor {
             .destination
             .create_relative_directory(relative, self.request.conflict_policy)
         {
-            Ok(_) => {
-                for absent in absent_prefixes {
+            Ok((_, created)) => {
+                for created_directory in created {
                     context.committed.push(OwnedChange::CreatedDirectory {
-                        created_directory: self.request.destination.relative_leaf_identity(&absent),
-                        relative_path: absent,
+                        created_directory: self
+                            .request
+                            .destination
+                            .relative_leaf_identity(&created_directory),
+                        relative_path: created_directory,
                     });
                 }
                 Ok(())
@@ -466,9 +470,12 @@ impl TransferExecutor {
     /// stage. The publish refused to replace it; the policy decides what
     /// happens next. Skip and Fail are represented distinctly — a Skip-policy
     /// stage is skipped without committing anything, a Fail-policy stage
-    /// rejects the run — while Preserve re-resolves exactly as the planner
-    /// would have: one retry onto a disambiguated sibling, with the
-    /// collision untouched.
+    /// rejects the run — Preserve re-resolves exactly as the planner
+    /// would have (one retry onto a disambiguated sibling, with the
+    /// collision untouched), and Overwrite re-resolves onto the occupant
+    /// that now exists: the request's stated policy is to replace, so the
+    /// retry binds the current occupant to a commit-time backup and swaps
+    /// it out atomically.
     #[allow(clippy::too_many_arguments)]
     fn resolve_post_plan_collision(
         &self,
@@ -485,6 +492,39 @@ impl TransferExecutor {
             (ConflictPolicy::Fail, ConflictResolution::Fresh) => {
                 Err(TransferError::ConflictRejected {
                     path: destination_relative.to_path_buf(),
+                })
+            }
+            (ConflictPolicy::Overwrite, ConflictResolution::Fresh) => {
+                // The destination was absent at plan time but appeared
+                // before commit, so the fresh-planned no-replace publish
+                // refused to destroy it. The request's Overwrite policy
+                // decides: stage a replacement against the live filesystem,
+                // binding the current occupant to a commit-time backup and
+                // publishing over it atomically. The collided attempt's
+                // staged copy was discarded with its target, and its byte
+                // count was restored before the collision surfaced, so the
+                // retry re-copies the source into the fresh staged target
+                // exactly once.
+                let staged = self
+                    .request
+                    .destination
+                    .prepare_write_relative_file(destination_relative, ConflictPolicy::Overwrite)
+                    .map_err(|error| {
+                        TransferError::io("failed to stage overwrite replacement", error)
+                    })?;
+                Self::copy_and_commit_staged(
+                    staged,
+                    declared_bytes,
+                    stage_index,
+                    context,
+                    source_file,
+                )
+                .map(Some)
+                .map_err(|failure| match failure {
+                    StageFailure::Final(error) => error,
+                    StageFailure::Collision(error) => {
+                        TransferError::io("overwrite replacement publish collided", error)
+                    }
                 })
             }
             (ConflictPolicy::Preserve, ConflictResolution::Fresh) => {
@@ -510,9 +550,10 @@ impl TransferExecutor {
                     }
                 })
             }
-            // An Overwrite-planned commit never collides (replace semantics
-            // with a bound backup), and a planned Preserved sibling
-            // collision is a genuine allocation failure.
+            // A planned Preserved sibling collision is a genuine allocation
+            // failure: the disambiguated name is freshly chosen, so an
+            // occupant there can only be an allocation race the policy has
+            // no further resolution for.
             _ => Err(TransferError::io(
                 "failed to commit destination file",
                 collision,
@@ -589,34 +630,18 @@ fn copy_in_chunks(
     Ok(copied)
 }
 
-/// Walk `relative` and collect every normal-component prefix that was
-/// provably absent immediately before a directory creation, leaf inclusive.
-/// A component that already existed is not owned by the transfer and must
-/// survive rollback, so it is not recorded. A non-normal component is a
-/// typed invalid-path error, exactly as the executor reported it before
-/// this walk was extracted.
-fn absent_directory_prefixes(root: &Path, relative: &Path) -> Result<Vec<PathBuf>, TransferError> {
-    let mut absent_prefixes: Vec<PathBuf> = Vec::new();
-    let mut prefix = PathBuf::new();
+/// Validate that every component of `relative` is a normal (relative,
+/// traversal-free) component, reporting the typed invalid-path error exactly
+/// as the executor always has. Ownership is decided by the authority's
+/// created-component report — never by a race-prone pre-creation absence
+/// scan — so no filesystem walk happens here.
+fn ensure_normal_item_path(relative: &Path) -> Result<(), TransferError> {
     for component in relative.components() {
         if !matches!(component, std::path::Component::Normal(_)) {
             return Err(TransferError::InvalidItemPath {
                 path: relative.to_path_buf(),
             });
         }
-        prefix.push(component);
-        match std::fs::symlink_metadata(root.join(&prefix)) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                absent_prefixes.push(prefix.clone());
-            }
-            Err(error) => {
-                return Err(TransferError::io(
-                    "failed to inspect destination directory",
-                    error,
-                ));
-            }
-            Ok(_) => {}
-        }
     }
-    Ok(absent_prefixes)
+    Ok(())
 }
