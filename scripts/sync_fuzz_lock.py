@@ -285,7 +285,8 @@ def unification_replacements(
     old_identities: set[tuple[str, str]],
     after_identities: set[tuple[str, str]],
 ) -> dict[tuple[str, str], tuple[str, str]]:
-    """Attribute exact removals to a Cargo shared-transitive unification.
+    """
+    Attribute exact removals to a Cargo shared-transitive unification.
 
     Cargo unifies same-requirement consumers onto a single lock entry, so
     promoting a shared transitive can delete an exact identity that the old
@@ -294,9 +295,10 @@ def unification_replacements(
     resolves every requirer onto one surviving (name, new) record. A removal
     is attributed to that unification only when the removed identity has
     exactly one surviving same-name record, that record lies inside the exact
-    after closure (so the selected production update necessitated it), and it
-    preserves the removed record's source identity. Unrelated removals,
-    ambiguous survivors, and cross-source substitutions stay rejected.
+    after closure (so the selected production update necessitated it), it
+    preserves the removed record's source identity, and the repair itself
+    introduced it. Unrelated removals, ambiguous survivors, pre-existing
+    survivors, and cross-source substitutions stay rejected.
     """
     replacements: dict[tuple[str, str], tuple[str, str]] = {}
     candidates = sorted(
@@ -311,6 +313,12 @@ def unification_replacements(
         replacement = survivors[0]
         if replacement not in after_identities:
             continue
+        if replacement in before_records:
+            # A survivor that already existed in the before lock could
+            # silently downgrade or substitute a transitive by absorbing its
+            # consumers; only a record the repair itself introduced is
+            # provably the unification target.
+            continue
         if (
             before_records[identity].get("source")
             != after_records[replacement].get("source")
@@ -323,9 +331,10 @@ def unification_replacements(
 def is_exact_unification_rebind(
     before_targets: tuple[tuple[str, str], ...],
     after_targets: tuple[tuple[str, str], ...],
-    unification_replacements: dict[tuple[str, str], tuple[str, str]],
+    replacements: dict[tuple[str, str], tuple[str, str]],
 ) -> bool:
-    """True when an edge change is exactly the admitted unification mapping.
+    """
+    True when an edge change is exactly the admitted unification mapping.
 
     A rebinding consumer keeps its dependency-name surface and edge count;
     every changed target must map from an admitted removed identity onto its
@@ -335,7 +344,7 @@ def is_exact_unification_rebind(
     if len(before_targets) != len(after_targets):
         return False
     remapped = tuple(
-        unification_replacements.get(target, target) for target in before_targets
+        replacements.get(target, target) for target in before_targets
     )
     return remapped == after_targets and remapped != before_targets
 
@@ -349,7 +358,7 @@ def validate_dependency_edges(
     authorized_identities: set[tuple[str, str]],
     old_identities: set[tuple[str, str]],
     target_identities: set[tuple[str, str]],
-    unification_replacements: dict[tuple[str, str], tuple[str, str]],
+    replacements: dict[tuple[str, str], tuple[str, str]],
 ) -> None:
     """Reject semantic edge changes outside the reviewed dependency surface."""
     #lizard forgives
@@ -453,7 +462,7 @@ def validate_dependency_edges(
                 # exact old->replacement mapping proven by
                 # unification_replacements; every other rebind fails.
                 or is_exact_unification_rebind(
-                    before_targets, after_targets, unification_replacements
+                    before_targets, after_targets, replacements
                 )
             ):
                 continue
