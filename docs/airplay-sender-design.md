@@ -583,24 +583,37 @@ Tributary talks to an OwnTone instance as a transmission service:
   construction. "Daemon unreachable / version too old / pipe missing
   / API port taken" remain probe-time failures with actionable
   guidance.
-- **Exclusivity is enforced, revalidated, and restored — never
-  assumed.** A dedicated instance is the default posture, not a
-  substitute for the adapter treating the daemon as shared state,
-  because the API offers no session boundary an adapter could lean
-  on. At open, the session: records the current enabled output set,
-  verifies the player is stopped with an empty (or already-ours)
-  queue, then takes control — enable exactly the selected receiver,
-  clear the queue, start our pipe item — refusing with actionable
-  guidance if the player is active, and never preempting audible
-  playback. While open, every publication cycle (§4.4) revalidates
-  that the enabled set still selects exactly our receiver and that
-  the player state still reflects our session; a mismatch is session
-  loss surfaced through the §9.4 contract, not a silent re-takeover.
-  At close or failure, the session stops the player, removes our
-  queue items, and restores the recorded enabled set. Should a future
-  record ever attach to a pre-existing shared instance instead, it
-  inherits every one of these as hard, tested requirements plus a
-  written justification — that is the exception path, not the
+- **Exclusivity is locked before the first state read, revalidated,
+  and restored — never assumed.** A dedicated instance is the default
+  posture, not a substitute for the adapter treating the daemon as
+  shared state, because the API offers no session boundary an adapter
+  could lean on — any client can interleave between two HTTP calls,
+  so sequencing checks without a lock would leave a window where
+  another client takes over after our verification but before our
+  takeover. Before its first state read, therefore, the session
+  acquires an OS-level lock on the dedicated instance: an advisory
+  `flock` (or the platform equivalent) on a lock file inside the
+  instance's own state directory — a file only this adapter and the
+  instance's supervision ever open. The lock is held for the
+  session's entire lifetime: through recording the current enabled
+  output set, verifying the player is stopped with an empty (or
+  already-ours) queue, taking control (enable exactly the selected
+  receiver, clear the queue, start our pipe item), every §4.4
+  revalidation, and close-time restoration. A second Tributary
+  session that cannot take the lock refuses immediately with the
+  existing actionable-guidance path instead of interleaving with the
+  holder. The lock is released only after restoration completes —
+  player stopped, our queue items removed, the recorded enabled set
+  re-applied — and a crashed holder releases it by OS semantics;
+  the §4.4 revalidation remains the backstop for external clients
+  the lock cannot see. Open-time behavior is otherwise unchanged:
+  refusing with actionable guidance if the player is active, and
+  never preempting audible playback. A revalidation mismatch is
+  session loss surfaced through the §9.4 contract, not a silent
+  re-takeover. Should a future record ever attach to a pre-existing
+  shared instance instead, it inherits every one of these — lock,
+  revalidation, restoration — as hard, tested requirements plus a
+  written justification; that is the exception path, not the
   default.
 
 ### 4.4 What must NOT change in this refactor
@@ -815,6 +828,25 @@ What the implementation record must nail down, per §4.3:
   the Tributary↔daemon leg is a local FIFO plus loopback HTTP and
   needs no additional cryptography. The JSON API listener must be
   bound to loopback only in the adapter's generated config.
+  **Loopback is network isolation, not authentication, and the
+  design says so explicitly.** OwnTone's JSON API has no native
+  authentication (pinned [`docs/json-api.md`](https://github.com/owntone/owntone-server/blob/d6fb3edf5831de38134ebd92fcf09a730ddd37aa/docs/json-api.md)
+  documents none; access control is a deployment concern), and its
+  endpoints mutate state — `PUT /api/outputs/set` rewrites the
+  enabled-output set, `/api/queue/clear` empties the queue, and the
+  `/api/player/*` endpoints drive playback. The threat model is
+  therefore explicit and recorded here: the dedicated instance is
+  owned by the invoking user; the adapter generates its config,
+  FIFO, lock file, and state directories with owner-only
+  permissions (umask-enforced, verified in the implementation
+  record's tests); and **every local process running as the same
+  user is trusted by this design** — same-user interference is
+  accepted residual risk, and cross-user interference is excluded
+  by OS user separation, not by the API. A record that must relax
+  same-user trust (shared multi-user hosts) has to add an
+  authentication or reverse-proxy layer and re-open this section;
+  this one documents the trust boundary instead of pretending
+  loopback binding authenticates.
 - **Audio:** s16le 44100 Hz stereo into the pipe (§2.4, §4.3);
   encoding, framing, and per-device quirks are the daemon's.
 - **Timing/position:** the daemon session publishes position and
