@@ -12,19 +12,26 @@ use std::path::PathBuf;
 use super::executor_rollback_tests::{entry_names, run_plan_expect_failure};
 use super::executor_tests::transfer_request;
 use super::test_support::{authority_pair, read_authority, write_source_file};
-use super::types::{Stage, TransferItem};
-use super::TransferPlanner;
+use super::types::{
+    Stage, TransferError, TransferItem, TransferPlan, TransferProgress, TransferRequest,
+};
+use super::{TransferExecutor, TransferPlanner};
 use crate::local::write_authority::ConflictPolicy;
+use crate::source_lifecycle::CancellationObserver;
 
-#[test]
-fn directory_rollback_removes_created_directories() {
-    let source_root = tempfile::tempdir().expect("temporary source root");
-    let destination_root = tempfile::tempdir().expect("temporary destination root");
-    write_source_file(source_root.path(), "album/a.flac", b"a");
-    write_source_file(source_root.path(), "album/b.flac", b"b");
-    write_source_file(source_root.path(), "album/sub/c.flac", b"c");
-    let source = read_authority(source_root.path());
-    let (_, destination) = authority_pair(destination_root.path());
+/// Plan an album→imported directory transfer of the shared two-file
+/// source fixture: `album/a.flac` and `album/b.flac` over a fresh
+/// destination authority under [`ConflictPolicy::Preserve`]. Returns the
+/// request and its plan so tests can interpose between planning and
+/// execution.
+fn planned_album_import_transfer(
+    source_root: &std::path::Path,
+    destination_root: &std::path::Path,
+) -> (TransferRequest, TransferPlan) {
+    write_source_file(source_root, "album/a.flac", b"a");
+    write_source_file(source_root, "album/b.flac", b"b");
+    let source = read_authority(source_root);
+    let (_, destination) = authority_pair(destination_root);
     let request = transfer_request(
         source,
         destination,
@@ -35,6 +42,16 @@ fn directory_rollback_removes_created_directories() {
         ConflictPolicy::Preserve,
     );
     let plan = TransferPlanner::new().plan(&request).expect("plan");
+    (request, plan)
+}
+
+#[test]
+fn directory_rollback_removes_created_directories() {
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    write_source_file(source_root.path(), "album/sub/c.flac", b"c");
+    let (request, plan) =
+        planned_album_import_transfer(source_root.path(), destination_root.path());
     std::fs::remove_file(source_root.path().join("album/b.flac")).expect("remove source b");
     let _error = run_plan_expect_failure(request, plan);
     assert!(
@@ -48,26 +65,14 @@ fn directory_rollback_removes_created_directories() {
 fn pre_existing_directory_survives_rollback() {
     let source_root = tempfile::tempdir().expect("temporary source root");
     let destination_root = tempfile::tempdir().expect("temporary destination root");
-    write_source_file(source_root.path(), "album/a.flac", b"a");
-    write_source_file(source_root.path(), "album/b.flac", b"b");
     std::fs::create_dir(destination_root.path().join("imported")).expect("pre-create imported");
     std::fs::write(
         destination_root.path().join("imported/foreign.txt"),
         b"foreign",
     )
     .expect("write foreign entry");
-    let source = read_authority(source_root.path());
-    let (_, destination) = authority_pair(destination_root.path());
-    let request = transfer_request(
-        source,
-        destination,
-        vec![TransferItem::new(
-            PathBuf::from("album"),
-            PathBuf::from("imported"),
-        )],
-        ConflictPolicy::Preserve,
-    );
-    let plan = TransferPlanner::new().plan(&request).expect("plan");
+    let (request, plan) =
+        planned_album_import_transfer(source_root.path(), destination_root.path());
     std::fs::remove_file(source_root.path().join("album/b.flac")).expect("remove source b");
     let _error = run_plan_expect_failure(request, plan);
     // The pre-existing directory holds foreign data; it must survive even
@@ -85,13 +90,8 @@ fn pre_existing_directory_survives_rollback() {
 #[cfg(unix)]
 #[test]
 fn mount_swap_during_execution_fails_closed() {
-    // Unix-only imports: the swap scenario itself cannot exist behind the
-    // retained Windows handles, and module-level imports here would be
-    // unused — a hard error under `-D warnings` — on Windows.
-    use super::types::{Stage, TransferError, TransferProgress};
-    use super::TransferExecutor;
-    use crate::source_lifecycle::CancellationObserver;
-
+    // Unix-only: the swap scenario itself cannot exist behind the
+    // retained Windows handles.
     let source_root = tempfile::tempdir().expect("temporary source root");
     let destination_root = tempfile::tempdir().expect("temporary destination root");
     write_source_file(source_root.path(), "one.flac", b"one");
@@ -187,6 +187,31 @@ fn directory_appearing_after_plan_survives_rollback() {
     );
 }
 
+/// Interposition that swaps a pre-built newcomer directory over the
+/// destination directory the instant the create stage commits — the
+/// audit's replace-between-create-and-identity-capture window, driven
+/// through the progress callback.
+struct ReplaceCreatedDirectory {
+    created: std::path::PathBuf,
+    newcomer: std::path::PathBuf,
+}
+impl TransferProgress for ReplaceCreatedDirectory {
+    fn on_stage_completed(
+        &mut self,
+        stage: &Stage,
+        _index: u32,
+        _total: u32,
+        _bytes_so_far: u64,
+        _total_bytes: u64,
+    ) {
+        if matches!(stage, Stage::CreateDirectory { .. }) {
+            std::fs::remove_dir_all(&self.created).expect("remove created directory");
+            std::fs::rename(&self.newcomer, &self.created)
+                .expect("newcomer replaces the created directory");
+        }
+    }
+}
+
 /// A newcomer that replaces a directory the transfer just created — after
 /// the create stage committed but before the transfer finished — is never
 /// recorded as owned: the recorded identity is the one the authority
@@ -196,26 +221,10 @@ fn directory_appearing_after_plan_survives_rollback() {
 /// requires for created directories.
 #[test]
 fn created_directory_replaced_midrun_is_refused_by_rollback() {
-    use super::types::{Stage, TransferError, TransferProgress};
-    use super::TransferExecutor;
-    use crate::source_lifecycle::CancellationObserver;
-
     let source_root = tempfile::tempdir().expect("temporary source root");
     let destination_root = tempfile::tempdir().expect("temporary destination root");
-    write_source_file(source_root.path(), "album/a.flac", b"a");
-    write_source_file(source_root.path(), "album/b.flac", b"b");
-    let source = read_authority(source_root.path());
-    let (_, destination) = authority_pair(destination_root.path());
-    let request = transfer_request(
-        source,
-        destination,
-        vec![TransferItem::new(
-            PathBuf::from("album"),
-            PathBuf::from("imported"),
-        )],
-        ConflictPolicy::Preserve,
-    );
-    let plan = TransferPlanner::new().plan(&request).expect("plan");
+    let (request, plan) =
+        planned_album_import_transfer(source_root.path(), destination_root.path());
     // The copy of b.flac fails after the create stage and the copy of
     // a.flac have committed, triggering the rollback.
     std::fs::remove_file(source_root.path().join("album/b.flac")).expect("remove source b");
@@ -227,26 +236,6 @@ fn created_directory_replaced_midrun_is_refused_by_rollback() {
     let newcomer = destination_root.path().join("newcomer");
     std::fs::create_dir(&newcomer).expect("create newcomer directory");
     std::fs::write(newcomer.join("foreign.txt"), b"foreign").expect("write foreign entry");
-    struct ReplaceCreatedDirectory {
-        created: std::path::PathBuf,
-        newcomer: std::path::PathBuf,
-    }
-    impl TransferProgress for ReplaceCreatedDirectory {
-        fn on_stage_completed(
-            &mut self,
-            stage: &Stage,
-            _index: u32,
-            _total: u32,
-            _bytes_so_far: u64,
-            _total_bytes: u64,
-        ) {
-            if matches!(stage, Stage::CreateDirectory { .. }) {
-                std::fs::remove_dir_all(&self.created).expect("remove created directory");
-                std::fs::rename(&self.newcomer, &self.created)
-                    .expect("newcomer replaces the created directory");
-            }
-        }
-    }
     let mut progress = ReplaceCreatedDirectory {
         created: destination_root.path().join("imported"),
         newcomer,
