@@ -154,7 +154,7 @@ satisfy the gate.
 | Desktop Metadata | GitHub Actions (15368) |
 | SHA256 Checksums | GitHub Actions (15368) |
 | Windows (aarch64) | GitHub Actions (15368) |
-| Bot Review Gate | dedicated bot-review-gate-publisher App (repository variable `BOT_REVIEW_GATE_APP_ID`) |
+| Bot Review Gate | dedicated gate-publisher App (repository variable `BOT_REVIEW_GATE_APP_ID`) |
 | CodeQL | GitHub Advanced Security (57789) |
 | Analyze (python) | GitHub Advanced Security (57789) |
 | Analyze (rust) | GitHub Advanced Security (57789) |
