@@ -386,14 +386,67 @@ impl PublishedIdentityProof {
     }
 }
 
+/// Open a retained identity handle on `leaf` inside the open `parent`
+/// directory: an `O_PATH|NOFOLLOW` descriptor that keeps the object alive
+/// and re-statable across the publish rename. The post-publish proof uses
+/// it to refresh the published object's identity EXACTLY — `fstat` names
+/// the retained object itself, never whatever the name holds afterwards —
+/// instead of inferring sameness from a device/index pair that an
+/// immediate same-directory recreate can inherit (a freed index is the
+/// first candidate the allocator hands back). `None` when the platform has
+/// no path-less handle type or the open fails; the proof then degrades to
+/// the legacy device/index comparison rather than changing behavior on
+/// platforms the exact proof cannot serve.
+#[cfg(unix)]
+fn retained_leaf_handle(parent: &File, leaf: &OsStr) -> Option<File> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        rustix::fs::openat(
+            parent,
+            leaf,
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .ok()
+        .map(File::from)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = (parent, leaf);
+        None
+    }
+}
+
+/// Refresh the identity of the object a retained handle holds. `fstat` is
+/// permitted on `O_PATH` descriptors, so the handle needs neither read
+/// access nor a re-lookup through the leaf's (possibly replaced) name; the
+/// refresh reads the object's CURRENT metadata, which is what the rename
+/// legitimately updated.
+#[cfg(unix)]
+fn retained_handle_identity(handle: &File) -> Option<LeafIdentity> {
+    rustix::fs::fstat(handle)
+        .ok()
+        .map(|stat| leaf_identity_from_stat(&stat))
+}
+
 /// Refresh a pre-publish staged-object capture into the recorded published
-/// identity. A rename legitimately updates the published object's
-/// change instant, so the staged capture alone can never compare exactly
+/// identity. A rename legitimately updates the published object's change
+/// instant, so the staged capture alone can never compare exactly
 /// against a later same-name reversal verification; the post-publish lookup
 /// here supplies the refreshed identity but is accepted ONLY when it names
 /// the same object the staged capture bound — a concurrent writer's
 /// replacement landing in the capture window is never recorded as the
 /// publication (it would be matched and destroyed by a later rollback).
+///
+/// The acceptance proof is exact whenever a retained handle on the staged
+/// object is available ([`retained_leaf_handle`], opened before the
+/// rename): the refresh is accepted only when the destination's FULL
+/// identity — device, index, and change instant — equals an `fstat` of the
+/// retained object. A device/index-only comparison cannot distinguish the
+/// staged object from a foreign replacement that inherited its recycled
+/// index; the exact proof closes that hole. Both the `fstat` and the
+/// destination lookup describe the same post-rename instant, so a landed
+/// publish compares equal against its own retained object.
 ///
 /// When the proof FAILS — the leaf vanished, the lookup errored, or a
 /// foreign object interposed — the admitted staged identity is recorded
@@ -409,10 +462,28 @@ fn cross_checked_published_identity(
     parent: &File,
     leaf: &OsStr,
     staged: Option<LeafIdentity>,
+    staged_object: Option<&File>,
 ) -> PublishedIdentityProof {
     let Some(staged) = staged else {
         return PublishedIdentityProof::Uncaptured;
     };
+    if let Some(refreshed) = staged_object.and_then(retained_handle_identity) {
+        return match leaf_identity_at(parent, leaf) {
+            Ok(Some(current)) if current == refreshed => {
+                PublishedIdentityProof::Verified(refreshed)
+            }
+            // A failed proof: preserve the admitted identity. An intact
+            // publication whose lookup merely errored transiently may also
+            // be refused by a later full-equality reversal — a safe
+            // outcome, never a destructive one.
+            Ok(_) | Err(_) => PublishedIdentityProof::Admitted(staged),
+        };
+    }
+    // Degraded proof (no retained handle: a platform without `O_PATH`, or
+    // the open failed): compare objects — device and index. A recreated
+    // object that inherited the recycled index still passes here; that is
+    // the hole the exact proof above closes, kept only where the exact
+    // proof is unavailable.
     match leaf_identity_at(parent, leaf) {
         Ok(Some(current)) if current.same_object(&staged) => {
             PublishedIdentityProof::Verified(current)
@@ -998,6 +1069,8 @@ impl MountedRootAuthority {
         // concurrent writer does to the destination name afterwards.
         #[cfg(unix)]
         let staged_identity = leaf_identity_at(parent.handle(), from_leaf).ok().flatten();
+        #[cfg(unix)]
+        let staged_object = retained_leaf_handle(parent.handle(), from_leaf);
         #[cfg(windows)]
         let staged_identity = leaf_identity_at_path(from_absolute).ok().flatten();
         let outcome = if no_replace {
@@ -1033,8 +1106,13 @@ impl MountedRootAuthority {
         // across a rename, so the staged capture itself is the stable
         // published identity.
         #[cfg(unix)]
-        let published_leaf =
-            cross_checked_published_identity(parent.handle(), to_leaf, staged_identity).recorded();
+        let published_leaf = cross_checked_published_identity(
+            parent.handle(),
+            to_leaf,
+            staged_identity,
+            staged_object.as_ref(),
+        )
+        .recorded();
         #[cfg(windows)]
         let published_leaf = staged_identity;
         let post_validate = parent.validate_with(self);
@@ -4140,6 +4218,7 @@ fn replace_publish_attempt(
             // identity names the transfer's publication even if a
             // concurrent writer replaces the destination name afterwards.
             let staged = leaf_identity_at(parent, from_leaf).ok().flatten();
+            let staged_object = retained_leaf_handle(parent, from_leaf);
             return match rename_no_replace_within_parent(
                 parent,
                 from_leaf,
@@ -4149,7 +4228,13 @@ fn replace_publish_attempt(
             ) {
                 Ok(()) => Ok(Some((
                     false,
-                    cross_checked_published_identity(parent, to_leaf, staged).recorded(),
+                    cross_checked_published_identity(
+                        parent,
+                        to_leaf,
+                        staged,
+                        staged_object.as_ref(),
+                    )
+                    .recorded(),
                 ))),
                 // The creation won the race — loop back and bind it.
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(None),
@@ -4270,9 +4355,12 @@ fn swap_and_verify_replace(
     // itself updates the object's change instant — the raw staged capture
     // could never compare exactly in a later reversal.
     let staged = leaf_identity_at(parent, from_leaf).ok().flatten();
+    let staged_object = retained_leaf_handle(parent, from_leaf);
     match renameat_with(parent, from_leaf, parent, to_leaf, RenameFlags::EXCHANGE) {
         Ok(()) => {
-            let published = cross_checked_published_identity(parent, to_leaf, staged).recorded();
+            let published =
+                cross_checked_published_identity(parent, to_leaf, staged, staged_object.as_ref())
+                    .recorded();
             verify_atomic_swap(
                 parent,
                 from_leaf,
@@ -6883,6 +6971,8 @@ mod tests {
                 .expect("write staged leaf");
             let parent = open_parent_dir(directory.path());
             let staged = staged_capture(&parent, OsStr::new("staged.tmp"));
+            let staged_object = retained_leaf_handle(&parent, OsStr::new("staged.tmp"))
+                .expect("retain the staged object");
 
             // The publish renames the staged object onto the destination:
             // same object, updated change instant.
@@ -6892,7 +6982,12 @@ mod tests {
             )
             .expect("publish rename");
 
-            match cross_checked_published_identity(&parent, OsStr::new("song.flac"), Some(staged)) {
+            match cross_checked_published_identity(
+                &parent,
+                OsStr::new("song.flac"),
+                Some(staged),
+                Some(&staged_object),
+            ) {
                 PublishedIdentityProof::Verified(recorded) => {
                     let current = staged_capture(&parent, OsStr::new("song.flac"));
                     assert_eq!(
@@ -6915,13 +7010,26 @@ mod tests {
                 .expect("write published leaf");
             let parent = open_parent_dir(directory.path());
             let staged = staged_capture(&parent, OsStr::new("song.flac"));
+            let staged_object = retained_leaf_handle(&parent, OsStr::new("song.flac"))
+                .expect("retain the staged object");
 
             // A concurrent writer replaces the publication with a NEW
-            // object in the capture window.
+            // object in the capture window. The unlink-then-recreate
+            // pattern deliberately invites the allocator to hand the freed
+            // index straight back (observed on the aarch64 CI runners): the
+            // proof must not care either way, because it compares the FULL
+            // identity of the retained object — device, index, and change
+            // instant — and the replacement carries its own later instant
+            // even when it inherits the index.
             fs::remove_file(directory.path().join("song.flac")).expect("racer unlink");
             fs::write(directory.path().join("song.flac"), b"racer bytes").expect("racer replace");
 
-            match cross_checked_published_identity(&parent, OsStr::new("song.flac"), Some(staged)) {
+            match cross_checked_published_identity(
+                &parent,
+                OsStr::new("song.flac"),
+                Some(staged),
+                Some(&staged_object),
+            ) {
                 PublishedIdentityProof::Admitted(recorded) => {
                     assert_eq!(
                         recorded, staged,
@@ -6942,10 +7050,17 @@ mod tests {
                 .expect("write published leaf");
             let parent = open_parent_dir(directory.path());
             let staged = staged_capture(&parent, OsStr::new("song.flac"));
+            let staged_object = retained_leaf_handle(&parent, OsStr::new("song.flac"))
+                .expect("retain the staged object");
 
             fs::remove_file(directory.path().join("song.flac")).expect("racer removal");
 
-            match cross_checked_published_identity(&parent, OsStr::new("song.flac"), Some(staged)) {
+            match cross_checked_published_identity(
+                &parent,
+                OsStr::new("song.flac"),
+                Some(staged),
+                Some(&staged_object),
+            ) {
                 PublishedIdentityProof::Admitted(recorded) => {
                     assert_eq!(recorded, staged);
                 }
@@ -6961,12 +7076,56 @@ mod tests {
             fs::write(directory.path().join("song.flac"), b"published bytes")
                 .expect("write published leaf");
             let parent = open_parent_dir(directory.path());
+            let staged_object = retained_leaf_handle(&parent, OsStr::new("song.flac"))
+                .expect("retain the published object");
 
-            match cross_checked_published_identity(&parent, OsStr::new("song.flac"), None) {
+            // A retained handle without a staged capture proves nothing —
+            // only the pre-rename capture is the admission — so the record
+            // still degrades to the legacy path-only reversal.
+            match cross_checked_published_identity(
+                &parent,
+                OsStr::new("song.flac"),
+                None,
+                Some(&staged_object),
+            ) {
                 PublishedIdentityProof::Uncaptured => {}
                 other => panic!("a missing staged capture must degrade: {other:?}"),
             }
             assert!(PublishedIdentityProof::Uncaptured.recorded().is_none());
+        }
+
+        #[test]
+        fn degraded_proof_still_verifies_a_genuine_refresh() {
+            let directory = TestDirectory::new("proof-degraded");
+            fs::write(directory.path().join("staged.tmp"), b"published bytes")
+                .expect("write staged leaf");
+            let parent = open_parent_dir(directory.path());
+            let staged = staged_capture(&parent, OsStr::new("staged.tmp"));
+
+            fs::rename(
+                directory.path().join("staged.tmp"),
+                directory.path().join("song.flac"),
+            )
+            .expect("publish rename");
+
+            // Platforms without a path-less handle type (and failed
+            // handle opens) fall back to the legacy device/index
+            // comparison; it must keep verifying a genuine rename refresh.
+            match cross_checked_published_identity(
+                &parent,
+                OsStr::new("song.flac"),
+                Some(staged),
+                None,
+            ) {
+                PublishedIdentityProof::Verified(recorded) => {
+                    let current = staged_capture(&parent, OsStr::new("song.flac"));
+                    assert_eq!(
+                        recorded, current,
+                        "the verified record must be the post-publish capture"
+                    );
+                }
+                other => panic!("expected a verified degraded proof, got {other:?}"),
+            }
         }
     }
 
