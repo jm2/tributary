@@ -1421,10 +1421,17 @@ impl MountedRootAuthority {
     /// retained root, walking and creating each level no-follow from the
     /// retained root handle on Unix. An existing directory is tolerated
     /// only when it is a real directory, never a symlink.
+    ///
+    /// Every created component is reported together with the no-follow
+    /// identity captured from the created object itself during the
+    /// exclusive creation — never from a later lookup of the component's
+    /// path, so a concurrent writer that replaces a just-created component
+    /// can never have its object recorded (and later rolled back) as the
+    /// transfer's own.
     pub(super) fn create_directories_within(
         &self,
         components: &[OsString],
-    ) -> io::Result<Vec<usize>> {
+    ) -> io::Result<Vec<CreatedDirectoryComponent>> {
         if components.is_empty() {
             return Err(invalid_input(
                 "directory creation requires a path below the mounted root",
@@ -1438,7 +1445,13 @@ impl MountedRootAuthority {
             for (index, component) in components.iter().enumerate() {
                 let (opened, created_component) = ensure_directory_component(&current, component)?;
                 if created_component {
-                    created.push(index);
+                    // The identity is read from the handle opened on the
+                    // component this call just created: a race-free fstat of
+                    // the creation product, not a re-lookup of the name.
+                    created.push(CreatedDirectoryComponent {
+                        index,
+                        identity: retained_handle_identity(&opened),
+                    });
                 }
                 current = opened;
                 ensure_boundary(self.boundary, &current)?;
@@ -3923,6 +3936,25 @@ fn validate_leaf_name(leaf: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
+/// One directory component an exclusive-creation walk actually created,
+/// paired with the no-follow identity captured from the created object
+/// itself during the creation call. The capture is anchored to the
+/// creation-time handle (an fstat of the handle this invocation opened on
+/// the component it just created), never to a later lookup of the
+/// component's path: a concurrent writer that replaces the component
+/// after creation must never have its object recorded — and later rolled
+/// back — as the transfer's own.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CreatedDirectoryComponent {
+    /// Index of the component within the requested creation chain.
+    pub index: usize,
+    /// Identity of the created object. `None` only when the platform
+    /// cannot capture an identity from the creation handle; such a
+    /// component degrades the eventual reversal to the legacy path-only
+    /// behavior, exactly like an uncaptured publish identity.
+    pub identity: Option<LeafIdentity>,
+}
+
 /// Create one path component as a directory inside `current` (or verify the
 /// existing entry is a real directory), then open it no-follow for the next
 /// walk level. Unix only; used by
@@ -4831,15 +4863,25 @@ fn replace_publish_loop(
 
 /// Windows fallback for [`MountedRootAuthority::create_directories_within`]:
 /// path-based per-component creation with a reparse-free is-directory check,
-/// mirroring the historical `create_directory_atomic` behavior.
+/// mirroring the historical `create_directory_atomic` behavior. Every
+/// created component's identity is captured from a handle opened on the
+/// just-created object — the closest object-anchored capture available to a
+/// creation primitive without a parent directory handle — so the report
+/// never depends on a lookup that a later replacement could influence.
 #[cfg(windows)]
-fn create_directory_tree_by_path(root: &Path, components: &[OsString]) -> io::Result<Vec<usize>> {
+fn create_directory_tree_by_path(
+    root: &Path,
+    components: &[OsString],
+) -> io::Result<Vec<CreatedDirectoryComponent>> {
     let mut path = root.to_path_buf();
     let mut created = Vec::new();
     for (index, component) in components.iter().enumerate() {
         path.push(component);
         match std::fs::create_dir(&path) {
-            Ok(()) => created.push(index),
+            Ok(()) => created.push(CreatedDirectoryComponent {
+                index,
+                identity: leaf_identity_at_path(&path).ok().flatten(),
+            }),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let metadata = std::fs::symlink_metadata(&path)?;
                 if !metadata.is_dir() {

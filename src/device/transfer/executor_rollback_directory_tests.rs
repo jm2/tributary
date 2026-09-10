@@ -187,6 +187,89 @@ fn directory_appearing_after_plan_survives_rollback() {
     );
 }
 
+/// A newcomer that replaces a directory the transfer just created — after
+/// the create stage committed but before the transfer finished — is never
+/// recorded as owned: the recorded identity is the one the authority
+/// captured during the exclusive creation, so the rollback refuses the
+/// replacement fail-closed and the newcomer (with its foreign data)
+/// survives. This is the interposition guarantee the transfer audit
+/// requires for created directories.
+#[test]
+fn created_directory_replaced_midrun_is_refused_by_rollback() {
+    use super::types::{Stage, TransferError, TransferProgress};
+    use super::TransferExecutor;
+    use crate::source_lifecycle::CancellationObserver;
+
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    write_source_file(source_root.path(), "album/a.flac", b"a");
+    write_source_file(source_root.path(), "album/b.flac", b"b");
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = transfer_request(
+        source,
+        destination,
+        vec![TransferItem::new(
+            PathBuf::from("album"),
+            PathBuf::from("imported"),
+        )],
+        ConflictPolicy::Preserve,
+    );
+    let plan = TransferPlanner::new().plan(&request).expect("plan");
+    // The copy of b.flac fails after the create stage and the copy of
+    // a.flac have committed, triggering the rollback.
+    std::fs::remove_file(source_root.path().join("album/b.flac")).expect("remove source b");
+    // The newcomer is a sibling directory created before the transfer ran
+    // and renamed over the just-created `imported` once the create stage
+    // completes. Renaming a pre-existing directory (rather than recreating
+    // one) keeps the newcomer's identity independent of index reuse on
+    // every filesystem.
+    let newcomer = destination_root.path().join("newcomer");
+    std::fs::create_dir(&newcomer).expect("create newcomer directory");
+    std::fs::write(newcomer.join("foreign.txt"), b"foreign").expect("write foreign entry");
+    struct ReplaceCreatedDirectory {
+        created: std::path::PathBuf,
+        newcomer: std::path::PathBuf,
+    }
+    impl TransferProgress for ReplaceCreatedDirectory {
+        fn on_stage_completed(
+            &mut self,
+            stage: &Stage,
+            _index: u32,
+            _total: u32,
+            _bytes_so_far: u64,
+            _total_bytes: u64,
+        ) {
+            if matches!(stage, Stage::CreateDirectory { .. }) {
+                std::fs::remove_dir_all(&self.created).expect("remove created directory");
+                std::fs::rename(&self.newcomer, &self.created)
+                    .expect("newcomer replaces the created directory");
+            }
+        }
+    }
+    let mut progress = ReplaceCreatedDirectory {
+        created: destination_root.path().join("imported"),
+        newcomer,
+    };
+    let observer = CancellationObserver::never_cancelled();
+    let error = TransferExecutor::new(request, plan)
+        .run(&mut progress, &observer)
+        .expect_err("an interposed replacement must fail the transfer fail-closed");
+    assert!(
+        matches!(error, TransferError::RollbackFailed { .. }),
+        "rollback must refuse the replaced directory: {error:?}"
+    );
+    assert_eq!(
+        std::fs::read(destination_root.path().join("imported/foreign.txt")).expect("read foreign"),
+        b"foreign",
+        "the newcomer must survive the rollback"
+    );
+    assert!(
+        !destination_root.path().join("imported/a.flac").exists(),
+        "the transfer's own committed copy must still be rolled back"
+    );
+}
+
 /// A directory item mapped to a nested destination stages every missing
 /// ancestor before its leaf, and the executor records each created
 /// component: a failed transfer must remove the whole created chain
