@@ -784,28 +784,37 @@ What the implementation record must nail down, per §4.3:
   acquisition channels (§5.4, rechecked 2026-09-09: Raspberry Pi OS,
   Debian/Ubuntu amd64, Docker, OpenWrt, FreeBSD) are upstream's, not
   Tributary platforms — Docker, OpenWrt, and FreeBSD are not Tributary
-  package targets and confer no availability here. The matrix below
-  is the design's availability decision for every Tributary target;
-  each row was checked against the documented channel on 2026-09-09:
+  package targets and confer no availability here. The design's
+  availability decision for every Tributary target follows; each
+  entry was checked against the documented channel on 2026-09-09:
 
-  | Tributary package target | Documented OwnTone acquisition + §4.3 dedicated-instance runtime | Sender availability |
-  |---|---|---|
-  | `.deb` (Debian/Ubuntu-family installs) | Upstream-documented Debian/Ubuntu amd64 packages; user-native daemon Tributary can own and supervise | **Available** |
-  | Fedora RPM (COPR, `.rpm` releases) | No OwnTone channel documented upstream | **Unavailable — fail-closed** |
-  | Arch AUR (`tributary`, `-bin`, `-git`) | Only the community AUR `owntone-server` package; not an upstream-documented channel | **Unavailable — fail-closed** |
-  | Flatpak | No OwnTone app or runtime extension on Flathub; the sandbox cannot own a host daemon (§4.3); bundling forbidden (§11) | **Unavailable — fail-closed** |
-  | macOS `.dmg` | No channel documented upstream (no Homebrew formula); bundling forbidden (§11) | **Unavailable — fail-closed** |
-  | Windows (winget, installer, zip) | No channel documented upstream; bundling forbidden (§11) | **Unavailable — fail-closed** |
+  - `.deb` (Debian/Ubuntu-family installs) — **Available.** Upstream
+    documents Debian/Ubuntu amd64 packages; the user-native daemon is
+    one Tributary can own and supervise (§4.3).
+  - Fedora RPM (COPR, `.rpm` releases) — **Unavailable —
+    fail-closed.** No OwnTone channel is documented upstream.
+  - Arch AUR (`tributary`, `tributary-bin`, `tributary-git`) —
+    **Unavailable — fail-closed.** Only the community AUR
+    `owntone-server` package exists; not an upstream-documented
+    channel.
+  - Flatpak — **Unavailable — fail-closed.** No OwnTone app or
+    runtime extension on Flathub; the sandbox cannot own a host
+    daemon (§4.3); bundling forbidden (§11).
+  - macOS `.dmg` — **Unavailable — fail-closed.** No channel
+    documented upstream (no Homebrew formula); bundling forbidden
+    (§11).
+  - Windows (winget, installer, zip) — **Unavailable — fail-closed.**
+    No channel documented upstream; bundling forbidden (§11).
 
-  Rows marked available gain the "for AirPlay output, install
+  Targets marked available gain the "for AirPlay output, install
   OwnTone ≥ 29.x" install-docs entry with the pinned source (upstream
   releases page); where OwnTone is absent even from a covered
   distro's own archives (no official Debian archive), the docs say so
-  and the probe error repeats it. Unavailable rows ship the honest
+  and the probe error repeats it. Unavailable targets ship the honest
   fail-closed state: install docs state that AirPlay output requires
   an OwnTone-capable target with no acquisition path implied, and the
   probe fails closed with the same localized unavailable contract as
-  today's `raopsink` message. The Arch row names the community AUR
+  today's `raopsink` message. The Arch entry names the community AUR
   `owntone-server` package honestly but does not treat it as a
   supported acquisition path, because it fails the
   dependency-documentation discipline above (community-maintained,
