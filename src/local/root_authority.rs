@@ -6964,6 +6964,11 @@ mod tests {
                 .expect("staged leaf exists")
         }
 
+        // The exact-object proof requires a path-less retained handle
+        // (O_PATH), which only Linux-family kernels provide; elsewhere the
+        // proof legitimately degrades and [`degraded_proof_still_verifies_a_genuine_refresh`]
+        // covers the fallback.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         #[test]
         fn verified_proof_records_the_refreshed_identity() {
             let directory = TestDirectory::new("proof-verified");
@@ -7003,6 +7008,7 @@ mod tests {
             }
         }
 
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         #[test]
         fn foreign_interposition_preserves_the_admitted_identity() {
             let directory = TestDirectory::new("proof-foreign");
@@ -7043,6 +7049,7 @@ mod tests {
             }
         }
 
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         #[test]
         fn vanishing_leaf_preserves_the_admitted_identity() {
             let directory = TestDirectory::new("proof-vanished");
@@ -7070,6 +7077,7 @@ mod tests {
             }
         }
 
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         #[test]
         fn missing_staged_capture_degrades_to_uncaptured() {
             let directory = TestDirectory::new("proof-uncaptured");
