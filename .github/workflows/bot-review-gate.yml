@@ -13,6 +13,10 @@ name: Bot review gate
 # executes from its default-branch revision via the `workflow_run` event.
 # This file contributes nothing but the refresh events:
 #   * pull_request synchronize re-announces at every new head;
+#   * pull_request edited re-announces when the pull request record changes
+#     without a push — retargeting to main above all, because a base-branch
+#     change alters which pull request the announced commit must be
+#     evaluated against and fires no other event;
 #   * pull_request_review submitted/edited/dismissed re-announces when a
 #     conclusion is made, revised, or formally withdrawn;
 #   * pull_request_review_comment created re-announces when a thread is
@@ -45,7 +49,7 @@ on:
   pull_request:
     branches:
       - main
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
   pull_request_review:
     types: [submitted, edited, dismissed]
   pull_request_review_comment:
