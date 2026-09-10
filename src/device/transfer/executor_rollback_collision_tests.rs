@@ -2,11 +2,11 @@
 //! [`TransferExecutor`](super::TransferExecutor).
 //!
 //! A destination that appears after planning is resolved by the recorded
-//! policy (Skip, Fail, or one Preserve re-resolution), never by a silent
-//! replace, and a skipped stage must neither count nor report its discarded
-//! bytes as copied. A leaf a concurrent writer substituted for a published
-//! or replaced destination must survive rollback untouched, with the
-//! reversal refused fail-closed.
+//! policy (Skip, Fail, one Preserve re-resolution, or an Overwrite
+//! replacement), never by a silent unbacked replace, and a skipped stage
+//! must neither count nor report its discarded bytes as copied. A leaf a
+//! concurrent writer substituted for a published or replaced destination
+//! must survive rollback untouched, with the reversal refused fail-closed.
 
 use std::path::PathBuf;
 
@@ -98,6 +98,50 @@ fn post_plan_collision_under_skip_policy_skips_the_stage() {
         entry_names(destination_root.path()),
         vec!["song.flac".to_string()],
         "staged bytes of the skipped stage must be discarded"
+    );
+}
+
+/// A destination that appears after planning under an Overwrite request is
+/// replaced, exactly as the stated policy demands: the fresh-planned
+/// no-replace publish refused to destroy the interposed occupant, and the
+/// re-resolution binds it to a commit-time backup before publishing the
+/// transfer's bytes — the collision must not surface as a generic commit
+/// failure.
+#[test]
+fn post_plan_collision_under_overwrite_policy_replaces_the_destination() {
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    write_source_file(source_root.path(), "song.flac", b"planned song");
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = transfer_request(
+        source,
+        destination,
+        vec![TransferItem::same(PathBuf::from("song.flac"))],
+        ConflictPolicy::Overwrite,
+    );
+    let plan = TransferPlanner::new().plan(&request).expect("plan");
+    // The destination appears after planning; Overwrite must replace it,
+    // with the interposed bytes backed up at commit time rather than
+    // destroyed unbacked.
+    std::fs::write(destination_root.path().join("song.flac"), b"racer")
+        .expect("write post-plan destination");
+    let observer = CancellationObserver::never_cancelled();
+    let mut progress = ();
+    let summary = TransferExecutor::new(request, plan)
+        .run(&mut progress, &observer)
+        .expect("overwrite re-resolution must not fail the transfer");
+    assert_eq!(summary.committed_stages, 1);
+    assert!(summary.completed);
+    assert_eq!(
+        std::fs::read(destination_root.path().join("song.flac")).expect("read replaced song"),
+        b"planned song",
+        "the transfer's bytes must replace the post-plan destination"
+    );
+    assert_eq!(
+        entry_names(destination_root.path()),
+        vec!["song.flac".to_string()],
+        "no backup litter may survive a successful overwrite"
     );
 }
 

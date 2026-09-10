@@ -53,13 +53,17 @@ pub struct CommitOutcome {
     /// and destroyed. `None` when nothing pre-existing was replaced (a
     /// fresh publish or a preserved sibling).
     pub replaced_original: Option<PathBuf>,
-    /// No-follow identity of the published leaf, captured immediately after
-    /// the winning publish by the write authority. Rollback reversals
+    /// No-follow identity of the published leaf, bound to the staged object
+    /// immediately before the winning publish (the rename preserves the
+    /// object, so this names exactly what the transfer published — not
+    /// whatever a concurrent writer may have put at the destination name
+    /// afterwards). Rollback reversals
     /// compare this against whatever occupies the path before removing or
     /// restoring over it, so a concurrent writer's replacement is detected
     /// and refused instead of destroyed by pathname alone. `None` when the
-    /// identity could not be captured (the leaf vanished in the instant
-    /// after publishing, or the platform has no identity primitive); a
+    /// identity could not be captured (the platform has no identity
+    /// primitive, or the staged leaf could not be read in the instant
+    /// before the publish); a
     /// reversal of an identity-less record degrades to the legacy
     /// path-only behavior.
     pub published_leaf: Option<LeafIdentity>,

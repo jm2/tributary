@@ -233,9 +233,16 @@ pub enum ReversalOutcome {
     RefusedForeignLeaf,
 }
 
-/// A publish whose rename already landed: the best-effort published-leaf
-/// identity captured immediately after the winning rename, and the trailing
+/// A publish whose rename already landed: the published-leaf identity bound
+/// to the staged object before the winning rename, and the trailing
 /// retained-parent revalidation.
+///
+/// The identity is captured from the staged leaf in the instant before the
+/// rename — `rename` preserves the object — so it names the transfer's
+/// publication even when a concurrent writer replaces the destination name
+/// afterwards. It is `None` when the staged object's identity could not be
+/// read before the rename; a reversal of such a record degrades to the
+/// legacy path-only behavior.
 ///
 /// The revalidation is REPORTED rather than enforced so a landed publish is
 /// never surfaced as an unpublished failure: enforcing it would return an
@@ -246,8 +253,8 @@ pub enum ReversalOutcome {
 /// revalidation into its own verified-publication error path (the write
 /// authority's `CommitError::PublishVerification`).
 pub(super) struct LandedPublish {
-    /// No-follow identity of the published leaf; `None` when the leaf
-    /// vanished in the instant after the rename or the capture failed.
+    /// No-follow identity of the published leaf, bound to the staged object
+    /// before the rename; `None` when the capture failed.
     pub(super) published_leaf: Option<LeafIdentity>,
     /// Result of the retained-parent revalidation that runs immediately
     /// after the rename and the identity capture.
@@ -334,6 +341,28 @@ fn leaf_identity_at(parent: &File, leaf: &OsStr) -> io::Result<Option<LeafIdenti
         Err(rustix::io::Errno::NOENT) => Ok(None),
         Err(error) => Err(io::Error::from(error)),
     }
+}
+
+/// Refresh a pre-publish staged-object capture into the recorded published
+/// identity. A rename legitimately updates the published object's
+/// change instant, so the staged capture alone can never compare exactly
+/// against a later same-name reversal verification; the post-publish lookup
+/// here supplies the refreshed identity but is accepted ONLY when it names
+/// the same object the staged capture bound — a concurrent writer's
+/// replacement landing in the capture window is never recorded as the
+/// publication (it would be matched and destroyed by a later rollback).
+/// `None` — no staged capture, the leaf vanished, or a foreign object
+/// interposed — degrades the record to the legacy path-only reversal
+/// behavior.
+#[cfg(unix)]
+fn cross_checked_published_identity(
+    parent: &File,
+    leaf: &OsStr,
+    staged: Option<LeafIdentity>,
+) -> Option<LeafIdentity> {
+    let current = leaf_identity_at(parent, leaf).ok().flatten()?;
+    staged.filter(|staged| current.same_object(staged))?;
+    Some(current)
 }
 
 /// Capture the no-follow identity of the entry at `path`. `Ok(None)` means
@@ -827,12 +856,17 @@ impl MountedRootAuthority {
     /// then the same fail-closed refusal — and the retained parent identity
     /// is revalidated immediately before and after.
     ///
-    /// On success the no-follow identity of the published leaf is captured
-    /// immediately after the rename through the same pinned parent, so the
-    /// caller can verify the leaf still names the transfer's publication
-    /// before any later reversal. Capture is best-effort: a leaf that
-    /// vanished in the instant after the rename reports `Ok(None)` rather
-    /// than failing an already-successful publish.
+    /// On success the no-follow identity of the published leaf is bound to
+    /// the staged object immediately BEFORE the rename: `rename` preserves
+    /// the object it moves, so the identity the staged leaf had in the
+    /// instant before the publish is exactly the identity the destination
+    /// leaf has in the instant after — even if a concurrent writer replaces
+    /// the destination name later. A post-rename pathname lookup would
+    /// instead report whatever replaced the publication in that window (or
+    /// `None` for a leaf it watched vanish), so reversal would refuse or
+    /// destroy the wrong object. Capture is best-effort: an identity that
+    /// cannot be read before the rename reports `Ok(None)` and the reversal
+    /// of that record degrades to the legacy path-only behavior.
     ///
     /// The trailing revalidation is ENFORCED here: callers for which a
     /// landed rename must never be mistaken for a failure (the forward
@@ -887,6 +921,14 @@ impl MountedRootAuthority {
         validate_leaf_name(from_leaf)?;
         validate_leaf_name(to_leaf)?;
         parent.validate_with(self)?;
+        // Bind the published-leaf identity to the staged object before the
+        // rename (see the doc comment above): the rename preserves the
+        // object, so this capture names the publication no matter what a
+        // concurrent writer does to the destination name afterwards.
+        #[cfg(unix)]
+        let staged_identity = leaf_identity_at(parent.handle(), from_leaf).ok().flatten();
+        #[cfg(windows)]
+        let staged_identity = leaf_identity_at_path(from_absolute).ok().flatten();
         let outcome = if no_replace {
             rename_no_replace_within_parent(
                 parent.handle(),
@@ -905,10 +947,23 @@ impl MountedRootAuthority {
             )
         };
         outcome?;
+        // Unix: a rename legitimately updates the published object's change
+        // instant, so the staged capture alone can never compare exactly
+        // against a later same-name reversal verification. Refresh it with
+        // a post-publish lookup — accepted only when it names the staged
+        // object, so a concurrent writer's replacement in the capture
+        // window is never recorded as the publication; a vanishing leaf or
+        // an unreadable capture degrades the record to `None` (the legacy
+        // path-only reversal behavior).
+        //
+        // Windows: the identity's creation-sensitive fields are immutable
+        // across a rename, so the staged capture itself is the stable
+        // published identity.
         #[cfg(unix)]
-        let published_leaf = leaf_identity_at(parent.handle(), to_leaf).ok().flatten();
+        let published_leaf =
+            cross_checked_published_identity(parent.handle(), to_leaf, staged_identity);
         #[cfg(windows)]
-        let published_leaf = leaf_identity_at_path(to_absolute).ok().flatten();
+        let published_leaf = staged_identity;
         let post_validate = parent.validate_with(self);
         Ok(LandedPublish {
             published_leaf,
@@ -933,10 +988,10 @@ impl MountedRootAuthority {
     ///   racing the publish re-enters the bind loop and is backed up
     ///   instead.
     ///
-    /// Either way the published leaf's identity is captured immediately
-    /// after the winning publish (see
-    /// [`Self::rename_within_directory`]); it may be `None` when the leaf
-    /// vanished in the instant after publishing.
+    /// Either way the published leaf's identity is bound to the staged
+    /// object immediately before the winning publish (see
+    /// [`Self::rename_within_directory`]); it is `None` when the staged
+    /// object's identity could not be read in that instant.
     ///
     /// A directory occupant is refused with a typed `InvalidInput` error —
     /// a file publish never replaces a directory. The retained parent is
@@ -1112,15 +1167,39 @@ impl MountedRootAuthority {
         )? {
             return Ok(ReversalOutcome::RefusedForeignLeaf);
         }
-        self.rename_within_directory(
-            &parent,
-            backup_leaf.as_os_str(),
-            self.root.join(backup_relative).as_path(),
-            destination_leaf.as_os_str(),
-            self.root.join(destination_relative).as_path(),
-            false,
-        )?;
-        Ok(ReversalOutcome::Reversed)
+        #[cfg(unix)]
+        {
+            restore_backup_by_exchange_unix(
+                parent.handle(),
+                backup_leaf.as_os_str(),
+                destination_leaf.as_os_str(),
+                self.root.join(backup_relative).as_path(),
+                self.root.join(destination_relative).as_path(),
+                expected,
+            )
+        }
+        #[cfg(windows)]
+        {
+            self.rename_within_directory(
+                &parent,
+                backup_leaf.as_os_str(),
+                self.root.join(backup_relative).as_path(),
+                destination_leaf.as_os_str(),
+                self.root.join(destination_relative).as_path(),
+                false,
+            )?;
+            Ok(ReversalOutcome::Reversed)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (
+                backup_leaf,
+                destination_leaf,
+                backup_relative,
+                destination_relative,
+            );
+            Err(unsupported_platform())
+        }
     }
 
     /// Best-effort no-follow identity of the leaf at `relative` beneath the
@@ -1191,7 +1270,10 @@ impl MountedRootAuthority {
     /// retained root, walking and creating each level no-follow from the
     /// retained root handle on Unix. An existing directory is tolerated
     /// only when it is a real directory, never a symlink.
-    pub(super) fn create_directories_within(&self, components: &[OsString]) -> io::Result<()> {
+    pub(super) fn create_directories_within(
+        &self,
+        components: &[OsString],
+    ) -> io::Result<Vec<usize>> {
         if components.is_empty() {
             return Err(invalid_input(
                 "directory creation requires a path below the mounted root",
@@ -1201,21 +1283,29 @@ impl MountedRootAuthority {
         #[cfg(unix)]
         {
             let mut current = self.root_handle.file.try_clone()?;
-            for component in components {
-                current = ensure_directory_component(&current, component)?;
+            let mut created = Vec::new();
+            for (index, component) in components.iter().enumerate() {
+                let (opened, created_component) = ensure_directory_component(&current, component)?;
+                if created_component {
+                    created.push(index);
+                }
+                current = opened;
                 ensure_boundary(self.boundary, &current)?;
             }
+            self.validate()?;
+            Ok(created)
         }
         #[cfg(windows)]
         {
-            create_directory_tree_by_path(&self.root, components)?;
+            let created = create_directory_tree_by_path(&self.root, components)?;
+            self.validate()?;
+            return Ok(created);
         }
         #[cfg(not(any(unix, windows)))]
         {
             let _ = components;
             return Err(unsupported_platform());
         }
-        self.validate()
     }
 
     /// Open the parent directory of the final component of `components` as a
@@ -2965,34 +3055,372 @@ fn windows_leaf_entry(final_path: &Path) -> io::Result<Option<(std::fs::Metadata
     Ok(Some((metadata, found)))
 }
 
-/// Unix body of the regular-file reversal: type the leaf no-follow, gate on
-/// the publish-time identity, refuse a directory leaf with the typed
-/// `InvalidInput` error, then unlink. A symlink leaf is removed as a link.
+/// What kind of leaf a reversal quarantine removes: the typing performed on
+/// the quarantined object before it is removed.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuarantinedLeafKind {
+    /// The object must be a regular file or symlink; a directory is refused.
+    RegularFile,
+    /// The object must be a directory, removed with `AT_REMOVEDIR`.
+    EmptyDirectory,
+}
+
+/// Allocate a unique, private tombstone leaf for reversal quarantine. The
+/// name is created `O_EXCL` so it can never collide with a concurrent
+/// writer's file, and no other process ever learns it: after the quarantine
+/// exchange, the verify-then-remove on the tombstone name is race-free.
+#[cfg(unix)]
+fn create_reversal_tombstone(parent: &File) -> io::Result<OsString> {
+    use rustix::fs::{Mode, OFlags};
+
+    for _ in 0..8 {
+        let mut name = OsString::from(".tributary-reversal-");
+        name.push(Uuid::new_v4().to_string());
+        name.push(".tmp");
+        match rustix::fs::openat(
+            parent,
+            &name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::from_bits_truncate(0o600),
+        ) {
+            Ok(descriptor) => {
+                drop(File::from(descriptor));
+                return Ok(name);
+            }
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => return Err(io::Error::from(error)),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a private reversal tombstone name",
+    ))
+}
+
+/// Atomically exchange the names `leaf` and `tombstone` within `parent`.
+/// Used both to quarantine a leaf ahead of its reversal and to restore the
+/// original naming when a reversal must be refused or has failed.
+#[cfg(unix)]
+fn exchange_leaf_names(parent: &File, leaf: &OsStr, tombstone: &OsStr) -> io::Result<()> {
+    use rustix::fs::RenameFlags;
+
+    rustix::fs::renameat_with(parent, leaf, parent, tombstone, RenameFlags::EXCHANGE)
+        .map_err(io::Error::from)
+}
+
+/// Unix body of the backup restoration: put the backup back over its
+/// destination slot without an uncoupled check-then-replace window. An
+/// absent slot takes the backup through a no-replace rename, so a
+/// concurrent creation is refused — never destroyed. An occupied slot is
+/// first verified exactly against the recorded publication identity (the
+/// publication has not been renamed by us, so the creation-sensitive fields
+/// compare), then exchanged atomically with the backup: the slot receives
+/// the backup's object while the captured prior occupant — the transfer's
+/// publication, or a concurrent writer's interposition that raced past the
+/// exact verification — is preserved at the private backup name until an
+/// object-level (device and inode) coupling check confirms it is the
+/// verified publication and discards it. A filesystem without an exchange
+/// primitive fails closed rather than replacing unverified.
+#[cfg(unix)]
+fn restore_backup_by_exchange_unix(
+    parent: &File,
+    backup_leaf: &OsStr,
+    destination_leaf: &OsStr,
+    backup_absolute: &Path,
+    destination_absolute: &Path,
+    expected: Option<&LeafIdentity>,
+) -> io::Result<ReversalOutcome> {
+    use rustix::fs::{statat, unlinkat, AtFlags, RenameFlags};
+
+    match rename_no_replace_within_parent(
+        parent,
+        backup_leaf,
+        backup_absolute,
+        destination_leaf,
+        destination_absolute,
+    ) {
+        // The slot was empty: the backup took the name atomically.
+        Ok(()) => return Ok(ReversalOutcome::Reversed),
+        // The slot is occupied: verify-then-exchange below.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    // Verify the occupied slot BEFORE anything moves. The recorded
+    // publication has not been renamed since its capture, so the
+    // creation-sensitive fields compare exactly here: a slot naming a
+    // different object — a concurrent writer's interposition, or a
+    // same-index replacement — is refused without a single rename.
+    match statat(parent, destination_leaf, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => {
+            let found = leaf_identity_from_stat(&stat);
+            if expected.is_some_and(|expected| expected != &found) {
+                return Ok(ReversalOutcome::RefusedForeignLeaf);
+            }
+        }
+        // The slot emptied between the no-replace refusal and this stat:
+        // re-run the atomic no-replace publish rather than exchange with a
+        // name that may vanish again.
+        Err(rustix::io::Errno::NOENT) => {
+            return rename_no_replace_within_parent(
+                parent,
+                backup_leaf,
+                backup_absolute,
+                destination_leaf,
+                destination_absolute,
+            )
+            .map(|()| ReversalOutcome::Reversed)
+        }
+        Err(error) => return Err(io::Error::from(error)),
+    }
+    match rustix::fs::renameat_with(
+        parent,
+        backup_leaf,
+        parent,
+        destination_leaf,
+        RenameFlags::EXCHANGE,
+    ) {
+        Ok(()) => {}
+        // No exchange primitive: fail closed. The exchange never landed, so
+        // the destination still names the publication and the backup still
+        // names the original occupant — nothing was displaced.
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::OPNOTSUPP) => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "filesystem offers no atomic exchange primitive; refusing a backup restore \
+                 that could destroy a concurrent writer's interposition unverified",
+            ));
+        }
+        Err(error) => return Err(io::Error::from(error)),
+    }
+    // The destination now names the backup's object; the backup name holds
+    // the captured prior occupant. The exchange legitimately updated the
+    // captured object's change instant, so the coupling check compares
+    // objects — device and inode — not change instants: whatever now sits
+    // at the private backup name must be the object the slot was verified
+    // against, or the exchange captured an interposer and must undo.
+    match statat(parent, backup_leaf, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => {
+            let found = leaf_identity_from_stat(&stat);
+            let coupled = expected.is_none_or(|expected| found.same_object(expected));
+            if !coupled {
+                // An interposed writer's object was captured: exchange it
+                // back and refuse. The exchange preserves both sides, so
+                // refusing destroys nothing.
+                rustix::fs::renameat_with(
+                    parent,
+                    backup_leaf,
+                    parent,
+                    destination_leaf,
+                    RenameFlags::EXCHANGE,
+                )
+                .map_err(io::Error::from)?;
+                return Ok(ReversalOutcome::RefusedForeignLeaf);
+            }
+            // The captured occupant is exactly the publication being
+            // reversed — or no identity was recorded and the slot is the
+            // transfer's own by contract. Discard the redundant link.
+            unlinkat(parent, backup_leaf, AtFlags::empty()).map_err(io::Error::from)?;
+            Ok(ReversalOutcome::Reversed)
+        }
+        Err(verification) => {
+            // The captured occupant cannot be verified: put it back rather
+            // than remove an unverifiable object.
+            let _ = rustix::fs::renameat_with(
+                parent,
+                backup_leaf,
+                parent,
+                destination_leaf,
+                RenameFlags::EXCHANGE,
+            );
+            Err(io::Error::from(verification))
+        }
+    }
+}
+
+/// Unix body shared by the identity-coupled reversals. Two verification
+/// phases bracket the quarantine so the removal can never destroy an object
+/// the transfer does not own:
+///
+/// 1. The leaf is verified EXACTLY against the recorded identity while it
+///    still sits at its published name — nothing has renamed it since the
+///    capture, so the creation-sensitive fields (which guard against
+///    same-index inode reuse) compare strictly. A foreign occupant is
+///    refused here without a single rename.
+/// 2. The verified leaf is quarantined with an atomic exchange against a
+///    private tombstone name no concurrent writer can know, re-verified at
+///    the tombstone with the object-level check — the exchange
+///    legitimately updated the object's change instant, so the coupling
+///    compares device and inode, not change instants — and only then
+///    removed. An interposition that raced between the phases is captured
+///    by the exchange, exchanged back, and refused: captured, never
+///    destroyed.
+///
+/// The historical check-then-unlink deleted whatever bore the leaf name at
+/// unlink time, so a concurrent writer's replacement landing between the
+/// two syscalls was destroyed while the reversal still reported an
+/// identity-verified outcome; a filesystem without an exchange primitive
+/// fails closed instead of racing.
+#[cfg(unix)]
+fn quarantine_and_remove_leaf_unix(
+    parent: &File,
+    leaf: &OsStr,
+    expected: Option<LeafIdentity>,
+    kind: QuarantinedLeafKind,
+    operation: &str,
+) -> io::Result<ReversalOutcome> {
+    use rustix::fs::{statat, unlinkat, AtFlags};
+
+    // Phase 1: exact verification at the still-published name.
+    let verified = match statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => {
+            let found = leaf_identity_from_stat(&stat);
+            if expected.is_some_and(|expected| expected != found) {
+                // A concurrent writer's replacement — or a same-index
+                // reuse of the recorded inode — occupies the leaf: refuse
+                // without touching it.
+                return Ok(ReversalOutcome::RefusedForeignLeaf);
+            }
+            let is_directory = rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                == rustix::fs::FileType::Directory;
+            match kind {
+                QuarantinedLeafKind::RegularFile if is_directory => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "refusing to remove a directory through remove_relative_file",
+                    ));
+                }
+                QuarantinedLeafKind::EmptyDirectory if !is_directory => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "refusing to remove a non-directory through remove_relative_directory",
+                    ));
+                }
+                _ => {}
+            }
+            found
+        }
+        Err(rustix::io::Errno::NOENT) => return Ok(ReversalOutcome::AlreadyAbsent),
+        Err(error) => return Err(io::Error::from(error)),
+    };
+
+    // Phase 2: quarantine by atomic exchange against a private tombstone.
+    let tombstone = create_reversal_tombstone(parent)?;
+    let release_tombstone_file =
+        |parent: &File| -> io::Result<()> { exchange_leaf_names(parent, leaf, &tombstone) };
+    match rustix::fs::renameat_with(
+        parent,
+        leaf,
+        parent,
+        &tombstone,
+        rustix::fs::RenameFlags::EXCHANGE,
+    ) {
+        Ok(()) => {}
+        // The leaf vanished after the exact verification: nothing of the
+        // transfer's remained to reverse.
+        Err(rustix::io::Errno::NOENT) => {
+            let _ = unlinkat(parent, &tombstone, AtFlags::empty());
+            return Ok(ReversalOutcome::AlreadyAbsent);
+        }
+        // No exchange primitive: fail closed rather than racing a
+        // concurrent writer with an uncoupled check-then-unlink.
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::OPNOTSUPP) => {
+            let _ = unlinkat(parent, &tombstone, AtFlags::empty());
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "filesystem offers no atomic exchange primitive; refusing a reversal that \
+                 could remove a concurrent writer's replacement unverified",
+            ));
+        }
+        Err(error) => {
+            let _ = unlinkat(parent, &tombstone, AtFlags::empty());
+            return Err(io::Error::from(error));
+        }
+    }
+    // The exchange landed: `leaf` now names our empty tombstone file and
+    // `tombstone` names exactly the object the leaf named at the exchange
+    // instant. Coupling check through the private tombstone name: the
+    // object must be the one phase 1 verified (device and inode — the
+    // exchange updated its change instant), otherwise an interposer was
+    // captured and is exchanged back before refusing.
+    let removal_flags = match kind {
+        QuarantinedLeafKind::RegularFile => AtFlags::empty(),
+        QuarantinedLeafKind::EmptyDirectory => AtFlags::REMOVEDIR,
+    };
+    match statat(parent, &tombstone, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => {
+            let quarantined = leaf_identity_from_stat(&stat);
+            if !quarantined.same_object(&verified) {
+                if let Err(restore) = release_tombstone_file(parent) {
+                    return Err(io::Error::new(
+                        restore.kind(),
+                        format!(
+                            "{operation} refused a foreign replacement: {restore}; the \
+                             replacement could not be restored to its leaf name and remains \
+                             at a private .tributary-reversal-* tombstone"
+                        ),
+                    ));
+                }
+                return Ok(ReversalOutcome::RefusedForeignLeaf);
+            }
+            if let Err(error) = unlinkat(parent, &tombstone, removal_flags).map_err(io::Error::from)
+            {
+                // The verified object could not be removed. Restore it to
+                // the leaf name so no private-name litter holds live data,
+                // then surface the failure.
+                if let Err(restore) = release_tombstone_file(parent) {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{operation} failed: {error}; the quarantined object could not be \
+                             restored to its leaf name ({restore}) and remains at a private \
+                             .tributary-reversal-* tombstone"
+                        ),
+                    ));
+                }
+                return Err(error);
+            }
+            let _ = unlinkat(parent, leaf, AtFlags::empty());
+            Ok(ReversalOutcome::Reversed)
+        }
+        Err(verification) => {
+            // The quarantined object cannot be verified: put it back rather
+            // than remove an unverifiable object.
+            let verification = io::Error::from(verification);
+            if let Err(restore) = release_tombstone_file(parent) {
+                return Err(io::Error::new(
+                    verification.kind(),
+                    format!(
+                        "{operation} failed before removal: {verification}; the quarantined \
+                         object could not be restored ({restore}) and remains at a private \
+                         .tributary-reversal-* tombstone"
+                    ),
+                ));
+            }
+            Err(verification)
+        }
+    }
+}
+
+/// Unix body of the regular-file reversal: quarantine the leaf with an
+/// atomic exchange against a private tombstone (see
+/// [`quarantine_and_remove_leaf_unix`]), gate the quarantined object on the
+/// publish-time identity, refuse a directory leaf with the typed
+/// `InvalidInput` error, then remove the verified object. A symlink leaf is
+/// removed as a link.
 #[cfg(unix)]
 fn remove_regular_leaf_entry_unix(
     parent: &File,
     leaf: &OsStr,
     expected: Option<LeafIdentity>,
 ) -> io::Result<ReversalOutcome> {
-    use rustix::fs::{statat, unlinkat, AtFlags};
-
-    let stat = match statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => stat,
-        Err(rustix::io::Errno::NOENT) => return Ok(ReversalOutcome::AlreadyAbsent),
-        Err(error) => return Err(io::Error::from(error)),
-    };
-    let found = leaf_identity_from_stat(&stat);
-    if expected.is_some_and(|expected| expected != found) {
-        return Ok(ReversalOutcome::RefusedForeignLeaf);
-    }
-    if rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Directory {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "refusing to remove a directory through remove_relative_file",
-        ));
-    }
-    unlinkat(parent, leaf, AtFlags::empty()).map_err(io::Error::from)?;
-    Ok(ReversalOutcome::Reversed)
+    quarantine_and_remove_leaf_unix(
+        parent,
+        leaf,
+        expected,
+        QuarantinedLeafKind::RegularFile,
+        "remove_relative_file",
+    )
 }
 
 /// Windows body of the regular-file reversal. The leaf is typed no-follow
@@ -3025,34 +3453,24 @@ fn remove_regular_leaf_entry_windows(
     Ok(ReversalOutcome::Reversed)
 }
 
-/// Unix body of the empty-directory reversal: type the leaf no-follow, gate
-/// on the creation-time identity, refuse a non-directory leaf with the
-/// typed `InvalidInput` error, then remove the directory.
+/// Unix body of the empty-directory reversal: quarantine the leaf with an
+/// atomic exchange against a private tombstone (see
+/// [`quarantine_and_remove_leaf_unix`]), gate the quarantined object on the
+/// creation-time identity, refuse a non-directory leaf with the typed
+/// `InvalidInput` error, then remove the verified empty directory.
 #[cfg(unix)]
 fn remove_directory_leaf_entry_unix(
     parent: &File,
     leaf: &OsStr,
     expected: Option<LeafIdentity>,
 ) -> io::Result<ReversalOutcome> {
-    use rustix::fs::{statat, unlinkat, AtFlags};
-
-    let stat = match statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => stat,
-        Err(rustix::io::Errno::NOENT) => return Ok(ReversalOutcome::AlreadyAbsent),
-        Err(error) => return Err(io::Error::from(error)),
-    };
-    let found = leaf_identity_from_stat(&stat);
-    if expected.is_some_and(|expected| expected != found) {
-        return Ok(ReversalOutcome::RefusedForeignLeaf);
-    }
-    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "refusing to remove a non-directory through remove_relative_directory",
-        ));
-    }
-    unlinkat(parent, leaf, AtFlags::REMOVEDIR).map_err(io::Error::from)?;
-    Ok(ReversalOutcome::Reversed)
+    quarantine_and_remove_leaf_unix(
+        parent,
+        leaf,
+        expected,
+        QuarantinedLeafKind::EmptyDirectory,
+        "remove_relative_directory",
+    )
 }
 
 /// Windows body of the empty-directory reversal: same typing and identity
@@ -3125,12 +3543,16 @@ fn validate_leaf_name(leaf: &OsStr) -> io::Result<()> {
 /// existing entry is a real directory), then open it no-follow for the next
 /// walk level. Unix only; used by
 /// [`MountedRootAuthority::create_directories_within`].
+///
+/// Reports whether this invocation actually created the component: a
+/// component that already existed (and was adopted) is reported as not
+/// created, so callers can record ownership of exactly what they created.
 #[cfg(unix)]
-fn ensure_directory_component(current: &File, component: &OsString) -> io::Result<File> {
+fn ensure_directory_component(current: &File, component: &OsString) -> io::Result<(File, bool)> {
     use rustix::fs::{AtFlags, Mode, OFlags};
 
-    match rustix::fs::mkdirat(current, component, Mode::from_bits_truncate(0o777)) {
-        Ok(()) => {}
+    let created = match rustix::fs::mkdirat(current, component, Mode::from_bits_truncate(0o777)) {
+        Ok(()) => true,
         Err(rustix::io::Errno::EXIST) => {
             let stat = rustix::fs::statat(current, component, AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(io::Error::from)?;
@@ -3141,9 +3563,10 @@ fn ensure_directory_component(current: &File, component: &OsString) -> io::Resul
                     "intermediate path is not a directory",
                 ));
             }
+            false
         }
         Err(error) => return Err(io::Error::from(error)),
-    }
+    };
     let opened = rustix::fs::openat(
         current,
         component,
@@ -3151,7 +3574,7 @@ fn ensure_directory_component(current: &File, component: &OsString) -> io::Resul
         Mode::empty(),
     )
     .map_err(io::Error::from)?;
-    Ok(File::from(opened))
+    Ok((File::from(opened), created))
 }
 
 /// Rename `from_leaf` to `to_leaf` inside the parent directory `parent`,
@@ -3352,11 +3775,11 @@ fn rename_over_bound_backup(
 /// the swap: that writer's file is intact at the private staged name and is
 /// renamed back to `to_leaf`, the stale backup is released, and the loop
 /// re-binds. There is therefore no window in which the publish destroys an
-/// occupant its backup does not name: a filesystem without `EXCHANGE` (no
-/// `renameat2`/`renamex_np` support) falls back to a bound-identity
-/// re-verification immediately before a plain replacing rename, and a
-/// filesystem without hard links copy-binds the occupant before the same
-/// verification.
+/// occupant its backup does not name. A filesystem without `EXCHANGE` (no
+/// `renameat2`/`renamex_np` support) offers no primitive that couples the
+/// backup to the destroy, so the overwrite fails closed there — a
+/// verify-then-rename fallback would leave a window in which a concurrent
+/// replacement is destroyed while the backup names the previous occupant.
 #[cfg(unix)]
 fn replace_publish_loop(
     parent: &File,
@@ -3406,6 +3829,11 @@ fn replace_publish_attempt(
     match statat(parent, to_leaf, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(_) => {}
         Err(rustix::io::Errno::NOENT) => {
+            // Bind the published-leaf identity to the staged object before
+            // the rename (the rename preserves the object), so the reported
+            // identity names the transfer's publication even if a
+            // concurrent writer replaces the destination name afterwards.
+            let staged = leaf_identity_at(parent, from_leaf).ok().flatten();
             return match rename_no_replace_within_parent(
                 parent,
                 from_leaf,
@@ -3413,10 +3841,10 @@ fn replace_publish_attempt(
                 to_leaf,
                 to_absolute,
             ) {
-                Ok(()) => {
-                    let published = leaf_identity_at(parent, to_leaf).ok().flatten();
-                    Ok(Some((false, published)))
-                }
+                Ok(()) => Ok(Some((
+                    false,
+                    cross_checked_published_identity(parent, to_leaf, staged),
+                ))),
                 // The creation won the race — loop back and bind it.
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(None),
                 Err(error) => Err(error),
@@ -3505,43 +3933,59 @@ fn release_occupant_backup(parent: &File, backup_leaf: &OsStr) {
     let _ = unlinkat(parent, backup_leaf, AtFlags::empty());
 }
 
-/// Replace the bound occupant: the identity-verified atomic swap when the
-/// platform offers `RENAME_EXCHANGE`, else the strongest available coupling
-/// — a bound-identity re-verification immediately before a plain replacing
-/// rename. `Ok(None)` — the attempt observed a changing occupant; the stale
-/// state was undone and the caller must re-bind.
+/// Replace the bound occupant: the identity-verified atomic swap. `Ok(None)`
+/// — the attempt observed a changing occupant; the stale state was undone
+/// and the caller must re-bind.
+///
+/// There is no non-atomic fallback: a filesystem without an exchange
+/// primitive has no way to couple the backup to the destroy, and a
+/// verify-then-rename sequence leaves a window in which a concurrent
+/// writer's replacement is destroyed while the backup still names the
+/// previous occupant. Such filesystems fail closed with a typed
+/// `Unsupported` error instead of racing a concurrent writer.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn swap_and_verify_replace(
     parent: &File,
     from_leaf: &OsStr,
-    from_absolute: &Path,
+    _from_absolute: &Path,
     to_leaf: &OsStr,
-    to_absolute: &Path,
+    _to_absolute: &Path,
     backup_leaf: &OsStr,
     bound_identity: &LeafIdentity,
 ) -> io::Result<Option<(bool, Option<LeafIdentity>)>> {
     use rustix::fs::{renameat_with, RenameFlags};
 
+    // Bind the published-leaf identity to the staged object before the
+    // exchange: the exchange preserves the object, so the post-swap refresh
+    // (accepted only when it still names this object) is the identity of
+    // the transfer's publication even if a concurrent writer replaces the
+    // destination name later. The refresh is required because the exchange
+    // itself updates the object's change instant — the raw staged capture
+    // could never compare exactly in a later reversal.
+    let staged = leaf_identity_at(parent, from_leaf).ok().flatten();
     match renameat_with(parent, from_leaf, parent, to_leaf, RenameFlags::EXCHANGE) {
-        Ok(()) => verify_atomic_swap(parent, from_leaf, to_leaf, backup_leaf, bound_identity),
-        // Filesystem (or kernel) without atomic-swap support: fall back to
-        // the strongest available coupling — re-verify that the destination
-        // still names the bound identity immediately before a plain
-        // replacing rename. The residual window between that verification
-        // and the rename is documented and bounded by the retry loop;
-        // filesystems this old typically also lack hard links, so the
-        // copy-bind verification above already applied.
-        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::OPNOTSUPP) => {
-            verified_plain_replace(
+        Ok(()) => {
+            let published = cross_checked_published_identity(parent, to_leaf, staged);
+            verify_atomic_swap(
                 parent,
                 from_leaf,
-                from_absolute,
                 to_leaf,
-                to_absolute,
                 backup_leaf,
                 bound_identity,
+                published,
             )
+        }
+        // Filesystem (or kernel) without atomic-swap support: fail closed.
+        // The swap never happened, so nothing was displaced and the backup —
+        // which names a live occupant — must be released.
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL | rustix::io::Errno::OPNOTSUPP) => {
+            release_occupant_backup(parent, backup_leaf);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "destination filesystem offers no atomic exchange primitive; refusing an \
+                 overwrite replace that could destroy a concurrent writer's file unbacked",
+            ))
         }
         Err(error) => {
             // The swap never happened: nothing was displaced, so the
@@ -3559,13 +4003,22 @@ fn swap_and_verify_replace(
 /// file is intact at the private staged name and is renamed back to
 /// `to_leaf`, the stale backup is released, and the caller re-binds.
 /// `Ok(None)` reports that interposition.
+///
+/// A failed restore never releases the backup and never unlinks the
+/// displaced object: the destination still names the transfer's published
+/// bytes, the backup still names the bind-time occupant, and the displaced
+/// object is preserved at the private staged leaf. The failure carries the
+/// [`DisplacedOccupantFailure`] marker so the caller can record the
+/// publication for rollback and shield the staged leaf from cleanup.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn verify_atomic_swap(
     parent: &File,
     from_leaf: &OsStr,
     to_leaf: &OsStr,
     backup_leaf: &OsStr,
     bound_identity: &LeafIdentity,
+    published_leaf: Option<LeafIdentity>,
 ) -> io::Result<Option<(bool, Option<LeafIdentity>)>> {
     use rustix::fs::{renameat, unlinkat, AtFlags};
 
@@ -3576,15 +4029,23 @@ fn verify_atomic_swap(
         Ok(Some(displaced)) if displaced.same_object(bound_identity) => {
             // The swap displaced exactly the object the backup names. The
             // displaced bytes live on in the backup; drop the now-redundant
-            // link at the staged name.
+            // link at the staged name. The published identity is the one
+            // bound to the staged object before the exchange.
             let _ = unlinkat(parent, from_leaf, AtFlags::empty());
-            let published = leaf_identity_at(parent, to_leaf).ok().flatten();
-            Ok(Some((true, published)))
+            Ok(Some((true, published_leaf)))
         }
         Ok(_) => {
+            // An interposed writer's object was displaced: restore it to
+            // the destination before reporting the interposition. The
+            // restore replaces the transfer's published bytes at
+            // `to_leaf` — nothing published remains, so this is an
+            // ordinary retryable interposition.
             if let Err(error) = renameat(parent, from_leaf, parent, to_leaf) {
-                release_occupant_backup(parent, backup_leaf);
-                return Err(io::Error::from(error));
+                return Err(displaced_occupant_failure(
+                    published_leaf,
+                    io::Error::from(error),
+                    None,
+                ));
             }
             release_occupant_backup(parent, backup_leaf);
             Ok(None)
@@ -3592,55 +4053,115 @@ fn verify_atomic_swap(
         // The displaced leaf cannot be read back: fail closed with the
         // destination restored to the swap-instant state (the displaced
         // object returns to `to_leaf`) rather than leaving an unverifiable
-        // publication.
-        Err(verification) => {
-            release_occupant_backup(parent, backup_leaf);
-            let _ = renameat(parent, from_leaf, parent, to_leaf);
-            Err(verification)
+        // publication. The backup is released only once the restoration is
+        // confirmed; if the restore itself fails, the backup and the
+        // displaced object are kept and the failure carries the
+        // displaced-occupant marker.
+        Err(verification) => match renameat(parent, from_leaf, parent, to_leaf) {
+            Ok(()) => {
+                release_occupant_backup(parent, backup_leaf);
+                Err(verification)
+            }
+            Err(restore) => Err(displaced_occupant_failure(
+                published_leaf,
+                verification,
+                Some(io::Error::from(restore)),
+            )),
+        },
+    }
+}
+
+/// Error payload for a replace publish whose atomic exchange landed but
+/// whose post-swap verification could not restore the destination: the
+/// transfer's bytes ARE published at the destination, the bind-time backup
+/// is retained for restoration, and the displaced object survives at the
+/// private staged leaf — which the caller must shield from cleanup.
+/// Surfaced through an [`io::Error`] payload so it travels every `?` on the
+/// publish path; the write authority's commit maps it to a
+/// verified-publication failure carrying the outcome.
+#[cfg(unix)]
+pub(crate) struct DisplacedOccupantFailure {
+    /// Identity of the published leaf, bound to the staged object before
+    /// the exchange.
+    pub(crate) published_leaf: Option<LeafIdentity>,
+}
+
+impl fmt::Debug for DisplacedOccupantFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DisplacedOccupantFailure")
+            .field("published_leaf_captured", &self.published_leaf.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for DisplacedOccupantFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "the atomic exchange published the staged bytes but the displaced occupant \
+             could not be restored to the destination; the bind-time backup is retained \
+             and the displaced object is preserved at the private staged leaf"
+        )
+    }
+}
+
+impl std::error::Error for DisplacedOccupantFailure {}
+
+/// Build the marker-carrying error for a displaced occupant the publish
+/// machinery could not restore. `cause` is the primary failure; `detail`
+/// is a secondary failure woven into the message.
+#[cfg(unix)]
+fn displaced_occupant_failure(
+    published_leaf: Option<LeafIdentity>,
+    cause: io::Error,
+    detail: Option<io::Error>,
+) -> io::Error {
+    let failure = RestoreFailure {
+        payload: DisplacedOccupantFailure { published_leaf },
+        cause,
+        detail,
+    };
+    io::Error::other(failure)
+}
+
+/// Wrapper pairing the marker payload with its causing error so the
+/// surfaced message names both the state and the cause. The write
+/// authority's commit path downcasts to this wrapper to recover the
+/// published-leaf identity of a landed-but-unrestorable exchange.
+#[cfg(unix)]
+pub(crate) struct RestoreFailure {
+    pub(crate) payload: DisplacedOccupantFailure,
+    cause: io::Error,
+    detail: Option<io::Error>,
+}
+
+impl fmt::Debug for RestoreFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestoreFailure")
+            .field("payload", &self.payload)
+            .field("detail", &self.detail.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for RestoreFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.detail {
+            Some(detail) => write!(
+                formatter,
+                "{}: {} (restore also failed: {})",
+                self.payload, self.cause, detail
+            ),
+            None => write!(formatter, "{}: {}", self.payload, self.cause),
         }
     }
 }
 
-/// The no-atomic-swap fallback: re-verify that the destination still names
-/// the bound identity immediately before a plain replacing rename.
-/// `Ok(None)` — the occupant changed or vanished after the bind; the stale
-/// backup was released and the caller must re-bind.
-#[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
-fn verified_plain_replace(
-    parent: &File,
-    from_leaf: &OsStr,
-    from_absolute: &Path,
-    to_leaf: &OsStr,
-    to_absolute: &Path,
-    backup_leaf: &OsStr,
-    bound_identity: &LeafIdentity,
-) -> io::Result<Option<(bool, Option<LeafIdentity>)>> {
-    match leaf_identity_at(parent, to_leaf) {
-        Ok(Some(current)) if current == *bound_identity => {
-            if let Err(error) =
-                rename_within_parent(parent, from_leaf, from_absolute, to_leaf, to_absolute)
-            {
-                release_occupant_backup(parent, backup_leaf);
-                return Err(error);
-            }
-            let published = leaf_identity_at(parent, to_leaf).ok().flatten();
-            Ok(Some((true, published)))
-        }
-        // The occupant changed or vanished after the bind: the backup is
-        // stale — release it and re-bind.
-        Ok(_) => {
-            release_occupant_backup(parent, backup_leaf);
-            Ok(None)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            release_occupant_backup(parent, backup_leaf);
-            Ok(None)
-        }
-        Err(error) => {
-            release_occupant_backup(parent, backup_leaf);
-            Err(error)
-        }
+impl std::error::Error for RestoreFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
     }
 }
 
@@ -3912,12 +4433,13 @@ fn replace_publish_loop(
 /// path-based per-component creation with a reparse-free is-directory check,
 /// mirroring the historical `create_directory_atomic` behavior.
 #[cfg(windows)]
-fn create_directory_tree_by_path(root: &Path, components: &[OsString]) -> io::Result<()> {
+fn create_directory_tree_by_path(root: &Path, components: &[OsString]) -> io::Result<Vec<usize>> {
     let mut path = root.to_path_buf();
-    for component in components {
+    let mut created = Vec::new();
+    for (index, component) in components.iter().enumerate() {
         path.push(component);
         match std::fs::create_dir(&path) {
-            Ok(()) => {}
+            Ok(()) => created.push(index),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let metadata = std::fs::symlink_metadata(&path)?;
                 if !metadata.is_dir() {
@@ -3930,7 +4452,7 @@ fn create_directory_tree_by_path(root: &Path, components: &[OsString]) -> io::Re
             Err(error) => return Err(error),
         }
     }
-    Ok(())
+    Ok(created)
 }
 
 #[cfg(unix)]
