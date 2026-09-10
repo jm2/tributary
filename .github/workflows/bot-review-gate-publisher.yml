@@ -14,9 +14,17 @@ name: Bot review gate publisher
 # announcer workflow, and GitHub ALWAYS executes a `workflow_run` workflow's
 # default-branch revision. A pull request therefore cannot alter the
 # evaluation or publication logic below; tampering with the announcer can
-# only suppress the refresh, which leaves the required context unreported —
-# and an unreported required check blocks the merge. Fail-closed by
-# construction, without `pull_request_target`.
+# only suppress the refresh. A refresh that dies before publishing is not
+# fail-safe by itself, though: check runs attach to the head SHA and the
+# LATEST completed run under the required name decides, so a head that
+# already carries a green verdict would keep it across a dead refresh. The
+# publisher therefore never exits without publishing at a known head: every
+# discovery-level refusal — a failed discovery query, an announcement with
+# no candidate pull request, an announcement whose every candidate was
+# skipped — publishes the SUPERSEDING failing verdict at the announced head
+# before exiting. (An unreported required check blocks the merge only at a
+# head that has never been evaluated.) Fail-closed by construction,
+# without `pull_request_target`.
 #
 # The check fails while, at one exact pull-request head commit, any of the
 # following holds:
@@ -120,8 +128,13 @@ name: Bot review gate publisher
 # pull-request job can author a check run under.
 #
 # A query failure, an incomplete pagination, or a head mismatch publishes a
-# failing check instead of silently passing it; a publication failure leaves
-# the required context unreported, which also blocks the merge.
+# failing check instead of silently passing it. The same supersession rule
+# covers the driver's discovery-level exits: a failed discovery query, an
+# announcement with no candidate pull request, and an all-candidates-skipped
+# announcement each publish the failing verdict at the announced head,
+# because a refresh that publishes nothing would leave the head's previous
+# verdict standing. A publication failure also leaves the previous verdict
+# standing; the failed job is the operator's re-run signal.
 on:
   workflow_run:
     workflows: ["Bot review gate"]
@@ -164,6 +177,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GATE_TOKEN: ${{ steps.gate_publisher_token.outputs.token }}
           EVENT_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT_RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
 
@@ -173,10 +187,13 @@ jobs:
           # requires, authenticated as the gate-publisher App so the check
           # run is authored by that App's integration — never by the shared
           # GitHub Actions integration a pull-request job could publish
-          # under. It is called from exactly two places — the aggregated
-          # failure branch and the aggregated success branch of the driver
-          # below — so one announced head can never carry competing
-          # verdicts.
+          # under. It is called only from the driver below — the aggregated
+          # failure branch, the aggregated success branch, and the three
+          # discovery-level supersession paths (discovery failure, no
+          # candidate, all candidates skipped) — so one announced head can
+          # never carry competing verdicts: every refresh ends in exactly
+          # one publication at the head, green only when every candidate is
+          # clean.
           publish_gate_check_run() {
             evaluated_head="$1"
             conclusion="$2"
@@ -185,10 +202,10 @@ jobs:
             # Defense in depth against a future refactor dropping the mint
             # step: publishing under the shared workflow identity would
             # reopen the forged-context hole, so a missing gate token must
-            # fail closed. The context stays unreported and the merge stays
-            # blocked.
+            # fail closed — the head's verdict keeps its previous value
+            # and the failed job is the re-run signal.
             if [ -z "${GATE_TOKEN:-}" ]; then
-              echo "The gate-publisher App token is missing; refusing to publish the required context under any shared identity. The context stays unreported and the merge stays blocked." >&2
+              echo "The gate-publisher App token is missing; refusing to publish the required context under any shared identity. The head's verdict keeps its previous value and the failed job is the re-run signal." >&2
               return 1
             fi
             if ! GH_TOKEN="${GATE_TOKEN}" gh api "repos/${GITHUB_REPOSITORY}/check-runs" \
@@ -198,7 +215,7 @@ jobs:
                 -F conclusion="${conclusion}" \
                 -F output.title="${title}" \
                 -F output.summary="${summary}" > /dev/null; then
-              echo "Check-run publication failed; the required context stays unreported and the merge stays blocked." >&2
+              echo "Check-run publication failed; the head's verdict keeps its previous value and the failed job is the re-run signal." >&2
               return 1
             fi
           }
@@ -709,7 +726,23 @@ jobs:
           # are derived from matching branch names and are not trusted. The
           # pull requests are re-derived from this exact commit via the API.
           announcer_head="${EVENT_HEAD_SHA:-}"
+          if [ -z "${announcer_head}" ] && [ -n "${EVENT_RUN_ID:-}" ]; then
+            # The completion event carried no head commit. The Actions run
+            # record is the same authority GitHub derived the event field
+            # from, so recover the head from it before giving up — exiting
+            # here would skip the supersession duty every refresh owes the
+            # announced head.
+            recovered_head="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${EVENT_RUN_ID}" --jq '.head_sha // empty' 2>/dev/null || true)"
+            if [ -n "${recovered_head}" ]; then
+              echo "The completion event carried no head commit; using the announcing run's head ${recovered_head} from the Actions run record." >&2
+              announcer_head="${recovered_head}"
+            fi
+          fi
           if [ -z "${announcer_head}" ]; then
+            # No head is known, so no check-run can be honestly bound —
+            # and none superseded. This is the only publication-less exit:
+            # the context keeps its previous verdict and the failed job is
+            # the re-run signal.
             echo "The publisher requires the announcing run's head commit; failing closed." >&2
             exit 1
           fi
@@ -726,6 +759,17 @@ jobs:
           # evaluation.
           if ! associated="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${announcer_head}/pulls?per_page=100")"; then
             echo "Associated-pull-request query failed; failing closed." >&2
+            # A refresh that exits here would leave the head's previous
+            # verdict standing — including a green one that predates a bot
+            # change request submitted at this same head, or one kept alive
+            # by a transient discovery failure. The latest completed run
+            # under the required name decides, so publish the superseding
+            # failure before exiting.
+            if ! publish_gate_check_run "${announcer_head}" "failure" \
+                "Bot Review Gate: refresh failed before evaluation" \
+                "The associated-pull-request discovery query failed, so bot-review evidence at this commit could not be re-evaluated. This failing result supersedes any earlier verdict published at this commit; a later announcer completion publishes the current verdict."; then
+              exit 1
+            fi
             exit 1
           fi
           # The publisher script is also materialized and executed by
@@ -744,7 +788,23 @@ jobs:
                      and ((.head.sha // "") | ascii_downcase) == ($announcer_head | ascii_downcase))
             | .number' <<<"${associated}")
           if [ "${#candidate_prs[@]}" -eq 0 ]; then
-            echo "No open pull request against main is headed by the announced commit ${announcer_head}; nothing to publish."
+            echo "No open pull request against main is headed by the announced commit ${announcer_head}; publishing the not-evaluated verdict."
+            # An empty candidate list is not evidence of cleanliness: a
+            # read-after-write lag on commits/<sha>/pulls, a just-closed
+            # pull request, a dispatch on a branch without a pull request,
+            # or an announced commit that only a stacked descendant
+            # contains all land here. A refresh that published nothing
+            # would leave an earlier verdict at this commit standing, so
+            # publish the superseding failure. The red is inert where no
+            # open main pull request is headed — that commit merges
+            # nowhere — and opening or retargeting a pull request onto this
+            # commit fires its own announcement, which publishes the fresh
+            # verdict.
+            if ! publish_gate_check_run "${announcer_head}" "failure" \
+                "Bot Review Gate: no open main pull request at this commit" \
+                "No open pull request against main is headed by this commit, so no bot-review evidence was evaluated here. This failing result supersedes any earlier verdict published at this commit; opening or retargeting a pull request headed here re-announces the gate."; then
+              exit 1
+            fi
             exit 0
           fi
 
@@ -788,5 +848,15 @@ jobs:
             exit 0
           fi
 
-          echo >&2 "Every selected pull request skipped evaluation (its base is no longer main); nothing was published, the required context stays unreported, and the merge stays blocked."
+          echo >&2 "Every selected pull request skipped evaluation (its base is no longer main); publishing the superseding failure at the announced head."
+          # Retargeting away from main fires no Actions event, so this path
+          # can be the ONLY refresh a retargeted pull request's head ever
+          # sees: publishing nothing would leave its previous verdict —
+          # possibly green — standing at the commit, ready to apply again
+          # after a retarget back to main, which fires no refresh either.
+          if ! publish_gate_check_run "${announcer_head}" "failure" \
+              "Bot Review Gate: every associated pull request skipped evaluation" \
+              "Every open pull request headed by this commit now targets a branch other than main, so none was evaluated. This failing result supersedes any earlier verdict published at this commit; retargeting a pull request back to main fires its own announcement, which publishes the fresh verdict."; then
+            exit 1
+          fi
           exit 1

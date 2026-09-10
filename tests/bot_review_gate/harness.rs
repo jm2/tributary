@@ -166,6 +166,12 @@ impl GateSandbox {
             .env("GITHUB_REPOSITORY", GATE_REPOSITORY)
             .env("GITHUB_EVENT_NAME", event_name)
             .env("EVENT_HEAD_SHA", announcer_head_sha.unwrap_or(""))
+            // The completion event's announcing run id, as the workflow
+            // passes it; the publisher falls back to the run record only
+            // when the event head is missing, and a scenario without an
+            // actions-run.json fixture answers that fallback with an
+            // API-style failure.
+            .env("EVENT_RUN_ID", "4711")
             .env("RUNNER_TEMP", self.root.join("runner-temp"))
             .env("GH_STUB_PAGES", self.root.join("pages"))
             .env("GH_STUB_STATE", self.root.join("state"));
