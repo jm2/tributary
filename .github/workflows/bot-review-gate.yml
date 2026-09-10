@@ -60,9 +60,15 @@ on:
 # The announcer evaluates nothing and needs no token scopes.
 permissions: {}
 
+# Duplicate refresh bursts are serialized, never cancelled: a cancelled run
+# is terminal, and its check run would sit red at the live head forever (no
+# later event re-runs it), so any mechanical reader of head check runs would
+# see a failed `Bot Review Gate Trigger` on every multi-event burst. Queued
+# duplicates cost seconds (the job is a no-op) and the trusted publisher
+# collapses the burst with its own per-head concurrency.
 concurrency:
   group: bot-review-gate-${{ github.repository }}-${{ github.event.pull_request.number || inputs.pr_number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   bot-review-gate:

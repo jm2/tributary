@@ -239,9 +239,13 @@ pushes (`synchronize`), review submissions, edits, and dismissals
 (`pull_request_review`), new review comments
 (`pull_request_review_comment`), a targeted
 `gh workflow run bot-review-gate.yml --ref <head branch> -f pr_number=<n>`
-(`workflow_dispatch`), or a plain check re-run — every announcer completion,
-a cancellation included, fires the publisher, which re-evaluates the current
-state. A dispatch must target the
+(`workflow_dispatch`), or a plain check re-run — every announcer completion
+fires the publisher, which re-evaluates the current
+state. Duplicate announcer refreshes queue rather than cancel: a cancelled
+run is terminal and would leave a red `Bot Review Gate Trigger` check at the
+live head that no later event re-runs, so the announcer serializes its
+per-pull-request refreshes and the publisher's own per-head concurrency
+collapses the burst. A dispatch must target the
 pull request's head branch: the publisher binds its verdict to the
 announcing run's head commit (`workflow_run.head_sha`), so a run announced
 from any other ref is refused exactly like a stale head — no evaluation can
