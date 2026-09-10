@@ -585,9 +585,7 @@ fn parse_rhythmdb(
                 }
             }
             Event::Text(text) => {
-                let value = text
-                    .xml10_content()
-                    .map_err(|_| RhythmboxParseError::MalformedXml { document })?;
+                let value = text.xml10_content();
                 validate_xml_10_characters(&value, document)?;
                 append_document_text(
                     &mut stack,
@@ -600,9 +598,7 @@ fn parse_rhythmdb(
                 preamble.on_non_declaration_event();
             }
             Event::CData(text) => {
-                let value = text
-                    .xml10_content()
-                    .map_err(|_| RhythmboxParseError::MalformedXml { document })?;
+                let value = text.xml10_content();
                 validate_xml_10_characters(&value, document)?;
                 append_document_text(
                     &mut stack,
@@ -633,9 +629,7 @@ fn parse_rhythmdb(
                 return Err(RhythmboxParseError::ForbiddenProcessingInstruction { document });
             }
             Event::Comment(comment) => {
-                let value = comment
-                    .xml10_content()
-                    .map_err(|_| RhythmboxParseError::MalformedXml { document })?;
+                let value = comment.xml10_content();
                 validate_xml_10_characters(&value, document)?;
                 preamble.on_non_declaration_event();
             }
@@ -1032,9 +1026,7 @@ fn parse_playlists(
                 }
             }
             Event::Text(text) => {
-                let value = text
-                    .xml10_content()
-                    .map_err(|_| RhythmboxParseError::MalformedXml { document })?;
+                let value = text.xml10_content();
                 validate_xml_10_characters(&value, document)?;
                 append_playlist_text(
                     &mut stack,
@@ -1047,9 +1039,7 @@ fn parse_playlists(
                 preamble.on_non_declaration_event();
             }
             Event::CData(text) => {
-                let value = text
-                    .xml10_content()
-                    .map_err(|_| RhythmboxParseError::MalformedXml { document })?;
+                let value = text.xml10_content();
                 validate_xml_10_characters(&value, document)?;
                 append_playlist_text(
                     &mut stack,
@@ -1080,9 +1070,7 @@ fn parse_playlists(
                 return Err(RhythmboxParseError::ForbiddenProcessingInstruction { document });
             }
             Event::Comment(comment) => {
-                let value = comment
-                    .xml10_content()
-                    .map_err(|_| RhythmboxParseError::MalformedXml { document })?;
+                let value = comment.xml10_content();
                 validate_xml_10_characters(&value, document)?;
                 preamble.on_non_declaration_event();
             }
@@ -1365,8 +1353,7 @@ fn element_name(
     document: RhythmboxDocument,
 ) -> Result<String, RhythmboxParseError> {
     let qualified_name = element.name();
-    let name = std::str::from_utf8(qualified_name.as_ref())
-        .map_err(|_| RhythmboxParseError::MalformedXml { document })?;
+    let name = qualified_name.as_ref();
     validate_xml_10_characters(name, document)?;
     if name.is_empty() || name.contains(':') {
         return Err(RhythmboxParseError::MalformedXml { document });
@@ -1394,8 +1381,7 @@ fn parse_attributes(
             });
         }
         let attribute = attribute.map_err(|_| RhythmboxParseError::MalformedXml { document })?;
-        let name = std::str::from_utf8(attribute.key.as_ref())
-            .map_err(|_| RhythmboxParseError::MalformedXml { document })?;
+        let name = attribute.key.as_ref();
         validate_xml_10_characters(name, document)?;
         if name.is_empty() || name.contains(':') || name == "xmlns" {
             return Err(RhythmboxParseError::MalformedXml { document });
@@ -1434,8 +1420,7 @@ fn validate_declaration(
     declaration: &BytesDecl<'_>,
     document: RhythmboxDocument,
 ) -> Result<(), RhythmboxParseError> {
-    let raw = std::str::from_utf8(declaration)
-        .map_err(|_| RhythmboxParseError::InvalidDeclaration { document })?;
+    let raw: &str = declaration;
     let declaration = BytesStart::from_content(raw, 3);
     let mut stage = 0u8;
     for attribute in declaration.attributes().with_checks(true) {
@@ -1447,9 +1432,9 @@ fn validate_declaration(
         validate_xml_10_characters(&value, document)
             .map_err(|_| RhythmboxParseError::InvalidDeclaration { document })?;
         match attribute.key.as_ref() {
-            b"version" if stage == 0 && value == "1.0" => stage = 1,
-            b"encoding" if stage == 1 && value.eq_ignore_ascii_case("utf-8") => stage = 2,
-            b"standalone"
+            "version" if stage == 0 && value == "1.0" => stage = 1,
+            "encoding" if stage == 1 && value.eq_ignore_ascii_case("utf-8") => stage = 2,
+            "standalone"
                 if (stage == 1 || stage == 2) && matches!(value.as_ref(), "yes" | "no") =>
             {
                 stage = 3;
@@ -1475,9 +1460,7 @@ fn resolve_predefined_reference(
         validate_xml_10_characters(&value, document)?;
         return Ok(value);
     }
-    let name = reference
-        .decode()
-        .map_err(|_| RhythmboxParseError::MalformedXml { document })?;
+    let name = reference.xml10_content();
     let value = quick_xml::escape::resolve_xml_entity(&name)
         .map(str::to_owned)
         .ok_or(RhythmboxParseError::ForbiddenEntity { document })?;
@@ -2080,6 +2063,23 @@ mod tests {
             parsed.issues[0].kind,
             RhythmboxImportIssueKind::UnsupportedEntryType
         );
+    }
+
+    #[test]
+    fn entity_references_in_entry_text_resolve_through_the_general_ref_path() {
+        let xml = song(
+            &local_uri("music/B%20Side.flac"),
+            "<title>Tom &amp; Jerry</title>",
+        );
+        let parsed = parse_db(&xml).unwrap();
+
+        // <title> is not a tracked Rhythmbox field, but its text still flows
+        // through the quick-xml 0.42 GeneralRef + xml10_content() path that
+        // replaced the removed BytesRef::decode(); the predefined entity must
+        // resolve (no ForbiddenEntity/MalformedXml) and the track must import
+        // cleanly with no issues recorded.
+        assert_eq!(parsed.tracks.len(), 1);
+        assert!(parsed.issues.is_empty());
     }
 
     #[test]
