@@ -470,12 +470,8 @@ impl TransferExecutor {
     /// stage. The publish refused to replace it; the policy decides what
     /// happens next. Skip and Fail are represented distinctly — a Skip-policy
     /// stage is skipped without committing anything, a Fail-policy stage
-    /// rejects the run — Preserve re-resolves exactly as the planner
-    /// would have (one retry onto a disambiguated sibling, with the
-    /// collision untouched), and Overwrite re-resolves onto the occupant
-    /// that now exists: the request's stated policy is to replace, so the
-    /// retry binds the current occupant to a commit-time backup and swaps
-    /// it out atomically.
+    /// rejects the run — while Preserve and Overwrite re-resolve exactly as
+    /// the planner would have, through [`Self::restage_and_commit`].
     #[allow(clippy::too_many_arguments)]
     fn resolve_post_plan_collision(
         &self,
@@ -494,62 +490,18 @@ impl TransferExecutor {
                     path: destination_relative.to_path_buf(),
                 })
             }
-            (ConflictPolicy::Overwrite, ConflictResolution::Fresh) => {
-                // The destination was absent at plan time but appeared
-                // before commit, so the fresh-planned no-replace publish
-                // refused to destroy it. The request's Overwrite policy
-                // decides: stage a replacement against the live filesystem,
-                // binding the current occupant to a commit-time backup and
-                // publishing over it atomically. The collided attempt's
-                // staged copy was discarded with its target, and its byte
-                // count was restored before the collision surfaced, so the
-                // retry re-copies the source into the fresh staged target
-                // exactly once.
-                let staged = self
-                    .request
-                    .destination
-                    .prepare_write_relative_file(destination_relative, ConflictPolicy::Overwrite)
-                    .map_err(|error| {
-                        TransferError::io("failed to stage overwrite replacement", error)
-                    })?;
-                Self::copy_and_commit_staged(
-                    staged,
-                    declared_bytes,
-                    stage_index,
-                    context,
-                    source_file,
-                )
-                .map(Some)
-                .map_err(|failure| match failure {
-                    StageFailure::Final(error) => error,
-                    StageFailure::Collision(error) => {
-                        TransferError::io("overwrite replacement publish collided", error)
-                    }
-                })
-            }
-            (ConflictPolicy::Preserve, ConflictResolution::Fresh) => {
-                let staged = self
-                    .request
-                    .destination
-                    .prepare_write_relative_file(destination_relative, ConflictPolicy::Preserve)
-                    .map_err(|error| {
-                        TransferError::io("failed to stage preserved sibling", error)
-                    })?;
-                Self::copy_and_commit_staged(
-                    staged,
-                    declared_bytes,
-                    stage_index,
-                    context,
-                    source_file,
-                )
-                .map(Some)
-                .map_err(|failure| match failure {
-                    StageFailure::Final(error) => error,
-                    StageFailure::Collision(error) => {
-                        TransferError::io("preserved sibling publish collided", error)
-                    }
-                })
-            }
+            (
+                policy @ (ConflictPolicy::Overwrite | ConflictPolicy::Preserve),
+                ConflictResolution::Fresh,
+            ) => Self::restage_and_commit(
+                self,
+                destination_relative,
+                declared_bytes,
+                stage_index,
+                context,
+                source_file,
+                policy,
+            ),
             // A planned Preserved sibling collision is a genuine allocation
             // failure: the disambiguated name is freshly chosen, so an
             // occupant there can only be an allocation race the policy has
@@ -559,6 +511,49 @@ impl TransferExecutor {
                 collision,
             )),
         }
+    }
+
+    /// Re-stage the source against a post-plan policy resolution and commit
+    /// exactly once. The collided attempt's staged copy was discarded with
+    /// its target, and its byte count was restored before the collision
+    /// surfaced, so the retry re-copies the source into the fresh staged
+    /// target exactly once. Under Overwrite the request's stated policy is
+    /// to replace, so the retry binds the current occupant to a commit-time
+    /// backup and swaps it out atomically; under Preserve it re-resolves
+    /// onto a disambiguated sibling with the collision untouched. A second
+    /// collision has no policy resolution and surfaces as an ordinary I/O
+    /// failure.
+    #[allow(clippy::too_many_arguments)]
+    fn restage_and_commit(
+        &self,
+        destination_relative: &Path,
+        declared_bytes: u64,
+        stage_index: u32,
+        context: &mut RunContext<'_>,
+        source_file: &mut File,
+        policy: ConflictPolicy,
+    ) -> Result<Option<CommitOutcome>, TransferError> {
+        let (stage_context, collision_context) = match policy {
+            ConflictPolicy::Overwrite => (
+                "failed to stage overwrite replacement",
+                "overwrite replacement publish collided",
+            ),
+            _ => (
+                "failed to stage preserved sibling",
+                "preserved sibling publish collided",
+            ),
+        };
+        let staged = self
+            .request
+            .destination
+            .prepare_write_relative_file(destination_relative, policy)
+            .map_err(|error| TransferError::io(stage_context, error))?;
+        Self::copy_and_commit_staged(staged, declared_bytes, stage_index, context, source_file)
+            .map(Some)
+            .map_err(|failure| match failure {
+                StageFailure::Final(error) => error,
+                StageFailure::Collision(error) => TransferError::io(collision_context, error),
+            })
     }
 
     /// Flush the staged file and verify the copied byte count against the
