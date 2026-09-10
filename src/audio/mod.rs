@@ -595,9 +595,11 @@ impl Player {
     /// Apply a new equalizer state per the live-reconfiguration boundary:
     ///
     /// - `Enabled` and `Clip protection` toggles change the bin topology,
-    ///   so they run through the pause → surgery → resume seam.
+    ///   so they run through the pause → surgery → resume seam, which
+    ///   edits only after the pipeline has confirmed `Paused`.
     /// - Band, preamp, and preset changes are buffer-boundary
-    ///   property-write transactions (freeze/thaw) on the running bin.
+    ///   property-write transactions (idle pad probe on the running
+    ///   bin's sink ghost pad) on the installed chain.
     /// - The new state is persisted through the trailing-edge debounce;
     ///   every change-spell writes, including one whose result is exactly
     ///   the fresh-install default state.
@@ -616,8 +618,13 @@ impl Player {
             } else {
                 self.uninstall_equalizer_bin();
             }
-        } else if clip_changed {
-            self.toggle_clip_protection(next.clip_protection);
+        } else if clip_changed && !self.toggle_clip_protection(next.clip_protection) {
+            // The toggle was deferred (pause unconfirmed) or the
+            // surgery failed: the bin still carries the previous
+            // protection, so record that — the persisted and
+            // user-visible state stays truthful, and the next
+            // apply re-attempts the toggle cleanly.
+            self.eq_state.borrow_mut().settings.clip_protection = current.clip_protection;
         }
 
         if next.enabled {
@@ -636,8 +643,11 @@ impl Player {
     }
 
     /// Limiter-only topology change inside the installed bin (clip
-    /// protection toggle while the equalizer stays enabled).
-    fn toggle_clip_protection(&self, protection: equalizer::ClipProtection) {
+    /// protection toggle while the equalizer stays enabled). Returns
+    /// `false` when the seam deferred the edit or the surgery failed —
+    /// recoverable per the contract; the caller keeps the previous
+    /// protection recorded.
+    fn toggle_clip_protection(&self, protection: equalizer::ClipProtection) -> bool {
         self.with_pipeline_suspended(|| {
             let mut state = self.eq_state.borrow_mut();
             let Some(chain) = state.chain.as_mut() else {
@@ -650,7 +660,7 @@ impl Player {
                 "Clip protection element toggled in local pipeline"
             );
             installed
-        });
+        })
     }
 
     /// Buffer-boundary property-write transaction for band/preamp
@@ -735,14 +745,35 @@ impl Player {
 
     /// Run one pipeline-topology edit through the pause → edit → resume
     /// seam. A running pipeline is paused and given a bounded window to
-    /// settle; a NULL pipeline (idle player) skips straight to the edit.
+    /// settle; the edit runs **only once the state query confirms the
+    /// pipeline reached `Paused`** — a slow or blocked transition never
+    /// leaves the edit running against live data flow. A pipeline that
+    /// misses the window gets its pending pause cancelled (back to
+    /// `Playing`) and the edit is deferred: the caller reports failure
+    /// and the next apply, or the next URI load's install seam, retries.
+    /// A NULL pipeline (idle player) skips straight to the edit.
     fn with_pipeline_suspended<F: FnOnce() -> bool>(&self, edit: F) -> bool {
         let (_, current, _) = self.playbin.state(gst::ClockTime::ZERO);
         let was_playing = current == gst::State::Playing;
         if was_playing {
-            let _ = self.playbin.set_state(gst::State::Paused);
+            if let Err(error) = self.playbin.set_state(gst::State::Paused) {
+                warn!(
+                    error = %error,
+                    "Pipeline pause request failed; equalizer topology edit deferred"
+                );
+                return false;
+            }
             // Bounded settle — a topology edit must never wedge the UI.
-            let _ = self.playbin.state(gst::ClockTime::from_seconds(1));
+            let (_, settled, _) = self.playbin.state(gst::ClockTime::from_seconds(1));
+            if settled != gst::State::Paused {
+                let _ = self.playbin.set_state(gst::State::Playing);
+                warn!(
+                    settled_state = ?settled,
+                    "Pipeline did not confirm PAUSED within the settle window; \
+                     equalizer topology edit deferred"
+                );
+                return false;
+            }
         }
         let result = edit();
         if was_playing {
