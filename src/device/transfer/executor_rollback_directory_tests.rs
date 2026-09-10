@@ -142,6 +142,51 @@ fn mount_swap_during_execution_fails_closed() {
     );
 }
 
+/// A destination directory that appears between planning and execution is
+/// adopted, not owned: the authority reports nothing created for it, so a
+/// failed transfer's rollback must leave the directory — and the foreign
+/// data inside it — in place while still reversing the transfer's own
+/// committed copy.
+#[test]
+fn directory_appearing_after_plan_survives_rollback() {
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    write_source_file(source_root.path(), "album/a.flac", b"a");
+    write_source_file(source_root.path(), "album/b.flac", b"b");
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = transfer_request(
+        source,
+        destination,
+        vec![TransferItem::new(
+            PathBuf::from("album"),
+            PathBuf::from("imported"),
+        )],
+        ConflictPolicy::Preserve,
+    );
+    let plan = TransferPlanner::new().plan(&request).expect("plan");
+    // The destination directory appears after planning, before execution:
+    // the create stage must adopt it without claiming ownership — a
+    // concurrent writer's directory is never recorded as created.
+    std::fs::create_dir(destination_root.path().join("imported")).expect("post-plan directory");
+    std::fs::write(
+        destination_root.path().join("imported/foreign.txt"),
+        b"foreign",
+    )
+    .expect("write foreign entry");
+    std::fs::remove_file(source_root.path().join("album/b.flac")).expect("remove source b");
+    let _error = run_plan_expect_failure(request, plan);
+    assert_eq!(
+        std::fs::read(destination_root.path().join("imported/foreign.txt")).expect("read foreign"),
+        b"foreign",
+        "a directory that appeared after planning is not owned by the transfer"
+    );
+    assert!(
+        !destination_root.path().join("imported/a.flac").exists(),
+        "the committed copy inside the adopted directory must be rolled back"
+    );
+}
+
 /// A directory item mapped to a nested destination stages every missing
 /// ancestor before its leaf, and the executor records each created
 /// component: a failed transfer must remove the whole created chain
