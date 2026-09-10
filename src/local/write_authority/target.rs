@@ -1,6 +1,7 @@
 //! The staged-write handle ([`PreparedWriteTarget`]) and the bound
 //! directory handle ([`MountedDirectory`]) produced by the write authority.
 
+use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
@@ -64,7 +65,11 @@ pub struct PreparedWriteTarget {
     /// unlinking it would destroy the displaced object's last reachable
     /// link — and the caller recovers the published outcome from the
     /// `PublishVerification` error to record it for rollback.
-    pub(super) staged_leaf_holds_displaced_occupant: bool,
+    ///
+    /// Held as a one-shot latch in a `Cell` so the publish path arms it
+    /// behind `&self`: the unix-only marker path that sets it compiles out
+    /// on Windows, where no publish step mutates the target.
+    pub(super) staged_leaf_holds_displaced_occupant: Cell<bool>,
 }
 
 impl fmt::Debug for PreparedWriteTarget {
@@ -193,7 +198,7 @@ impl PreparedWriteTarget {
     /// Overwrite publish actually replaced an occupant — plus the landing
     /// data whose trailing retained-parent revalidation the caller reports
     /// as a verified-publication failure.
-    fn publish_staged(&mut self) -> Result<(Option<PathBuf>, LandedPublish), CommitError> {
+    fn publish_staged(&self) -> Result<(Option<PathBuf>, LandedPublish), CommitError> {
         let final_path = self.authority.root().join(&self.final_relative_path);
         let final_leaf = self.final_leaf_name().map_err(CommitError::from)?;
         if self.resolution != ConflictResolution::Overwrite {
@@ -223,7 +228,7 @@ impl PreparedWriteTarget {
     /// publish degrades to the no-replace cascade — a concurrent creation
     /// is bypassed or backed up, never silently replaced-and-deleted.
     fn publish_by_replace(
-        &mut self,
+        &self,
         final_leaf: OsString,
         final_path: PathBuf,
     ) -> Result<(Option<PathBuf>, LandedPublish), CommitError> {
@@ -267,13 +272,13 @@ impl PreparedWriteTarget {
     /// The Windows replace loop re-binds on verification mismatch and
     /// surfaces an ordinary I/O error, so there is nothing to downcast.
     #[cfg(unix)]
-    fn map_replace_failure(&mut self, error: io::Error, backup_relative: PathBuf) -> CommitError {
+    fn map_replace_failure(&self, error: io::Error, backup_relative: PathBuf) -> CommitError {
         let displaced = error
             .get_ref()
             .and_then(|payload| payload.downcast_ref::<RestoreFailure>())
             .map(|failure| failure.payload.published_leaf);
         if let Some(published_leaf) = displaced {
-            self.staged_leaf_holds_displaced_occupant = true;
+            self.staged_leaf_holds_displaced_occupant.set(true);
             let outcome = CommitOutcome {
                 relative_path: self.final_relative_path.clone(),
                 resolution: self.resolution,
@@ -315,7 +320,7 @@ impl PreparedWriteTarget {
     /// concurrent writer's (or the original occupant's) last reachable
     /// link.
     pub fn rollback(mut self) -> io::Result<()> {
-        if self.committed || self.staged_leaf_holds_displaced_occupant {
+        if self.committed || self.staged_leaf_holds_displaced_occupant.get() {
             return Ok(());
         }
         drop(self.staged_file.take());
@@ -345,7 +350,7 @@ impl PreparedWriteTarget {
 
 impl Drop for PreparedWriteTarget {
     fn drop(&mut self) {
-        if self.committed || self.staged_leaf_holds_displaced_occupant {
+        if self.committed || self.staged_leaf_holds_displaced_occupant.get() {
             // A displaced-occupant failure keeps the staged leaf: it holds
             // the displaced object's last reachable link, not staged
             // garbage. See `staged_leaf_holds_displaced_occupant`.
