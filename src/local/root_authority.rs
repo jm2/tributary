@@ -671,6 +671,26 @@ impl MountedMutationCommit<'_> {
         Ok(source)
     }
 
+    /// Clone the retained parent directory handle and admitted leaf name
+    /// that anchor the staged tag sibling.
+    ///
+    /// Private machinery for the local tag writer's anchored unix staging.
+    /// The staged copy is created, written, flushed, and — on every failure
+    /// path — cleaned up beneath this exact retained parent object, never by
+    /// resolving the target pathname, so an ancestor displaced after this
+    /// section's validation can neither strand the staging area inside an
+    /// impostor directory nor leak the complete tagged copy of the admitted
+    /// file across a symlink planted at an old name. The commit already
+    /// refuses a staged leaf it cannot find beneath this parent, so
+    /// anchoring staging here makes staging and install agree on one
+    /// directory object for the whole section.
+    #[cfg(unix)]
+    pub(crate) fn retained_staging_anchor(&self) -> io::Result<(File, OsString)> {
+        let parent = self.retained_parent();
+        parent.validate_live()?;
+        Ok((parent.file.try_clone()?, self.target.relative_leaf()?))
+    }
+
     /// Prove the replacement target immediately before an atomic rename.
     ///
     /// The mounted root is revalidated against its retained identity, and the

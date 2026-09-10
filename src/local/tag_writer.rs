@@ -18,7 +18,11 @@
 //!   filename shape.
 //! - **The temp path is unguessable and exclusively created** (`O_EXCL` via
 //!   `create_new`), so two concurrent saves to the same file cannot collide and
-//!   the copy cannot be redirected through a pre-planted symlink.
+//!   the copy cannot be redirected through a pre-planted symlink. For a
+//!   retained-authority write the staging never resolves a pathname at all:
+//!   the sibling is created, written, flushed, and cleaned up beneath the
+//!   retained parent handle, so no displaced ancestor or planted symlink can
+//!   observe or receive any part of the copy.
 //! - **A Windows copy is never exposed through an inherited DACL.** Its handle
 //!   denies competing opens from creation until the source DACL and protection
 //!   state are installed; a fresh exclusive write handle must then pass that
@@ -26,6 +30,7 @@
 //! - **The replacement is durable**: the tagged copy is `fsync`ed before the
 //!   rename, so a crash cannot leave a truncated file in place of the original.
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -35,7 +40,7 @@ use lofty::file::{TaggedFile, TaggedFileExt};
 use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem};
 use uuid::Uuid;
 
-use super::root_authority::MountedMutationTarget;
+use super::root_authority::{MountedMutationCommit, MountedMutationTarget};
 
 /// Reserved filename prefix for the private sibling used by atomic tag writes.
 const TAG_WRITE_TEMP_PREFIX: &str = ".tributary-tag-";
@@ -283,6 +288,35 @@ impl Drop for WindowsDacl {
 struct TempFile {
     path: PathBuf,
     persisted: bool,
+    /// Unix authority-based staging: the retained parent directory the
+    /// staged sibling is anchored at. Set only when `path` holds the bare
+    /// leaf name of a sibling created beneath a retained parent handle; the
+    /// drop cleanup then unlinks that leaf through the handle — never
+    /// through a pathname — so the cleanup cannot mutate a displaced
+    /// impostor directory.
+    #[cfg(unix)]
+    anchored_parent: Option<File>,
+}
+
+/// Randomized staged-sibling leaf name, preserving the final extension.
+///
+/// `lofty` infers the format from the final extension, and the retained
+/// commit machinery addresses the staged copy by this exact leaf, so
+/// preserve only that extension: including the whole source name could
+/// overflow a filesystem's component-length limit for an otherwise valid
+/// long filename.
+fn staged_sibling_name(target_leaf: &OsStr) -> std::ffi::OsString {
+    let extension = Path::new(target_leaf)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let mut candidate_name =
+        std::ffi::OsString::from(format!("{TAG_WRITE_TEMP_PREFIX}{}", Uuid::new_v4()));
+    if let Some(extension) = extension.as_deref() {
+        candidate_name.push(".");
+        candidate_name.push(extension);
+    }
+    candidate_name
 }
 
 impl TempFile {
@@ -298,23 +332,9 @@ impl TempFile {
     /// not leak into logs (see `replacement_path`).
     fn create_beside(target: &Path, target_label: &str) -> Result<(Self, std::fs::File)> {
         let directory = target.parent().unwrap_or_else(|| Path::new("."));
-        let extension = target
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase);
 
         for _ in 0..8 {
-            // `lofty::read_from_path` infers the format from the final
-            // extension. Preserve only that extension: including the whole
-            // source name could overflow a filesystem's component-length
-            // limit for an otherwise valid long filename.
-            let mut candidate_name =
-                std::ffi::OsString::from(format!("{TAG_WRITE_TEMP_PREFIX}{}", Uuid::new_v4()));
-            if let Some(extension) = extension.as_deref() {
-                candidate_name.push(".");
-                candidate_name.push(extension);
-            }
-            let candidate = directory.join(candidate_name);
+            let candidate = directory.join(staged_sibling_name(target.as_os_str()));
 
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
@@ -346,9 +366,58 @@ impl TempFile {
                         Self {
                             path: candidate,
                             persisted: false,
+                            #[cfg(unix)]
+                            anchored_parent: None,
                         },
                         file,
                     ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Failed to create a temp file beside {target_label}")
+                    })
+                }
+            }
+        }
+
+        anyhow::bail!("Failed to create a unique temp file beside {target_label}")
+    }
+
+    /// Create an empty, exclusively owned temp file beside the admitted leaf
+    /// *through the retained parent handle* — the unix authority-based twin
+    /// of [`TempFile::create_beside`].
+    ///
+    /// The sibling is created with `openat(O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW)`
+    /// beneath the retained parent directory, so creation can neither
+    /// traverse a displaced ancestor nor follow a symlink planted at the
+    /// candidate name, and the copy starts from that handle without a
+    /// reopening window. The temp's `path` records only the bare leaf name:
+    /// every consumer — tagging, flush, commit, and the drop cleanup —
+    /// addresses the staged leaf through the retained parent, never through
+    /// a pathname. Error contexts name the target by `target_label`, never
+    /// by any path.
+    #[cfg(unix)]
+    fn create_beside_retained(
+        parent: &File,
+        leaf: &OsStr,
+        target_label: &str,
+    ) -> Result<(Self, std::fs::File)> {
+        for _ in 0..8 {
+            let candidate_name = staged_sibling_name(leaf);
+            match create_retained_sibling_exclusive(parent, &candidate_name) {
+                Ok(staged) => {
+                    let cleanup_parent = parent.try_clone().with_context(|| {
+                        format!("Failed to retain the staging parent of {target_label}")
+                    })?;
+                    return Ok((
+                        Self {
+                            path: PathBuf::from(candidate_name),
+                            persisted: false,
+                            anchored_parent: Some(cleanup_parent),
+                        },
+                        staged,
+                    ));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
@@ -432,6 +501,19 @@ impl TempFile {
 impl Drop for TempFile {
     fn drop(&mut self) {
         if !self.persisted {
+            #[cfg(unix)]
+            if let Some(parent) = &self.anchored_parent {
+                // Anchored staging: unlink the staged leaf through the
+                // retained parent. `unlinkat` never follows a symlink at the
+                // leaf and resolves nothing above it, so the cleanup removes
+                // exactly the entry this section created and can never
+                // mutate a directory the authority did not admit — the
+                // pre-anchoring cleanup walked the absolute pathname and
+                // removed its stranded sibling from whatever directory an
+                // external writer had installed at the old ancestor name.
+                let _ = rustix::fs::unlinkat(parent, &self.path, rustix::fs::AtFlags::empty());
+                return;
+            }
             let _ = std::fs::remove_file(&self.path);
         }
     }
@@ -651,37 +733,222 @@ pub fn write_tags_with_mutation_target(
     let source = commit
         .source_file()
         .with_context(|| "Failed to read the exact retained mutation target".to_string())?;
-    // The replacement path is a native mount path whose contract forbids
-    // logging or formatting it, so every error context below names the
-    // target by a redacted label instead of the path — the removable-media
-    // error branch surfaces the whole chain to the user.
-    atomic_tag_replacement(
+    write_tag_edits_for_commit(&mut commit, source, target, edits)
+}
+
+/// Perform the staged tag replacement for an open commit section.
+///
+/// The replacement path is a native mount path whose contract forbids
+/// logging or formatting it, so every error context names the target by a
+/// redacted label instead of the path — the removable-media error branch
+/// surfaces the whole chain to the user.
+#[cfg(unix)]
+fn write_tag_edits_for_commit(
+    commit: &mut MountedMutationCommit<'_>,
+    source: File,
+    _target: &MountedMutationTarget,
+    edits: &TagEdits,
+) -> Result<()> {
+    // Anchor the staging at the retained parent before anything is staged:
+    // the pinned parent identity makes staging and the later install agree
+    // on one directory object, and no step below ever resolves an absolute
+    // pathname.
+    let (staging_parent, staged_leaf) = commit.retained_staging_anchor().map_err(|error| {
+        anyhow::Error::new(error).context("The retained mutation authority lost the staging parent")
+    })?;
+    #[cfg(test)]
+    run_pre_staging_interpose(_target);
+    anchored_atomic_tag_replacement(
         source,
-        target.replacement_path(),
+        &staging_parent,
+        &staged_leaf,
         "the retained mutation target",
         edits,
-        |temp| {
-            // The replacement and the re-anchor of the retained evidence to the
-            // installed object both happen inside this commit section, while its
-            // guard still holds the target's commit lock — the re-anchor is
-            // identity-conditioned on the proven landing, so no pathname is ever
-            // opened outside the guard and no leaf swap between the landing and
-            // the re-anchor can be silently adopted.
-            commit.commit_replacement(temp.path()).map_err(|error| {
-                anyhow::Error::new(error)
-                    .context("The retained mutation authority refused the tagged replacement")
-            })?;
-            // The retained authority renamed the staged copy into place; the
-            // staging name no longer exists for the drop guard to remove.
-            temp.disarm_cleanup();
-            Ok(())
-        },
+        |temp| finish_committed_tag_replacement(commit, temp),
     )
+}
+
+/// Platforms without retained parent handles keep the documented path-based
+/// staging discipline: the commit re-proves the admitted identity through
+/// the pathname before anything is installed, and a staging area stranded
+/// by a displaced ancestor is refused and cleaned up by pathname.
+#[cfg(not(unix))]
+fn write_tag_edits_for_commit(
+    commit: &mut MountedMutationCommit<'_>,
+    source: File,
+    target: &MountedMutationTarget,
+    edits: &TagEdits,
+) -> Result<()> {
+    let replacement_path = target.replacement_path().to_path_buf();
+    atomic_tag_replacement(
+        source,
+        &replacement_path,
+        "the retained mutation target",
+        edits,
+        |temp| finish_committed_tag_replacement(commit, temp),
+    )
+}
+
+/// Rename the staged copy into place through the retained authority and
+/// disarm the staging cleanup once the authority owns the name.
+///
+/// The replacement and the re-anchor of the retained evidence to the
+/// installed object both happen inside the commit section, while its guard
+/// still holds the target's commit lock — the re-anchor is
+/// identity-conditioned on the proven landing, so no pathname is ever
+/// opened outside the guard and no leaf swap between the landing and the
+/// re-anchor can be silently adopted.
+fn finish_committed_tag_replacement(
+    commit: &mut MountedMutationCommit<'_>,
+    temp: &mut TempFile,
+) -> Result<()> {
+    commit.commit_replacement(temp.path()).map_err(|error| {
+        anyhow::Error::new(error)
+            .context("The retained mutation authority refused the tagged replacement")
+    })?;
+    // The retained authority renamed the staged copy into place; the
+    // staging name no longer exists for the drop guard to remove.
+    temp.disarm_cleanup();
+    Ok(())
+}
+
+/// Stage and tag the admitted file's replacement with every staged access
+/// anchored at the retained parent handle (unix).
+///
+/// [`TempFile::create_beside_retained`] creates the exclusively-created
+/// sibling beneath the retained parent; the admitted bytes are copied into
+/// that handle; tagging reads and saves through the same handle; and the
+/// flush, permission carry-over, and — on every failure path — the drop
+/// cleanup address the staged leaf through the retained parent as well.
+/// [`finish_committed_tag_replacement`] then consumes the staged copy by
+/// leaf name through the retained parent. No step resolves an absolute
+/// pathname, so an ancestor displaced after the section's validation can
+/// neither strand the staging area in an impostor directory nor leak the
+/// complete tagged copy of the admitted file across a symlink planted at
+/// an old name.
+#[cfg(unix)]
+fn anchored_atomic_tag_replacement(
+    mut source: File,
+    staging_parent: &File,
+    staged_leaf: &OsStr,
+    target_label: &str,
+    edits: &TagEdits,
+    commit_replacement: impl FnOnce(&mut TempFile) -> Result<()>,
+) -> Result<()> {
+    let (mut temp, mut staged) =
+        TempFile::create_beside_retained(staging_parent, staged_leaf, target_label)?;
+    let copy_result = copy_source_into_destination(&mut source, &mut staged, target_label);
+    // Capture the replacement's Unix permissions from the exact source
+    // object while the handle is still open — never from a lookup at any
+    // pathname, which an external writer can retarget (same discipline as
+    // the path-based flow).
+    let retained_permissions = source
+        .metadata()
+        .ok()
+        .map(|metadata| metadata.permissions());
+    drop(source);
+    copy_result?;
+
+    write_tags_to_retained(&mut staged, target_label, edits)?;
+    flush_and_prepare_tagged_copy_retained(&mut staged, target_label, retained_permissions)?;
+    drop(staged);
+    commit_replacement(&mut temp)?;
+
+    tracing::debug!("Tags written successfully");
+    Ok(())
+}
+
+/// Probe, edit, and save the staged copy through its retained handle — the
+/// anchored twin of [`write_tags_to`], never touching a pathname.
+///
+/// lofty's own `save_to_path` is *open a fresh read/write handle, then*
+/// `save_to`, so driving the same `save_to` through the anchored sibling
+/// handle at position zero is behavior-identical to the path-based flow;
+/// the format is guessed from the content instead of the staged name, which
+/// the name's random prefix would not identify anyway.
+#[cfg(unix)]
+fn write_tags_to_retained(staged: &mut File, target_label: &str, edits: &TagEdits) -> Result<()> {
+    use std::io::Seek;
+
+    staged
+        .rewind()
+        .with_context(|| format!("Failed to read tags from {target_label}"))?;
+    let probe = lofty::probe::Probe::new(&mut *staged)
+        .guess_file_type()
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("Failed to read tags from {target_label}"))?;
+    let mut tagged_file = probe
+        .read()
+        .with_context(|| format!("Failed to read tags from {target_label}"))?;
+
+    let tag = ensure_primary_tag(&mut tagged_file, target_label)?;
+    apply_tag_edits(tag, edits)?;
+
+    staged
+        .rewind()
+        .with_context(|| format!("Failed to write tags to {target_label}"))?;
+    tag.save_to(staged, WriteOptions::default())
+        .with_context(|| format!("Failed to write tags to {target_label}"))?;
+    Ok(())
+}
+
+/// Flush the tagged copy and carry over the source permissions, addressing
+/// the staged leaf through its retained handle — the anchored twin of
+/// [`flush_and_prepare_tagged_copy`]. The flush happens *before* the
+/// permission copy, exactly like the path-based flow: a read-only file
+/// cannot be flushed.
+#[cfg(unix)]
+fn flush_and_prepare_tagged_copy_retained(
+    staged: &mut File,
+    target_label: &str,
+    retained_permissions: Option<std::fs::Permissions>,
+) -> Result<()> {
+    staged
+        .sync_all()
+        .with_context(|| format!("Failed to flush the tagged copy of {target_label}"))?;
+
+    // Best-effort, exactly like the path-based flow: a capture failure
+    // skips the carry-over rather than failing the write.
+    if let Some(permissions) = retained_permissions {
+        let _ = staged.set_permissions(permissions);
+    }
+
+    Ok(())
+}
+
+/// `openat(parent, name, O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0o600)`
+/// — the creation twin of the retained-parent opens the commit machinery
+/// already performs. Resolution starts at the retained parent handle, the
+/// final component never follows a symlink, the exclusive create refuses an
+/// occupied name, and the private mode keeps a full source copy unexposed
+/// before final permissions are applied.
+#[cfg(unix)]
+fn create_retained_sibling_exclusive(
+    parent: &File,
+    name: &OsStr,
+) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(std::fs::File::from(descriptor))
 }
 
 /// Copy `source` to an exclusively created sibling of `target_path`, tag the
 /// copy, flush it, and hand it to `commit_replacement` for the atomic
 /// replacement of `target_path`.
+///
+/// This is the path-based staging flow: the user-visible pathname writer
+/// uses it directly, and platforms without retained parent handles keep it
+/// as their documented authority-based staging discipline (their commit
+/// re-proves the admitted identity through the pathname before anything is
+/// installed). Unix authority-based callers stage through the retained
+/// parent instead — see [`anchored_atomic_tag_replacement`].
 ///
 /// `commit_replacement` runs after the flush and permission carry-over and
 /// owns the entire final gate: authority-checked callers prove the exact
@@ -978,6 +1245,38 @@ fn apply_comment_edit(tag: &mut Tag, edits: &TagEdits) {
             tag.set_comment(comment.clone());
         }
     }
+}
+
+/// Test-only seam: runs between the commit section's validation and the
+/// staging of the tagged copy, driving the exact window an external writer
+/// needs to displace an ancestor after validation and before staging. The
+/// regression tests plant an impostor directory or symlink at the displaced
+/// ancestor's old name here and assert the staged copy never appears on the
+/// other side.
+#[cfg(all(test, unix))]
+type PreStagingInterpose = dyn Fn(&MountedMutationTarget) + Send + Sync;
+
+#[cfg(all(test, unix))]
+static PRE_STAGING_INTERPOSE: std::sync::Mutex<Option<Box<PreStagingInterpose>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, unix))]
+static PRE_STAGING_INTERPOSE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(test, unix))]
+fn run_pre_staging_interpose(target: &MountedMutationTarget) {
+    if let Some(interpose) = PRE_STAGING_INTERPOSE.lock().unwrap().as_ref() {
+        interpose(target);
+    }
+}
+
+/// Serialize tests that use the pre-staging interposition seam.
+#[cfg(all(test, unix))]
+fn with_pre_staging_interpose(interpose: Box<PreStagingInterpose>, run: impl FnOnce()) {
+    let _serial = PRE_STAGING_INTERPOSE_SERIAL.lock().unwrap();
+    *PRE_STAGING_INTERPOSE.lock().unwrap() = Some(interpose);
+    run();
+    *PRE_STAGING_INTERPOSE.lock().unwrap() = None;
 }
 
 #[cfg(test)]
@@ -1489,14 +1788,15 @@ mod tests {
         );
     }
 
-    /// A parent directory displaced between selection and commit strands the
-    /// staging area inside whatever now occupies the old pathname. The
-    /// retained authority stages and replaces only through its retained
-    /// parent object, so the commit must refuse, leave the impostor
-    /// untouched, and clean up the stranded sibling.
+    /// A parent directory displaced between selection and commit must not
+    /// strand the staging area inside whatever now occupies the old
+    /// pathname: the retained authority stages and replaces only through its
+    /// retained parent object, so the write lands beside the admitted file
+    /// in the retained directory and the impostor never receives anything
+    /// at all — not the staged sibling, not the tagged copy.
     #[cfg(unix)]
     #[test]
-    fn a_mutation_target_write_refuses_when_the_parent_directory_was_displaced() {
+    fn a_mutation_target_write_lands_beside_the_retained_parent_when_it_was_displaced() {
         let directory = TestDirectory::new("mutation-parent-e2e");
         let album = directory.path.join("album");
         std::fs::create_dir(&album).expect("create album");
@@ -1524,39 +1824,132 @@ mod tests {
         std::fs::write(&track, b"impostor audio").expect("install impostor file");
 
         write_tags_with_mutation_target(&target, &year("2026"))
-            .expect_err("a stranded staging area must refuse the commit");
+            .expect("staging and replacement run through the retained parent");
 
-        assert_refused_displacement_left_files_untouched(
-            &track,
-            &displaced_album.join("silence.flac"),
-        );
-        assert_no_stranded_tag_write_siblings(&[&album, &displaced_album]);
-    }
-
-    /// Both files the displaced-parent scenario can observe must be untouched
-    /// by the refused commit: the impostor now occupying the old pathname
-    /// never receives the replacement, and the displaced admitted file keeps
-    /// its original tags.
-    #[cfg(unix)]
-    fn assert_refused_displacement_left_files_untouched(
-        impostor_track: &Path,
-        displaced_track: &Path,
-    ) {
+        // The replacement landed beside the admitted file in the retained
+        // (displaced) directory.
+        let tagged_file = lofty::read_from_path(displaced_album.join("silence.flac"))
+            .expect("reopen the replaced admitted file");
         assert_eq!(
-            std::fs::read(impostor_track).expect("read impostor file"),
-            b"impostor audio",
-            "the impostor directory must never receive the replacement"
-        );
-        let displaced_tagged =
-            lofty::read_from_path(displaced_track).expect("reopen the displaced admitted file");
-        assert_ne!(
-            displaced_tagged
+            tagged_file
                 .primary_tag()
                 .expect("primary tag")
                 .get_string(ItemKey::Year),
             Some("2026"),
-            "the admitted file must be untouched by the refused commit"
+            "the replacement must land beside the admitted file in the retained directory"
         );
+
+        // The impostor keeps exactly what it had. Under path-resolved
+        // staging it transiently received the staged sibling and the
+        // complete tagged copy of the admitted file before the commit
+        // refused; anchored staging never resolves its name at all.
+        assert_eq!(
+            std::fs::read(&track).expect("read impostor file"),
+            b"impostor audio",
+            "the impostor directory must never receive the replacement"
+        );
+        let impostor_entries: Vec<std::ffi::OsString> = std::fs::read_dir(&album)
+            .expect("list impostor directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            impostor_entries,
+            [std::ffi::OsString::from("silence.flac")],
+            "the impostor directory must never receive a staged sibling"
+        );
+        assert_no_stranded_tag_write_siblings(&[&album, &displaced_album]);
+    }
+
+    /// The staging of a retained-authority copy must never traverse the
+    /// absolute-path ancestry. This drives the exact window an external
+    /// writer needs — after the commit section validated the retained chain,
+    /// before the writer stages the sibling — and installs a symlink at the
+    /// displaced ancestor's old name, pointing outside the mount. Path-
+    /// resolved staging would create the staged sibling through that symlink
+    /// and leak the complete tagged copy of the admitted file outside the
+    /// retained authority; anchored staging resolves nothing, so the write
+    /// lands beside the admitted file in the retained directory and the
+    /// symlink's target stays empty.
+    #[cfg(unix)]
+    #[test]
+    fn a_mutation_target_write_stages_beside_the_retained_parent_never_through_a_displaced_ancestor()
+    {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("mutation-stage-anchor");
+        let album = directory.path.join("album");
+        std::fs::create_dir(&album).expect("create album");
+        let track = album.join("silence.flac");
+        std::fs::write(
+            &track,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        )
+        .expect("write fixture");
+
+        let outside = TestDirectory::new("mutation-stage-outside");
+
+        let authority = std::sync::Arc::new(
+            crate::local::root_authority::MountedRootAuthority::acquire(&directory.path)
+                .expect("acquire mounted authority"),
+        );
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+
+        let displaced_album = directory.path.join("displaced-album");
+        let impostor_album = album.clone();
+        let outside_root = outside.path.clone();
+        let watched = track.clone();
+        let closure_displaced_album = displaced_album.clone();
+        with_pre_staging_interpose(
+            Box::new(move |interposed| {
+                if interposed.replacement_path() != watched.as_path() {
+                    return;
+                }
+                // Displace the retained ancestor inside the staging window
+                // and plant a symlink at its old name.
+                std::fs::rename(&watched.parent().expect("album parent"), &closure_displaced_album)
+                    .expect("displace retained parent");
+                symlink(&outside_root, &impostor_album)
+                    .expect("install symlink impostor at the old name");
+            }),
+            || {
+                write_tags_with_mutation_target(&target, &year("2026")).expect(
+                    "anchored staging must land the write through the retained parent",
+                );
+            },
+        );
+
+        // The replacement landed beside the admitted file in the retained
+        // (displaced) directory.
+        let tagged_file = lofty::read_from_path(displaced_album.join("silence.flac"))
+            .expect("reopen the replaced admitted file");
+        assert_eq!(
+            tagged_file
+                .primary_tag()
+                .expect("primary tag")
+                .get_string(ItemKey::Year),
+            Some("2026"),
+            "the replacement must land beside the admitted file in the retained directory"
+        );
+
+        // Nothing — staged sibling or tagged copy — may ever have crossed
+        // the symlink into the impostor's target.
+        let outside_entries: Vec<std::ffi::OsString> = std::fs::read_dir(&outside.path)
+            .expect("list the symlink impostor's target")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            outside_entries.is_empty(),
+            "the displaced ancestor's symlink target must never receive anything: \
+             {outside_entries:?}"
+        );
+        assert_no_stranded_tag_write_siblings(&[&displaced_album]);
     }
 
     /// A refused commit must clean up its stranded staging sibling in every
