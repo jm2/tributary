@@ -48,10 +48,15 @@ release-tag commits (PipeWire 1.6.8, tag commit `b741e0c7`), not to moving
 branches; every cited line number was verified against the pinned revision
 on 2026-09-08.
 
-Closes the P2.4 "Open and complete an AirPlay sender design investigation"
-checklist item ([`docs/task.md:1128-1132`](task.md)) and is the first
+Records the P2.4 "Open and complete an AirPlay sender design
+investigation" investigation ([`docs/task.md:399-408`](task.md),
+entry P2.4-C) and is the first
 record on the maintained AirPlay sender path that the P2.4 work stream
-must select. The investigation exists because the currently shipped seam
+must select. The P2.4-C checklist item itself stays unchecked — it is
+marked "In flight" against this PR — and closes on a maintainer's
+acceptance of the design, not on this document's existence.
+
+The investigation exists because the currently shipped seam
 (`uridecodebin ! audioconvert ! avenc_alac ! raopsink`) is gated on a
 GStreamer `raopsink` element that **no current official GStreamer,
 Homebrew, or MSYS2 package ships** — see the 2026-07-20 sender review
@@ -830,9 +835,10 @@ Ordering rationale:
 
 The Tributary-owned RAOP-1 sender (§5.6) remains documented as the
 no-daemon fallback, pending its dedicated key-provenance review.
-AirPlay 2 in-tree (§5.7) is rejected for now. The task.md P2.4
-checkbox (["docs/task.md:1128-1132"](task.md)) continues to point at
-this document; the follow-on implementation record must restate its
+AirPlay 2 in-tree (§5.7) is rejected for now. The P2.4-C index entry
+([`docs/task.md:399-408`](task.md)) points at this document and
+remains unchecked "In flight" until the design is accepted; the
+follow-on implementation record must restate its
 choice and the policy call-back before writing sender code.
 
 ## 7. Pairing, encrypted control, audio, timing — per selected path
@@ -1055,13 +1061,16 @@ already-pinned tests (§1) are unchanged.
 - It does not implement AirPlay 2, MFi-SAP/FairPlay-encrypted session
   types (`et=3/4`), or multi-room sync.
 - It does not promise a target date; the P2.1 feature focus leading
-  the **17/39** active-backlog count
-  ([`docs/task.md:26`](task.md), kept synchronized with that file's
-  literal top-level checkboxes) stays ahead of this work in the
+  the current active-backlog count
+  ([`docs/task.md:31-33`](task.md) — **16/57** implementation
+  records complete, retained baseline **16/39**, kept synchronized
+  with that file's literal counters) stays ahead of this work in the
   backlog order.
 - Its only changes outside its own file are the two cross-references
-  this branch already carries — the flipped P2.4 checkbox in
-  [`docs/task.md`](task.md) and the follow-on note in
+  this branch already carries — the P2.4-C in-flight note in
+  [`docs/task.md`](task.md) (checkbox intentionally unchanged; the
+  item closes on an accepted design, not on this record) and the
+  follow-on note in
   [`docs/release-component-policy.md`](release-component-policy.md).
   The substantive updates to both — the dependency decision, the
   shared-policy containment run, the changelog entry — belong to the
