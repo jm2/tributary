@@ -3401,10 +3401,15 @@ fn quarantine_and_remove_leaf_unix(
     }
     // The exchange landed: `leaf` now names our empty tombstone file and
     // `tombstone` names exactly the object the leaf named at the exchange
-    // instant. Coupling check through the private tombstone name: the
+    // instant. Capture the parked tombstone file's identity now, while the
+    // exchange has just placed it: the public leaf's final cleanup must
+    // remove exactly that object and nothing a concurrent writer may race
+    // into the leaf name while the verified object is being removed.
+    // Coupling check through the private tombstone name: the
     // object must be the one phase 1 verified (device and inode — the
     // exchange updated its change instant), otherwise an interposer was
     // captured and is exchanged back before refusing.
+    let parked_tombstone = leaf_identity_at(parent, leaf).ok().flatten();
     let removal_flags = match kind {
         QuarantinedLeafKind::RegularFile => AtFlags::empty(),
         QuarantinedLeafKind::EmptyDirectory => AtFlags::REMOVEDIR,
@@ -3442,7 +3447,14 @@ fn quarantine_and_remove_leaf_unix(
                 }
                 return Err(error);
             }
-            let _ = unlinkat(parent, leaf, AtFlags::empty());
+            // The verified object is removed. `leaf` still names the
+            // private empty tombstone file the exchange parked there —
+            // unless a concurrent writer raced a replacement into the
+            // public name, in which case an unconditional unlink would
+            // destroy that writer's object. Release the leaf through the
+            // race-conditioned helper: only the parked tombstone file is
+            // ever removed.
+            release_parked_reversal_leaf(parent, leaf, parked_tombstone, &tombstone)?;
             Ok(ReversalOutcome::Reversed)
         }
         Err(verification) => {
@@ -3460,6 +3472,72 @@ fn quarantine_and_remove_leaf_unix(
                 ));
             }
             Err(verification)
+        }
+    }
+}
+
+/// Release the private tombstone file the quarantine exchange parked at
+/// the public `leaf` name, after the verified object itself has been
+/// removed through the now-vacant private `tombstone` name.
+///
+/// The cleanup is conditioned on the object actually parked there: a
+/// concurrent writer that raced a replacement into the public leaf name
+/// owns the name now, and an unconditional unlink would destroy that
+/// writer's object. The leaf's occupant is therefore moved — by an
+/// atomic rename, never a check-then-unlink — to the vacant private
+/// tombstone name, where the capture can be verified race-free against
+/// `parked`, the identity captured for the parked tombstone file right
+/// after the exchange. Only the verified parked tombstone file is
+/// removed; anything else is renamed back to the public name untouched
+/// (the restore is itself no-replace, so a fresh concurrent creation at
+/// the leaf is left in place and the parked file stays at the private
+/// name rather than displacing it).
+///
+/// `parked` is `None` when the parked file's identity could not be
+/// captured; verification cannot admit an unknown object, so the
+/// occupant is renamed back in that case as well — the public name keeps
+/// whatever it holds and nothing is destroyed.
+#[cfg(unix)]
+fn release_parked_reversal_leaf(
+    parent: &File,
+    leaf: &OsStr,
+    parked: Option<LeafIdentity>,
+    tombstone: &OsStr,
+) -> io::Result<()> {
+    use rustix::fs::{statat, unlinkat, AtFlags, RenameFlags};
+
+    // Atomically vacate the public leaf into the private tombstone name.
+    // `Err(NOENT)` means the leaf is already absent — nothing of the
+    // transfer's is parked there and there is nothing to release.
+    match rustix::fs::renameat(parent, leaf, parent, tombstone) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(error) => return Err(io::Error::from(error)),
+    }
+    // Race-free verify-then-remove on the private name.
+    let parked_object = match statat(parent, tombstone, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Some(leaf_identity_from_stat(&stat)),
+        Err(_) => None,
+    };
+    if parked_object.is_some_and(|object| parked.is_some_and(|parked| object.same_object(&parked)))
+    {
+        unlinkat(parent, tombstone, AtFlags::empty()).map_err(io::Error::from)
+    } else {
+        // A concurrent writer's object (or an unverifiable one) was
+        // parked: move it back to the public name untouched. A fresh
+        // concurrent creation at the leaf makes the restore fail with
+        // `AlreadyExists` — the writer's object stays and the parked
+        // object remains at the private tombstone name, which the error
+        // below documents.
+        match rustix::fs::renameat_with(parent, tombstone, parent, leaf, RenameFlags::NOREPLACE) {
+            Ok(()) => Ok(()),
+            Err(rustix::io::Errno::EXIST) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the reversal leaf was recreated by a concurrent writer during cleanup; \
+                 the parked object was left at a private .tributary-reversal-* tombstone \
+                 and the writer's object was left untouched",
+            )),
+            Err(error) => Err(io::Error::from(error)),
         }
     }
 }
@@ -6723,6 +6801,146 @@ mod tests {
                 other => panic!("a missing staged capture must degrade: {other:?}"),
             }
             assert!(PublishedIdentityProof::Uncaptured.recorded().is_none());
+        }
+    }
+
+    /// Interposition regressions for the parked-tombstone release: the
+    /// public leaf's cleanup must remove only the parked tombstone file —
+    /// never a concurrent writer's replacement that raced into the name.
+    #[cfg(unix)]
+    mod parked_leaf_release {
+        use super::*;
+
+        const PARKED: &str = ".tributary-reversal-parked-a.tmp";
+        const SCRATCH: &str = ".tributary-reversal-scratch-b.tmp";
+
+        fn open_parent_dir(path: &Path) -> File {
+            let opened = rustix::fs::openat(
+                rustix::fs::CWD,
+                path,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .expect("open parent directory handle");
+            File::from(opened)
+        }
+
+        #[test]
+        fn release_removes_exactly_the_parked_object() {
+            let directory = TestDirectory::new("parked-clean");
+            fs::write(directory.path().join(PARKED), b"").expect("park the tombstone file");
+            let parent = open_parent_dir(directory.path());
+            let parked = leaf_identity_at(&parent, OsStr::new(PARKED))
+                .expect("stat parked file")
+                .expect("parked file exists");
+
+            release_parked_reversal_leaf(
+                &parent,
+                OsStr::new(PARKED),
+                Some(parked),
+                OsStr::new(SCRATCH),
+            )
+            .expect("release the parked tombstone file");
+
+            assert!(
+                !directory.path().join(PARKED).exists(),
+                "the parked tombstone file must be removed from the public name"
+            );
+            assert!(
+                !directory.path().join(SCRATCH).exists(),
+                "the private scratch name must be vacant afterwards"
+            );
+            assert_eq!(
+                fs::read_dir(directory.path())
+                    .expect("read directory")
+                    .count(),
+                0,
+                "no litter may survive the release"
+            );
+        }
+
+        #[test]
+        fn release_preserves_a_foreign_replacement_of_the_leaf() {
+            let directory = TestDirectory::new("parked-foreign");
+            // The parked tombstone file exists only as an identity here:
+            // the racer replaced the public name before the cleanup ran.
+            let parked_root = TestDirectory::new("parked-foreign-source");
+            fs::write(parked_root.path().join("source.tmp"), b"parked").expect("write source");
+            let parked_parent = open_parent_dir(parked_root.path());
+            let parked = leaf_identity_at(&parked_parent, OsStr::new("source.tmp"))
+                .expect("stat parked stand-in")
+                .expect("parked stand-in exists");
+            fs::write(directory.path().join(PARKED), b"racer bytes").expect("racer replaces leaf");
+            let parent = open_parent_dir(directory.path());
+
+            release_parked_reversal_leaf(
+                &parent,
+                OsStr::new(PARKED),
+                Some(parked),
+                OsStr::new(SCRATCH),
+            )
+            .expect("the release must succeed without destroying the foreign object");
+
+            assert_eq!(
+                fs::read(directory.path().join(PARKED)).expect("read the racer's object"),
+                b"racer bytes",
+                "the concurrent writer's replacement must survive the release untouched"
+            );
+            assert!(
+                !directory.path().join(SCRATCH).exists(),
+                "the foreign object must be restored off the private name"
+            );
+        }
+
+        #[test]
+        fn release_tolerates_an_absent_leaf() {
+            let directory = TestDirectory::new("parked-absent");
+            let parent = open_parent_dir(directory.path());
+            let parked_root = TestDirectory::new("parked-absent-source");
+            fs::write(parked_root.path().join("source.tmp"), b"parked").expect("write source");
+            let parked_parent = open_parent_dir(parked_root.path());
+            let parked = leaf_identity_at(&parked_parent, OsStr::new("source.tmp"))
+                .expect("stat parked stand-in")
+                .expect("parked stand-in exists");
+
+            release_parked_reversal_leaf(
+                &parent,
+                OsStr::new(PARKED),
+                Some(parked),
+                OsStr::new(SCRATCH),
+            )
+            .expect("an absent leaf is nothing to release");
+
+            assert_eq!(
+                fs::read_dir(directory.path())
+                    .expect("read directory")
+                    .count(),
+                0,
+                "an absent leaf release must not create anything"
+            );
+        }
+
+        #[test]
+        fn release_without_a_captured_parked_identity_destroys_nothing() {
+            let directory = TestDirectory::new("parked-uncaptured");
+            fs::write(directory.path().join(PARKED), b"unverified").expect("occupy the leaf");
+            let parent = open_parent_dir(directory.path());
+
+            release_parked_reversal_leaf(&parent, OsStr::new(PARKED), None, OsStr::new(SCRATCH))
+                .expect("an unverifiable occupant must be restored, not removed");
+
+            assert_eq!(
+                fs::read(directory.path().join(PARKED)).expect("read the occupant"),
+                b"unverified",
+                "an unverifiable occupant must stay at the public name"
+            );
+            assert!(
+                !directory.path().join(SCRATCH).exists(),
+                "the private scratch name must be vacant afterwards"
+            );
         }
     }
 }
