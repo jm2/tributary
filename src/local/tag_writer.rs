@@ -743,10 +743,14 @@ pub fn write_tags_with_mutation_target(
 /// redacted label instead of the path — the removable-media error branch
 /// surfaces the whole chain to the user.
 #[cfg(unix)]
+#[cfg_attr(
+    not(test),
+    allow(unused_variables) // only the test-only staging seam reads the target
+)]
 fn write_tag_edits_for_commit(
     commit: &mut MountedMutationCommit<'_>,
     source: File,
-    _target: &MountedMutationTarget,
+    target: &MountedMutationTarget,
     edits: &TagEdits,
 ) -> Result<()> {
     // Anchor the staging at the retained parent before anything is staged:
@@ -757,7 +761,7 @@ fn write_tag_edits_for_commit(
         anyhow::Error::new(error).context("The retained mutation authority lost the staging parent")
     })?;
     #[cfg(test)]
-    run_pre_staging_interpose(_target);
+    run_pre_staging_interpose(target);
     anchored_atomic_tag_replacement(
         source,
         &staging_parent,
@@ -850,7 +854,7 @@ fn anchored_atomic_tag_replacement(
     copy_result?;
 
     write_tags_to_retained(&mut staged, target_label, edits)?;
-    flush_and_prepare_tagged_copy_retained(&mut staged, target_label, retained_permissions)?;
+    flush_and_prepare_tagged_copy_retained(&staged, target_label, retained_permissions)?;
     drop(staged);
     commit_replacement(&mut temp)?;
 
@@ -899,7 +903,7 @@ fn write_tags_to_retained(staged: &mut File, target_label: &str, edits: &TagEdit
 /// cannot be flushed.
 #[cfg(unix)]
 fn flush_and_prepare_tagged_copy_retained(
-    staged: &mut File,
+    staged: &File,
     target_label: &str,
     retained_permissions: Option<std::fs::Permissions>,
 ) -> Result<()> {
@@ -1873,8 +1877,8 @@ mod tests {
     /// symlink's target stays empty.
     #[cfg(unix)]
     #[test]
-    fn a_mutation_target_write_stages_beside_the_retained_parent_never_through_a_displaced_ancestor()
-    {
+    fn a_mutation_target_write_stages_beside_the_retained_parent_never_through_a_displaced_ancestor(
+    ) {
         use std::os::unix::fs::symlink;
 
         let directory = TestDirectory::new("mutation-stage-anchor");
@@ -1912,15 +1916,17 @@ mod tests {
                 }
                 // Displace the retained ancestor inside the staging window
                 // and plant a symlink at its old name.
-                std::fs::rename(&watched.parent().expect("album parent"), &closure_displaced_album)
-                    .expect("displace retained parent");
+                std::fs::rename(
+                    watched.parent().expect("album parent"),
+                    &closure_displaced_album,
+                )
+                .expect("displace retained parent");
                 symlink(&outside_root, &impostor_album)
                     .expect("install symlink impostor at the old name");
             }),
             || {
-                write_tags_with_mutation_target(&target, &year("2026")).expect(
-                    "anchored staging must land the write through the retained parent",
-                );
+                write_tags_with_mutation_target(&target, &year("2026"))
+                    .expect("anchored staging must land the write through the retained parent");
             },
         );
 
