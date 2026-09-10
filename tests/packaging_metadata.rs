@@ -1640,8 +1640,10 @@ fn assert_announcer_pull_request_triggers(on: &serde_yaml::Value) {
     let pull_request_types = yaml_string_list(&on["pull_request"], "types");
     assert_eq!(
         pull_request_types,
-        ["opened", "synchronize", "reopened"],
-        "every push to a pull request must re-announce the gate at the new head"
+        ["opened", "synchronize", "reopened", "edited"],
+        "every push to a pull request must re-announce the gate at the new head; \
+         `edited` covers retargeting — a base change fires edited, never synchronize, \
+         and a retarget away-and-back fires no other refresh"
     );
     let review_types = yaml_string_list(&on["pull_request_review"], "types");
     assert_eq!(
@@ -1918,8 +1920,9 @@ fn assert_publisher_binds_the_evaluation_to_the_announcing_head(workflow: &serde
 // Pull-request discovery is API-derived from the announcing run's commit,
 // filtered to open main pull requests actually HEADED by that commit (the
 // association endpoint also returns stacked descendants that merely contain
-// it), and the published verdict is one shared completed check-run under the
-// required context name, bound to the evaluated head.
+// it), and the published verdict is one shared check-run under the required
+// context name — opened in progress before any evaluation and finalized by
+// the same refresh — bound to the evaluated head.
 fn assert_publisher_publishes_the_verdict_at_the_evaluated_head(script: &str) {
     assert!(
         script.contains("commits/${announcer_head}/pulls")
@@ -1929,17 +1932,21 @@ fn assert_publisher_publishes_the_verdict_at_the_evaluated_head(script: &str) {
         "pull requests must be re-derived from the announcer's exact commit, open against main, and selected by exact head SHA"
     );
     assert!(
-        script.contains("publish_gate_check_run \"${announcer_head}\" \"failure\"")
-            && script.contains("publish_gate_check_run \"${announcer_head}\" \"success\""),
-        "exactly one shared verdict — aggregated failure or success — must be published per announced head"
+        script.contains("start_gate_check_run \"${announcer_head}\"")
+            && script.contains("finish_gate_check_run \"${announcer_head}\" \"failure\"")
+            && script.contains("finish_gate_check_run \"${announcer_head}\" \"success\""),
+        "exactly one shared verdict — opened in progress before evaluation, \
+         finalized to an aggregated failure or success — must be published per announced head"
     );
 
     assert!(
-        script.contains("-F name=\"Bot Review Gate\"")
+        script.contains("gate_context=\"Bot Review Gate\"")
+            && script.contains("-F name=\"${gate_context}\"")
             && script.contains("-F head_sha=")
+            && script.contains("-F status=in_progress")
             && script.contains("-F status=completed")
             && script.contains("-F conclusion="),
-        "the publisher must publish its verdict as the required check-run at the evaluated head"
+        "the publisher must open the required check-run in progress at the evaluated head and finalize that same run to its conclusion"
     );
 }
 

@@ -36,7 +36,7 @@
               }
             },
             {
-              "url": "u/tapd-chatgpt-approval",
+              "url": "u/clean-chatgpt-approval",
               "state": "APPROVED",
               "submittedAt": "2026-09-07T11:00:00Z",
               "databaseId": 20,
@@ -46,6 +46,19 @@
               "author": {
                 "__typename": "Bot",
                 "login": "chatgpt-codex-connector[bot]"
+              }
+            },
+            {
+              "url": "u/pending-attempt",
+              "state": "PENDING",
+              "submittedAt": null,
+              "databaseId": 21,
+              "commit": {
+                "oid": "1111111111111111111111111111111111111111"
+              },
+              "author": {
+                "__typename": "Bot",
+                "login": "coderabbitai[bot]"
               }
             }
           ]

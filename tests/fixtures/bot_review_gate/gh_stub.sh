@@ -13,16 +13,23 @@
 #   * `gh api repos/.../pulls/N [--jq <filter>]` — the Nth REST call serves
 #     GH_STUB_PAGES/pr.N.json, falling back to pr.1.json.
 #   * `gh api repos/.../commits/<sha>/pulls` — the publisher's discovery
-#     call; served from GH_STUB_PAGES/commits-head-pulls.json, or the
-#     built-in default (open pull request 42 against main, headed by the
-#     test HEAD_SHA) when the scenario does not stage one.
-#   * `gh api repos/.../check-runs` — the publication call; each invocation
-#     is appended to GH_STUB_STATE/check-runs.log as one line of its
-#     name/head_sha/status/conclusion fields so tests can assert what the
-#     publisher published.
+#     call; when the scenario stages per-page files they are served in
+#     order from GH_STUB_PAGES/commits-head-pulls.page.N.json (parsed from
+#     the page= query parameter), otherwise the single
+#     commits-head-pulls.json (or the built-in default: open pull request
+#     42 against main, headed by the test HEAD_SHA) answers every page.
+#   * `gh api repos/.../check-runs` — the publication calls (the
+#     in-progress opening POST and the terminal PATCH of that same run);
+#     each invocation is appended to GH_STUB_STATE/check-runs.log as one
+#     line of its target path and name/head_sha/status/conclusion fields,
+#     and a creation answers with the fixed run id 1 (honouring --jq) so
+#     the test can assert the terminal PATCH finalizes the run the
+#     refresh opened.
 #   * A GH_STUB_PAGES/fail file injects failures: tokens "threads",
 #     "reviews", "graphql" fail the matching GraphQL query; "pr" fails REST;
-#     "discover" fails the discovery call; "checkrun" fails publication.
+#     "discover" fails the discovery call; "checkrun" fails every check-run
+#     call; "checkrun-finish" fails only the terminal update (the one
+#     carrying a conclusion), leaving the opened pending run standing.
 set -u
 
 pages="${GH_STUB_PAGES:?GH_STUB_PAGES must be set}"
@@ -41,6 +48,8 @@ jq_filter=""
 query=""
 rest_path=""
 checkrun_fields=""
+run_name=""
+run_head=""
 prev=""
 for arg in "$@"; do
   if [ "${prev}" = "--jq" ]; then
@@ -48,7 +57,15 @@ for arg in "$@"; do
   elif [ "${prev}" = "-f" ] || [ "${prev}" = "-F" ]; then
     case "${arg}" in
       query=*) query="${arg#query=}" ;;
-      name=*|head_sha=*|status=*|conclusion=*)
+      name=*)
+        checkrun_fields="${checkrun_fields} ${arg}"
+        run_name="${arg#name=}"
+        ;;
+      head_sha=*)
+        checkrun_fields="${checkrun_fields} ${arg}"
+        run_head="${arg#head_sha=}"
+        ;;
+      status=*|conclusion=*)
         checkrun_fields="${checkrun_fields} ${arg}" ;;
     esac
   fi
@@ -70,14 +87,19 @@ if [ -n "${rest_path}" ]; then
   case "${rest_path}" in
     *commits/*/pulls*)
       # The publisher's discovery call: the pull requests associated with
-      # the announcing run's exact commit.
+      # the announcing run's exact commit. The script walks the endpoint's
+      # pages; serve the scenario's staged page files in order when present,
+      # otherwise one short page answers the whole walk.
       case "${fail_mode}" in
         *discover*)
           echo "stub: injected discovery query failure" >&2
           exit 1
           ;;
       esac
-      file="${pages}/commits-head-pulls.json"
+      page_no="${rest_path##*page=}"
+      if [ "${page_no}" = "${rest_path}" ]; then page_no="1"; fi
+      file="${pages}/commits-head-pulls.page.${page_no}.json"
+      if [ ! -f "${file}" ]; then file="${pages}/commits-head-pulls.json"; fi
       if [ -f "${file}" ]; then
         cat "${file}"
       else
@@ -88,15 +110,50 @@ if [ -n "${rest_path}" ]; then
       exit 0
       ;;
     *check-runs*)
-      # The publication call: record what was published so tests can
-      # assert the verdict and its head binding.
+      # The publication calls: record what was published so tests can
+      # assert the verdict, its head binding, and that the terminal PATCH
+      # finalizes the run the refresh opened.
       case "${fail_mode}" in
+        *checkrun-finish*)
+          case "${checkrun_fields}" in
+            *conclusion=*)
+              echo "stub: injected check-run finalization failure" >&2
+              exit 1
+              ;;
+          esac
+          ;;
         *checkrun*)
           echo "stub: injected check-run publication failure" >&2
           exit 1
           ;;
       esac
-      printf 'CHECK-RUN%s\n' "${checkrun_fields}" >> "${state}/check-runs.log"
+      # The check-run API binds name and head_sha at creation and the
+      # update call carries neither, so the stub attests both itself: the
+      # creation POST records the name and head it was created with, and
+      # the terminal PATCH of that run id logs the recorded identity — the
+      # logged evidence is the stub's own creation record, not a caller
+      # claim, which is what lets the tests assert that the finalized run
+      # is the required context at the head the refresh opened.
+      heads_dir="${state}/check-run-heads"
+      case "${rest_path}" in
+        */check-runs)
+          mkdir -p "${heads_dir}"
+          printf 'name=%s\n' "${run_name}" > "${heads_dir}/1"
+          printf 'head_sha=%s\n' "${run_head}" >> "${heads_dir}/1"
+          ;;
+        */check-runs/*)
+          run_id="${rest_path##*/}"
+          if [ -f "${heads_dir}/${run_id}" ]; then
+            while IFS= read -r field; do
+              checkrun_fields="${checkrun_fields} ${field}"
+            done < "${heads_dir}/${run_id}"
+          fi
+          ;;
+      esac
+      printf 'CHECK-RUN target=%s%s\n' "${rest_path}" "${checkrun_fields}" >> "${state}/check-runs.log"
+      if [ -n "${jq_filter}" ]; then
+        exec jq -r "${jq_filter}" <<< '{"id": 1, "html_url": "stub://check-runs/1"}'
+      fi
       printf '%s\n' '{"id": 1, "html_url": "stub://check-runs/1"}'
       exit 0
       ;;

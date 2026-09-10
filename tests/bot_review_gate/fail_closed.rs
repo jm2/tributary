@@ -36,7 +36,7 @@ fn a_missing_event_head_is_recovered_from_the_announcing_run_record() {
         "the recovered head must drive a normal refresh:\n{}",
         report(&output)
     );
-    let check_run = sandbox.single_check_run();
+    let check_run = sandbox.opened_and_finalized_verdict();
     assert!(
         check_run.contains(&format!("head_sha={HEAD_SHA}"))
             && check_run.contains("conclusion=success"),
@@ -63,11 +63,10 @@ fn an_announcer_run_at_the_pull_request_head_publishes_evidence_at_that_head() {
         "the published verdict must bind to the pull request head:\n{}",
         report(&output)
     );
+    let check_run = sandbox.opened_and_finalized_verdict();
     assert!(
-        sandbox
-            .single_check_run()
-            .contains(&format!("head_sha={HEAD_SHA}"))
-            && sandbox.single_check_run().contains("conclusion=success"),
+        check_run.contains(&format!("head_sha={HEAD_SHA}"))
+            && check_run.contains("conclusion=success"),
         "the green verdict must be published as the required context at the evaluated head"
     );
 }
@@ -140,7 +139,7 @@ fn non_main_base_fails_closed_and_supersedes_the_head_verdict() {
     sandbox.use_scenario("non-main-base");
     let output = sandbox.run("pull_request", Some(HEAD_SHA));
     assert_blocked(&output, &[], "not main");
-    let check_run = sandbox.single_check_run();
+    let check_run = sandbox.opened_and_finalized_verdict();
     assert!(
         check_run.contains("name=Bot Review Gate")
             && check_run.contains(&format!("head_sha={HEAD_SHA}"))
@@ -184,7 +183,7 @@ fn an_announced_commit_only_a_descendant_contains_is_never_evaluated() {
         !invocations.contains("graphql"),
         "a descendant that merely contains the announced commit must never be evaluated:\n{invocations}"
     );
-    let check_run = sandbox.single_check_run();
+    let check_run = sandbox.opened_and_finalized_verdict();
     assert!(
         check_run.contains(&format!("head_sha={OTHER_SHA}"))
             && check_run.contains("conclusion=failure"),

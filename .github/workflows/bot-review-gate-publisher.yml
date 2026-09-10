@@ -221,17 +221,34 @@ jobs:
           EVENT_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           EVENT_RUN_ID: ${{ github.event.workflow_run.id }}
           # The trusted expected-reviewer set, fixed by enumeration (never by
-          # observation): every review-posting integration the repository
-          # requires on every pull request, listed by exact bot login and
+          # observation): every review-posting integration the operator has
+          # authorized for this repository, listed by exact bot login and
           # matched case-insensitively with or without GitHub's "[bot]"
-          # suffix. This list is default-branch content: it grows only by the
-          # reviewed change that enables the bot. A listed identity with no
-          # review on the pull request fails the gate — an outage, a rate
-          # limit, or a rename is unproven, never clean — waivable only by
-          # the operator-documented substitution below.
-          EXPECTED_BOT_REVIEWERS: "coderabbitai,chatgpt-codex-connector"
+          # suffix. This list is default-branch content: it grows only by
+          # the reviewed change that enables the bot, and it currently names
+          # CodeRabbit alone — the only review integration the reviewer
+          # policy authorizes (docs/refinery-config.md); operational or
+          # out-of-band reviewers are not repository integrations and are
+          # deliberately absent. A listed identity with no review on the
+          # pull request fails the gate — an outage, a rate limit, or a
+          # rename is unproven, never clean — waivable only by the
+          # operator-documented substitution below.
+          EXPECTED_BOT_REVIEWERS: "coderabbitai"
         run: |
           set -euo pipefail
+
+          # ── One verdict per announced head ───────────────────────────────
+          # Check runs attach to commits, not pull requests: two open main
+          # pull requests that share one announced head would otherwise get
+          # competing verdicts under the one required context name, and the
+          # last-published verdict would decide for both — letting a clean
+          # duplicate evaluated last make a dirty pull request appear green
+          # (or causing the reverse availability failure). Every candidate
+          # evaluation therefore only RECORDS its findings; exactly one
+          # shared verdict is published per refresh — success only when
+          # every candidate is clean, failure when any of them is not — and
+          # the publication helpers below are the ONLY writers of that
+          # verdict: the evaluator itself never touches the check run.
 
           # ── Publication bound to the evaluated head ──────────────────────
           # The verdict is published as ONE check run at the exact evaluated
@@ -647,12 +664,18 @@ jobs:
                                      and (.submitted_at > $dismissed_at)))))
                  | sort_by(.submitted_at, .database_id)
                  | last) as $after_decisive
-              | ( if ($decisive == null) or ($latest == null) then
+              | ( if $latest == null then
                     # The author has no submitted review at all (their only
                     # review, if any, is the pending attempt above): the
                     # terminal-state rules have nothing to decide, and the
                     # absence itself is reported by the expected-reviewer
-                    # check below.
+                    # check below. A comment-only author has a latest review
+                    # and falls through to the ordinary rules below: the
+                    # decisive chain finds no conclusion to act on, and the
+                    # head-binding branch reports the comment as stale
+                    # evidence when it predates the evaluated head — a bot's
+                    # latest review is bound to the exact commit regardless
+                    # of whether it carried a conclusion.
                     []
                   elif $decisive.state == "CHANGES_REQUESTED" then
                     [ { reason: "outstanding_bot_change_request",
@@ -721,10 +744,17 @@ jobs:
                       expected_head: $head,
                       url: "EXPECTED_BOT_REVIEWERS in bot-review-gate-publisher.yml" } ]
                 else
+                  # The element must be bound with `as` before the select:
+                  # inside `select($reviewed | index($login) | not)` the
+                  # argument's `.` would otherwise be rebound by the pipe to
+                  # $reviewed itself, so `index` would search the review list
+                  # for the whole list and filter out every absence — the
+                  # check would silently pass whenever any review exists.
                   [ $expected_set[]
-                    | select($reviewed | index(.) | not)
+                    | . as $login
+                    | select($reviewed | index($login) | not)
                     | { reason: "stale_bot_review_evidence",
-                        author: .,
+                        author: $login,
                         state: "no review submitted",
                         review_head: "none",
                         expected_head: $head,
@@ -796,7 +826,16 @@ jobs:
               + expected_reviewer_violations($head)
               + missing_evidence_violations($head; $policy) ) as $all_violations
             | substitution_eligible($head; $policy) as $eligible
-            | (($policy.rate_limited_reviewers // []) | map(.login)) as $waivable_logins
+            # Waiver matching is login-normalized on BOTH sides: the
+            # expected-reviewer check emits the normalized login (the
+            # enumeration is matched "[bot]"-suffix-insensitively) while the
+            # policy file records the raw operator-spelled login, and the
+            # same absent reviewer's two synthesized violations must agree —
+            # waivable through one path and blocking through the other would
+            # make the waiver unreachable or over-broad depending on which
+            # check happened to synthesize the finding.
+            | (($policy.rate_limited_reviewers // [])
+               | map(.login | normalize_login)) as $waivable_logins
             | {
                 evaluated_head: $head,
                 evaluated_threads: ([ $threads[].data.repository.pullRequest.reviewThreads.nodes[] ] | length),
@@ -806,7 +845,8 @@ jobs:
                     [ $all_violations[]
                       | . as $v
                       | select(.reason != "stale_bot_review_evidence"
-                               or ($waivable_logins | index($v.author) | not)) ]
+                               or ($waivable_logins
+                                   | index($v.author | normalize_login) | not)) ]
                   else $all_violations
                   end
                 ),
@@ -815,12 +855,20 @@ jobs:
                     [ $all_violations[]
                       | select(.reason == "stale_bot_review_evidence")
                       | . as $v
-                      | select($waivable_logins | index($v.author))
+                      | select($waivable_logins
+                               | index($v.author | normalize_login))
                       | { author: $v.author,
                           url: $v.url,
                           substitute: $policy.substitute_reviewer,
+                          # The evidence is looked up with the same
+                          # login-normalized matching as the waiver decision
+                          # above, so the report cites the policy entry for
+                          # the violation it actually waived regardless of
+                          # the two spellings.
                           evidence: ([ $policy.rate_limited_reviewers[]
-                                       | select(.login == $v.author) ] | map(.evidence) | join(", ")) } ]
+                                       | select((.login | normalize_login)
+                                                == ($v.author | normalize_login)) ]
+                                      | map(.evidence) | join(", ")) } ]
                   else []
                   end
                 )
@@ -849,6 +897,12 @@ jobs:
                 + ": " + .url + " — " + .path + ":" + ((.line // 0) | tostring) + " by " + .author
               elif .reason == "outstanding_bot_change_request" then
                 "OUTSTANDING BOT CHANGE REQUEST by " + .author + ": " + .url
+              elif .reason == "pending_bot_review" then
+                "PENDING BOT REVIEW ATTEMPT by " + .author
+                + " (database id " + (.database_id | tostring)
+                + " at " + .review_head + "): " + .url
+              elif .reason == "trusted_reviewer_set_empty" then
+                "TRUSTED REVIEWER SET EMPTY — no trusted reviewers are configured: " + .url
               else
                 "STALE BOT REVIEW EVIDENCE by " + .author + " (" + .state + " at " + .review_head
                 + ", pull request head is " + .expected_head + "): " + .url
@@ -880,16 +934,9 @@ jobs:
           return 0
           }
 
-          # ── One verdict per announced head ───────────────────────────────
-          # Check runs attach to commits, not pull requests: two open main
-          # pull requests that share the announced head would otherwise
-          # publish competing verdicts under the one required context name,
-          # and the last-published verdict would decide for both — letting a
-          # clean duplicate evaluated last make a dirty pull request appear
-          # green (or causing the reverse availability failure). The
-          # evaluations above only record their findings; exactly one shared
-          # verdict is published below, success only when every candidate is
-          # clean and failure when any of them is not.
+          # ── Aggregate the recorded candidate verdicts ────────────────────
+          # The evaluations above only recorded their findings; the driver
+          # below turns the recordings into the one shared verdict.
           VERDICTS_DIR="${RUNNER_TEMP}/bot-review-gate-verdicts"
           rm -rf "${VERDICTS_DIR}"
           mkdir -p "${VERDICTS_DIR}"
