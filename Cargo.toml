@@ -91,7 +91,7 @@ zeroize = "1"
 keyring-core = "1"
 
 # mDNS service discovery (Subsonic/DAAP auto-detect)
-mdns-sd = "0.20"
+mdns-sd = "0.21"
 
 # DAAP/DMAP binary protocol parsing
 nom = "8"
