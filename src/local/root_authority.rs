@@ -484,14 +484,25 @@ fn leaf_identity_at_path(path: &Path) -> io::Result<Option<LeafIdentity>> {
     }
     // SAFETY: the successful call above initialized the complete structure.
     let info = unsafe { info.assume_init() };
-    Ok(Some(LeafIdentity {
+    Ok(Some(leaf_identity_from_handle_info(&info)))
+}
+
+/// Build the no-follow [`LeafIdentity`] of an open object from an already
+/// captured `BY_HANDLE_FILE_INFORMATION`. The creation timestamp is the
+/// creation-sensitive half of the identity that keeps a same-index
+/// replacement from comparing equal.
+#[cfg(windows)]
+fn leaf_identity_from_handle_info(
+    info: &windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION,
+) -> LeafIdentity {
+    LeafIdentity {
         volume: u64::from(info.dwVolumeSerialNumber),
         file_id: WindowsFileId::Legacy(
             (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         ),
         created: (u64::from(info.ftCreationTime.dwHighDateTime) << 32)
             | u64::from(info.ftCreationTime.dwLowDateTime),
-    }))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3100,23 +3111,6 @@ fn destination_slot_is_foreign(
     ))
 }
 
-/// No-follow state of a Windows leaf entry: the entry's metadata and its
-/// captured identity. `Ok(None)` means the entry is absent (or vanished
-/// between the two reads), which every reversal caller maps to
-/// [`ReversalOutcome::AlreadyAbsent`].
-#[cfg(windows)]
-fn windows_leaf_entry(final_path: &Path) -> io::Result<Option<(std::fs::Metadata, LeafIdentity)>> {
-    let metadata = match std::fs::symlink_metadata(final_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let Some(found) = leaf_identity_at_path(final_path)? else {
-        return Ok(None);
-    };
-    Ok(Some((metadata, found)))
-}
-
 /// What kind of leaf a reversal quarantine removes: the typing performed on
 /// the quarantined object before it is removed.
 #[cfg(unix)]
@@ -3563,11 +3557,208 @@ fn remove_regular_leaf_entry_unix(
     )
 }
 
-/// Windows body of the regular-file reversal. The leaf is typed no-follow
-/// through `symlink_metadata`, so a symlink or junction leaf is removed (or
-/// refused) as itself, never through its target. The retained parent is
-/// revalidated immediately before the removal to narrow the pin-to-delete
-/// window on a platform that cannot unlink through a handle.
+/// What kind of leaf the Windows object-conditioned removal must find: the
+/// typing performed on the captured object before it is deleted.
+#[cfg(windows)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WindowsRemovalKind {
+    /// The object must not be a real directory; a directory leaf is
+    /// refused. A reparse-point leaf is removed as itself (the link),
+    /// never through its target.
+    RegularFile,
+    /// The object must be a real (non-reparse) directory.
+    EmptyDirectory,
+}
+
+/// Remove the leaf at `path` by object, not by pathname.
+///
+/// The leaf is opened ONCE with delete access — no reparse following, so a
+/// symlink or junction leaf is opened as itself — and the identity of the
+/// open object is compared against `expected` before anything is deleted:
+/// a mismatch reports [`ReversalOutcome::RefusedForeignLeaf`] without
+/// touching the foreign object. The deletion itself is then requested
+/// through the open handle (POSIX-semantics deletion when the filesystem
+/// offers it, delete-on-close otherwise), so it is bound to the object the
+/// identity was verified against. A concurrent writer that replaces the
+/// PATH after the handle is opened can never make this removal destroy the
+/// replacement: the handle keeps naming the verified object, and the
+/// writer's object at the path is untouched by the close.
+///
+/// `Ok(AlreadyAbsent)` reports the leaf was already absent. A filesystem
+/// that offers no handle-conditioned delete primitive fails closed with
+/// `Unsupported` rather than falling back to an unverified check-then-
+/// `remove_file` race.
+#[cfg(windows)]
+fn remove_leaf_by_object(
+    path: &Path,
+    expected: Option<LeafIdentity>,
+    kind: WindowsRemovalKind,
+) -> io::Result<ReversalOutcome> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path valid for the call;
+    // every other argument is null or a constant. `OPEN_REPARSE_POINT` keeps
+    // a symlink or junction leaf from resolving to its target, and
+    // `FILE_FLAG_BACKUP_SEMANTICS` admits directory leaves.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            DELETE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(ReversalOutcome::AlreadyAbsent)
+        } else {
+            Err(error)
+        };
+    }
+    let outcome = (|| -> io::Result<ReversalOutcome> {
+        let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        // SAFETY: `handle` is live and `info` is a correctly sized, aligned
+        // output buffer that the API fully initializes on success.
+        let filled = unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) };
+        if filled == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the successful call above initialized the complete structure.
+        let info = unsafe { info.assume_init() };
+        let found = leaf_identity_from_handle_info(&info);
+        if expected.is_some_and(|expected| expected != found) {
+            return Ok(ReversalOutcome::RefusedForeignLeaf);
+        }
+        let is_reparse = info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        let is_directory = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        match kind {
+            WindowsRemovalKind::RegularFile if is_directory && !is_reparse => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to remove a directory through remove_relative_file",
+                ));
+            }
+            WindowsRemovalKind::EmptyDirectory if !is_directory || is_reparse => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to remove a non-directory through remove_relative_directory",
+                ));
+            }
+            _ => {}
+        }
+        request_object_deletion(handle)?;
+        Ok(ReversalOutcome::Reversed)
+    })();
+    // SAFETY: `handle` was created above and is closed exactly once on
+    // every path. A requested deletion commits at this close.
+    unsafe { CloseHandle(handle) };
+    // A filesystem without POSIX-semantics deletion reports some failures
+    // (a non-empty directory, a pinned file) only at close time, where they
+    // are not surfaced as an error. A read-only existence check confirms
+    // the verified object actually went away; it can never destroy
+    // anything, and a replacement that raced in after the close is left
+    // untouched and reported as a failure rather than assumed reversed.
+    match outcome {
+        Ok(ReversalOutcome::Reversed) => match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ReversalOutcome::Reversed),
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::other(
+                "the verified object could not be deleted by handle; the leaf was left \
+                 in place",
+            )),
+        },
+        other => other,
+    }
+}
+
+/// Mark the open object for deletion through its handle: POSIX semantics
+/// when the filesystem supports them (the name disappears at close even
+/// with concurrent handles on the same object), delete-on-close otherwise.
+/// Both bind the deletion to the object the handle names, so the public
+/// path can never be re-resolved onto a different object between the
+/// identity verification and the removal.
+#[cfg(windows)]
+fn request_object_deletion(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<()> {
+    use std::mem::size_of;
+
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, FileDispositionInfoEx, SetFileInformationByHandle,
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
+        FILE_DISPOSITION_INFO_EX,
+    };
+
+    let request_ex = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: `handle` is a live file handle and the buffer is a correctly
+    // initialized structure of exactly the class' expected size.
+    let requested = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfoEx,
+            &request_ex as *const _ as *const core::ffi::c_void,
+            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    };
+    if requested != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    // Pre-1709 Windows and filesystems without POSIX-semantics deletion
+    // reject the extended class. Basic delete-on-close still binds the
+    // deletion to the verified object.
+    let unsupported = matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == ERROR_INVALID_FUNCTION as i32
+                || code == ERROR_INVALID_PARAMETER as i32
+                || code == ERROR_NOT_SUPPORTED as i32
+    );
+    if !unsupported {
+        return Err(error);
+    }
+    let request_basic = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    // SAFETY: `handle` is a live file handle and the buffer is a correctly
+    // initialized structure of exactly the class' expected size.
+    let requested_basic = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            &request_basic as *const _ as *const core::ffi::c_void,
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if requested_basic != 0 {
+        return Ok(());
+    }
+    Err(io::Error::last_os_error())
+}
+
+/// Windows body of the regular-file reversal. The leaf is removed by
+/// object through a delete-access handle (see [`remove_leaf_by_object`]):
+/// the recorded identity is verified against the open object before the
+/// deletion is requested, a directory leaf is refused with the typed
+/// `InvalidInput` error, and a symlink or junction leaf is removed as
+/// itself, never through its target. The retained parent is revalidated
+/// immediately before the removal.
 #[cfg(windows)]
 fn remove_regular_leaf_entry_windows(
     authority: &MountedRootAuthority,
@@ -3577,20 +3768,7 @@ fn remove_regular_leaf_entry_windows(
 ) -> io::Result<ReversalOutcome> {
     parent.validate_with(authority)?;
     let final_path = join_components(&authority.root, components);
-    let Some((metadata, found)) = windows_leaf_entry(&final_path)? else {
-        return Ok(ReversalOutcome::AlreadyAbsent);
-    };
-    if expected.is_some_and(|expected| expected != found) {
-        return Ok(ReversalOutcome::RefusedForeignLeaf);
-    }
-    if metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "refusing to remove a directory through remove_relative_file",
-        ));
-    }
-    std::fs::remove_file(&final_path)?;
-    Ok(ReversalOutcome::Reversed)
+    remove_leaf_by_object(&final_path, expected, WindowsRemovalKind::RegularFile)
 }
 
 /// Unix body of the empty-directory reversal: quarantine the leaf with an
@@ -3613,9 +3791,10 @@ fn remove_directory_leaf_entry_unix(
     )
 }
 
-/// Windows body of the empty-directory reversal: same typing and identity
-/// gate as the regular-file reversal, refusing a non-directory leaf and
-/// removing through the revalidated parent's namespace.
+/// Windows body of the empty-directory reversal: same identity gate and
+/// typing as the regular-file reversal, refusing a non-directory leaf and
+/// removing the verified empty directory by object through a
+/// delete-access handle (see [`remove_leaf_by_object`]).
 #[cfg(windows)]
 fn remove_directory_leaf_entry_windows(
     authority: &MountedRootAuthority,
@@ -3625,20 +3804,7 @@ fn remove_directory_leaf_entry_windows(
 ) -> io::Result<ReversalOutcome> {
     parent.validate_with(authority)?;
     let final_path = join_components(&authority.root, components);
-    let Some((metadata, found)) = windows_leaf_entry(&final_path)? else {
-        return Ok(ReversalOutcome::AlreadyAbsent);
-    };
-    if expected.is_some_and(|expected| expected != found) {
-        return Ok(ReversalOutcome::RefusedForeignLeaf);
-    }
-    if !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "refusing to remove a non-directory through remove_relative_directory",
-        ));
-    }
-    std::fs::remove_dir(&final_path)?;
-    Ok(ReversalOutcome::Reversed)
+    remove_leaf_by_object(&final_path, expected, WindowsRemovalKind::EmptyDirectory)
 }
 
 /// Verify one leaf name is a single normal path component: non-empty and
