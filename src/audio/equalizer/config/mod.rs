@@ -149,7 +149,16 @@ fn replace_with_defaults(path: &std::path::Path, byte_count: u64, bad_key: &str)
         byte_count,
         bad_key: bad_key.to_string(),
     };
-    let _ = write_equalizer_file_atomic(path, &render_equalizer_file(&settings));
+    if let Err(error) = write_equalizer_file_atomic(path, &render_equalizer_file(&settings)) {
+        // The in-memory defaults are authoritative for this session
+        // either way; the repair write is best-effort and the next
+        // debounced save rewrites the file.
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "Malformed equalizer.cfg could not be repaired in place"
+        );
+    }
     EqLoadOutcome::ReplacedWithDefaults {
         settings,
         diagnostic,
@@ -158,9 +167,13 @@ fn replace_with_defaults(path: &std::path::Path, byte_count: u64, bad_key: &str)
 
 // ── Save ────────────────────────────────────────────────────────────────
 
-/// Persist settings with the atomic-replace protocol: temp file
-/// (`O_EXCL`, single write, fsync), `rename(2)`, then directory fsync.
-/// A concurrent or failed writer never leaves a partial file visible.
+/// Persist settings with the atomic-replace protocol: a unique,
+/// exclusively-created temp file (single write, fsync), `rename(2)`,
+/// then directory fsync. A concurrent or failed writer never leaves a
+/// partial file visible, and never touches another writer's temp
+/// sibling. A directory-fsync failure after a successful rename is
+/// reported as a failed save (post-rename policy: the replaced file
+/// stays in place; the next save rewrites it).
 pub fn save_equalizer_settings_to_disk(settings: &EqSettings) -> bool {
     let Some(path) = equalizer_path() else {
         return false;
@@ -200,7 +213,17 @@ mod tests {
         // The unreadable fixture is untouched: no atomic replace ran
         // over it, and no temp sibling was scheduled.
         assert!(path.is_dir());
-        assert!(!write::temp_sibling(&path).exists());
+        let scheduled: Vec<String> = std::fs::read_dir(base.path())
+            .expect("readable directory")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(scheduled, vec!["equalizer.cfg".to_string()]);
     }
 
     /// The malformed-content path keeps its contract behavior: the
