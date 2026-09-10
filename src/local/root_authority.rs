@@ -578,6 +578,35 @@ impl MountedMutationTarget {
         validate_mounted_bound(self.authority.as_ref(), &file)?;
         Ok(MountedMutationCommit { target: self, file })
     }
+
+    /// The retained directory that must contain the replacement — the exact
+    /// parent directory handle plus the admitted leaf name — for read-only
+    /// capability rehearsals.
+    ///
+    /// This is the same directory object the commit section resolves (the
+    /// retained parent guard, or the retained root for a mount-top target),
+    /// so a rehearsal run through it exercises the true directory even when
+    /// an ancestor pathname was displaced after admission and an impostor
+    /// directory now occupies the old name. A pathname-based rehearsal
+    /// would instead probe inside whatever occupies the path now — outside
+    /// the admitted mount — or reject a target the anchored writer could
+    /// safely update.
+    ///
+    /// The handle is a clone; the target's retained evidence is untouched.
+    #[cfg(unix)]
+    pub(crate) fn retained_directory_handle(&self) -> io::Result<(File, OsString)> {
+        let file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("mutation target commit section is unavailable"))?;
+        let parent = if let Some(guard) = file.parent_guards.last() {
+            guard
+        } else {
+            self.authority.root_handle()
+        };
+        parent.validate_live()?;
+        Ok((parent.file.try_clone()?, self.relative_leaf()?))
+    }
 }
 
 /// One serialized commit section over a [`MountedMutationTarget`].

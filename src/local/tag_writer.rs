@@ -653,6 +653,72 @@ pub fn preflight_tag_write(path: &Path) -> Result<(), TagWritePreflightError> {
     preflight_tag_write_directory(path)
 }
 
+/// Rehearse the anchored replacement's directory mechanics through the
+/// retained parent handle — the anchored twin of
+/// [`preflight_tag_write_directory`].
+///
+/// The rehearsal exclusively creates two private siblings beneath the
+/// retained parent, flushes them, replaces one with the other through the
+/// retained directory, and unlinks the result: the same create, replace,
+/// and remove shapes the anchored writer performs, addressed entirely
+/// through the directory handle. No absolute pathname is resolved, so an
+/// ancestor displaced after the authority's validation can neither take
+/// the probe outside the admitted mount directory nor reject a rehearsal
+/// the anchored writer could safely perform.
+///
+/// `leaf` is the admitted file's leaf name; it only seeds the randomized
+/// probe names' extension. Error contexts name the target by
+/// `target_label`, never by any path. On any failure the dropped probe
+/// siblings clean themselves up through the retained parent.
+///
+/// This performs blocking filesystem I/O and must not run on the GTK
+/// thread.
+#[cfg(unix)]
+pub(crate) fn preflight_tag_write_directory_retained(
+    parent: &std::fs::File,
+    leaf: &OsStr,
+    target_label: &str,
+) -> Result<(), TagWritePreflightError> {
+    let (mut replacement, replacement_file) =
+        TempFile::create_beside_retained(parent, leaf, target_label)
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
+    replacement_file
+        .sync_all()
+        .map_err(|_| TagWritePreflightError::Unavailable)?;
+    drop(replacement_file);
+
+    let (mut destination, destination_file) =
+        TempFile::create_beside_retained(parent, leaf, target_label)
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
+    destination_file
+        .sync_all()
+        .map_err(|_| TagWritePreflightError::Unavailable)?;
+    drop(destination_file);
+
+    // Replace the destination sibling with the replacement sibling — the
+    // rename shape the anchored commit's install performs.
+    rustix::fs::renameat(
+        parent,
+        replacement.path().as_os_str(),
+        parent,
+        destination.path().as_os_str(),
+    )
+    .map_err(|_| TagWritePreflightError::Unavailable)?;
+    replacement.disarm_cleanup();
+
+    // A capability check is successful only when cleanup succeeds: the
+    // probe sibling is removed through the retained parent and the drop
+    // guard disarmed.
+    rustix::fs::unlinkat(
+        parent,
+        destination.path().as_os_str(),
+        rustix::fs::AtFlags::empty(),
+    )
+    .map_err(|_| TagWritePreflightError::Unavailable)?;
+    destination.disarm_cleanup();
+    Ok(())
+}
+
 /// Write tag edits to an audio file.
 ///
 /// Only fields that are `Some(...)` in `edits` are modified.
@@ -1985,6 +2051,61 @@ mod tests {
              {outside_entries:?}"
         );
         assert_no_stranded_tag_write_siblings(&[&displaced_album]);
+    }
+
+    /// The removable preflight's directory rehearsal must probe the
+    /// retained directory, not the pathname: after the retained parent was
+    /// displaced and an impostor directory installed at the old name, the
+    /// rehearsal's create, replace, and remove siblings happen beside the
+    /// admitted file in the retained (displaced) directory, the impostor
+    /// never receives anything, and no probe sibling survives.
+    #[cfg(unix)]
+    #[test]
+    fn retained_preflight_rehearsal_probes_the_retained_directory_after_displacement() {
+        let (directory, album, _) = anchored_album_fixture("preflight-retained-anchor");
+
+        let authority = mounted_root_authority(&directory);
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+        let (parent, leaf) = target
+            .retained_directory_handle()
+            .expect("retain the directory anchor");
+
+        let displaced_album = directory.path.join("displaced-album");
+        std::fs::rename(&album, &displaced_album).expect("displace retained parent");
+        std::fs::create_dir(&album).expect("install impostor directory at the old name");
+
+        crate::local::tag_writer::preflight_tag_write_directory_retained(
+            &parent,
+            &leaf,
+            "the removable mutation target",
+        )
+        .expect("the rehearsal must run through the retained parent");
+
+        // The impostor at the old pathname never saw a probe sibling.
+        let impostor_entries: Vec<std::ffi::OsString> = std::fs::read_dir(&album)
+            .expect("list the impostor directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            impostor_entries.is_empty(),
+            "the impostor directory must receive no probe siblings: {impostor_entries:?}"
+        );
+
+        // The retained directory holds exactly the admitted file: every
+        // probe sibling was removed again through the retained parent.
+        let retained_entries: Vec<std::ffi::OsString> = std::fs::read_dir(&displaced_album)
+            .expect("list the retained directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            retained_entries,
+            vec![std::ffi::OsString::from("silence.flac")],
+            "the rehearsal must leave only the admitted file in the retained directory"
+        );
     }
 
     /// A refused commit must clean up its stranded staging sibling in every

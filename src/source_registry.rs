@@ -131,7 +131,34 @@ impl RemovableMutationTarget {
         self.inner
             .validate()
             .map_err(|_| TagWritePreflightError::Unavailable)?;
-        crate::local::tag_writer::preflight_tag_write(self.inner.replacement_path())
+        // The format check reads only the file extension — exactly like the
+        // writer itself; the retained file's liveness and regularity are
+        // already proven by the validate() above.
+        if !crate::local::tag_writer::supports_tag_writes(self.inner.replacement_path()) {
+            return Err(TagWritePreflightError::UnsupportedFormat);
+        }
+        // The directory rehearsal runs through the retained parent handle —
+        // the same directory object the anchored commit resolves — so an
+        // ancestor displaced after admission can neither take the probe
+        // siblings outside the admitted mount directory nor reject a target
+        // the anchored writer could safely update. Platforms without
+        // retained parent handles keep the documented path-based rehearsal.
+        #[cfg(unix)]
+        {
+            let (parent, leaf) = self
+                .inner
+                .retained_directory_handle()
+                .map_err(|_| TagWritePreflightError::Unavailable)?;
+            crate::local::tag_writer::preflight_tag_write_directory_retained(
+                &parent,
+                &leaf,
+                "the removable mutation target",
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            crate::local::tag_writer::preflight_tag_write(self.inner.replacement_path())
+        }
     }
 
     /// Write tag edits through the retained authority.
