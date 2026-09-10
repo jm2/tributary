@@ -27,7 +27,21 @@ pub(super) fn write_equalizer_file_atomic(
     let staged = write_and_sync(&mut file, content);
     drop(file);
     match staged.and_then(|()| std::fs::rename(&temp_path, path)) {
-        Ok(()) => sync_parent_dir(path),
+        Ok(()) => {
+            // POSIX flushes the directory entry and reports a failure to
+            // the caller; platforms without a std directory handle skip
+            // the flush entirely (see sync_parent_dir), so the rename's
+            // success is the save's outcome.
+            #[cfg(unix)]
+            {
+                sync_parent_dir(path)
+            }
+            #[cfg(not(unix))]
+            {
+                sync_parent_dir(path);
+                Ok(())
+            }
+        }
         // Ownership guard: the temp exists only because this call
         // created it exclusively, and the rename has not consumed it
         // yet, so this is the only writer entitled to remove it.
@@ -77,11 +91,10 @@ fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
 
 /// Non-POSIX platforms have no std directory handle to flush; the file
 /// fsync and the rename carry the durability the platform's std layer
-/// can express, so the entry flush is a no-op there.
+/// can express, so the entry flush is a no-op that cannot fail — the
+/// caller's cfg arm treats the rename's success as final.
 #[cfg(not(unix))]
-fn sync_parent_dir(_path: &std::path::Path) -> std::io::Result<()> {
-    Ok(())
-}
+fn sync_parent_dir(_path: &std::path::Path) {}
 
 /// The temp sibling for one write: the destination name extended with
 /// the writing process's id and a per-process sequence, then `.tmp`.
@@ -226,7 +239,9 @@ mod tests {
     }
 
     /// P2: a parent directory that cannot be opened is an error, not a
-    /// silently-swallowed durability failure.
+    /// silently-swallowed durability failure. (Unix-only: elsewhere the
+    /// flush is a no-op that cannot fail.)
+    #[cfg(unix)]
     #[test]
     fn sync_parent_dir_propagates_an_unopenable_parent() {
         let base = tempfile::tempdir().expect("temporary config root");
@@ -234,6 +249,7 @@ mod tests {
         assert!(sync_parent_dir(&path).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn sync_parent_dir_succeeds_on_a_real_directory() {
         let base = tempfile::tempdir().expect("temporary config root");
