@@ -1619,7 +1619,7 @@ fn bot_review_gate_announcer_declares_only_trusted_noop_refresh_events() {
     assert_announcer_pull_request_triggers(on);
     assert_announcer_declares_only_documented_refresh_paths(on);
     assert_announcer_holds_no_token_scopes(&workflow);
-    assert_announcer_concurrency_cancels_stale_runs(&workflow);
+    assert_announcer_concurrency_never_cancels_a_refresh(&workflow);
     assert_announcer_body_is_a_single_noop_step(&workflow);
 }
 
@@ -1688,14 +1688,19 @@ fn assert_announcer_holds_no_token_scopes(workflow: &serde_yaml::Value) {
     );
 }
 
-// A newer review event must cancel the announcer's stale run, and the
-// concurrency group must be scoped to the exact pull request across event
-// kinds.
-fn assert_announcer_concurrency_cancels_stale_runs(workflow: &serde_yaml::Value) {
+// A refresh burst must queue, never cancel: a cancelled announcer run is
+// terminal and its check run would sit red at the live head forever (no
+// later event re-runs it), so any mechanical reader of head check runs —
+// the ruleset UI, the refinery guard — would see a failed
+// `Bot Review Gate Trigger` on every multi-event burst. The per-PR group
+// still serializes duplicates across event kinds, and the publisher's own
+// per-head concurrency collapses the resulting burst.
+fn assert_announcer_concurrency_never_cancels_a_refresh(workflow: &serde_yaml::Value) {
     assert_eq!(
         workflow["concurrency"]["cancel-in-progress"].as_bool(),
-        Some(true),
-        "a newer review event must cancel the announcer's stale run"
+        Some(false),
+        "a cancelled announcer check run is a terminal red state at the live head; \
+         duplicate refreshes must queue instead"
     );
     assert!(
         workflow["concurrency"]["group"].as_str().is_some_and(
