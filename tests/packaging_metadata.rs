@@ -1924,6 +1924,15 @@ fn assert_publisher_binds_the_evaluation_to_the_announcing_head(workflow: &serde
 // context name — opened in progress before any evaluation and finalized by
 // the same refresh — bound to the evaluated head.
 fn assert_publisher_publishes_the_verdict_at_the_evaluated_head(script: &str) {
+    assert_pull_requests_are_rederived_from_the_announced_head(script);
+    assert_one_shared_verdict_is_published_per_announced_head(script);
+    assert_the_required_context_is_opened_in_progress_and_finalized(script);
+}
+
+// Discovery: the candidate set comes from the announcer's exact commit,
+// restricted to open pull requests against main and matched by exact head
+// SHA (case-normalized), never from event-supplied pull-request fields.
+fn assert_pull_requests_are_rederived_from_the_announced_head(script: &str) {
     assert!(
         script.contains("commits/${announcer_head}/pulls")
             && script.contains(".base.ref == \"main\"")
@@ -1931,6 +1940,11 @@ fn assert_publisher_publishes_the_verdict_at_the_evaluated_head(script: &str) {
             && script.contains("($announcer_head | ascii_downcase)"),
         "pull requests must be re-derived from the announcer's exact commit, open against main, and selected by exact head SHA"
     );
+}
+
+// Publication shape: one shared verdict per announced head — opened in
+// progress before evaluation, finalized to an aggregated failure or success.
+fn assert_one_shared_verdict_is_published_per_announced_head(script: &str) {
     assert!(
         script.contains("start_gate_check_run \"${announcer_head}\"")
             && script.contains("finish_gate_check_run \"${announcer_head}\" \"failure\"")
@@ -1938,7 +1952,11 @@ fn assert_publisher_publishes_the_verdict_at_the_evaluated_head(script: &str) {
         "exactly one shared verdict — opened in progress before evaluation, \
          finalized to an aggregated failure or success — must be published per announced head"
     );
+}
 
+// The check-run API calls: the required context is created in progress at
+// the evaluated head and that same run is finalized to its conclusion.
+fn assert_the_required_context_is_opened_in_progress_and_finalized(script: &str) {
     assert!(
         script.contains("gate_context=\"Bot Review Gate\"")
             && script.contains("-F name=\"${gate_context}\"")

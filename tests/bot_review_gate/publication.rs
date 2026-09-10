@@ -355,15 +355,16 @@ fn the_publisher_owns_the_required_context_exclusively() {
 
 #[test]
 fn every_refusal_records_before_returning_and_only_the_driver_opens_and_finalizes() {
-    // The evaluation loop swallows `set -e`, so a refusal site that merely
-    // recorded a verdict and fell through would continue evaluating — and
-    // might still contribute a clean verdict afterwards. Every record call
-    // site must therefore be followed by an explicit `return 1`. The check
-    // run itself is touched only by the driver: exactly one in-progress
-    // start, and exactly the five terminal finalizations (aggregated
-    // failure, aggregated success, and the three discovery-level
-    // supersession paths).
     let script = super::harness::gate_run_script();
+    assert_every_refusal_records_before_returning(&script);
+    assert_only_the_driver_opens_and_finalizes(&script);
+}
+
+// The evaluation loop swallows `set -e`, so a refusal site that merely
+// recorded a verdict and fell through would continue evaluating — and
+// might still contribute a clean verdict afterwards. Every record call
+// site must therefore be followed by an explicit `return 1`.
+fn assert_every_refusal_records_before_returning(script: &str) {
     let lines: Vec<&str> = script.lines().collect();
     let mut call_sites = 0;
     for (index, line) in lines.iter().enumerate() {
@@ -385,6 +386,13 @@ fn every_refusal_records_before_returning_and_only_the_driver_opens_and_finalize
         call_sites >= 9,
         "every query, pagination, and head-binding refusal must record its verdict: {call_sites}"
     );
+}
+
+// The check run itself is touched only by the driver: exactly one
+// in-progress start, and exactly the five terminal finalizations
+// (aggregated failure, aggregated success, and the three discovery-level
+// supersession paths).
+fn assert_only_the_driver_opens_and_finalizes(script: &str) {
     let starts = script
         .matches("start_gate_check_run \"${announcer_head}\"")
         .count();
