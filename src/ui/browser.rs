@@ -1211,6 +1211,17 @@ fn populate_albums(
 /// selection changes use fresh data, then repopulates all three stores
 /// with filters reset to "All".
 pub fn rebuild_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks: &[TrackObject]) {
+    // The track set just changed (FullSync, source switch, snapshot
+    // refresh). Bump the album-art cache's content generation so covers
+    // changed by the new data are re-resolved within the SAME source
+    // session instead of serving the previous contents of
+    // `(source, epoch, album)` (2026-09-10 review finding — the key
+    // carried the source epoch but no artwork/content generation, so a
+    // same-session FullSync left changed covers stale). Old-generation
+    // entries become unqueryable and age out through the bounded
+    // eviction.
+    state.album_art_controller.cache().bump_content_generation();
+
     // Update the shared snapshot that selection handlers reference.
     let snapshots: Vec<TrackSnapshot> = tracks.iter().map(TrackSnapshot::from_object).collect();
     *state.tracks.borrow_mut() = snapshots;
@@ -1227,33 +1238,41 @@ pub fn rebuild_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks
 
     let borrowed = state.tracks.borrow();
     let use_aa = state.use_album_artist.get();
+    populate_all_panes(browser_box, &borrowed, use_aa);
+}
 
-    // The browser_box layout is: SearchEntry, panes_box (horizontal Box).
-    // The panes_box contains 3 children (genre_pane, artist_pane, album_pane).
-    let panes_box = browser_box
+/// Repopulate the genre, artist and album pane stores from the shared
+/// track snapshot with their filters reset to "All".
+///
+/// The browser_box layout is: SearchEntry, panes_box (horizontal Box);
+/// the panes_box contains 3 children (genre_pane, artist_pane,
+/// album_pane).
+fn populate_all_panes(browser_box: &gtk::Box, tracks: &[TrackSnapshot], use_aa: bool) {
+    let Some(panes_box) = browser_box
         .last_child()
-        .and_then(|w| w.downcast::<gtk::Box>().ok());
+        .and_then(|w| w.downcast::<gtk::Box>().ok())
+    else {
+        return;
+    };
 
-    if let Some(ref panes_box) = panes_box {
-        let mut child = panes_box.first_child();
-        let mut panes = Vec::new();
-        while let Some(widget) = child {
-            if let Some(pane) = widget.downcast_ref::<gtk::Box>() {
-                panes.push(pane.clone());
-            }
-            child = widget.next_sibling();
+    let mut child = panes_box.first_child();
+    let mut panes = Vec::new();
+    while let Some(widget) = child {
+        if let Some(pane) = widget.downcast_ref::<gtk::Box>() {
+            panes.push(pane.clone());
         }
+        child = widget.next_sibling();
+    }
 
-        if panes.len() >= 3 {
-            if let Some(genre_store) = get_store_from_pane(&panes[0]) {
-                populate_genres(&genre_store, &borrowed, &None, &None, use_aa);
-            }
-            if let Some(artist_store) = get_store_from_pane(&panes[1]) {
-                populate_artists(&artist_store, &borrowed, &None, &None, use_aa);
-            }
-            if let Some(album_store) = get_store_from_pane(&panes[2]) {
-                populate_albums(&album_store, &borrowed, &None, &None, use_aa);
-            }
+    if panes.len() >= 3 {
+        if let Some(genre_store) = get_store_from_pane(&panes[0]) {
+            populate_genres(&genre_store, tracks, &None, &None, use_aa);
+        }
+        if let Some(artist_store) = get_store_from_pane(&panes[1]) {
+            populate_artists(&artist_store, tracks, &None, &None, use_aa);
+        }
+        if let Some(album_store) = get_store_from_pane(&panes[2]) {
+            populate_albums(&album_store, tracks, &None, &None, use_aa);
         }
     }
 }
@@ -1508,70 +1527,24 @@ mod tests {
         assert_eq!(row.count().text(), "");
     }
 
-    /// Codex P2 (PR #171 discussion r3962112844): toggling album-pane
-    /// artwork or changing its thumbnail size is a presentation-only
-    /// factory swap. The rebuild must keep the album store filtered to
-    /// the active genre selection and keep the selected album row; the
-    /// previous implementation repopulated the store with the filters
-    /// cleared and reset the selection to "All", which expanded the pane
-    /// to unrelated albums and — through the selection-changed callback
-    /// — silently cleared the user's active album filter.
-    fn factory_swap_preserves_album_filters_and_selection() {
-        let tracks = vec![
-            TrackObject::new(
-                1,
-                "T1",
-                60,
-                "AR",
-                "A1",
-                "G1",
-                "",
-                0,
-                "",
-                0,
-                0,
-                0,
-                "",
-                "file:///t1.flac",
-            ),
-            TrackObject::new(
-                2,
-                "T2",
-                60,
-                "AR",
-                "A2",
-                "G1",
-                "",
-                0,
-                "",
-                0,
-                0,
-                0,
-                "",
-                "file:///t2.flac",
-            ),
-            TrackObject::new(
-                3,
-                "T3",
-                60,
-                "AR2",
-                "A3",
-                "G2",
-                "",
-                0,
-                "",
-                0,
-                0,
-                0,
-                "",
-                "file:///t3.flac",
-            ),
-        ];
-        let (browser_box, state) =
-            build_browser(&tracks, false, false, 48, Box::new(|_, _, _, _, _| {}));
+    /// Compact track fixture for the pane tests (the real constructor
+    /// takes 14 arguments; only these five vary here).
+    fn fixture_track(
+        number: u32,
+        artist: &str,
+        album: &str,
+        genre: &str,
+        uri: &str,
+    ) -> TrackObject {
+        TrackObject::new(
+            number, "T", 60, artist, album, genre, "", 0, "", 0, 0, 0, "", uri,
+        )
+    }
 
-        // Collect the panes: browser_box = [SearchEntry, panes_box], and
-        // panes_box = [genre, artist, album] (mirrors rebuild_browser_data).
+    /// Collect the three pane boxes from the browser widget tree
+    /// (browser_box = [SearchEntry, panes_box], panes_box = [genre,
+    /// artist, album] — mirrors `rebuild_browser_data`).
+    fn collect_browser_panes(browser_box: &gtk::Box) -> Vec<gtk::Box> {
         let panes_box = browser_box
             .last_child()
             .and_then(|w| w.downcast::<gtk::Box>().ok())
@@ -1585,6 +1558,42 @@ mod tests {
             child = widget.next_sibling();
         }
         assert_eq!(panes.len(), 3, "genre, artist and album panes");
+        panes
+    }
+
+    /// A presentation-only factory swap must keep the album store
+    /// filtered and the album/genre selections in place.
+    fn assert_album_pane_preserved(panes: &[gtk::Box], album_store: &gio::ListStore) {
+        assert_eq!(
+            album_store.n_items(),
+            3,
+            "the genre-filtered album store must survive the swap"
+        );
+        assert_eq!(
+            get_selection(&panes[2]).selected(),
+            2,
+            "the selected album row must survive the swap"
+        );
+        assert_eq!(get_selection(&panes[0]).selected(), 1);
+    }
+
+    /// Codex P2 (PR #171 discussion r3962112844): toggling album-pane
+    /// artwork or changing its thumbnail size is a presentation-only
+    /// factory swap. The rebuild must keep the album store filtered to
+    /// the active genre selection and keep the selected album row; the
+    /// previous implementation repopulated the store with the filters
+    /// cleared and reset the selection to "All", which expanded the pane
+    /// to unrelated albums and — through the selection-changed callback
+    /// — silently cleared the user's active album filter.
+    fn factory_swap_preserves_album_filters_and_selection() {
+        let tracks = vec![
+            fixture_track(1, "AR", "A1", "G1", "file:///t1.flac"),
+            fixture_track(2, "AR", "A2", "G1", "file:///t2.flac"),
+            fixture_track(3, "AR2", "A3", "G2", "file:///t3.flac"),
+        ];
+        let (browser_box, state) =
+            build_browser(&tracks, false, false, 48, Box::new(|_, _, _, _, _| {}));
+        let panes = collect_browser_panes(&browser_box);
 
         // Filter to genre G1 (genre store: "All", "G1", "G2" → index 1).
         // The album store narrows to G1's albums: "All", "A1", "A2".
@@ -1597,35 +1606,31 @@ mod tests {
         );
         // Select the second album row ("A2").
         get_selection(&panes[2]).set_selected(2);
-        assert_eq!(get_selection(&panes[2]).selected(), 2);
 
         // Layout toggle: swap the artwork factory in place.
         set_album_pane_artwork(&browser_box, &state, true);
-        assert_eq!(
-            album_store.n_items(),
-            3,
-            "an artwork toggle must keep the genre-filtered album store"
-        );
-        assert_eq!(
-            get_selection(&panes[2]).selected(),
-            2,
-            "an artwork toggle must keep the selected album row"
-        );
+        assert_album_pane_preserved(&panes, &album_store);
 
         // Thumbnail size change: same contract.
         set_album_pane_artwork_size(&browser_box, &state, 72);
-        assert_eq!(
-            album_store.n_items(),
-            3,
-            "a size change must keep the genre-filtered album store"
+        assert_album_pane_preserved(&panes, &album_store);
+    }
+
+    /// FullSync and any other full data rebuild must invalidate cached
+    /// covers: the rebuild bumps the album-art cache's content
+    /// generation, so artwork decoded before the rebuild can never be
+    /// queried afterwards (2026-09-10 review finding — same-session
+    /// FullSync used to leave changed covers stale).
+    fn rebuild_bumps_album_art_content_generation() {
+        let tracks = vec![fixture_track(1, "AR", "A1", "G1", "file:///t1.flac")];
+        let (browser_box, state) =
+            build_browser(&tracks, false, false, 48, Box::new(|_, _, _, _, _| {}));
+        let before = state.album_art_controller.cache().content_generation();
+        rebuild_browser_data(&browser_box, &state, &[]);
+        assert!(
+            state.album_art_controller.cache().content_generation() > before,
+            "a full data rebuild must advance the album-art content generation"
         );
-        assert_eq!(
-            get_selection(&panes[2]).selected(),
-            2,
-            "a size change must keep the selected album row"
-        );
-        // The genre pane's own selection survives both swaps.
-        assert_eq!(get_selection(&panes[0]).selected(), 1);
     }
 
     /// The crate's single consolidated GTK widget test, all run on the ONE
@@ -1680,5 +1685,6 @@ mod tests {
         crate::ui::album_art_cell::widget_tests::show_placeholder_keeps_the_missing_art_visible();
         crate::ui::album_art_cell::widget_tests::revoking_a_cell_revokes_its_outstanding_fetch_token();
         factory_swap_preserves_album_filters_and_selection();
+        rebuild_bumps_album_art_content_generation();
     }
 }
