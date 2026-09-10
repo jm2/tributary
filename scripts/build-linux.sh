@@ -92,7 +92,7 @@ error() { echo -e "${RED}[tributary]${NC} $*" >&2; exit 1; }
 
 QUICK_MODE_COUNT=0
 for selected in "$CHECK" "$FMT" "$CLIPPY" "$COVERAGE"; do
-  if $selected; then QUICK_MODE_COUNT=$((QUICK_MODE_COUNT + 1)); fi
+  if "$selected"; then QUICK_MODE_COUNT=$((QUICK_MODE_COUNT + 1)); fi
 done
 [[ "$QUICK_MODE_COUNT" -le 1 ]] || usage_error "Choose at most one quick-exit mode"
 
@@ -100,7 +100,7 @@ if { $CHECK || $FMT || $CLIPPY || $COVERAGE; } && \
    { $FLATPAK || $DEB || $RPM || $ARCH_PKG; }; then
   usage_error "Quick-exit and packaging modes cannot be combined"
 fi
-if $RUN && { $CHECK || $FMT || $CLIPPY || $COVERAGE || $FLATPAK || $DEB || $RPM || $ARCH_PKG; }; then
+if "$RUN" && { "$CHECK" || "$FMT" || "$CLIPPY" || "$COVERAGE" || "$FLATPAK" || "$DEB" || "$RPM" || "$ARCH_PKG"; }; then
   usage_error "--run cannot be combined with quick-exit or packaging modes"
 fi
 
@@ -113,7 +113,7 @@ if $FMT; then
 fi
 
 BINARY="${REPO_ROOT}/target/release/tributary"
-if $RUN; then
+if "$RUN"; then
   command -v rustc &>/dev/null || error "rustc not found. Install Rust from https://rustup.rs"
   RUN_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
   [[ "$RUN_TARGET" == *-linux-* ]] || error "--run requires a native Linux Rust toolchain"
@@ -245,7 +245,7 @@ fi
 # ── Rust Build ───────────────────────────────────────────────────────────────
 "$PACKAGE_METADATA_VALIDATOR"
 info "Building Tributary (release)..."
-if $RUN; then
+if "$RUN"; then
   cargo build --release --locked --target "$RUN_TARGET" --target-dir "${REPO_ROOT}/target"
 else
   cargo build --release
@@ -253,7 +253,7 @@ fi
 "$PACKAGE_VALIDATOR" --elf "$BINARY"
 info "Binary: $BINARY"
 
-if $RUN; then
+if "$RUN"; then
   info "Launching Tributary..."
   exec "$BINARY"
 fi

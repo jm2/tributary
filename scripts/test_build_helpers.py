@@ -12,7 +12,6 @@ from tempfile import TemporaryDirectory
 
 
 REPOSITORY = Path(__file__).resolve().parent.parent
-BASH = shutil.which("bash")
 FAKE_TOOL = r'''#!/usr/bin/env python3
 import json
 import os
@@ -106,12 +105,15 @@ class BuildHelperTests(unittest.TestCase):
         """Run from outside the checkout and capture output plus tool calls."""
         self.calls.write_text("")
         host = "aarch64-apple-darwin" if platform == "macos" else "x86_64-unknown-linux-gnu"
+        # Both supported platforms provide /bin/bash. Execute the checked-in
+        # helper copy with separate arguments; PATH selects fixture build tools.
         result = subprocess.run(  # nosec B603 -- local fixtures, no shell expansion
-            [BASH, str(self.scripts / f"build-{platform}.sh"), *arguments],
+            ["/bin/bash", str(self.scripts / f"build-{platform}.sh"), *arguments],
             cwd=self.root.parent,
             env={**self.environment, "HELPER_HOST": host, **overrides},
             capture_output=True,
             text=True,
+            shell=False,
             timeout=20,
             check=False,
         )

@@ -69,13 +69,13 @@ error() { echo -e "${RED}[tributary]${NC} $*" >&2; exit 1; }
 
 QUICK_MODE_COUNT=0
 for selected in "$CHECK" "$FMT" "$CLIPPY" "$COVERAGE"; do
-  if $selected; then QUICK_MODE_COUNT=$((QUICK_MODE_COUNT + 1)); fi
+  if "$selected"; then QUICK_MODE_COUNT=$((QUICK_MODE_COUNT + 1)); fi
 done
 [[ "$QUICK_MODE_COUNT" -le 1 ]] || usage_error "Choose at most one quick-exit mode"
-if [[ "$QUICK_MODE_COUNT" -gt 0 ]] && $MAKE_DMG; then
+if [[ "$QUICK_MODE_COUNT" -gt 0 ]] && "$MAKE_DMG"; then
   usage_error "Quick-exit and packaging modes cannot be combined"
 fi
-if $RUN && { $CHECK || $FMT || $CLIPPY || $COVERAGE || $MAKE_DMG; }; then
+if "$RUN" && { "$CHECK" || "$FMT" || "$CLIPPY" || "$COVERAGE" || "$MAKE_DMG"; }; then
   usage_error "--run cannot be combined with quick-exit or packaging modes"
 fi
 
@@ -90,7 +90,7 @@ if $FMT; then
   info "Formatting complete."
   exit 0
 fi
-if $RUN; then
+if "$RUN"; then
   command -v rustc &>/dev/null || error "rustc not found. Install Rust: https://rustup.rs"
   RUN_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
   [[ "$RUN_TARGET" == *-apple-darwin ]] || error "--run requires a native macOS Rust toolchain"
@@ -179,7 +179,7 @@ if $COVERAGE; then
   exit 0
 fi
 
-if $RUN; then
+if "$RUN"; then
   if ! macos_package_policy_load "$MACOS_BUNDLED_COMPONENT_POLICY"; then
     error "$MACOS_PACKAGE_POLICY_REASON"
   fi
