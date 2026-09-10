@@ -988,8 +988,20 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn same_target_rebuild_clears_the_session_then_stops_and_replaces_the_lapsed_output() {
+    /// Shared fixtures for a same-target supervised MPD rebuild: the active
+    /// slot holds a lapsed supervised output, the target is a supervised
+    /// exclusive MPD endpoint, and the playback session still holds an owned
+    /// queue item — exactly the state in which a rebuild must revoke the
+    /// session proof before touching the predecessor.
+    struct LapsedSupervisedRebuildFixture {
+        order: Rc<RefCell<Vec<&'static str>>>,
+        lapsed_state: Rc<RefCell<FakeOutputState>>,
+        active_output: Rc<RefCell<Box<dyn AudioOutput>>>,
+        active_target: Rc<RefCell<OutputTarget>>,
+        playback_session: Rc<RefCell<PlaybackSession>>,
+    }
+
+    fn lapsed_supervised_mpd_fixture() -> LapsedSupervisedRebuildFixture {
         let order = Rc::new(RefCell::new(Vec::new()));
         let (lapsed, lapsed_state) = FakeOutput::boxed_lapsed_with_order(
             "mpd-lapsed",
@@ -997,7 +1009,6 @@ mod tests {
             0,
             Some(order.clone()),
         );
-        let (fresh, _) = FakeOutput::boxed("mpd-fresh", OutputType::Mpd, 0);
         let active_output = Rc::new(RefCell::new(lapsed));
         let active_target = Rc::new(RefCell::new(OutputTarget::Mpd {
             host: "music.local".to_string(),
@@ -1015,19 +1026,32 @@ mod tests {
             )],
             0,
         ));
-        assert!(playback_session.borrow().has_current());
+        LapsedSupervisedRebuildFixture {
+            order,
+            lapsed_state,
+            active_output,
+            active_target,
+            playback_session,
+        }
+    }
+
+    #[test]
+    fn same_target_rebuild_clears_the_session_then_stops_and_replaces_the_lapsed_output() {
+        let fx = lapsed_supervised_mpd_fixture();
+        assert!(fx.playback_session.borrow().has_current());
+        let (fresh, _) = FakeOutput::boxed("mpd-fresh", OutputType::Mpd, 0);
         let callbacks = Cell::new(0);
 
         let (outcome, external_source) = commit_same_target_output_rebuild(
-            &active_target,
-            &playback_session,
-            &active_output,
+            &fx.active_target,
+            &fx.playback_session,
+            &fx.active_output,
             OutputActivation::Remote(fresh),
             || {
-                order.borrow_mut().push("coordinator-retire");
-                assert!(playback_session.try_borrow_mut().is_ok());
-                assert!(active_output.try_borrow_mut().is_ok());
-                assert!(!playback_session.borrow().has_current());
+                fx.order.borrow_mut().push("coordinator-retire");
+                assert!(fx.playback_session.try_borrow_mut().is_ok());
+                assert!(fx.active_output.try_borrow_mut().is_ok());
+                assert!(!fx.playback_session.borrow().has_current());
                 callbacks.set(callbacks.get() + 1);
             },
         );
@@ -1036,13 +1060,16 @@ mod tests {
         assert_eq!(callbacks.get(), 1);
         // The stale (lapsed) instance is stopped and dropped; the fresh one
         // takes the slot; the target is unchanged by definition.
-        assert_eq!(lapsed_state.borrow().stops, 1);
+        assert_eq!(fx.lapsed_state.borrow().stops, 1);
         assert_eq!(
-            *order.borrow(),
+            *fx.order.borrow(),
             ["coordinator-retire", "output-stop", "output-drop"]
         );
-        assert_eq!(active_output.borrow().name(), "mpd-fresh");
-        assert!(matches!(*active_target.borrow(), OutputTarget::Mpd { .. }));
+        assert_eq!(fx.active_output.borrow().name(), "mpd-fresh");
+        assert!(matches!(
+            *fx.active_target.borrow(),
+            OutputTarget::Mpd { .. }
+        ));
     }
 
     #[test]
