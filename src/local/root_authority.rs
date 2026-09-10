@@ -595,10 +595,10 @@ pub struct MountedMutationCommit<'a> {
 /// object's identity — ext4 hands recently freed inodes to the next file
 /// created in the same directory, so an unlink-plus-recreate swap can
 /// produce a different object with the same `(device, inode)` pair. The
-/// open handle pins the published object: on unix it exposes the link
-/// count that proves the object was not unlinked, and on every platform
-/// an object with an open handle still exists and holds its identity, so
-/// no later creation can alias it.
+/// open handle pins the published object: on unix and Windows it exposes
+/// the link count that proves the object was not unlinked, and on every
+/// platform an object with an open handle still exists and holds its
+/// identity, so no later creation can alias it.
 struct InstalledReplacement {
     identity: ObjectIdentity,
     published: File,
@@ -608,7 +608,11 @@ impl InstalledReplacement {
     /// Prove the published object is still live and linked, returning the
     /// identity the re-anchor may condition on.
     ///
-    /// On unix a handle to an unlinked object reports zero links: without
+    /// A handle to an unlinked object reports zero links — on unix through
+    /// `st_nlink`, and on Windows through `GetFileInformationByHandle`'s
+    /// `nNumberOfLinks`, which drops to zero when the object's last name is
+    /// removed under POSIX delete semantics even though the open handle
+    /// keeps working and a plain `metadata()` read keeps succeeding. Without
     /// this check, a leaf swap whose stranger recycled the published
     /// object's identity would pass the re-anchor's identity comparison
     /// and anchor the target to a file the user never selected.
@@ -629,7 +633,15 @@ impl InstalledReplacement {
                 ));
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            if windows_published_link_count(&self.published)? == 0 {
+                return Err(authority_changed(
+                    "the proven replacement was removed before the target could re-anchor",
+                ));
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = self.published.metadata()?;
         }
@@ -2004,6 +2016,39 @@ fn object_identity(file: &File) -> io::Result<ObjectIdentity> {
         volume: u64::from(legacy.dwVolumeSerialNumber),
         file_id: WindowsFileId::Legacy(legacy_id),
     })
+}
+
+/// Read the link count of an open file through its handle on Windows.
+///
+/// `GetFileInformationByHandle` reports the same liveness signal unix
+/// exposes through `st_nlink`: when a file's last name is removed under
+/// POSIX delete semantics, the reported count drops to zero while the open
+/// handle keeps working — and a plain `metadata()` read keeps succeeding,
+/// so the link count, not the read's success, is the deleted-object proof.
+/// The call reads the object through the handle itself, never through a
+/// name, so a removed or replaced directory entry cannot influence it. A
+/// failed read means liveness cannot be proven and the caller fails closed.
+#[cfg(windows)]
+fn windows_published_link_count(file: &File) -> io::Result<u32> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let handle = file.as_raw_handle() as HANDLE;
+    let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: `handle` is live and `info` is a correctly sized, aligned
+    // output buffer that is fully initialized on success.
+    let result = unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful call above initialized the complete structure.
+    let info = unsafe { info.assume_init() };
+    Ok(info.nNumberOfLinks)
 }
 
 #[cfg(not(any(unix, windows)))]

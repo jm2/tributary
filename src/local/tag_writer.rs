@@ -727,7 +727,7 @@ fn atomic_tag_replacement(
     drop(destination);
     copy_result?;
 
-    write_tags_to(temp.path(), edits)?;
+    write_tags_to(temp.path(), target_label, edits)?;
     #[cfg(unix)]
     flush_and_prepare_tagged_copy(&temp, target_label, retained_permissions)?;
     #[cfg(not(unix))]
@@ -828,9 +828,15 @@ fn flush_to_disk(path: &Path) -> std::io::Result<()> {
 }
 
 /// Apply `edits` to the tags of the file at `temp_path` in-place.
-fn write_tags_to(temp_path: &Path, edits: &TagEdits) -> Result<()> {
+///
+/// Error contexts name the target by `target_label`, never by `temp_path`:
+/// the staged copy is created beside the target, so its path points inside
+/// the target's own directory — a native mount directory for
+/// authority-based callers — and formatting it would leak exactly the
+/// location the redacted label exists to protect.
+fn write_tags_to(temp_path: &Path, target_label: &str, edits: &TagEdits) -> Result<()> {
     let mut tagged_file = lofty::read_from_path(temp_path)
-        .with_context(|| format!("Failed to read tags from {}", temp_path.display()))?;
+        .with_context(|| format!("Failed to read tags from {target_label}"))?;
 
     // Get or create the primary tag for this file type. Files with no
     // existing primary tag (e.g. a stripped MP3, or a FLAC without a Vorbis
@@ -843,10 +849,7 @@ fn write_tags_to(temp_path: &Path, edits: &TagEdits) -> Result<()> {
     }
 
     let tag = tagged_file.primary_tag_mut().ok_or_else(|| {
-        anyhow::anyhow!(
-            "No primary tag found and cannot create one for {}",
-            temp_path.display()
-        )
+        anyhow::anyhow!("No primary tag found and cannot create one for {target_label}")
     })?;
 
     // Apply edits — only touch fields that are Some.
@@ -942,7 +945,7 @@ fn write_tags_to(temp_path: &Path, edits: &TagEdits) -> Result<()> {
 
     // Save back to the temp file.
     tag.save_to_path(temp_path, WriteOptions::default())
-        .with_context(|| format!("Failed to write tags to {}", temp_path.display()))?;
+        .with_context(|| format!("Failed to write tags to {target_label}"))?;
 
     Ok(())
 }
