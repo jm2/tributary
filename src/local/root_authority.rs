@@ -253,8 +253,12 @@ pub enum ReversalOutcome {
 /// revalidation into its own verified-publication error path (the write
 /// authority's `CommitError::PublishVerification`).
 pub(super) struct LandedPublish {
-    /// No-follow identity of the published leaf, bound to the staged object
-    /// before the rename; `None` when the capture failed.
+    /// No-follow identity of the published leaf: the refreshed capture
+    /// when the post-publish proof verified the staged object, or the
+    /// admitted staged capture when the proof failed (a vanishing leaf,
+    /// an unreadable lookup, or a foreign interposition). Only a missing
+    /// pre-rename capture records `None`, degrading the reversal to the
+    /// legacy path-only behavior.
     pub(super) published_leaf: Option<LeafIdentity>,
     /// Result of the retained-parent revalidation that runs immediately
     /// after the rename and the identity capture.
@@ -343,6 +347,45 @@ fn leaf_identity_at(parent: &File, leaf: &OsStr) -> io::Result<Option<LeafIdenti
     }
 }
 
+/// The outcome of the post-publish published-object proof.
+///
+/// The publish machinery binds the staged object's identity before the
+/// rename and refreshes it after the rename lands, accepting the refresh
+/// only when it names the same object the staged capture bound. The
+/// refresh can fail to prove that: the leaf may have vanished, its
+/// lookup may have errored, or a concurrent writer's replacement may
+/// have interposed in the capture window. A failed proof must never
+/// degrade the record to `None` — the legacy path-only reversal would
+/// then clean the destination up by pathname alone, and whatever
+/// replaced the publication would be destroyed unchecked.
+#[cfg(unix)]
+#[derive(Debug)]
+enum PublishedIdentityProof {
+    /// The post-publish lookup named the staged object: the refreshed
+    /// identity is recorded, and a later same-name reversal compares
+    /// exactly against the rename-updated change instant.
+    Verified(LeafIdentity),
+    /// The proof failed, but the staged capture still names what the
+    /// transfer admits publishing: the admitted identity is recorded so
+    /// a later reversal refuses a foreign replacement fail-closed
+    /// instead of degrading to path-only cleanup.
+    Admitted(LeafIdentity),
+    /// No staged capture exists, so there is no admitted identity to
+    /// preserve; the record degrades to the legacy path-only reversal.
+    Uncaptured,
+}
+
+#[cfg(unix)]
+impl PublishedIdentityProof {
+    /// The identity to record on the landed publish.
+    fn recorded(self) -> Option<LeafIdentity> {
+        match self {
+            Self::Verified(identity) | Self::Admitted(identity) => Some(identity),
+            Self::Uncaptured => None,
+        }
+    }
+}
+
 /// Refresh a pre-publish staged-object capture into the recorded published
 /// identity. A rename legitimately updates the published object's
 /// change instant, so the staged capture alone can never compare exactly
@@ -351,18 +394,35 @@ fn leaf_identity_at(parent: &File, leaf: &OsStr) -> io::Result<Option<LeafIdenti
 /// the same object the staged capture bound — a concurrent writer's
 /// replacement landing in the capture window is never recorded as the
 /// publication (it would be matched and destroyed by a later rollback).
-/// `None` — no staged capture, the leaf vanished, or a foreign object
-/// interposed — degrades the record to the legacy path-only reversal
-/// behavior.
+///
+/// When the proof FAILS — the leaf vanished, the lookup errored, or a
+/// foreign object interposed — the admitted staged identity is recorded
+/// instead of `None`: the publication names the staged object regardless
+/// of what happened after the rename, so a later reversal must verify
+/// against that admitted identity and refuse a mismatched (foreign)
+/// occupant fail-closed rather than degrade to path-only cleanup that
+/// could destroy the replacement unchecked. Only a missing staged
+/// capture — nothing admitted — degrades to the legacy path-only
+/// reversal behavior.
 #[cfg(unix)]
 fn cross_checked_published_identity(
     parent: &File,
     leaf: &OsStr,
     staged: Option<LeafIdentity>,
-) -> Option<LeafIdentity> {
-    let current = leaf_identity_at(parent, leaf).ok().flatten()?;
-    staged.filter(|staged| current.same_object(staged))?;
-    Some(current)
+) -> PublishedIdentityProof {
+    let Some(staged) = staged else {
+        return PublishedIdentityProof::Uncaptured;
+    };
+    match leaf_identity_at(parent, leaf) {
+        Ok(Some(current)) if current.same_object(&staged) => {
+            PublishedIdentityProof::Verified(current)
+        }
+        // A failed proof: preserve the admitted identity. An intact
+        // publication whose lookup merely errored transiently may also be
+        // refused by a later full-equality reversal — a safe outcome, never
+        // a destructive one.
+        Ok(_) | Err(_) => PublishedIdentityProof::Admitted(staged),
+    }
 }
 
 /// Capture the no-follow identity of the entry at `path`. `Ok(None)` means
@@ -952,16 +1012,18 @@ impl MountedRootAuthority {
         // against a later same-name reversal verification. Refresh it with
         // a post-publish lookup — accepted only when it names the staged
         // object, so a concurrent writer's replacement in the capture
-        // window is never recorded as the publication; a vanishing leaf or
-        // an unreadable capture degrades the record to `None` (the legacy
-        // path-only reversal behavior).
+        // window is never recorded as the publication. A failed proof — a
+        // vanishing leaf, an unreadable capture, or an interposed foreign
+        // object — records the ADMITTED staged identity rather than
+        // degrading to `None`: a `None` record would reverse by pathname
+        // alone and could destroy the replacement unchecked.
         //
         // Windows: the identity's creation-sensitive fields are immutable
         // across a rename, so the staged capture itself is the stable
         // published identity.
         #[cfg(unix)]
         let published_leaf =
-            cross_checked_published_identity(parent.handle(), to_leaf, staged_identity);
+            cross_checked_published_identity(parent.handle(), to_leaf, staged_identity).recorded();
         #[cfg(windows)]
         let published_leaf = staged_identity;
         let post_validate = parent.validate_with(self);
@@ -3843,7 +3905,7 @@ fn replace_publish_attempt(
             ) {
                 Ok(()) => Ok(Some((
                     false,
-                    cross_checked_published_identity(parent, to_leaf, staged),
+                    cross_checked_published_identity(parent, to_leaf, staged).recorded(),
                 ))),
                 // The creation won the race — loop back and bind it.
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(None),
@@ -3966,7 +4028,7 @@ fn swap_and_verify_replace(
     let staged = leaf_identity_at(parent, from_leaf).ok().flatten();
     match renameat_with(parent, from_leaf, parent, to_leaf, RenameFlags::EXCHANGE) {
         Ok(()) => {
-            let published = cross_checked_published_identity(parent, to_leaf, staged);
+            let published = cross_checked_published_identity(parent, to_leaf, staged).recorded();
             verify_atomic_swap(
                 parent,
                 from_leaf,
@@ -6540,5 +6602,127 @@ mod tests {
         );
         fs::remove_file(&staged_second)
             .expect("a refused commit leaves its staging name to the caller");
+    }
+
+    /// Interposition regressions for the post-publish published-object
+    /// proof: a failed proof must record the admitted staged identity, so
+    /// a later reversal refuses a foreign replacement fail-closed instead
+    /// of degrading to unchecked path-only cleanup.
+    #[cfg(unix)]
+    mod published_identity_proof {
+        use super::*;
+
+        fn open_parent_dir(path: &Path) -> File {
+            let opened = rustix::fs::openat(
+                rustix::fs::CWD,
+                path,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .expect("open parent directory handle");
+            File::from(opened)
+        }
+
+        fn staged_capture(parent: &File, leaf: &OsStr) -> LeafIdentity {
+            leaf_identity_at(parent, leaf)
+                .expect("stat staged leaf")
+                .expect("staged leaf exists")
+        }
+
+        #[test]
+        fn verified_proof_records_the_refreshed_identity() {
+            let directory = TestDirectory::new("proof-verified");
+            fs::write(directory.path().join("staged.tmp"), b"published bytes")
+                .expect("write staged leaf");
+            let parent = open_parent_dir(directory.path());
+            let staged = staged_capture(&parent, OsStr::new("staged.tmp"));
+
+            // The publish renames the staged object onto the destination:
+            // same object, updated change instant.
+            fs::rename(
+                directory.path().join("staged.tmp"),
+                directory.path().join("song.flac"),
+            )
+            .expect("publish rename");
+
+            match cross_checked_published_identity(&parent, OsStr::new("song.flac"), Some(staged)) {
+                PublishedIdentityProof::Verified(recorded) => {
+                    let current = staged_capture(&parent, OsStr::new("song.flac"));
+                    assert_eq!(
+                        recorded, current,
+                        "the verified record must be the post-publish capture"
+                    );
+                    assert!(
+                        recorded.same_object(&staged),
+                        "the verified record must name the staged object"
+                    );
+                }
+                other => panic!("expected a verified proof, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn foreign_interposition_preserves_the_admitted_identity() {
+            let directory = TestDirectory::new("proof-foreign");
+            fs::write(directory.path().join("song.flac"), b"published bytes")
+                .expect("write published leaf");
+            let parent = open_parent_dir(directory.path());
+            let staged = staged_capture(&parent, OsStr::new("song.flac"));
+
+            // A concurrent writer replaces the publication with a NEW
+            // object in the capture window.
+            fs::remove_file(directory.path().join("song.flac")).expect("racer unlink");
+            fs::write(directory.path().join("song.flac"), b"racer bytes").expect("racer replace");
+
+            match cross_checked_published_identity(&parent, OsStr::new("song.flac"), Some(staged)) {
+                PublishedIdentityProof::Admitted(recorded) => {
+                    assert_eq!(
+                        recorded, staged,
+                        "the admitted record must be the staged capture, never the foreign object"
+                    );
+                }
+                other => panic!(
+                    "a foreign interposition must admit the staged identity, never degrade: \
+                     {other:?}"
+                ),
+            }
+        }
+
+        #[test]
+        fn vanishing_leaf_preserves_the_admitted_identity() {
+            let directory = TestDirectory::new("proof-vanished");
+            fs::write(directory.path().join("song.flac"), b"published bytes")
+                .expect("write published leaf");
+            let parent = open_parent_dir(directory.path());
+            let staged = staged_capture(&parent, OsStr::new("song.flac"));
+
+            fs::remove_file(directory.path().join("song.flac")).expect("racer removal");
+
+            match cross_checked_published_identity(&parent, OsStr::new("song.flac"), Some(staged)) {
+                PublishedIdentityProof::Admitted(recorded) => {
+                    assert_eq!(recorded, staged);
+                }
+                other => panic!(
+                    "a vanishing leaf must admit the staged identity, never degrade: {other:?}"
+                ),
+            }
+        }
+
+        #[test]
+        fn missing_staged_capture_degrades_to_uncaptured() {
+            let directory = TestDirectory::new("proof-uncaptured");
+            fs::write(directory.path().join("song.flac"), b"published bytes")
+                .expect("write published leaf");
+            let parent = open_parent_dir(directory.path());
+
+            match cross_checked_published_identity(&parent, OsStr::new("song.flac"), None) {
+                PublishedIdentityProof::Uncaptured => {}
+                other => panic!("a missing staged capture must degrade: {other:?}"),
+            }
+            assert!(PublishedIdentityProof::Uncaptured.recorded().is_none());
+        }
     }
 }
