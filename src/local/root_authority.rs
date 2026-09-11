@@ -270,12 +270,13 @@ pub(super) struct LandedPublish {
 ///
 /// Both restoration of the backup (rollback) and its disposal
 /// (successful-transfer cleanup) verify the backup still names this
-/// object — object-coupled, not change-instant-exact, because the bind
-/// and the atomic exchange legitimately update the bound object's
-/// change-sensitive instant — before moving or discarding it. A backup
-/// name a concurrent writer swapped for a foreign object is refused
-/// fail-closed: the replacement is never installed as the original and
-/// never deleted.
+/// object — change-instant-exact. The bind captures the object's
+/// identity only after the linking operation has updated its instant,
+/// and nothing in the publish machinery touches the backup object
+/// afterwards, so a legitimate backup compares exactly equal — while a
+/// same-index swap-in of a foreign object cannot inherit the recorded
+/// instant and is refused fail-closed: the replacement is never
+/// installed as the original and never deleted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct BoundOccupantBackup {
     /// Relative path of the backup sibling.
@@ -1330,7 +1331,7 @@ impl MountedRootAuthority {
     /// the same parent directory, verifying against the published-leaf
     /// identity when one is supplied, and verifying the BACKUP itself
     /// against its bind-time identity (`backup_leaf_identity`, compared
-    /// object-coupled) before it is moved. See
+    /// change-instant-exact) before it is moved. See
     /// [`MountedWriteAuthority::restore_relative_file_verified`](crate::local::write_authority::MountedWriteAuthority::restore_relative_file_verified)
     /// for the full contract.
     #[allow(clippy::too_many_arguments)]
@@ -1372,8 +1373,13 @@ impl MountedRootAuthority {
         // swapped backup never restores — installing a foreign object as
         // "the original" would destroy the transfer's own history — and
         // the foreign object is never deleted here. The comparison is
-        // object-coupled: the bind's hard link and the atomic exchange
-        // legitimately updated the bound object's change instant.
+        // change-instant-exact: the bind captures the bound object's
+        // identity after the linking operation has updated its instant,
+        // and nothing in the publish machinery touches the backup object
+        // afterwards, so a legitimate backup compares exactly equal —
+        // while a same-index swap-in cannot inherit the recorded instant
+        // and is refused (the same-path inode-reuse hazard that the
+        // object-level check alone cannot defeat).
         let backup_identity =
             coupled_leaf_identity(&self.root, &parent, &backup_leaf, &backup_components)?;
         if backup_identity.is_none() && backup_leaf_identity.is_some() {
@@ -1387,7 +1393,7 @@ impl MountedRootAuthority {
         if identity_mismatches(
             backup_leaf_identity,
             backup_identity,
-            IdentityCoupling::SameObject,
+            IdentityCoupling::Exact,
         ) {
             return Ok(ReversalOutcome::RefusedForeignLeaf);
         }
@@ -1447,7 +1453,7 @@ impl MountedRootAuthority {
             &parent,
             &backup_components,
             backup_leaf_identity,
-            IdentityCoupling::SameObject,
+            IdentityCoupling::Exact,
         )?;
         drop(parent);
         self.validate()?;
@@ -3320,7 +3326,7 @@ fn coupled_leaf_identity(
     }
     #[cfg(windows)]
     {
-        let _ = parent;
+        let _ = (parent, leaf);
         leaf_identity_at_path(&join_components(root, leaf_components))
     }
     #[cfg(not(any(unix, windows)))]
@@ -3352,20 +3358,17 @@ fn identity_mismatches(
 enum IdentityCoupling {
     /// Full equality, change-sensitive fields included. For objects that
     /// have not been renamed since their capture: a same-index replacement
-    /// cannot inherit the recorded instant, so it compares unequal.
+    /// cannot inherit the recorded instant, so it compares unequal. Every
+    /// reversal gate compares under this coupling — including the bound
+    /// backup gates, whose captures are taken after the bind has settled
+    /// the object's instant.
     Exact,
-    /// Object-level equality (device and index, or volume and file id).
-    /// For objects the machinery itself renamed after the capture — a
-    /// bound backup sibling whose object the bind's hard link and the
-    /// atomic exchange legitimately moved and re-instanted.
-    SameObject,
 }
 
 impl IdentityCoupling {
     fn matches(self, expected: &LeafIdentity, found: &LeafIdentity) -> bool {
         match self {
             Self::Exact => expected == found,
-            Self::SameObject => expected.same_object(found),
         }
     }
 }
@@ -3907,7 +3910,7 @@ fn remove_leaf_by_object(
         // SAFETY: the successful call above initialized the complete structure.
         let info = unsafe { info.assume_init() };
         let found = leaf_identity_from_handle_info(&info);
-        if expected.is_some_and(|expected| !coupling.matches(expected, &found)) {
+        if expected.is_some_and(|expected| !coupling.matches(&expected, &found)) {
             return Ok(ReversalOutcome::RefusedForeignLeaf);
         }
         let is_reparse = info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
@@ -4645,7 +4648,7 @@ fn bind_occupant_backup(
             | rustix::io::Errno::XDEV
             | rustix::io::Errno::MLINK,
         ) => match copy_bind_occupant_backup(parent, to_leaf, backup_leaf)? {
-            OccupantBackup::Bound(identity) => Ok(Some(identity)),
+            OccupantBackup::Bound(identity) => Ok(identity),
             // The occupant vanished (or was replaced) while it was being
             // copied: discard the stale copy and re-bind from the top.
             OccupantBackup::Vanished => Ok(None),
@@ -4766,7 +4769,16 @@ fn verify_atomic_swap(
             // link at the staged name. The published identity is the one
             // bound to the staged object before the exchange.
             let _ = unlinkat(parent, from_leaf, AtFlags::empty());
-            Ok(Some((true, published_leaf, Some(*bound_identity))))
+            // The publish machinery has now finished moving the bound
+            // object around (the exchange) and dropping its redundant
+            // staged link (the unlink) — both of which update its change
+            // instant. Re-capture the backup's identity NOW so the
+            // recorded instant is the object's settled post-commit state:
+            // a legitimate backup compares exactly equal at every later
+            // reversal gate, while a same-index swap-in after the commit
+            // cannot inherit the recorded instant.
+            let settled = leaf_identity_at(parent, backup_leaf).ok().flatten();
+            Ok(Some((true, published_leaf, settled)))
         }
         Ok(_) => {
             // An interposed writer's object was displaced: restore it to
@@ -4775,9 +4787,13 @@ fn verify_atomic_swap(
             // `to_leaf` — nothing published remains, so this is an
             // ordinary retryable interposition.
             if let Err(error) = renameat(parent, from_leaf, parent, to_leaf) {
+                // The exchange moved the bound object (updating its
+                // instant), so the retained identity must be captured at
+                // the settled post-exchange state.
+                let settled = leaf_identity_at(parent, backup_leaf).ok().flatten();
                 return Err(displaced_occupant_failure(
                     published_leaf,
-                    Some(*bound_identity),
+                    settled,
                     io::Error::from(error),
                     None,
                 ));
@@ -4797,12 +4813,18 @@ fn verify_atomic_swap(
                 release_occupant_backup(parent, backup_leaf);
                 Err(verification)
             }
-            Err(restore) => Err(displaced_occupant_failure(
-                published_leaf,
-                Some(*bound_identity),
-                verification,
-                Some(io::Error::from(restore)),
-            )),
+            Err(restore) => {
+                // The exchange moved the bound object (updating its
+                // instant), so the retained identity must be captured at
+                // the settled post-exchange state.
+                let settled = leaf_identity_at(parent, backup_leaf).ok().flatten();
+                Err(displaced_occupant_failure(
+                    published_leaf,
+                    settled,
+                    verification,
+                    Some(io::Error::from(restore)),
+                ))
+            }
         },
     }
 }
@@ -4919,8 +4941,10 @@ impl std::error::Error for RestoreFailure {
 #[cfg(unix)]
 enum OccupantBackup {
     /// The backup leaf now names a verified copy of the occupant; the
-    /// payload is the occupant's captured identity.
-    Bound(LeafIdentity),
+    /// payload is the object at the backup name as of commit completion —
+    /// `None` when the capture failed, degrading the reversal gates to the
+    /// legacy path-only handling.
+    Bound(Option<LeafIdentity>),
     /// The occupant vanished or changed under the copy; the backup was
     /// discarded and the caller must re-bind.
     Vanished,
@@ -5016,7 +5040,6 @@ fn copy_bind_occupant_backup(
         Err(rustix::io::Errno::NOENT) => return Ok(OccupantBackup::Vanished),
         Err(error) => return Err(io::Error::from(error)),
     };
-    let before_identity = leaf_identity_from_stat(&before);
     classify_copy_bind_occupant(before.st_mode)?;
     let occupant = openat(
         parent,
@@ -5050,7 +5073,12 @@ fn copy_bind_occupant_backup(
         }
     };
     if bound {
-        Ok(OccupantBackup::Bound(before_identity))
+        // Record the identity of the object AT THE BACKUP NAME — the
+        // verified copy — as of commit completion: reversal gates compare
+        // the backup's current occupant against this capture with full
+        // equality, so the copy must be the captured object.
+        let backup_identity = leaf_identity_at(parent, backup_leaf).ok().flatten();
+        Ok(OccupantBackup::Bound(backup_identity))
     } else {
         let _ = unlinkat(parent, backup_leaf, AtFlags::empty());
         Ok(OccupantBackup::Vanished)
@@ -5378,7 +5406,7 @@ fn create_directory_tree_by_path(
 
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, MoveFileExW, BY_HANDLE_FILE_INFORMATION,
+        CreateFileW, GetFileInformationByHandle, MoveFileExW, BY_HANDLE_FILE_INFORMATION,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, OPEN_EXISTING,
     };
