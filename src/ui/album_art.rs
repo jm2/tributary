@@ -481,12 +481,28 @@ fn local_art_queue() -> Option<&'static async_channel::Sender<LocalArtJob>> {
                     .name(format!("local-art-worker-{worker_index}"))
                     .spawn(move || {
                         while let Ok(job) = job_rx.recv_blocking() {
-                            if !job.liveness.is_valid() {
+                            let LocalArtJob {
+                                liveness,
+                                extract,
+                                reply_tx,
+                            } = job;
+                            if !liveness.is_valid() {
                                 continue;
                             }
-                            if let Some(bytes) = (job.extract)() {
-                                if job.liveness.is_valid() {
-                                    let _ = job.reply_tx.send_blocking(bytes);
+                            // A panicking extractor must cost the job its
+                            // reply, not the pool its worker: the panic is
+                            // contained here, dropping the reply sender
+                            // closes the awaiting receiver, and this thread
+                            // re-enters the loop at full pool capacity.
+                            let extracted =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                                    extract()
+                                }))
+                                .ok()
+                                .flatten();
+                            if let Some(bytes) = extracted {
+                                if liveness.is_valid() {
+                                    let _ = reply_tx.send_blocking(bytes);
                                 }
                             }
                         }
@@ -1621,9 +1637,19 @@ mod tests {
     /// media carries the retained capability, so a pathname replacement
     /// cannot swap the artwork (2026-09-10 review finding — the raw
     /// file:// path freshly opened whatever the pathname then pointed to).
+    ///
+    /// Holds [`GENERATION_TEST_LOCK`] because the local pool is
+    /// process-global and exactly saturated by
+    /// [`local_art_pool_bounds_workers_and_pending_jobs`]: an
+    /// unsynchronized enqueue here can steal a pending slot mid-fill and
+    /// turn that test's exact-bound fill into a spurious
+    /// `TrySendError::Full` (2026-09-11 local reproduction).
     #[cfg(unix)]
     #[test]
     fn scoped_resolved_extraction_publishes_retained_handle_bytes() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = tempfile::tempdir().expect("temporary authority root");
         let original = mp4_with_cover_art(b"original-retained-art");
         let replacement = mp4_with_cover_art(b"replacement-path-art");
@@ -1756,8 +1782,18 @@ mod tests {
     /// The local extractor thread must honor the scoped token after the
     /// extraction completed, too: bytes extracted for a row that was
     /// revoked mid-read are dropped instead of published.
+    ///
+    /// Holds [`GENERATION_TEST_LOCK`] for the same reason as
+    /// [`scoped_resolved_extraction_publishes_retained_handle_bytes`]:
+    /// this test's job occupies one local-pool slot between enqueue and
+    /// completion, and an unlocked run alongside
+    /// [`local_art_pool_bounds_workers_and_pending_jobs`] can desync that
+    /// test's exact-bound fill.
     #[test]
     fn scoped_local_job_revoked_during_extract_publishes_nothing() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let liveness = ScopedArtFetch::new();
         let revoker = liveness.clone();
         let reply = enqueue_local_art_job(RequestLiveness::Scoped(liveness), move || {
@@ -1768,6 +1804,69 @@ mod tests {
             reply.recv_blocking().is_err(),
             "bytes extracted under a revoked token must be dropped"
         );
+    }
+
+    /// Poll a local-pool reply until it closes, which happens when its
+    /// job is dequeued (a refusal would have closed it at enqueue).
+    /// Bounded so a regression fails instead of hanging.
+    fn assert_reply_closes_from_dequeue(reply: &async_channel::Receiver<Vec<u8>>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match reply.try_recv() {
+                Err(TryRecvError::Closed) => return,
+                Err(TryRecvError::Empty) => {}
+                Ok(bytes) => panic!("a dropped-in job published {bytes:?}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job was never dequeued: a pool worker died"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A panicking extraction job must cost the job its reply, not the
+    /// pool its worker. This pins the 2026-09-11 local reproduction: a
+    /// panicked worker died holding its queue, every later admitted job
+    /// waited forever, and the test suite hung. The worker must contain
+    /// the panic, close that job's reply, and keep serving at full pool
+    /// capacity.
+    #[test]
+    fn panicking_local_job_closes_reply_and_keeps_full_pool_capacity() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scoped = || RequestLiveness::Scoped(ScopedArtFetch::new());
+
+        let (reply1, release1_tx) = occupy_pool_worker(scoped(), b"one");
+        let (reply2, release2_tx) = occupy_pool_worker(scoped(), b"two");
+        let panic_reply = enqueue_local_art_job(scoped(), || panic!("extractor blew up"));
+        let survivor = enqueue_local_art_job(scoped(), || Some(b"survivor".to_vec()));
+
+        release1_tx.send(()).expect("release worker one");
+        release2_tx.send(()).expect("release worker two");
+        assert_eq!(reply1.recv_blocking().expect("worker one reply"), b"one");
+        assert_eq!(reply2.recv_blocking().expect("worker two reply"), b"two");
+
+        // FIFO: the panicking job is dequeued first (its reply closes),
+        // then the survivor behind it publishes through the same worker.
+        assert_reply_closes_from_dequeue(&panic_reply);
+        assert_eq!(
+            survivor.recv_blocking().expect("survivor job reply"),
+            b"survivor"
+        );
+
+        // One surviving thread could mask a dead sibling, but two
+        // simultaneous blocking jobs require the full fixed pool.
+        let (reply3, release3_tx) = occupy_pool_worker(scoped(), b"three");
+        let (reply4, release4_tx) = occupy_pool_worker(scoped(), b"four");
+        release3_tx.send(()).expect("release worker three");
+        release4_tx.send(()).expect("release worker four");
+        assert_eq!(
+            reply3.recv_blocking().expect("worker three reply"),
+            b"three"
+        );
+        assert_eq!(reply4.recv_blocking().expect("worker four reply"), b"four");
     }
 
     #[test]
