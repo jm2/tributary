@@ -220,7 +220,21 @@ fn wire_reload_button(
     let band_scales = controls.band_scales.clone();
     let preamp_scale = controls.preamp_scale.clone();
     controls.reload_button.connect_clicked(move |_| {
-        let settings = active_output.borrow().reload_equalizer_settings();
+        // A supported output re-reads through its own state (the local
+        // pipeline reloads the file it owns). An unsupported active
+        // renderer parks the local settings on disk, so the reload
+        // surfaces the parked persisted state — the disabled panel must
+        // keep showing the last-saved values, never defaults (contract:
+        // *Capability matrix*), and the shared reader keeps the
+        // repair-and-diagnose behavior identical to startup's.
+        let settings = {
+            let output = active_output.borrow();
+            if output.supports_equalizer() {
+                output.reload_equalizer_settings()
+            } else {
+                crate::audio::equalizer::config::load_settings_with_status().0
+            }
+        };
         updating.set(true);
         enable_row.set_active(settings.enabled);
         for (scale, gain) in band_scales.iter().zip(settings.bands_db) {
