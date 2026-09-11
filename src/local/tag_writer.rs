@@ -301,6 +301,33 @@ struct TempFile {
     /// impostor directory.
     #[cfg(unix)]
     anchored_parent: Option<File>,
+    /// Unix: dev/ino of the object this section created, read from the
+    /// creation handle. The anchored cleanup unlinks the staged leaf only
+    /// while the leaf still names this exact object, so a name an external
+    /// writer reused after stealing the leaf is preserved debris, never
+    /// destroyed.
+    #[cfg(unix)]
+    created_identity: Option<(u64, u64)>,
+}
+
+/// dev/ino of an open file object — the identity pair the anchored cleanups
+/// compare before unlinking a leaf name.
+#[cfg(unix)]
+fn retained_handle_identity(file: &File) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// dev/ino of whatever entry `leaf` currently names beneath the retained
+/// parent, resolved through the directory handle without following a leaf
+/// symlink.
+#[cfg(unix)]
+fn retained_leaf_identity(parent: &File, leaf: &OsStr) -> std::io::Result<(u64, u64)> {
+    let stat = rustix::fs::statat(parent, leaf, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(std::io::Error::from)?;
+    Ok((stat.st_dev, stat.st_ino))
 }
 
 /// Randomized staged-sibling leaf name, preserving the final extension.
@@ -373,6 +400,8 @@ impl TempFile {
                             persisted: false,
                             #[cfg(unix)]
                             anchored_parent: None,
+                            #[cfg(unix)]
+                            created_identity: None,
                         },
                         file,
                     ))
@@ -412,6 +441,13 @@ impl TempFile {
             let candidate_name = staged_sibling_name(leaf);
             match create_retained_sibling_exclusive(parent, &candidate_name) {
                 Ok(staged) => {
+                    // Capture the sibling's identity from the creation
+                    // handle: every later cleanup of this leaf proves the
+                    // entry still names this exact object before unlinking.
+                    let created_identity =
+                        retained_handle_identity(&staged).with_context(|| {
+                            format!("Failed to identity the staged sibling of {target_label}")
+                        })?;
                     let cleanup_parent = parent.try_clone().with_context(|| {
                         format!("Failed to retain the staging parent of {target_label}")
                     })?;
@@ -420,6 +456,7 @@ impl TempFile {
                             path: PathBuf::from(candidate_name),
                             persisted: false,
                             anchored_parent: Some(cleanup_parent),
+                            created_identity: Some(created_identity),
                         },
                         staged,
                     ));
@@ -510,16 +547,39 @@ impl Drop for TempFile {
             if let Some(parent) = &self.anchored_parent {
                 // Anchored staging: unlink the staged leaf through the
                 // retained parent. `unlinkat` never follows a symlink at the
-                // leaf and resolves nothing above it, so the cleanup removes
-                // exactly the entry this section created and can never
-                // mutate a directory the authority did not admit — the
-                // pre-anchoring cleanup walked the absolute pathname and
-                // removed its stranded sibling from whatever directory an
-                // external writer had installed at the old ancestor name.
-                let _ = rustix::fs::unlinkat(parent, &self.path, rustix::fs::AtFlags::empty());
+                // leaf and resolves nothing above it, and the unlink fires
+                // only while the leaf still names the object this section
+                // created (exact dev/ino, read through the same handle) —
+                // the cleanup removes exactly the entry this section created
+                // and can never mutate a directory the authority did not
+                // admit. An entry an external writer swapped into the name
+                // after stealing the staged leaf is debris we must preserve,
+                // never destroy.
+                if self.leaf_names_created_object(parent) {
+                    let _ = rustix::fs::unlinkat(parent, &self.path, rustix::fs::AtFlags::empty());
+                }
                 return;
             }
             let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl TempFile {
+    /// Whether the anchored leaf still names the object this section
+    /// created.
+    ///
+    /// An unprovable identity (the leaf vanished, or the creation handle's
+    /// identity was never captured) fails closed: the caller preserves the
+    /// entry instead of unlinking a name it cannot prove is its own.
+    #[cfg(unix)]
+    fn leaf_names_created_object(&self, parent: &File) -> bool {
+        match (
+            self.created_identity,
+            retained_leaf_identity(parent, self.path.as_os_str()),
+        ) {
+            (Some(created), Ok(landed)) => landed == created,
+            _ => false,
         }
     }
 }
@@ -708,7 +768,12 @@ pub fn preflight_tag_write_directory_retained(
     // flag support) refuses the rehearsal instead of being overwritten.
     let vacant_name = staged_sibling_name(leaf);
     #[cfg(all(test, unix))]
-    run_retained_preflight_interpose(parent, replacement.path().as_os_str(), &vacant_name);
+    run_retained_preflight_interpose(
+        RetainedPreflightPhase::BeforeInstall,
+        parent,
+        replacement.path().as_os_str(),
+        &vacant_name,
+    );
     rustix::fs::renameat_with(
         parent,
         replacement.path().as_os_str(),
@@ -719,10 +784,31 @@ pub fn preflight_tag_write_directory_retained(
     .map_err(|_| TagWritePreflightError::Unavailable)?;
 
     // The probe now lives at the vacant name. Aim the drop guard's
-    // anchored cleanup at that leaf so a failed explicit cleanup below
-    // still backstops through the retained parent, then remove it: a
-    // capability check is successful only when cleanup succeeds.
+    // anchored cleanup at that leaf, then prove the landed leaf still
+    // names this section's probe (exact dev/ino through the retained
+    // parent) before removing it: inside the rename→cleanup window an
+    // external writer can swap the entry, and the cleanup removes exactly
+    // the entry this section created — a swapped-in newcomer is preserved
+    // debris and the rehearsal refuses, because a capability check is
+    // successful only when its own cleanup provably succeeded.
     replacement.path = PathBuf::from(&vacant_name);
+    #[cfg(all(test, unix))]
+    run_retained_preflight_interpose(
+        RetainedPreflightPhase::BeforeCleanup,
+        parent,
+        replacement.path().as_os_str(),
+        &vacant_name,
+    );
+    if !replacement.leaf_names_created_object(parent) {
+        // The landed leaf no longer provably names this section's probe: an
+        // external writer swapped the entry inside the rename→cleanup
+        // window, or it vanished. Preserve the newcomer (and the stolen
+        // probe, now debris) — debris is never destruction — disarm the
+        // guard, and refuse: a capability check is successful only when
+        // its own cleanup provably succeeded.
+        replacement.disarm_cleanup();
+        return Err(TagWritePreflightError::Unavailable);
+    }
     rustix::fs::unlinkat(parent, &vacant_name, rustix::fs::AtFlags::empty())
         .map_err(|_| TagWritePreflightError::Unavailable)?;
     replacement.disarm_cleanup();
@@ -1390,15 +1476,31 @@ fn with_pre_staging_interpose(interpose: Box<PreStagingInterpose>, run: impl FnO
     *PRE_STAGING_INTERPOSE.lock().unwrap() = None;
 }
 
-/// Test-only seam: runs immediately before the retained preflight
-/// rehearsal's no-replace rename, receiving the retained parent handle, the
-/// staged probe sibling's leaf, and the fresh vacant candidate leaf the
-/// rehearsal is about to rename onto. The regression tests observe the
-/// rehearsal's exact shape (a staged probe; a rename target that is vacant)
-/// and occupy the candidate name to prove the rehearsal's rename refuses a
-/// replacement — the no-replace primitive the anchored commit installs with.
+/// The retained-preflight rehearsal windows a regression test can observe.
 #[cfg(all(test, unix))]
-type RetainedPreflightInterpose = dyn Fn(&std::fs::File, &OsStr, &OsStr) + Send + Sync;
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RetainedPreflightPhase {
+    /// Immediately before the no-replace install rename: the probe sibling
+    /// is staged and the rename candidate is still vacant.
+    BeforeInstall,
+    /// Immediately after the install rename landed, before the landed-probe
+    /// cleanup proves and removes it: the external-swap window the cleanup's
+    /// identity proof guards.
+    BeforeCleanup,
+}
+
+/// Test-only seam: runs at each [`RetainedPreflightPhase`] of the retained
+/// preflight rehearsal, receiving the phase, the retained parent handle, the
+/// staged probe sibling's leaf, and the fresh vacant candidate leaf the
+/// rehearsal renames onto. The regression tests observe the rehearsal's
+/// exact shape (a staged probe; a rename target that is vacant; a landed
+/// probe before cleanup) — occupying the candidate name proves the rename
+/// refuses a replacement (the no-replace primitive the anchored commit
+/// installs with), and swapping the landed probe proves the cleanup removes
+/// exactly the entry the rehearsal created.
+#[cfg(all(test, unix))]
+type RetainedPreflightInterpose =
+    dyn Fn(RetainedPreflightPhase, &std::fs::File, &OsStr, &OsStr) + Send + Sync;
 
 #[cfg(all(test, unix))]
 static RETAINED_PREFLIGHT_INTERPOSE: std::sync::Mutex<Option<Box<RetainedPreflightInterpose>>> =
@@ -1408,9 +1510,14 @@ static RETAINED_PREFLIGHT_INTERPOSE: std::sync::Mutex<Option<Box<RetainedPreflig
 static RETAINED_PREFLIGHT_INTERPOSE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(all(test, unix))]
-fn run_retained_preflight_interpose(parent: &std::fs::File, probe: &OsStr, vacant: &OsStr) {
+fn run_retained_preflight_interpose(
+    phase: RetainedPreflightPhase,
+    parent: &std::fs::File,
+    probe: &OsStr,
+    vacant: &OsStr,
+) {
     if let Some(interpose) = RETAINED_PREFLIGHT_INTERPOSE.lock().unwrap().as_ref() {
-        interpose(parent, probe, vacant);
+        interpose(phase, parent, probe, vacant);
     }
 }
 
@@ -2181,8 +2288,14 @@ mod tests {
         let occupied_candidate = Arc::new(Mutex::new(None::<std::ffi::OsString>));
         let closure_candidate = occupied_candidate.clone();
         with_retained_preflight_interpose(
-            Box::new(move |interposed_parent, probe_leaf, vacant_leaf| {
+            Box::new(move |phase, interposed_parent, probe_leaf, vacant_leaf| {
                 use rustix::fs::AtFlags;
+
+                // This regression shapes the install window only; the
+                // landed-probe cleanup window has its own regression.
+                if phase != RetainedPreflightPhase::BeforeInstall {
+                    return;
+                }
 
                 // The rehearsal renames onto a fresh vacant name: the probe
                 // sibling exists and the rename target does not. A rehearsal
@@ -2272,6 +2385,136 @@ mod tests {
             retained_entries,
             vec![std::ffi::OsString::from("silence.flac")],
             "the refused rehearsal must leave no probe sibling behind"
+        );
+    }
+
+    /// The newcomer an external writer swapped into the cleanup window's
+    /// vacant name, with the exact identity it was installed under.
+    #[cfg(unix)]
+    struct SwappedNewcomer {
+        leaf: std::ffi::OsString,
+        identity: (u64, u64),
+    }
+
+    /// The landed-probe cleanup must remove exactly the entry the rehearsal
+    /// created. An external writer can rename the landed probe away and
+    /// create a newcomer at the vacant name inside the rename→cleanup
+    /// window; the rehearsal must then refuse with the newcomer preserved —
+    /// debris is never destruction — and leave none of its own residue.
+    #[cfg(unix)]
+    #[test]
+    fn retained_preflight_cleanup_preserves_a_swapped_in_newcomer() {
+        use std::sync::{Arc, Mutex};
+
+        let (directory, album, _) = anchored_album_fixture("preflight-swap");
+
+        let authority = mounted_root_authority(&directory);
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+        let (parent, leaf) = target
+            .retained_directory_handle()
+            .expect("retain the directory anchor");
+
+        let newcomer = Arc::new(Mutex::new(None::<SwappedNewcomer>));
+        let stolen = Arc::new(Mutex::new(None::<std::ffi::OsString>));
+        swap_a_newcomer_into_the_cleanup_window(Arc::clone(&newcomer), Arc::clone(&stolen), || {
+            assert_eq!(
+                crate::local::tag_writer::preflight_tag_write_directory_retained(
+                    &parent,
+                    &leaf,
+                    "the removable mutation target",
+                ),
+                Err(TagWritePreflightError::Unavailable),
+                "a swapped-in newcomer must refuse the rehearsal, never be destroyed"
+            );
+        });
+
+        assert_the_swap_survived_the_refused_cleanup(&parent, &album, newcomer, stolen);
+    }
+
+    /// Drive the rehearsal through the cleanup window with an external
+    /// writer's swap: rename the landed probe away (stealing it as debris)
+    /// and install a newcomer at the vacant name before the cleanup runs.
+    #[cfg(unix)]
+    fn swap_a_newcomer_into_the_cleanup_window(
+        newcomer: std::sync::Arc<std::sync::Mutex<Option<SwappedNewcomer>>>,
+        stolen: std::sync::Arc<std::sync::Mutex<Option<std::ffi::OsString>>>,
+        run: impl FnOnce(),
+    ) {
+        with_retained_preflight_interpose(
+            Box::new(move |phase, interposed_parent, _probe_leaf, vacant_leaf| {
+                if phase != RetainedPreflightPhase::BeforeCleanup {
+                    return;
+                }
+                let stolen_leaf = staged_sibling_name(std::ffi::OsStr::new("silence.flac"));
+                rustix::fs::renameat(
+                    interposed_parent,
+                    vacant_leaf,
+                    interposed_parent,
+                    &stolen_leaf,
+                )
+                .expect("steal the landed probe");
+                create_retained_sibling_exclusive(interposed_parent, vacant_leaf)
+                    .expect("install the newcomer at the vacant name");
+                let identity = retained_leaf_identity(interposed_parent, vacant_leaf)
+                    .expect("read the newcomer's identity");
+                *newcomer.lock().unwrap() = Some(SwappedNewcomer {
+                    leaf: vacant_leaf.to_os_string(),
+                    identity,
+                });
+                *stolen.lock().unwrap() = Some(stolen_leaf);
+            }),
+            run,
+        );
+    }
+
+    /// Require the refused cleanup to have preserved the swapped-in
+    /// newcomer and the stolen probe debris, then remove both and require
+    /// the directory to hold exactly the admitted file again: the refused
+    /// rehearsal leaves no probe residue of its own.
+    #[cfg(unix)]
+    fn assert_the_swap_survived_the_refused_cleanup(
+        parent: &std::fs::File,
+        album: &Path,
+        newcomer: std::sync::Arc<std::sync::Mutex<Option<SwappedNewcomer>>>,
+        stolen: std::sync::Arc<std::sync::Mutex<Option<std::ffi::OsString>>>,
+    ) {
+        use rustix::fs::AtFlags;
+
+        let newcomer = newcomer
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the seam swapped a newcomer in");
+        let stolen_leaf = stolen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the seam stole the landed probe");
+        assert_eq!(
+            retained_leaf_identity(parent, &newcomer.leaf).expect("the newcomer survives"),
+            newcomer.identity,
+            "the refused cleanup must preserve the swapped-in newcomer exactly"
+        );
+        assert!(
+            rustix::fs::statat(parent, stolen_leaf.as_os_str(), AtFlags::empty()).is_ok(),
+            "the stolen probe is preserved debris, never destroyed"
+        );
+        rustix::fs::unlinkat(parent, &newcomer.leaf, AtFlags::empty())
+            .expect("remove the newcomer debris");
+        rustix::fs::unlinkat(parent, stolen_leaf.as_os_str(), AtFlags::empty())
+            .expect("remove the stolen-probe debris");
+
+        let retained_entries: Vec<std::ffi::OsString> = std::fs::read_dir(album)
+            .expect("list the retained directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            retained_entries,
+            vec![std::ffi::OsString::from("silence.flac")],
+            "the refused rehearsal must leave no probe residue of its own"
         );
     }
 
