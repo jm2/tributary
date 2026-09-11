@@ -341,13 +341,25 @@ not re-enable non-Dependabot auto-merge.
    dedicated gate-publisher GitHub App in the same step, before the
    ruleset edit in the next step can bind to it: create a GitHub App with
    only the `Checks: write` repository permission (nothing else), install
-   it on this repository, store its credentials as repository-level
-   **Actions secrets** named `BOT_REVIEW_GATE_APP_ID` and
-   `BOT_REVIEW_GATE_PRIVATE_KEY` (the publisher runs on `workflow_run`
-   completions, not on Dependabot pull requests, so ordinary Actions
-   secrets — not Dependabot secrets — are the right store here), and set
-   the repository variable `BOT_REVIEW_GATE_APP_ID` to the App's numeric
-   id. Without the App credentials the publisher fails before it can
+   it on this repository, create the GitHub environment
+   `bot-review-gate-publisher` that the publisher job names, locked on the
+   repository side to a protected-branch deployment policy restricted to
+   `main` (and no required reviewers, which would strand the automation),
+   and store its credentials **exclusively as that environment's
+   secrets**, named `BOT_REVIEW_GATE_APP_ID` and
+   `BOT_REVIEW_GATE_PRIVATE_KEY`. Never store them as repository-level
+   Actions secrets: every same-repository pull-request workflow can read
+   those, which would put the publishing key in the hands of the exact
+   forged-verdict exposure the identity-bound context exists to prevent.
+   The environment's branch policy is what makes the credentials
+   reachable exactly where they are trusted — `workflow_run` completions
+   from default-branch content — and nowhere else; creating that
+   environment is an operator-side repository prerequisite (tracked
+   separately from this branch), and until it exists the publisher mints
+   no token and behaves exactly as the fail-closed paragraph below
+   describes. Then set the repository variable `BOT_REVIEW_GATE_APP_ID`
+   to the App's numeric id. Without the App credentials the publisher
+   fails before it can
    publish anything — the head's verdict keeps its previous value and the
    failed job is the re-run signal after the credentials are fixed; the
    publisher must never fall back to the shared workflow token, because
