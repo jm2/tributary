@@ -251,3 +251,87 @@ fn an_empty_trusted_reviewer_set_is_a_configuration_failure_not_a_pass() {
         "not clean",
     );
 }
+
+#[test]
+fn an_outstanding_re_review_request_invalidates_the_reviewer_s_earlier_clean_result() {
+    // docs/refinery-config.md: a re-review request addressed to a trusted
+    // expected reviewer is an attempt in flight, and until a review is
+    // submitted at the evaluated head it invalidates that reviewer's
+    // earlier clean result there. The scenario carries the bot's APPROVED
+    // review at an EARLIER head plus an API-visible requested_reviewers
+    // entry for it: no submitted review at the evaluated head acknowledges
+    // the request, so the earlier approval stops counting and the gate
+    // must block, naming the outstanding request and its reviewer.
+    let output = run_scenario(
+        "requested-review-outstanding",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert_blocked(
+        &output,
+        &["OUTSTANDING BOT REVIEW REQUEST by coderabbitai"],
+        "not clean",
+    );
+}
+
+#[test]
+fn a_re_review_request_acknowledged_by_a_review_at_the_head_does_not_block() {
+    // GitHub clears a reviewer's request when the reviewer submits, so a
+    // listed request standing beside that reviewer's review at the exact
+    // evaluated head is the bounded API-lag race, not an attempt in
+    // flight: the submitted at-head review is the acknowledgment the API
+    // can observe, and with it the prior verdict logic applies. The
+    // request alone never blocks a head its reviewer has already reviewed.
+    let sandbox = GateSandbox::new("requested-review-acknowledged-at-head");
+    sandbox.use_scenario("requested-review-acknowledged-at-head");
+    let output = sandbox.run("pull_request", Some(HEAD_SHA));
+    assert!(
+        output.status.success(),
+        "the at-head review must acknowledge the outstanding request:\n{}",
+        report(&output)
+    );
+    let check_run = sandbox.opened_and_finalized_verdict();
+    assert!(
+        check_run.contains(&format!("head_sha={HEAD_SHA}"))
+            && check_run.contains("conclusion=success"),
+        "the acknowledged request must leave the clean verdict green at the evaluated head:\n{check_run}"
+    );
+}
+
+#[test]
+fn re_review_requests_outside_the_trusted_set_do_not_block() {
+    // The handshake binds only the enumerated trusted set: a re-review
+    // request addressed to any other login — a human, a non-review
+    // integration — is out of scope and must not block an otherwise clean
+    // pull request.
+    let sandbox = GateSandbox::new("requested-review-out-of-scope");
+    sandbox.use_scenario("requested-review-out-of-scope");
+    let output = sandbox.run("pull_request", Some(HEAD_SHA));
+    assert!(
+        output.status.success(),
+        "out-of-scope review requests must not block:\n{}",
+        report(&output)
+    );
+    let check_run = sandbox.opened_and_finalized_verdict();
+    assert!(
+        check_run.contains("conclusion=success"),
+        "out-of-scope requests must leave the clean verdict green:\n{check_run}"
+    );
+}
+
+#[test]
+fn a_failed_requested_reviewers_query_fails_closed() {
+    // The requested-reviewers read is evidence like any other: a query
+    // failure must block the gate instead of silently reading as "no
+    // outstanding requests".
+    let output = run_scenario(
+        "requested-review-query-failure",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert_blocked(
+        &output,
+        &[],
+        "Requested-reviewers query failed; failing closed.",
+    );
+}

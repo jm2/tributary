@@ -61,6 +61,16 @@ name: Bot review gate publisher
 #      rename — fails closed exactly like a rejected review, threads or no
 #      threads. The only sanctioned waiver is the operator-documented
 #      substitution below.
+#   6. a trusted expected reviewer carries an outstanding re-review
+#      request — the pull request's API-visible `requested_reviewers`
+#      list — that no submitted review at the evaluated head
+#      acknowledges. A re-review request is an attempt in flight, and
+#      until a review is submitted at this head it invalidates that
+#      reviewer's earlier clean result here: the prior approval stops
+#      counting. The bot-owned, attempt-bound acknowledgment signal the
+#      policy document describes is coordinator/operator design scope and
+#      is deliberately not invented from an untrusted source; this
+#      API-visible half fails closed in the meantime.
 #
 # Semantics:
 #   * Only explicit thread resolution or a formal review dismissal clears a
@@ -85,8 +95,17 @@ name: Bot review gate publisher
 #     latest run under the required name decides mergeability, so the
 #     pending run immediately supersedes any earlier green verdict and
 #     keeps the merge blocked for the whole refresh; a refresh that dies
-#     mid-flight leaves the pending run standing (a blocked merge and the
-#     failed job as the re-run signal), never a resurrected stale green.
+#     after the pending run is opened leaves it standing (a blocked merge
+#     and the failed job as the re-run signal). Recorded residual: a death
+#     BEFORE the first App-authored publication — the token-mint step
+#     failing, or the runner being lost before the publish step starts —
+#     leaves the head's previous verdict standing, because no App-authored
+#     pending run exists yet and the workflow token structurally cannot
+#     open one (it holds no `checks: write`); the failed `Bot Review Gate
+#     Publisher` job is the re-run signal for exactly that window.
+#     Narrowing it further needs coordinator/operator architecture (the
+#     same lane as the retarget-without-events decision), so it is
+#     disclosed here rather than claimed away.
 #     Check runs attach
 #     to commits, not pull requests, so two open main pull requests sharing
 #     one head commit would otherwise publish competing verdicts under the
@@ -232,7 +251,11 @@ jobs:
           # deliberately absent. A listed identity with no review on the
           # pull request fails the gate — an outage, a rate limit, or a
           # rename is unproven, never clean — waivable only by the
-          # operator-documented substitution below.
+          # operator-documented substitution below. Additionally, a
+          # re-review request addressed to a listed identity (the pull
+          # request's API-visible requested_reviewers list) that no
+          # submitted review at the evaluated head acknowledges blocks
+          # independently as an outstanding_bot_review_request.
           EXPECTED_BOT_REVIEWERS: "coderabbitai"
         run: |
           set -euo pipefail
@@ -261,9 +284,12 @@ jobs:
           # (a pending required check immediately supersedes any earlier
           # green verdict and blocks the merge for the whole refresh), and
           # every terminal path UPDATES that same run to its conclusion —
-          # so no evaluation window and no dead refresh can leave an old
-          # verdict standing. The functions are called only from the
-          # driver — the single in-progress start, the aggregated failure
+          # so no evaluation window and no refresh that dies after this
+          # opening can leave an old verdict standing. (A death before the
+          # opening — the token-mint step or the runner — is the recorded
+          # residual: the previous verdict keeps standing and the failed
+          # job is the re-run signal.) The functions are called only from
+          # the driver — the single in-progress start, the aggregated failure
           # branch, the aggregated success branch, and the three
           # discovery-level supersession paths (discovery failure, no
           # candidate, all candidates skipped) — so one announced head can
@@ -517,6 +543,22 @@ jobs:
             || ! jq -s -e --arg head "${intended_head}" "${head_binding_guard}" "${timeline_pages}" > /dev/null; then
             echo "Paginated evidence spans a head other than ${intended_head}; a push landed mid-query; failing closed." >&2
             record_blocked "${verdict_base}" "Paginated evidence spans a head other than ${intended_head}; a push landed mid-query; failing closed."
+            return 1
+          fi
+
+          # ── Requested re-reviews: the API-visible handshake half ─────────
+          # docs/refinery-config.md: whether a re-review is in flight is
+          # knowable through a gate-visible, trusted handshake, and an
+          # outstanding handshake at the evaluated head invalidates that
+          # reviewer's earlier clean result there. The API-visible half is
+          # the pull request's requested_reviewers list — GitHub's own
+          # record, not a bot-asserted signal. The endpoint returns one
+          # document (it does not paginate), and a query failure fails
+          # closed like every other evidence read.
+          if ! gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/requested_reviewers" \
+              > "${pages_dir}/requested-reviewers.json"; then
+            echo "Requested-reviewers query failed; failing closed." >&2
+            record_blocked "${verdict_base}" "Requested-reviewers query failed; failing closed."
             return 1
           fi
 
@@ -786,6 +828,43 @@ jobs:
                       url: $entry.evidence } ]
               | unique_by(.author);
 
+            # The fail-closed half of the documented re-review handshake: a
+            # re-review request addressed to a trusted expected reviewer is
+            # an attempt in flight. Until a submitted review at the
+            # evaluated head acknowledges it, the request invalidates that
+            # reviewer's earlier clean result at this head — the prior
+            # approval stops counting. The bot-owned, attempt-bound
+            # acknowledgment signal the policy describes is
+            # coordinator/operator design scope and is deliberately not
+            # invented here from an untrusted source; a submitted review at
+            # the head is the acknowledgment the API can observe (GitHub
+            # clears a reviewer's request on submission, so a listed request
+            # beside an at-head review is the bounded API-lag race, and the
+            # residual for a re-request that postdates an at-head review is
+            # disclosed, not hidden). Requests to any other login are out of
+            # scope: only the enumerated trusted set is bound by the
+            # handshake. The violation is NOT waivable by the rate-limit
+            # substitution — that waiver covers a listed reviewer's missing
+            # or stale evidence, never an outstanding re-review request.
+            def outstanding_request_violations($head):
+              expected_reviewers as $expected_set
+              | [ $requested[0].users[]?
+                  | ((.login // "") | normalize_login) ] as $requested_set
+              | [ $reviews[].data.repository.pullRequest.reviews.nodes[]
+                  | select(.state != "PENDING")
+                  | select((.commit.oid // "") == $head)
+                  | ((.author.login // "") | normalize_login) ] as $head_acknowledgments
+              | [ $expected_set[]
+                  | . as $login
+                  | select($requested_set | index($login))
+                  | select($head_acknowledgments | index($login) | not)
+                  | { reason: "outstanding_bot_review_request",
+                      author: $login,
+                      state: "re-review requested, none submitted at this head",
+                      review_head: "none",
+                      expected_head: $head,
+                      url: "requested_reviewers of this pull request" } ];
+
             # Operator rate-limit substitution: for a reviewer documented in
             # the repo-owned policy file, the stale-evidence violation may
             # be waived only when ALL of the following hold at the exact
@@ -824,7 +903,8 @@ jobs:
             | ( ($threads | unresolved_bot_threads)
               + [ $reviews | bot_review_violations($head; $dismissals)[] ]
               + expected_reviewer_violations($head)
-              + missing_evidence_violations($head; $policy) ) as $all_violations
+              + missing_evidence_violations($head; $policy)
+              + outstanding_request_violations($head) ) as $all_violations
             | substitution_eligible($head; $policy) as $eligible
             # Waiver matching is login-normalized on BOTH sides: the
             # expected-reviewer check emits the normalized login (the
@@ -879,6 +959,7 @@ jobs:
             --slurpfile threads "${threads_pages}" \
             --slurpfile reviews "${reviews_pages}" \
             --slurpfile timeline "${timeline_pages}" \
+            --slurpfile requested "${pages_dir}/requested-reviewers.json" \
             --slurpfile policy "${policy_file}" \
             --arg head "${intended_head}" \
             --arg expected "${EXPECTED_BOT_REVIEWERS:-}" \
@@ -901,6 +982,9 @@ jobs:
                 "PENDING BOT REVIEW ATTEMPT by " + .author
                 + " (database id " + (.database_id | tostring)
                 + " at " + .review_head + "): " + .url
+              elif .reason == "outstanding_bot_review_request" then
+                "OUTSTANDING BOT REVIEW REQUEST by " + .author
+                + " (" + .state + " at head " + .expected_head + "): " + .url
               elif .reason == "trusted_reviewer_set_empty" then
                 "TRUSTED REVIEWER SET EMPTY — no trusted reviewers are configured: " + .url
               else
@@ -975,11 +1059,14 @@ jobs:
           # discovery or evaluation immediately supersedes that old verdict
           # — the pending run blocks the merge for the whole refresh — and
           # every terminal path below UPDATES this same run to its
-          # conclusion. A refresh that dies mid-flight leaves the pending
-          # run standing (a blocked merge, and the failed job as the re-run
-          # signal) instead of resurrecting a stale green. If the start
-          # itself fails, nothing was superseded and nothing is finalized:
-          # the previous verdict keeps standing and the failed job is the
+          # conclusion. A refresh that dies after this opening leaves the
+          # pending run standing (a blocked merge, and the failed job as
+          # the re-run signal) instead of resurrecting a stale green. A
+          # death BEFORE the opening — the mint step or the runner — is the
+          # recorded residual: the previous verdict keeps standing and the
+          # failed job is the re-run signal. If the start call itself
+          # fails, nothing was superseded and nothing is finalized: the
+          # previous verdict keeps standing and the failed job is the
           # re-run signal.
           if ! start_gate_check_run "${announcer_head}"; then
             exit 1
