@@ -1873,4 +1873,387 @@ mod tests {
         );
     }
 
+    // ── Equalizer caller state discipline ───────────────────────────
+    //
+    // Regressions for the deferred/failed topology-edit paths: the
+    // recorded settings must always describe the *installed* topology,
+    // and every deferred edit must be retried by the next apply.
+
+    /// Builds a bare `Player` around the given playbin and equalizer
+    /// state. Only the equalizer surface is exercised; the event
+    /// channel, media proxy, and bus watch are inert stand-ins.
+    fn eq_test_player(playbin: gst::Element, eq_state: EqEngineState) -> Player {
+        Player {
+            #[cfg(target_os = "macos")]
+            macos_audio_route: None,
+            playbin,
+            volume: Rc::new(Cell::new(1.0)),
+            sink_recovery_claimed: Rc::new(Cell::new(false)),
+            event_tx: async_channel::unbounded().0,
+            media_proxy: Arc::new(GstreamerMediaProxy::new(None)),
+            event_generation: Rc::new(Cell::new(PlayerEventGeneration(0))),
+            volume_save_pending: Rc::new(Cell::new(None)),
+            eq_state: Rc::new(RefCell::new(eq_state)),
+            bus_watch: RefCell::new(None),
+            #[cfg(target_os = "windows")]
+            _windows_audio_route: None,
+            seam_override: RefCell::new(None),
+        }
+    }
+
+    fn eq_state_with(chain: Option<equalizer::EqChain>, settings: EqSettings) -> EqEngineState {
+        EqEngineState {
+            settings,
+            chain,
+            save_generation: 0,
+            persistence_suppressed: false,
+            retired: false,
+        }
+    }
+
+    /// Whether the host provides the playbin and the plugins the
+    /// equalizer bin needs, loading them exactly once per process.
+    /// Minimal development hosts may omit gst-plugins-good; packaged
+    /// builds require them (see the chain.rs tests for the contract).
+    fn eq_engine_plugins_available() -> bool {
+        static EQ_ENGINE_PLUGINS: OnceLock<bool> = OnceLock::new();
+        *EQ_ENGINE_PLUGINS.get_or_init(|| {
+            gst::init().is_ok()
+                && gst::ElementFactory::make("playbin3")
+                    .build()
+                    .or_else(|_| gst::ElementFactory::make("playbin").build())
+                    .is_ok()
+                && gst::ElementFactory::make("equalizer-10bands")
+                    .build()
+                    .is_ok()
+                && gst::ElementFactory::make("rglimiter").build().is_ok()
+        })
+    }
+
+    fn eq_enabled_settings(clip: equalizer::ClipProtection) -> EqSettings {
+        EqSettings {
+            enabled: true,
+            preset: equalizer::Preset::Flat,
+            preamp_db: 0.0,
+            bands_db: [0.0; 10],
+            clip_protection: clip,
+        }
+    }
+
+    fn eq_test_playbin() -> gst::Element {
+        gst::ElementFactory::make("playbin3")
+            .build()
+            .or_else(|_| gst::ElementFactory::make("playbin").build())
+            .expect("playbin for eq caller-discipline test")
+    }
+
+    fn installed_audio_filter(playbin: &gst::Element) -> Option<gst::Element> {
+        playbin.property::<Option<gst::Element>>("audio-filter")
+    }
+
+    /// Apply serialized across the test threads: the trailing-edge
+    /// save attaches a glib timeout source to the *global* default main
+    /// context (production does this once on the main GTK thread),
+    /// and parallel attaches race the context acquire. Only these
+    /// caller-discipline tests touch the context, so one test-local
+    /// mutex around `apply` is enough to keep them deterministic.
+    fn apply_serialized(player: &Player, next: EqSettings) {
+        static APPLY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = APPLY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        player.apply_equalizer_settings(next);
+    }
+
+    /// Regression (review finding r3985265728 CRITICAL): a deferred
+    /// disable must not strand the bin. The chain handle is cleared
+    /// only inside the confirmed edit, and `enabled` stays recorded, so
+    /// the persisted state stays truthful and the next apply retries
+    /// the removal — the bin can never become unremovable-until-restart.
+    #[test]
+    fn deferred_uninstall_keeps_chain_and_enabled_and_a_later_apply_retries() {
+        if !eq_engine_plugins_available() {
+            return;
+        }
+        let playbin = eq_test_playbin();
+        let settings = eq_enabled_settings(equalizer::ClipProtection::Off);
+        let chain = equalizer::EqChain::build(&settings).expect("chain builds");
+        // Seed the installed topology: a previously confirmed install
+        // left the bin attached at `audio-filter`.
+        playbin.set_property("audio-filter", Some(&chain.bin));
+        let player = eq_test_player(playbin.clone(), eq_state_with(Some(chain), settings));
+
+        let next = EqSettings {
+            enabled: false,
+            ..settings
+        };
+        // Defer the seam: the edit closure never runs.
+        *player.seam_override.borrow_mut() = Some(Box::new(|_edit| false));
+        apply_serialized(&player, next);
+
+        {
+            let state = player.eq_state.borrow();
+            assert!(
+                state.settings.enabled,
+                "a deferred uninstall must keep `enabled` recorded so a later apply retries"
+            );
+            assert!(
+                state.chain.is_some(),
+                "the chain handle must survive a deferred uninstall"
+            );
+        }
+        assert!(
+            installed_audio_filter(&playbin).is_some(),
+            "the bin must still be attached after a deferred uninstall"
+        );
+
+        // Retry with the real seam (a NULL playbin confirms directly).
+        apply_serialized(&player, next);
+        {
+            let state = player.eq_state.borrow();
+            assert!(!state.settings.enabled);
+            assert!(
+                state.chain.is_none(),
+                "the retried removal must clear the chain handle"
+            );
+        }
+        assert!(
+            installed_audio_filter(&playbin).is_none(),
+            "the retried removal must detach the bin"
+        );
+    }
+
+    /// Regression (review finding r3983308690 P2): a deferred enable
+    /// must not persist `enabled = true` while no chain exists — band
+    /// edits would be passthrough while the UI shows enabled. The
+    /// previous (disabled) record stays, and the next apply retries.
+    #[test]
+    fn deferred_install_keeps_disabled_record_and_a_later_apply_retries() {
+        if !eq_engine_plugins_available() {
+            return;
+        }
+        let playbin = eq_test_playbin();
+        let settings = EqSettings {
+            enabled: false,
+            ..eq_enabled_settings(equalizer::ClipProtection::Off)
+        };
+        let player = eq_test_player(playbin.clone(), eq_state_with(None, settings));
+
+        let next = EqSettings {
+            enabled: true,
+            ..settings
+        };
+        *player.seam_override.borrow_mut() = Some(Box::new(|_edit| false));
+        apply_serialized(&player, next);
+
+        {
+            let state = player.eq_state.borrow();
+            assert!(
+                !state.settings.enabled,
+                "a deferred install must keep the previous disabled record"
+            );
+            assert!(state.chain.is_none());
+        }
+        assert!(installed_audio_filter(&playbin).is_none());
+
+        // Retry with the real seam.
+        apply_serialized(&player, next);
+        {
+            let state = player.eq_state.borrow();
+            assert!(state.settings.enabled);
+            assert!(state.chain.is_some());
+        }
+        assert!(installed_audio_filter(&playbin).is_some());
+    }
+
+    /// Regression (review findings r3983308675 P1 / r3985265725 Major,
+    /// deferred arm): when the clip-protection toggle is deferred, the
+    /// recorded protection must be what the installed chain carries
+    /// (Soft), not the requested value — the previous code's rollback
+    /// write was immediately overwritten by the unconditional settings
+    /// assignment, so the persisted state lied and the retry never
+    /// fired (`clip_changed` went false).
+    #[test]
+    fn deferred_clip_toggle_records_the_installed_protection_not_the_request() {
+        if !eq_engine_plugins_available() {
+            return;
+        }
+        let playbin = eq_test_playbin();
+        let settings = eq_enabled_settings(equalizer::ClipProtection::Soft);
+        let chain = equalizer::EqChain::build(&settings).expect("chain builds");
+        let player = eq_test_player(playbin.clone(), eq_state_with(Some(chain), settings));
+
+        let next = EqSettings {
+            clip_protection: equalizer::ClipProtection::Off,
+            ..settings
+        };
+        *player.seam_override.borrow_mut() = Some(Box::new(|_edit| false));
+        apply_serialized(&player, next);
+
+        {
+            let state = player.eq_state.borrow();
+            assert_eq!(
+                state.settings.clip_protection,
+                equalizer::ClipProtection::Soft,
+                "a deferred toggle must record the installed Soft limiter"
+            );
+            assert!(state.settings.enabled);
+            let chain = state.chain.as_ref().expect("chain retained on defer");
+            assert!(chain.clip_protection_installed());
+        }
+
+        // The recorded Soft keeps `clip_changed` true, so the next apply
+        // retries the toggle and confirms the removal.
+        apply_serialized(&player, next);
+        {
+            let state = player.eq_state.borrow();
+            assert_eq!(
+                state.settings.clip_protection,
+                equalizer::ClipProtection::Off
+            );
+            let chain = state.chain.as_ref().expect("chain stays installed");
+            assert!(!chain.clip_protection_installed());
+        }
+    }
+
+    /// Regression (review findings r3983308675 P1 / r3985265725 Major,
+    /// failed-surgery arm): when the limiter surgery fails and the
+    /// chain degrades to the no-limiter layout, the recorded protection
+    /// must be the degraded `Off`, not the requested `Soft`. The limiter
+    /// insertion here fails on a duplicate `clipper` element name inside
+    /// the bin (`bin.add` rejects duplicates), which is the same
+    /// degraded-false path a failed removal reports.
+    #[test]
+    fn failed_clip_surgery_records_the_degraded_layout() {
+        if !eq_engine_plugins_available() {
+            return;
+        }
+        let playbin = eq_test_playbin();
+        let settings = eq_enabled_settings(equalizer::ClipProtection::Off);
+        let chain = equalizer::EqChain::build(&settings).expect("chain builds");
+        // Plant the name collision that fails the insertion.
+        let impostor = gst::ElementFactory::make("fakesink")
+            .name("clipper")
+            .build()
+            .expect("fakesink for the name collision");
+        chain.bin.add(&impostor).expect("plant the name collision");
+        let player = eq_test_player(playbin.clone(), eq_state_with(Some(chain), settings));
+
+        let next = EqSettings {
+            clip_protection: equalizer::ClipProtection::Soft,
+            ..settings
+        };
+        // Let the edit run against the chain; the surgery itself fails.
+        *player.seam_override.borrow_mut() = Some(Box::new(|edit| edit()));
+        apply_serialized(&player, next);
+
+        let state = player.eq_state.borrow();
+        assert_eq!(
+            state.settings.clip_protection,
+            equalizer::ClipProtection::Off,
+            "a failed surgery must record the degraded no-limiter layout"
+        );
+        let chain = state.chain.as_ref().expect("chain stays installed");
+        assert!(!chain.clip_protection_installed());
+    }
+
+    /// Regression (review finding r3985258424 P2): the pending member of
+    /// a zero-timeout state query must never be discarded — a query
+    /// that finds a transition in flight reports the *origin* state in
+    /// `current` and must classify as unsettled, deferring the edit.
+    #[test]
+    fn zero_timeout_queries_with_a_transition_in_flight_are_unsettled() {
+        use gst::StateChangeSuccess as Scs;
+
+        let settled = |state| Ok::<gst::StateChangeSuccess, gst::StateChangeError>(state);
+        assert_eq!(
+            settled_zero_state((
+                settled(Scs::Success),
+                gst::State::Playing,
+                gst::State::VoidPending
+            )),
+            Some(true)
+        );
+        assert_eq!(
+            settled_zero_state((
+                settled(Scs::Success),
+                gst::State::Paused,
+                gst::State::VoidPending
+            )),
+            Some(false)
+        );
+        assert_eq!(
+            settled_zero_state((
+                settled(Scs::Success),
+                gst::State::Null,
+                gst::State::VoidPending
+            )),
+            Some(false)
+        );
+        // NoPreroll (live pipelines) reports a settled, confirmed state.
+        assert_eq!(
+            settled_zero_state((
+                settled(Scs::NoPreroll),
+                gst::State::Paused,
+                gst::State::VoidPending
+            )),
+            Some(false)
+        );
+        // The discarded-pending hazard: origin `Paused`, target `Playing`
+        // in flight reads as "not playing" but is not settled.
+        assert_eq!(
+            settled_zero_state((settled(Scs::Async), gst::State::Paused, gst::State::Playing)),
+            None
+        );
+        assert_eq!(
+            settled_zero_state((settled(Scs::Async), gst::State::Null, gst::State::Paused)),
+            None
+        );
+        // A failed state query is not a settled confirmation either.
+        assert_eq!(
+            settled_zero_state((
+                Err(gst::StateChangeError),
+                gst::State::Null,
+                gst::State::VoidPending
+            )),
+            None
+        );
+    }
+
+    /// Regression (review finding r3985258424 P2, live half): a real
+    /// pipeline stuck mid-transition (data flow into the sink is
+    /// blocked, so the PLAYING transition can never preroll) reports
+    /// `Async` with a pending target from the zero-timeout query and
+    /// must classify as unsettled.
+    #[test]
+    fn a_pipeline_mid_transition_is_not_settled() {
+        gst::init().expect("GStreamer init");
+        let Ok(src) = gst::ElementFactory::make("audiotestsrc").build() else {
+            return;
+        };
+        let Ok(sink) = gst::ElementFactory::make("fakesink").build() else {
+            return;
+        };
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([&src, &sink]).expect("assemble fixture");
+        src.link(&sink).expect("link fixture");
+
+        // Block data flow at the sink pad so the PLAYING transition can
+        // never complete its preroll — the pipeline stays mid-transition.
+        let sink_pad = sink.static_pad("sink").expect("fakesink sink pad");
+        sink_pad.add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, |_pad, _info| {
+            gst::PadProbeReturn::Ok
+        });
+
+        pipeline
+            .set_state(gst::State::Playing)
+            .expect("request PLAYING");
+        assert_eq!(
+            settled_zero_state(pipeline.state(gst::ClockTime::ZERO)),
+            None,
+            "a pipeline stuck mid-transition must classify as unsettled"
+        );
+
+        let _ = pipeline.set_state(gst::State::Null);
+    }
 }
