@@ -882,11 +882,17 @@ jobs:
             # exactly like derived stale evidence, only under an eligible
             # substitution.
             def missing_evidence_violations($head; $policy):
+              # Both sides are login-normalized (case-insensitive, "[bot]"
+              # suffix stripped): the policy records the operator-spelled
+              # login while the API may surface the same integration with
+              # the suffix, and a raw-vs-normalized mismatch would
+              # synthesize a false stale-evidence violation for a reviewer
+              # who is actually present.
               [ $reviews[].data.repository.pullRequest.reviews.nodes[]
-                | (.author.login // "") ] as $reviewed
+                | ((.author.login // "") | normalize_login) ] as $reviewed
               | [ $policy.rate_limited_reviewers[]?
                   | . as $entry
-                  | select($reviewed | index($entry.login) | not)
+                  | select($reviewed | index($entry.login | normalize_login) | not)
                   | { reason: "stale_bot_review_evidence",
                       author: $entry.login,
                       state: "no review submitted",
@@ -998,7 +1004,13 @@ jobs:
                    | group_by(.author)
                    | all(.[]; ((sort_by(.database_id) | last).state != "CHANGES_REQUESTED")))
               and ([ $reviews[].data.repository.pullRequest.reviews.nodes[]
-                     | select(.author.login == $policy.substitute_reviewer)
+                     # Normalized on both sides like every other login
+                     # comparison: the substitute spelled in the policy file
+                     # must match the API's spelling of the same identity
+                     # with or without the "[bot]" suffix, or the waiver
+                     # could never fire (or could never be earned).
+                     | select(((.author.login // "") | normalize_login)
+                              == ($policy.substitute_reviewer | normalize_login))
                      | select(.state == "APPROVED" and .commit.oid == $head) ] | length > 0);
 
             $policy[0] as $policy
