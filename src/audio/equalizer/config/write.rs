@@ -161,10 +161,14 @@ mod tests {
             path.parent(),
             "same directory as the destination"
         );
+        // Separator-agnostic: rebuild the destination-with-suffix prefix
+        // from the same path so the comparison holds on POSIX and Windows
+        // (which renders the separators as backslashes).
+        let destination_prefix = path.with_file_name("equalizer.cfg.");
         assert!(
             first
                 .to_string_lossy()
-                .starts_with("state/tributary/equalizer.cfg."),
+                .starts_with(destination_prefix.to_string_lossy().as_ref()),
             "sibling keeps the destination name as its prefix"
         );
         assert!(first.to_string_lossy().ends_with(".tmp"));
