@@ -256,12 +256,14 @@ fn an_empty_trusted_reviewer_set_is_a_configuration_failure_not_a_pass() {
 fn an_outstanding_re_review_request_invalidates_the_reviewer_s_earlier_clean_result() {
     // docs/refinery-config.md: a re-review request addressed to a trusted
     // expected reviewer is an attempt in flight, and until a review is
-    // submitted at the evaluated head it invalidates that reviewer's
-    // earlier clean result there. The scenario carries the bot's APPROVED
-    // review at an EARLIER head plus an API-visible requested_reviewers
-    // entry for it: no submitted review at the evaluated head acknowledges
-    // the request, so the earlier approval stops counting and the gate
-    // must block, naming the outstanding request and its reviewer.
+    // submitted at the evaluated head in response to it, it invalidates
+    // that reviewer's earlier clean result there. The scenario carries the
+    // bot's APPROVED review at an EARLIER head plus an API-visible
+    // requested_reviewers entry for it, and no timeline events at all: no
+    // review-request event exists to order against, so the handshake
+    // cannot be proven acknowledged — the fail-closed path — and the
+    // earlier approval stops counting. The gate must block, naming the
+    // outstanding request and its reviewer.
     let output = run_scenario(
         "requested-review-outstanding",
         "pull_request",
@@ -279,9 +281,13 @@ fn a_re_review_request_acknowledged_by_a_review_at_the_head_does_not_block() {
     // GitHub clears a reviewer's request when the reviewer submits, so a
     // listed request standing beside that reviewer's review at the exact
     // evaluated head is the bounded API-lag race, not an attempt in
-    // flight: the submitted at-head review is the acknowledgment the API
-    // can observe, and with it the prior verdict logic applies. The
-    // request alone never blocks a head its reviewer has already reviewed.
+    // flight. The acknowledgment is attempt-bound: the fixture's timeline
+    // carries the review-request event PREDATING the at-head review, so
+    // the submitted at-head review provably answers that specific request
+    // and the prior verdict logic applies. A request event that predated
+    // nothing — one postdating the at-head review — is the blocking
+    // scenario below. The request alone never blocks a head its reviewer
+    // has already re-reviewed.
     let sandbox = GateSandbox::new("requested-review-acknowledged-at-head");
     sandbox.use_scenario("requested-review-acknowledged-at-head");
     let output = sandbox.run("pull_request", Some(HEAD_SHA));
@@ -295,6 +301,55 @@ fn a_re_review_request_acknowledged_by_a_review_at_the_head_does_not_block() {
         check_run.contains(&format!("head_sha={HEAD_SHA}"))
             && check_run.contains("conclusion=success"),
         "the acknowledged request must leave the clean verdict green at the evaluated head:\n{check_run}"
+    );
+}
+
+#[test]
+fn a_re_review_request_that_postdates_the_reviewer_s_at_head_review_blocks() {
+    // The attempt-bound handshake: a review-request event that POSTDATES
+    // the reviewer's at-head review is a re-review attempt in flight that
+    // the older review cannot acknowledge — it predates the request. The
+    // requested_reviewers snapshot still lists the reviewer, the reviewer's
+    // APPROVED review sits at the exact evaluated head, and yet the gate
+    // must block: without attempt-binding, a manual refresh would publish
+    // green for the duration of the in-flight re-review.
+    let output = run_scenario(
+        "requested-review-request-postdates-head-review",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert_blocked(
+        &output,
+        &[
+            "OUTSTANDING BOT REVIEW REQUEST by coderabbitai",
+            "re-review requested after the reviewer's review at this head",
+        ],
+        "not clean",
+    );
+}
+
+#[test]
+fn a_formally_removed_re_review_request_does_not_block() {
+    // A review-request removal event after the latest request formally
+    // withdraws the attempt (GitHub also auto-removes a request when the
+    // reviewer submits), so the request no longer stands even while the
+    // requested_reviewers snapshot still carries the reviewer — the
+    // fixture deliberately stages that lag to prove the timeline ordering,
+    // not list membership, decides. The reviewer's at-head approval is
+    // otherwise current, so the gate must stay green.
+    let sandbox = GateSandbox::new("requested-review-request-removed");
+    sandbox.use_scenario("requested-review-request-removed");
+    let output = sandbox.run("pull_request", Some(HEAD_SHA));
+    assert!(
+        output.status.success(),
+        "a withdrawn re-review request must not block:\n{}",
+        report(&output)
+    );
+    let check_run = sandbox.opened_and_finalized_verdict();
+    assert!(
+        check_run.contains(&format!("head_sha={HEAD_SHA}"))
+            && check_run.contains("conclusion=success"),
+        "the withdrawn request must leave the clean verdict green at the evaluated head:\n{check_run}"
     );
 }
 
