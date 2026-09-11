@@ -67,12 +67,14 @@ pub enum EqLoadStatus {
 }
 
 /// Bounded diagnostic for a replaced malformed file: file path, byte
-/// count, and the offending key only — never the file content.
+/// count, and a key-or-line locator — the offending key when one is
+/// parseable, otherwise the failing line number and a failure category.
+/// Never the file content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EqFileDiagnostic {
     pub path: String,
     pub byte_count: u64,
-    pub bad_key: String,
+    pub locator: String,
 }
 
 /// Shared reader for startup and the settings UI's reload escape hatch:
@@ -91,7 +93,7 @@ pub fn load_settings_with_status() -> (EqSettings, EqLoadStatus) {
             tracing::warn!(
                 path = %diagnostic.path,
                 byte_count = diagnostic.byte_count,
-                bad_key = %diagnostic.bad_key,
+                locator = %diagnostic.locator,
                 "Malformed equalizer.cfg replaced with default state"
             );
             (settings, EqLoadStatus::ReplacedWithDefaults)
@@ -138,16 +140,16 @@ fn load_equalizer_settings_from_path(path: &std::path::Path) -> EqLoadOutcome {
     };
     match parse_equalizer_file(&bytes) {
         Ok(settings) => EqLoadOutcome::Loaded(settings),
-        Err(bad_key) => replace_with_defaults(path, bytes.len() as u64, &bad_key),
+        Err(locator) => replace_with_defaults(path, bytes.len() as u64, &locator),
     }
 }
 
-fn replace_with_defaults(path: &std::path::Path, byte_count: u64, bad_key: &str) -> EqLoadOutcome {
+fn replace_with_defaults(path: &std::path::Path, byte_count: u64, locator: &str) -> EqLoadOutcome {
     let settings = EqSettings::default();
     let diagnostic = EqFileDiagnostic {
         path: path.display().to_string(),
         byte_count,
-        bad_key: bad_key.to_string(),
+        locator: locator.to_string(),
     };
     if let Err(error) = write_equalizer_file_atomic(path, &render_equalizer_file(&settings)) {
         // The in-memory defaults are authoritative for this session
@@ -228,7 +230,7 @@ mod tests {
 
     /// The malformed-content path keeps its contract behavior: the
     /// defaults-overwrite repair runs only for a read that *succeeded*,
-    /// with the bounded diagnostic carrying the bad key.
+    /// with the bounded diagnostic carrying the key-or-line locator.
     #[test]
     fn malformed_content_is_repaired_at_the_path_level() {
         let base = tempfile::tempdir().expect("temporary config root");
@@ -245,7 +247,7 @@ mod tests {
             other => panic!("malformed content must be replaced with defaults, not {other:?}"),
         };
         assert_eq!(settings, EqSettings::default());
-        assert_eq!(diagnostic.bad_key, "preset");
+        assert_eq!(diagnostic.locator, "preset");
         assert_eq!(diagnostic.byte_count, malformed.len() as u64);
         // The repair wrote the default file content back to disk.
         assert_eq!(

@@ -24,34 +24,70 @@ struct RawEqConfig {
 
 impl RawEqConfig {
     /// Fold one parsed `key="value"` pair into the accumulator.
+    ///
+    /// A schema key that is already present is a malformed file, not an
+    /// overwrite: the parser is order-insensitive, so no positional
+    /// precedence (first or last wins) could be stated without making
+    /// the parsed state depend on line order. The error names the
+    /// duplicated key for the replacement diagnostic (contract:
+    /// *Persistence*, validation rules). Unknown keys stay ignored for
+    /// schema forward-compatibility, so their duplicates are ignored
+    /// with them.
     fn absorb(&mut self, key: &str, value: &str) -> Result<(), String> {
         if key == "preamp_db" {
+            if self.preamp_db.is_some() {
+                return Err(key.to_string());
+            }
             self.preamp_db = Some(required_gain(value, "preamp_db")?);
             return Ok(());
         }
-        if self.absorb_scalar(key, value) {
+        if self.absorb_scalar(key, value)? {
             return Ok(());
         }
         self.absorb_band(key, value)
     }
 
-    /// Fold one enum-ish scalar key. Returns `false` when the key is not
-    /// one of the scalars, leaving it to the band/required-gain handlers.
-    fn absorb_scalar(&mut self, key: &str, value: &str) -> bool {
+    /// Fold one enum-ish scalar key. Returns `Ok(false)` when the key is
+    /// not one of the scalars, leaving it to the band/required-gain
+    /// handlers; `Err` names a duplicated key.
+    fn absorb_scalar(&mut self, key: &str, value: &str) -> Result<bool, String> {
         match key {
-            "schema_version" => self.schema_version = Some(value.to_string()),
-            "enabled" => self.enabled = Some(value == "true"),
-            "preset" => self.preset = Some(Preset::from_key(value)),
-            "clip_protect" => self.clip_protection = Some(ClipProtection::from_key(value)),
-            _ => return false,
+            "schema_version" => {
+                Self::require_fresh(key, self.schema_version.is_some())?;
+                self.schema_version = Some(value.to_string());
+            }
+            "enabled" => {
+                Self::require_fresh(key, self.enabled.is_some())?;
+                self.enabled = Some(value == "true");
+            }
+            "preset" => {
+                Self::require_fresh(key, self.preset.is_some())?;
+                self.preset = Some(Preset::from_key(value));
+            }
+            "clip_protect" => {
+                Self::require_fresh(key, self.clip_protection.is_some())?;
+                self.clip_protection = Some(ClipProtection::from_key(value));
+            }
+            _ => return Ok(false),
         }
-        true
+        Ok(true)
+    }
+
+    /// Reject a second occurrence of a schema key by naming it.
+    fn require_fresh(key: &str, already_present: bool) -> Result<(), String> {
+        if already_present {
+            return Err(key.to_string());
+        }
+        Ok(())
     }
 
     /// Fold one `band<N>_db` key. Unknown keys are ignored so a future
     /// minor schema can add keys without discarding user state.
     fn absorb_band(&mut self, key: &str, value: &str) -> Result<(), String> {
         if let Some(band) = band_index(key) {
+            if self.bands_db[band].is_some() {
+                return Err(key.to_string());
+            }
             self.bands_db[band] = Some(parse_gain(value).ok_or_else(|| format!("band{band}_db"))?);
         }
         Ok(())
@@ -59,7 +95,9 @@ impl RawEqConfig {
 
     /// Finish the scan: require the schema version *and* all fifteen
     /// keys — a file omitting any key is malformed and reported with the
-    /// first missing key — then clamp gains to the contract bounds.
+    /// first missing key — then normalize the gains (range clamp, then
+    /// the 0.5 dB step snap) and reconcile the preset name with the
+    /// normalized values.
     fn into_settings(self) -> Result<EqSettings, String> {
         let schema_version = required(self.schema_version, "schema_version")?;
         if schema_version != SCHEMA_VERSION {
@@ -72,7 +110,7 @@ impl RawEqConfig {
             bands_db: required_bands(self.bands_db)?,
             clip_protection: required(self.clip_protection, "clip_protect")?,
         };
-        Ok(clamp_gains(settings))
+        Ok(reconcile_preset_truth(normalize_gains(settings)))
     }
 }
 
@@ -92,36 +130,81 @@ fn required_bands(bands_db: [Option<f64>; 10]) -> Result<[f64; 10], String> {
     Ok(bands)
 }
 
-/// Clamp preamp and band gains into the contract bounds on read.
-fn clamp_gains(mut settings: EqSettings) -> EqSettings {
-    settings.preamp_db = EqSettings::clamp_gain_db(settings.preamp_db);
+/// Normalize preamp and band gains across the read boundary: clamp into
+/// the contract bounds, then snap to the 0.5 dB step grid, ties away
+/// from zero. The normalized value is what the runtime materializes and
+/// what the next save persists, so no off-grid value survives the read
+/// (contract: *Persistence*, validation rules).
+fn normalize_gains(mut settings: EqSettings) -> EqSettings {
+    settings.preamp_db = EqSettings::normalize_gain_db(settings.preamp_db);
     for gain in &mut settings.bands_db {
-        *gain = EqSettings::clamp_gain_db(*gain);
+        *gain = EqSettings::normalize_gain_db(*gain);
     }
     settings
 }
 
-/// Parse the strict `key="value"` grammar. Returns `Err(bad_key)` for a
-/// malformed line, a bad schema version, or an unparseable mandatory key.
+/// Preset-truth reconciliation: after all per-key coercions, a persisted
+/// *named* preset must still describe the values the file carries. An
+/// exact match between the normalized band vector (and preamp) and the
+/// named preset's canonical definition keeps the name; any difference —
+/// including a named preset whose preamp was clamped or snapped away
+/// from its canonical recommendation, and a value coerced to `Flat`
+/// whose vector is not all zeros — moves the persisted preset to
+/// `Custom`. This is a name-side transition only: no stored or coerced
+/// value is ever altered here, and `Custom` is left untouched.
+fn reconcile_preset_truth(mut settings: EqSettings) -> EqSettings {
+    if settings.preset == Preset::Custom {
+        return settings;
+    }
+    let canonical_bands = settings.preset.band_gains_db();
+    let canonical_preamp = settings.preset.recommended_preamp_db();
+    // Exact comparison is the contract's intent: both sides are
+    // multiples of 0.5 dB — exact in f64 — and `==` also treats a
+    // negative zero from the snap as equal to canonical +0.0. The test
+    // module carries the same justification (contract: *Persistence*,
+    // preset-truth reconciliation).
+    #[allow(clippy::float_cmp)]
+    if settings.bands_db != canonical_bands || settings.preamp_db != canonical_preamp {
+        settings.preset = Preset::Custom;
+    }
+    settings
+}
+
+/// Parse the strict `key="value"` grammar. Returns `Err(locator)` for a
+/// malformed line, a bad schema version, or an unparseable mandatory
+/// key. The locator is a key-or-line locator: the offending key when
+/// one is parseable, otherwise the failing line number and a failure
+/// category — a line the grammar cannot split has no key to report, and
+/// the diagnostic must never carry file content.
 pub(super) fn parse_equalizer_file(bytes: &[u8]) -> Result<EqSettings, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "schema_version".to_string())?;
     let mut config = RawEqConfig::default();
-    for line in text.lines() {
+    for (index, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let (key, value) = parse_line(line).ok_or_else(|| bad_key_of(line))?;
+        let Some((key, value)) = parse_line(line) else {
+            return Err(line_locator(index + 1, line));
+        };
         config.absorb(&key, &value)?;
     }
     config.into_settings()
 }
 
-fn bad_key_of(line: &str) -> String {
-    line.split('=')
-        .next()
-        .unwrap_or("(unknown)")
-        .trim()
-        .to_string()
+/// The diagnostic locator for a line that failed the line grammar. When
+/// a parseable `key=` prefix exists (the same key shape `parse_line`
+/// would accept), the key names the failure; anything else is reported
+/// as a numbered, categorized line so no hand-edited or corrupted
+/// content can leak into the warn diagnostic.
+fn line_locator(line_number: usize, line: &str) -> String {
+    match line.split_once('=') {
+        Some((key, _rest))
+            if !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+        {
+            key.to_string()
+        }
+        _ => format!("line {line_number}: unparseable line"),
+    }
 }
 
 fn band_index(key: &str) -> Option<usize> {
@@ -241,7 +324,11 @@ band5_db=\"6.0\"
 ";
         let parsed = parse_equalizer_file(reordered.as_bytes()).expect("reordered parse");
         assert!(parsed.enabled);
-        assert_eq!(parsed.preset, Preset::Jazz);
+        // Preset-truth reconciliation: the file names Jazz but carries
+        // values that are not Jazz's canonical vector and preamp, so
+        // the persisted name moves to `Custom` (name-side only — the
+        // values below are exactly what the file carried).
+        assert_eq!(parsed.preset, Preset::Custom);
         assert_eq!(parsed.preamp_db, -24.0);
         assert_eq!(parsed.bands_db[0], -24.0);
         assert_eq!(parsed.bands_db[1], 2.0);
@@ -272,7 +359,7 @@ band5_db=\"6.0\"
     }
 
     #[test]
-    fn unknown_preset_coerces_to_flat_and_keeps_the_band_vector() {
+    fn unknown_preset_coerces_to_flat_then_reconciles_to_custom() {
         let content = render_equalizer_file(&EqSettings {
             preset: Preset::Rock,
             bands_db: [3.0, 2.0, 0.0, -1.0, -1.0, 0.0, 2.0, 3.0, 3.0, 2.0],
@@ -280,8 +367,122 @@ band5_db=\"6.0\"
         })
         .replace("preset=\"rock\"", "preset=\"loudness2001\"");
         let parsed = parse_equalizer_file(content.as_bytes()).expect("coerced parse");
-        assert_eq!(parsed.preset, Preset::Flat);
+        // The unknown name first coerces to `flat`; the preset-truth
+        // reconciliation then moves the persisted name to `custom`
+        // because the band vector is not canonical Flat (all zeros).
+        // The coerced values themselves are never altered.
+        assert_eq!(parsed.preset, Preset::Custom);
         assert_eq!(parsed.bands_db[0], 3.0);
+        assert_eq!(parsed.bands_db[1], 2.0);
+    }
+
+    /// A file naming a canonical preset whose values are exactly that
+    /// preset's canonical definition keeps the name — the contract's
+    /// exact-match rule.
+    #[test]
+    fn canonical_named_preset_keeps_its_name() {
+        let settings = EqSettings {
+            preset: Preset::Classical,
+            preamp_db: Preset::Classical.recommended_preamp_db(),
+            bands_db: Preset::Classical.band_gains_db(),
+            ..EqSettings::default()
+        };
+        let parsed =
+            parse_equalizer_file(render_equalizer_file(&settings).as_bytes()).expect("parse");
+        assert_eq!(parsed.preset, Preset::Classical);
+        assert_eq!(parsed, settings);
+    }
+
+    /// A named preset whose preamp was moved away from the canonical
+    /// recommendation (here by a hand edit of the persisted file)
+    /// reconciles to `custom`; the stored preamp is kept, not replaced
+    /// by the canonical value.
+    #[test]
+    fn named_preset_with_off_canonical_preamp_becomes_custom() {
+        let content = render_equalizer_file(&EqSettings {
+            preset: Preset::Rock,
+            preamp_db: -1.0,
+            bands_db: Preset::Rock.band_gains_db(),
+            ..EqSettings::default()
+        })
+        .replace("preamp_db=\"-1.0\"", "preamp_db=\"-0.5\"");
+        let parsed = parse_equalizer_file(content.as_bytes()).expect("parse");
+        assert_eq!(parsed.preset, Preset::Custom);
+        assert_eq!(parsed.preamp_db, -0.5);
+        assert_eq!(parsed.bands_db, Preset::Rock.band_gains_db());
+    }
+
+    /// Off-grid values inside the range snap to the nearest 0.5 dB step,
+    /// ties away from zero; the snapped values are what the runtime
+    /// materializes and the next save persists.
+    #[test]
+    fn off_grid_gains_snap_to_the_half_step_grid() {
+        let mut content = render_equalizer_file(&EqSettings::default());
+        content = content.replace("preamp_db=\"0.0\"", "preamp_db=\"3.7\"");
+        content = content.replace("band0_db=\"0.0\"", "band0_db=\"0.1\"");
+        content = content.replace("band1_db=\"0.0\"", "band1_db=\"-0.1\"");
+        content = content.replace("band2_db=\"0.0\"", "band2_db=\"-6.25\"");
+        let parsed = parse_equalizer_file(content.as_bytes()).expect("snapped parse");
+        assert_eq!(parsed.preamp_db, 3.5);
+        assert_eq!(parsed.bands_db[0], 0.0);
+        assert_eq!(parsed.bands_db[1], 0.0);
+        assert_eq!(parsed.bands_db[2], -6.5);
+    }
+
+    /// A file that contains any schema key more than once is malformed
+    /// as a whole, and the diagnostic names the duplicated key — no
+    /// positional precedence is defined for duplicate lines.
+    #[test]
+    fn duplicate_schema_keys_are_malformed_and_name_the_key() {
+        for duplicated in [
+            "enabled",
+            "schema_version",
+            "preset",
+            "clip_protect",
+            "preamp_db",
+            "band0_db",
+            "band9_db",
+        ] {
+            let lines = render_equalizer_file(&EqSettings::default());
+            let duplicated_line = lines
+                .lines()
+                .find(|line| line.starts_with(&format!("{duplicated}=")))
+                .expect("canonical render carries every schema key")
+                .to_string();
+            let content = format!("{lines}{duplicated_line}\n");
+            let error = parse_equalizer_file(content.as_bytes())
+                .expect_err("a duplicated schema key must be malformed");
+            assert_eq!(error, duplicated, "the diagnostic names the duplicated key");
+        }
+    }
+
+    /// A malformed line whose `key=` prefix the grammar cannot accept —
+    /// or a line with no `=` at all — is reported by line number and
+    /// failure category, never by content: the diagnostic must not
+    /// disclose arbitrary hand-edited or corrupted file bytes.
+    #[test]
+    fn unparseable_lines_report_a_non_content_locator() {
+        let content = render_equalizer_file(&EqSettings::default())
+            .lines()
+            .chain(["this line has no equals sign at all"])
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = parse_equalizer_file(content.as_bytes()).expect_err("no-equals line");
+        assert_eq!(error, "line 16: unparseable line");
+        assert!(
+            !error.contains("this line has"),
+            "the locator must not carry the line's content"
+        );
+
+        // An invalid key shape (space inside the key) is equally
+        // content-free: the grammar cannot accept the prefix as a key.
+        let content = render_equalizer_file(&EqSettings::default())
+            .lines()
+            .chain(["not a key=\"value\""])
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = parse_equalizer_file(content.as_bytes()).expect_err("bad key shape");
+        assert_eq!(error, "line 16: unparseable line");
     }
 
     #[test]
