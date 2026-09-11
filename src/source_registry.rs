@@ -2773,6 +2773,13 @@ impl SourceRegistry {
     /// republished row set. A cancelled or failed refresh consumes nothing:
     /// its batch stays pending for the next refresh to re-read.
     ///
+    /// Consumption is settlement-confirmed: a task's carried batch leaves the
+    /// pending map only when that exact generation's publication is ACCEPTED
+    /// by the lifecycle. A superseded generation consumes nothing, so no
+    /// window between its adapter result and its settlement can strand a
+    /// written identity outside both the successor's carried set and the
+    /// pending map — the successor re-reads everything not yet published.
+    ///
     /// Returns the minted refresh generations, one per source that still had
     /// an exact live session. Fire-and-forget — publication happens on the
     /// lifecycle runtime and the visible row, subsequent Properties values,
@@ -2809,7 +2816,23 @@ impl SourceRegistry {
                 continue;
             };
             let generation = owner.generation();
+            let consumed_ids = track_ids.clone();
             let pending_written = Arc::clone(&self.inner);
+            let owner = owner.on_acceptance(Box::new(move || {
+                // Settlement-confirmed consumption: this exact generation's
+                // publication was accepted by the lifecycle, so the carried
+                // batch is published and may leave the pending map. A
+                // superseded generation consumes nothing — its payload was
+                // rejected — and the successor cloned the pending map
+                // including this batch, so every committed identity is either
+                // republished by the successor or stays pending for the next
+                // refresh.
+                if let Some(entry) =
+                    lock(&pending_written.mutation_refresh_pending).get_mut(&source_id)
+                {
+                    entry.retain(|track_id| !consumed_ids.contains(track_id));
+                }
+            }));
             owner.spawn(move |session, cancellation| async move {
                 let adapter = session.adapter();
                 let regular_playlist_capability = adapter.regular_playlist_capability();
@@ -2818,18 +2841,12 @@ impl SourceRegistry {
                     .await
                 {
                     Ok(tracks) => {
-                        // Consume the carried batch only while this
-                        // publication is uncontested: a cancelled token means
-                        // a newer refresh displaced this lane, and the
-                        // identities stay pending for the successor, whose
-                        // carried set already includes their union.
-                        if !cancellation.is_cancelled() {
-                            if let Some(entry) =
-                                lock(&pending_written.mutation_refresh_pending).get_mut(&source_id)
-                            {
-                                entry.retain(|track_id| !track_ids.contains(track_id));
-                            }
-                        }
+                        // Test-only seam between the adapter's Ok and the
+                        // payload's submission for settlement: the window a
+                        // supersede races the settlement-confirmed batch
+                        // consumption across.
+                        #[cfg(test)]
+                        run_post_mutation_refresh_ok_interpose();
                         RefreshTaskResult::Refreshed(AcceptedSourcePayload::catalogue(
                             tracks,
                             regular_playlist_capability,
@@ -2853,6 +2870,42 @@ impl SourceRegistry {
         }
         generations
     }
+}
+
+/// Test-only hook fired inside a post-mutation refresh task after its adapter
+/// call returned `Ok` and before its payload is submitted for settlement: the
+/// Ok→settlement window whose supersede races the pending batch's
+/// consumption.
+#[cfg(test)]
+type PostMutationRefreshOkInterpose = dyn Fn() + Send + Sync;
+
+#[cfg(test)]
+static POST_MUTATION_REFRESH_OK_INTERPOSE: std::sync::Mutex<
+    Option<Box<PostMutationRefreshOkInterpose>>,
+> = std::sync::Mutex::new(None);
+
+/// Serializes tests that use the post-mutation Ok interposition seam.
+#[cfg(test)]
+static POST_MUTATION_REFRESH_OK_INTERPOSE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn run_post_mutation_refresh_ok_interpose() {
+    if let Some(interpose) = lock(&POST_MUTATION_REFRESH_OK_INTERPOSE).as_ref() {
+        interpose();
+    }
+}
+
+/// Install the post-mutation Ok interposition seam for the duration of `run`,
+/// serializing against other tests that use the seam.
+#[cfg(test)]
+fn with_post_mutation_refresh_ok_interpose(
+    interpose: Box<PostMutationRefreshOkInterpose>,
+    run: impl FnOnce(),
+) {
+    let _serial = lock(&POST_MUTATION_REFRESH_OK_INTERPOSE_SERIAL);
+    *lock(&POST_MUTATION_REFRESH_OK_INTERPOSE) = Some(interpose);
+    run();
+    *lock(&POST_MUTATION_REFRESH_OK_INTERPOSE) = None;
 }
 
 /// Closed source-kind/provenance policy for structured playback attribution.
@@ -4472,6 +4525,127 @@ mod tests {
             snapshot.catalogue.is_none(),
             "the retired mount's catalogue is gone: the cancelled coalesced refresh published nothing"
         );
+        drop(registry);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_supersede_between_ok_and_settlement_loses_no_committed_identity() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let first_track = TrackId::remote("settle-first-track").expect("track ID");
+        let second_track = TrackId::remote("settle-second-track").expect("track ID");
+        let third_track = TrackId::remote("settle-third-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        probe.hold_post_mutation_refresh();
+
+        let adapter = probe
+            .playlist_adapter(
+                "settlement-supersede",
+                vec![fixture_track(first_track.clone())],
+            )
+            .with_post_mutation_refresh(vec![fixture_track(first_track.clone())]);
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+        let (initial_generation, _epoch) = wait_for_catalogue(&registry, source_id).await;
+
+        // The first save's refresh blocks inside the adapter call, holding
+        // its generation and its carried batch.
+        let first_generation =
+            registry.refresh_catalogue_after_mutation(&[(source_id, first_track.clone())])[0];
+        probe.wait_for_post_mutation_calls(1).await;
+
+        // Drive the exact race the settlement-confirmed consumption guards:
+        // the moment the blocked refresh's adapter call returns Ok — after
+        // the Ok, before its payload is submitted for settlement — an
+        // overlapping save supersedes the lane. The superseding generation
+        // must clone a pending map the superseded generation has not consumed
+        // from: a superseded generation consumes nothing, so the successor
+        // re-reads every identity the rejected payload can no longer publish.
+        let (supersede_landed_signal, supersede_landed) = mpsc::channel::<()>();
+        let interpose_registry = registry.clone();
+        let interpose_source = source_id;
+        let interpose_second = second_track.clone();
+        let successor_generation: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let successor_slot = Arc::clone(&successor_generation);
+        let fired = AtomicBool::new(false);
+        with_post_mutation_refresh_ok_interpose(
+            Box::new(move || {
+                if fired.swap(true, Ordering::SeqCst) {
+                    return; // only the superseded generation's Ok drives the race
+                }
+                let written = [(interpose_source, interpose_second.clone())];
+                let generations = interpose_registry.refresh_catalogue_after_mutation(&written);
+                *successor_slot.lock().unwrap() = generations.first().copied();
+                let _ = supersede_landed_signal.send(());
+            }),
+            || {
+                probe.release_post_mutation_refresh();
+                supersede_landed
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("the supersede landed between Ok and settlement");
+            },
+        );
+        probe.wait_for_post_mutation_calls(2).await;
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+
+        // The successor re-read both identities: the superseded refresh's
+        // payload was rejected without consuming, so neither identity was
+        // stranded outside the successor's carried set.
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "exactly one refresh per save: {requests:?}"
+        );
+        assert_eq!(
+            requests[0],
+            HashSet::from([first_track.clone()]),
+            "the superseded refresh was dispatched with its own identity"
+        );
+        assert_eq!(
+            requests[1],
+            HashSet::from([first_track.clone(), second_track.clone()]),
+            "the successor re-reads the identity the superseded generation never consumed"
+        );
+        let successor = successor_generation
+            .lock()
+            .unwrap()
+            .expect("the superseding save minted a refresh generation");
+        assert_ne!(
+            successor, first_generation,
+            "the Ok→settlement supersede minted a newer generation"
+        );
+        let catalogue = registry
+            .snapshot(source_id)
+            .expect("the source stays live")
+            .catalogue
+            .expect("the accepted catalogue survives");
+        assert_ne!(
+            catalogue.generation, initial_generation,
+            "a refresh republished the catalogue"
+        );
+        assert_eq!(
+            catalogue.generation, successor,
+            "the successor's payload published; the superseded payload did not"
+        );
+
+        // Consumption is settlement-confirmed: the successor's acceptance
+        // emptied the batch, so a later save re-reads only its own identity.
+        let third_generation =
+            registry.refresh_catalogue_after_mutation(&[(source_id, third_track.clone())])[0];
+        probe.wait_for_post_mutation_calls(3).await;
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests[2],
+            HashSet::from([third_track]),
+            "the successor's settlement consumed the batch; nothing lingers pending"
+        );
+        let catalogue = registry
+            .snapshot(source_id)
+            .expect("the source stays live")
+            .catalogue
+            .expect("the accepted catalogue survives");
+        assert_eq!(catalogue.generation, third_generation);
         drop(registry);
     }
 

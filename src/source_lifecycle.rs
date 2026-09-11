@@ -3247,6 +3247,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             session,
             cancellation: observer,
             completed: false,
+            on_accepted: None,
         })
     }
 
@@ -4199,6 +4200,13 @@ pub struct RefreshOwner<A: LifecycleAdapter + ?Sized, S> {
     session: SessionHandle<A>,
     cancellation: CancellationObserver,
     completed: bool,
+    /// Runs exactly when this generation's publication is ACCEPTED by the
+    /// lifecycle — never on a superseded rejection, failure, cancellation,
+    /// or drop. Callers use it for bookkeeping that must be bound to
+    /// settlement (e.g. consuming a pending-work batch only once this
+    /// generation's payload has actually published), so a generation whose
+    /// payload is rejected consumes nothing.
+    on_accepted: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl<A: LifecycleAdapter + ?Sized, S> RefreshOwner<A, S> {
@@ -4222,6 +4230,18 @@ impl<A: LifecycleAdapter + ?Sized, S> RefreshOwner<A, S> {
         self.cancellation.clone()
     }
 
+    /// Bind a hook to this generation's settlement acceptance.
+    ///
+    /// The hook runs exactly when [`Self::spawn`]'s submission of this
+    /// generation's payload is accepted by the lifecycle (the generation was
+    /// still current and the publication landed) — and never when the
+    /// submission is rejected as superseded, fails, is cancelled, or the
+    /// owner drops unfinished.
+    pub fn on_acceptance(mut self, hook: Box<dyn FnOnce() + Send>) -> Self {
+        self.on_accepted = Some(hook);
+        self
+    }
+
     /// Exact operational adapter/lease/epoch captured atomically when this
     /// refresh generation began.
     fn session(&self) -> SessionHandle<A> {
@@ -4238,6 +4258,14 @@ impl<A: LifecycleAdapter + ?Sized, S> RefreshOwner<A, S> {
             snapshot,
         );
         self.completed = true;
+        if accepted {
+            // Settlement-confirmed: this exact generation's publication was
+            // accepted, so bookkeeping bound to acceptance may run now. A
+            // rejected submission consumed nothing.
+            if let Some(on_accepted) = self.on_accepted.take() {
+                on_accepted();
+            }
+        }
         accepted
     }
 
