@@ -57,9 +57,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gate under the required name with pull-request-controlled workflow content. The
   publisher binds every verdict to the announcing run's head commit, re-derives the
   associated pull requests through the API from that exact commit, and publishes the
-  check-run itself under a `checks: write` grant; every refusal publishes its failing
-  verdict before returning, and a publication failure leaves the required context
-  unreported, which still blocks the merge.
+  check-run itself under the dedicated gate-publisher App identity: the workflow token
+  deliberately holds no `checks: write`, so it structurally cannot author the required
+  context, and anything a pull request adds publishes only under the shared Actions
+  integration the ruleset refuses. Every refusal that executes publishes its failing
+  verdict before returning; a refresh that dies after its in-progress run is opened
+  leaves that pending check superseding the old verdict, and the recorded residual — a
+  death before the first App-authored publication, such as the token-mint step failing
+  or the runner being lost — leaves the head's previous verdict standing, with the
+  failed `Bot Review Gate Publisher` job as the re-run signal.
 
 ## [0.6.2] — 2026-09-01
 
