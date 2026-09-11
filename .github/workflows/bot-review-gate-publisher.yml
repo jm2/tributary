@@ -202,6 +202,12 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  # The completion event is supposed to carry the announcing run's head
+  # commit, and the run-record fallback that recovers it when it does not
+  # (repos/.../actions/runs/<id>) needs `actions: read` — without the grant
+  # the recovery call is refused and the refresh would give up its
+  # supersession duty for no reason. Read-only, like the rest.
+  actions: read
   # Deliberately no `checks: write`: the workflow token must be structurally
   # unable to publish the required context. Only the minted gate-publisher
   # App token below can.
