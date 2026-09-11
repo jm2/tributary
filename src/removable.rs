@@ -309,20 +309,10 @@ impl RemovableMediaAdapter {
     /// one lock.
     ///
     /// Only identities the accepted scan admitted are re-read; every other
-    /// requested identity is ignored. An identity that fails to re-read or
-    /// re-parse keeps its previous catalogue entry — the refresh is scoped
-    /// to what actually committed, and one unreadable row never fails the
-    /// whole publication. Re-reads flow through the retained mount
-    /// authority via the same [`ResolvedFileMedia::from_mounted_relative_path`]
-    /// path the scan and stream resolution use, so no native mount location
-    /// is exposed and a displaced ancestor can never retarget the lookup.
-    /// The attribution profile is rebuilt from the fresh parse on the same
-    /// real-tag provenance rules as the scan, so the republished catalogue
-    /// and the live playback-attribution authority change together.
-    ///
-    /// The swap happens only after the mount authority revalidates: a mount
-    /// that changed under the re-reads publishes nothing. Blocking — worker
-    /// threads only.
+    /// requested identity is ignored (see [`Self::refreshed_identity`]).
+    /// One unreadable row never fails the whole publication, and a lane
+    /// cancelled mid-re-read stops re-reading and publishes nothing (see
+    /// [`Self::publish_refreshed`]). Blocking — worker threads only.
     fn refresh_written_identities(
         &self,
         written: &HashSet<TrackId>,
@@ -331,51 +321,80 @@ impl RemovableMediaAdapter {
         let mut refreshed: Vec<(TrackId, Track, Option<PlaybackAttributionProfile>)> =
             Vec::with_capacity(written.len());
         for track_id in written {
-            // Membership: a well-formed relative identity that appeared
-            // outside the accepted scan is not authority to read anything
-            // in this session.
-            if !self.accepted_track_ids.contains(track_id) {
-                continue;
-            }
             if cancellation.is_cancelled() {
                 break;
             }
-            let Ok(relative_path) = track_id.removable_relative_path() else {
-                continue;
-            };
-            let extension = extension_hint(&relative_path);
-            let Ok(media) = ResolvedFileMedia::from_mounted_relative_path(
-                Arc::clone(&self.authority),
-                &relative_path,
-                extension,
-            ) else {
-                continue;
-            };
-            let parsed = media
-                .with_serialized_seekable_file(|file| {
-                    crate::local::tag_parser::parse_audio_file_from_file(file, &relative_path)
-                })
-                .ok()
-                .and_then(Result::ok);
-            if cancellation.is_cancelled() {
-                break;
+            if let Some(row) = self.refreshed_identity(track_id, cancellation) {
+                refreshed.push(row);
             }
-            let Some(parsed) = parsed.filter(parsed_metadata_is_bounded) else {
-                continue;
-            };
-            let title_from_tag = parsed.title_from_tag;
-            let artist_from_tag = parsed.artist_from_tag;
-            let album_from_tag = parsed.album_from_tag;
-            let track = pathless_track(self.source_id, track_id.clone(), parsed);
-            let profile = PlaybackAttributionProfile::from_tagged_track(
-                &track,
-                title_from_tag,
-                artist_from_tag,
-                album_from_tag,
-            );
-            refreshed.push((track_id.clone(), track, profile));
         }
+        self.publish_refreshed(refreshed, cancellation)
+    }
 
+    /// Re-derive one accepted identity from the retained mount after its
+    /// write committed. An identity that fails to re-read or re-parse —
+    /// or one the accepted scan never admitted — yields `None` and keeps
+    /// its previous catalogue entry: the refresh is scoped to what
+    /// actually committed. Re-reads flow through the retained mount
+    /// authority via the same [`ResolvedFileMedia::from_mounted_relative_path`]
+    /// path the scan and stream resolution use, so no native mount location
+    /// is exposed and a displaced ancestor can never retarget the lookup.
+    /// The attribution profile is rebuilt from the fresh parse on the same
+    /// real-tag provenance rules as the scan, so the republished catalogue
+    /// and the live playback-attribution authority change together.
+    fn refreshed_identity(
+        &self,
+        track_id: &TrackId,
+        cancellation: &CancellationObserver,
+    ) -> Option<(TrackId, Track, Option<PlaybackAttributionProfile>)> {
+        // Membership: a well-formed relative identity that appeared
+        // outside the accepted scan is not authority to read anything
+        // in this session.
+        if !self.accepted_track_ids.contains(track_id) {
+            return None;
+        }
+        let relative_path = track_id.removable_relative_path().ok()?;
+        let extension = extension_hint(&relative_path);
+        let media = ResolvedFileMedia::from_mounted_relative_path(
+            Arc::clone(&self.authority),
+            &relative_path,
+            extension,
+        )
+        .ok()?;
+        let parsed = media
+            .with_serialized_seekable_file(|file| {
+                crate::local::tag_parser::parse_audio_file_from_file(file, &relative_path)
+            })
+            .ok()
+            .and_then(Result::ok);
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let parsed = parsed.filter(parsed_metadata_is_bounded)?;
+        let title_from_tag = parsed.title_from_tag;
+        let artist_from_tag = parsed.artist_from_tag;
+        let album_from_tag = parsed.album_from_tag;
+        let track = pathless_track(self.source_id, track_id.clone(), parsed);
+        let profile = PlaybackAttributionProfile::from_tagged_track(
+            &track,
+            title_from_tag,
+            artist_from_tag,
+            album_from_tag,
+        );
+        Some((track_id.clone(), track, profile))
+    }
+
+    /// Swap refreshed rows into the accepted catalogue under one lock.
+    ///
+    /// The swap happens only after the mount authority revalidates: a mount
+    /// that changed under the re-reads publishes nothing. A lane cancelled
+    /// mid-re-read publishes nothing — the same discipline as the accepted
+    /// scan, which never repopulates from a cancelled pass.
+    fn publish_refreshed(
+        &self,
+        refreshed: Vec<(TrackId, Track, Option<PlaybackAttributionProfile>)>,
+        cancellation: &CancellationObserver,
+    ) -> BackendResult<Vec<Track>> {
         if self.authority.validate().is_err() {
             if cancellation.is_cancelled() {
                 return Ok(self.catalogue_tracks());
@@ -383,9 +402,6 @@ impl RemovableMediaAdapter {
             return Err(scan_failed());
         }
         if cancellation.is_cancelled() {
-            // A lane cancelled mid-re-read publishes nothing — the same
-            // discipline as the accepted scan, which never repopulates from
-            // a cancelled pass.
             return Ok(self.catalogue_tracks());
         }
 
@@ -861,6 +877,50 @@ mod tests {
         drop(owner);
     }
 
+    /// Scan a one-track mount and hand back the live adapter plus the
+    /// accepted identity of its only row.
+    fn scanned_single_track(
+        source_id: SourceId,
+        mount: &Path,
+        cancellation: &CancellationObserver,
+    ) -> (Arc<RemovableMediaAdapter>, TrackId) {
+        let adapter = Arc::new(
+            RemovableMediaAdapter::scan(
+                source_id,
+                mount.to_path_buf(),
+                cancellation,
+                Handle::current(),
+            )
+            .expect("scan removable media")
+            .expect("scan remains current"),
+        );
+        assert_eq!(adapter.tracks().len(), 1);
+        let track_id = adapter.tracks()[0]
+            .native_track_id
+            .clone()
+            .expect("accepted identity");
+        (adapter, track_id)
+    }
+
+    /// A committed retained write replaced the file content at the same
+    /// relative path; the refresh must republish the row and the
+    /// attribution profile from the fresh parse.
+    fn assert_republished_attribution(adapter: &RemovableMediaAdapter, track_id: &TrackId) {
+        let published = adapter.tracks();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].title, "After Refresh");
+        assert_eq!(
+            published[0].native_track_id.as_ref(),
+            Some(track_id),
+            "the row keeps its accepted identity"
+        );
+        let profile = adapter
+            .playback_attribution_profile(track_id)
+            .expect("fresh real tags keep attribution authorized");
+        assert_eq!(profile.title(), "After Refresh");
+        assert_eq!(profile.track_number(), Some(2));
+    }
+
     #[tokio::test]
     async fn refresh_republishes_written_identities_and_attribution() {
         let mount = tempfile::tempdir().expect("temporary removable mount");
@@ -876,26 +936,9 @@ mod tests {
 
         let source_id = SourceId::removable("test:refresh-republish").expect("source identity");
         let (_registry, owner, cancellation) = live_cancellation(source_id);
-        let adapter = Arc::new(
-            RemovableMediaAdapter::scan(
-                source_id,
-                mount.path().to_path_buf(),
-                &cancellation,
-                Handle::current(),
-            )
-            .expect("scan removable media")
-            .expect("scan remains current"),
-        );
-        assert_eq!(adapter.tracks().len(), 1);
-        let track_id = adapter.tracks()[0]
-            .native_track_id
-            .clone()
-            .expect("accepted identity");
+        let (adapter, track_id) = scanned_single_track(source_id, mount.path(), &cancellation);
         assert_eq!(adapter.tracks()[0].title, "Before Refresh");
 
-        // A committed retained write replaced the file content at the same
-        // relative path; the refresh re-derives the row and the attribution
-        // profile from the fresh parse.
         write_tagged_flac(
             &song_path,
             Some("After Refresh"),
@@ -914,19 +957,7 @@ mod tests {
         assert_eq!(refreshed.len(), 1);
         assert_eq!(refreshed[0].title, "After Refresh");
 
-        let published = adapter.tracks();
-        assert_eq!(published.len(), 1);
-        assert_eq!(published[0].title, "After Refresh");
-        assert_eq!(
-            published[0].native_track_id.as_ref(),
-            Some(&track_id),
-            "the row keeps its accepted identity"
-        );
-        let profile = adapter
-            .playback_attribution_profile(&track_id)
-            .expect("fresh real tags keep attribution authorized");
-        assert_eq!(profile.title(), "After Refresh");
-        assert_eq!(profile.track_number(), Some(2));
+        assert_republished_attribution(&adapter, &track_id);
         drop(owner);
     }
 
