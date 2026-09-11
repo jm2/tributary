@@ -228,6 +228,13 @@ fn settled_zero_state(
     Some(current == gst::State::Playing)
 }
 
+/// Test-only seam hook: consumes one topology edit closure and reports
+/// the seam outcome (`true` confirmed / `false` deferred), letting the
+/// caller-discipline tests drive `with_pipeline_suspended` without a
+/// live pipeline.
+#[cfg(test)]
+type EqSeamHook = Box<dyn FnOnce(&mut dyn FnMut() -> bool) -> bool>;
+
 /// GStreamer playback engine.
 ///
 /// Wraps a `playbin3` (with `playbin` fallback) and exposes a safe,
@@ -271,7 +278,7 @@ pub struct Player {
     /// the deferred/confirmed seam outcomes behind the equalizer caller
     /// discipline are exercisable deterministically in tests.
     #[cfg(test)]
-    seam_override: RefCell<Option<Box<dyn FnOnce(&mut dyn FnMut() -> bool) -> bool>>>,
+    seam_override: RefCell<Option<EqSeamHook>>,
 }
 
 impl Player {
@@ -1906,7 +1913,15 @@ mod tests {
             settings,
             chain,
             save_generation: 0,
-            persistence_suppressed: false,
+            // Test players must never persist: the debounced writer and
+            // the Drop shutdown flush both route through the real user
+            // config path, and a test that applied `enabled = true`
+            // would otherwise leave that file armed — later tests (the
+            // protected-stream EOS child reads the same path) would then
+            // run the equalizer install seam inside their playback
+            // pipelines. Test discipline assertions are in-memory only;
+            // on-disk persistence is the config module's tested concern.
+            persistence_suppressed: true,
             retired: false,
         }
     }
