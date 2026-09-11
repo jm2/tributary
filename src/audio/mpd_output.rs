@@ -3710,13 +3710,28 @@ where
     // controller. Under `Unconfirmed` we conservatively retain the orphan so
     // any other client retains its anyway. A supervised `Exclusive` output
     // whose supervisor has lapsed — foreign current song, partition-option
-    // drift, or an observation gap — also retains: stale confirmation must
-    // never authorise cleanup, and only an explicit user reconfirmation
-    // restores the authority. The staleness check is eager: a supervised
-    // output whose supervision evidence is older than `MAX_SUPERVISION_GAP`
-    // retains too, without waiting for the next poll. Unsupervised
-    // `Exclusive` proceeds on the user's confirmation alone.
+    // drift, an observation gap, or the unreadable pre-stop status above —
+    // also retains: stale confirmation must never authorise cleanup, and
+    // only an explicit user reconfirmation restores the authority. The
+    // staleness check is eager: a supervised output whose supervision
+    // evidence is older than `MAX_SUPERVISION_GAP` retains too, without
+    // waiting for the next poll. Unsupervised `Exclusive` proceeds on the
+    // user's confirmation alone.
+    //
+    // The gate is kind-aware. A lapsed `StopOwned` cleanup has issued
+    // neither the stop nor the delete: the connection-usable status-failure
+    // arm above records the ACK failure and falls through here with the
+    // owned song possibly still playing, so returning `Completed` would let
+    // the Stop caller publish a successful stopped state for mutations that
+    // never ran. It therefore returns `Refused` and the caller surfaces the
+    // exclusive-control error with the owned queue entry retained.
+    // `Targeted` load-path cleanup keeps `Completed`: retaining the orphan
+    // and still succeeding is exactly the post-lapse load contract, and the
+    // load rechecks authority on the same evidence after the cleanup.
     if !supervision_authorizes(plan, supervision) {
+        if kind == CleanupKind::StopOwned {
+            return CleanupOutcome::Refused;
+        }
         return CleanupOutcome::Completed;
     }
     let removed = session.connection.delete_id(song_id, deadline);
@@ -6234,6 +6249,92 @@ mod tests {
                     if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
             )),
             "the expired-supervision stop refusal must surface the exclusive-control error"
+        );
+        assert_eq!(harness.cache().state, PlayerState::Stopped);
+        harness.shutdown();
+    }
+
+    #[test]
+    fn supervised_stop_cleanup_refused_when_status_round_trip_fails_with_usable_ack() {
+        // Connection-usable-failure sibling of the two refusals above
+        // (adjudicated P1, PR #173 thread 3989340443): the cleanup status
+        // round-trip itself fails with a synchronized ACK error — the stream
+        // stays usable, but ownership is indeterminate. The unreadable reply
+        // is a blind window over the partition, so the supervised output
+        // lapses BEFORE the mutation decisions; execution then fell through
+        // to the targeted-delete authority gate, which returned `Completed`,
+        // and the Stop caller published a successful stopped state even
+        // though neither the stop nor the deleteid ran and the owned song
+        // may still be playing. The kind-aware gate must refuse instead:
+        // zero mutations reach MPD and the UI sees the exclusive-control
+        // error — never a silent successful stopped state.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(playing_status(0, 10_000));
+        let owner = harness.next_owner(3);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/clean".to_string(),
+            },
+        );
+        harness.fence(owner);
+
+        // The stop cleanup's own status round-trip fails with a
+        // synchronized ACK failure: connection usable, ownership
+        // indeterminate. No poll can interfere inside this window (the
+        // poll interval is one hour), so the only status fetched is the
+        // cleanup's own — and the lapsed supervisor refuses every
+        // mutation afterwards.
+        *shared.fail_at.lock().expect("failure lock") = Some(Point::Status);
+
+        let _ = harness.events();
+        harness.send(owner, CommandKind::Stop);
+        harness.fence(owner);
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the connection-usable status failure must lapse the supervisor before the stop"
+        );
+        let actions = shared.actions();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Point(Point::Stop)))
+                .count(),
+            0,
+            "a stop whose cleanup status failed with a usable ACK must not reach MPD"
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Delete(42)))
+                .count(),
+            0,
+            "the targeted delete stays gated behind the lapsed supervision"
+        );
+        assert!(
+            harness.events().iter().any(|event| matches!(
+                event,
+                PlayerEvent::Error { message, .. }
+                    if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+            )),
+            "the usable-ACK stop refusal must surface the exclusive-control error"
         );
         assert_eq!(harness.cache().state, PlayerState::Stopped);
         harness.shutdown();
