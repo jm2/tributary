@@ -569,6 +569,31 @@ jobs:
             return 1
           fi
 
+          # A partial body is equally unproven: a GraphQL error entry can sit
+          # beside a valid head on an HTTP 200, and a null connection under an
+          # otherwise complete pull request silently iterates as empty — both
+          # would read as "no findings" downstream. Each guard therefore also
+          # demands a complete body: no `errors` key on any page, and the
+          # queried connection present on every page.
+          if ! jq -s -e 'all(.[]; (has("errors") | not) and .data.repository.pullRequest.reviewThreads != null)' \
+              "${threads_pages}" > /dev/null; then
+            echo "Review-thread response was partial (GraphQL errors or a missing reviewThreads connection); failing closed." >&2
+            record_blocked "${verdict_base}" "Review-thread response was partial (GraphQL errors or a missing reviewThreads connection); failing closed."
+            return 1
+          fi
+          if ! jq -s -e 'all(.[]; (has("errors") | not) and .data.repository.pullRequest.reviews != null)' \
+              "${reviews_pages}" > /dev/null; then
+            echo "Review response was partial (GraphQL errors or a missing reviews connection); failing closed." >&2
+            record_blocked "${verdict_base}" "Review response was partial (GraphQL errors or a missing reviews connection); failing closed."
+            return 1
+          fi
+          if ! jq -s -e 'all(.[]; (has("errors") | not) and .data.repository.pullRequest.timelineItems != null)' \
+              "${timeline_pages}" > /dev/null; then
+            echo "Review-timeline response was partial (GraphQL errors or a missing timelineItems connection); failing closed." >&2
+            record_blocked "${verdict_base}" "Review-timeline response was partial (GraphQL errors or a missing timelineItems connection); failing closed."
+            return 1
+          fi
+
           # Bind pagination to the intended head: a push during pagination
           # changes headRefOid in later pages and must fail the check instead
           # of mixing evidence from two commits.
@@ -1037,7 +1062,16 @@ jobs:
               }
           DECISIONS
 
-          evaluated="$(jq -n \
+          # The decision filter is the gate's whole arithmetic, and the
+          # candidate loop below swallows errexit (`|| true`) on purpose —
+          # so this status must be checked EXPLICITLY: a jq failure over a
+          # partial-200 evidence shape, or any defect in the filter itself,
+          # must block, never fall through as an empty `evaluated` whose
+          # empty violation report reads as clean. The verdict shape is
+          # validated for the same reason: an output that is empty, a
+          # non-object, or bound to another head is a failed evaluation,
+          # and only a validated verdict can ever reach `.clean`.
+          if ! evaluated="$(jq -n \
             --slurpfile threads "${threads_pages}" \
             --slurpfile reviews "${reviews_pages}" \
             --slurpfile timeline "${timeline_pages}" \
@@ -1045,7 +1079,21 @@ jobs:
             --slurpfile policy "${policy_file}" \
             --arg head "${intended_head}" \
             --arg expected "${EXPECTED_BOT_REVIEWERS:-}" \
-            -f "${decisions_jq}")"
+            -f "${decisions_jq}")" \
+            || [ -z "${evaluated}" ] \
+            || ! jq -e '
+                (type == "object")
+                and (.evaluated_head == $head)
+                and (.evaluated_threads | type == "number")
+                and (.evaluated_reviews | type == "number")
+                and (.violations | type == "array")
+                and (.waived | type == "array")' \
+                --arg head "${intended_head}" \
+                >/dev/null <<<"${evaluated}"; then
+            echo >&2 "Decision evaluation failed or returned a malformed verdict; failing closed."
+            record_blocked "${verdict_base}" "Decision evaluation failed or returned a malformed verdict; failing closed."
+            return 1
+          fi
 
           jq -r '.waived[] |
                  "RATE-LIMIT SUBSTITUTION: stale evidence by \(.author) waived under the documented rate limit"
