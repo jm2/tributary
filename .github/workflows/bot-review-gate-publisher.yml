@@ -320,12 +320,16 @@ jobs:
               echo "The gate-publisher App token is missing; refusing to publish the required context under any shared identity. The head's verdict keeps its previous value and the failed job is the re-run signal." >&2
               return 1
             fi
+            # gh's nested payload syntax is key[subkey]=value; a dotted
+            # key would be sent as a literal top-level field and dropped
+            # by the API, so the in-progress output would silently carry
+            # neither title nor summary.
             if ! gate_check_run_id="$(GH_TOKEN="${GATE_TOKEN}" gh api "repos/${GITHUB_REPOSITORY}/check-runs" \
                 -F name="${gate_context}" \
                 -F head_sha="${evaluated_head}" \
                 -F status=in_progress \
-                -F output.title="Bot Review Gate: evidence refresh in progress" \
-                -F output.summary="A refresh is re-evaluating bot-review evidence at this commit. This pending check supersedes the previous verdict until the refresh finishes, so no earlier result is mergeable while evidence is being re-read." \
+                -F "output[title]=Bot Review Gate: evidence refresh in progress" \
+                -F "output[summary]=A refresh is re-evaluating bot-review evidence at this commit. This pending check supersedes the previous verdict until the refresh finishes, so no earlier result is mergeable while evidence is being re-read." \
                 --jq '.id' 2>/dev/null)" \
               || [ -z "${gate_check_run_id}" ]; then
               echo "Check-run publication failed: the in-progress refresh check could not be created; the head's verdict keeps its previous value and the failed job is the re-run signal." >&2
@@ -354,12 +358,15 @@ jobs:
             # A check run cannot move to another commit after creation, so
             # finalizing at a different head is impossible by construction —
             # the guard above refuses the impossible instead of silently
-            # mis-reporting. The update carries only the terminal state.
+            # mis-reporting. The update carries only the terminal state, with
+            # the output as genuine nested fields (key[subkey]=value — a
+            # dotted key is a literal top-level field the API drops, and the
+            # verdict's title and summary would never reach GitHub).
             if ! GH_TOKEN="${GATE_TOKEN}" gh api -X PATCH "repos/${GITHUB_REPOSITORY}/check-runs/${gate_check_run_id}" \
                 -F status=completed \
                 -F conclusion="${conclusion}" \
-                -F output.title="${title}" \
-                -F output.summary="${summary}" > /dev/null; then
+                -F "output[title]=${title}" \
+                -F "output[summary]=${summary}" > /dev/null; then
               echo "Check-run publication failed; the head's verdict keeps its previous value and the failed job is the re-run signal." >&2
               return 1
             fi
