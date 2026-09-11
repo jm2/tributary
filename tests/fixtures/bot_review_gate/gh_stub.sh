@@ -18,6 +18,11 @@
 #     the page= query parameter), otherwise the single
 #     commits-head-pulls.json (or the built-in default: open pull request
 #     42 against main, headed by the test HEAD_SHA) answers every page.
+#   * `gh api repos/.../pulls/N/requested_reviewers` — the requested
+#     re-review handshake read; served from requested-reviewers.json when
+#     the scenario stages one, otherwise the endpoint's empty shape
+#     (`{"users": [], "teams": []}`) answers, like the real API for a
+#     pull request with no outstanding review requests.
 #   * `gh api repos/.../check-runs` — the publication calls (the
 #     in-progress opening POST and the terminal PATCH of that same run);
 #     each invocation is appended to GH_STUB_STATE/check-runs.log as one
@@ -27,7 +32,8 @@
 #     refresh opened.
 #   * A GH_STUB_PAGES/fail file injects failures: tokens "threads",
 #     "reviews", "graphql" fail the matching GraphQL query; "pr" fails REST;
-#     "discover" fails the discovery call; "checkrun" fails every check-run
+#     "discover" fails the discovery call; "requested" fails the
+#     requested-reviewers call; "checkrun" fails every check-run
 #     call; "checkrun-finish" fails only the terminal update (the one
 #     carrying a conclusion), leaving the opened pending run standing.
 set -u
@@ -191,6 +197,25 @@ if [ -n "${rest_path}" ]; then
         exec jq -r "${jq_filter}" "${file}"
       fi
       cat "${file}"
+      exit 0
+      ;;
+    *pulls/*/requested_reviewers*)
+      # The requested-reviewers handshake read: served from
+      # requested-reviewers.json when the scenario stages one, otherwise
+      # the endpoint's empty shape answers, like the real API for a pull
+      # request with no outstanding review requests.
+      case "${fail_mode}" in
+        *requested*)
+          echo "stub: injected requested-reviewers query failure" >&2
+          exit 1
+          ;;
+      esac
+      file="${pages}/requested-reviewers.json"
+      if [ -f "${file}" ]; then
+        cat "${file}"
+      else
+        printf '%s\n' '{"users": [], "teams": []}'
+      fi
       exit 0
       ;;
   esac
