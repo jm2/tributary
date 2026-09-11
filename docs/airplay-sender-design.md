@@ -467,7 +467,7 @@ trait AirplaySender: Send + Sync {
     /// cancellation (the load being dropped or its generation
     /// superseded) needs no protocol cleanup: dropping the call in
     /// flight is the whole cleanup.
-    fn probe(&self) -> Result<(), String>;
+    fn probe(&self) -> Result<(), SenderError>;
     /// Negotiate a session with the receiver at `host:port`, sourcing
     /// audio from the prepared media at `prepared_uri`, and return
     /// it. Called only after `probe` succeeded and after media
