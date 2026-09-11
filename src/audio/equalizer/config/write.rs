@@ -18,6 +18,23 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// retry simply advances the per-process sequence to a fresh name.
 const TEMP_COLLISION_RETRIES: usize = 8;
 
+/// How many times one replace retries when the destination name is
+/// momentarily held by a concurrent replacement. Windows'
+/// `MOVEFILE_REPLACE_EXISTING` is not an atomic-replace queue: while
+/// another thread's replacement of the same destination is in flight,
+/// the losing rename is refused with a sharing violation instead of
+/// being serialized behind the winner. POSIX `rename(2)` serializes
+/// concurrent replacements in the kernel and never reports this shape,
+/// so only the Windows backend ever hits the retries — but the policy
+/// itself is platform-independent and unit-tested on every platform
+/// through an injected replace backend.
+const REPLACE_RACE_RETRIES: usize = 8;
+
+/// Base pause between replace retries; each retry waits a multiple of
+/// this (`base × attempt`) so a name held under heavier contention
+/// gets proportionally more room before the save honestly gives up.
+const REPLACE_RACE_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// Write `content` to `path` via the atomic-replace protocol. The temp
 /// sibling is created exclusively under a name unique to this write, so
 /// concurrent writers never collide and a sibling left behind by a
@@ -96,7 +113,9 @@ fn create_temp_exclusively(
 /// so a reported success could still be lost to a sudden power loss
 /// while the destination-directory update is only in flight. The
 /// `MOVEFILE_REPLACE_EXISTING` flag preserves `rename(2)`'s
-/// replace-the-destination semantics.
+/// replace-the-destination semantics, and the shared retry policy
+/// absorbs the transient refusals a concurrent replacement of the same
+/// destination produces on Windows.
 #[cfg(windows)]
 fn rename_over(temp_path: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -106,28 +125,92 @@ fn rename_over(temp_path: &std::path::Path, path: &std::path::Path) -> std::io::
 
     let mut from: Vec<u16> = temp_path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // Safety: both pointers reference NUL-terminated wide buffers owned
-    // by this call and `MoveFileExW` keeps them valid for its duration.
-    let ok = unsafe {
-        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
-            from.as_mut_ptr(),
-            to.as_mut_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if ok == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    retry_transient_replace_race(
+        move || {
+            // Safety: both pointers reference NUL-terminated wide buffers owned
+            // by this call and `MoveFileExW` keeps them valid for its duration.
+            let ok = unsafe {
+                windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+                    from.as_mut_ptr(),
+                    to.as_mut_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if ok == 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        },
+        is_replace_race_refusal,
+    )
 }
 
 /// POSIX and everything else: `rename(2)` atomically replaces the
-/// destination; the directory-entry flush is the caller's separate
-/// `sync_parent_dir` step on unix.
+/// destination and the kernel serializes concurrent replacements, so
+/// the shared retry policy never triggers here; the directory-entry
+/// flush remains the caller's separate `sync_parent_dir` step.
 #[cfg(not(windows))]
 fn rename_over(temp_path: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(temp_path, path)
+    retry_transient_replace_race(|| std::fs::rename(temp_path, path), is_replace_race_refusal)
+}
+
+/// Windows error values (the `windows-sys` `Win32::Foundation` names)
+/// that mean "the destination name is momentarily held by a concurrent
+/// replacement" rather than "this save cannot succeed":
+/// `ERROR_ACCESS_DENIED` observes the target's brief delete-pending
+/// state, `ERROR_SHARING_VIOLATION` and `ERROR_LOCK_VIOLATION` find the
+/// name still held by the winner's in-flight replacement. Kept as local
+/// constants so the classifier reads without a platform-gated import.
+#[cfg(windows)]
+const ERROR_ACCESS_DENIED: i32 = 5;
+#[cfg(windows)]
+const ERROR_SHARING_VIOLATION: i32 = 32;
+#[cfg(windows)]
+const ERROR_LOCK_VIOLATION: i32 = 33;
+
+/// Classify one replace error for the shared retry policy. Windows:
+/// exactly the in-flight-replacement refusals above. POSIX: nothing —
+/// `rename(2)` never refuses a replacement because another one is in
+/// flight, so every error is reported on the first attempt.
+#[cfg(windows)]
+fn is_replace_race_refusal(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+    )
+}
+
+#[cfg(not(windows))]
+fn is_replace_race_refusal(_error: &std::io::Error) -> bool {
+    false
+}
+
+/// Run one destination replace under the bounded transient-race policy:
+/// a refusal that means "another replacement of this same destination
+/// is in flight" is retried with a `REPLACE_RACE_RETRY_BASE × attempt`
+/// pause, up to `REPLACE_RACE_RETRIES` retries, before the last error
+/// is honestly reported; every other error is returned on the first
+/// attempt. A save is only ever reported successful when the replace
+/// itself reported success.
+fn retry_transient_replace_race<F, C>(mut replace: F, is_transient: C) -> std::io::Result<()>
+where
+    F: FnMut() -> std::io::Result<()>,
+    C: Fn(&std::io::Error) -> bool,
+{
+    let mut attempts = 0;
+    loop {
+        match replace() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                attempts += 1;
+                if attempts > REPLACE_RACE_RETRIES || !is_transient(&error) {
+                    return Err(error);
+                }
+                std::thread::sleep(REPLACE_RACE_RETRY_BASE * attempts as u32);
+            }
+        }
+    }
 }
 
 /// One writer's work between exclusive creation and rename: a single
@@ -402,5 +485,76 @@ mod tests {
         let base = tempfile::tempdir().expect("temporary config root");
         let path = base.path().join("equalizer.cfg");
         assert!(sync_parent_dir(&path).is_ok());
+    }
+
+    /// The raw OS error a Windows replace refusal carries (the
+    /// `windows-sys` `ERROR_SHARING_VIOLATION` value); `from_raw_os_error`
+    /// stores it verbatim on every platform, so the shared policy below
+    /// is exercisable without a Windows host.
+    const TEST_SHARING_VIOLATION: i32 = 32;
+
+    /// Regression (Windows CI, concurrent-writers test): a replace
+    /// refused because a concurrent replacement of the same destination
+    /// name is in flight costs a bounded retry — never the save. The
+    /// policy is driven through an injected backend so every platform's
+    /// test run exercises it; only the per-platform classification
+    /// differs (`is_replace_race_refusal`).
+    #[test]
+    fn a_transient_replace_race_costs_a_retry_not_the_save() {
+        let mut calls = 0;
+        let result = retry_transient_replace_race(
+            || {
+                calls += 1;
+                if calls <= 2 {
+                    Err(std::io::Error::from_raw_os_error(TEST_SHARING_VIOLATION))
+                } else {
+                    Ok(())
+                }
+            },
+            |error| error.raw_os_error() == Some(TEST_SHARING_VIOLATION),
+        );
+        assert!(
+            result.is_ok(),
+            "a transient refusal must cost a retry, never the save"
+        );
+        assert_eq!(calls, 3);
+    }
+
+    /// A non-race failure is returned on the first attempt: the retry
+    /// policy exists for in-flight-replacement refusals only, never to
+    /// paper over a replace that cannot succeed.
+    #[test]
+    fn a_permanent_replace_failure_is_returned_on_the_first_attempt() {
+        let mut calls = 0;
+        let result = retry_transient_replace_race(
+            || {
+                calls += 1;
+                // An error outside the race family (ENOENT-shaped here).
+                Err(std::io::Error::from_raw_os_error(2))
+            },
+            |error| error.raw_os_error() == Some(TEST_SHARING_VIOLATION),
+        );
+        assert!(result.is_err(), "a non-race failure must not be retried");
+        assert_eq!(calls, 1, "a non-race error is returned immediately");
+    }
+
+    /// Exhausted retries report the save as failed with the last
+    /// refusal — the durability-honest outcome the caller's trailing
+    /// edge persistence re-arms on.
+    #[test]
+    fn exhausted_race_retries_return_the_last_refusal() {
+        let mut calls = 0;
+        let result = retry_transient_replace_race(
+            || {
+                calls += 1;
+                Err(std::io::Error::from_raw_os_error(TEST_SHARING_VIOLATION))
+            },
+            |error| error.raw_os_error() == Some(TEST_SHARING_VIOLATION),
+        );
+        assert!(
+            result.is_err(),
+            "exhausted retries must honestly report the save as failed"
+        );
+        assert_eq!(calls, REPLACE_RACE_RETRIES + 1);
     }
 }
