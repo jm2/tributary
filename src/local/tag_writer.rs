@@ -327,7 +327,16 @@ fn retained_handle_identity(file: &File) -> std::io::Result<(u64, u64)> {
 fn retained_leaf_identity(parent: &File, leaf: &OsStr) -> std::io::Result<(u64, u64)> {
     let stat = rustix::fs::statat(parent, leaf, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
         .map_err(std::io::Error::from)?;
-    Ok((stat.st_dev, stat.st_ino))
+    // `dev_t` is `i32` on macOS while Linux's is already `u64`; normalize to
+    // the `u64` the creation identity carries (`MetadataExt::dev`). A
+    // negative device id fails closed: an unprovable identity means the
+    // caller preserves the entry, never unlinks it.
+    #[cfg(target_os = "macos")]
+    let device = u64::try_from(stat.st_dev)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "negative device id"))?;
+    #[cfg(not(target_os = "macos"))]
+    let device = stat.st_dev;
+    Ok((device, stat.st_ino))
 }
 
 /// Randomized staged-sibling leaf name, preserving the final extension.
