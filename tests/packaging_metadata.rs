@@ -1856,12 +1856,14 @@ fn assert_publisher_mints_the_gate_app_token(workflow: &serde_yaml::Value) {
     assert_eq!(
         mint["with"]["app-id"].as_str(),
         Some("${{ secrets.BOT_REVIEW_GATE_APP_ID }}"),
-        "the gate-publisher App id must come from a repository secret"
+        "the gate-publisher App id must come from a \
+         bot-review-gate-publisher environment secret"
     );
     assert_eq!(
         mint["with"]["private-key"].as_str(),
         Some("${{ secrets.BOT_REVIEW_GATE_PRIVATE_KEY }}"),
-        "the gate-publisher App key must come from a repository secret"
+        "the gate-publisher App key must come from a \
+         bot-review-gate-publisher environment secret"
     );
     assert_eq!(
         mint["with"]["permission-checks"].as_str(),
