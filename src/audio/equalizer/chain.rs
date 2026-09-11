@@ -315,10 +315,27 @@ impl EqChain {
 
     /// Remove the installed `rglimiter` and restore the direct
     /// eq → post-convert link.
+    ///
+    /// Both old links are unlinked **before** the direct relink is
+    /// attempted (the `post-convert` sink pad stays busy until the
+    /// limiter's link is gone), and if the relink fails the previous
+    /// eq → clipper → post-convert path is re-established, so a failed
+    /// removal leaves the chain with a working (limiter-installed) data
+    /// path instead of a dangling `eq` source pad — unchanged, never
+    /// broken.
     fn remove_limiter(&self, clipper: &gst::Element) -> bool {
         self.eq.unlink(clipper);
-        drop_limiter_from_bin(&self.bin, clipper);
-        self.eq.link(&self.post_convert).is_ok()
+        clipper.unlink(&self.post_convert);
+        if self.eq.link(&self.post_convert).is_ok() {
+            drop_limiter_from_bin(&self.bin, clipper);
+            return true;
+        }
+        // Relink failed: restore the working limiter path so the chain
+        // stays playable and truthful (`clip_protection_installed`
+        // keeps matching the routed graph).
+        let _ = self.eq.link(clipper);
+        let _ = clipper.link(&self.post_convert);
+        false
     }
 
     /// True when the `rglimiter` element is currently inside the bin.

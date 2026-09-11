@@ -201,6 +201,33 @@ fn equalizer_persistence_allowed(state: &EqEngineState) -> bool {
     !state.persistence_suppressed
 }
 
+/// Classify a zero-timeout `state()` query. Returns `Some(was_playing)`
+/// when the pipeline reports a *settled* state (`Success` or `NoPreroll`
+/// with no pending target), and `None` when a state transition is in
+/// flight: an `Async` return reports the transition's *origin* state in
+/// `current` and its target in `pending`, so acting on `current` alone
+/// would run a topology edit against a pipeline whose data flow is
+/// about to change — `current = Paused, pending = Playing` reads as
+/// "not playing" and skips the pause entirely. The pending member of a
+/// zero-timeout query must therefore never be discarded.
+fn settled_zero_state(
+    query: (
+        Result<gst::StateChangeSuccess, gst::StateChangeError>,
+        gst::State,
+        gst::State,
+    ),
+) -> Option<bool> {
+    let (result, current, pending) = query;
+    let settled = matches!(
+        result,
+        Ok(gst::StateChangeSuccess::Success | gst::StateChangeSuccess::NoPreroll)
+    );
+    if !settled || pending != gst::State::VoidPending {
+        return None;
+    }
+    Some(current == gst::State::Playing)
+}
+
 /// GStreamer playback engine.
 ///
 /// Wraps a `playbin3` (with `playbin` fallback) and exposes a safe,
@@ -239,6 +266,12 @@ pub struct Player {
     /// of the local playback pipeline.
     #[cfg(target_os = "windows")]
     _windows_audio_route: Option<windows_audio::WindowsAudioRoute>,
+    /// Test-only seam override: when set, `with_pipeline_suspended`
+    /// delegates to this hook instead of driving the real pipeline, so
+    /// the deferred/confirmed seam outcomes behind the equalizer caller
+    /// discipline are exercisable deterministically in tests.
+    #[cfg(test)]
+    seam_override: RefCell<Option<Box<dyn FnOnce(&mut dyn FnMut() -> bool) -> bool>>>,
 }
 
 impl Player {
@@ -332,6 +365,8 @@ impl Player {
             bus_watch: RefCell::new(None),
             #[cfg(target_os = "windows")]
             _windows_audio_route: windows_audio_route,
+            #[cfg(test)]
+            seam_override: RefCell::new(None),
         };
 
         Ok((player, event_rx))
@@ -604,6 +639,14 @@ impl Player {
     ///   every change-spell writes, including one whose result is exactly
     ///   the fresh-install default state.
     ///
+    /// **Recorded-vs-installed discipline:** the recorded settings start
+    /// as the user's choice and are walked back to the *installed*
+    /// topology wherever the seam defers or the surgery fails, so the
+    /// persisted state never describes a bin that is not actually there.
+    /// A rolled-back record also makes the *next* apply retry the edit
+    /// (the toggles still differ), which is what keeps a deferred
+    /// uninstall/install from stranding a bin.
+    ///
     /// A configuration update never emits a `Buffering` event: GObject
     /// property writes produce no pipeline event, and any `Buffering`
     /// observed on the bus originates from the upstream decoder.
@@ -612,28 +655,46 @@ impl Player {
         let enabled_changed = current.enabled != next.enabled;
         let clip_changed = next.enabled && current.clip_protection != next.clip_protection;
 
+        let mut effective = next;
+
         if enabled_changed {
             if next.enabled {
-                self.install_equalizer_bin(&next);
-            } else {
-                self.uninstall_equalizer_bin();
+                if !self.install_equalizer_bin(&next) {
+                    // Deferred install: no chain was recorded and no bin
+                    // entered the pipeline. Keep `enabled` at its
+                    // previous value so the recorded state stays
+                    // truthful — band edits have no chain to land on —
+                    // and the next apply retries the enable.
+                    effective.enabled = current.enabled;
+                }
+            } else if !self.uninstall_equalizer_bin() {
+                // Deferred uninstall: the bin is still attached *with
+                // its chain handle retained*. Keep `enabled` recorded —
+                // persisting `false` here would make
+                // `ensure_equalizer_installed` skip both the rebuild and
+                // the removal, stranding an audio-processing bin until
+                // restart — so the next apply retries the removal.
+                effective.enabled = current.enabled;
             }
         } else if clip_changed && !self.toggle_clip_protection(next.clip_protection) {
-            // The toggle was deferred (pause unconfirmed) or the
-            // surgery failed: the bin still carries the previous
-            // protection, so record that — the persisted and
-            // user-visible state stays truthful, and the next
-            // apply re-attempts the toggle cleanly.
-            self.eq_state.borrow_mut().settings.clip_protection = current.clip_protection;
+            // The toggle was deferred (the edit never ran, so the chain
+            // carries the previous protection) or the surgery failed
+            // (the chain degraded to the no-limiter layout): record what
+            // the installed chain *actually* carries instead of assuming
+            // either endpoint — the persisted and user-visible state
+            // stays truthful, and the next apply re-attempts cleanly.
+            effective.clip_protection = self
+                .installed_clip_protection()
+                .unwrap_or(current.clip_protection);
         }
 
-        if next.enabled {
-            self.push_band_transaction(&next);
+        if effective.enabled {
+            self.push_band_transaction(&effective);
         }
 
         {
             let mut state = self.eq_state.borrow_mut();
-            state.settings = next;
+            state.settings = effective;
             // A user-driven apply clears an error retirement: the
             // operator explicitly chose this configuration, so the next
             // load must honor it again.
@@ -642,11 +703,24 @@ impl Player {
         self.schedule_equalizer_save();
     }
 
+    /// The clip-protection policy the installed chain actually carries,
+    /// or `None` when no chain is installed.
+    fn installed_clip_protection(&self) -> Option<equalizer::ClipProtection> {
+        self.eq_state.borrow().chain.as_ref().map(|chain| {
+            if chain.clip_protection_installed() {
+                equalizer::ClipProtection::Soft
+            } else {
+                equalizer::ClipProtection::Off
+            }
+        })
+    }
+
     /// Limiter-only topology change inside the installed bin (clip
     /// protection toggle while the equalizer stays enabled). Returns
     /// `false` when the seam deferred the edit or the surgery failed —
-    /// recoverable per the contract; the caller keeps the previous
-    /// protection recorded.
+    /// recoverable per the contract; the caller then records the
+    /// protection the installed chain actually carries (see
+    /// [`Player::installed_clip_protection`]).
     fn toggle_clip_protection(&self, protection: equalizer::ClipProtection) -> bool {
         self.with_pipeline_suspended(|| {
             let mut state = self.eq_state.borrow_mut();
@@ -676,7 +750,15 @@ impl Player {
     /// or directly when the pipeline is not running. Construction or
     /// negotiation failure degrades to the passthrough layout with a
     /// single informational diagnostic — never a half-inserted chain.
-    fn install_equalizer_bin(&self, settings: &EqSettings) {
+    ///
+    /// Returns `true` when the attempt reached a confirmed topology:
+    /// the bin installed (chain retained), or a build failure degraded
+    /// to the documented passthrough (the next URI load retries the
+    /// build, and an equalizer-originated pipeline error retires the
+    /// chain). Returns `false` only when the seam deferred: no chain
+    /// was recorded, the pipeline is untouched, and the caller must
+    /// keep `enabled` at its previous value so the next apply retries.
+    fn install_equalizer_bin(&self, settings: &EqSettings) -> bool {
         match equalizer::EqChain::build(settings) {
             Ok(chain) => {
                 let bin = chain.bin.clone();
@@ -692,6 +774,7 @@ impl Player {
                         "Equalizer chain installed into local pipeline"
                     );
                 }
+                installed
             }
             Err(error) => {
                 self.eq_state.borrow_mut().chain = None;
@@ -701,27 +784,43 @@ impl Player {
                     error = %error,
                     "Equalizer unavailable; local output remains passthrough"
                 );
+                true
             }
         }
     }
 
     /// Remove the installed equalizer bin via the pause/relink seam.
     /// Persisted settings stay on disk untouched.
-    fn uninstall_equalizer_bin(&self) {
-        let had_chain = self.eq_state.borrow_mut().chain.take().is_some();
-        if !had_chain {
-            return;
+    ///
+    /// The chain handle is cleared **inside the confirmed edit** — a
+    /// deferred seam therefore leaves both the bin attached and its
+    /// handle retained, and the caller keeps `enabled` recorded, so the
+    /// removal is retried by the next apply instead of stranding an
+    /// audio-processing bin whose rebuild path (`enabled = false` +
+    /// `chain = None`) has been erased. Returns `true` when the
+    /// pipeline is confirmed passthrough, `false` when the edit was
+    /// deferred.
+    fn uninstall_equalizer_bin(&self) -> bool {
+        if self.eq_state.borrow().chain.is_none() {
+            // Nothing recorded as installed: the pipeline is already in
+            // the passthrough layout, so there is nothing to confirm.
+            return true;
         }
+        let preset = Preset::key(self.eq_state.borrow().settings.preset);
         self.with_pipeline_suspended(|| {
+            let mut state = self.eq_state.borrow_mut();
+            let had_chain = state.chain.take().is_some();
             self.playbin
                 .set_property("audio-filter", Option::<&gst::Element>::None);
+            drop(state);
+            if had_chain {
+                info!(
+                    enabled = false,
+                    preset, "Equalizer chain removed from local pipeline"
+                );
+            }
             true
-        });
-        info!(
-            enabled = false,
-            preset = Preset::key(self.eq_state.borrow().settings.preset),
-            "Equalizer chain removed from local pipeline"
-        );
+        })
     }
 
     /// Guarantee an installed bin before a fresh pipeline spins up (URI
@@ -752,9 +851,33 @@ impl Player {
     /// `Playing`) and the edit is deferred: the caller reports failure
     /// and the next apply, or the next URI load's install seam, retries.
     /// A NULL pipeline (idle player) skips straight to the edit.
+    ///
+    /// A zero-timeout query that finds a *transition in flight* is also
+    /// a defer: its `current` member reports the transition's *origin*
+    /// state (e.g. `Paused` with `Playing` pending), which would read as
+    /// "not playing" and run the edit without ever confirming a settled
+    /// state — exactly the async-transition race the bounded window
+    /// exists to prevent.
     fn with_pipeline_suspended<F: FnOnce() -> bool>(&self, edit: F) -> bool {
-        let (_, current, _) = self.playbin.state(gst::ClockTime::ZERO);
-        let was_playing = current == gst::State::Playing;
+        #[cfg(test)]
+        if let Some(seam) = self.seam_override.borrow_mut().take() {
+            // Test hook: hand the edit to the injected seam outcome so
+            // the deferred/confirmed caller discipline is exercisable
+            // without a live pipeline.
+            let mut edit: Option<F> = Some(edit);
+            let mut run = move || {
+                let taken = edit.take().expect("edit invoked at most once");
+                taken()
+            };
+            return seam(&mut run);
+        }
+        let Some(was_playing) = settled_zero_state(self.playbin.state(gst::ClockTime::ZERO)) else {
+            warn!(
+                "Pipeline state query found a transition in flight; \
+                 equalizer topology edit deferred"
+            );
+            return false;
+        };
         if was_playing {
             if let Err(error) = self.playbin.set_state(gst::State::Paused) {
                 warn!(
@@ -1319,6 +1442,7 @@ fn save_volume(level: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
 
     const PROXY_BYPASS_CHILD: &str = "TRIBUTARY_PROXY_BYPASS_CHILD";
     const PROXY_BYPASS_CHILD_VALUE: &str = "tributary-proxy-bypass-child-v1";
@@ -1748,4 +1872,5 @@ mod tests {
             "a readable file must accept default-state writes"
         );
     }
+
 }
