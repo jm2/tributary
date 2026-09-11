@@ -52,9 +52,14 @@ pub(super) fn announce_gain_value(scale: &gtk::Scale) {
 }
 
 /// UI values snap to the contract's 0.5 dB precision even when the
-/// platform hands the slider a finer intermediate value.
+/// platform hands the slider a finer intermediate value. The formula is
+/// the one canonical read-boundary normalization ([`EqSettings::
+/// normalize_gain_db`]): clamp into the contract range, then snap to
+/// the half-step grid, ties away from zero — the same coercion a
+/// persisted off-grid value undergoes, so the UI and the parser can
+/// never disagree about what a gain value may be.
 pub(super) fn snap_gain(value: f64) -> f64 {
-    EqSettings::clamp_gain_db((value * 2.0).round() / 2.0)
+    EqSettings::normalize_gain_db(value)
 }
 
 pub(super) fn preset_menu_position(preset: Preset) -> u32 {

@@ -11,6 +11,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// within this process; the process id separates concurrent writers.
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// How many exclusive-create collisions one write tolerates before
+/// giving up. A collision means another process generated the same
+/// `<pid>.<sequence>` name — realistically only a crashed writer whose
+/// pid the OS later reused at the same sequence position — and each
+/// retry simply advances the per-process sequence to a fresh name.
+const TEMP_COLLISION_RETRIES: usize = 8;
+
 /// Write `content` to `path` via the atomic-replace protocol. The temp
 /// sibling is created exclusively under a name unique to this write, so
 /// concurrent writers never collide and a sibling left behind by a
@@ -20,18 +27,22 @@ pub(super) fn write_equalizer_file_atomic(
     path: &std::path::Path,
     content: &str,
 ) -> std::io::Result<()> {
-    let temp_path = unique_temp_sibling(path);
     // Exclusive create: if this open fails, this writer owns no file
-    // and must not remove whatever beat it to the name.
-    let mut file = open_temp_file(&temp_path)?;
+    // and must not remove whatever beat it to the name. A collision
+    // with a sibling stranded under the same `<pid>.<sequence>` name
+    // (crashed writer, later pid reuse) costs one retry with the next
+    // sequence value — the save is only discarded when every retry
+    // collides, and a file this writer did not create is never removed.
+    let (mut file, temp_path) = create_temp_exclusively(path)?;
     let staged = write_and_sync(&mut file, content);
     drop(file);
-    match staged.and_then(|()| std::fs::rename(&temp_path, path)) {
+    match staged.and_then(|()| rename_over(&temp_path, path)) {
         Ok(()) => {
             // POSIX flushes the directory entry and reports a failure to
-            // the caller; platforms without a std directory handle skip
-            // the flush entirely (see sync_parent_dir), so the rename's
-            // success is the save's outcome.
+            // the caller; platforms whose std layer cannot express the
+            // equivalent either carry the durability in the rename
+            // itself (Windows MOVEFILE_WRITE_THROUGH) or skip the flush
+            // entirely, so the rename's success is the save's outcome.
             #[cfg(unix)]
             {
                 sync_parent_dir(path)
@@ -50,6 +61,69 @@ pub(super) fn write_equalizer_file_atomic(
             Err(error)
         }
     }
+}
+
+/// Create the temp sibling for exclusive single-writer access,
+/// retrying with the next per-process sequence value when the name
+/// collides with an existing file (crashed writer plus pid reuse).
+/// Returns the exclusively-created handle together with the winning
+/// path, so the caller's cleanup can never touch a file it did not
+/// create.
+fn create_temp_exclusively(
+    path: &std::path::Path,
+) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
+    let mut last_error = None;
+    for _ in 0..TEMP_COLLISION_RETRIES {
+        let temp_path = unique_temp_sibling(path);
+        match open_temp_file(&temp_path) {
+            Ok(file) => return Ok((file, temp_path)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "every temp-sibling name collided",
+        )
+    }))
+}
+
+/// Replace the destination with the staged temp. On Windows the rename
+/// must request `MOVEFILE_WRITE_THROUGH`: `std::fs::rename` does not,
+/// so a reported success could still be lost to a sudden power loss
+/// while the destination-directory update is only in flight. The
+/// `MOVEFILE_REPLACE_EXISTING` flag preserves `rename(2)`'s
+/// replace-the-destination semantics.
+#[cfg(windows)]
+fn rename_over(temp_path: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+    let mut from: Vec<u16> = temp_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let ok = windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+        from.as_mut_ptr(),
+        to.as_mut_ptr(),
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+    );
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// POSIX and everything else: `rename(2)` atomically replaces the
+/// destination; the directory-entry flush is the caller's separate
+/// `sync_parent_dir` step on unix.
+#[cfg(not(windows))]
+fn rename_over(temp_path: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(temp_path, path)
 }
 
 /// One writer's work between exclusive creation and rename: a single
@@ -99,7 +173,10 @@ fn sync_parent_dir(_path: &std::path::Path) {}
 /// The temp sibling for one write: the destination name extended with
 /// the writing process's id and a per-process sequence, then `.tmp`.
 /// Unique per write, always in the destination's directory so the
-/// rename stays within one filesystem.
+/// rename stays within one filesystem. A name collision — only
+/// possible when a crashed writer's pid is later reused at the same
+/// sequence position — is retried with the next sequence value by
+/// [`create_temp_exclusively`].
 fn unique_temp_sibling(path: &std::path::Path) -> std::path::PathBuf {
     let mut name = path
         .file_name()
@@ -117,7 +194,16 @@ fn unique_temp_sibling(path: &std::path::Path) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard};
+
     use super::*;
+
+    /// Serializes every test whose outcome depends on the shared
+    /// per-process `TEMP_SEQUENCE`: a parallel test consuming sequence
+    /// values mid-test would break the collision test's name
+    /// prediction. Locking this in each sequence-consuming test keeps
+    /// the predictions deterministic.
+    static SEQUENCE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// The temp files a directory holds, sorted for stable assertions.
     fn dir_entries(dir: &std::path::Path) -> Vec<String> {
@@ -135,8 +221,17 @@ mod tests {
         names
     }
 
+    /// Hold while consuming or predicting sequence values (see
+    /// [`SEQUENCE_TEST_LOCK`]).
+    fn lock_sequence() -> MutexGuard<'static, ()> {
+        SEQUENCE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn atomic_write_replaces_and_leaves_no_temp_sibling() {
+        let _sequence_guard = lock_sequence();
         let base = tempfile::tempdir().expect("temporary config root");
         let path = base.path().join("equalizer.cfg");
 
@@ -151,6 +246,7 @@ mod tests {
 
     #[test]
     fn unique_temp_siblings_differ_and_stay_beside_the_destination() {
+        let _sequence_guard = lock_sequence();
         let path = std::path::Path::new("state/tributary/equalizer.cfg");
         let first = unique_temp_sibling(path);
         let second = unique_temp_sibling(path);
@@ -180,6 +276,7 @@ mod tests {
     /// a temp may ever delete it.
     #[test]
     fn a_stale_sibling_from_a_crashed_writer_never_blocks_or_dies() {
+        let _sequence_guard = lock_sequence();
         let base = tempfile::tempdir().expect("temporary config root");
         let path = base.path().join("equalizer.cfg");
         let stale = base.path().join("equalizer.cfg.999.0.tmp");
@@ -198,6 +295,48 @@ mod tests {
             vec![
                 "equalizer.cfg".to_string(),
                 "equalizer.cfg.999.0.tmp".to_string(),
+            ]
+        );
+    }
+
+    /// Regression (review thread on PID-reuse collisions): when the
+    /// writer's first `<pid>.<sequence>` name is already taken — the
+    /// crashed-writer-plus-pid-reuse shape — the save retries with the
+    /// next sequence value and succeeds instead of discarding the
+    /// settings, and the pre-existing sibling (not this writer's) is
+    /// left exactly as it was.
+    #[test]
+    fn a_colliding_first_sibling_name_costs_one_retry_not_the_save() {
+        // The sequence and the pid must not move under the test while
+        // it predicts the writer's first name.
+        let _sequence_guard = SEQUENCE_TEST_LOCK.lock().unwrap();
+        let base = tempfile::tempdir().expect("temporary config root");
+        let path = base.path().join("equalizer.cfg");
+
+        let next_sequence = TEMP_SEQUENCE.load(Ordering::Relaxed);
+        let colliding = base.path().join(format!(
+            "equalizer.cfg.{}.{}.tmp",
+            std::process::id(),
+            next_sequence
+        ));
+        std::fs::write(&colliding, "a reused pid's stranded temp").expect("seed colliding sibling");
+
+        assert!(
+            write_equalizer_file_atomic(&path, "fresh=\"1\"\n").is_ok(),
+            "a single collision must cost a retry, never the save"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh=\"1\"\n");
+        // The colliding sibling belongs to someone else: untouched.
+        assert_eq!(
+            std::fs::read_to_string(&colliding).unwrap(),
+            "a reused pid's stranded temp"
+        );
+        // Exactly the destination and the foreign sibling remain.
+        assert_eq!(
+            dir_entries(base.path()),
+            vec![
+                "equalizer.cfg".to_string(),
+                format!("equalizer.cfg.{}.{}.tmp", std::process::id(), next_sequence),
             ]
         );
     }

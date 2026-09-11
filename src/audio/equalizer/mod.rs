@@ -161,6 +161,18 @@ impl EqSettings {
         value.clamp(MIN_GAIN_DB, MAX_GAIN_DB)
     }
 
+    /// Normalize a gain value across the read boundary: clamp into the
+    /// contract range, then snap to the fixed 0.5 dB step grid, ties
+    /// away from zero (`f64::round`). No off-grid value may cross the
+    /// read boundary into the runtime — the bounded user surface would
+    /// reject it, so runtime code must not be able to materialize it
+    /// either (contract: *Persistence*, validation rules). Off-grid
+    /// coercion happens per key exactly like the range clamps; it never
+    /// invalidates the file.
+    pub fn normalize_gain_db(value: f64) -> f64 {
+        Self::clamp_gain_db((value * 2.0).round() / 2.0)
+    }
+
     /// Convert a preamp dB value to the `volume` element's linear factor
     /// (`factor = 10^(dB/20)`); `0.0 dB` maps to unity `1.0`.
     pub fn preamp_db_to_factor(preamp_db: f64) -> f64 {
