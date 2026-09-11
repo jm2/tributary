@@ -7,11 +7,90 @@
 //! after the transfer published it.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::super::types::TransferError;
-use super::{OwnedChange, RunContext, TransferExecutor};
-use crate::local::write_authority::{PreparedWriteTarget, ReversalOutcome};
+use super::{RunContext, TransferExecutor};
+use crate::local::root_authority::LeafIdentity;
+use crate::local::write_authority::{
+    CommitOutcome, ConflictResolution, PreparedWriteTarget, ReversalOutcome,
+};
+
+/// One destination mutation the executor owns and must undo on rollback.
+///
+/// Rollback reverses what was actually published, never what the plan
+/// predicted. A Preserve conflict publishes to a renamed sibling — removing
+/// the planned path would destroy the pre-existing original — and an
+/// Overwrite commit replaces an original that only a saved copy can restore.
+///
+/// Every variant also carries the no-follow leaf identity the write
+/// authority captured at publish/creation time. Before each reversal
+/// mutation the destination is re-stat'ed and the identity compared: a
+/// mismatch means a concurrent writer replaced the transfer's publication
+/// after it committed, so reversing by pathname alone would delete — or
+/// restore a backup over — a file the transfer does not own. Such a leaf is
+/// refused and the rollback fails instead. `None` degrades that reversal to
+/// the legacy path-only behavior (identity capture is best-effort).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum OwnedChange {
+    /// A file the executor published at this path; rollback removes exactly
+    /// this path. Fresh publishes and preserved siblings both land here.
+    PublishedFile {
+        relative_path: PathBuf,
+        published_leaf: Option<LeafIdentity>,
+    },
+    /// A pre-existing file the executor replaced; its bytes were saved at
+    /// `backup_relative_path` before the replace. Rollback republishes
+    /// the backup over `relative_path` and consumes the backup. The
+    /// backup's bind-time identity (`backup_leaf`) is verified —
+    /// change-instant-exact, so a same-index swap-in is refused — before
+    /// BOTH the restoration and the
+    /// successful-transfer disposal: a backup name a concurrent writer
+    /// swapped for a foreign object is refused fail-closed, never
+    /// installed as the original and never silently deleted.
+    ReplacedFile {
+        relative_path: PathBuf,
+        backup_relative_path: PathBuf,
+        backup_leaf: Option<LeafIdentity>,
+        published_leaf: Option<LeafIdentity>,
+    },
+    /// A directory (or directory ancestor) the executor created; it must be
+    /// empty once every file inside it has been rolled back. Recorded only
+    /// when the directory was provably absent immediately before creation.
+    CreatedDirectory {
+        relative_path: PathBuf,
+        created_directory: Option<LeafIdentity>,
+    },
+}
+
+/// Classify a committed copy into the owned change rollback must reverse.
+///
+/// The commit outcome is authoritative about what the publish actually did:
+/// an Overwrite commit that bound a replaced original (`replaced_original`)
+/// is rolled back by restoring that backup, while an Overwrite commit that
+/// replaced nothing (the occupant vanished before the publish), a fresh
+/// publish, and a preserved sibling all roll back by removing the actual
+/// published path.
+pub(super) fn owned_change_for_copy(outcome: CommitOutcome) -> OwnedChange {
+    match outcome.resolution {
+        ConflictResolution::Overwrite => match outcome.replaced_original {
+            Some(backup_relative_path) => OwnedChange::ReplacedFile {
+                relative_path: outcome.relative_path,
+                backup_relative_path,
+                backup_leaf: outcome.replaced_original_leaf,
+                published_leaf: outcome.published_leaf,
+            },
+            None => OwnedChange::PublishedFile {
+                relative_path: outcome.relative_path,
+                published_leaf: outcome.published_leaf,
+            },
+        },
+        ConflictResolution::Fresh | ConflictResolution::Preserved => OwnedChange::PublishedFile {
+            relative_path: outcome.relative_path,
+            published_leaf: outcome.published_leaf,
+        },
+    }
+}
 
 impl TransferExecutor {
     /// Remove the saved originals of successful overwrite commits.
@@ -107,40 +186,7 @@ impl TransferExecutor {
                     TransferError::authority(format!("destination not current: {error}"))
                 }));
             }
-            let outcome = match change {
-                OwnedChange::PublishedFile {
-                    relative_path,
-                    published_leaf,
-                } => Self::reverse(
-                    &relative_path,
-                    self.request
-                        .destination
-                        .remove_relative_file_verified(&relative_path, published_leaf),
-                ),
-                OwnedChange::ReplacedFile {
-                    relative_path,
-                    backup_relative_path,
-                    backup_leaf,
-                    published_leaf,
-                } => Self::reverse(
-                    &relative_path,
-                    self.request.destination.restore_relative_file_verified(
-                        &backup_relative_path,
-                        &relative_path,
-                        published_leaf.as_ref(),
-                        backup_leaf.as_ref(),
-                    ),
-                ),
-                OwnedChange::CreatedDirectory {
-                    relative_path,
-                    created_directory,
-                } => Self::reverse(
-                    &relative_path,
-                    self.request
-                        .destination
-                        .remove_relative_directory_verified(&relative_path, created_directory),
-                ),
-            };
+            let outcome = self.reverse_committed_change(change);
             if outcome.is_err() && first_failure.is_none() {
                 first_failure = outcome.err();
             }
@@ -148,6 +194,47 @@ impl TransferExecutor {
         match first_failure {
             Some(error) => Err(error),
             None => Ok(()),
+        }
+    }
+
+    /// Reverse one committed owned change: the recorded leaf identity is
+    /// re-verified against whatever currently occupies the path before the
+    /// reversal mutation, and a refused or failed reversal is surfaced
+    /// instead of touching a leaf the transfer no longer owns.
+    fn reverse_committed_change(&self, change: OwnedChange) -> Result<(), TransferError> {
+        match change {
+            OwnedChange::PublishedFile {
+                relative_path,
+                published_leaf,
+            } => Self::reverse(
+                &relative_path,
+                self.request
+                    .destination
+                    .remove_relative_file_verified(&relative_path, published_leaf),
+            ),
+            OwnedChange::ReplacedFile {
+                relative_path,
+                backup_relative_path,
+                backup_leaf,
+                published_leaf,
+            } => Self::reverse(
+                &relative_path,
+                self.request.destination.restore_relative_file_verified(
+                    &backup_relative_path,
+                    &relative_path,
+                    published_leaf.as_ref(),
+                    backup_leaf.as_ref(),
+                ),
+            ),
+            OwnedChange::CreatedDirectory {
+                relative_path,
+                created_directory,
+            } => Self::reverse(
+                &relative_path,
+                self.request
+                    .destination
+                    .remove_relative_directory_verified(&relative_path, created_directory),
+            ),
         }
     }
 
