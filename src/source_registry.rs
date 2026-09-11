@@ -1436,6 +1436,11 @@ struct SourceRegistryInner {
     playback_reference_binding: PlaybackReferenceBinding,
     built_ins: Mutex<HashMap<SourceId, BuiltInInstallation>>,
     external_sessions: Mutex<HashMap<SourceId, ProvenanceClaimId>>,
+    /// Written identities per source that no post-mutation refresh has
+    /// published yet. Every spawned Catalogue-lane refresh task carries the
+    /// accumulated union, so a superseding refresh re-reads an earlier
+    /// overlapping save's batch instead of dropping it.
+    mutation_refresh_pending: Mutex<HashMap<SourceId, HashSet<TrackId>>>,
 }
 
 impl PublicHttpAuthority for SourceRegistryInner {
@@ -1588,6 +1593,7 @@ impl SourceRegistry {
                 playback_reference_binding: PlaybackReferenceBinding(Arc::new(())),
                 built_ins: Mutex::new(built_ins),
                 external_sessions: Mutex::new(HashMap::new()),
+                mutation_refresh_pending: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -2757,6 +2763,16 @@ impl SourceRegistry {
     /// re-derived; the adapter republishes every other accepted row
     /// untouched, and no other source is ever rescanned.
     ///
+    /// Overlapping saves for one source coalesce rather than supersede with
+    /// disjoint sets: written identities stay pending per source until a
+    /// refresh publishes them, and every spawned task carries the accumulated
+    /// union. `begin_refresh` supersedes — cancels — the pending Catalogue
+    /// lane task, so a second save's refresh would otherwise cancel the
+    /// first save's refresh before it publishes and never re-read its
+    /// identities; carrying the union keeps every committed identity in the
+    /// republished row set. A cancelled or failed refresh consumes nothing:
+    /// its batch stays pending for the next refresh to re-read.
+    ///
     /// Returns the minted refresh generations, one per source that still had
     /// an exact live session. Fire-and-forget — publication happens on the
     /// lifecycle runtime and the visible row, subsequent Properties values,
@@ -2772,32 +2788,58 @@ impl SourceRegistry {
         }
 
         let mut generations = Vec::with_capacity(by_source.len());
-        for (source_id, track_ids) in by_source {
+        for (source_id, batch) in by_source {
+            // Accumulate this save into the source's pending identities and
+            // carry the accumulated union: any earlier save whose refresh has
+            // not published yet is re-read by this task too.
+            let track_ids = {
+                let mut pending = lock(&self.inner.mutation_refresh_pending);
+                let entry = pending.entry(source_id).or_default();
+                entry.extend(batch);
+                entry.clone()
+            };
             // No exact live session: a retired or replaced mount is never
-            // repopulated.
+            // repopulated, and its pending identities can never publish.
             let Some(owner) = self
                 .inner
                 .lifecycle
                 .begin_refresh(source_id, RefreshLane::Catalogue)
             else {
+                lock(&self.inner.mutation_refresh_pending).remove(&source_id);
                 continue;
             };
             let generation = owner.generation();
+            let pending_written = Arc::clone(&self.inner);
             owner.spawn(move |session, cancellation| async move {
                 let adapter = session.adapter();
                 let regular_playlist_capability = adapter.regular_playlist_capability();
                 match adapter
-                    .refresh_catalogue_after_mutation(track_ids, cancellation.clone())
+                    .refresh_catalogue_after_mutation(track_ids.clone(), cancellation.clone())
                     .await
                 {
-                    Ok(tracks) => RefreshTaskResult::Refreshed(AcceptedSourcePayload::catalogue(
-                        tracks,
-                        regular_playlist_capability,
-                    )),
-                    // A cancelled lane publishes nothing, and the default
-                    // adapter refusal (an adapter never reviewed for
-                    // post-mutation refresh semantics) is a no-op, never a
-                    // source failure: neither may degrade a live session.
+                    Ok(tracks) => {
+                        // Consume the carried batch only while this
+                        // publication is uncontested: a cancelled token means
+                        // a newer refresh displaced this lane, and the
+                        // identities stay pending for the successor, whose
+                        // carried set already includes their union.
+                        if !cancellation.is_cancelled() {
+                            if let Some(entry) =
+                                lock(&pending_written.mutation_refresh_pending).get_mut(&source_id)
+                            {
+                                entry.retain(|track_id| !track_ids.contains(track_id));
+                            }
+                        }
+                        RefreshTaskResult::Refreshed(AcceptedSourcePayload::catalogue(
+                            tracks,
+                            regular_playlist_capability,
+                        ))
+                    }
+                    // A cancelled lane publishes nothing and keeps its batch
+                    // pending, and the default adapter refusal (an adapter
+                    // never reviewed for post-mutation refresh semantics) is
+                    // a no-op, never a source failure: neither may degrade a
+                    // live session.
                     Err(error)
                         if cancellation.is_cancelled()
                             || matches!(error, BackendError::Unsupported { .. }) =>
@@ -3092,6 +3134,10 @@ mod tests {
         stream_release: watch::Sender<bool>,
         server_playlist_release: watch::Sender<bool>,
         server_playlist_snapshot_release: watch::Sender<bool>,
+        post_mutation_release: watch::Sender<bool>,
+        post_mutation_calls: AtomicUsize,
+        post_mutation_requests: Mutex<Vec<HashSet<TrackId>>>,
+        post_mutation_failure: AtomicBool,
         view_specs: Mutex<HashMap<ViewOrigin, VecDeque<ViewSpec>>>,
     }
 
@@ -3106,6 +3152,7 @@ mod tests {
             let (stream_release, _receiver) = watch::channel(true);
             let (server_playlist_release, _receiver) = watch::channel(true);
             let (server_playlist_snapshot_release, _receiver) = watch::channel(true);
+            let (post_mutation_release, _receiver) = watch::channel(true);
             Arc::new(Self {
                 close_calls: AtomicUsize::new(0),
                 stream_calls: AtomicUsize::new(0),
@@ -3117,8 +3164,42 @@ mod tests {
                 stream_release,
                 server_playlist_release,
                 server_playlist_snapshot_release,
+                post_mutation_release,
+                post_mutation_calls: AtomicUsize::new(0),
+                post_mutation_requests: Mutex::new(Vec::new()),
+                post_mutation_failure: AtomicBool::new(false),
                 view_specs: Mutex::new(HashMap::new()),
             })
+        }
+
+        /// Hold every subsequent post-mutation refresh inside the adapter
+        /// call until [`FakeProbe::release_post_mutation_refresh`].
+        fn hold_post_mutation_refresh(&self) {
+            self.post_mutation_release.send_replace(false);
+        }
+
+        fn release_post_mutation_refresh(&self) {
+            self.post_mutation_release.send_replace(true);
+        }
+
+        /// Make every unblocked post-mutation refresh call fail with a
+        /// backend error until switched off.
+        fn set_post_mutation_failure(&self, failing: bool) {
+            self.post_mutation_failure.store(failing, Ordering::Release);
+        }
+
+        async fn wait_for_post_mutation_calls(&self, expected: usize) {
+            timeout(Duration::from_secs(2), async {
+                while self.post_mutation_calls.load(Ordering::Acquire) < expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("post-mutation refresh call started");
+        }
+
+        fn post_mutation_requests(&self) -> Vec<HashSet<TrackId>> {
+            lock(&self.post_mutation_requests).clone()
         }
 
         fn queue_public_view(&self, view: ViewOrigin, endpoint: &str, delay: Duration) {
@@ -3516,11 +3597,40 @@ mod tests {
 
         fn refresh_catalogue_after_mutation(
             self: Arc<Self>,
-            _written_track_ids: HashSet<TrackId>,
-            _cancellation: crate::source_lifecycle::CancellationObserver,
+            written_track_ids: HashSet<TrackId>,
+            mut cancellation: crate::source_lifecycle::CancellationObserver,
         ) -> CatalogueFuture {
             let refreshed = self.post_mutation_refresh.clone();
+            let mut release = self.probe.post_mutation_release.subscribe();
+            let probe = Arc::clone(&self.probe);
             Box::pin(async move {
+                // Record exactly which identities each refresh call is
+                // handed, so a test can require the coalesced union.
+                lock(&probe.post_mutation_requests).push(written_track_ids);
+                probe.post_mutation_calls.fetch_add(1, Ordering::AcqRel);
+                // A held gate keeps the call open so a test can overlap
+                // saves; a real device observes cancellation the same way.
+                while !*release.borrow_and_update() {
+                    tokio::select! {
+                        () = cancellation.cancelled() => {
+                            return Err(BackendError::ConnectionFailed {
+                                message: "fixture post-mutation refresh cancelled".to_string(),
+                                source: None,
+                            });
+                        }
+                        changed = release.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if probe.post_mutation_failure.load(Ordering::Acquire) {
+                    return Err(BackendError::ConnectionFailed {
+                        message: "fixture device error".to_string(),
+                        source: None,
+                    });
+                }
                 match refreshed {
                     Some(tracks) => Ok(tracks),
                     None => Err(BackendError::Unsupported {
@@ -4164,6 +4274,204 @@ mod tests {
         assert!(registry
             .refresh_catalogue_after_mutation(&[(ghost, track_id)])
             .is_empty());
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn overlapping_saves_coalesce_into_one_superseding_refresh() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let first_track = TrackId::remote("first-written-track").expect("track ID");
+        let second_track = TrackId::remote("second-written-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        probe.hold_post_mutation_refresh();
+
+        let republished = fixture_track(first_track.clone());
+        let adapter = probe
+            .playlist_adapter("coalescing", vec![fixture_track(first_track.clone())])
+            .with_post_mutation_refresh(vec![republished]);
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+        let (initial_generation, _epoch) = wait_for_catalogue(&registry, source_id).await;
+
+        // The first save's refresh blocks inside the adapter call.
+        let first_generation =
+            registry.refresh_catalogue_after_mutation(&[(source_id, first_track.clone())])[0];
+        probe.wait_for_post_mutation_calls(1).await;
+
+        // A second overlapping save supersedes the blocked lane. Its refresh
+        // must carry the union of both saves' written identities — not only
+        // its own — because the superseded first refresh publishes nothing.
+        let second_generation =
+            registry.refresh_catalogue_after_mutation(&[(source_id, second_track.clone())])[0];
+        assert_ne!(
+            second_generation, first_generation,
+            "the second save supersedes the first save's refresh lane"
+        );
+        probe.wait_for_post_mutation_calls(2).await;
+
+        probe.release_post_mutation_refresh();
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "exactly one refresh per save: {requests:?}"
+        );
+        assert_eq!(
+            requests[0],
+            HashSet::from([first_track.clone()]),
+            "the first save's refresh carries its own identity"
+        );
+        assert_eq!(
+            requests[1],
+            HashSet::from([first_track.clone(), second_track.clone()]),
+            "the superseding refresh coalesces the first save's written identity with its own"
+        );
+
+        let catalogue = registry
+            .snapshot(source_id)
+            .expect("the source stays live")
+            .catalogue
+            .expect("the accepted catalogue survives");
+        assert_ne!(
+            catalogue.generation, initial_generation,
+            "the coalesced refresh republished the catalogue"
+        );
+        assert_eq!(
+            catalogue.generation, second_generation,
+            "the publication carries the superseding generation"
+        );
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn a_failed_coalesced_refresh_keeps_earlier_identities_pending() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let first_track = TrackId::remote("pending-first-track").expect("track ID");
+        let second_track = TrackId::remote("pending-second-track").expect("track ID");
+        let third_track = TrackId::remote("pending-third-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        probe.hold_post_mutation_refresh();
+        probe.set_post_mutation_failure(true);
+
+        let adapter = probe
+            .playlist_adapter("failing-coalesce", vec![fixture_track(first_track.clone())])
+            .with_post_mutation_refresh(vec![fixture_track(first_track.clone())]);
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+        let (_initial_generation, _epoch) = wait_for_catalogue(&registry, source_id).await;
+
+        // Two overlapping saves: the coalesced refresh (carrying both
+        // identities) is the one that fails.
+        registry.refresh_catalogue_after_mutation(&[(source_id, first_track.clone())]);
+        probe.wait_for_post_mutation_calls(1).await;
+        registry.refresh_catalogue_after_mutation(&[(source_id, second_track.clone())]);
+        probe.wait_for_post_mutation_calls(2).await;
+        probe.release_post_mutation_refresh();
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests[1],
+            HashSet::from([first_track.clone(), second_track.clone()]),
+            "the coalesced refresh carried both saves' identities"
+        );
+        let snapshot = registry.snapshot(source_id).expect("the source stays live");
+        assert!(
+            snapshot
+                .refresh_failures
+                .contains_key(&RefreshLane::Catalogue),
+            "the coalesced refresh's failure is recorded: {:?}",
+            snapshot.refresh_failures
+        );
+
+        // A later save's refresh must still re-read the earlier identities:
+        // the failed coalesced batch stayed pending, never vanished.
+        probe.set_post_mutation_failure(false);
+        let third_generation =
+            registry.refresh_catalogue_after_mutation(&[(source_id, third_track.clone())])[0];
+        probe.wait_for_post_mutation_calls(3).await;
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests[2],
+            HashSet::from([
+                first_track.clone(),
+                second_track.clone(),
+                third_track.clone()
+            ]),
+            "the later refresh republishes the failed batch's identities together with its own"
+        );
+        let catalogue = registry
+            .snapshot(source_id)
+            .expect("the source stays live")
+            .catalogue
+            .expect("the accepted catalogue survives");
+        assert_eq!(catalogue.generation, third_generation);
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_during_a_coalesced_refresh_publishes_nothing() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let first_track = TrackId::remote("disconnect-first-track").expect("track ID");
+        let second_track = TrackId::remote("disconnect-second-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        probe.hold_post_mutation_refresh();
+
+        let adapter = probe
+            .playlist_adapter(
+                "disconnect-coalesce",
+                vec![fixture_track(first_track.clone())],
+            )
+            .with_post_mutation_refresh(vec![fixture_track(first_track.clone())]);
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+        let (initial_generation, _epoch) = wait_for_catalogue(&registry, source_id).await;
+
+        // Two overlapping saves coalesce into the second refresh while the
+        // first blocks inside the adapter call.
+        registry.refresh_catalogue_after_mutation(&[(source_id, first_track.clone())]);
+        probe.wait_for_post_mutation_calls(1).await;
+        registry.refresh_catalogue_after_mutation(&[(source_id, second_track.clone())]);
+        probe.wait_for_post_mutation_calls(2).await;
+        assert_eq!(
+            registry
+                .snapshot(source_id)
+                .expect("the source stays live while the refresh is held")
+                .catalogue
+                .expect("the accepted catalogue survives")
+                .generation,
+            initial_generation,
+            "a held refresh publishes nothing"
+        );
+
+        // Disconnecting mid-refresh cancels the coalesced task; releasing
+        // the gate must not let either call publish.
+        let disconnect = registry.disconnect(source_id).expect("disconnect source");
+        probe.release_post_mutation_refresh();
+        disconnect.wait().await;
+
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests[1],
+            HashSet::from([first_track.clone(), second_track.clone()]),
+            "the coalesced refresh was dispatched before the disconnect"
+        );
+        let snapshot = registry
+            .snapshot(source_id)
+            .expect("the retired source keeps its entry");
+        assert_eq!(
+            snapshot.state,
+            crate::source_lifecycle::SourceState::Dormant,
+            "the disconnected source retired to its dormant resting state"
+        );
+        assert!(
+            snapshot.catalogue.is_none(),
+            "the retired mount's catalogue is gone: the cancelled coalesced refresh published nothing"
+        );
         drop(registry);
     }
 
