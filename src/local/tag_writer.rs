@@ -320,6 +320,27 @@ fn retained_handle_identity(file: &File) -> std::io::Result<(u64, u64)> {
     Ok((metadata.dev(), metadata.ino()))
 }
 
+/// dev/ino pair from a rustix `Stat`, normalized to the `u64` the creation
+/// identity carries.
+///
+/// `dev_t` is `i32` on macOS while Linux's is already `u64`; normalize to
+/// the `u64` the creation identity carries (`MetadataExt::dev`). A negative
+/// device id fails closed: an unprovable identity means the caller preserves
+/// the entry, never unlinks it.
+#[cfg(unix)]
+// The `Result` is load-bearing on macOS (a negative `dev_t` fails closed) and
+// keeps every caller platform-uniform; on Linux the conversion is infallible,
+// which is the only target clippy sees here.
+#[allow(clippy::unnecessary_wraps)]
+fn stat_identity(stat: &rustix::fs::Stat) -> std::io::Result<(u64, u64)> {
+    #[cfg(target_os = "macos")]
+    let device = u64::try_from(stat.st_dev)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "negative device id"))?;
+    #[cfg(not(target_os = "macos"))]
+    let device = stat.st_dev;
+    Ok((device, stat.st_ino))
+}
+
 /// dev/ino of whatever entry `leaf` currently names beneath the retained
 /// parent, resolved through the directory handle without following a leaf
 /// symlink.
@@ -327,16 +348,118 @@ fn retained_handle_identity(file: &File) -> std::io::Result<(u64, u64)> {
 fn retained_leaf_identity(parent: &File, leaf: &OsStr) -> std::io::Result<(u64, u64)> {
     let stat = rustix::fs::statat(parent, leaf, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
         .map_err(std::io::Error::from)?;
-    // `dev_t` is `i32` on macOS while Linux's is already `u64`; normalize to
-    // the `u64` the creation identity carries (`MetadataExt::dev`). A
-    // negative device id fails closed: an unprovable identity means the
-    // caller preserves the entry, never unlinks it.
-    #[cfg(target_os = "macos")]
-    let device = u64::try_from(stat.st_dev)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "negative device id"))?;
-    #[cfg(not(target_os = "macos"))]
-    let device = stat.st_dev;
-    Ok((device, stat.st_ino))
+    stat_identity(&stat)
+}
+
+/// Remove the anchored `leaf` only while it is provably still bound to the
+/// object `created` names.
+///
+/// A proof-then-unlink pair (statat, then unlinkat) is two directory
+/// operations: an external writer that swaps the occupant between them has
+/// its newcomer destroyed by the unlink. This binds the removal to the
+/// verified identity instead:
+///
+/// 1. the leaf is opened `O_NOFOLLOW` through the retained parent, pinning
+///    the object a held handle refers to (a planted leaf symlink fails the
+///    open, and an unopenable leaf is unprovable);
+/// 2. the pinned object is fstat-verified against `created` — a mismatch
+///    means a newcomer occupies the name, which is preserved;
+/// 3. the entry is atomically relocated with the commit's own no-replace
+///    primitive onto a fresh randomized private name — a single directory
+///    operation, so the bind cannot tear, and the no-replace refusal on an
+///    occupied candidate preserves that occupant;
+/// 4. the private name is re-verified to name exactly the pinned object (a
+///    swap between the pin and the relocation moved a newcomer, which is
+///    renamed back where it was) — and only then unlinked.
+///
+/// Every unprovable step reports `false` and preserves every entry: debris
+/// is never destruction. The final unlink removes a name nothing else
+/// created and that was atomically bound to the verified object, so an
+/// external swap can strand debris but can never make this removal destroy
+/// a newcomer.
+#[cfg(unix)]
+fn remove_anchored_leaf_bound_to_identity(
+    parent: &File,
+    leaf: &OsStr,
+    created: (u64, u64),
+) -> bool {
+    // Pin the leaf's current object without following a symlink planted at
+    // the name, and require it to be exactly the object this section
+    // created. An unprovable leaf (vanished, symlinked, unopenable) is
+    // preserved.
+    let Ok(pinned) = rustix::fs::openat(
+        parent,
+        leaf,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) else {
+        return false;
+    };
+    let Ok(stat) = rustix::fs::fstat(&pinned) else {
+        return false;
+    };
+    let Ok(pinned_identity) = stat_identity(&stat) else {
+        return false;
+    };
+    if pinned_identity != created {
+        return false;
+    }
+    // Test-only seam inside the proof→bind window: the pinned object is
+    // verified, and the relocation that binds it to the private name has
+    // not run yet. A swap driven here exercises the relocation's re-verify
+    // and restore paths.
+    #[cfg(all(test, unix))]
+    run_retained_preflight_interpose(RetainedPreflightPhase::AfterProof, parent, leaf, leaf);
+
+    for _ in 0..8 {
+        // Relocate the pinned object onto a fresh randomized private name
+        // with the no-replace primitive: one atomic directory operation
+        // binds the verified object to a name nothing else created.
+        let retire_name = staged_sibling_name(leaf);
+        match rustix::fs::renameat_with(
+            parent,
+            leaf,
+            parent,
+            &retire_name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => {
+                // Re-verify the bind: the private name must now name the
+                // pinned object. A mismatch means the leaf was swapped
+                // between the pin and this relocation, so the newcomer —
+                // not the probe — moved; put it back where it was and
+                // preserve it.
+                match retained_leaf_identity(parent, &retire_name) {
+                    Ok(identity) if identity == created => {
+                        return rustix::fs::unlinkat(
+                            parent,
+                            &retire_name,
+                            rustix::fs::AtFlags::empty(),
+                        )
+                        .is_ok();
+                    }
+                    _ => {
+                        // Restore the displaced newcomer best-effort; if the
+                        // original name is occupied again, the newcomer
+                        // stays preserved at the private name.
+                        let _ = rustix::fs::renameat_with(
+                            parent,
+                            &retire_name,
+                            parent,
+                            leaf,
+                            rustix::fs::RenameFlags::NOREPLACE,
+                        );
+                        return false;
+                    }
+                }
+            }
+            Err(rustix::io::Errno::EXIST) => {}
+            // An unsupported relocation primitive cannot prove the bind:
+            // preserve the entry exactly where it is.
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// Randomized staged-sibling leaf name, preserving the final extension.
@@ -556,17 +679,17 @@ impl Drop for TempFile {
             if let Some(parent) = &self.anchored_parent {
                 // Anchored staging: unlink the staged leaf through the
                 // retained parent. `unlinkat` never follows a symlink at the
-                // leaf and resolves nothing above it, and the unlink fires
-                // only while the leaf still names the object this section
-                // created (exact dev/ino, read through the same handle) —
+                // leaf and resolves nothing above it, and the removal is
+                // bound to the object this section created (exact dev/ino,
+                // captured from the creation handle): the leaf is pinned by
+                // an O_NOFOLLOW open, verified, atomically relocated onto a
+                // fresh private name, re-verified, and only then unlinked —
                 // the cleanup removes exactly the entry this section created
                 // and can never mutate a directory the authority did not
                 // admit. An entry an external writer swapped into the name
                 // after stealing the staged leaf is debris we must preserve,
                 // never destroy.
-                if self.leaf_names_created_object(parent) {
-                    let _ = rustix::fs::unlinkat(parent, &self.path, rustix::fs::AtFlags::empty());
-                }
+                let _ = self.remove_bound_to_created_identity(parent);
                 return;
             }
             let _ = std::fs::remove_file(&self.path);
@@ -575,20 +698,20 @@ impl Drop for TempFile {
 }
 
 impl TempFile {
-    /// Whether the anchored leaf still names the object this section
-    /// created.
+    /// Remove this anchored temp's leaf only while it provably still names
+    /// the object this section created.
     ///
-    /// An unprovable identity (the leaf vanished, or the creation handle's
-    /// identity was never captured) fails closed: the caller preserves the
-    /// entry instead of unlinking a name it cannot prove is its own.
+    /// The removal is bound to the verified identity (see
+    /// [`remove_anchored_leaf_bound_to_identity`]): a swap between proof and
+    /// removal strands the newcomer as preserved debris instead of
+    /// destroying it. An uncaptured creation identity fails closed.
     #[cfg(unix)]
-    fn leaf_names_created_object(&self, parent: &File) -> bool {
-        match (
-            self.created_identity,
-            retained_leaf_identity(parent, self.path.as_os_str()),
-        ) {
-            (Some(created), Ok(landed)) => landed == created,
-            _ => false,
+    fn remove_bound_to_created_identity(&self, parent: &File) -> bool {
+        match self.created_identity {
+            Some(created) => {
+                remove_anchored_leaf_bound_to_identity(parent, self.path.as_os_str(), created)
+            }
+            None => false,
         }
     }
 }
@@ -793,13 +916,15 @@ pub fn preflight_tag_write_directory_retained(
     .map_err(|_| TagWritePreflightError::Unavailable)?;
 
     // The probe now lives at the vacant name. Aim the drop guard's
-    // anchored cleanup at that leaf, then prove the landed leaf still
-    // names this section's probe (exact dev/ino through the retained
-    // parent) before removing it: inside the rename→cleanup window an
-    // external writer can swap the entry, and the cleanup removes exactly
-    // the entry this section created — a swapped-in newcomer is preserved
-    // debris and the rehearsal refuses, because a capability check is
-    // successful only when its own cleanup provably succeeded.
+    // anchored cleanup at that leaf, then remove it through a removal
+    // bound to the probe's verified identity: the landed leaf is pinned
+    // by an O_NOFOLLOW open, fstat-verified, atomically relocated onto a
+    // fresh private name with the commit's own no-replace primitive,
+    // re-verified there, and only then unlinked. A swap in any window
+    // strands the newcomer on a provably-wrong identity — preserved
+    // debris, never destruction — and the rehearsal refuses, because a
+    // capability check is successful only when its own cleanup provably
+    // succeeded.
     replacement.path = PathBuf::from(&vacant_name);
     #[cfg(all(test, unix))]
     run_retained_preflight_interpose(
@@ -808,18 +933,16 @@ pub fn preflight_tag_write_directory_retained(
         replacement.path().as_os_str(),
         &vacant_name,
     );
-    if !replacement.leaf_names_created_object(parent) {
-        // The landed leaf no longer provably names this section's probe: an
-        // external writer swapped the entry inside the rename→cleanup
-        // window, or it vanished. Preserve the newcomer (and the stolen
-        // probe, now debris) — debris is never destruction — disarm the
-        // guard, and refuse: a capability check is successful only when
-        // its own cleanup provably succeeded.
+    if !replacement.remove_bound_to_created_identity(parent) {
+        // The landed leaf could not be provably removed as this section's
+        // probe: an external writer swapped the entry inside the
+        // install→cleanup window, or it vanished. Preserve the newcomer
+        // (and the stolen probe, now debris) — debris is never
+        // destruction — disarm the guard, and refuse: a capability check
+        // is successful only when its own cleanup provably succeeded.
         replacement.disarm_cleanup();
         return Err(TagWritePreflightError::Unavailable);
     }
-    rustix::fs::unlinkat(parent, &vacant_name, rustix::fs::AtFlags::empty())
-        .map_err(|_| TagWritePreflightError::Unavailable)?;
     replacement.disarm_cleanup();
     Ok(())
 }
@@ -1496,6 +1619,11 @@ enum RetainedPreflightPhase {
     /// cleanup proves and removes it: the external-swap window the cleanup's
     /// identity proof guards.
     BeforeCleanup,
+    /// Inside the bound removal, after the landed leaf's pinned object is
+    /// verified and before the relocation binds it to the private name:
+    /// the proof→bind window the identity-bound removal's re-verify and
+    /// restore paths guard. Both leaf arguments carry the landed leaf.
+    AfterProof,
 }
 
 /// Test-only seam: runs at each [`RetainedPreflightPhase`] of the retained
@@ -2525,6 +2653,79 @@ mod tests {
             vec![std::ffi::OsString::from("silence.flac")],
             "the refused rehearsal must leave no probe residue of its own"
         );
+    }
+
+    /// The identity-bound removal must survive a swap that lands between the
+    /// identity proof and the bind itself. The proof pins the landed probe
+    /// with an O_NOFOLLOW open; an external writer can then steal the probe
+    /// from the landed name and install a newcomer there before the
+    /// relocation runs. The relocation moves the newcomer — not the probe —
+    /// onto the private name, the re-verification catches the identity
+    /// mismatch, the newcomer is restored to its own name, and the rehearsal
+    /// refuses with every entry preserved: debris is never destruction.
+    #[cfg(unix)]
+    #[test]
+    fn retained_preflight_bind_preserves_a_newcomer_swapped_after_the_proof() {
+        use std::sync::{Arc, Mutex};
+
+        let (directory, album, _) = anchored_album_fixture("preflight-bind-swap");
+
+        let authority = mounted_root_authority(&directory);
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+        let (parent, leaf) = target
+            .retained_directory_handle()
+            .expect("retain the directory anchor");
+
+        let newcomer = Arc::new(Mutex::new(None::<SwappedNewcomer>));
+        let stolen = Arc::new(Mutex::new(None::<std::ffi::OsString>));
+        let newcomer_closure = Arc::clone(&newcomer);
+        let stolen_closure = Arc::clone(&stolen);
+        with_retained_preflight_interpose(
+            Box::new(move |phase, interposed_parent, landed_leaf, _vacant_leaf| {
+                if phase != RetainedPreflightPhase::AfterProof {
+                    return;
+                }
+                // The rehearsal's probe is pinned and identity-verified at
+                // the landed name. Steal it and install a newcomer there
+                // before the relocation binds the name: the bind must move
+                // the newcomer, catch the mismatch, and restore it.
+                let stolen_leaf = staged_sibling_name(std::ffi::OsStr::new("silence.flac"));
+                rustix::fs::renameat(
+                    interposed_parent,
+                    landed_leaf,
+                    interposed_parent,
+                    &stolen_leaf,
+                )
+                .expect("steal the pinned probe");
+                create_retained_sibling_exclusive(interposed_parent, landed_leaf)
+                    .expect("install the newcomer at the landed name");
+                let identity = retained_leaf_identity(interposed_parent, landed_leaf)
+                    .expect("read the newcomer's identity");
+                *newcomer_closure.lock().unwrap() = Some(SwappedNewcomer {
+                    leaf: landed_leaf.to_os_string(),
+                    identity,
+                });
+                *stolen_closure.lock().unwrap() = Some(stolen_leaf);
+            }),
+            || {
+                assert_eq!(
+                    crate::local::tag_writer::preflight_tag_write_directory_retained(
+                        &parent,
+                        &leaf,
+                        "the removable mutation target",
+                    ),
+                    Err(TagWritePreflightError::Unavailable),
+                    "a bind broken by a post-proof swap must refuse the rehearsal, \
+                     never destroy the newcomer"
+                );
+            },
+        );
+
+        // The newcomer was restored to its own name and the stolen probe is
+        // preserved debris; the refused rehearsal left nothing of its own.
+        assert_the_swap_survived_the_refused_cleanup(&parent, &album, newcomer, stolen);
     }
 
     #[test]
