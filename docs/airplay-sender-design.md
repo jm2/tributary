@@ -444,6 +444,57 @@ enum SenderError {
     Receiver(String),
 }
 
+/// Cancellation currency for one `open_session` call, owned by the
+/// load path. The in-flight call polls it at every blocking
+/// checkpoint — ownership re-verification (§4.3), each RTSP
+/// handshake step or daemon RPC, FIFO and API setup — and aborts
+/// negotiation as soon as it observes the flag, without waiting for
+/// the open deadline. The load path sets it when the load is
+/// dropped or its generation is superseded: exactly the conditions
+/// the event contract already keys on. This is deliberately not
+/// `PlayerEventGeneration` itself — a generation
+/// (`src/audio/mod.rs:85-87`) is a `Copy` value the caller compares
+/// after the fact, not a flag an in-flight call can observe, and a
+/// synchronous signature that carries only the generation cannot
+/// express the abort this contract promises (the module's
+/// non-blocking rule, `src/audio/mod.rs:5`). The concrete type is
+/// the implementation record's choice (an `Arc<AtomicBool>`-shaped
+/// flag or the runtime's cancellation primitive); the contract
+/// requires only that the flag is pollable from the calling thread
+/// and that setting it is synchronous and idempotent.
+struct OpenCancel { /* the implementation record's primitive */ }
+
+impl OpenCancel {
+    /// Synchronous, idempotent, safe from any thread. After it
+    /// returns, an in-flight `open_session` observes the flag at its
+    /// next checkpoint and unwinds through the restoration path.
+    fn cancel(&self);
+    /// The poll the in-flight call performs between blocking steps.
+    fn is_cancelled(&self) -> bool;
+}
+
+/// Outcome of `open_session`. Cancellation is its own outcome, not
+/// an error: a cancelled open never surfaces as a user-facing
+/// failure — no `SenderError` kind is invented for "the caller
+/// changed its mind", and no error event is published for the
+/// cancelled generation — while remaining machine-distinguishable
+/// so the load path can skip its failure-reporting branch entirely.
+enum OpenOutcome {
+    /// Negotiation completed; the session is live.
+    Opened(Box<dyn SenderSession>),
+    /// Cancellation was observed before negotiation completed.
+    /// Everything the attempt created — receiver session, queue
+    /// items, enabled-output changes — was already torn down through
+    /// the same restoration path as failure (§4.1, §4.3) before this
+    /// variant is returned, so `Cancelled` is a terminal,
+    /// fully-unwound state, never a half-open session.
+    Cancelled,
+    /// A failure inside the seam's taxonomy; the teardown guarantees
+    /// are the failure path's — restoration has run before the value
+    /// is returned.
+    Failed(SenderError),
+}
+
 /// A selectable transmission path. One immutable instance per
 /// protocol/backend, chosen at load time by configuration — never
 /// silently, never per-track.
@@ -484,28 +535,39 @@ trait AirplaySender: Send + Sync {
     /// to `build_raop_pipeline`
     /// (`src/audio/airplay_output.rs:231-241`). Ticket revocation on
     /// failure stays in the load path (`open_prepared_media`,
-    /// :199-208), exactly as today.
+    /// :199-208), exactly as today; a cancelled open needs no
+    /// revocation step at all — the load that owned the ticket is
+    /// being discarded by definition.
     ///
     /// Bounded and cancellable by contract: the call enforces the
     /// adapter's documented open deadline (again a named constant
-    /// the implementation record states), and cancellation — the
-    /// load being dropped or its generation superseded mid-call —
-    /// aborts any in-flight negotiation. On a deadline miss or a
-    /// cancellation the implementation tears down everything it
-    /// created so far (receiver session, queue items, enabled-output
-    /// changes) through the same restoration path as failure (§4.3)
-    /// before the error surfaces. The method never returns a
+    /// the implementation record states) and polls `cancel` at every
+    /// blocking checkpoint, so cancellation — the load being dropped
+    /// or its generation superseded mid-call — aborts in-flight
+    /// negotiation instead of racing the deadline. On a deadline
+    /// miss, a cancellation, or any failure the implementation tears
+    /// down everything it created so far (receiver session, queue
+    /// items, enabled-output changes) through the same restoration
+    /// path (§4.3) before the outcome surfaces; on the daemon
+    /// adapter a cancellation landing mid-takeover records and
+    /// reverses its steps through the same incomplete-takeover
+    /// discipline as a crash (§4.3). The method never returns a
     /// half-open session, and a load can never remain pending on it
-    /// indefinitely; after timeout the load fails with
-    /// `SenderError::Deadline` carrying explicit, localized
-    /// guidance (§9.1 contract).
+    /// indefinitely: after timeout the outcome is
+    /// `Failed(SenderError::Deadline)` carrying explicit, localized
+    /// guidance (§9.1 contract), while a caller-requested abort is
+    /// `Cancelled` — distinct outcomes, so the UI never renders a
+    /// cancelled load as an error and never reports one (§9.5). If
+    /// cancellation and the deadline fire in the same window, the
+    /// call returns whichever it observed first and never both.
     fn open_session(
         &self,
         target: &AirplayTarget,
         prepared_uri: &str,
         event_tx: async_channel::Sender<PlayerEvent>,
         generation: PlayerEventGeneration,
-    ) -> Result<Box<dyn SenderSession>, SenderError>;
+        cancel: &OpenCancel,
+    ) -> OpenOutcome;
 }
 ```
 
@@ -530,10 +592,14 @@ Key differences from revision 1, and why:
   its pipeline, not by pushed PCM. Encoding and framing stay inside
   adapters — where the 352-sample contract (§2.4) lives — never in
   the shared seam.
-- **`open_session` returns a session, not a sink element.** Pause /
-  resume / volume / flush are protocol operations (RTSP
-  SET_PARAMETER / PAUSE, daemon RPC), not pipeline state writes, so
-  they belong to the session object.
+- **`open_session` returns a session, not a sink element — and
+  cancellation as an outcome, not an error.** Pause / resume /
+  volume / flush are protocol operations (RTSP SET_PARAMETER /
+  PAUSE, daemon RPC), not pipeline state writes, so they belong to
+  the session object; and the open call carries a pollable
+  `OpenCancel` handle and returns `OpenOutcome`, whose `Cancelled`
+  variant keeps "the caller changed its mind" out of the
+  `SenderError` taxonomy entirely (§4.1).
 - **Events stay generation-scoped.** Adapters receive the event
   channel and the load's generation so receiver-side failures
   (reconnect exhaustion, auth refusal) surface through the exact same
@@ -543,13 +609,15 @@ Key differences from revision 1, and why:
   `SenderSession::observe` returns the session's cached snapshot
   without I/O. Each adapter owns how the cache is produced — the
   GStreamer adapter samples pipeline state on a session-owned task,
-  the daemon adapter samples the JSON API player progress
-  (`item_progress_ms`/`item_length_ms`, §7) — while the seam owns the
-  semantics: paused sessions freeze their position instead of
-  advancing it, disconnected sessions set `stale` instead of
-  extrapolating, and snapshots from a foreign generation are dropped
-  by the publisher. The UI's 500 ms timer remains the *publisher*
-  (§4.4); it reads the cache rather than being the only measurement.
+  the daemon adapter samples `item_progress_ms` for position and
+  sources duration from its own decode pipeline (§4.3), with the
+  JSON `item_length_ms` as fallback/cross-check only — while the
+  seam owns the semantics: paused sessions freeze their position
+  instead of advancing it, disconnected sessions set `stale` instead
+  of extrapolating, and snapshots from a foreign generation are
+  dropped by the publisher. The UI's 500 ms timer remains the
+  *publisher* (§4.4); it reads the cache rather than being the only
+  measurement.
 
 ### 4.2 GStreamer adapter (`raopsink`)
 
@@ -593,7 +661,19 @@ Tributary talks to an OwnTone instance as a transmission service:
   same `prepared_uri` the seam carries, and pumps the decoded PCM
   into `write_pcm`. The pump wakes on backpressure and stops on the
   first terminal outcome; it holds no retry loop across a terminal
-  session. This reuses the GStreamer decoder stack
+  session. **The pump also owns the track duration:** it issues a
+  TIME-format duration query against its own pipeline — re-asking
+  until the demuxer patches a known value — and publishes the result
+  into the session's §4.1 observation cache as `duration_ms`. It
+  must, because the daemon cannot know the length of a pipe-fed
+  item: the pipe carries raw PCM and never the prepared URI
+  (`src/inputs/pipe.c`), so the daemon's JSON `item_length_ms` reads
+  0/unknown until EOF, and a finite track would render LIVE with a
+  pinned, disabled slider for its whole length
+  (`src/ui/window.rs:3243-3253`). The JSON value is therefore a
+  cross-check, never the source (§7); a stream whose duration the
+  pipeline genuinely cannot answer keeps `duration_ms: None` and the
+  honest LIVE rendering. This reuses the GStreamer decoder stack
   Tributary already requires — no new dependency — and it keeps the
   protected loopback ticket URI entirely inside Tributary's process:
   the daemon never receives the URL, only the decoded bytes.
@@ -658,7 +738,11 @@ Tributary talks to an OwnTone instance as a transmission service:
   existing actionable-guidance path instead of interleaving with the
   holder. The lock is released only after restoration completes —
   player stopped, our queue items removed, the recorded enabled set
-  re-applied. A crashed holder releases the lock by OS semantics,
+  re-applied. A cancelled open (§4.1 `OpenOutcome::Cancelled`)
+  unwinds through exactly this path: steps already taken are
+  recorded and reversed in order, and the `Cancelled` outcome is
+  returned only after restoration completes — never as a shortcut
+  past it (§9.5). A crashed holder releases the lock by OS semantics,
   and what happens next is defined, not incidental: before the
   first mutating step (the first output, queue, or player change),
   the session persists an incomplete-takeover record next to the
@@ -697,9 +781,10 @@ Tributary talks to an OwnTone instance as a transmission service:
   contract), but the timer is the **publisher, not the only source**:
   sessions expose their measurement through the nonblocking
   `SenderSession::observe` cache (§4.1), maintained by each adapter's
-  own task — GStreamer adapters sample pipeline state there, the
-  daemon adapter samples the JSON API player progress
-  (`item_progress_ms`/`item_length_ms`). Paused sessions freeze,
+  own task — GStreamer adapters sample pipeline state there; the
+  daemon adapter samples `item_progress_ms` for position and sources
+  duration from its own decode pump, treating JSON `item_length_ms`
+  as a cross-check only (§4.3, §7). Paused sessions freeze,
   disconnected ones set `stale` instead of extrapolating, and
   snapshots from a foreign generation are dropped, per §4.1.
 - **Localization:** the honest unavailable message stays user-visible
@@ -938,11 +1023,20 @@ What the implementation record must nail down, per §4.3:
 - **Audio:** s16le 44100 Hz stereo into the pipe (§2.4, §4.3);
   encoding, framing, and per-device quirks are the daemon's.
 - **Timing/position:** the daemon session publishes position and
-  duration through the §4.1 observation cache, sampled from the JSON
-  API player progress (`item_progress_ms`/`item_length_ms`); the
-  500 ms publication cadence is unchanged (§4.4), and paused and
-  disconnected behavior follow the seam's contract. Receiver latency
-  is invisible to the UI, as today — documented, not hidden.
+  duration through the §4.1 observation cache, but the two values do
+  not share a source: position is sampled from the JSON API player
+  progress (`item_progress_ms`), while duration comes from the
+  adapter's own decode pipeline (§4.3 pump duration query). The JSON
+  `item_length_ms` is a fallback/cross-check only and is never
+  authoritative for pipe-fed items, which receive no length over the
+  pipe and read 0/unknown until EOF — trusting it would render a
+  finite track as LIVE with a pinned, disabled slider
+  (`src/ui/window.rs:3243-3253`). The 500 ms publication cadence is
+  unchanged (§4.4), and the snapshot semantics are preserved: paused
+  sessions freeze position, stale snapshots stop extrapolation, and
+  foreign-generation snapshots are dropped by the publisher (§4.1).
+  Receiver latency is invisible to the UI, as today — documented,
+  not hidden.
 - **Multi-room:** out of scope unless separately approved (task.md
   P2.4); the adapter enables exactly the one discovered device the
   user activated — which, given the server-wide enabled-output set
@@ -1046,7 +1140,8 @@ record for the selected path must add, at minimum:
    per-track proxy work, regardless of configuration.
 2. **Adapter-injection stub** (mirrors
    `a_missing_raopsink_load_fails_loudly_not_silently`): a stub
-   `AirplaySender` returning `Err(SenderError::Dependency(..))`
+   `AirplaySender` returning
+   `OpenOutcome::Failed(SenderError::Dependency(..))`
    makes `finish_load` emit the
    generation-tagged `PlayerEvent::Error` followed by `Stopped`.
 3. **Registry-attribute regression** for the GStreamer adapter: the
@@ -1069,7 +1164,13 @@ record for the selected path must add, at minimum:
    playback continuing, and returns `Stopped` for the exact load
    generation; on the daemon adapter it also restores the state
    recorded at takeover — player stopped, our queue items removed,
-   the recorded enabled-output set re-applied (§4.3).
+   the recorded enabled-output set re-applied (§4.3). The same
+   acceptance covers cancellation *during* negotiation: a load whose
+   `OpenCancel` is set while `open_session` is still in flight
+   unwinds through the restoration path and yields
+   `OpenOutcome::Cancelled` — no user-facing error and no error
+   event for the cancelled generation, no half-taken-over daemon,
+   and a following load opens cleanly (§4.1, §4.3).
 6. **Authentication-failure acceptance:** a password-protected
    receiver with no configured password, and a wrong-password case,
    each surface a distinct, localized, actionable error (pointing at
