@@ -2042,6 +2042,15 @@ struct WorkerSession<T> {
 enum CleanupOutcome {
     Completed,
     Stale,
+    /// The session's cleanup mutations were refused before the first one was
+    /// issued: on a supervised output the pre-mutation status evidence
+    /// lapsed the supervisor (partition-option drift or an expired
+    /// observation gap), or the status observed a foreign current song, so
+    /// neither the partition-global stop nor the targeted delete may run.
+    /// The session has been dropped and the owned queue entry retained per
+    /// the post-lapse contract; the caller must surface the exclusive-control
+    /// refusal instead of reporting a successful stop.
+    Refused,
     Failed(MpdFailure),
 }
 
@@ -2243,6 +2252,23 @@ fn run_mpd_worker<C>(
                                     &event_tx,
                                 );
                             }
+                            CleanupOutcome::Refused => {
+                                // The cleanup's own status evidence refused
+                                // every mutation: option drift, an expired
+                                // supervision window, or a foreign current
+                                // song. Nothing was sent to MPD and the
+                                // owned queue entry is retained, so the UI
+                                // must see the exclusive-control refusal —
+                                // not a successful stopped state while the
+                                // partition may still be playing.
+                                fail_current(
+                                    command.owner,
+                                    MpdFailure::exclusive_control_required(),
+                                    &intent_epoch,
+                                    &cache,
+                                    &event_tx,
+                                );
+                            }
                             CleanupOutcome::Failed(failure) => fail_current(
                                 command.owner,
                                 failure,
@@ -2351,6 +2377,12 @@ fn handle_load<C>(
         supervision,
     ) {
         CleanupOutcome::Completed => {}
+        CleanupOutcome::Refused => {
+            // The previous session's targeted cleanup was refused by its own
+            // status evidence (supervised lapse or a foreign current song):
+            // the orphan is retained and nothing was sent. The recheck below
+            // gates the new load on the same authority.
+        }
         CleanupOutcome::Failed(failure) => {
             error!(operation = failure.operation, "Previous MPD cleanup failed");
         }
@@ -3621,9 +3653,13 @@ where
                     // supervisor lapsed by the status above (or by the
                     // status round-trip consuming the supervision window)
                     // must not issue it. The targeted delete below keeps
-                    // its own authority gate.
+                    // its own authority gate. The refusal is distinct from
+                    // `Completed` so the Stop caller reports the
+                    // exclusive-control refusal instead of publishing a
+                    // successful stopped state while the owned song may
+                    // still be playing.
                     if !supervision_authorizes(plan, supervision) {
-                        return CleanupOutcome::Completed;
+                        return CleanupOutcome::Refused;
                     }
                     let stopped = session.connection.stop(deadline);
                     if !is_current(owner, intent_epoch) {
@@ -3649,7 +3685,12 @@ where
             // violated. It still does not authorize either a global stop or a
             // racy targeted delete: another client could select our queued id
             // between this status and deleteid, so deliberately retain it.
-            Ok(status) if status.song_id.is_some() => return CleanupOutcome::Completed,
+            // On a supervised output the observation above already lapsed the
+            // supervisor, and on an unsupervised one the contract is violated
+            // all the same: either way the stop was refused, so the caller
+            // must surface the exclusive-control refusal rather than a
+            // successful stopped state.
+            Ok(status) if status.song_id.is_some() => return CleanupOutcome::Refused,
             // No current id authorizes only the targeted cleanup below.
             Ok(_) => {}
             Err(status_failure) if status_failure.connection_usable => {
@@ -6061,6 +6102,7 @@ mod tests {
             .expect("statuses lock")
             .push_back(drifted);
 
+        let _ = harness.events();
         harness.send(owner, CommandKind::Stop);
         harness.fence(owner);
         assert!(
@@ -6088,6 +6130,112 @@ mod tests {
             0,
             "the targeted delete stays gated behind lapsed authority"
         );
+        // The refusal must reach the UI as the exclusive-control error on
+        // top of the terminal stopped state — never as a silent successful
+        // stop while the owned song may still be playing.
+        assert!(
+            harness.events().iter().any(|event| matches!(
+                event,
+                PlayerEvent::Error { message, .. }
+                    if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+            )),
+            "the drifted-stop refusal must surface the exclusive-control error"
+        );
+        assert_eq!(harness.cache().state, PlayerState::Stopped);
+        harness.shutdown();
+    }
+
+    #[test]
+    fn supervised_stop_cleanup_refused_when_status_round_trip_expires_supervision() {
+        // Deadline-expiry sibling of the drift refusal above: the pre-stop
+        // status is clean and still names our song, but the supervision
+        // window expired while the command waited, so the eager gap check
+        // inside the cleanup's own supervision observation lapses the
+        // supervisor. The partition-global stop and the targeted delete are
+        // both refused, and the UI sees the exclusive-control refusal —
+        // never a successful stopped state.
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(playing_status(0, 10_000));
+        let owner = harness.next_owner(3);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/clean".to_string(),
+            },
+        );
+        harness.fence(owner);
+
+        // Expire the supervision window without touching the phase: the
+        // cleanup's own supervision observation must apply the eager gap
+        // rule before the stop decision.
+        let stale = Instant::now()
+            .checked_sub(MAX_SUPERVISION_GAP + Duration::from_secs(1))
+            .expect("backdated observation instant");
+        harness
+            .supervision
+            .lock()
+            .expect("supervision lock")
+            .last_observation = Some(stale);
+
+        // The queued status is clean evidence: our own song, playing, no
+        // partition-option drift — the lapse comes purely from the expired
+        // observation gap.
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(playing_status(500, 10_000));
+
+        let _ = harness.events();
+        harness.send(owner, CommandKind::Stop);
+        harness.fence(owner);
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .is_lapsed(),
+            "the expired supervision window must lapse the supervisor before the stop"
+        );
+        let actions = shared.actions();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Point(Point::Stop)))
+                .count(),
+            0,
+            "a stop whose supervision expired mid-cleanup must not reach MPD"
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, Action::Delete(42)))
+                .count(),
+            0,
+            "the targeted delete stays gated behind the expired supervision"
+        );
+        assert!(
+            harness.events().iter().any(|event| matches!(
+                event,
+                PlayerEvent::Error { message, .. }
+                    if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+            )),
+            "the expired-supervision stop refusal must surface the exclusive-control error"
+        );
+        assert_eq!(harness.cache().state, PlayerState::Stopped);
         harness.shutdown();
     }
 
@@ -7820,13 +7968,20 @@ mod tests {
         harness.fence(stop);
 
         assert_eq!(shared.actions(), vec![Action::Point(Point::Status)]);
-        assert!(matches!(
-            harness.events().as_slice(),
-            [PlayerEvent::StateChanged {
-                state: PlayerState::Stopped,
-                ..
-            }]
-        ));
+        // The stop was refused — a foreign current song violates the
+        // exclusive-control contract, so no stop and no delete may run —
+        // and the refusal must reach the UI as the exclusive-control error
+        // instead of a silent successful stopped state.
+        let events = harness.events();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::Error { message, .. }
+                    if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+            )),
+            "the foreign-song stop refusal must surface the exclusive-control error"
+        );
+        assert_eq!(harness.cache().state, PlayerState::Stopped);
         harness.shutdown();
     }
 
