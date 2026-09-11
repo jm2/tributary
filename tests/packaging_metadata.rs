@@ -1640,10 +1640,22 @@ fn assert_announcer_pull_request_triggers(on: &serde_yaml::Value) {
     let pull_request_types = yaml_string_list(&on["pull_request"], "types");
     assert_eq!(
         pull_request_types,
-        ["opened", "synchronize", "reopened", "edited"],
+        [
+            "opened",
+            "synchronize",
+            "reopened",
+            "edited",
+            "review_requested",
+            "review_request_removed"
+        ],
         "every push to a pull request must re-announce the gate at the new head; \
          `edited` covers retargeting — a base change fires edited, never synchronize, \
-         and a retarget away-and-back fires no other refresh"
+         and a retarget away-and-back fires no other refresh; \
+         `review_requested`/`review_request_removed` re-announce the re-review \
+         handshake whose outstanding request invalidates the reviewer's earlier \
+         clean result at the head (best-effort coverage: GitHub does not \
+         guarantee the Actions event for bot/App requesters or reviewers, so the \
+         documented workflow_dispatch re-run stays the guaranteed refresh path)"
     );
     let review_types = yaml_string_list(&on["pull_request_review"], "types");
     assert_eq!(

@@ -237,7 +237,14 @@ Resolving a review thread fires no GitHub Actions event
 the gate uses only documented Actions triggers and refreshes through:
 pushes (`synchronize`), review submissions, edits, and dismissals
 (`pull_request_review`), new review comments
-(`pull_request_review_comment`), a targeted
+(`pull_request_review_comment`), review requests addressed to a reviewer and
+their withdrawal (`pull_request` `review_requested`/`review_request_removed`
+— the events behind the re-review handshake that invalidates the reviewer's
+earlier clean result at the head; note GitHub does not guarantee that an
+Actions run fires when the requester or requested reviewer is a bot or App,
+the common case for the gate's trusted reviewers, so these two types are
+best-effort and the targeted dispatch below remains the guaranteed refresh
+path for a re-review request that fired no announcer run), a targeted
 `gh workflow run bot-review-gate.yml --ref <head branch> -f pr_number=<n>`
 (`workflow_dispatch`), or a plain check re-run — every announcer completion
 fires the publisher, which re-evaluates the current
