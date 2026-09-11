@@ -5374,8 +5374,9 @@ fn replace_publish_loop(
         match &first_binding {
             Some((relative, _)) => format!(
                 "destination kept changing through the replace publish; the displaced \
-                 original remains preserved at the private backup sibling {relative:?} \
-                 and was never destroyed"
+                 original remains preserved at the private backup sibling {} \
+                 and was never destroyed",
+                relative.display()
             ),
             None => "destination kept changing through the replace publish".to_string(),
         },
