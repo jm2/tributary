@@ -22,8 +22,19 @@ pub fn build_equalizer_group(active_output: &SharedAudioOutput) -> adw::Preferen
         .description(rust_i18n::t!("equalizer.description").as_ref())
         .build();
 
-    let settings: EqSettings = active_output.borrow().equalizer_settings();
     let supported = active_output.borrow().supports_equalizer();
+    let settings: EqSettings = if supported {
+        active_output.borrow().equalizer_settings()
+    } else {
+        // An unsupported active renderer parks the local settings on
+        // disk (contract: *Capability matrix* — disabled controls
+        // preserve the last-saved values locally). The disabled panel
+        // therefore displays that parked persisted state, never the
+        // fresh-install defaults standing in for it. The shared reader
+        // is the same path startup uses, so a malformed parked file is
+        // repaired and diagnosed exactly once with the same wording.
+        crate::audio::equalizer::config::load_settings_with_status().0
+    };
 
     // Re-entrancy guard: programmatic control updates (preset load,
     // reload-from-disk, reset) must not be re-interpreted as manual
@@ -37,6 +48,11 @@ pub fn build_equalizer_group(active_output: &SharedAudioOutput) -> adw::Preferen
     let (clip_row, clip_dropdown) = build_clip_row(&settings);
     let (buttons_row, reset_button, reload_button) = build_buttons_row();
 
+    // The unsupported-output explanation must exist before the controls
+    // are rendered: every disabled control is attached to it as its
+    // accessible description (see `apply_unsupported_rendering`).
+    let unsupported_note = build_unsupported_note(active_output, supported);
+
     // Assemble the group (band rows were appended by their builder, so
     // the remaining rows land after them in contract order).
     group.add(&enable_row);
@@ -44,7 +60,7 @@ pub fn build_equalizer_group(active_output: &SharedAudioOutput) -> adw::Preferen
     group.add(&preamp_row);
     group.add(&clip_row);
     group.add(&buttons_row);
-    group.add(&build_unsupported_note(active_output, supported));
+    group.add(&unsupported_note);
 
     let controls = EqualizerControls {
         disabled_rows: vec![
@@ -62,7 +78,7 @@ pub fn build_equalizer_group(active_output: &SharedAudioOutput) -> adw::Preferen
         reset_button,
         reload_button,
     };
-    apply_unsupported_rendering(active_output, supported, &controls);
+    apply_unsupported_rendering(active_output, supported, &controls, &unsupported_note);
     super::wiring::wire_equalizer_controls(active_output, &controls, &updating);
 
     group
@@ -178,14 +194,20 @@ fn build_unsupported_note(active_output: &SharedAudioOutput, supported: bool) ->
         .build()
 }
 
-/// Disable every control with a tooltip explanation of why the active
-/// output cannot render the equalizer DSP. The persisted values stay
-/// visible (and remain on disk); the controls just cannot be touched
-/// while the receiver renders audio.
+/// Disable every control, keep the tooltip explanation for pointing
+/// users, and attach the explanation as each control's accessible
+/// description (the toolkit's `aria-describedby`-equivalent relation).
+/// Disabled controls are frequently not focusable, so a tooltip alone
+/// leaves the limitation undiscoverable by keyboard and screen-reader
+/// users — the relation is the contract-required channel (contract:
+/// *Capability matrix*: "the explanation is never tool-tip-only"). The
+/// persisted values stay visible (and remain on disk); the controls
+/// just cannot be touched while the receiver renders audio.
 fn apply_unsupported_rendering(
     active_output: &SharedAudioOutput,
     supported: bool,
     controls: &EqualizerControls,
+    unsupported_note: &gtk::Label,
 ) {
     if supported {
         return;
@@ -194,11 +216,24 @@ fn apply_unsupported_rendering(
     for widget in &controls.disabled_rows {
         widget.set_sensitive(false);
         widget.set_tooltip_text(Some(&tooltip));
+        describe_with_note(widget, unsupported_note);
     }
     for scale in &controls.band_scales {
         scale.set_sensitive(false);
+        describe_with_note(scale, unsupported_note);
     }
     controls.preset_dropdown.set_sensitive(false);
+    describe_with_note(&controls.preset_dropdown, unsupported_note);
     controls.clip_dropdown.set_sensitive(false);
+    describe_with_note(&controls.clip_dropdown, unsupported_note);
     controls.preamp_scale.set_sensitive(false);
+    describe_with_note(&controls.preamp_scale, unsupported_note);
+}
+
+/// Attach the explanation label as the widget's accessible description
+/// via the `DescribedBy` relation, so screen readers announce why the
+/// control is unavailable even when the disabled control itself is not
+/// focusable.
+fn describe_with_note(widget: &impl IsA<gtk::Accessible>, note: &gtk::Label) {
+    widget.update_relation(&[gtk::accessible::Relation::DescribedBy(&[note.upcast_ref()])]);
 }
