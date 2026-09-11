@@ -12,6 +12,7 @@
 //! replacement can never redirect them.
 #![cfg(windows)]
 
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 
 use super::authority;
@@ -65,8 +66,15 @@ fn pinned_occupant_fails_closed_without_destruction() {
     std::fs::write(&destination, b"pinned original").expect("write existing original");
 
     // A concurrent writer holds the occupant open without delete sharing,
-    // pinning it against the handle-conditioned deletion.
-    let pin = std::fs::File::open(&destination).expect("open the pinned occupant");
+    // pinning it against the handle-conditioned deletion. The share mode
+    // must be explicit: the std default grants `FILE_SHARE_DELETE`, which
+    // would let the bind's delete-capable open succeed and the replace
+    // proceed — no pin at all.
+    let pin = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+        .open(&destination)
+        .expect("open the pinned occupant");
 
     let authority = authority(&root);
     let mut staged = authority
