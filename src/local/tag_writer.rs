@@ -660,19 +660,28 @@ pub fn preflight_tag_write(path: &Path) -> Result<(), TagWritePreflightError> {
 /// retained parent handle — the anchored twin of
 /// [`preflight_tag_write_directory`].
 ///
-/// The rehearsal exclusively creates two private siblings beneath the
-/// retained parent, flushes them, replaces one with the other through the
-/// retained directory, and unlinks the result: the same create, replace,
-/// and remove shapes the anchored writer performs, addressed entirely
-/// through the directory handle. No absolute pathname is resolved, so an
-/// ancestor displaced after the authority's validation can neither take
-/// the probe outside the admitted mount directory nor reject a rehearsal
-/// the anchored writer could safely perform.
+/// The rehearsal exclusively creates one private probe sibling beneath the
+/// retained parent, flushes it, renames it onto a fresh vacant candidate
+/// name with the anchored commit's own no-replace install primitive
+/// (`renameat2(RENAME_NOREPLACE)` through the retained directory), and
+/// unlinks the result: the same create, install, and remove shapes the
+/// anchored writer performs, addressed entirely through the directory
+/// handle. No absolute pathname is resolved, so an ancestor displaced
+/// after the authority's validation can neither take the probe outside
+/// the admitted mount directory nor reject a rehearsal the anchored
+/// writer could safely perform.
+///
+/// Rehearsing the no-replace primitive itself is the point: the commit
+/// fails closed on filesystems without `RENAME_NOREPLACE` support, so a
+/// rehearsal that only exercised a plain overwriting rename would report
+/// such volumes write-capable and doom every later commit to fail. Here
+/// the unsupported primitive refuses the rehearsal, surfacing the
+/// limitation before the user edits.
 ///
 /// `leaf` is the admitted file's leaf name; it only seeds the randomized
 /// probe names' extension. Error contexts name the target by
 /// `target_label`, never by any path. On any failure the dropped probe
-/// siblings clean themselves up through the retained parent.
+/// sibling cleans itself up through the retained parent.
 ///
 /// This performs blocking filesystem I/O and must not run on the GTK
 /// thread.
@@ -682,6 +691,9 @@ pub fn preflight_tag_write_directory_retained(
     leaf: &OsStr,
     target_label: &str,
 ) -> Result<(), TagWritePreflightError> {
+    // Create and flush one private probe sibling beneath the retained
+    // parent — the create-and-flush shape the anchored commit performs on
+    // its staged copy.
     let (mut replacement, replacement_file) =
         TempFile::create_beside_retained(parent, leaf, target_label)
             .map_err(|_| TagWritePreflightError::Unavailable)?;
@@ -690,35 +702,30 @@ pub fn preflight_tag_write_directory_retained(
         .map_err(|_| TagWritePreflightError::Unavailable)?;
     drop(replacement_file);
 
-    let (mut destination, destination_file) =
-        TempFile::create_beside_retained(parent, leaf, target_label)
-            .map_err(|_| TagWritePreflightError::Unavailable)?;
-    destination_file
-        .sync_all()
-        .map_err(|_| TagWritePreflightError::Unavailable)?;
-    drop(destination_file);
-
-    // Replace the destination sibling with the replacement sibling — the
-    // rename shape the anchored commit's install performs.
-    rustix::fs::renameat(
+    // Install the probe with the anchored commit's own primitive: a
+    // no-replace rename onto a fresh vacant candidate name through the
+    // retained parent. An occupied destination (or a filesystem without
+    // flag support) refuses the rehearsal instead of being overwritten.
+    let vacant_name = staged_sibling_name(leaf);
+    #[cfg(all(test, unix))]
+    run_retained_preflight_interpose(parent, replacement.path().as_os_str(), &vacant_name);
+    rustix::fs::renameat_with(
         parent,
         replacement.path().as_os_str(),
         parent,
-        destination.path().as_os_str(),
+        &vacant_name,
+        rustix::fs::RenameFlags::NOREPLACE,
     )
     .map_err(|_| TagWritePreflightError::Unavailable)?;
-    replacement.disarm_cleanup();
 
-    // A capability check is successful only when cleanup succeeds: the
-    // probe sibling is removed through the retained parent and the drop
-    // guard disarmed.
-    rustix::fs::unlinkat(
-        parent,
-        destination.path().as_os_str(),
-        rustix::fs::AtFlags::empty(),
-    )
-    .map_err(|_| TagWritePreflightError::Unavailable)?;
-    destination.disarm_cleanup();
+    // The probe now lives at the vacant name. Aim the drop guard's
+    // anchored cleanup at that leaf so a failed explicit cleanup below
+    // still backstops through the retained parent, then remove it: a
+    // capability check is successful only when cleanup succeeds.
+    replacement.path = PathBuf::from(&vacant_name);
+    rustix::fs::unlinkat(parent, &vacant_name, rustix::fs::AtFlags::empty())
+        .map_err(|_| TagWritePreflightError::Unavailable)?;
+    replacement.disarm_cleanup();
     Ok(())
 }
 
@@ -1381,6 +1388,42 @@ fn with_pre_staging_interpose(interpose: Box<PreStagingInterpose>, run: impl FnO
     *PRE_STAGING_INTERPOSE.lock().unwrap() = Some(interpose);
     run();
     *PRE_STAGING_INTERPOSE.lock().unwrap() = None;
+}
+
+/// Test-only seam: runs immediately before the retained preflight
+/// rehearsal's no-replace rename, receiving the retained parent handle, the
+/// staged probe sibling's leaf, and the fresh vacant candidate leaf the
+/// rehearsal is about to rename onto. The regression tests observe the
+/// rehearsal's exact shape (a staged probe; a rename target that is vacant)
+/// and occupy the candidate name to prove the rehearsal's rename refuses a
+/// replacement — the no-replace primitive the anchored commit installs with.
+#[cfg(all(test, unix))]
+type RetainedPreflightInterpose = dyn Fn(&std::fs::File, &OsStr, &OsStr) + Send + Sync;
+
+#[cfg(all(test, unix))]
+static RETAINED_PREFLIGHT_INTERPOSE: std::sync::Mutex<Option<Box<RetainedPreflightInterpose>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, unix))]
+static RETAINED_PREFLIGHT_INTERPOSE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(test, unix))]
+fn run_retained_preflight_interpose(parent: &std::fs::File, probe: &OsStr, vacant: &OsStr) {
+    if let Some(interpose) = RETAINED_PREFLIGHT_INTERPOSE.lock().unwrap().as_ref() {
+        interpose(parent, probe, vacant);
+    }
+}
+
+/// Serialize tests that use the retained-preflight interposition seam.
+#[cfg(all(test, unix))]
+fn with_retained_preflight_interpose(
+    interpose: Box<RetainedPreflightInterpose>,
+    run: impl FnOnce(),
+) {
+    let _serial = RETAINED_PREFLIGHT_INTERPOSE_SERIAL.lock().unwrap();
+    *RETAINED_PREFLIGHT_INTERPOSE.lock().unwrap() = Some(interpose);
+    run();
+    *RETAINED_PREFLIGHT_INTERPOSE.lock().unwrap() = None;
 }
 
 #[cfg(test)]
@@ -2110,6 +2153,91 @@ mod tests {
             retained_entries,
             vec![std::ffi::OsString::from("silence.flac")],
             "the rehearsal must leave only the admitted file in the retained directory"
+        );
+    }
+
+    /// The retained rehearsal must exercise the anchored commit's no-replace
+    /// install primitive, not a plain overwriting rename. Its rename target
+    /// must be a fresh vacant name it does not pre-create, and when that
+    /// name is occupied the no-replace rename must refuse the rehearsal
+    /// with the probe cleaned up — the exact behavior that refuses
+    /// no-replace-incapable volumes at preflight instead of reporting them
+    /// write-capable and dooming every later commit to fail closed.
+    #[cfg(unix)]
+    #[test]
+    fn retained_preflight_rehearsal_refuses_an_occupied_rename_target() {
+        use std::sync::{Arc, Mutex};
+
+        let (directory, album, _) = anchored_album_fixture("preflight-no-replace");
+
+        let authority = mounted_root_authority(&directory);
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+        let (parent, leaf) = target
+            .retained_directory_handle()
+            .expect("retain the directory anchor");
+
+        let occupied_candidate = Arc::new(Mutex::new(None::<std::ffi::OsString>));
+        let closure_candidate = occupied_candidate.clone();
+        with_retained_preflight_interpose(
+            Box::new(move |interposed_parent, probe_leaf, vacant_leaf| {
+                use rustix::fs::AtFlags;
+
+                // The rehearsal renames onto a fresh vacant name: the probe
+                // sibling exists and the rename target does not. A rehearsal
+                // that pre-created a second sibling to overwrite fails here.
+                assert!(
+                    rustix::fs::statat(interposed_parent, probe_leaf, AtFlags::empty()).is_ok(),
+                    "the rehearsal must have staged its probe sibling through the retained parent"
+                );
+                assert!(
+                    rustix::fs::statat(interposed_parent, vacant_leaf, AtFlags::empty()).is_err(),
+                    "the rehearsal must rename onto a vacant name, not a pre-created sibling"
+                );
+
+                // Occupy the rename target. A plain overwriting rename would
+                // clobber this occupant and report the volume write-capable;
+                // the no-replace rename the commit installs with must refuse.
+                create_retained_sibling_exclusive(interposed_parent, vacant_leaf)
+                    .expect("occupy the rehearsal's rename target");
+                *closure_candidate.lock().unwrap() = Some(vacant_leaf.to_os_string());
+            }),
+            || {
+                assert_eq!(
+                    crate::local::tag_writer::preflight_tag_write_directory_retained(
+                        &parent,
+                        &leaf,
+                        "the removable mutation target",
+                    ),
+                    Err(TagWritePreflightError::Unavailable),
+                    "an occupied rename target must refuse the rehearsal, never be clobbered"
+                );
+            },
+        );
+
+        // The refusal path cleaned its probe sibling up through the
+        // retained parent; remove the deliberate occupant and require the
+        // directory to hold exactly the admitted file again.
+        let occupied = occupied_candidate.lock().unwrap().take();
+        rustix::fs::unlinkat(
+            &parent,
+            occupied
+                .as_deref()
+                .expect("the seam occupied the candidate"),
+            rustix::fs::AtFlags::empty(),
+        )
+        .expect("remove the deliberate occupant");
+
+        let retained_entries: Vec<std::ffi::OsString> = std::fs::read_dir(&album)
+            .expect("list the retained directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            retained_entries,
+            vec![std::ffi::OsString::from("silence.flac")],
+            "the refused rehearsal must leave no probe sibling behind"
         );
     }
 
