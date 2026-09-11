@@ -1758,7 +1758,7 @@ fn bot_review_gate_publisher_publishes_the_required_context_from_default_branch_
     let workflow = bot_review_gate_publisher_workflow();
 
     assert_publisher_runs_exclusively_on_announcer_completions(&workflow);
-    assert_publisher_declares_exactly_two_read_only_grants(&workflow);
+    assert_publisher_declares_exactly_three_read_only_grants(&workflow);
     assert_publisher_binds_the_evaluation_to_the_announcing_head(&workflow);
 
     // Extracting the run script also proves the step shape: the pinned
@@ -1802,14 +1802,14 @@ fn assert_publisher_runs_exclusively_on_announcer_completions(workflow: &serde_y
 // cannot publish a check run, so no pull-request-controlled job's identity
 // (the shared GitHub Actions integration) can be mistaken for the
 // publisher's.
-fn assert_publisher_declares_exactly_two_read_only_grants(workflow: &serde_yaml::Value) {
+fn assert_publisher_declares_exactly_three_read_only_grants(workflow: &serde_yaml::Value) {
     let permissions = workflow["permissions"]
         .as_mapping()
         .expect("publisher permissions must be a mapping");
     assert_eq!(
         permissions.len(),
-        2,
-        "the publisher must declare exactly its two workflow-level permissions"
+        3,
+        "the publisher must declare exactly its three workflow-level permissions"
     );
     assert!(
         workflow["permissions"].get("checks").is_none(),
@@ -1824,7 +1824,14 @@ fn assert_publisher_declares_exactly_two_read_only_grants(workflow: &serde_yaml:
     assert_eq!(
         workflow["permissions"]["contents"].as_str(),
         Some("read"),
-        "the only other grant is the read-only policy-file read"
+        "the substitution policy file is read through a read-only grant"
+    );
+    assert_eq!(
+        workflow["permissions"]["actions"].as_str(),
+        Some("read"),
+        "the announcing-run record fallback (head recovery) is read through \
+         a read-only grant; without it the recovery call is refused and the \
+         refresh would skip the supersession it owes the announced head"
     );
 }
 
