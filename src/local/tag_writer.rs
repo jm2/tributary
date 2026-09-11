@@ -370,13 +370,19 @@ fn retained_leaf_identity(parent: &File, leaf: &OsStr) -> std::io::Result<(u64, 
 ///    occupied candidate preserves that occupant;
 /// 4. the private name is re-verified to name exactly the pinned object (a
 ///    swap between the pin and the relocation moved a newcomer, which is
-///    renamed back where it was) — and only then unlinked.
+///    renamed back where it was) — and only then unlinked, with the pin
+///    descriptor held through the removal and the outcome fd-verified.
 ///
 /// Every unprovable step reports `false` and preserves every entry: debris
-/// is never destruction. The final unlink removes a name nothing else
-/// created and that was atomically bound to the verified object, so an
-/// external swap can strand debris but can never make this removal destroy
-/// a newcomer.
+/// is never destruction. Trust boundary of the final unlink: POSIX has no
+/// unlink-by-fd, so the verify→unlink window on the private name cannot be
+/// made atomic — an external writer can swap the occupant inside it. The
+/// fd-verified post-condition (see [`unlink_fd_verified`]) detects and
+/// loudly reports such a wrong-object removal instead of silently
+/// succeeding; it converts silent destruction into a reported refusal, and
+/// an operator/coordinator decision (accept the residual or redesign the
+/// cleanup contract to leave contested debris) remains open for the
+/// strictly atomic form.
 #[cfg(unix)]
 fn remove_anchored_leaf_bound_to_identity(
     parent: &File,
@@ -387,7 +393,7 @@ fn remove_anchored_leaf_bound_to_identity(
     // the name, and require it to be exactly the object this section
     // created. An unprovable leaf (vanished, symlinked, unopenable) is
     // preserved, as is a name a newcomer occupies.
-    let Some(_pinned) = pin_created_leaf_identity(parent, leaf, created) else {
+    let Some(pinned) = pin_created_leaf_identity(parent, leaf, created) else {
         return false;
     };
     // Test-only seam inside the proof→bind window: the pinned object is
@@ -398,7 +404,7 @@ fn remove_anchored_leaf_bound_to_identity(
     run_retained_preflight_interpose(RetainedPreflightPhase::AfterProof, parent, leaf, leaf);
 
     for _ in 0..8 {
-        if let Some(removed) = retire_leaf_bound_to_private_name(parent, leaf, created) {
+        if let Some(removed) = retire_leaf_bound_to_private_name(parent, leaf, created, &pinned) {
             return removed;
         }
     }
@@ -435,11 +441,15 @@ fn pin_created_leaf_identity(
 /// object to a name nothing else created — then prove the private name and
 /// remove it there. `Some(removed)` is definitive; `None` means the
 /// randomized candidate collided (`EXIST`) and another attempt may run.
+/// `pinned` is the descriptor holding the verified object, kept across the
+/// removal so its fd-relative post-condition cannot be spoofed by
+/// directory-entry games.
 #[cfg(unix)]
 fn retire_leaf_bound_to_private_name(
     parent: &File,
     leaf: &OsStr,
     created: (u64, u64),
+    pinned: &rustix::fd::OwnedFd,
 ) -> Option<bool> {
     let retire_name = staged_sibling_name(leaf);
     match rustix::fs::renameat_with(
@@ -454,6 +464,7 @@ fn retire_leaf_bound_to_private_name(
             &retire_name,
             created,
             leaf,
+            pinned,
         )),
         Err(rustix::io::Errno::EXIST) => None,
         // An unsupported relocation primitive cannot prove the bind:
@@ -472,10 +483,22 @@ fn unlink_bound_private_name(
     retire_name: &OsStr,
     created: (u64, u64),
     leaf: &OsStr,
+    pinned: &rustix::fd::OwnedFd,
 ) -> bool {
     match retained_leaf_identity(parent, retire_name) {
         Ok(identity) if identity == created => {
-            rustix::fs::unlinkat(parent, retire_name, rustix::fs::AtFlags::empty()).is_ok()
+            // Test-only seam inside the verify→unlink window: the private
+            // name has re-verified as the pinned object and the unlinkat
+            // has not run yet. A swap driven here exercises the
+            // fd-verified post-condition on the removal.
+            #[cfg(all(test, unix))]
+            run_retained_preflight_interpose(
+                RetainedPreflightPhase::AfterRetireVerify,
+                parent,
+                retire_name,
+                retire_name,
+            );
+            unlink_fd_verified(parent, retire_name, pinned)
         }
         _ => {
             // Restore the displaced newcomer best-effort; if the original
@@ -491,6 +514,56 @@ fn unlink_bound_private_name(
             false
         }
     }
+}
+
+/// Remove the private name with an fd-verified post-condition.
+///
+/// Trust boundary: POSIX has no unlink-by-fd, so the verify→unlink window
+/// on the private name cannot be closed — an external writer can swap the
+/// occupant between the re-verification and the [`unlinkat`]. The pin
+/// descriptor is held across the removal and `fstat` through it (immune to
+/// directory-entry games) proves the outcome: the removed entry referenced
+/// the pinned object iff the pinned object's link count dropped by exactly
+/// one. An unchanged count means a swap landed in the window and the
+/// unlinkat destroyed a foreign entry — reported loudly and refused, never
+/// reported success. Any other outcome is unprovable and refused with
+/// everything left where it lies.
+///
+/// [`unlinkat`]: rustix::fs::unlinkat
+// The `u64::from` is load-bearing on macOS (`st_nlink` is `u16` there) and
+// keeps every caller platform-uniform; on Linux it is infallible, which is
+// the only target clippy sees here.
+#[allow(clippy::useless_conversion)]
+#[cfg(unix)]
+fn unlink_fd_verified(parent: &File, retire_name: &OsStr, pinned: &rustix::fd::OwnedFd) -> bool {
+    let Ok(before) = rustix::fs::fstat(pinned) else {
+        // Unprovable: the pin's link count is unreadable, so no removal
+        // outcome could be proven.
+        return false;
+    };
+    let links_before = u64::from(before.st_nlink);
+    if rustix::fs::unlinkat(parent, retire_name, rustix::fs::AtFlags::empty()).is_err() {
+        return false;
+    }
+    let Ok(after) = rustix::fs::fstat(pinned) else {
+        // The removal landed but its post-condition is unreadable: refuse
+        // rather than claim a success that cannot be proven.
+        tracing::warn!(
+            "retained-cleanup removal landed but its fd-verified post-condition is unreadable"
+        );
+        return false;
+    };
+    let links_after = u64::from(after.st_nlink);
+    if links_before >= 1 && links_after == links_before - 1 {
+        return true;
+    }
+    if links_after == links_before {
+        tracing::error!(
+            "contested retained-cleanup destroyed an external writer's entry swapped \
+             into the verify-to-unlink window; refusing the removal"
+        );
+    }
+    false
 }
 
 /// Randomized staged-sibling leaf name, preserving the final extension.
@@ -1655,17 +1728,25 @@ enum RetainedPreflightPhase {
     /// the proof→bind window the identity-bound removal's re-verify and
     /// restore paths guard. Both leaf arguments carry the landed leaf.
     AfterProof,
+    /// Inside the bound removal, after the private name re-verified as the
+    /// pinned object and before the unlinkat removes it: the verify→unlink
+    /// window the fd-verified post-condition guards. Both leaf arguments
+    /// carry the private name about to be removed.
+    AfterRetireVerify,
 }
 
 /// Test-only seam: runs at each [`RetainedPreflightPhase`] of the retained
 /// preflight rehearsal, receiving the phase, the retained parent handle, the
 /// staged probe sibling's leaf, and the fresh vacant candidate leaf the
-/// rehearsal renames onto. The regression tests observe the rehearsal's
-/// exact shape (a staged probe; a rename target that is vacant; a landed
-/// probe before cleanup) — occupying the candidate name proves the rename
-/// refuses a replacement (the no-replace primitive the anchored commit
-/// installs with), and swapping the landed probe proves the cleanup removes
-/// exactly the entry the rehearsal created.
+/// rehearsal renames onto (for the bound-removal windows, both leaf slots
+/// carry the window's private/landed leaf name instead). The regression
+/// tests observe the rehearsal's exact shape (a staged probe; a rename
+/// target that is vacant; a landed probe before cleanup; a re-verified
+/// private name before removal) — occupying the candidate name proves the
+/// rename refuses a replacement (the no-replace primitive the anchored
+/// commit installs with), and swapping the landed probe or the re-verified
+/// private name proves the cleanup removes exactly the entry the rehearsal
+/// created and reports a contested removal instead of silently succeeding.
 #[cfg(all(test, unix))]
 type RetainedPreflightInterpose =
     dyn Fn(RetainedPreflightPhase, &std::fs::File, &OsStr, &OsStr) + Send + Sync;
@@ -2770,6 +2851,243 @@ mod tests {
         // The newcomer was restored to its own name and the stolen probe is
         // preserved debris; the refused rehearsal left nothing of its own.
         assert_the_swap_survived_the_refused_cleanup(&parent, &album, newcomer, stolen);
+    }
+
+    /// Steal the re-verified probe from the private name and install a
+    /// newcomer there inside the verify→unlink window, recording the
+    /// private name (the newcomer's, briefly) and the stolen probe's
+    /// debris name for the post-refusal assertions.
+    #[cfg(unix)]
+    fn steal_reverified_probe_install_newcomer(
+        interposed_parent: &std::fs::File,
+        retire_leaf: &OsStr,
+        contested: &std::sync::Arc<std::sync::Mutex<Option<std::ffi::OsString>>>,
+        stolen: &std::sync::Arc<std::sync::Mutex<Option<std::ffi::OsString>>>,
+    ) {
+        let stolen_leaf = staged_sibling_name(std::ffi::OsStr::new("silence.flac"));
+        rustix::fs::renameat(
+            interposed_parent,
+            retire_leaf,
+            interposed_parent,
+            &stolen_leaf,
+        )
+        .expect("steal the re-verified probe");
+        create_retained_sibling_exclusive(interposed_parent, retire_leaf)
+            .expect("install the newcomer at the private name");
+        *contested.lock().unwrap() = Some(retire_leaf.to_os_string());
+        *stolen.lock().unwrap() = Some(stolen_leaf);
+    }
+
+    /// A `tracing` layer capturing the message of every ERROR-level event
+    /// emitted under it, so a regression can require the loud signal the
+    /// contested-cleanup refusal must carry.
+    #[cfg(unix)]
+    struct ErrorEventSink(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[cfg(unix)]
+    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for ErrorEventSink {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().level() != &tracing::Level::ERROR {
+                return;
+            }
+            event.record(&mut MessageVisitor(std::sync::Arc::clone(&self.0)));
+        }
+    }
+
+    /// A `tracing` field visitor extracting the `message` field of an
+    /// ERROR-level event into the sink.
+    #[cfg(unix)]
+    struct MessageVisitor(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[cfg(unix)]
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0.lock().unwrap().push(format!("{value:?}"));
+            }
+        }
+    }
+
+    /// Run `body` capturing the message of every ERROR-level tracing event
+    /// it emits on this thread.
+    #[cfg(unix)]
+    fn capture_error_events(body: impl FnOnce()) -> Vec<String> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(ErrorEventSink(std::sync::Arc::clone(&sink)));
+        // The default dispatcher is scoped to `body`; it is restored before
+        // this returns.
+        tracing::subscriber::with_default(subscriber, body);
+        let captured = sink.lock().unwrap().clone();
+        captured
+    }
+
+    /// The bound removal must survive — by refusing loudly — an external
+    /// writer's swap inside the verify→unlink window: the re-verified
+    /// private name is stolen and a newcomer installed there before the
+    /// unlinkat runs. POSIX has no unlink-by-fd, so the newcomer's entry is
+    /// destroyed, but the fd-verified post-condition proves the removal did
+    /// not touch the pinned object, reports the contested destruction at
+    /// ERROR level, and refuses — the rehearsal never reports success for a
+    /// wrong-object removal, and the stolen probe survives as preserved
+    /// debris.
+    #[cfg(unix)]
+    #[test]
+    fn retained_preflight_reports_a_newcomer_swapped_between_verify_and_unlink() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let (directory, album, _) = anchored_album_fixture("preflight-retire-verify-swap");
+        let authority = mounted_root_authority(&directory);
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+        let (parent, leaf) = target
+            .retained_directory_handle()
+            .expect("retain the directory anchor");
+
+        let contested = Arc::new(Mutex::new(None::<std::ffi::OsString>));
+        let stolen = Arc::new(Mutex::new(None::<std::ffi::OsString>));
+        let contested_closure = Arc::clone(&contested);
+        let stolen_closure = Arc::clone(&stolen);
+        let window_ran = Arc::new(AtomicBool::new(false));
+        let window_ran_closure = Arc::clone(&window_ran);
+        with_retained_preflight_interpose(
+            Box::new(move |phase, interposed_parent, retire_leaf, _vacant_leaf| {
+                if phase != RetainedPreflightPhase::AfterRetireVerify {
+                    return;
+                }
+                window_ran_closure.store(true, Ordering::SeqCst);
+                steal_reverified_probe_install_newcomer(
+                    interposed_parent,
+                    retire_leaf,
+                    &contested_closure,
+                    &stolen_closure,
+                );
+            }),
+            || {
+                let errors = capture_error_events(|| {
+                    assert_eq!(
+                        crate::local::tag_writer::preflight_tag_write_directory_retained(
+                            &parent,
+                            &leaf,
+                            "the removable mutation target",
+                        ),
+                        Err(TagWritePreflightError::Unavailable),
+                        "a contested cleanup must refuse the rehearsal, never report \
+                         success for a wrong-object removal"
+                    );
+                });
+                assert_eq!(
+                    errors.len(),
+                    1,
+                    "the contested cleanup must report the destroyed foreign entry \
+                     loudly exactly once: {errors:?}"
+                );
+            },
+        );
+
+        assert!(
+            window_ran.load(Ordering::SeqCst),
+            "the verify→unlink window observer must have run"
+        );
+        let contested_leaf = contested
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the seam contested the private name");
+        let stolen_leaf = stolen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the seam stole the re-verified probe");
+        use rustix::fs::AtFlags;
+        assert!(
+            rustix::fs::statat(&parent, &contested_leaf, AtFlags::empty()).is_err(),
+            "the swapped-in newcomer's entry was destroyed by the contested \
+             unlink — the acknowledged, reported loss"
+        );
+        assert!(
+            rustix::fs::statat(&parent, stolen_leaf.as_os_str(), AtFlags::empty()).is_ok(),
+            "the stolen probe is preserved debris, never destroyed"
+        );
+        rustix::fs::unlinkat(&parent, stolen_leaf.as_os_str(), AtFlags::empty())
+            .expect("remove the stolen-probe debris");
+        let retained_entries: Vec<std::ffi::OsString> = std::fs::read_dir(&album)
+            .expect("list the retained directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            retained_entries,
+            vec![std::ffi::OsString::from("silence.flac")],
+            "the refused rehearsal must leave no probe residue of its own"
+        );
+    }
+
+    /// The verify→unlink window must not disturb the clean path: an
+    /// observer that watches the window (reading the re-verified identity,
+    /// touching nothing) still sees the private name removed and the
+    /// rehearsal report success.
+    #[cfg(unix)]
+    #[test]
+    fn retained_preflight_removes_the_probe_across_an_observed_verify_window() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let (directory, album, _) = anchored_album_fixture("preflight-retire-verify-clean");
+        let authority = mounted_root_authority(&directory);
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+        let (parent, leaf) = target
+            .retained_directory_handle()
+            .expect("retain the directory anchor");
+
+        let window_ran = Arc::new(AtomicBool::new(false));
+        let window_ran_closure = Arc::clone(&window_ran);
+        with_retained_preflight_interpose(
+            Box::new(move |phase, interposed_parent, retire_leaf, _vacant_leaf| {
+                if phase != RetainedPreflightPhase::AfterRetireVerify {
+                    return;
+                }
+                window_ran_closure.store(true, Ordering::SeqCst);
+                retained_leaf_identity(interposed_parent, retire_leaf)
+                    .expect("the re-verified private name still names the pinned probe");
+            }),
+            || {
+                assert_eq!(
+                    crate::local::tag_writer::preflight_tag_write_directory_retained(
+                        &parent,
+                        &leaf,
+                        "the removable mutation target",
+                    ),
+                    Ok(()),
+                    "an observed-but-undisturbed window must leave the clean path \
+                     removing the probe and reporting success"
+                );
+            },
+        );
+
+        assert!(
+            window_ran.load(Ordering::SeqCst),
+            "the verify→unlink window observer must have run"
+        );
+        let retained_entries: Vec<std::ffi::OsString> = std::fs::read_dir(&album)
+            .expect("list the retained directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            retained_entries,
+            vec![std::ffi::OsString::from("silence.flac")],
+            "the clean rehearsal removes its probe completely"
+        );
     }
 
     #[test]
