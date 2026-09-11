@@ -471,8 +471,9 @@ trait AirplaySender: Send + Sync {
     /// Negotiate a session with the receiver at `host:port`, sourcing
     /// audio from the prepared media at `prepared_uri`, and return
     /// it. Called only after `probe` succeeded and after media
-    /// preparation, so a failure here is a receiver-side failure, not
-    /// a missing dependency. Ownership of the dedicated instance
+    /// preparation, so negotiation failures are receiver-side
+    /// failures; ownership re-verification failures return
+    /// `SenderError::Dependency`. Ownership of the dedicated instance
     /// (§4.3) is re-verified from the same supervision record before
     /// the lock is taken, so a daemon swapped in after probe fails
     /// closed before any state is read or mutated. The seam must
