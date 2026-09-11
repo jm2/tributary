@@ -548,6 +548,564 @@ class FuzzLockPolicyTests(unittest.TestCase):
                 [sync_fuzz_lock.Transition("facade", "1.0.0", "1.1.0")],
             )
 
+    def test_bounded_repair_allows_shared_transitive_unification_replacement(self):
+        #lizard forgives
+        # Regression for the lofty 0.24.0 -> 0.25.1 repair: lofty-attr 0.13.0
+        # requires syn ^3.0.3, so cargo unifies every syn requirer onto a
+        # single record and deletes syn 3.0.2, which the old lofty closure
+        # never contained. The repaired lock must pass its own bounded proof.
+        base = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "syn": ["3.0.2"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        # package order: lofty, lofty-attr, syn, quote, async-trait,
+        # serde-derive. The old lofty subtree never reaches syn.
+        base["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        base["package"][3]["dependencies"] = ["quote 1.0.0"]
+        base["package"][5]["dependencies"] = ["syn 3.0.2"]
+        base["package"][6]["dependencies"] = ["syn 3.0.2"]
+        stale_fuzz = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "syn": ["3.0.2"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        stale_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        stale_fuzz["package"][3]["dependencies"] = ["quote 1.0.0"]
+        stale_fuzz["package"][5]["dependencies"] = ["syn 3.0.2"]
+        stale_fuzz["package"][6]["dependencies"] = ["syn 3.0.2"]
+        current = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "syn": ["3.0.5"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        current["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        current["package"][2]["dependencies"] = ["syn 3.0.5"]
+        current["package"][3]["dependencies"] = ["quote 1.0.0"]
+        current["package"][5]["dependencies"] = ["syn 3.0.5"]
+        current["package"][6]["dependencies"] = ["syn 3.0.5"]
+        repaired_fuzz = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "syn": ["3.0.5"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        repaired_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        repaired_fuzz["package"][2]["dependencies"] = ["syn 3.0.5"]
+        repaired_fuzz["package"][3]["dependencies"] = ["quote 1.0.0"]
+        repaired_fuzz["package"][5]["dependencies"] = ["syn 3.0.5"]
+        repaired_fuzz["package"][6]["dependencies"] = ["syn 3.0.5"]
+
+        requested, remaining = sync_fuzz_lock.validate_submitted_fuzz_update(
+            base,
+            current,
+            stale_fuzz,
+            repaired_fuzz,
+            {"dependencies": {"lofty": "1"}},
+        )
+        self.assertEqual(
+            requested,
+            [sync_fuzz_lock.Transition("lofty", "0.24.0", "0.25.1")],
+        )
+        self.assertEqual(remaining, [])
+        sync_fuzz_lock.validate_bounded_package_changes(
+            base,
+            current,
+            stale_fuzz,
+            repaired_fuzz,
+            requested,
+        )
+
+    def test_bounded_repair_rejects_unification_with_ambiguous_survivors(self):
+        #lizard forgives
+        # Two same-name records survive the repair, so the removal cannot be
+        # attributed to one exact unification; the proof fails closed.
+        base = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "syn": ["3.0.2"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        base["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        base["package"][3]["dependencies"] = ["quote 1.0.0"]
+        base["package"][5]["dependencies"] = ["syn 3.0.2"]
+        stale_fuzz = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "syn": ["3.0.2"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        stale_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        stale_fuzz["package"][3]["dependencies"] = ["quote 1.0.0"]
+        stale_fuzz["package"][5]["dependencies"] = ["syn 3.0.2"]
+        current = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "syn": ["3.0.5", "3.0.9"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        current["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        current["package"][2]["dependencies"] = ["syn 3.0.5"]
+        current["package"][3]["dependencies"] = ["quote 1.0.0"]
+        current["package"][6]["dependencies"] = ["syn 3.0.9"]
+        repaired_fuzz = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "syn": ["3.0.5", "3.0.9"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        repaired_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        repaired_fuzz["package"][2]["dependencies"] = ["syn 3.0.5"]
+        repaired_fuzz["package"][3]["dependencies"] = ["quote 1.0.0"]
+        repaired_fuzz["package"][6]["dependencies"] = ["syn 3.0.9"]
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError, "removed package identities"
+        ):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                current,
+                stale_fuzz,
+                repaired_fuzz,
+                [sync_fuzz_lock.Transition("lofty", "0.24.0", "0.25.1")],
+            )
+
+    def test_bounded_repair_rejects_unification_survivor_outside_exact_after_closure(
+        self,
+    ):
+        #lizard forgives
+        # The only surviving same-name record is not reachable from the
+        # requested transition, so the removal is not necessitated by the
+        # selected production update and must fail closed.
+        base = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "syn": ["3.0.2"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        base["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        base["package"][3]["dependencies"] = ["quote 1.0.0"]
+        base["package"][5]["dependencies"] = ["syn 3.0.2"]
+        stale_fuzz = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "syn": ["3.0.2"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        stale_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        stale_fuzz["package"][3]["dependencies"] = ["quote 1.0.0"]
+        stale_fuzz["package"][5]["dependencies"] = ["syn 3.0.2"]
+        current = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "syn": ["3.0.9"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        current["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        current["package"][3]["dependencies"] = ["quote 1.0.0"]
+        current["package"][5]["dependencies"] = ["syn 3.0.9"]
+        repaired_fuzz = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "syn": ["3.0.9"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        repaired_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        repaired_fuzz["package"][3]["dependencies"] = ["quote 1.0.0"]
+        repaired_fuzz["package"][5]["dependencies"] = ["syn 3.0.9"]
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError, "removed package identities"
+        ):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                current,
+                stale_fuzz,
+                repaired_fuzz,
+                [sync_fuzz_lock.Transition("lofty", "0.24.0", "0.25.1")],
+            )
+
+    def test_bounded_repair_rejects_unification_cross_source_substitution(self):
+        #lizard forgives
+        # The survivor carries a different source than the removed record:
+        # that is a source substitution, not a version unification.
+        base = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "syn": ["3.0.2"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        base["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        base["package"][3]["dependencies"] = ["quote 1.0.0"]
+        base["package"][5]["dependencies"] = ["syn 3.0.2"]
+        stale_fuzz = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "syn": ["3.0.2"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        stale_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        stale_fuzz["package"][3]["dependencies"] = ["quote 1.0.0"]
+        stale_fuzz["package"][5]["dependencies"] = ["syn 3.0.2"]
+        current = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "quote": ["1.0.0"],
+            },
+        )
+        current["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        current["package"][2]["dependencies"] = ["syn 3.0.5"]
+        repaired_fuzz = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "syn": ["3.0.5"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        repaired_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        repaired_fuzz["package"][2]["dependencies"] = ["syn 3.0.5"]
+        repaired_fuzz["package"][3]["dependencies"] = ["quote 1.0.0"]
+        repaired_fuzz["package"][5]["dependencies"] = ["syn 3.0.5"]
+        repaired_fuzz["package"][3]["source"] = "git+https://invalid.example/syn"
+
+        with self.assertRaisesRegex(sync_fuzz_lock.PolicyError, 'removed package identities'):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                current,
+                stale_fuzz,
+                repaired_fuzz,
+                [sync_fuzz_lock.Transition("lofty", "0.24.0", "0.25.1")],
+            )
+
+    def test_bounded_repair_rejects_unification_mixed_with_arbitrary_rebind(self):
+        #lizard forgives
+        # A consumer may rebind onto the unified record, but mixing that
+        # admitted rebind with an unrelated edge rewrite on the same consumer
+        # must still fail closed.
+        base = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "syn": ["3.0.2"],
+                "quote": ["1.0.0", "1.1.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        base["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        base["package"][3]["dependencies"] = ["quote 1.1.0"]
+        base["package"][6]["dependencies"] = ["quote 1.0.0", "syn 3.0.2"]
+        stale_fuzz = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "syn": ["3.0.2"],
+                "quote": ["1.0.0", "1.1.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        stale_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        stale_fuzz["package"][3]["dependencies"] = ["quote 1.1.0"]
+        stale_fuzz["package"][6]["dependencies"] = ["quote 1.0.0", "syn 3.0.2"]
+        current = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "syn": ["3.0.5"],
+                "quote": ["1.0.0", "1.1.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        current["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        current["package"][2]["dependencies"] = ["syn 3.0.5"]
+        current["package"][3]["dependencies"] = ["quote 1.1.0"]
+        current["package"][6]["dependencies"] = ["quote 1.1.0", "syn 3.0.5"]
+        repaired_fuzz = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "syn": ["3.0.5"],
+                "quote": ["1.0.0", "1.1.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        repaired_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        repaired_fuzz["package"][2]["dependencies"] = ["syn 3.0.5"]
+        repaired_fuzz["package"][3]["dependencies"] = ["quote 1.1.0"]
+        repaired_fuzz["package"][6]["dependencies"] = ["quote 1.1.0", "syn 3.0.5"]
+
+        with self.assertRaises(sync_fuzz_lock.PolicyError):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                current,
+                stale_fuzz,
+                repaired_fuzz,
+                [sync_fuzz_lock.Transition("lofty", "0.24.0", "0.25.1")],
+            )
+
+    def test_bounded_repair_rejects_removal_without_surviving_same_name_record(self):
+        # A crate removed entirely from the repaired lock has no unification
+        # successor, so the removal stays outside the old transition closure
+        # and must fail closed.
+        base = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "orphan": ["1.0.0"],
+            },
+        )
+        base["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        stale_fuzz = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "orphan": ["1.0.0"],
+            },
+        )
+        stale_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        current = lock(
+            ["lofty 0.25.1"],
+            {"lofty": ["0.25.1"], "lofty-attr": ["0.13.0"]},
+        )
+        current["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        repaired_fuzz = lock(
+            ["lofty 0.25.1"],
+            {"lofty": ["0.25.1"], "lofty-attr": ["0.13.0"]},
+        )
+        repaired_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+
+        with self.assertRaises(sync_fuzz_lock.PolicyError):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                current,
+                stale_fuzz,
+                repaired_fuzz,
+                [sync_fuzz_lock.Transition("lofty", "0.24.0", "0.25.1")],
+            )
+
+    def test_bounded_repair_rejects_unification_onto_preexisting_survivor(self):
+        #lizard forgives
+        # The surviving syn record already existed in the before lock, so the
+        # removal of syn 3.0.2 cannot be proven a necessitated unification:
+        # admitting it would let consumers silently rebind onto a pre-existing
+        # (possibly older) version. The proof must fail closed on the removal.
+        base = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "syn": ["3.0.2", "3.0.5"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        base["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        base["package"][3]["dependencies"] = ["quote 1.0.0"]
+        base["package"][6]["dependencies"] = ["syn 3.0.2"]
+        stale_fuzz = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "syn": ["3.0.2", "3.0.5"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        stale_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        stale_fuzz["package"][3]["dependencies"] = ["quote 1.0.0"]
+        stale_fuzz["package"][6]["dependencies"] = ["syn 3.0.2"]
+        current = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "syn": ["3.0.5"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        current["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        current["package"][2]["dependencies"] = ["syn 3.0.5"]
+        current["package"][3]["dependencies"] = ["quote 1.0.0"]
+        current["package"][5]["dependencies"] = ["syn 3.0.5"]
+        repaired_fuzz = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "syn": ["3.0.5"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+            },
+        )
+        repaired_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        repaired_fuzz["package"][2]["dependencies"] = ["syn 3.0.5"]
+        repaired_fuzz["package"][3]["dependencies"] = ["quote 1.0.0"]
+        repaired_fuzz["package"][5]["dependencies"] = ["syn 3.0.5"]
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError, "removed package identities"
+        ):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                current,
+                stale_fuzz,
+                repaired_fuzz,
+                [sync_fuzz_lock.Transition("lofty", "0.24.0", "0.25.1")],
+            )
+
+    def test_bounded_repair_rejects_unused_unification_replacement(self):
+        #lizard forgives
+        # The removed shared 1.0.0 record is unused: no before edge targets
+        # it, and the upgraded facade merely gains a new shared 2.0.0
+        # dependency. A newly reachable survivor that only shares the removed
+        # record's name and source does not authorize the removal — no edge
+        # rebind consumes the mapping — so the proof must fail closed.
+        base = lock(
+            ["facade 1.0.0"],
+            {"facade": ["1.0.0"], "shared": ["1.0.0"]},
+        )
+        stale_fuzz = lock(
+            ["facade 1.0.0"],
+            {"facade": ["1.0.0"], "shared": ["1.0.0"]},
+        )
+        current = lock(
+            ["facade 2.0.0"],
+            {"facade": ["2.0.0"], "shared": ["2.0.0"]},
+        )
+        current["package"][1]["dependencies"] = ["shared 2.0.0"]
+        repaired_fuzz = lock(
+            ["facade 2.0.0"],
+            {"facade": ["2.0.0"], "shared": ["2.0.0"]},
+        )
+        repaired_fuzz["package"][1]["dependencies"] = ["shared 2.0.0"]
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError, "no observed exact edge rebind"
+        ):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                current,
+                stale_fuzz,
+                repaired_fuzz,
+                [sync_fuzz_lock.Transition("facade", "1.0.0", "2.0.0")],
+            )
+
+    def test_bounded_repair_rejects_independently_dropped_last_edge(self):
+        # The helper's last edge targeting shared 1.0.0 is dropped without a
+        # rebind, while the upgraded facade independently introduces
+        # shared 2.0.0. The edge drop itself is bounded, but no observed
+        # exact rebind consumes the unification mapping, so the removed
+        # record's deletion must still fail closed.
+        base = lock(
+            ["facade 1.0.0"],
+            {"facade": ["1.0.0"], "helper": ["1.0.0"], "shared": ["1.0.0"]},
+        )
+        base["package"][2]["dependencies"] = ["shared 1.0.0"]
+        stale_fuzz = lock(
+            ["facade 1.0.0"],
+            {"facade": ["1.0.0"], "helper": ["1.0.0"], "shared": ["1.0.0"]},
+        )
+        stale_fuzz["package"][2]["dependencies"] = ["shared 1.0.0"]
+        current = lock(
+            ["facade 2.0.0"],
+            {"facade": ["2.0.0"], "helper": ["1.0.0"], "shared": ["2.0.0"]},
+        )
+        current["package"][1]["dependencies"] = ["helper 1.0.0", "shared 2.0.0"]
+        repaired_fuzz = lock(
+            ["facade 2.0.0"],
+            {"facade": ["2.0.0"], "helper": ["1.0.0"], "shared": ["2.0.0"]},
+        )
+        repaired_fuzz["package"][1]["dependencies"] = [
+            "helper 1.0.0",
+            "shared 2.0.0",
+        ]
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError, "no observed exact edge rebind"
+        ):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                current,
+                stale_fuzz,
+                repaired_fuzz,
+                [sync_fuzz_lock.Transition("facade", "1.0.0", "2.0.0")],
+            )
+
     def test_check_mode_rejects_raw_rebind_after_direct_transition_is_repaired(self):
         base = lock(
             ["facade 1.0.0"],

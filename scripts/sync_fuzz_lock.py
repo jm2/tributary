@@ -279,6 +279,113 @@ def resolved_dependency_edges(
     }
 
 
+def unification_replacements(
+    before_records: dict[tuple[str, str], dict[str, Any]],
+    after_records: dict[tuple[str, str], dict[str, Any]],
+    old_identities: set[tuple[str, str]],
+    after_identities: set[tuple[str, str]],
+) -> dict[tuple[str, str], tuple[str, str]]:
+    """
+    Attribute exact removals to a Cargo shared-transitive unification.
+
+    Cargo unifies same-requirement consumers onto a single lock entry, so
+    promoting a shared transitive can delete an exact identity that the old
+    transition closure never contained: the base lock holds (name, old) only
+    for crates outside the transitioned subtree, and the repaired lock
+    resolves every requirer onto one surviving (name, new) record. A removal
+    is attributed to that unification only when the removed identity has
+    exactly one surviving same-name record, that record lies inside the exact
+    after closure (so the selected production update necessitated it), it
+    preserves the removed record's source identity, and the repair itself
+    introduced it. Unrelated removals, ambiguous survivors, pre-existing
+    survivors, and cross-source substitutions stay rejected.
+    """
+    replacements: dict[tuple[str, str], tuple[str, str]] = {}
+    candidates = sorted(
+        before_records.keys() - after_records.keys() - old_identities
+    )
+    for identity in candidates:
+        survivors = sorted(
+            candidate for candidate in after_records if candidate[0] == identity[0]
+        )
+        if len(survivors) != 1:
+            continue
+        replacement = survivors[0]
+        if replacement not in after_identities:
+            continue
+        if replacement in before_records:
+            # A survivor that already existed in the before lock could
+            # silently downgrade or substitute a transitive by absorbing its
+            # consumers; only a record the repair itself introduced is
+            # provably the unification target.
+            continue
+        if (
+            before_records[identity].get("source")
+            != after_records[replacement].get("source")
+        ):
+            continue
+        replacements[identity] = replacement
+    return replacements
+
+
+def is_exact_unification_rebind(
+    before_targets: tuple[tuple[str, str], ...],
+    after_targets: tuple[tuple[str, str], ...],
+    replacements: dict[tuple[str, str], tuple[str, str]],
+) -> bool:
+    """
+    True when an edge change is exactly the admitted unification mapping.
+
+    A rebinding consumer keeps its dependency-name surface and edge count;
+    every changed target must map from an admitted removed identity onto its
+    unique surviving replacement. Arbitrary rebinds, added or dropped edges,
+    and unrelated changes mixed into the same consumer still fail closed.
+    """
+    if len(before_targets) != len(after_targets):
+        return False
+    remapped = tuple(
+        replacements.get(target, target) for target in before_targets
+    )
+    return remapped == after_targets and remapped != before_targets
+
+
+def observed_unification_rebinds(
+    before_records: dict[tuple[str, str], dict[str, Any]],
+    after_records: dict[tuple[str, str], dict[str, Any]],
+    replacements: dict[tuple[str, str], tuple[str, str]],
+) -> set[tuple[str, str]]:
+    """
+    Return the removed identities whose mapping an edge rebind consumes.
+
+    A unification mapping justifies its removal only when at least one
+    retained consumer exhibits the exact before-edge to after-edge rebind:
+    cargo deleted the old record because that consumer now resolves onto the
+    surviving record. A survivor that merely shares the removed record's
+    name and source — for example a newly reachable dependency of an
+    upgraded facade — never consumes the mapping, and neither does a
+    consumer whose last old edge was dropped without a rebind. Unused
+    mappings stay unauthorized.
+    """
+    observed: set[tuple[str, str]] = set()
+    for identity in sorted(before_records.keys() & after_records.keys()):
+        before_edges = resolved_dependency_edges(
+            before_records[identity], before_records
+        )
+        after_edges = resolved_dependency_edges(after_records[identity], after_records)
+        for dependency_name in before_edges.keys() & after_edges.keys():
+            before_targets = before_edges[dependency_name]
+            after_targets = after_edges[dependency_name]
+            if before_targets == after_targets:
+                continue
+            if is_exact_unification_rebind(
+                before_targets, after_targets, replacements
+            ):
+                observed.update(
+                    target for target in before_targets if target in replacements
+                )
+    return observed
+
+
 # The explicit fail-closed branches mirror distinct lockfile invariants; folding
 # them together would make the safety proof harder to audit.
 def validate_dependency_edges(
@@ -288,6 +395,7 @@ def validate_dependency_edges(
     authorized_identities: set[tuple[str, str]],
     old_identities: set[tuple[str, str]],
     target_identities: set[tuple[str, str]],
+    replacements: dict[tuple[str, str], tuple[str, str]],
 ) -> None:
     """Reject semantic edge changes outside the reviewed dependency surface."""
     #lizard forgives
@@ -386,6 +494,13 @@ def validate_dependency_edges(
             if (
                 identity in authorized_identities
                 or edge_surface <= authorized_identities
+                # A shared-transitive promotion can rebind an unchanged
+                # consumer onto the single unified record. Admit only an
+                # exact old->replacement mapping proven by
+                # unification_replacements; every other rebind fails.
+                or is_exact_unification_rebind(
+                    before_targets, after_targets, replacements
+                )
             ):
                 continue
 
@@ -424,7 +539,29 @@ def validate_bounded_package_changes(
     root_records = package_records_by_identity(current_root_lock)
     removed_identities = before_records.keys() - after_records.keys()
     added_identities = after_records.keys() - before_records.keys()
-    unexpected_removed = removed_identities - old_identities
+    # Exact shared-transitive unification replacements necessitated by the
+    # selected production update. Every other removal stays unexpected.
+    replacements = unification_replacements(
+        before_records, after_records, old_identities, after_identities
+    )
+    # A unification mapping authorizes its removal only when the repaired
+    # lock actually exhibits the exact edge rebind consuming it. A survivor
+    # that merely shares the removed record's name and source — or a last
+    # edge dropped without any rebind — leaves the mapping unused, so the
+    # removal stays outside the reviewed dependency surface.
+    observed = observed_unification_rebinds(
+        before_records, after_records, replacements
+    )
+    unused_replacements = replacements.keys() - observed
+    if unused_replacements:
+        raise PolicyError(
+            "fuzz lock repair removed package identities outside the exact "
+            "old dependency closure with no observed exact edge rebind onto "
+            f"the unified survivor: {sorted(unused_replacements)}"
+        )
+    unexpected_removed = (
+        removed_identities - old_identities - replacements.keys()
+    )
     unexpected_added = added_identities - after_identities
     if unexpected_removed:
         raise PolicyError(
@@ -467,6 +604,7 @@ def validate_bounded_package_changes(
         authorized_identities,
         old_identities,
         after_identities,
+        replacements,
     )
 
 
