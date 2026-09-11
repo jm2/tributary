@@ -2836,6 +2836,10 @@ impl SourceRegistry {
             let track_ids: HashSet<TrackId> = carried.keys().cloned().collect();
             let carried_versions = carried;
             let pending_written = Arc::clone(&self.inner);
+            // The spawned refresh task's test-only Ok seam names its source,
+            // so an armed closure can act only on its own test's generation.
+            #[cfg(test)]
+            let seam_source = source_id;
             let owner = owner.on_acceptance(Box::new(move || {
                 // Settlement-confirmed, version-matched consumption: this
                 // exact generation's publication was accepted by the
@@ -2851,7 +2855,7 @@ impl SourceRegistry {
                 // either republished by the successor or stays pending for
                 // the next refresh.
                 #[cfg(test)]
-                run_pending_consumption_interpose();
+                run_pending_consumption_interpose(&source_id);
                 if let Some(entry) =
                     lock(&pending_written.mutation_refresh_pending).get_mut(&source_id)
                 {
@@ -2875,7 +2879,7 @@ impl SourceRegistry {
                         // supersede races the settlement-confirmed batch
                         // consumption across.
                         #[cfg(test)]
-                        run_post_mutation_refresh_ok_interpose();
+                        run_post_mutation_refresh_ok_interpose(&seam_source);
                         RefreshTaskResult::Refreshed(AcceptedSourcePayload::catalogue(
                             tracks,
                             regular_playlist_capability,
@@ -2904,9 +2908,11 @@ impl SourceRegistry {
 /// Test-only hook fired inside a post-mutation refresh task after its adapter
 /// call returned `Ok` and before its payload is submitted for settlement: the
 /// Ok→settlement window whose supersede races the pending batch's
-/// consumption.
+/// consumption. The armed closure receives the refreshing source's id and
+/// acts only on its own — a foreign test's generation fires this seam on
+/// its own schedule under the parallel harness.
 #[cfg(test)]
-type PostMutationRefreshOkInterpose = dyn Fn() + Send + Sync;
+type PostMutationRefreshOkInterpose = dyn Fn(&SourceId) + Send + Sync;
 
 #[cfg(test)]
 static POST_MUTATION_REFRESH_OK_INTERPOSE: std::sync::Mutex<
@@ -2918,9 +2924,9 @@ static POST_MUTATION_REFRESH_OK_INTERPOSE: std::sync::Mutex<
 static POST_MUTATION_REFRESH_OK_INTERPOSE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
-fn run_post_mutation_refresh_ok_interpose() {
+fn run_post_mutation_refresh_ok_interpose(source_id: &SourceId) {
     if let Some(interpose) = lock(&POST_MUTATION_REFRESH_OK_INTERPOSE).as_ref() {
-        interpose();
+        interpose(source_id);
     }
 }
 
@@ -2940,9 +2946,13 @@ fn with_post_mutation_refresh_ok_interpose(
 /// Test-only hook fired inside a refresh generation's acceptance hook before
 /// it consumes the pending map: the acceptance→consumption window a
 /// same-track save races across, since the acceptance and the pending map
-/// take different locks.
+/// take different locks. The armed closure receives the refreshing source's
+/// id and acts only on its own: under the parallel test harness a foreign
+/// test's refresh generation fires this seam on its own schedule, and an
+/// identity-blind process-wide closure would run its race inside a
+/// stranger's window and desynchronize an innocent test.
 #[cfg(test)]
-type PendingConsumptionInterpose = dyn Fn() + Send + Sync;
+type PendingConsumptionInterpose = dyn Fn(&SourceId) + Send + Sync;
 
 #[cfg(test)]
 static PENDING_CONSUMPTION_INTERPOSE: std::sync::Mutex<Option<Box<PendingConsumptionInterpose>>> =
@@ -2953,9 +2963,9 @@ static PENDING_CONSUMPTION_INTERPOSE: std::sync::Mutex<Option<Box<PendingConsump
 static PENDING_CONSUMPTION_INTERPOSE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
-fn run_pending_consumption_interpose() {
+fn run_pending_consumption_interpose(source_id: &SourceId) {
     if let Some(interpose) = lock(&PENDING_CONSUMPTION_INTERPOSE).as_ref() {
-        interpose();
+        interpose(source_id);
     }
 }
 
@@ -4640,7 +4650,13 @@ mod tests {
         let successor_slot = Arc::clone(&successor_generation);
         let fired = AtomicBool::new(false);
         with_post_mutation_refresh_ok_interpose(
-            Box::new(move || {
+            Box::new(move |fired_source: &SourceId| {
+                // Identity scoping: a foreign test's refresh generation also
+                // fires this seam under the parallel harness; only this
+                // test's own source may spend the one-shot latch.
+                if fired_source != &interpose_source {
+                    return;
+                }
                 if fired.swap(true, Ordering::SeqCst) {
                     return; // only the superseded generation's Ok drives the race
                 }
@@ -4769,7 +4785,13 @@ mod tests {
         let successor_generation: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let successor_slot = Arc::clone(&successor_generation);
         with_pending_consumption_interpose(
-            Box::new(move || {
+            Box::new(move |fired_source: &SourceId| {
+                // Identity scoping: a foreign test's refresh generation also
+                // fires this seam under the parallel harness; only this
+                // test's own source may drive the race.
+                if fired_source != &race_source {
+                    return;
+                }
                 race_probe.set_post_mutation_failure(true);
                 let written = [(race_source, race_track.clone())];
                 let generations = race_registry.refresh_catalogue_after_mutation(&written);

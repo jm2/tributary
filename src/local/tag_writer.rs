@@ -1751,10 +1751,22 @@ enum RetainedPreflightPhase {
 type RetainedPreflightInterpose =
     dyn Fn(RetainedPreflightPhase, &std::fs::File, &OsStr, &OsStr) + Send + Sync;
 
+// The seam slot is THREAD-LOCAL: an armed closure is visible only to
+// firings on the thread that armed it. Every seam test drives its own
+// rehearsal synchronously on its own thread, while the Rust harness runs
+// tests in parallel on distinct threads — a process-wide slot let a
+// parallel, seam-less test's rehearsal observe another test's armed
+// closure (every rehearsal passes the same phases, so the windows match),
+// stealing the probe from a foreign fixture and failing an innocent test.
+// Per-thread storage makes cross-test firing structurally impossible.
 #[cfg(all(test, unix))]
-static RETAINED_PREFLIGHT_INTERPOSE: std::sync::Mutex<Option<Box<RetainedPreflightInterpose>>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    static RETAINED_PREFLIGHT_INTERPOSE:
+        std::cell::RefCell<Option<Box<RetainedPreflightInterpose>>> =
+        std::cell::RefCell::new(None);
+}
 
+/// Serialize tests that use the retained-preflight interposition seam.
 #[cfg(all(test, unix))]
 static RETAINED_PREFLIGHT_INTERPOSE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1765,21 +1777,32 @@ fn run_retained_preflight_interpose(
     probe: &OsStr,
     vacant: &OsStr,
 ) {
-    if let Some(interpose) = RETAINED_PREFLIGHT_INTERPOSE.lock().unwrap().as_ref() {
-        interpose(phase, parent, probe, vacant);
-    }
+    RETAINED_PREFLIGHT_INTERPOSE.with(|slot| {
+        if let Some(interpose) = slot.borrow().as_ref() {
+            interpose(phase, parent, probe, vacant);
+        }
+    });
 }
 
-/// Serialize tests that use the retained-preflight interposition seam.
+/// Arm `interpose` for the duration of `run` on THIS thread, serializing
+/// against other tests that use the seam. A drop guard uninstalls the
+/// closure, so a panicking observation cannot leave a stale seam armed for
+/// a later test on this thread.
 #[cfg(all(test, unix))]
 fn with_retained_preflight_interpose(
     interpose: Box<RetainedPreflightInterpose>,
     run: impl FnOnce(),
 ) {
+    struct UninstallRetainedPreflightInterpose;
+    impl Drop for UninstallRetainedPreflightInterpose {
+        fn drop(&mut self) {
+            RETAINED_PREFLIGHT_INTERPOSE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
     let _serial = RETAINED_PREFLIGHT_INTERPOSE_SERIAL.lock().unwrap();
-    *RETAINED_PREFLIGHT_INTERPOSE.lock().unwrap() = Some(interpose);
+    RETAINED_PREFLIGHT_INTERPOSE.with(|slot| *slot.borrow_mut() = Some(interpose));
+    let _uninstall = UninstallRetainedPreflightInterpose;
     run();
-    *RETAINED_PREFLIGHT_INTERPOSE.lock().unwrap() = None;
 }
 
 #[cfg(test)]
@@ -2927,6 +2950,84 @@ mod tests {
         captured
     }
 
+    /// Drive the contested rehearsal under the armed verify→unlink window:
+    /// the rehearsal must refuse with `Unavailable` — never report success
+    /// for a wrong-object removal — and the refusal must carry exactly one
+    /// ERROR-level event acknowledging the destroyed foreign entry.
+    #[cfg(unix)]
+    fn run_contested_rehearsal_expect_refusal(parent: &std::fs::File, leaf: &OsStr) {
+        let errors = capture_error_events(|| {
+            assert_eq!(
+                crate::local::tag_writer::preflight_tag_write_directory_retained(
+                    parent,
+                    leaf,
+                    "the removable mutation target",
+                ),
+                Err(TagWritePreflightError::Unavailable),
+                "a contested cleanup must refuse the rehearsal, never report \
+                 success for a wrong-object removal"
+            );
+        });
+        assert_eq!(
+            errors.len(),
+            1,
+            "the contested cleanup must report the destroyed foreign entry \
+             loudly exactly once: {errors:?}"
+        );
+    }
+
+    /// Assert the observed outcomes of the refused contested cleanup: the
+    /// verify→unlink window observer ran; the swapped-in newcomer's
+    /// destroyed entry is the acknowledged loss; the stolen probe survives
+    /// as debris (removed here as test cleanup); and the refused rehearsal
+    /// left no probe residue of its own beside the admitted file.
+    #[cfg(unix)]
+    fn assert_contested_removal_refusal_outcomes(
+        window_ran: &std::sync::atomic::AtomicBool,
+        contested: &std::sync::Arc<std::sync::Mutex<Option<std::ffi::OsString>>>,
+        stolen: &std::sync::Arc<std::sync::Mutex<Option<std::ffi::OsString>>>,
+        parent: &std::fs::File,
+        album: &Path,
+    ) {
+        use rustix::fs::AtFlags;
+        use std::sync::atomic::Ordering;
+        assert!(
+            window_ran.load(Ordering::SeqCst),
+            "the verify→unlink window observer must have run"
+        );
+        let contested_leaf = contested
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the seam contested the private name");
+        let stolen_leaf = stolen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the seam stole the re-verified probe");
+        assert!(
+            rustix::fs::statat(parent, &contested_leaf, AtFlags::empty()).is_err(),
+            "the swapped-in newcomer's entry was destroyed by the contested \
+             unlink — the acknowledged, reported loss"
+        );
+        assert!(
+            rustix::fs::statat(parent, stolen_leaf.as_os_str(), AtFlags::empty()).is_ok(),
+            "the stolen probe is preserved debris, never destroyed"
+        );
+        rustix::fs::unlinkat(parent, stolen_leaf.as_os_str(), AtFlags::empty())
+            .expect("remove the stolen-probe debris");
+        let retained_entries: Vec<std::ffi::OsString> = std::fs::read_dir(album)
+            .expect("list the retained directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            retained_entries,
+            vec![std::ffi::OsString::from("silence.flac")],
+            "the refused rehearsal must leave no probe residue of its own"
+        );
+    }
+
     /// The bound removal must survive — by refusing loudly — an external
     /// writer's swap inside the verify→unlink window: the re-verified
     /// private name is stolen and a newcomer installed there before the
@@ -2970,63 +3071,15 @@ mod tests {
                     &stolen_closure,
                 );
             }),
-            || {
-                let errors = capture_error_events(|| {
-                    assert_eq!(
-                        crate::local::tag_writer::preflight_tag_write_directory_retained(
-                            &parent,
-                            &leaf,
-                            "the removable mutation target",
-                        ),
-                        Err(TagWritePreflightError::Unavailable),
-                        "a contested cleanup must refuse the rehearsal, never report \
-                         success for a wrong-object removal"
-                    );
-                });
-                assert_eq!(
-                    errors.len(),
-                    1,
-                    "the contested cleanup must report the destroyed foreign entry \
-                     loudly exactly once: {errors:?}"
-                );
-            },
+            || run_contested_rehearsal_expect_refusal(&parent, &leaf),
         );
 
-        assert!(
-            window_ran.load(Ordering::SeqCst),
-            "the verify→unlink window observer must have run"
-        );
-        let contested_leaf = contested
-            .lock()
-            .unwrap()
-            .take()
-            .expect("the seam contested the private name");
-        let stolen_leaf = stolen
-            .lock()
-            .unwrap()
-            .take()
-            .expect("the seam stole the re-verified probe");
-        use rustix::fs::AtFlags;
-        assert!(
-            rustix::fs::statat(&parent, &contested_leaf, AtFlags::empty()).is_err(),
-            "the swapped-in newcomer's entry was destroyed by the contested \
-             unlink — the acknowledged, reported loss"
-        );
-        assert!(
-            rustix::fs::statat(&parent, stolen_leaf.as_os_str(), AtFlags::empty()).is_ok(),
-            "the stolen probe is preserved debris, never destroyed"
-        );
-        rustix::fs::unlinkat(&parent, stolen_leaf.as_os_str(), AtFlags::empty())
-            .expect("remove the stolen-probe debris");
-        let retained_entries: Vec<std::ffi::OsString> = std::fs::read_dir(&album)
-            .expect("list the retained directory")
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name())
-            .collect();
-        assert_eq!(
-            retained_entries,
-            vec![std::ffi::OsString::from("silence.flac")],
-            "the refused rehearsal must leave no probe residue of its own"
+        assert_contested_removal_refusal_outcomes(
+            &window_ran,
+            &contested,
+            &stolen,
+            &parent,
+            &album,
         );
     }
 
