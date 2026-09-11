@@ -2180,40 +2180,20 @@ mod tests {
     fn zero_timeout_queries_with_a_transition_in_flight_are_unsettled() {
         use gst::StateChangeSuccess as Scs;
 
-        let settled = |state| Ok::<gst::StateChangeSuccess, gst::StateChangeError>(state);
-        assert_eq!(
-            settled_zero_state((
-                settled(Scs::Success),
-                gst::State::Playing,
-                gst::State::VoidPending
-            )),
-            Some(true)
-        );
-        assert_eq!(
-            settled_zero_state((
-                settled(Scs::Success),
-                gst::State::Paused,
-                gst::State::VoidPending
-            )),
-            Some(false)
-        );
-        assert_eq!(
-            settled_zero_state((
-                settled(Scs::Success),
-                gst::State::Null,
-                gst::State::VoidPending
-            )),
-            Some(false)
-        );
+        let settled = |success| Ok::<gst::StateChangeSuccess, gst::StateChangeError>(success);
+        // A settled, pending-free query confirms the reported state:
+        // only a confirmed Playing state reads as "was playing".
+        let confirms = |state: gst::State, success: gst::StateChangeSuccess| {
+            assert_eq!(
+                settled_zero_state((settled(success), state, gst::State::VoidPending)),
+                Some(state == gst::State::Playing)
+            );
+        };
+        confirms(gst::State::Playing, Scs::Success);
+        confirms(gst::State::Paused, Scs::Success);
+        confirms(gst::State::Null, Scs::Success);
         // NoPreroll (live pipelines) reports a settled, confirmed state.
-        assert_eq!(
-            settled_zero_state((
-                settled(Scs::NoPreroll),
-                gst::State::Paused,
-                gst::State::VoidPending
-            )),
-            Some(false)
-        );
+        confirms(gst::State::Paused, Scs::NoPreroll);
         // The discarded-pending hazard: origin `Paused`, target `Playing`
         // in flight reads as "not playing" but is not settled.
         assert_eq!(

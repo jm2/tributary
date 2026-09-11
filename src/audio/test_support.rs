@@ -94,11 +94,13 @@ where
         return;
     }
 
-    let sentinel = std::env::temp_dir().join(format!(
-        "tributary-protected-gstreamer-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
+    // The tempfile crate's managed unique directory is the sandbox root
+    // for everything this harness stages on disk (the repo's standard
+    // root, same family as the config-module tests — and unlike
+    // `std::env::temp_dir`, not a security-sensitive primitive). Its own
+    // Drop cleanup backs the explicit guards below.
+    let sandbox_root = tempfile::tempdir().expect("protected-stream sandbox root");
+    let sentinel = sandbox_root.path().join("protected-gstreamer-sentinel");
     let _sentinel_guard = RemoveFileOnDrop(sentinel.clone());
     // Sandbox the child's data directory: without this, `Player::new`
     // in the child reads the *real* user `equalizer.cfg`. A file left
@@ -109,11 +111,7 @@ where
     // contract is playback-to-EOS with in-memory defaults — equalizer
     // persistence is the config module's tested concern, not this
     // playback harness's.
-    let child_data_dir = std::env::temp_dir().join(format!(
-        "tributary-protected-gstreamer-data-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
+    let child_data_dir = sandbox_root.path().join("child-data");
     std::fs::create_dir_all(&child_data_dir).expect("create child data sandbox");
     let _data_dir_guard = RemoveDirOnDrop(child_data_dir.clone());
     let mut child = Command::new(std::env::current_exe().expect("current test executable"));
