@@ -179,7 +179,8 @@ name: Bot review gate publisher
 # publish at all — it holds no `checks` grant — and the required context is
 # published only under a minted installation token of the dedicated
 # gate-publisher GitHub App (`BOT_REVIEW_GATE_APP_ID` /
-# `BOT_REVIEW_GATE_PRIVATE_KEY` repository secrets; missing credentials fail
+# `BOT_REVIEW_GATE_PRIVATE_KEY` environment secrets, scoped to the
+# `bot-review-gate-publisher` environment; missing credentials fail
 # the job before anything can be published, leaving the required context
 # unreported and the merge blocked). The live `main` ruleset entry and
 # dependabot-automerge.yml require the context from that App's integration
