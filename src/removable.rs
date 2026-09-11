@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Handle;
 use uuid::Uuid;
@@ -28,18 +28,29 @@ use crate::source_registry::{
 
 const MAX_TAG_TEXT_BYTES: usize = 64 * 1024;
 
+/// Accepted catalogue content of one mounted removable session.
+///
+/// Mutable only through [`RemovableMediaAdapter::refresh_catalogue_after_mutation`]:
+/// a committed retained write swaps the refreshed entry and attribution
+/// profile for exactly the written identity under one lock, so the
+/// republished catalogue and the live attribution authority can never
+/// disagree about a mutated row.
+#[derive(Default)]
+struct RemovableCatalogue {
+    tracks: Vec<Track>,
+    playback_attribution_profiles: HashMap<TrackId, PlaybackAttributionProfile>,
+}
+
 /// One mounted removable source whose catalogue and media authority share an
 /// exact lifecycle generation.
 pub struct RemovableMediaAdapter {
-    #[cfg(test)]
     source_id: SourceId,
     authority: Arc<MountedRootAuthority>,
-    tracks: Vec<Track>,
     accepted_track_ids: HashSet<TrackId>,
-    /// Exact real-tag attribution captured by the same retained scan that
-    /// accepted `tracks`. This map is immutable for the entire source session;
-    /// synchronous lifecycle admission never waits on a parser or lock.
-    playback_attribution_profiles: HashMap<TrackId, PlaybackAttributionProfile>,
+    /// Accepted catalogue. Scan constructs it once; the post-mutation
+    /// refresh replaces entries for exact written identities under the
+    /// catalogue lock.
+    catalogue: Mutex<RemovableCatalogue>,
     runtime: Handle,
 }
 
@@ -157,12 +168,13 @@ impl RemovableMediaAdapter {
         }
 
         Ok(Some(Self {
-            #[cfg(test)]
             source_id,
             authority,
-            tracks,
             accepted_track_ids,
-            playback_attribution_profiles,
+            catalogue: Mutex::new(RemovableCatalogue {
+                tracks,
+                playback_attribution_profiles,
+            }),
             runtime,
         }))
     }
@@ -173,8 +185,17 @@ impl RemovableMediaAdapter {
     }
 
     #[cfg(test)]
-    pub fn tracks(&self) -> &[Track] {
-        &self.tracks
+    pub fn tracks(&self) -> Vec<Track> {
+        self.catalogue_tracks()
+    }
+
+    /// Snapshot of the accepted catalogue tracks under the catalogue lock.
+    fn catalogue_tracks(&self) -> Vec<Track> {
+        self.catalogue
+            .lock()
+            .expect("removable catalogue mutex poisoned")
+            .tracks
+            .clone()
     }
 }
 
@@ -196,11 +217,16 @@ impl ManagedSourceAdapter for RemovableMediaAdapter {
         &self,
         track_id: &TrackId,
     ) -> Option<PlaybackAttributionProfile> {
-        self.playback_attribution_profiles.get(track_id).cloned()
+        self.catalogue
+            .lock()
+            .expect("removable catalogue mutex poisoned")
+            .playback_attribution_profiles
+            .get(track_id)
+            .cloned()
     }
 
     fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
-        Box::pin(async move { Ok(self.tracks.clone()) })
+        Box::pin(async move { Ok(self.catalogue_tracks()) })
     }
 
     fn resolve_stream(self: Arc<Self>, track_id: TrackId) -> StreamFuture {
@@ -254,6 +280,139 @@ impl ManagedSourceAdapter for RemovableMediaAdapter {
 
             task.await.map_err(|_| resolution_failed())?
         })
+    }
+
+    fn refresh_catalogue_after_mutation(
+        self: Arc<Self>,
+        written_track_ids: HashSet<TrackId>,
+        cancellation: CancellationObserver,
+    ) -> CatalogueFuture {
+        Box::pin(async move {
+            if written_track_ids.is_empty() {
+                return Ok(self.catalogue_tracks());
+            }
+            let this = Arc::clone(&self);
+            let task = self.runtime.spawn_blocking(move || {
+                this.refresh_written_identities(&written_track_ids, &cancellation)
+            });
+            match task.await {
+                Ok(result) => result,
+                Err(_) => Err(scan_failed()),
+            }
+        })
+    }
+}
+
+impl RemovableMediaAdapter {
+    /// Re-derive catalogue entries for exact identities whose retained
+    /// writes committed, and swap them into the accepted catalogue under
+    /// one lock.
+    ///
+    /// Only identities the accepted scan admitted are re-read; every other
+    /// requested identity is ignored. An identity that fails to re-read or
+    /// re-parse keeps its previous catalogue entry — the refresh is scoped
+    /// to what actually committed, and one unreadable row never fails the
+    /// whole publication. Re-reads flow through the retained mount
+    /// authority via the same [`ResolvedFileMedia::from_mounted_relative_path`]
+    /// path the scan and stream resolution use, so no native mount location
+    /// is exposed and a displaced ancestor can never retarget the lookup.
+    /// The attribution profile is rebuilt from the fresh parse on the same
+    /// real-tag provenance rules as the scan, so the republished catalogue
+    /// and the live playback-attribution authority change together.
+    ///
+    /// The swap happens only after the mount authority revalidates: a mount
+    /// that changed under the re-reads publishes nothing. Blocking — worker
+    /// threads only.
+    fn refresh_written_identities(
+        &self,
+        written: &HashSet<TrackId>,
+        cancellation: &CancellationObserver,
+    ) -> BackendResult<Vec<Track>> {
+        let mut refreshed: Vec<(TrackId, Track, Option<PlaybackAttributionProfile>)> =
+            Vec::with_capacity(written.len());
+        for track_id in written {
+            // Membership: a well-formed relative identity that appeared
+            // outside the accepted scan is not authority to read anything
+            // in this session.
+            if !self.accepted_track_ids.contains(track_id) {
+                continue;
+            }
+            if cancellation.is_cancelled() {
+                break;
+            }
+            let Ok(relative_path) = track_id.removable_relative_path() else {
+                continue;
+            };
+            let extension = extension_hint(&relative_path);
+            let Ok(media) = ResolvedFileMedia::from_mounted_relative_path(
+                Arc::clone(&self.authority),
+                &relative_path,
+                extension,
+            ) else {
+                continue;
+            };
+            let parsed = media
+                .with_serialized_seekable_file(|file| {
+                    crate::local::tag_parser::parse_audio_file_from_file(file, &relative_path)
+                })
+                .ok()
+                .and_then(Result::ok);
+            if cancellation.is_cancelled() {
+                break;
+            }
+            let Some(parsed) = parsed.filter(parsed_metadata_is_bounded) else {
+                continue;
+            };
+            let title_from_tag = parsed.title_from_tag;
+            let artist_from_tag = parsed.artist_from_tag;
+            let album_from_tag = parsed.album_from_tag;
+            let track = pathless_track(self.source_id, track_id.clone(), parsed);
+            let profile = PlaybackAttributionProfile::from_tagged_track(
+                &track,
+                title_from_tag,
+                artist_from_tag,
+                album_from_tag,
+            );
+            refreshed.push((track_id.clone(), track, profile));
+        }
+
+        if self.authority.validate().is_err() {
+            if cancellation.is_cancelled() {
+                return Ok(self.catalogue_tracks());
+            }
+            return Err(scan_failed());
+        }
+        if cancellation.is_cancelled() {
+            // A lane cancelled mid-re-read publishes nothing — the same
+            // discipline as the accepted scan, which never repopulates from
+            // a cancelled pass.
+            return Ok(self.catalogue_tracks());
+        }
+
+        let mut catalogue = self
+            .catalogue
+            .lock()
+            .expect("removable catalogue mutex poisoned");
+        for (track_id, track, profile) in refreshed {
+            if let Some(slot) = catalogue
+                .tracks
+                .iter_mut()
+                .find(|track| track.native_track_id.as_ref() == Some(&track_id))
+            {
+                *slot = track;
+            }
+            match profile {
+                Some(profile) => {
+                    catalogue
+                        .playback_attribution_profiles
+                        .insert(track_id, profile);
+                }
+                None => {
+                    catalogue.playback_attribution_profiles.remove(&track_id);
+                }
+            }
+        }
+        Ok(catalogue.tracks.clone())
     }
 }
 
@@ -699,6 +858,328 @@ mod tests {
             .expect("write replacement WAV");
 
         assert!(Arc::new(adapter).resolve_stream(track_id).await.is_err());
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn refresh_republishes_written_identities_and_attribution() {
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let song_path = mount.path().join("song.flac");
+        write_tagged_flac(
+            &song_path,
+            Some("Before Refresh"),
+            Some("Before Artist"),
+            Some("Before Album"),
+            None,
+            Some("1"),
+        );
+
+        let source_id = SourceId::removable("test:refresh-republish").expect("source identity");
+        let (_registry, owner, cancellation) = live_cancellation(source_id);
+        let adapter = Arc::new(
+            RemovableMediaAdapter::scan(
+                source_id,
+                mount.path().to_path_buf(),
+                &cancellation,
+                Handle::current(),
+            )
+            .expect("scan removable media")
+            .expect("scan remains current"),
+        );
+        assert_eq!(adapter.tracks().len(), 1);
+        let track_id = adapter.tracks()[0]
+            .native_track_id
+            .clone()
+            .expect("accepted identity");
+        assert_eq!(adapter.tracks()[0].title, "Before Refresh");
+
+        // A committed retained write replaced the file content at the same
+        // relative path; the refresh re-derives the row and the attribution
+        // profile from the fresh parse.
+        write_tagged_flac(
+            &song_path,
+            Some("After Refresh"),
+            Some("After Artist"),
+            Some("After Album"),
+            None,
+            Some("2"),
+        );
+        let refreshed = Arc::clone(&adapter)
+            .refresh_catalogue_after_mutation(
+                HashSet::from([track_id.clone()]),
+                cancellation.clone(),
+            )
+            .await
+            .expect("a committed write republishes");
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].title, "After Refresh");
+
+        let published = adapter.tracks();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].title, "After Refresh");
+        assert_eq!(
+            published[0].native_track_id.as_ref(),
+            Some(&track_id),
+            "the row keeps its accepted identity"
+        );
+        let profile = adapter
+            .playback_attribution_profile(&track_id)
+            .expect("fresh real tags keep attribution authorized");
+        assert_eq!(profile.title(), "After Refresh");
+        assert_eq!(profile.track_number(), Some(2));
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn refresh_ignores_identities_outside_the_accepted_scan() {
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let accepted_path = mount.path().join("accepted.wav");
+        std::fs::write(&accepted_path, minimal_wav_bytes(0x80)).expect("write accepted WAV");
+
+        let source_id = SourceId::removable("test:refresh-membership").expect("source identity");
+        let (_registry, owner, cancellation) = live_cancellation(source_id);
+        let adapter = Arc::new(
+            RemovableMediaAdapter::scan(
+                source_id,
+                mount.path().to_path_buf(),
+                &cancellation,
+                Handle::current(),
+            )
+            .expect("scan removable media")
+            .expect("scan remains current"),
+        );
+        let accepted_id = adapter.tracks()[0]
+            .native_track_id
+            .clone()
+            .expect("accepted identity");
+
+        let appeared_path = mount.path().join("appeared-later.wav");
+        std::fs::write(&appeared_path, minimal_wav_bytes(0x40)).expect("write later WAV");
+        let appeared_id =
+            TrackId::removable_relative(mount.path(), &appeared_path).expect("later identity");
+
+        let refreshed = Arc::clone(&adapter)
+            .refresh_catalogue_after_mutation(
+                HashSet::from([accepted_id.clone(), appeared_id]),
+                cancellation.clone(),
+            )
+            .await
+            .expect("unaccepted identities are ignored, never a failure");
+        assert_eq!(
+            refreshed.len(),
+            1,
+            "an identity outside the accepted scan is never catalogued"
+        );
+        assert_eq!(refreshed[0].native_track_id.as_ref(), Some(&accepted_id));
+        assert_eq!(adapter.tracks().len(), 1);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn refresh_failed_reread_keeps_the_previous_catalogue_entry() {
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let song_path = mount.path().join("song.flac");
+        write_tagged_flac(
+            &song_path,
+            Some("Kept Title"),
+            Some("Kept Artist"),
+            None,
+            None,
+            None,
+        );
+
+        let source_id =
+            SourceId::removable("test:refresh-reread-failure").expect("source identity");
+        let (_registry, owner, cancellation) = live_cancellation(source_id);
+        let adapter = Arc::new(
+            RemovableMediaAdapter::scan(
+                source_id,
+                mount.path().to_path_buf(),
+                &cancellation,
+                Handle::current(),
+            )
+            .expect("scan removable media")
+            .expect("scan remains current"),
+        );
+        let track_id = adapter.tracks()[0]
+            .native_track_id
+            .clone()
+            .expect("accepted identity");
+
+        std::fs::remove_file(&song_path).expect("remove the written file");
+        let refreshed = Arc::clone(&adapter)
+            .refresh_catalogue_after_mutation(
+                HashSet::from([track_id.clone()]),
+                cancellation.clone(),
+            )
+            .await
+            .expect("one unreadable row never fails the whole refresh");
+        assert_eq!(
+            refreshed[0].title, "Kept Title",
+            "an identity that fails to re-read keeps its previous entry"
+        );
+        assert!(adapter.playback_attribution_profile(&track_id).is_some());
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn refresh_publishes_nothing_when_the_mount_changed_under_the_rereads() {
+        let parent = tempfile::tempdir().expect("mount parent");
+        let mount_path = parent.path().join("mounted");
+        let displaced_path = parent.path().join("displaced");
+        std::fs::create_dir(&mount_path).expect("create mounted root");
+        std::fs::write(mount_path.join("song.wav"), minimal_wav_bytes(0x80))
+            .expect("write accepted WAV");
+
+        let source_id = SourceId::removable("test:refresh-mount-change").expect("source identity");
+        let (_registry, owner, cancellation) = live_cancellation(source_id);
+        let adapter = Arc::new(
+            RemovableMediaAdapter::scan(
+                source_id,
+                mount_path.clone(),
+                &cancellation,
+                Handle::current(),
+            )
+            .expect("scan removable media")
+            .expect("scan remains current"),
+        );
+        let track_id = adapter.tracks()[0]
+            .native_track_id
+            .clone()
+            .expect("accepted identity");
+        let title_before = adapter.tracks()[0].title.clone();
+
+        std::fs::rename(&mount_path, &displaced_path).expect("displace mounted root");
+        std::fs::create_dir(&mount_path).expect("create replacement root");
+        std::fs::write(mount_path.join("song.wav"), minimal_wav_bytes(0x40))
+            .expect("write replacement WAV");
+
+        let error = Arc::clone(&adapter)
+            .refresh_catalogue_after_mutation(
+                HashSet::from([track_id.clone()]),
+                cancellation.clone(),
+            )
+            .await
+            .expect_err("a mount that changed under the re-reads publishes nothing");
+        assert_eq!(
+            error.to_string(),
+            "Internal error: removable media scan failed"
+        );
+        assert!(!error
+            .to_string()
+            .contains(&mount_path.display().to_string()));
+        let published = adapter.tracks();
+        assert_eq!(published.len(), 1);
+        assert_eq!(
+            published[0].title, title_before,
+            "the accepted entry is not displaced by the replacement root"
+        );
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn cancelled_refresh_is_not_a_failure_and_publishes_nothing() {
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let song_path = mount.path().join("song.flac");
+        write_tagged_flac(
+            &song_path,
+            Some("Before Cancel"),
+            Some("Cancel Artist"),
+            None,
+            None,
+            None,
+        );
+
+        let source_id = SourceId::removable("test:refresh-cancelled").expect("source identity");
+        let (registry, owner, cancellation) = live_cancellation(source_id);
+        let adapter = Arc::new(
+            RemovableMediaAdapter::scan(
+                source_id,
+                mount.path().to_path_buf(),
+                &cancellation,
+                Handle::current(),
+            )
+            .expect("scan removable media")
+            .expect("scan remains current"),
+        );
+        let track_id = adapter.tracks()[0]
+            .native_track_id
+            .clone()
+            .expect("accepted identity");
+        drop(owner);
+        assert!(cancellation.is_cancelled());
+
+        // Even a write that committed before the lane was cancelled must not
+        // republish: a cancelled lane publishes nothing.
+        write_tagged_flac(
+            &song_path,
+            Some("After Cancel"),
+            Some("Cancel Artist"),
+            None,
+            None,
+            None,
+        );
+        let refreshed = Arc::clone(&adapter)
+            .refresh_catalogue_after_mutation(
+                HashSet::from([track_id.clone()]),
+                cancellation.clone(),
+            )
+            .await
+            .expect("cancelled refresh is not a failure");
+        assert_eq!(refreshed[0].title, "Before Cancel");
+        assert_eq!(adapter.tracks()[0].title, "Before Cancel");
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn refresh_drops_attribution_when_the_fresh_parse_loses_real_tags() {
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let song_path = mount.path().join("song.flac");
+        write_tagged_flac(
+            &song_path,
+            Some("Tagged Title"),
+            Some("Tagged Artist"),
+            None,
+            None,
+            None,
+        );
+
+        let source_id =
+            SourceId::removable("test:refresh-attribution-loss").expect("source identity");
+        let (_registry, owner, cancellation) = live_cancellation(source_id);
+        let adapter = Arc::new(
+            RemovableMediaAdapter::scan(
+                source_id,
+                mount.path().to_path_buf(),
+                &cancellation,
+                Handle::current(),
+            )
+            .expect("scan removable media")
+            .expect("scan remains current"),
+        );
+        let track_id = adapter.tracks()[0]
+            .native_track_id
+            .clone()
+            .expect("accepted identity");
+        assert!(adapter.playback_attribution_profile(&track_id).is_some());
+
+        // A committed write cleared the real tags: the stale profile must not
+        // survive the refresh, because attribution authority follows the
+        // fresh parse.
+        write_tagged_flac(&song_path, None, None, None, None, None);
+        let refreshed = Arc::clone(&adapter)
+            .refresh_catalogue_after_mutation(
+                HashSet::from([track_id.clone()]),
+                cancellation.clone(),
+            )
+            .await
+            .expect("the refresh republishes the cleared row");
+        assert_eq!(refreshed.len(), 1);
+        assert!(
+            adapter.playback_attribution_profile(&track_id).is_none(),
+            "a profile the fresh parse no longer supports is dropped"
+        );
+        assert_eq!(adapter.tracks().len(), 1);
         drop(owner);
     }
 }

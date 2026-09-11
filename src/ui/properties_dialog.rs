@@ -22,12 +22,13 @@ use adw::prelude::*;
 use gtk::glib;
 use tracing::{info, warn};
 
+use crate::architecture::{SourceId, TrackId};
 #[cfg(target_os = "windows")]
 use crate::local::tag_writer::preflight_tag_write_target_access;
 use crate::local::tag_writer::{
     preflight_tag_write_directory, validate_tag_write_target, TagEdits, TagWritePreflightError,
 };
-use crate::source_registry::RemovableMutationTarget;
+use crate::source_registry::{RemovableMutationTarget, SourceRegistry};
 
 /// Exactly what one selected row is saved through.
 #[derive(Clone, Debug)]
@@ -358,6 +359,7 @@ pub fn show_properties_dialog(
     parent: &adw::ApplicationWindow,
     tracks: &[TrackInfo],
     automatic_device: bool,
+    catalogue_refresh: Option<SourceRegistry>,
 ) {
     if tracks.is_empty() {
         return;
@@ -710,6 +712,7 @@ pub fn show_properties_dialog(
     let capability_for_save = capability_label.clone();
     let cancel_for_save = cancel_button.clone();
     let generation_for_save = operation_generation.clone();
+    let catalogue_refresh_for_save = catalogue_refresh.clone();
 
     save_button.connect_clicked(move |button| {
         // Build TagEdits from the form, only including changed fields.
@@ -780,6 +783,7 @@ pub fn show_properties_dialog(
         );
 
         let targets = save_targets_for_save.clone();
+        let catalogue_refresh_for_save = catalogue_refresh_for_save.clone();
 
         // Re-probe the entire selection before the first write, then track
         // both the files that were written and the ones that failed.
@@ -795,6 +799,7 @@ pub fn show_properties_dialog(
 
             let mut modified = 0usize;
             let mut failed = 0usize;
+            let mut written: Vec<(SourceId, TrackId)> = Vec::new();
             for target in &targets {
                 // An unresolved pending identity cannot reach the write loop:
                 // the preflight above refuses the whole selection first.
@@ -811,6 +816,9 @@ pub fn show_properties_dialog(
                 match outcome {
                     Ok(()) => {
                         modified += 1;
+                        if let SaveTarget::Removable(authority) = target {
+                            written.push((authority.source_id(), authority.track_id().clone()));
+                        }
                     }
                     Err(e) => {
                         // Removable failures must never log their native mount
@@ -833,6 +841,20 @@ pub fn show_properties_dialog(
                     }
                 }
             }
+
+            // Publish refreshed metadata for exactly the identities whose
+            // writes committed, before any completion branch can forget
+            // them. The trigger is fire-and-forget: publication flows through
+            // the registry's catalogue refresh lane, whose settlement
+            // revalidates the exact live session, so a completion that lands
+            // after a disconnect or replacement can never repopulate a stale
+            // mount or overwrite a newer generation.
+            if let Some(registry) = &catalogue_refresh_for_save {
+                if !written.is_empty() {
+                    registry.refresh_catalogue_after_mutation(&written);
+                }
+            }
+
             let current_availability = if failed == 0 {
                 TagEditingAvailability::Ready
             } else {

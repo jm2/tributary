@@ -1167,6 +1167,28 @@ pub trait ManagedSourceAdapter: LifecycleAdapter + Send + Sync {
             })
         })
     }
+
+    /// Re-derive accepted catalogue content for exact identities whose
+    /// retained mutations committed.
+    ///
+    /// Called through the catalogue refresh lane after a successful write,
+    /// so republication carries a fresh generation and inherits every exact
+    /// session/catalogue validation the lane performs. The default refuses:
+    /// adapters without reviewed post-mutation refresh semantics never
+    /// republish catalogue content from outside their accepted scan, and
+    /// the registry treats that refusal as a cancelled (never failed)
+    /// refresh lane.
+    fn refresh_catalogue_after_mutation(
+        self: Arc<Self>,
+        _written_track_ids: HashSet<TrackId>,
+        _cancellation: crate::source_lifecycle::CancellationObserver,
+    ) -> CatalogueFuture {
+        Box::pin(async {
+            Err(BackendError::Unsupported {
+                operation: "post-mutation catalogue refresh".to_string(),
+            })
+        })
+    }
 }
 
 mod source_scoped_playlist_sealed {
@@ -2722,6 +2744,73 @@ impl SourceRegistry {
             track_id,
         })
     }
+
+    /// Refresh exact sources' accepted catalogues after retained removable
+    /// writes committed.
+    ///
+    /// Each affected source refreshes through its existing catalogue lane:
+    /// the refresh mints a fresh generation, captures the exact live session,
+    /// and settlement revalidates that session before replacing the accepted
+    /// catalogue — a late completion after disconnect, replacement, or a
+    /// superseding refresh can never repopulate a retired mount or overwrite
+    /// a newer generation. Only identities whose writes committed are
+    /// re-derived; the adapter republishes every other accepted row
+    /// untouched, and no other source is ever rescanned.
+    ///
+    /// Returns the minted refresh generations, one per source that still had
+    /// an exact live session. Fire-and-forget — publication happens on the
+    /// lifecycle runtime and the visible row, subsequent Properties values,
+    /// and playback attribution follow the ordinary catalogue-change
+    /// invalidations.
+    pub fn refresh_catalogue_after_mutation(&self, written: &[(SourceId, TrackId)]) -> Vec<u64> {
+        let mut by_source: HashMap<SourceId, HashSet<TrackId>> = HashMap::new();
+        for (source_id, track_id) in written {
+            by_source
+                .entry(*source_id)
+                .or_default()
+                .insert(track_id.clone());
+        }
+
+        let mut generations = Vec::with_capacity(by_source.len());
+        for (source_id, track_ids) in by_source {
+            // No exact live session: a retired or replaced mount is never
+            // repopulated.
+            let Some(owner) = self
+                .inner
+                .lifecycle
+                .begin_refresh(source_id, RefreshLane::Catalogue)
+            else {
+                continue;
+            };
+            let generation = owner.generation();
+            owner.spawn(move |session, cancellation| async move {
+                let adapter = session.adapter();
+                let regular_playlist_capability = adapter.regular_playlist_capability();
+                match adapter
+                    .refresh_catalogue_after_mutation(track_ids, cancellation.clone())
+                    .await
+                {
+                    Ok(tracks) => RefreshTaskResult::Refreshed(AcceptedSourcePayload::catalogue(
+                        tracks,
+                        regular_playlist_capability,
+                    )),
+                    // A cancelled lane publishes nothing, and the default
+                    // adapter refusal (an adapter never reviewed for
+                    // post-mutation refresh semantics) is a no-op, never a
+                    // source failure: neither may degrade a live session.
+                    Err(error)
+                        if cancellation.is_cancelled()
+                            || matches!(error, BackendError::Unsupported { .. }) =>
+                    {
+                        RefreshTaskResult::Cancelled
+                    }
+                    Err(error) => RefreshTaskResult::Failed(failure_category(&error)),
+                }
+            });
+            generations.push(generation);
+        }
+        generations
+    }
 }
 
 /// Closed source-kind/provenance policy for structured playback attribution.
@@ -3059,6 +3148,7 @@ mod tests {
                 server_playlist_snapshot_failure: None,
                 stream_failure: None,
                 artwork_available: false,
+                post_mutation_refresh: None,
             }
         }
 
@@ -3083,6 +3173,7 @@ mod tests {
                 server_playlist_snapshot_failure: None,
                 stream_failure: None,
                 artwork_available: true,
+                post_mutation_refresh: None,
             }
         }
 
@@ -3120,6 +3211,7 @@ mod tests {
                 server_playlist_snapshot_failure: None,
                 stream_failure: None,
                 artwork_available: true,
+                post_mutation_refresh: None,
             }
         }
 
@@ -3184,6 +3276,7 @@ mod tests {
         server_playlist_snapshot_failure: Option<String>,
         stream_failure: Option<String>,
         artwork_available: bool,
+        post_mutation_refresh: Option<Vec<Track>>,
     }
 
     impl FakeAdapter {
@@ -3204,6 +3297,13 @@ mod tests {
                     Some(181),
                 ),
             );
+            self
+        }
+
+        /// Authorize one post-mutation catalogue refresh payload. `None`
+        /// keeps the fixture on the default refusal contract.
+        fn with_post_mutation_refresh(mut self, tracks: Vec<Track>) -> Self {
+            self.post_mutation_refresh = Some(tracks);
             self
         }
     }
@@ -3412,6 +3512,22 @@ mod tests {
 
         fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
             Box::pin(async move { Ok(self.catalogue.clone()) })
+        }
+
+        fn refresh_catalogue_after_mutation(
+            self: Arc<Self>,
+            _written_track_ids: HashSet<TrackId>,
+            _cancellation: crate::source_lifecycle::CancellationObserver,
+        ) -> CatalogueFuture {
+            let refreshed = self.post_mutation_refresh.clone();
+            Box::pin(async move {
+                match refreshed {
+                    Some(tracks) => Ok(tracks),
+                    None => Err(BackendError::Unsupported {
+                        operation: "post-mutation catalogue refresh".to_string(),
+                    }),
+                }
+            })
         }
 
         fn resolve_stream(self: Arc<Self>, track_id: TrackId) -> StreamFuture {
@@ -3900,6 +4016,155 @@ mod tests {
         .await
         .expect("catalogue refresh accepted");
         generation
+    }
+
+    async fn wait_for_post_mutation_refresh_settled(
+        registry: &SourceRegistry,
+        source_id: SourceId,
+    ) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let Some(snapshot) = registry.snapshot(source_id) else {
+                    tokio::task::yield_now().await;
+                    continue;
+                };
+                if !snapshot
+                    .pending_refreshes
+                    .contains_key(&RefreshLane::Catalogue)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("post-mutation catalogue refresh settles");
+    }
+
+    #[tokio::test]
+    async fn post_mutation_refresh_refusal_is_never_a_lane_failure() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let track_id = TrackId::remote("refused-refresh-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            probe.playlist_adapter("refused-refresh", vec![fixture_track(track_id.clone())]),
+        )
+        .await;
+        let (generation, _epoch) = wait_for_catalogue(&registry, source_id).await;
+
+        let minted = registry.refresh_catalogue_after_mutation(&[(source_id, track_id)]);
+        assert_eq!(
+            minted.len(),
+            1,
+            "one source with an exact live session mints one refresh generation"
+        );
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+
+        // The unreviewed adapter's refusal settles as a cancellation: no
+        // refresh failure is recorded and the accepted catalogue is left
+        // exactly as the scan accepted it.
+        let snapshot = registry
+            .snapshot(source_id)
+            .expect("a refused refresh never retires the source");
+        assert!(
+            !snapshot
+                .refresh_failures
+                .contains_key(&RefreshLane::Catalogue),
+            "the post-mutation refusal is a cancellation, never a lane failure: {:?}",
+            snapshot.refresh_failures
+        );
+        let catalogue = snapshot
+            .catalogue
+            .expect("the accepted catalogue survives the refusal");
+        assert_eq!(catalogue.generation, generation, "nothing is republished");
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn authorized_post_mutation_refresh_republishes_only_the_written_source() {
+        let registry = registry();
+        let written_source = SourceId::random();
+        let untouched_source = SourceId::random();
+        let written_track = TrackId::remote("written-track").expect("track ID");
+        let untouched_track = TrackId::remote("untouched-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+
+        let initial = fixture_track(written_track.clone());
+        let mut replacement = fixture_track(written_track.clone());
+        replacement.title = "Republished After Retained Write".to_string();
+        let adapter = probe
+            .playlist_adapter("written", vec![initial])
+            .with_post_mutation_refresh(vec![replacement]);
+        connect_playlist_fixture(&registry, written_source, adapter).await;
+        connect_playlist_fixture(
+            &registry,
+            untouched_source,
+            probe.playlist_adapter("untouched", vec![fixture_track(untouched_track)]),
+        )
+        .await;
+        let (written_generation, _epoch) = wait_for_catalogue(&registry, written_source).await;
+        let (untouched_generation, _epoch) = wait_for_catalogue(&registry, untouched_source).await;
+
+        let minted = registry.refresh_catalogue_after_mutation(&[(written_source, written_track)]);
+        assert_eq!(minted.len(), 1);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if registry
+                    .snapshot(written_source)
+                    .and_then(|snapshot| snapshot.catalogue)
+                    .is_some_and(|catalogue| catalogue.generation == minted[0])
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the minted refresh generation publishes");
+
+        let written = registry
+            .snapshot(written_source)
+            .expect("the written source stays live");
+        let catalogue = written.catalogue.expect("republished catalogue accepted");
+        assert_eq!(
+            catalogue.generation, minted[0],
+            "the publication carries the minted refresh generation"
+        );
+        assert_ne!(catalogue.generation, written_generation);
+        assert!(catalogue
+            .value
+            .tracks
+            .iter()
+            .any(|track| track.title == "Republished After Retained Write"));
+        assert!(
+            written.refresh_failures.is_empty(),
+            "an authorized refresh never records a failure: {:?}",
+            written.refresh_failures
+        );
+
+        let untouched = registry
+            .snapshot(untouched_source)
+            .expect("the untouched source stays live");
+        assert_eq!(
+            untouched.catalogue.expect("untouched catalogue").generation,
+            untouched_generation,
+            "a source outside the written set is never rescanned"
+        );
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn post_mutation_refresh_without_a_live_session_mints_nothing() {
+        let registry = registry();
+        let ghost = SourceId::random();
+        let track_id = TrackId::remote("ghost-track").expect("track ID");
+        assert!(registry
+            .refresh_catalogue_after_mutation(&[(ghost, track_id)])
+            .is_empty());
+        drop(registry);
     }
 
     #[tokio::test]

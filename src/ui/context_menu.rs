@@ -1217,7 +1217,14 @@ fn build_properties_action(
             .iter()
             .all(|info| matches!(info.target, SaveTarget::LocalPath(_)))
         {
-            super::properties_dialog::show_properties_dialog(win, &track_infos, automatic_device);
+            // A local-path-only selection can never write through a removable
+            // authority, so no post-mutation catalogue refresh can apply.
+            super::properties_dialog::show_properties_dialog(
+                win,
+                &track_infos,
+                automatic_device,
+                None,
+            );
             return;
         }
 
@@ -1228,6 +1235,7 @@ fn build_properties_action(
         // and a native mount location is never surfaced.
         let pending = distinct_pending_mutations(&track_infos);
         let registry = registry_for_props.clone();
+        let registry_for_catalogue = registry.clone();
         let rt_handle = rt_handle_for_props.clone();
         let win = win.clone();
         let track_infos_for_resolve = track_infos.clone();
@@ -1304,7 +1312,15 @@ fn build_properties_action(
                 tracing::warn!("removable properties resolution left an identity unresolved");
                 return;
             }
-            super::properties_dialog::show_properties_dialog(&win, &infos, automatic_device);
+            // Successful removable writes republish refreshed metadata for
+            // exactly the written identities; the dialog triggers the
+            // registry's catalogue refresh lane itself.
+            super::properties_dialog::show_properties_dialog(
+                &win,
+                &infos,
+                automatic_device,
+                Some(registry_for_catalogue),
+            );
         });
     });
 
