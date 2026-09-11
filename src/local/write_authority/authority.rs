@@ -267,10 +267,12 @@ impl MountedWriteAuthority {
     ///
     /// The backup itself is verified against `backup_leaf_identity` — the
     /// replaced occupant's bind-time identity recorded on the commit
-    /// outcome — before it is moved, compared object-coupled: the bind and
-    /// the atomic exchange legitimately update the bound object's
-    /// change-sensitive instant, so only a same-index swap-in of a foreign
-    /// object refuses. A swapped backup is reported as
+    /// outcome — before it is moved, compared change-instant-exact: the
+    /// bind captures the object's identity after the linking operation
+    /// has updated its instant, so a legitimate backup compares exactly
+    /// equal, and a same-index swap-in of a foreign object — which cannot
+    /// inherit the recorded instant — is refused. A swapped backup is
+    /// reported as
     /// [`ReversalOutcome::RefusedForeignLeaf`]: the replacement is never
     /// installed as the original and never deleted. `None` degrades to the
     /// legacy uncoupled handling, exactly like every other
