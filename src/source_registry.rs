@@ -1437,10 +1437,15 @@ struct SourceRegistryInner {
     built_ins: Mutex<HashMap<SourceId, BuiltInInstallation>>,
     external_sessions: Mutex<HashMap<SourceId, ProvenanceClaimId>>,
     /// Written identities per source that no post-mutation refresh has
-    /// published yet. Every spawned Catalogue-lane refresh task carries the
-    /// accumulated union, so a superseding refresh re-reads an earlier
-    /// overlapping save's batch instead of dropping it.
-    mutation_refresh_pending: Mutex<HashMap<SourceId, HashSet<TrackId>>>,
+    /// published yet, versioned per track: each save bumps every track it
+    /// writes to a version past every earlier save's, so a refresh
+    /// generation's acceptance hook can tell the batch it carried from a
+    /// track a newer save re-wrote between the hook's acceptance and its
+    /// consumption. Every spawned Catalogue-lane refresh task carries the
+    /// accumulated union (with the versions present at carry time), so a
+    /// superseding refresh re-reads an earlier overlapping save's batch
+    /// instead of dropping it.
+    mutation_refresh_pending: Mutex<HashMap<SourceId, HashMap<TrackId, u64>>>,
 }
 
 impl PublicHttpAuthority for SourceRegistryInner {
@@ -2773,12 +2778,19 @@ impl SourceRegistry {
     /// republished row set. A cancelled or failed refresh consumes nothing:
     /// its batch stays pending for the next refresh to re-read.
     ///
-    /// Consumption is settlement-confirmed: a task's carried batch leaves the
-    /// pending map only when that exact generation's publication is ACCEPTED
-    /// by the lifecycle. A superseded generation consumes nothing, so no
-    /// window between its adapter result and its settlement can strand a
-    /// written identity outside both the successor's carried set and the
-    /// pending map — the successor re-reads everything not yet published.
+    /// Consumption is settlement-confirmed and version-matched: a task's
+    /// carried batch leaves the pending map only when that exact
+    /// generation's publication is ACCEPTED by the lifecycle, and a carried
+    /// track is consumed only when its CURRENT pending version still equals
+    /// the version the generation carried. A same-track save that lands
+    /// between the acceptance and the hook's consumption — the two take
+    /// different locks — bumps the track's version, so the older hook
+    /// leaves it pending for the successor or retry lane instead of
+    /// consuming a mutation the successor's own failure could then lose. A
+    /// superseded generation consumes nothing, so no window between its
+    /// adapter result and its settlement can strand a written identity
+    /// outside both the successor's carried set and the pending map — the
+    /// successor re-reads everything not yet published.
     ///
     /// Returns the minted refresh generations, one per source that still had
     /// an exact live session. Fire-and-forget — publication happens on the
@@ -2796,13 +2808,18 @@ impl SourceRegistry {
 
         let mut generations = Vec::with_capacity(by_source.len());
         for (source_id, batch) in by_source {
-            // Accumulate this save into the source's pending identities and
-            // carry the accumulated union: any earlier save whose refresh has
-            // not published yet is re-read by this task too.
-            let track_ids = {
+            // Accumulate this save into the source's pending identities —
+            // bumping every written track's version past every earlier
+            // save's — and carry the accumulated union with the versions
+            // present at carry time: any earlier save whose refresh has not
+            // published yet is re-read by this task too.
+            let carried: HashMap<TrackId, u64> = {
                 let mut pending = lock(&self.inner.mutation_refresh_pending);
                 let entry = pending.entry(source_id).or_default();
-                entry.extend(batch);
+                let version = entry.values().copied().max().unwrap_or(0) + 1;
+                for track_id in &batch {
+                    entry.insert(track_id.clone(), version);
+                }
                 entry.clone()
             };
             // No exact live session: a retired or replaced mount is never
@@ -2816,21 +2833,33 @@ impl SourceRegistry {
                 continue;
             };
             let generation = owner.generation();
-            let consumed_ids = track_ids.clone();
+            let track_ids: HashSet<TrackId> = carried.keys().cloned().collect();
+            let carried_versions = carried;
             let pending_written = Arc::clone(&self.inner);
             let owner = owner.on_acceptance(Box::new(move || {
-                // Settlement-confirmed consumption: this exact generation's
-                // publication was accepted by the lifecycle, so the carried
-                // batch is published and may leave the pending map. A
-                // superseded generation consumes nothing — its payload was
+                // Settlement-confirmed, version-matched consumption: this
+                // exact generation's publication was accepted by the
+                // lifecycle, so a carried track whose pending version still
+                // equals the version this generation carried was published
+                // and may leave the pending map. A track a newer save
+                // re-wrote between the acceptance and this hook — the two
+                // take different locks — carries a bumped version and stays
+                // pending for the successor or retry lane. A superseded
+                // generation never runs this hook — its payload was
                 // rejected — and the successor cloned the pending map
-                // including this batch, so every committed identity is either
-                // republished by the successor or stays pending for the next
-                // refresh.
+                // including this batch, so every committed identity is
+                // either republished by the successor or stays pending for
+                // the next refresh.
+                #[cfg(test)]
+                run_pending_consumption_interpose();
                 if let Some(entry) =
                     lock(&pending_written.mutation_refresh_pending).get_mut(&source_id)
                 {
-                    entry.retain(|track_id| !consumed_ids.contains(track_id));
+                    entry.retain(|track_id, current| {
+                        carried_versions
+                            .get(track_id)
+                            .is_none_or(|carried| current != carried)
+                    });
                 }
             }));
             owner.spawn(move |session, cancellation| async move {
@@ -2906,6 +2935,49 @@ fn with_post_mutation_refresh_ok_interpose(
     *lock(&POST_MUTATION_REFRESH_OK_INTERPOSE) = Some(interpose);
     run();
     *lock(&POST_MUTATION_REFRESH_OK_INTERPOSE) = None;
+}
+
+/// Test-only hook fired inside a refresh generation's acceptance hook before
+/// it consumes the pending map: the acceptance→consumption window a
+/// same-track save races across, since the acceptance and the pending map
+/// take different locks.
+#[cfg(test)]
+type PendingConsumptionInterpose = dyn Fn() + Send + Sync;
+
+#[cfg(test)]
+static PENDING_CONSUMPTION_INTERPOSE: std::sync::Mutex<Option<Box<PendingConsumptionInterpose>>> =
+    std::sync::Mutex::new(None);
+
+/// Serializes tests that use the pending-consumption interposition seam.
+#[cfg(test)]
+static PENDING_CONSUMPTION_INTERPOSE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn run_pending_consumption_interpose() {
+    if let Some(interpose) = lock(&PENDING_CONSUMPTION_INTERPOSE).as_ref() {
+        interpose();
+    }
+}
+
+/// Install the pending-consumption interposition seam for the duration of
+/// `run`, serializing against other tests that use the seam. A drop guard
+/// uninstalls the closure, so a panicking observation cannot leave a stale
+/// seam armed for a later test's acceptance hooks.
+#[cfg(test)]
+fn with_pending_consumption_interpose(
+    interpose: Box<PendingConsumptionInterpose>,
+    run: impl FnOnce(),
+) {
+    struct UninstallPendingConsumptionInterpose;
+    impl Drop for UninstallPendingConsumptionInterpose {
+        fn drop(&mut self) {
+            *lock(&PENDING_CONSUMPTION_INTERPOSE) = None;
+        }
+    }
+    let _serial = lock(&PENDING_CONSUMPTION_INTERPOSE_SERIAL);
+    *lock(&PENDING_CONSUMPTION_INTERPOSE) = Some(interpose);
+    let _uninstall = UninstallPendingConsumptionInterpose;
+    run();
 }
 
 /// Closed source-kind/provenance policy for structured playback attribution.
@@ -4646,6 +4718,139 @@ mod tests {
             .catalogue
             .expect("the accepted catalogue survives");
         assert_eq!(catalogue.generation, third_generation);
+        drop(registry);
+    }
+
+    /// A save of the SAME track landing between an older generation's
+    /// acceptance and its hook's consumption — the two take different
+    /// locks — must not be consumed by the older hook. The track's pending
+    /// version was bumped by the newer save, so the older hook leaves it
+    /// pending; when the successor then fails, the track is still pending
+    /// and a later refresh re-reads it, so the newer mutation is republished
+    /// instead of being lost. A clean save after a successful settlement
+    /// still empties the batch: its acceptance re-reads only its own
+    /// identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_same_track_save_between_acceptance_and_its_hook_stays_pending() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let first_track = TrackId::remote("hook-race-first-track").expect("track ID");
+        let third_track = TrackId::remote("hook-race-third-track").expect("track ID");
+        let fourth_track = TrackId::remote("hook-race-fourth-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        probe.hold_post_mutation_refresh();
+
+        let adapter = probe
+            .playlist_adapter("hook-race", vec![fixture_track(first_track.clone())])
+            .with_post_mutation_refresh(vec![fixture_track(first_track.clone())]);
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+        let (initial_generation, _epoch) = wait_for_catalogue(&registry, source_id).await;
+
+        // The first save's refresh blocks inside the adapter call, holding
+        // its generation and its carried batch.
+        let first_generation =
+            registry.refresh_catalogue_after_mutation(&[(source_id, first_track.clone())])[0];
+        probe.wait_for_post_mutation_calls(1).await;
+
+        // Release the adapter: the blocked generation's payload is accepted
+        // and its acceptance hook fires — but before the hook consumes the
+        // pending map, a save of the SAME track lands, bumping the track's
+        // pending version and minting a successor generation. The failure
+        // fixture arms inside the seam: the blocked generation's adapter
+        // call has already returned Ok by the time the hook runs, so the
+        // flag can only arm the successor's call — which must FAIL: nothing
+        // it carries may be consumed, and the older hook must have left the
+        // re-written track pending for it.
+        let (hook_raced_signal, hook_raced) = mpsc::channel::<()>();
+        let race_probe = Arc::clone(&probe);
+        let race_registry = registry.clone();
+        let race_source = source_id;
+        let race_track = first_track.clone();
+        let successor_generation: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let successor_slot = Arc::clone(&successor_generation);
+        with_pending_consumption_interpose(
+            Box::new(move || {
+                race_probe.set_post_mutation_failure(true);
+                let written = [(race_source, race_track.clone())];
+                let generations = race_registry.refresh_catalogue_after_mutation(&written);
+                *successor_slot.lock().unwrap() = generations.first().copied();
+                let _ = hook_raced_signal.send(());
+            }),
+            || {
+                probe.release_post_mutation_refresh();
+                hook_raced
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("the same-track save landed between acceptance and consumption");
+            },
+        );
+        probe.wait_for_post_mutation_calls(2).await;
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+        let snapshot = registry.snapshot(source_id).expect("the source stays live");
+        assert!(
+            snapshot
+                .refresh_failures
+                .contains_key(&RefreshLane::Catalogue),
+            "the successor generation failed: {:?}",
+            snapshot.refresh_failures
+        );
+        assert_ne!(
+            successor_generation
+                .lock()
+                .unwrap()
+                .expect("the race save minted a successor"),
+            first_generation,
+            "the acceptance→hook save minted a newer generation"
+        );
+
+        // The older hook consumed nothing: a later save's refresh still
+        // re-reads the twice-written track, so the catalogue eventually
+        // reflects the newer metadata.
+        probe.set_post_mutation_failure(false);
+        let third_generation =
+            registry.refresh_catalogue_after_mutation(&[(source_id, third_track.clone())])[0];
+        probe.wait_for_post_mutation_calls(3).await;
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests[2],
+            HashSet::from([first_track.clone(), third_track.clone()]),
+            "the track re-written between acceptance and consumption stays pending \
+             and is re-read by the next refresh"
+        );
+        let catalogue = registry
+            .snapshot(source_id)
+            .expect("the source stays live")
+            .catalogue
+            .expect("the accepted catalogue survives");
+        assert_ne!(
+            catalogue.generation, initial_generation,
+            "a refresh republished the catalogue"
+        );
+        assert_eq!(
+            catalogue.generation, third_generation,
+            "the re-read published under the newest generation"
+        );
+
+        // The clean single-save path still empties the batch on acceptance:
+        // the third save's settlement consumed its batch, so a later clean
+        // save re-reads only its own identity.
+        let fourth_generation =
+            registry.refresh_catalogue_after_mutation(&[(source_id, fourth_track.clone())])[0];
+        probe.wait_for_post_mutation_calls(4).await;
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests[3],
+            HashSet::from([fourth_track]),
+            "the settled batch is consumed; only the clean save's own identity \
+             lingers for its own refresh"
+        );
+        let catalogue = registry
+            .snapshot(source_id)
+            .expect("the source stays live")
+            .catalogue
+            .expect("the accepted catalogue survives");
+        assert_eq!(catalogue.generation, fourth_generation);
         drop(registry);
     }
 
