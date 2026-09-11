@@ -17,6 +17,18 @@ name: Bot review gate
 #     without a push — retargeting to main above all, because a base-branch
 #     change alters which pull request the announced commit must be
 #     evaluated against and fires no other event;
+#   * pull_request review_requested re-announces when a re-review request
+#     is addressed to a reviewer, and review_request_removed re-announces
+#     when one is withdrawn: an outstanding re-review request invalidates
+#     the reviewer's earlier clean result at the head (the publisher's
+#     attempt-bound handshake), so the request and its withdrawal are both
+#     evidence-changing events. GitHub documents both activity types for
+#     the pull_request event, but does not guarantee that an Actions run
+#     fires when the requester or the requested reviewer is a bot or App —
+#     the common case for this gate's trusted reviewers — so these two
+#     types are best-effort coverage and the documented workflow_dispatch
+#     re-run below remains the guaranteed refresh path for a re-review
+#     request that fired no announcer run;
 #   * pull_request_review submitted/edited/dismissed re-announces when a
 #     conclusion is made, revised, or formally withdrawn;
 #   * pull_request_review_comment created re-announces when a thread is
@@ -49,7 +61,7 @@ on:
   pull_request:
     branches:
       - main
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened, edited, review_requested, review_request_removed]
   pull_request_review:
     types: [submitted, edited, dismissed]
   pull_request_review_comment:
