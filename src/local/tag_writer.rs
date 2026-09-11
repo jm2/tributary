@@ -2219,25 +2219,10 @@ mod tests {
         // The refusal path cleaned its probe sibling up through the
         // retained parent; remove the deliberate occupant and require the
         // directory to hold exactly the admitted file again.
-        let occupied = occupied_candidate.lock().unwrap().take();
-        rustix::fs::unlinkat(
+        assert_refused_rehearsal_left_only_the_admitted_file(
             &parent,
-            occupied
-                .as_deref()
-                .expect("the seam occupied the candidate"),
-            rustix::fs::AtFlags::empty(),
-        )
-        .expect("remove the deliberate occupant");
-
-        let retained_entries: Vec<std::ffi::OsString> = std::fs::read_dir(&album)
-            .expect("list the retained directory")
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name())
-            .collect();
-        assert_eq!(
-            retained_entries,
-            vec![std::ffi::OsString::from("silence.flac")],
-            "the refused rehearsal must leave no probe sibling behind"
+            &album,
+            occupied_candidate.lock().unwrap().take(),
         );
     }
 
@@ -2257,6 +2242,37 @@ mod tests {
                 "a refused commit must clean up its stranded sibling: {leftovers:?}"
             );
         }
+    }
+
+    /// Remove the occupant the retained-preflight seam deliberately
+    /// installed at the rehearsal's rename target, then require the
+    /// directory to hold exactly the admitted file again: a refused
+    /// rehearsal must leave no probe sibling behind.
+    #[cfg(unix)]
+    fn assert_refused_rehearsal_left_only_the_admitted_file(
+        parent: &std::fs::File,
+        album: &Path,
+        occupied: Option<std::ffi::OsString>,
+    ) {
+        rustix::fs::unlinkat(
+            parent,
+            occupied
+                .as_deref()
+                .expect("the seam occupied the candidate"),
+            rustix::fs::AtFlags::empty(),
+        )
+        .expect("remove the deliberate occupant");
+
+        let retained_entries: Vec<std::ffi::OsString> = std::fs::read_dir(album)
+            .expect("list the retained directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            retained_entries,
+            vec![std::ffi::OsString::from("silence.flac")],
+            "the refused rehearsal must leave no probe sibling behind"
+        );
     }
 
     #[test]
