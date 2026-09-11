@@ -100,6 +100,22 @@ where
         uuid::Uuid::new_v4()
     ));
     let _sentinel_guard = RemoveFileOnDrop(sentinel.clone());
+    // Sandbox the child's data directory: without this, `Player::new`
+    // in the child reads the *real* user `equalizer.cfg`. A file left
+    // `enabled` by anything on the machine (a leaked test save, a
+    // developer's own player) then arms the URI-load equalizer install
+    // seam inside this child's protected playback pipeline, and the
+    // edit's pause/resume can error the stream before EOS. The child
+    // contract is playback-to-EOS with in-memory defaults — equalizer
+    // persistence is the config module's tested concern, not this
+    // playback harness's.
+    let child_data_dir = std::env::temp_dir().join(format!(
+        "tributary-protected-gstreamer-data-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&child_data_dir).expect("create child data sandbox");
+    let _data_dir_guard = RemoveDirOnDrop(child_data_dir.clone());
     let mut child = Command::new(std::env::current_exe().expect("current test executable"));
     child
         .args([
@@ -110,6 +126,7 @@ where
         ])
         .env(CHILD_MARKER, CHILD_MARKER_VALUE)
         .env(CHILD_SENTINEL, &sentinel)
+        .env("XDG_DATA_HOME", &child_data_dir)
         .env("NO_PROXY", "127.0.0.1,localhost,::1")
         .env("no_proxy", "127.0.0.1,localhost,::1")
         .env_remove("HTTP_PROXY")
@@ -154,6 +171,18 @@ struct RemoveFileOnDrop(std::path::PathBuf);
 impl Drop for RemoveFileOnDrop {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Removes the sandboxed child data directory when the parent-side test
+/// scope ends (see the sandbox setup in
+/// [`assert_protected_stream_cases_play_to_eos`]). Best effort: a
+/// leftover directory must never fail an otherwise passing harness.
+struct RemoveDirOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
