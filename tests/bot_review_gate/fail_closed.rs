@@ -122,6 +122,85 @@ fn incomplete_timeline_pagination_fails_closed() {
 }
 
 #[test]
+fn a_null_reviews_connection_fails_closed_as_a_partial_response() {
+    // A partial-200 shape — a valid pull-request record whose reviews
+    // connection is null — passes the pull-request guard, but the evidence
+    // it carries is unproven: the decision filter would silently iterate
+    // the null connection as empty and could read "no reviews" out of a
+    // response that answered nothing. It must fail closed instead.
+    let output = run_scenario("decision-null-reviews", "pull_request", Some(HEAD_SHA));
+    assert_blocked(
+        &output,
+        &[],
+        "Review response was partial (GraphQL errors or a missing reviews connection); failing closed.",
+    );
+}
+
+#[test]
+fn a_null_review_threads_connection_fails_closed_as_a_partial_response() {
+    // The threads connection follows the same rule: a null connection under
+    // an otherwise complete pull request is unproven evidence, never a
+    // vacuously clean answer.
+    let output = run_scenario(
+        "decision-null-review-threads",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert_blocked(
+        &output,
+        &[],
+        "Review-thread response was partial (GraphQL errors or a missing reviewThreads connection); failing closed.",
+    );
+}
+
+#[test]
+fn graphql_errors_beside_a_valid_head_fail_closed() {
+    // A GraphQL error entry can ride beside a valid head on an HTTP 200, so
+    // the transport-level success of the query proves nothing on its own: a
+    // page carrying `errors` is a partial answer and must block instead of
+    // lending its valid-looking head to a clean verdict.
+    let output = run_scenario("decision-graphql-errors", "pull_request", Some(HEAD_SHA));
+    assert_blocked(
+        &output,
+        &[],
+        "Review-thread response was partial (GraphQL errors or a missing reviewThreads connection); failing closed.",
+    );
+}
+
+#[test]
+fn a_failed_decision_evaluation_fails_closed_instead_of_publishing_a_clean_verdict() {
+    // The fail-open the exact-head review caught: the candidate loop invokes
+    // the evaluator with `|| true`, which swallows errexit for the whole
+    // function body, so the decision filter's exit status was never checked
+    // and an empty `evaluated` fell through to a published clean verdict.
+    // This fixture passes EVERY fetch guard (pull request present, head
+    // bound, connections non-null, no GraphQL errors) and then makes the
+    // decision filter itself fail — a thread-nodes field that is not a list.
+    // The gate must catch the failed evaluation explicitly, record the
+    // blocked verdict, and let the shared publication go out red at the
+    // evaluated head — never `.clean`.
+    let sandbox = GateSandbox::new("decision-evaluation-failure");
+    sandbox.use_scenario("decision-evaluation-failure");
+    let output = sandbox.run("pull_request", Some(HEAD_SHA));
+    assert_blocked(
+        &output,
+        &[],
+        "Decision evaluation failed or returned a malformed verdict; failing closed.",
+    );
+    let check_run = sandbox.opened_and_finalized_verdict();
+    assert!(
+        check_run.contains(&format!("head_sha={HEAD_SHA}"))
+            && check_run.contains("conclusion=failure"),
+        "a failed decision evaluation must publish the blocked verdict at the evaluated head:\n{check_run}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("clean at"),
+        "a failed evaluation must never produce a clean summary:\n{stdout}"
+    );
+}
+
+#[test]
 fn head_moved_during_evaluation_fails_closed() {
     let output = run_scenario("head-moved", "pull_request", Some(HEAD_SHA));
     assert_blocked(&output, &[], "Pull request head moved to");
