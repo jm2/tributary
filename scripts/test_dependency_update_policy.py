@@ -836,7 +836,7 @@ class FuzzLockPolicyTests(unittest.TestCase):
         repaired_fuzz["package"][5]["dependencies"] = ["syn 3.0.5"]
         repaired_fuzz["package"][3]["source"] = "git+https://invalid.example/syn"
 
-        with self.assertRaises(sync_fuzz_lock.PolicyError):
+        with self.assertRaisesRegex(sync_fuzz_lock.PolicyError, 'removed package identities'):
             sync_fuzz_lock.validate_bounded_package_changes(
                 base,
                 current,
