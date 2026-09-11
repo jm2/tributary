@@ -106,11 +106,15 @@ fn rename_over(temp_path: &std::path::Path, path: &std::path::Path) -> std::io::
 
     let mut from: Vec<u16> = temp_path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let ok = windows_sys::Win32::Storage::FileSystem::MoveFileExW(
-        from.as_mut_ptr(),
-        to.as_mut_ptr(),
-        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-    );
+    // Safety: both pointers reference NUL-terminated wide buffers owned
+    // by this call and `MoveFileExW` keeps them valid for its duration.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+            from.as_mut_ptr(),
+            to.as_mut_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
     if ok == 0 {
         Err(std::io::Error::last_os_error())
     } else {
