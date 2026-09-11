@@ -47,11 +47,17 @@ enum OwnedChange {
         published_leaf: Option<LeafIdentity>,
     },
     /// A pre-existing file the executor replaced; its bytes were saved at
-    /// `backup_relative_path` before the replace. Rollback republishes the
-    /// backup over `relative_path` and consumes the backup.
+    /// `backup_relative_path` before the replace. Rollback republishes
+    /// the backup over `relative_path` and consumes the backup. The
+    /// backup's bind-time identity (`backup_leaf`) is verified —
+    /// object-coupled — before BOTH the restoration and the
+    /// successful-transfer disposal: a backup name a concurrent writer
+    /// swapped for a foreign object is refused fail-closed, never
+    /// installed as the original and never silently deleted.
     ReplacedFile {
         relative_path: PathBuf,
         backup_relative_path: PathBuf,
+        backup_leaf: Option<LeafIdentity>,
         published_leaf: Option<LeafIdentity>,
     },
     /// A directory (or directory ancestor) the executor created; it must be
@@ -77,6 +83,7 @@ fn owned_change_for_copy(outcome: CommitOutcome) -> OwnedChange {
             Some(backup_relative_path) => OwnedChange::ReplacedFile {
                 relative_path: outcome.relative_path,
                 backup_relative_path,
+                backup_leaf: outcome.replaced_original_leaf,
                 published_leaf: outcome.published_leaf,
             },
             None => OwnedChange::PublishedFile {
@@ -102,6 +109,14 @@ enum StageFailure {
     /// A final failure; the staged copy was already discarded.
     Final(TransferError),
 }
+
+/// How many times a Preserve resolution may re-allocate onto the next
+/// available sibling before the contention is reported as a failure. A
+/// bound of several rounds absorbs concurrent Preserve transfers racing
+/// the same disambiguated names without spinning. `pub(super)` so the
+/// adversarial collision tests bind to the real bound instead of a
+/// drift-prone literal.
+pub(super) const PRESERVE_REALLOCATION_ATTEMPTS: usize = 8;
 
 /// The transfer executor. Holds the authorities and the plan; runs the
 /// stages in order; rolls back on failure or cancellation.
@@ -153,7 +168,13 @@ impl TransferExecutor {
         let mut committed_stages: u32 = 0;
         match self.execute_plan(&mut context, &mut committed_stages) {
             Ok(()) => {
-                self.discard_superseded_backups(&context);
+                // A completed transfer supersedes every saved original, but
+                // a backup name a concurrent writer swapped for a foreign
+                // object is refused — never silently deleted — and the
+                // refusal surfaces as a transfer failure: the destination
+                // namespace is not in the state the successful summary
+                // would claim.
+                self.discard_superseded_backups(&context)?;
                 Ok(TransferSummary {
                     committed_stages,
                     bytes_copied: context.bytes_so_far,
@@ -304,7 +325,9 @@ impl TransferExecutor {
     /// `Ok(None)` when the stage is distinctly skipped: the destination
     /// appeared after planning, under a Skip policy. A Fail policy surfaces
     /// the post-plan collision as a typed rejection instead, and a Preserve
-    /// policy re-resolves once to a disambiguated sibling.
+    /// policy re-allocates onto the next available sibling within a bounded
+    /// loop — an allocation race on a freshly chosen hidden name is normal
+    /// contention.
     fn execute_copy_file(
         &self,
         source_relative: &Path,
@@ -468,11 +491,16 @@ impl TransferExecutor {
     }
 
     /// Resolve a destination that appeared after planning on a fresh-planned
-    /// stage. The publish refused to replace it; the policy decides what
-    /// happens next. Skip and Fail are represented distinctly — a Skip-policy
-    /// stage is skipped without committing anything, a Fail-policy stage
-    /// rejects the run — while Preserve and Overwrite re-resolve exactly as
-    /// the planner would have, through [`Self::restage_and_commit`].
+    /// stage, or a preserved sibling that an allocation race took. The
+    /// publish refused to replace it; the policy decides what happens next.
+    /// Skip and Fail are represented distinctly — a Skip-policy stage is
+    /// skipped without committing anything, a Fail-policy stage rejects the
+    /// run — Overwrite re-resolves exactly once as the planner would have,
+    /// through [`Self::restage_and_commit`], and Preserve re-allocates onto
+    /// the next available sibling within a bounded loop: an allocation race
+    /// on a freshly chosen hidden sibling name is normal contention, not a
+    /// failure, so a concurrent Preserve transfer winning the same name
+    /// must never roll back this transfer.
     #[allow(clippy::too_many_arguments)]
     fn resolve_post_plan_collision(
         &self,
@@ -491,22 +519,34 @@ impl TransferExecutor {
                     path: destination_relative.to_path_buf(),
                 })
             }
-            (
-                policy @ (ConflictPolicy::Overwrite | ConflictPolicy::Preserve),
-                ConflictResolution::Fresh,
-            ) => Self::restage_and_commit(
-                self,
+            (policy @ ConflictPolicy::Overwrite, ConflictResolution::Fresh) => {
+                Self::restage_and_commit(
+                    self,
+                    destination_relative,
+                    declared_bytes,
+                    stage_index,
+                    context,
+                    source_file,
+                    policy,
+                )
+            }
+            // Preserve: the collided name — the planned destination of a
+            // fresh-planned stage, or a disambiguated sibling an
+            // allocation race took — is re-allocated onto the next
+            // available sibling and re-published, within a bounded loop.
+            // Skip/Fail semantics are destination appearances and remain
+            // handled above, exactly as before.
+            (ConflictPolicy::Preserve, _) => self.reallocate_and_commit_preserved(
                 destination_relative,
                 declared_bytes,
                 stage_index,
                 context,
                 source_file,
-                policy,
+                collision,
             ),
-            // A planned Preserved sibling collision is a genuine allocation
-            // failure: the disambiguated name is freshly chosen, so an
-            // occupant there can only be an allocation race the policy has
-            // no further resolution for.
+            // A planned-Overwrite collision has no further policy
+            // resolution: the replace loop already re-bound within its own
+            // bound, so the collision surfaces as an ordinary I/O failure.
             _ => Err(TransferError::io(
                 "failed to commit destination file",
                 collision,
@@ -514,16 +554,67 @@ impl TransferExecutor {
         }
     }
 
-    /// Re-stage the source against a post-plan policy resolution and commit
-    /// exactly once. The collided attempt's staged copy was discarded with
-    /// its target, and its byte count was restored before the collision
-    /// surfaced, so the retry re-copies the source into the fresh staged
-    /// target exactly once. Under Overwrite the request's stated policy is
-    /// to replace, so the retry binds the current occupant to a commit-time
-    /// backup and swaps it out atomically; under Preserve it re-resolves
-    /// onto a disambiguated sibling with the collision untouched. A second
-    /// collision has no policy resolution and surfaces as an ordinary I/O
-    /// failure.
+    /// Re-allocate a Preserve resolution onto the next available sibling
+    /// and commit, retrying within a bounded loop. Every attempt stages a
+    /// fresh sibling target, re-copies the source (rewound by the caller),
+    /// and observes cancellation between attempts; a collided attempt's
+    /// staged copy is discarded by its target's drop and its byte count
+    /// was restored before the collision surfaced, so progress never
+    /// double-counts and a failed attempt never leaves litter. Exhausting
+    /// the bound surfaces the last collision as the typed I/O error: the
+    /// sibling namespace is adversarially contested, not silently
+    /// mis-resolved.
+    fn reallocate_and_commit_preserved(
+        &self,
+        destination_relative: &Path,
+        declared_bytes: u64,
+        stage_index: u32,
+        context: &mut RunContext<'_>,
+        source_file: &mut File,
+        first_collision: io::Error,
+    ) -> Result<Option<CommitOutcome>, TransferError> {
+        let mut last_collision = first_collision;
+        for _ in 0..PRESERVE_REALLOCATION_ATTEMPTS {
+            if context.cancellation.is_cancelled() {
+                return Err(TransferError::Cancelled);
+            }
+            match self.stage_and_commit_file(
+                destination_relative,
+                declared_bytes,
+                ConflictResolution::Preserved,
+                stage_index,
+                context,
+                source_file,
+            ) {
+                Ok(Some(outcome)) => return Ok(Some(outcome)),
+                // A Preserved resolution is never distinctly skipped; the
+                // arm exists for shape only.
+                Ok(None) => {}
+                Err(StageFailure::Final(error)) => return Err(error),
+                Err(StageFailure::Collision(error)) => {
+                    last_collision = error;
+                    // The next attempt re-copies the source from the start.
+                    source_file
+                        .rewind()
+                        .map_err(|error| TransferError::io("failed to copy source file", error))?;
+                }
+            }
+        }
+        Err(TransferError::io(
+            "preserved sibling allocation kept colliding with concurrent transfers",
+            last_collision,
+        ))
+    }
+
+    /// Re-stage the source against the Overwrite policy resolution and
+    /// commit exactly once. The collided attempt's staged copy was
+    /// discarded with its target, and its byte count was restored before
+    /// the collision surfaced, so the retry re-copies the source into the
+    /// fresh staged target exactly once. Under Overwrite the request's
+    /// stated policy is to replace, so the retry binds the current
+    /// occupant to a commit-time backup and swaps it out atomically. A
+    /// second collision has no policy resolution and surfaces as an
+    /// ordinary I/O failure.
     #[allow(clippy::too_many_arguments)]
     fn restage_and_commit(
         &self,

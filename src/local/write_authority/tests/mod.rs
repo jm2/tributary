@@ -1,7 +1,9 @@
 //! Regressions for the mounted write authority: staged writes, conflict
 //! policies, rollback, drop cleanup, and boundary refusal.
 
+mod creation;
 mod publish;
+mod replace_windows;
 mod reversal;
 mod staged_lifecycle;
 

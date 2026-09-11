@@ -246,7 +246,7 @@ impl MountedWriteAuthority {
         backup_relative: &Path,
         destination_relative: &Path,
     ) -> io::Result<()> {
-        self.restore_relative_file_verified(backup_relative, destination_relative, None)
+        self.restore_relative_file_verified(backup_relative, destination_relative, None, None)
             .map(|_| ())
     }
 
@@ -264,14 +264,44 @@ impl MountedWriteAuthority {
     /// [`ReversalOutcome::RefusedForeignLeaf`] and left untouched — a
     /// concurrent writer owns that name now, and rolling back over it
     /// would destroy a file the transfer does not own.
+    ///
+    /// The backup itself is verified against `backup_leaf_identity` — the
+    /// replaced occupant's bind-time identity recorded on the commit
+    /// outcome — before it is moved, compared object-coupled: the bind and
+    /// the atomic exchange legitimately update the bound object's
+    /// change-sensitive instant, so only a same-index swap-in of a foreign
+    /// object refuses. A swapped backup is reported as
+    /// [`ReversalOutcome::RefusedForeignLeaf`]: the replacement is never
+    /// installed as the original and never deleted. `None` degrades to the
+    /// legacy uncoupled handling, exactly like every other
+    /// uncaptured-identity reversal.
     pub fn restore_relative_file_verified(
         &self,
         backup_relative: &Path,
         destination_relative: &Path,
         expected: Option<&LeafIdentity>,
+        backup_leaf_identity: Option<&LeafIdentity>,
+    ) -> io::Result<ReversalOutcome> {
+        self.mounted.restore_relative_file_verified(
+            backup_relative,
+            destination_relative,
+            expected,
+            backup_leaf_identity,
+        )
+    }
+
+    /// Discard the saved original of a successful overwrite commit,
+    /// verifying the backup still names its bind-time object — object-
+    /// coupled — before it is removed. See
+    /// [`BoundOccupantBackup`](crate::local::root_authority::BoundOccupantBackup).
+    /// A swapped backup is refused and surfaced, never deleted.
+    pub fn discard_backup_relative_file(
+        &self,
+        backup_relative: &Path,
+        backup_leaf_identity: Option<LeafIdentity>,
     ) -> io::Result<ReversalOutcome> {
         self.mounted
-            .restore_relative_file_verified(backup_relative, destination_relative, expected)
+            .discard_backup_within(backup_relative, backup_leaf_identity)
     }
 
     /// Remove a regular file atomically through the retained authority,

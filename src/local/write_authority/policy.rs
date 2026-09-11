@@ -53,6 +53,19 @@ pub struct CommitOutcome {
     /// and destroyed. `None` when nothing pre-existing was replaced (a
     /// fresh publish or a preserved sibling).
     pub replaced_original: Option<PathBuf>,
+    /// No-follow identity of the replaced occupant, captured from the
+    /// object itself at the moment the backup was bound to it — the same
+    /// instant `replaced_original` was created. Rollback restoration and
+    /// successful-transfer cleanup verify the backup still names THIS
+    /// object before moving or discarding it: a backup sibling that a
+    /// concurrent writer swapped for a foreign object is refused
+    /// fail-closed (never installed as the original, never deleted). The
+    /// comparison is object-coupled (device and index, or volume and file
+    /// id) rather than exact, because the bind and the atomic swap
+    /// legitimately update the bound object's change-sensitive instant.
+    /// `None` only when the platform could not capture an identity; such
+    /// a backup degrades to the legacy path-only handling.
+    pub replaced_original_leaf: Option<LeafIdentity>,
     /// No-follow identity of the published leaf, bound to the staged object
     /// immediately before the winning publish (the rename preserves the
     /// object, so this names exactly what the transfer published — not
