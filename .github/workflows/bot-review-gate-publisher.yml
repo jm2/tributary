@@ -64,13 +64,21 @@ name: Bot review gate publisher
 #   6. a trusted expected reviewer carries an outstanding re-review
 #      request — the pull request's API-visible `requested_reviewers`
 #      list — that no submitted review at the evaluated head
-#      acknowledges. A re-review request is an attempt in flight, and
-#      until a review is submitted at this head it invalidates that
-#      reviewer's earlier clean result here: the prior approval stops
-#      counting. The bot-owned, attempt-bound acknowledgment signal the
-#      policy document describes is coordinator/operator design scope and
-#      is deliberately not invented from an untrusted source; this
-#      API-visible half fails closed in the meantime.
+#      acknowledges AFTER the request was made. A re-review request is
+#      an attempt in flight, and until a review is submitted at this
+#      head in response to it, it invalidates that reviewer's earlier
+#      clean result here: the prior approval stops counting. The
+#      handshake is attempt-bound through the review-request timeline
+#      events (the same trusted, API-visible evidence class as review
+#      dismissals): the request must be superseded by an at-head review
+#      submitted after the latest request event for that reviewer —
+#      and a request that POSTDATES every at-head review keeps the gate
+#      red even though the reviewer's older at-head approval still
+#      stands, because that older approval cannot acknowledge a request
+#      it predates. The bot-owned, attempt-bound acknowledgment signal
+#      the policy document describes is coordinator/operator design
+#      scope and is deliberately not invented from an untrusted source;
+#      this API-visible half fails closed in the meantime.
 #
 # Semantics:
 #   * Only explicit thread resolution or a formal review dismissal clears a
@@ -254,8 +262,9 @@ jobs:
           # operator-documented substitution below. Additionally, a
           # re-review request addressed to a listed identity (the pull
           # request's API-visible requested_reviewers list) that no
-          # submitted review at the evaluated head acknowledges blocks
-          # independently as an outstanding_bot_review_request.
+          # submitted review at the evaluated head acknowledges after
+          # the request event blocks independently as an
+          # outstanding_bot_review_request.
           EXPECTED_BOT_REVIEWERS: "coderabbitai"
         run: |
           set -euo pipefail
@@ -465,22 +474,48 @@ jobs:
               }
             }
           '
-          # The dismissal timeline: review dismissals mutate the dismissed
-          # review in place (same database ID, original submission time), so
-          # ordering evidence around a dismissal needs the dismissal events
-          # themselves. Each event carries the instant of the dismissal and
-          # the review it dismissed.
+          # The ordering timeline: the review-evidence mutations that keep no
+          # separate record in the submissions endpoints. Review dismissals
+          # mutate the dismissed review in place (same database ID, original
+          # submission time), so ordering evidence around a dismissal needs
+          # the dismissal events themselves; each carries the instant of the
+          # dismissal and the review it dismissed. Review requests are the
+          # same class of evidence for the re-review handshake: the REST
+          # requested_reviewers list is a snapshot with no timestamps, so
+          # whether an at-head review acknowledges the request against it —
+          # or postdates it unacknowledged — is decidable only from the
+          # request events themselves, each carrying the instant and the
+          # requested reviewer, plus the removal event that formally
+          # withdraws a request (including GitHub's own auto-removal when
+          # the reviewer submits).
           timeline_query='
             query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
               repository(owner: $owner, name: $repo) {
                 pullRequest(number: $number) {
                   headRefOid
-                  timelineItems(first: 100, after: $endCursor, itemTypes: [REVIEW_DISMISSED_EVENT]) {
+                  timelineItems(first: 100, after: $endCursor, itemTypes: [REVIEW_DISMISSED_EVENT, REVIEW_REQUESTED_EVENT, REVIEW_REQUEST_REMOVED_EVENT]) {
                     pageInfo { hasNextPage endCursor }
                     nodes {
+                      __typename
                       ... on ReviewDismissedEvent {
                         createdAt
                         review { databaseId }
+                      }
+                      ... on ReviewRequestedEvent {
+                        createdAt
+                        requestedReviewer {
+                          __typename
+                          ... on User { login }
+                          ... on Bot { login }
+                        }
+                      }
+                      ... on ReviewRequestRemovedEvent {
+                        createdAt
+                        requestedReviewer {
+                          __typename
+                          ... on User { login }
+                          ... on Bot { login }
+                        }
                       }
                     }
                   }
@@ -831,36 +866,75 @@ jobs:
             # The fail-closed half of the documented re-review handshake: a
             # re-review request addressed to a trusted expected reviewer is
             # an attempt in flight. Until a submitted review at the
-            # evaluated head acknowledges it, the request invalidates that
-            # reviewer's earlier clean result at this head — the prior
-            # approval stops counting. The bot-owned, attempt-bound
-            # acknowledgment signal the policy describes is
-            # coordinator/operator design scope and is deliberately not
-            # invented here from an untrusted source; a submitted review at
-            # the head is the acknowledgment the API can observe (GitHub
-            # clears a reviewer's request on submission, so a listed request
-            # beside an at-head review is the bounded API-lag race, and the
-            # residual for a re-request that postdates an at-head review is
-            # disclosed, not hidden). Requests to any other login are out of
-            # scope: only the enumerated trusted set is bound by the
-            # handshake. The violation is NOT waivable by the rate-limit
-            # substitution — that waiver covers a listed reviewer's missing
-            # or stale evidence, never an outstanding re-review request.
-            def outstanding_request_violations($head):
+            # evaluated head acknowledges THAT attempt, the request
+            # invalidates that reviewer's earlier clean result at this head
+            # — the prior approval stops counting. The acknowledgment is
+            # attempt-bound through the review-request timeline events
+            # ($review_requests, fetched like the dismissals): the REST
+            # requested_reviewers list is a timestampless snapshot, so a
+            # listed request is only provably answered when the reviewer's
+            # at-head review was submitted AFTER the latest request event
+            # for that reviewer — the bounded API-lag race (request first,
+            # at-head review just after) passes, while a request that
+            # postdates every at-head review keeps the gate red, because
+            # the older review cannot acknowledge a request it predates. A
+            # removal event after the latest request formally withdraws
+            # that attempt (GitHub also auto-removes a request when the
+            # reviewer submits), so the request no longer stands even while
+            # the snapshot list still carries the reviewer. A listed
+            # reviewer with no request event in the timeline has no
+            # ordering evidence at all and fails closed as outstanding,
+            # exactly like unproven evidence elsewhere in this gate.
+            # Requests to any other login are out of scope: only the
+            # enumerated trusted set is bound by the handshake. The
+            # violation is NOT waivable by the rate-limit substitution —
+            # that waiver covers a listed reviewer's missing or stale
+            # evidence, never an outstanding re-review request.
+            def outstanding_request_violations($head; $review_requests):
               expected_reviewers as $expected_set
               | [ $requested[0].users[]?
                   | ((.login // "") | normalize_login) ] as $requested_set
               | [ $reviews[].data.repository.pullRequest.reviews.nodes[]
                   | select(.state != "PENDING")
                   | select((.commit.oid // "") == $head)
-                  | ((.author.login // "") | normalize_login) ] as $head_acknowledgments
+                  | { author: ((.author.login // "") | normalize_login),
+                      submitted_at: (.submittedAt // "") } ] as $head_reviews
               | [ $expected_set[]
                   | . as $login
                   | select($requested_set | index($login))
-                  | select($head_acknowledgments | index($login) | not)
+                  | (($review_requests
+                      | map(select(.reviewer == $login and .event == "requested"))
+                      | map(.created_at) | max) // "") as $latest_request_at
+                  | (($review_requests
+                      | map(select(.reviewer == $login and .event == "removed"))
+                      | map(.created_at) | max) // "") as $latest_removal_at
+                  | ( if $latest_request_at == "" then
+                        # Listed but unordered: no timeline event proves when
+                        # the request was made, so no at-head review can be
+                        # proven to acknowledge it.
+                        "outstanding (no review-request event to order against)"
+                      elif $latest_removal_at != ""
+                        and $latest_removal_at > $latest_request_at then
+                        # The latest attempt was formally withdrawn after it
+                        # was made: nothing is in flight.
+                        ""
+                      elif [ $head_reviews[]
+                             | select(.author == $login)
+                             | select(.submitted_at > $latest_request_at) ]
+                            | length > 0 then
+                        # An at-head review submitted after the request
+                        # acknowledges this specific attempt.
+                        ""
+                      elif [ $head_reviews[] | select(.author == $login) ]
+                            | length > 0 then
+                        "re-review requested after the reviewer's review at this head"
+                      else
+                        "re-review requested, none submitted at this head"
+                      end )
+                  | select(. != "")
                   | { reason: "outstanding_bot_review_request",
                       author: $login,
-                      state: "re-review requested, none submitted at this head",
+                      state: .,
                       review_head: "none",
                       expected_head: $head,
                       url: "requested_reviewers of this pull request" } ];
@@ -900,11 +974,19 @@ jobs:
                  | select(.review != null)
                  | { review_id: .review.databaseId,
                      dismissed_at: .createdAt } ]) as $dismissals
+            | ([ $timeline[].data.repository.pullRequest.timelineItems.nodes[]
+                 | select(.__typename == "ReviewRequestedEvent"
+                          or .__typename == "ReviewRequestRemovedEvent")
+                 | { event: (if .__typename == "ReviewRequestedEvent"
+                             then "requested" else "removed" end),
+                     reviewer: ((.requestedReviewer.login // "") | normalize_login),
+                     created_at: .createdAt }
+                 | select(.reviewer != "") ]) as $review_requests
             | ( ($threads | unresolved_bot_threads)
               + [ $reviews | bot_review_violations($head; $dismissals)[] ]
               + expected_reviewer_violations($head)
               + missing_evidence_violations($head; $policy)
-              + outstanding_request_violations($head) ) as $all_violations
+              + outstanding_request_violations($head; $review_requests) ) as $all_violations
             | substitution_eligible($head; $policy) as $eligible
             # Waiver matching is login-normalized on BOTH sides: the
             # expected-reviewer check emits the normalized login (the
