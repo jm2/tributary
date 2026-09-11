@@ -386,24 +386,10 @@ fn remove_anchored_leaf_bound_to_identity(
     // Pin the leaf's current object without following a symlink planted at
     // the name, and require it to be exactly the object this section
     // created. An unprovable leaf (vanished, symlinked, unopenable) is
-    // preserved.
-    let Ok(pinned) = rustix::fs::openat(
-        parent,
-        leaf,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    ) else {
+    // preserved, as is a name a newcomer occupies.
+    let Some(_pinned) = pin_created_leaf_identity(parent, leaf, created) else {
         return false;
     };
-    let Ok(stat) = rustix::fs::fstat(&pinned) else {
-        return false;
-    };
-    let Ok(pinned_identity) = stat_identity(&stat) else {
-        return false;
-    };
-    if pinned_identity != created {
-        return false;
-    }
     // Test-only seam inside the proof→bind window: the pinned object is
     // verified, and the relocation that binds it to the private name has
     // not run yet. A swap driven here exercises the relocation's re-verify
@@ -412,54 +398,99 @@ fn remove_anchored_leaf_bound_to_identity(
     run_retained_preflight_interpose(RetainedPreflightPhase::AfterProof, parent, leaf, leaf);
 
     for _ in 0..8 {
-        // Relocate the pinned object onto a fresh randomized private name
-        // with the no-replace primitive: one atomic directory operation
-        // binds the verified object to a name nothing else created.
-        let retire_name = staged_sibling_name(leaf);
-        match rustix::fs::renameat_with(
-            parent,
-            leaf,
-            parent,
-            &retire_name,
-            rustix::fs::RenameFlags::NOREPLACE,
-        ) {
-            Ok(()) => {
-                // Re-verify the bind: the private name must now name the
-                // pinned object. A mismatch means the leaf was swapped
-                // between the pin and this relocation, so the newcomer —
-                // not the probe — moved; put it back where it was and
-                // preserve it.
-                match retained_leaf_identity(parent, &retire_name) {
-                    Ok(identity) if identity == created => {
-                        return rustix::fs::unlinkat(
-                            parent,
-                            &retire_name,
-                            rustix::fs::AtFlags::empty(),
-                        )
-                        .is_ok();
-                    }
-                    _ => {
-                        // Restore the displaced newcomer best-effort; if the
-                        // original name is occupied again, the newcomer
-                        // stays preserved at the private name.
-                        let _ = rustix::fs::renameat_with(
-                            parent,
-                            &retire_name,
-                            parent,
-                            leaf,
-                            rustix::fs::RenameFlags::NOREPLACE,
-                        );
-                        return false;
-                    }
-                }
-            }
-            Err(rustix::io::Errno::EXIST) => {}
-            // An unsupported relocation primitive cannot prove the bind:
-            // preserve the entry exactly where it is.
-            Err(_) => return false,
+        if let Some(removed) = retire_leaf_bound_to_private_name(parent, leaf, created) {
+            return removed;
         }
     }
     false
+}
+
+/// Pin the leaf's current object with an `O_NOFOLLOW` open through the
+/// retained parent and require it to be exactly the object this section
+/// created. Returns the pinning descriptor — held across the bind so the
+/// proven object cannot be recycled mid-sequence — or `None` when the leaf
+/// is unprovable (vanished, symlinked, unopenable) or names a newcomer.
+#[cfg(unix)]
+fn pin_created_leaf_identity(
+    parent: &File,
+    leaf: &OsStr,
+    created: (u64, u64),
+) -> Option<rustix::fd::OwnedFd> {
+    let pinned = rustix::fs::openat(
+        parent,
+        leaf,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .ok()?;
+    let stat = rustix::fs::fstat(&pinned).ok()?;
+    if stat_identity(&stat).ok()? != created {
+        return None;
+    }
+    Some(pinned)
+}
+
+/// Relocate the verified leaf onto a fresh randomized private name with the
+/// no-replace primitive — one atomic directory operation binds the verified
+/// object to a name nothing else created — then prove the private name and
+/// remove it there. `Some(removed)` is definitive; `None` means the
+/// randomized candidate collided (`EXIST`) and another attempt may run.
+#[cfg(unix)]
+fn retire_leaf_bound_to_private_name(
+    parent: &File,
+    leaf: &OsStr,
+    created: (u64, u64),
+) -> Option<bool> {
+    let retire_name = staged_sibling_name(leaf);
+    match rustix::fs::renameat_with(
+        parent,
+        leaf,
+        parent,
+        &retire_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => Some(unlink_bound_private_name(
+            parent,
+            &retire_name,
+            created,
+            leaf,
+        )),
+        Err(rustix::io::Errno::EXIST) => None,
+        // An unsupported relocation primitive cannot prove the bind:
+        // preserve the entry exactly where it is.
+        Err(_) => Some(false),
+    }
+}
+
+/// Re-verify the bind: the private name must name exactly the created
+/// object. A mismatch means the leaf was swapped between the pin and the
+/// relocation, so the newcomer — not the probe — moved: put it back where
+/// it was and preserve it. Reports whether the verified object was removed.
+#[cfg(unix)]
+fn unlink_bound_private_name(
+    parent: &File,
+    retire_name: &OsStr,
+    created: (u64, u64),
+    leaf: &OsStr,
+) -> bool {
+    match retained_leaf_identity(parent, retire_name) {
+        Ok(identity) if identity == created => {
+            rustix::fs::unlinkat(parent, retire_name, rustix::fs::AtFlags::empty()).is_ok()
+        }
+        _ => {
+            // Restore the displaced newcomer best-effort; if the original
+            // name is occupied again, the newcomer stays preserved at the
+            // private name.
+            let _ = rustix::fs::renameat_with(
+                parent,
+                retire_name,
+                parent,
+                leaf,
+                rustix::fs::RenameFlags::NOREPLACE,
+            );
+            false
+        }
+    }
 }
 
 /// Randomized staged-sibling leaf name, preserving the final extension.
@@ -2655,6 +2686,34 @@ mod tests {
         );
     }
 
+    /// Steal the pinned probe from the landed name and install a newcomer
+    /// there, recording both for the post-refusal assertions.
+    #[cfg(unix)]
+    fn steal_pinned_probe_install_newcomer(
+        interposed_parent: &std::fs::File,
+        landed_leaf: &OsStr,
+        newcomer: &std::sync::Arc<std::sync::Mutex<Option<SwappedNewcomer>>>,
+        stolen: &std::sync::Arc<std::sync::Mutex<Option<std::ffi::OsString>>>,
+    ) {
+        let stolen_leaf = staged_sibling_name(std::ffi::OsStr::new("silence.flac"));
+        rustix::fs::renameat(
+            interposed_parent,
+            landed_leaf,
+            interposed_parent,
+            &stolen_leaf,
+        )
+        .expect("steal the pinned probe");
+        create_retained_sibling_exclusive(interposed_parent, landed_leaf)
+            .expect("install the newcomer at the landed name");
+        let identity = retained_leaf_identity(interposed_parent, landed_leaf)
+            .expect("read the newcomer's identity");
+        *newcomer.lock().unwrap() = Some(SwappedNewcomer {
+            leaf: landed_leaf.to_os_string(),
+            identity,
+        });
+        *stolen.lock().unwrap() = Some(stolen_leaf);
+    }
+
     /// The identity-bound removal must survive a swap that lands between the
     /// identity proof and the bind itself. The proof pins the landed probe
     /// with an O_NOFOLLOW open; an external writer can then steal the probe
@@ -2687,27 +2746,12 @@ mod tests {
                 if phase != RetainedPreflightPhase::AfterProof {
                     return;
                 }
-                // The rehearsal's probe is pinned and identity-verified at
-                // the landed name. Steal it and install a newcomer there
-                // before the relocation binds the name: the bind must move
-                // the newcomer, catch the mismatch, and restore it.
-                let stolen_leaf = staged_sibling_name(std::ffi::OsStr::new("silence.flac"));
-                rustix::fs::renameat(
+                steal_pinned_probe_install_newcomer(
                     interposed_parent,
                     landed_leaf,
-                    interposed_parent,
-                    &stolen_leaf,
-                )
-                .expect("steal the pinned probe");
-                create_retained_sibling_exclusive(interposed_parent, landed_leaf)
-                    .expect("install the newcomer at the landed name");
-                let identity = retained_leaf_identity(interposed_parent, landed_leaf)
-                    .expect("read the newcomer's identity");
-                *newcomer_closure.lock().unwrap() = Some(SwappedNewcomer {
-                    leaf: landed_leaf.to_os_string(),
-                    identity,
-                });
-                *stolen_closure.lock().unwrap() = Some(stolen_leaf);
+                    &newcomer_closure,
+                    &stolen_closure,
+                );
             }),
             || {
                 assert_eq!(
