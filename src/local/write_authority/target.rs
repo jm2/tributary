@@ -17,7 +17,7 @@ use super::staging::discard_staged_file;
 #[cfg(not(unix))]
 use super::staging::{discard_staged_file, rollback_staged};
 use crate::local::root_authority::{
-    LandedPublish, LeafIdentity, MountedRootAuthority, RetainedWriteParent,
+    BoundOccupantBackup, LandedPublish, LeafIdentity, MountedRootAuthority, RetainedWriteParent,
 };
 // The displaced-occupant marker exists only where the atomic exchange does
 // (Unix; see `root_authority::RestoreFailure`). The Windows replace loop
@@ -160,17 +160,23 @@ impl PreparedWriteTarget {
     /// carries the [`CommitOutcome`] so the caller can record the
     /// publication for rollback before surfacing the failure — a committed
     /// file whose outcome is dropped can never be undone.
+    // The verified-publication payload grew by the replaced occupant's
+    // bind-time identity: the rollback couples the retained backup to that
+    // exact object, and boxing the payload to appease the size lint would
+    // obscure the every-`?`-carries-the-outcome contract.
+    #[allow(clippy::result_large_err)]
     pub fn commit(mut self) -> Result<CommitOutcome, CommitError> {
         self.authority.validate().map_err(CommitError::from)?;
         self.parent
             .validate_with(&self.authority)
             .map_err(CommitError::from)?;
         self.flush_and_close_staged().map_err(CommitError::from)?;
-        let (replaced_original, landed) = self.publish_staged()?;
+        let (replaced, landed) = self.publish_staged()?;
         let outcome = CommitOutcome {
             relative_path: self.final_relative_path.clone(),
             resolution: self.resolution,
-            replaced_original,
+            replaced_original: replaced.as_ref().map(|backup| backup.relative_path.clone()),
+            replaced_original_leaf: replaced.and_then(|backup| backup.leaf),
             published_leaf: landed.published_leaf,
         };
         // The bytes are now at the destination no matter what happens next:
@@ -194,11 +200,12 @@ impl PreparedWriteTarget {
     /// Publish the flushed-and-closed staged leaf under the planned
     /// resolution.
     ///
-    /// Returns the replaced-occupant backup path — `Some` only when an
-    /// Overwrite publish actually replaced an occupant — plus the landing
-    /// data whose trailing retained-parent revalidation the caller reports
-    /// as a verified-publication failure.
-    fn publish_staged(&self) -> Result<(Option<PathBuf>, LandedPublish), CommitError> {
+    /// Returns the bound backup of the replaced occupant — `Some` only
+    /// when an Overwrite publish actually replaced an occupant — plus the
+    /// landing data whose trailing retained-parent revalidation the caller
+    /// reports as a verified-publication failure.
+    #[allow(clippy::result_large_err)]
+    fn publish_staged(&self) -> Result<(Option<BoundOccupantBackup>, LandedPublish), CommitError> {
         let final_path = self.authority.root().join(&self.final_relative_path);
         let final_leaf = self.final_leaf_name().map_err(CommitError::from)?;
         if self.resolution != ConflictResolution::Overwrite {
@@ -223,22 +230,30 @@ impl PreparedWriteTarget {
     }
 
     /// The Overwrite publish: bind the current occupant of the destination
-    /// name to a hidden backup sibling and replace atomically, never
-    /// unbacked. If the destination turned out to be absent at commit, the
-    /// publish degrades to the no-replace cascade — a concurrent creation
-    /// is bypassed or backed up, never silently replaced-and-deleted.
+    /// name to a hidden backup sibling and replace atomically — through
+    /// object-coupled primitives, never an unbacked replace. If the
+    /// destination turned out to be absent at commit, the publish degrades
+    /// to the no-replace cascade — a concurrent creation is bypassed or
+    /// backed up, never silently replaced-and-deleted.
+    ///
+    /// The backup leaf is minted privately; the replace loop mints a fresh
+    /// private name for every re-bind (a Windows bind whose publish
+    /// collided keeps its completed binding, so the loop never reuses a
+    /// name that may hold a displaced object).
+    #[allow(clippy::result_large_err)]
     fn publish_by_replace(
         &self,
         final_leaf: OsString,
         final_path: PathBuf,
-    ) -> Result<(Option<PathBuf>, LandedPublish), CommitError> {
+    ) -> Result<(Option<BoundOccupantBackup>, LandedPublish), CommitError> {
         let backup_leaf = backup_leaf_name();
-        let mut backup_relative = self
-            .final_relative_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-        backup_relative.push(backup_leaf.as_os_str());
+        let backup_relative = self.backup_relative_path(&backup_leaf);
+        let initial_absolute = self.authority.root().join(&backup_relative);
+        let mut rebinding_backup = || {
+            let leaf = backup_leaf_name();
+            let relative = self.backup_relative_path(&leaf);
+            (leaf, relative)
+        };
         match self.authority.replace_within_directory(
             &self.parent,
             &self.staged_leaf,
@@ -246,9 +261,11 @@ impl PreparedWriteTarget {
             &final_leaf,
             &final_path,
             backup_leaf.as_os_str(),
-            &self.authority.root().join(&backup_relative),
+            &initial_absolute,
+            &backup_relative,
+            &mut rebinding_backup,
         ) {
-            Ok((replaced, landed)) => Ok((replaced.then_some(backup_relative), landed)),
+            Ok((replaced, landed, backup)) => Ok((backup.filter(|_| replaced), landed)),
             Err(error) => {
                 #[cfg(not(unix))]
                 return Err(CommitError::from(error));
@@ -256,6 +273,19 @@ impl PreparedWriteTarget {
                 Err(self.map_replace_failure(error, backup_relative))
             }
         }
+    }
+
+    /// The hidden backup sibling path for a backup leaf: same parent
+    /// directory as the destination, so the swap and the later restore
+    /// stay within one retained parent.
+    fn backup_relative_path(&self, backup_leaf: &OsStr) -> PathBuf {
+        let mut backup_relative = self
+            .final_relative_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        backup_relative.push(backup_leaf);
+        backup_relative
     }
 
     /// Classify a failed replace publish. A landed atomic exchange whose
@@ -269,20 +299,21 @@ impl PreparedWriteTarget {
     ///
     /// Unix only: the atomic exchange — and so the landed-but-unrestorable
     /// displaced occupant — exists only on platforms with a swap primitive.
-    /// The Windows replace loop re-binds on verification mismatch and
-    /// surfaces an ordinary I/O error, so there is nothing to downcast.
+    /// The Windows replace loop surfaces an ordinary I/O error, so there is
+    /// nothing to downcast.
     #[cfg(unix)]
     fn map_replace_failure(&self, error: io::Error, backup_relative: PathBuf) -> CommitError {
         let displaced = error
             .get_ref()
             .and_then(|payload| payload.downcast_ref::<RestoreFailure>())
-            .map(|failure| failure.payload.published_leaf);
-        if let Some(published_leaf) = displaced {
+            .map(|failure| (failure.payload.published_leaf, failure.payload.backup_leaf));
+        if let Some((published_leaf, backup_leaf)) = displaced {
             self.staged_leaf_holds_displaced_occupant.set(true);
             let outcome = CommitOutcome {
                 relative_path: self.final_relative_path.clone(),
                 resolution: self.resolution,
                 replaced_original: Some(backup_relative),
+                replaced_original_leaf: backup_leaf,
                 published_leaf,
             };
             return CommitError::PublishVerification { outcome, error };

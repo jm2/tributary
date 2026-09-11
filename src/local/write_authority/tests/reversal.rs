@@ -164,6 +164,7 @@ fn verified_restore_refuses_a_foreign_occupant_of_the_slot() {
             Path::new(".tributary-backup-test.tmp"),
             Path::new("song.flac"),
             Some(&published_leaf),
+            None,
         )
         .expect("a refusal is an outcome, not an error");
     assert_eq!(outcome, ReversalOutcome::RefusedForeignLeaf);
@@ -201,6 +202,7 @@ fn verified_restore_puts_the_backup_back_when_the_slot_is_empty() {
             Path::new(".tributary-backup-test.tmp"),
             Path::new("song.flac"),
             Some(&published_leaf),
+            None,
         )
         .expect("restore into the empty recorded slot must succeed");
     assert_eq!(outcome, ReversalOutcome::Reversed);
