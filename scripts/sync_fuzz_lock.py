@@ -279,6 +279,36 @@ def resolved_dependency_edges(
     }
 
 
+def same_semver_compat_family(left: str, right: str) -> bool:
+    """
+    True when two crate versions sit in the same Cargo compatibility family.
+
+    Cargo unification merges only requirements that resolve into one
+    compatibility family: the same major and, for 0.x crates, also the same
+    minor — a ^0.60 requirement never matches 0.61.x, so cross-minor 0.x
+    records can never absorb one another's consumers. Versions without an
+    integer leading component never compare equal, which keeps malformed
+    input fail-closed.
+    """
+
+    def family(version: str) -> tuple[str, str] | None:
+        components = version.split(".", 2)
+        major = components[0] if components[0].isdigit() else None
+        if major is None:
+            return None
+        if major != "0":
+            return (major, "")
+        minor = (
+            components[1]
+            if len(components) > 1 and components[1].isdigit()
+            else None
+        )
+        return None if minor is None else (major, minor)
+
+    left_family = family(left)
+    return left_family is not None and left_family == family(right)
+
+
 def unification_replacements(
     before_records: dict[tuple[str, str], dict[str, Any]],
     after_records: dict[tuple[str, str], dict[str, Any]],
@@ -294,11 +324,16 @@ def unification_replacements(
     for crates outside the transitioned subtree, and the repaired lock
     resolves every requirer onto one surviving (name, new) record. A removal
     is attributed to that unification only when the removed identity has
-    exactly one surviving same-name record, that record lies inside the exact
-    after closure (so the selected production update necessitated it), it
-    preserves the removed record's source identity, and the repair itself
-    introduced it. Unrelated removals, ambiguous survivors, pre-existing
-    survivors, and cross-source substitutions stay rejected.
+    exactly one surviving same-family record — cargo can never merge
+    requirements outside a compatibility family (same major; for 0.x also
+    the same minor), so same-name records in other families are separate
+    graph residents that neither defeat attribution nor qualify as the
+    replacement — that record lies inside the exact after closure (so the
+    selected production update necessitated it), it preserves the removed
+    record's source identity, and the repair itself introduced it. Unrelated
+    removals, ambiguous same-family survivors, pre-existing survivors,
+    cross-family substitutions, and cross-source substitutions stay
+    rejected.
     """
     replacements: dict[tuple[str, str], tuple[str, str]] = {}
     candidates = sorted(
@@ -306,7 +341,10 @@ def unification_replacements(
     )
     for identity in candidates:
         survivors = sorted(
-            candidate for candidate in after_records if candidate[0] == identity[0]
+            candidate
+            for candidate in after_records
+            if candidate[0] == identity[0]
+            and same_semver_compat_family(candidate[1], identity[1])
         )
         if len(survivors) != 1:
             continue
