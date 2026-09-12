@@ -13,9 +13,11 @@
 use std::path::{Path, PathBuf};
 
 use super::executor_tests::transfer_request;
-use super::test_support::{
-    authority_pair, process_respects_permission_bits, read_authority, write_source_file,
-};
+use super::test_support::{authority_pair, read_authority, write_source_file};
+// The root-detection probe is Unix-only; its sole caller below is
+// `#[cfg(unix)]` too, so the import must vanish on other targets.
+#[cfg(unix)]
+use super::test_support::process_respects_permission_bits;
 use super::types::{
     Stage, TransferError, TransferItem, TransferPlan, TransferProgress, TransferRequest,
 };
