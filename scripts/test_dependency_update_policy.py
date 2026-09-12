@@ -1324,16 +1324,15 @@ class FuzzLockPolicyTests(unittest.TestCase):
     ):
         # Cargo lock version fields are always a full numeric X.Y.Z core.
         # Anything else is malformed input that must never compare equal to
-        # a valid version — incomplete versions, prerelease suffixes,
-        # semver-forbidden leading zeros, extra components — so a crafted
-        # lock cannot smuggle a same-family match past the unification
-        # attribution. Build metadata is validated separately: valid
-        # metadata is stripped before the family parse, malformed metadata
-        # (empty, duplicated, or non-identifier content) stays malformed.
+        # a valid version — incomplete versions, semver-forbidden leading
+        # zeros, extra components — so a crafted lock cannot smuggle a
+        # same-family match past the unification attribution. Prerelease
+        # suffixes and build metadata are validated separately: valid
+        # suffixes fold into the numeric core's family, malformed ones
+        # stay malformed (see the prerelease and build-metadata tests).
         for malformed in (
             "3",
             "3.0",
-            "3.0.2-beta",
             "1.0.0+",
             "1.0.0+zlib+",
             "01.2.3",
@@ -1454,8 +1453,10 @@ class FuzzLockPolicyTests(unittest.TestCase):
         # Only well-formed metadata is stripped: empty or empty identifiers
         # ("1.0.0+", "1.0.0+z..lib"), a duplicated "+" separator, non-ASCII
         # or non-identifier characters are malformed input that must
-        # never compare equal to a valid version. A prerelease suffix
-        # stays malformed even behind a valid build metadata segment.
+        # never compare equal to a valid version. A well-formed prerelease
+        # behind valid build metadata parses (see
+        # test_compat_family_parses_valid_semver_prereleases); malformed
+        # suffixes stay fail-closed either way.
         # Leading zeros in numeric build identifiers are NOT malformed:
         # SemVer 2.0.0 restricts leading zeros to prerelease numerics, and
         # cargo accepts such records — see
@@ -1465,7 +1466,72 @@ class FuzzLockPolicyTests(unittest.TestCase):
             "1.0.0+z..lib",
             "1.0.0+zlib+more",
             "1.0.0+ä",
-            "1.2.3-rc.1+build",
+            "1.0.0-rc.01+build",
+        ):
+            self.assertFalse(
+                sync_fuzz_lock.same_semver_compat_family(malformed, "1.0.5"),
+                malformed,
+            )
+            self.assertFalse(
+                sync_fuzz_lock.same_semver_compat_family("1.0.5", malformed),
+                malformed,
+            )
+
+    def test_compat_family_parses_valid_semver_prereleases(self):
+        # Prereleases are valid Cargo.lock versions — the checked-in fuzz
+        # lock carries sea-orm-arrow 2.0.0-rc.4 — and cargo matches a
+        # prerelease comparator only within its release's own
+        # compatibility family (the same major.minor.patch triple), so a
+        # validated prerelease record shares its numeric core's family: a
+        # graph-refresh rebind from 2.0.0-rc.4 onto the 2.0.0 release is
+        # unification inside the family, and treating the record as
+        # malformed would falsely reject Cargo-generated output as an
+        # unauthorized removal.
+        self.assertTrue(
+            sync_fuzz_lock.same_semver_compat_family("2.0.0-rc.4", "2.0.0")
+        )
+        self.assertTrue(
+            sync_fuzz_lock.same_semver_compat_family("2.0.0", "2.0.0-rc.4")
+        )
+        self.assertTrue(
+            sync_fuzz_lock.same_semver_compat_family(
+                "2.0.0-rc.4", "2.0.0-rc.7"
+            )
+        )
+        # A well-formed prerelease behind valid build metadata parses too.
+        self.assertTrue(
+            sync_fuzz_lock.same_semver_compat_family(
+                "1.2.3-rc.1+build", "1.2.3"
+            )
+        )
+        # Prerelease validity never relaxes the compatibility axes: the
+        # 0.x minor axis, the 0.0.x patch axis, and the major axis all
+        # stay enforced on prerelease records.
+        self.assertFalse(
+            sync_fuzz_lock.same_semver_compat_family("0.5.0-rc.1", "0.6.0")
+        )
+        self.assertFalse(
+            sync_fuzz_lock.same_semver_compat_family("0.0.3-rc.1", "0.0.4")
+        )
+        self.assertFalse(
+            sync_fuzz_lock.same_semver_compat_family("2.0.0-rc.4", "3.0.0")
+        )
+
+    def test_compat_family_rejects_malformed_semver_prereleases(self):
+        # Only well-formed prereleases fold into the numeric core's
+        # family: empty identifiers ("1.0.0-", "1.0.0-rc..1"), non-ASCII
+        # or non-identifier characters, and leading zeros in numeric
+        # identifiers are malformed input that must never compare equal
+        # to a valid version. SemVer 2.0.0 forbids leading zeros in
+        # numeric prerelease identifiers (registry versions are valid
+        # semver, so cargo can never write them) even behind valid build
+        # metadata.
+        for malformed in (
+            "1.0.0-",
+            "1.0.0-rc..1",
+            "1.0.0-rc.01",
+            "1.0.0-beta.01+build",
+            "1.0.0-rç",
         ):
             self.assertFalse(
                 sync_fuzz_lock.same_semver_compat_family(malformed, "1.0.5"),
@@ -2114,6 +2180,179 @@ class FuzzLockPolicyTests(unittest.TestCase):
             repaired_fuzz,
             requested,
         )
+
+    def test_bounded_repair_allows_unification_onto_prerelease_survivor(
+        self,
+    ):
+        #lizard forgives
+        # Real locks carry prerelease records (sea-orm-arrow 2.0.0-rc.4 in
+        # this repository), and cargo matches a prerelease comparator only
+        # within its release's own compatibility family. When a repair's
+        # graph refresh rebinds the outside consumers of sea-orm-arrow
+        # 2.0.0-rc.4 onto the newly introduced 2.0.0 release inside the
+        # after closure, the removal must attribute as same-family
+        # unification — treating the prerelease version as malformed would
+        # falsely reject Cargo-generated output as an unauthorized removal.
+        base = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "sea-orm-arrow": ["2.0.0-rc.4"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        # package order: lofty, lofty-attr, sea-orm-arrow 2.0.0-rc.4,
+        # quote, async-trait, serde-derive. The old lofty subtree never
+        # reaches sea-orm-arrow; the rc record is consumed only by crates
+        # outside it.
+        base["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        base["package"][4]["dependencies"] = ["sea-orm-arrow 2.0.0-rc.4"]
+        base["package"][6]["dependencies"] = ["sea-orm-arrow 2.0.0-rc.4"]
+        stale_fuzz = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "sea-orm-arrow": ["2.0.0-rc.4"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        stale_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        stale_fuzz["package"][4]["dependencies"] = ["sea-orm-arrow 2.0.0-rc.4"]
+        stale_fuzz["package"][6]["dependencies"] = ["sea-orm-arrow 2.0.0-rc.4"]
+        current = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "sea-orm-arrow": ["2.0.0"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        current["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        current["package"][2]["dependencies"] = ["sea-orm-arrow 2.0.0"]
+        current["package"][4]["dependencies"] = ["sea-orm-arrow 2.0.0"]
+        current["package"][6]["dependencies"] = ["sea-orm-arrow 2.0.0"]
+        repaired_fuzz = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "sea-orm-arrow": ["2.0.0"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        repaired_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        repaired_fuzz["package"][2]["dependencies"] = ["sea-orm-arrow 2.0.0"]
+        repaired_fuzz["package"][4]["dependencies"] = ["sea-orm-arrow 2.0.0"]
+        repaired_fuzz["package"][6]["dependencies"] = ["sea-orm-arrow 2.0.0"]
+
+        requested, remaining = sync_fuzz_lock.validate_submitted_fuzz_update(
+            base,
+            current,
+            stale_fuzz,
+            repaired_fuzz,
+            {"dependencies": {"lofty": "1"}},
+        )
+        self.assertEqual(
+            requested,
+            [sync_fuzz_lock.Transition("lofty", "0.24.0", "0.25.1")],
+        )
+        self.assertEqual(remaining, [])
+        sync_fuzz_lock.validate_bounded_package_changes(
+            base,
+            current,
+            stale_fuzz,
+            repaired_fuzz,
+            requested,
+        )
+
+    def test_bounded_repair_rejects_prerelease_cross_minor_unification(self):
+        #lizard forgives
+        # Prerelease validity never relaxes the compatibility axes: a
+        # 0.5.0-rc.1 requirement resolves only within ^0.5 (^0.5.0-rc.1
+        # excludes 0.6.x), so a graph refresh that rebinds its consumers
+        # onto a fresh 0.6.0 record crosses the 0.x minor axis and the
+        # removal must stay rejected as an unauthorized removal.
+        base = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "sea-orm-arrow": ["0.5.0-rc.1"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        base["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        base["package"][4]["dependencies"] = ["sea-orm-arrow 0.5.0-rc.1"]
+        base["package"][6]["dependencies"] = ["sea-orm-arrow 0.5.0-rc.1"]
+        stale_fuzz = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "sea-orm-arrow": ["0.5.0-rc.1"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        stale_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        stale_fuzz["package"][4]["dependencies"] = ["sea-orm-arrow 0.5.0-rc.1"]
+        stale_fuzz["package"][6]["dependencies"] = ["sea-orm-arrow 0.5.0-rc.1"]
+        current = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "sea-orm-arrow": ["0.6.0"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        current["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        current["package"][2]["dependencies"] = ["sea-orm-arrow 0.6.0"]
+        current["package"][4]["dependencies"] = ["sea-orm-arrow 0.6.0"]
+        current["package"][6]["dependencies"] = ["sea-orm-arrow 0.6.0"]
+        repaired_fuzz = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "sea-orm-arrow": ["0.6.0"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        repaired_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        repaired_fuzz["package"][2]["dependencies"] = ["sea-orm-arrow 0.6.0"]
+        repaired_fuzz["package"][4]["dependencies"] = ["sea-orm-arrow 0.6.0"]
+        repaired_fuzz["package"][6]["dependencies"] = ["sea-orm-arrow 0.6.0"]
+
+        requested = [sync_fuzz_lock.Transition("lofty", "0.24.0", "0.25.1")]
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError, "removed package identities"
+        ):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                current,
+                stale_fuzz,
+                repaired_fuzz,
+                requested,
+            )
 
     def test_bounded_repair_rejects_unused_unification_replacement(self):
         #lizard forgives

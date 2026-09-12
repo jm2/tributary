@@ -302,26 +302,65 @@ def valid_semver_build_metadata(build: str) -> bool:
     )
 
 
+def valid_semver_prerelease(prerelease: str) -> bool:
+    """
+    True when prerelease is well-formed SemVer: dot-separated
+    identifiers of ASCII alphanumerics and hyphens, none empty, and
+    numeric identifiers carry no leading zeros (SemVer 2.0.0 restricts
+    leading zeros to numeric build identifiers, which cargo accepts and
+    re-emits). Registry versions are valid semver, so cargo can never
+    write anything else — malformed prereleases stay fail-closed.
+    """
+    for identifier in prerelease.split("."):
+        if (
+            not identifier
+            or not identifier.isascii()
+            or not all(
+                character.isalnum() or character == "-"
+                for character in identifier
+            )
+        ):
+            return False
+        if (
+            identifier.isdigit()
+            and len(identifier) > 1
+            and identifier.startswith("0")
+        ):
+            return False
+    return True
+
+
 def cargo_version_family(version: str) -> tuple[int, int | None, int | None] | None:
     """
     Parse a Cargo lock version into its unification identity components.
 
     Cargo lock version fields are full numeric X.Y.Z releases, optionally
-    carrying SemVer build metadata. Build metadata never affects cargo's
-    compatibility rules, so a valid suffix is stripped before the numeric
-    parse; a malformed one (empty, duplicated "+", or non-identifier
-    content) is malformed input. Either way anything that is not a full
-    numeric X.Y.Z release never compares equal to a valid version:
-    incomplete versions, prerelease suffixes, non-numeric or non-ASCII
-    components, semver-forbidden leading zeros, and extra components all
-    parse to None and stay fail-closed. The returned triple keeps exactly
-    the components cargo's compatibility rules unify on — (major, None,
-    None) for stable majors, (0, minor, None) for 0.x crates, and
-    (0, 0, patch) for 0.0.x crates, where a ^0.0.P requirement matches
-    only that patch.
+    carrying a SemVer prerelease and/or build metadata. Build metadata
+    never affects cargo's compatibility rules, and a prerelease only ever
+    narrows matching inside its release's own compatibility family (cargo
+    matches a prerelease comparator solely within the same
+    major.minor.patch triple), so valid suffixes are stripped before the
+    numeric parse and the family axes stay purely numeric; a malformed
+    suffix (empty, duplicated separator, non-identifier content,
+    leading-zero numeric prerelease identifiers) is malformed input.
+    Either way anything that is not a full numeric X.Y.Z core never
+    compares equal to a valid version: incomplete versions, non-numeric
+    or non-ASCII components, semver-forbidden leading zeros, and extra
+    components all parse to None and stay fail-closed. The returned
+    triple keeps exactly the components cargo's compatibility rules
+    unify on — (major, None, None) for stable majors, (0, minor, None)
+    for 0.x crates, and (0, 0, patch) for 0.0.x crates, where a ^0.0.P
+    requirement matches only that patch. A validated prerelease record
+    shares its release's family — cargo can resolve a prerelease
+    requirer onto the same-core release, and real locks carry such
+    records (sea-orm-arrow 2.0.0-rc.4) — while cross-axis moves stay
+    fail-closed.
     """
-    core, plus, build = version.partition("+")
+    core_and_prerelease, plus, build = version.partition("+")
     if plus and not valid_semver_build_metadata(build):
+        return None
+    core, dash, prerelease = core_and_prerelease.partition("-")
+    if dash and not valid_semver_prerelease(prerelease):
         return None
     components = core.split(".")
     if len(components) != 3:
@@ -352,9 +391,11 @@ def same_semver_compat_family(left: str, right: str) -> bool:
     compatibility family: the same major; for 0.x crates also the same
     minor (^0.60 never matches 0.61.x); and for 0.0.x crates the same
     patch (^0.0.1 excludes 0.0.2, so a 0.0.x patch bump can never absorb
-    another record's consumers). Versions that do not fully parse as
-    numeric X.Y.Z never compare equal, which keeps malformed input
-    fail-closed.
+    another record's consumers). A validated prerelease shares its
+    numeric core's family — cargo matches a prerelease comparator solely
+    within the same major.minor.patch triple. Versions that do not fully
+    parse as a numeric X.Y.Z core with well-formed optional suffixes
+    never compare equal, which keeps malformed input fail-closed.
     """
     left_family = cargo_version_family(left)
     return (
@@ -408,7 +449,9 @@ def unification_replacements(
     compatibility boundary, and 0.x minor and 0.0.x patch boundaries stay
     fail-closed — cross-boundary movement on those axes is
     operator-policy territory whichever side of the boundary the move
-    starts from. Every guard below
+    starts from — and it stays a fully numeric release, the shape the
+    evacuation carve-out was verified against, so prerelease survivors
+    remain fail-closed. Every guard below
     (exact after closure, freshly introduced, same source, and the observed
     exact edge rebind required by validate_bounded_package_changes) still
     applies to these replacements.
@@ -448,8 +491,16 @@ def unification_replacements(
                 if candidate[0] == identity[0]
             )
             if len(same_name) == 1:
-                survivor_family = cargo_version_family(same_name[0][1])
-                if survivor_family is not None and survivor_family[0] > 0:
+                survivor_version = same_name[0][1]
+                survivor_family = cargo_version_family(survivor_version)
+                # The cargo-verified evacuation shape resolves every
+                # requirer onto a fully numeric stable-major release; a
+                # prerelease survivor keeps this carve-out fail-closed.
+                if (
+                    survivor_family is not None
+                    and survivor_family[0] > 0
+                    and "-" not in survivor_version.partition("+")[0]
+                ):
                     survivors = same_name
         if len(survivors) != 1:
             continue
