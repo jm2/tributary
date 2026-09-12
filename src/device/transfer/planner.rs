@@ -10,6 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::types::{Stage, TransferError, TransferItem, TransferPlan, TransferRequest};
+use crate::local::root_authority::CrossedMountBoundary;
 use crate::local::write_authority::{ConflictPolicy, ConflictResolution, MountedWriteAuthority};
 
 /// The transfer planner. Stateless and `Clone` so the same plan can be
@@ -147,10 +148,45 @@ impl<'a> PlanBuilder<'a> {
                     walkdir_io_error(error),
                 )
             })?;
+            if entry.file_type().is_dir() {
+                self.ensure_walked_directory_boundary(entry.path())?;
+                continue;
+            }
             if !entry.file_type().is_file() {
                 continue;
             }
             self.plan_walked_file(item, &entry)?;
+        }
+        Ok(())
+    }
+
+    /// Validate one walked directory's mount boundary BEFORE any child of
+    /// it is staged. The walk's `st_dev` comparison cannot see a same-device
+    /// Linux bind mount, while the executor's per-component mount-ID checks
+    /// refuse every file beneath one — a nested-mount transfer could never
+    /// complete, and the refusal would land mid-run after earlier stages
+    /// had already committed, with the mount-foreign bytes already counted
+    /// into the plan. A boundary crossing therefore rejects the whole plan
+    /// at planning time with the nested mount path named; non-mount trees
+    /// stage and account exactly as before.
+    fn ensure_walked_directory_boundary(&self, directory: &Path) -> Result<(), TransferError> {
+        if let Err(error) = self
+            .request
+            .source
+            .validate_walked_directory_boundary(directory)
+        {
+            if let Some(crossing) = error
+                .get_ref()
+                .and_then(|payload| payload.downcast_ref::<CrossedMountBoundary>())
+            {
+                return Err(TransferError::NestedMountBoundary {
+                    path: crossing.path.clone(),
+                });
+            }
+            return Err(TransferError::io(
+                "failed to validate source directory mount boundary",
+                error,
+            ));
         }
         Ok(())
     }
