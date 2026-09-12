@@ -2953,17 +2953,25 @@ fn run_post_mutation_refresh_ok_interpose(source_id: &SourceId) {
     }
 }
 
-/// Install the post-mutation Ok interposition seam for the duration of `run`,
-/// serializing against other tests that use the seam.
+/// Install the post-mutation Ok interposition seam for the duration of
+/// `run`, serializing against other tests that use the seam. A drop guard
+/// uninstalls the closure, so a panicking observation cannot leave a stale
+/// seam armed for a later test's post-mutation hooks.
 #[cfg(test)]
 fn with_post_mutation_refresh_ok_interpose(
     interpose: Box<PostMutationRefreshOkInterpose>,
     run: impl FnOnce(),
 ) {
+    struct UninstallPostMutationRefreshOkInterpose;
+    impl Drop for UninstallPostMutationRefreshOkInterpose {
+        fn drop(&mut self) {
+            *lock(&POST_MUTATION_REFRESH_OK_INTERPOSE) = None;
+        }
+    }
     let _serial = lock(&POST_MUTATION_REFRESH_OK_INTERPOSE_SERIAL);
     *lock(&POST_MUTATION_REFRESH_OK_INTERPOSE) = Some(interpose);
+    let _uninstall = UninstallPostMutationRefreshOkInterpose;
     run();
-    *lock(&POST_MUTATION_REFRESH_OK_INTERPOSE) = None;
 }
 
 /// Test-only hook fired inside a refresh generation's acceptance hook before
