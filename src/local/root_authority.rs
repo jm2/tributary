@@ -5689,18 +5689,21 @@ fn replace_publish_loop(
                             superseded.push((relative.clone(), identity));
                         }
                         if published {
-                            // This winning attempt's binding displaced the
-                            // slot's latest occupant into ITS backup — a
-                            // superseded non-original. Dispose it together
-                            // with every earlier superseded backup,
-                            // identity-verified, so no hidden orphan
-                            // survives the successful publish.
-                            let mut stale = std::mem::take(&mut superseded);
-                            stale.push((relative, identity));
-                            for (stale_relative, stale_leaf) in &stale {
+                            // Every completed binding EXCEPT the first is a
+                            // superseded non-original: `superseded` already
+                            // holds each of them, including this winning
+                            // attempt's own whenever an earlier bind holds
+                            // the original. The FIRST binding's backup — the
+                            // pre-transfer occupant — must survive the
+                            // successful publish: it is exactly the backup
+                            // reported to the caller, and disposing it (as a
+                            // blanket push here once did) strands the
+                            // rollback with "the saved overwrite backup is
+                            // gone".
+                            for (stale_relative, stale_leaf) in std::mem::take(&mut superseded) {
                                 dispose_superseded_binding_windows(
                                     &root.join(stale_relative),
-                                    stale_leaf,
+                                    &stale_leaf,
                                 );
                             }
                             let published_leaf = leaf_identity_at_path(to_absolute).ok().flatten();
