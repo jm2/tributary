@@ -387,20 +387,52 @@ def unification_replacements(
     selected production update necessitated it), it preserves the removed
     record's source identity, and the repair itself introduced it. Unrelated
     removals, ambiguous same-family survivors, pre-existing survivors,
-    cross-family substitutions, and cross-source substitutions stay
-    rejected.
+    cross-family substitutions with a same-family co-resident, and
+    cross-source substitutions stay rejected.
+
+    One cross-family shape is also cargo's own doing: a retained consumer
+    whose requirement is broad (for example "*" or a range spanning
+    releases) does not bound the resolver to the removed identity's family,
+    so introducing a consumer outside that family can evacuate it entirely
+    — verified against cargo 1.98 (consumer on "*" rebinds 1.0.0 -> 2.0.0
+    and the 1.x record disappears when a "^2" consumer joins). When the
+    repaired lock leaves exactly one same-name record, cargo resolved every
+    requirer of the name onto it, so the observed exact rebind was
+    requirement-forced rather than arbitrary; a stable-major survivor with
+    a fully numeric release is therefore admitted as a replacement (0.x
+    minor and 0.0.x patch boundaries stay fail-closed — cross-boundary
+    movement on those axes is operator-policy territory). Every guard below
+    (exact after closure, freshly introduced, same source, and the observed
+    exact edge rebind required by validate_bounded_package_changes) still
+    applies to these replacements.
     """
     replacements: dict[tuple[str, str], tuple[str, str]] = {}
     candidates = sorted(
         before_records.keys() - after_records.keys() - old_identities
     )
     for identity in candidates:
+        removed_family = cargo_version_family(identity[1])
         survivors = sorted(
             candidate
             for candidate in after_records
             if candidate[0] == identity[0]
             and same_semver_compat_family(candidate[1], identity[1])
         )
+        if (
+            not survivors
+            and removed_family is not None
+            and removed_family[0] > 0
+        ):
+            # Broad consumer requirements evacuated the removed identity's
+            # compatibility family; consider the unique same-name survivor
+            # across families. Requiring exactly one fully numeric release
+            # keeps ambiguous or malformed survivors fail-closed.
+            survivors = sorted(
+                candidate
+                for candidate in after_records
+                if candidate[0] == identity[0]
+                and cargo_version_family(candidate[1]) is not None
+            )
         if len(survivors) != 1:
             continue
         replacement = survivors[0]
