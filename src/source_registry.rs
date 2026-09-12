@@ -1446,6 +1446,14 @@ struct SourceRegistryInner {
     /// superseding refresh re-reads an earlier overlapping save's batch
     /// instead of dropping it.
     mutation_refresh_pending: Mutex<HashMap<SourceId, HashMap<TrackId, u64>>>,
+    /// Last version minted per source by [`Self::refresh_catalogue_after_mutation`],
+    /// consulted for the next version. This is the monotonicity anchor: it
+    /// never resets when a pending batch drains or its pending entry is
+    /// removed, so a version number is never re-minted for a source — an
+    /// older descheduled generation carrying a consumed version can never
+    /// collide with the current pending version and consume a newer save's
+    /// unpublished mutation.
+    mutation_refresh_versions: Mutex<HashMap<SourceId, u64>>,
 }
 
 impl PublicHttpAuthority for SourceRegistryInner {
@@ -1599,6 +1607,7 @@ impl SourceRegistry {
                 built_ins: Mutex::new(built_ins),
                 external_sessions: Mutex::new(HashMap::new()),
                 mutation_refresh_pending: Mutex::new(HashMap::new()),
+                mutation_refresh_versions: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -2782,7 +2791,13 @@ impl SourceRegistry {
     /// carried batch leaves the pending map only when that exact
     /// generation's publication is ACCEPTED by the lifecycle, and a carried
     /// track is consumed only when its CURRENT pending version still equals
-    /// the version the generation carried. A same-track save that lands
+    /// the version the generation carried. Versions are minted from a
+    /// per-source monotonic counter that survives drained batches, so a
+    /// version number is never re-minted after the batch that first used it
+    /// is consumed — an older descheduled generation's carried version can
+    /// never equal a newer save's pending version, and its hook can never
+    /// consume a mutation the newer generation has not published. A
+    /// same-track save that lands
     /// between the acceptance and the hook's consumption — the two take
     /// different locks — bumps the track's version, so the older hook
     /// leaves it pending for the successor or retry lane instead of
@@ -2812,11 +2827,19 @@ impl SourceRegistry {
             // bumping every written track's version past every earlier
             // save's — and carry the accumulated union with the versions
             // present at carry time: any earlier save whose refresh has not
-            // published yet is re-read by this task too.
+            // published yet is re-read by this task too. The next version
+            // comes from the per-source monotonic counter, never from the
+            // pending map's current maximum: a drained or emptied batch must
+            // not reset the sequence, or the next save would re-mint a
+            // version an older descheduled generation also carried and its
+            // hook could consume this save's unpublished mutation.
             let carried: HashMap<TrackId, u64> = {
                 let mut pending = lock(&self.inner.mutation_refresh_pending);
+                let mut versions = lock(&self.inner.mutation_refresh_versions);
+                let version = versions.entry(source_id).or_insert(0);
+                *version += 1;
+                let version = *version;
                 let entry = pending.entry(source_id).or_default();
-                let version = entry.values().copied().max().unwrap_or(0) + 1;
                 for track_id in &batch {
                     entry.insert(track_id.clone(), version);
                 }
@@ -4873,6 +4896,120 @@ mod tests {
             .catalogue
             .expect("the accepted catalogue survives");
         assert_eq!(catalogue.generation, fourth_generation);
+        drop(registry);
+    }
+
+    /// Arm the pending-consumption seam for the drained-batch race: while
+    /// the older accepted generation's hook is descheduled just before its
+    /// consumption, remove the source's pending entry the way the
+    /// session-loss path removes it, then re-save the same track with the
+    /// successor forced to fail. The re-save must mint the monotonic
+    /// counter's next version — never a version the descheduled generation
+    /// also carried — or the older hook would consume the newer save's
+    /// unpublished marker.
+    #[cfg(test)]
+    fn arm_descheduled_hook_drain_race(
+        probe: &Arc<FakeProbe>,
+        registry: &SourceRegistry,
+        source_id: SourceId,
+        track: &TrackId,
+        raced_signal: mpsc::Sender<()>,
+        raced: mpsc::Receiver<()>,
+    ) {
+        let race_probe = Arc::clone(probe);
+        let race_registry = registry.clone();
+        let race_source = source_id;
+        let race_track = track.clone();
+        with_pending_consumption_interpose(
+            Box::new(move |fired_source: &SourceId| {
+                if fired_source != &race_source {
+                    return;
+                }
+                // Session-loss drain: the pending entry is removed while
+                // the older accepted generation's hook is descheduled.
+                lock(&race_registry.inner.mutation_refresh_pending).remove(&race_source);
+                race_probe.set_post_mutation_failure(true);
+                let _ = race_registry
+                    .refresh_catalogue_after_mutation(&[(race_source, race_track.clone())]);
+                // The re-save must mint the counter's next version, never
+                // a version the descheduled generation already carried.
+                let version = lock(&race_registry.inner.mutation_refresh_pending)
+                    .get(&race_source)
+                    .and_then(|entry| entry.get(&race_track))
+                    .copied();
+                assert_eq!(
+                    version,
+                    Some(2),
+                    "a save after a drained batch mints the counter's next \
+                     version, never a version an older descheduled \
+                     generation also carried"
+                );
+                let _ = raced_signal.send(());
+            }),
+            || {
+                probe.release_post_mutation_refresh();
+                raced
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("the re-save landed while the older hook was descheduled");
+            },
+        );
+    }
+
+    /// The version-matching consumption must stay correct across a drained
+    /// batch: while an older accepted generation's hook is descheduled, the
+    /// source's pending entry is removed (the session-loss drain), and the
+    /// same track is re-saved. The re-save must mint a version the older
+    /// generation never carried — deriving it from the pending map's
+    /// maximum would re-mint the drained version and let the older hook
+    /// consume the newer save's unpublished marker, losing it behind the
+    /// forced successor failure. With the monotonic counter, the marker
+    /// survives and a later clean refresh republishes the mutation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_descheduled_hook_after_a_drained_batch_never_consumes_a_re_minted_version() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let track = TrackId::remote("rearm-track").expect("track ID");
+        let later_track = TrackId::remote("rearm-later-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        probe.hold_post_mutation_refresh();
+
+        let adapter = probe
+            .playlist_adapter("pending-rearm", vec![fixture_track(track.clone())])
+            .with_post_mutation_refresh(vec![fixture_track(track.clone())]);
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+        let _ = wait_for_catalogue(&registry, source_id).await;
+
+        // The first save's generation blocks inside the adapter call.
+        registry.refresh_catalogue_after_mutation(&[(source_id, track.clone())]);
+        probe.wait_for_post_mutation_calls(1).await;
+
+        let (raced_signal, raced) = mpsc::channel::<()>();
+        arm_descheduled_hook_drain_race(&probe, &registry, source_id, &track, raced_signal, raced);
+        probe.wait_for_post_mutation_calls(2).await;
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+        let snapshot = registry.snapshot(source_id).expect("the source stays live");
+        assert!(
+            snapshot
+                .refresh_failures
+                .contains_key(&RefreshLane::Catalogue),
+            "the forced-failure successor failed: {:?}",
+            snapshot.refresh_failures
+        );
+
+        // The failed successor published nothing and the descheduled older
+        // hook consumed nothing: a later clean save re-reads BOTH
+        // identities, republishing the mutation the failure would lose.
+        probe.set_post_mutation_failure(false);
+        let _later = registry.refresh_catalogue_after_mutation(&[(source_id, later_track.clone())]);
+        probe.wait_for_post_mutation_calls(3).await;
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests[2],
+            HashSet::from([track, later_track]),
+            "the re-saved track's marker survived the descheduled older hook \
+             and is republished after the forced successor failure"
+        );
         drop(registry);
     }
 

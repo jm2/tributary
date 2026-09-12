@@ -377,10 +377,14 @@ fn retained_leaf_identity(parent: &File, leaf: &OsStr) -> std::io::Result<(u64, 
 /// is never destruction. Trust boundary of the final unlink: POSIX has no
 /// unlink-by-fd, so the verify→unlink window on the private name cannot be
 /// made atomic — an external writer can swap the occupant inside it. The
-/// fd-verified post-condition (see [`unlink_fd_verified`]) detects and
-/// loudly reports such a wrong-object removal instead of silently
-/// succeeding; it converts silent destruction into a reported refusal, and
-/// an operator/coordinator decision (accept the residual or redesign the
+/// removal is gated on a provable sole link and its outcome fd-verified
+/// (see [`unlink_fd_verified`]): a concurrent removal of an unrelated hard
+/// link can no longer counterfeit the expected link-count delta, and a
+/// wrong-object removal is detected and loudly reported instead of
+/// silently succeeding. The window is not fully closed — a writer
+/// manufacturing a create-link/remove-link pair inside the fstat→fstat
+/// window can still counterfeit the post-condition — and an
+/// operator/coordinator decision (accept the residual or redesign the
 /// cleanup contract to leave contested debris) remains open for the
 /// strictly atomic form.
 #[cfg(unix)]
@@ -520,14 +524,32 @@ fn unlink_bound_private_name(
 ///
 /// Trust boundary: POSIX has no unlink-by-fd, so the verify→unlink window
 /// on the private name cannot be closed — an external writer can swap the
-/// occupant between the re-verification and the [`unlinkat`]. The pin
-/// descriptor is held across the removal and `fstat` through it (immune to
-/// directory-entry games) proves the outcome: the removed entry referenced
-/// the pinned object iff the pinned object's link count dropped by exactly
-/// one. An unchanged count means a swap landed in the window and the
-/// unlinkat destroyed a foreign entry — reported loudly and refused, never
-/// reported success. Any other outcome is unprovable and refused with
-/// everything left where it lies.
+/// occupant between the re-verification and the [`unlinkat`]. Two measures
+/// bound what that window can cost:
+///
+/// * *Sole-link gate.* `st_nlink` is inode-global, not per-directory-entry,
+///   so the removal is attempted only when the pinned object has exactly
+///   one link — the private name is its only one. With a second link
+///   alive, a concurrent writer removing THAT link inside the
+///   fstat→fstat window would drop the count by one for an unrelated
+///   reason while the unlinkat destroyed a swapped-in foreign entry,
+///   counterfeiting the expected delta; the gate refuses such a removal
+///   outright and leaves the debris, attempting no unlink at all.
+/// * *fd-verified post-condition.* With one link, no unrelated removal
+///   can decrement the count, so the pinned object's link count dropping
+///   to zero through the held pin descriptor proves the removed entry
+///   referenced the pinned object. An unchanged count means a swap landed
+///   in the window and the unlinkat destroyed a foreign entry — reported
+///   loudly and refused, never reported success. Any other outcome is
+///   unprovable and refused with everything left where it lies.
+///
+/// Narrowed residual, stated precisely: a writer that can manufacture a
+/// create-link/remove-link pair *inside* the fstat→fstat window — unlink
+/// the sole link at the private name, plant a foreign entry, and make the
+/// count fall to zero for the plant — can still counterfeit the
+/// post-condition. The window is not fully closed; POSIX offers no
+/// unlink-by-fd. A strictly atomic identity-conditional unlink remains
+/// the recorded operator/coordinator decision (PR #237 precedent).
 ///
 /// [`unlinkat`]: rustix::fs::unlinkat
 // The `u64::from` is load-bearing on macOS (`st_nlink` is `u16` there) and
@@ -542,6 +564,19 @@ fn unlink_fd_verified(parent: &File, retire_name: &OsStr, pinned: &rustix::fd::O
         return false;
     };
     let links_before = u64::from(before.st_nlink);
+    // Sole-link gate: with more than one link alive, a concurrent writer
+    // removing an unrelated hard link inside the fstat→fstat window can
+    // counterfeit the expected delta while the unlinkat destroys a
+    // swapped-in foreign entry. Refuse and leave the debris — no unlink
+    // is attempted against an object whose removal outcome could not be
+    // proven.
+    if links_before != 1 {
+        tracing::warn!(
+            "retained-cleanup probe carries extra hard links; refusing the \
+             removal and leaving the debris"
+        );
+        return false;
+    }
     if rustix::fs::unlinkat(parent, retire_name, rustix::fs::AtFlags::empty()).is_err() {
         return false;
     }
@@ -554,7 +589,10 @@ fn unlink_fd_verified(parent: &File, retire_name: &OsStr, pinned: &rustix::fd::O
         return false;
     };
     let links_after = u64::from(after.st_nlink);
-    if links_before >= 1 && links_after == links_before - 1 {
+    // links_before is provably 1 here, so the proven success shape is
+    // exactly `links_after == 0`: the sole link went away through this
+    // removal.
+    if links_after == 0 {
         return true;
     }
     if links_after == links_before {
@@ -2531,7 +2569,80 @@ mod tests {
         assert_eq!(
             retained_entries,
             vec![std::ffi::OsString::from("silence.flac")],
-            "the rehearsal must leave only the admitted file in the retained directory"
+            "the refused rehearsal must leave no probe residue of its own"
+        );
+    }
+
+    /// Drive the rehearsal under an extra-hard-link probe: the sole-link
+    /// gate must refuse the removal with `Unavailable` — no unlink
+    /// attempted, so nothing is destroyed and no contested-destruction
+    /// ERROR event is carried.
+    #[cfg(unix)]
+    fn run_sole_link_rehearsal_expect_refusal(parent: &std::fs::File, leaf: &OsStr) {
+        let errors = capture_error_events(|| {
+            assert_eq!(
+                crate::local::tag_writer::preflight_tag_write_directory_retained(
+                    parent,
+                    leaf,
+                    "the removable mutation target",
+                ),
+                Err(TagWritePreflightError::Unavailable),
+                "a probe with extra hard links must be refused: its removal \
+                 outcome cannot be proven against a concurrent link removal"
+            );
+        });
+        assert!(
+            errors.is_empty(),
+            "the sole-link refusal attempts no unlink, so it must not carry \
+             the contested-destruction ERROR event: {errors:?}"
+        );
+    }
+
+    /// Assert the sole-link refusal's outcomes: the interposed hard link
+    /// ran, the extra link still names the two-link probe (never
+    /// unlinked), exactly the relocated private name and the extra link
+    /// remain beside the untouched admitted file.
+    #[cfg(unix)]
+    fn assert_sole_link_refusal_leaves_debris(
+        linked: &std::sync::atomic::AtomicBool,
+        extra: &std::sync::Mutex<Option<std::ffi::OsString>>,
+        parent: &std::fs::File,
+        album: &Path,
+    ) {
+        use rustix::fs::AtFlags;
+        use std::sync::atomic::Ordering;
+        assert!(
+            linked.load(Ordering::SeqCst),
+            "the interposed hard link must have run"
+        );
+        let extra_leaf = extra
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the probe was hard-linked");
+        let probe_stat = rustix::fs::statat(parent, &extra_leaf, AtFlags::SYMLINK_NOFOLLOW)
+            .expect("the extra hard link's debris is preserved");
+        assert_eq!(
+            probe_stat.st_nlink, 2,
+            "the refused removal never unlinked the probe"
+        );
+        let retained: Vec<std::ffi::OsString> = std::fs::read_dir(album)
+            .expect("list the retained directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            retained.len(),
+            3,
+            "exactly the probe debris remains beside the admitted file: {retained:?}"
+        );
+        assert!(
+            retained.contains(&std::ffi::OsString::from("silence.flac")),
+            "the admitted file is untouched: {retained:?}"
+        );
+        assert!(
+            retained.contains(&extra_leaf),
+            "the extra hard link survives as preserved debris: {retained:?}"
         );
     }
 
@@ -3141,6 +3252,55 @@ mod tests {
             vec![std::ffi::OsString::from("silence.flac")],
             "the clean rehearsal removes its probe completely"
         );
+    }
+
+    /// The fd-verified removal must gate on a provable sole link: a probe
+    /// carrying an extra hard link at removal time has an outcome no
+    /// link-count post-condition can prove — a concurrent writer removing
+    /// that unrelated link inside the fstat→fstat window would counterfeit
+    /// the expected delta while the unlinkat destroyed a swapped-in foreign
+    /// entry — so the removal must be refused before any unlink, the debris
+    /// left, and nothing reported as success.
+    #[cfg(unix)]
+    #[test]
+    fn retained_preflight_refuses_a_probe_with_extra_hard_links_and_leaves_debris() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let (directory, album, _) = anchored_album_fixture("preflight-sole-link");
+        let authority = mounted_root_authority(&directory);
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+        let (parent, leaf) = target
+            .retained_directory_handle()
+            .expect("retain the directory anchor");
+
+        let extra = Arc::new(Mutex::new(None::<std::ffi::OsString>));
+        let extra_closure = Arc::clone(&extra);
+        let linked = Arc::new(AtomicBool::new(false));
+        let linked_closure = Arc::clone(&linked);
+        with_retained_preflight_interpose(
+            Box::new(move |phase, interposed_parent, landed_leaf, _vacant_leaf| {
+                if phase != RetainedPreflightPhase::BeforeCleanup {
+                    return;
+                }
+                linked_closure.store(true, Ordering::SeqCst);
+                let extra_leaf = staged_sibling_name(std::ffi::OsStr::new("silence.flac"));
+                rustix::fs::linkat(
+                    interposed_parent,
+                    landed_leaf,
+                    interposed_parent,
+                    &extra_leaf,
+                    rustix::fs::AtFlags::empty(),
+                )
+                .expect("hard-link the landed probe");
+                *extra_closure.lock().unwrap() = Some(extra_leaf);
+            }),
+            || run_sole_link_rehearsal_expect_refusal(&parent, &leaf),
+        );
+
+        assert_sole_link_refusal_leaves_debris(&linked, &extra, &parent, &album);
     }
 
     #[test]
