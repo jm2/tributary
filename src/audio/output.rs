@@ -69,6 +69,18 @@ pub trait AudioOutput {
     /// (greyed out).  MPD manages its own volume independently.
     fn supports_volume(&self) -> bool;
 
+    /// Whether this output's exclusive-control supervision has lapsed.
+    ///
+    /// Only a supervised MPD output can lapse; every other output — and an
+    /// MPD output without an active supervisor — reports `false`. The output
+    /// selector consults this when the already-active row is activated
+    /// again: that reselection is the documented recovery for a lapsed
+    /// supervisor, so it must rebuild the instance (construction re-arms the
+    /// supervisor) instead of being swallowed as a non-perturbing no-op.
+    fn supervision_lapsed(&self) -> bool {
+        false
+    }
+
     // ── Playback controls ───────────────────────────────────────────
 
     /// Load a URI and start playback.

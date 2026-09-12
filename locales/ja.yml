@@ -145,6 +145,8 @@ dialogs:
   output_port: "ポート"
   output_exclusive_control_warning: "MPD の一時停止、停止、リピート、ランダム、シングル、consume コマンドは再生パーティション全体に影響します。別のコントローラーや Tributary インスタンスと共有しないでください。"
   output_exclusive_control_confirmation: "Tributary がこの MPD 再生パーティションを排他的に制御することを確認します。"
+  output_detection_warning: "監視を有効にすると、Tributary は再生中もパーティションを監視し続けます。外部の現在の曲、オプションの変更、または監視の途切れが検知されると、再生操作の権限を取り消し、孤立したキューエントリを保持します。監視は取り消しのみを行い、権限を付与することはありません。そのような証拠が検知された後は、再度選択して確認するまで、この出力はコマンドを拒否します。"
+  output_detection_confirmation: "この排他出力を監視し、他のコントローラーの兆候を検知した場合にその制御を取り消します。"
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:

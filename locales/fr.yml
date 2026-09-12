@@ -145,6 +145,8 @@ dialogs:
   output_port: "Port"
   output_exclusive_control_warning: "Les commandes MPD de pause, arrêt, répétition, lecture aléatoire, lecture unique et consommation affectent toute la partition de lecture. Ne la partagez pas avec un autre contrôleur ou une autre instance de Tributary."
   output_exclusive_control_confirmation: "Je confirme que Tributary contrôle exclusivement cette partition de lecture MPD."
+  output_detection_warning: "Avec la supervision activée, Tributary continue d'observer la partition pendant la lecture : une chanson actuelle étrangère, un changement d'option étranger ou une fenêtre d'observation perdue révoque le contrôle de la lecture et conserve toute entrée de file orpheline. La supervision ne peut que révoquer, jamais accorder : après de telles preuves, la sortie refuse les commandes jusqu'à ce que vous la resélectionniez pour la confirmer à nouveau."
+  output_detection_confirmation: "Superviser cette sortie exclusive et révoquer son contrôle en cas de preuve d'un autre contrôleur."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:

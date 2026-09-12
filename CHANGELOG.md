@@ -19,6 +19,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Build and run helpers** — Add `--run` on Linux and macOS to build with locked
   dependencies, validate the native binary, and launch it with logs in the terminal.
   The macOS development route uses Homebrew libraries and skips app packaging.
+- **MPD outputs can now be supervised while under the user's explicit exclusive-control
+  confirmation** (`src/audio/mpd_output.rs`, `src/ui/output_dialogs.rs`,
+  `src/ui/output_switch.rs`, `locales/*.yml`). The user's explicit confirmation remains the
+  ONLY grant of partition authority: automatic authority is declared infeasible because MPD
+  offers no ownership lock, lease, token, or atomic conditional partition mutation. The
+  `detection_enabled` persisted field now opts an exclusive output into a revoke-only
+  supervisor: a foreign current song, any of `repeat`/`random`/`single`/`consume` flipped away
+  from the enforced defaults, or an observation gap beyond `MAX_SUPERVISION_GAP = 2 s` lapses
+  the supervisor, which revokes playback control — loads and partition-global playback
+  controls are refused with the exclusive-control-required error and orphan cleanup retains
+  the queue entry — until the user explicitly reconfirms by re-selecting the output. Quiet
+  status polling never grants or restores authority, and a lapsed supervisor is terminal for
+  the output instance. The 2 s supervision age is enforced eagerly at every authority gate —
+  public loads, public playback controls, worker commands, and orphan cleanup — so a
+  confirmation whose clean evidence has gone stale is refused immediately (and lapses the
+  supervisor) instead of staying valid until the next poll observes the gap, and a `status`
+  reply that omits any of the four partition-option fields fails the poll rather than
+  defaulting the omission to a clean `false`. The `exclusive_control: false` default, the fail-closed load gate, the
+  refuse-before-Buffering/epoch/enqueue ordering, and the relinquish-without-racy-stop rule
+  for a foreign current song are all preserved; legacy `outputs.json` entries continue to
+  deserialize with `detection_enabled: false`, and a legacy `detection_enabled: true` entry
+  without the exclusive confirmation fails closed to `Unconfirmed`. The Add Output dialog
+  saves supervision only together with the exclusive confirmation, paired with a localized
+  warning/confirmation message in every supported catalog (13 locales).
 
 ### Changed
 
@@ -35,6 +59,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and keep the fuzz lockfile synchronized with dependency updates.
 
 ### Fixed
+
+- **Supervised MPD control TOCTOU** (`src/audio/mpd_output.rs`) — A playback
+  control (play/pause/toggle/seek) whose own pre-control `status` observed
+  partition-option drift or a foreign current song lapsed the supervisor yet was
+  still issued. Authority is now rechecked immediately after the authoritative
+  status is applied and before the control goes to the wire; a just-lapsed
+  supervisor receives the exclusive-control-required error and no command, the
+  same refusal shape as the worker gate.
+- **Supervised MPD cleanup rechecks authority on fresh evidence**
+  (`src/audio/mpd_output.rs`) — The shutdown-time `status` in
+  `cleanup_unconditionally` (and the `status` fetched by the Stop command's
+  `StopOwned` cleanup in `cleanup_session`) is now applied to the supervisor
+  before any mutation decision, and authority is rechecked before the teardown
+  `stop` and again before the targeted `delete`. A supervisor that is fresh at
+  the initial gate but whose own teardown observation (option drift, foreign
+  song, or the round-trip time past the 2 s window) supplies disqualifying
+  evidence now retains the orphan and issues neither command.
+- **Lapsed supervised MPD outputs rebuild on same-target reselection**
+  (`src/audio/output.rs`, `src/audio/mpd_output.rs`, `src/ui/output_switch.rs`)
+  — After supervision lapsed, the documented recovery — re-select the output —
+  never reached the constructor, because clicking the already-active row was
+  swallowed as a non-perturbing no-op and every later command stayed refused.
+  The selector now detects a lapsed supervisor on the active MPD row and routes
+  the reselection through a dedicated same-target rebuild that keeps the
+  committed-switch ordering (session proof cleared before coordinator ingress,
+  predecessor retired, stopped, replaced) while re-arming authority via the
+  fresh construction. Healthy supervisors and non-MPD targets keep the old
+  no-op behavior.
 
 - **macOS local playback** — Bundle the dynamically loaded libsoup runtime and its
   dependencies so protected streams can use the required HTTP source on Macs without
