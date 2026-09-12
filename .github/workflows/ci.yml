@@ -142,7 +142,7 @@ jobs:
             dbus-devel \
             gstreamer1-devel gstreamer1-plugins-base-devel \
             gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free gstreamer1-libav \
-            pkgconf-pkg-config git curl
+            pkgconf-pkg-config git curl jq
 
       - uses: actions/checkout@v7
 
@@ -221,7 +221,7 @@ jobs:
             dbus-devel \
             gstreamer1-devel gstreamer1-plugins-base-devel \
             gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free gstreamer1-libav \
-            pkgconf-pkg-config git curl
+            pkgconf-pkg-config git curl jq
 
       - uses: actions/checkout@v7
 

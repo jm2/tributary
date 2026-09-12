@@ -5,10 +5,21 @@ name: Dependabot auto-merge
 # How the pieces fit together:
 #   * This workflow only ENABLES GitHub's native auto-merge on the PR.
 #   * The actual gate ("wait for configured required checks") is enforced by
-#     the live branch ruleset on `main`, not by this file. Before deploying this
-#     workflow, that ruleset must be migrated to the documented stable check
-#     names, including `MSRV`. Auto-merge then lands the PR only after that
-#     configured set passes.
+#     the live branch ruleset on `main`, not by this file. Native auto-merge
+#     waits only on the checks that ruleset marks required, so before the
+#     writer enables auto-merge it reads the rulesets that APPLY to `main`
+#     and verifies they require the COMPLETE policy check set (every hosted
+#     CI job, CodeQL, Codacy, CodeRabbit, and the repo-owned Bot Review
+#     Gate). Until the live ruleset enforces that full set — including
+#     `MSRV` — the writer refuses and routine Dependabot auto-merge stays
+#     off. The exact rollout and verification steps are documented in
+#     docs/dependency-updates.md.
+#   * Reading rulesets needs the `administration` permission, which the
+#     workflow GITHUB_TOKEN cannot hold (it is not a valid GITHUB_TOKEN
+#     scope; declaring it makes GitHub reject the whole workflow). The
+#     writer therefore mints a single-purpose GitHub App installation token
+#     (administration: read only) with the pinned GitHub-org token action
+#     and uses it for nothing but the ruleset precondition.
 #   * Majors are NOT auto-merged: they fall through the update-type guard below
 #     and wait for coordinated repair and review.
 #   * Rust compiler/MSRV and rust-toolchain action-code proposals are NOT
@@ -17,8 +28,10 @@ name: Dependabot auto-merge
 #
 # Security: uses `pull_request` (NOT `pull_request_target`) and never checks out
 # the PR head. A read-only first job binds changed-file inspection and metadata
-# extraction to the event's exact head SHA. The action-free write job checks
-# that SHA again immediately before an exact-head-guarded merge request.
+# extraction to the event's exact head SHA. The write job contains exactly one
+# action — the pinned GitHub-org `actions/create-github-app-token`, which
+# executes no repository code — and checks that SHA again immediately before an
+# exact-head-guarded merge request.
 on:
   pull_request:
     paths-ignore:
@@ -164,6 +177,160 @@ jobs:
     steps:
       # Major bumps, compiler/MSRV proposals, rust-toolchain action-code
       # proposals, and metadata-action self-updates never reach this writer.
+      # `administration` is not a valid GITHUB_TOKEN scope, so the ruleset
+      # read below runs with a minted GitHub App installation token instead;
+      # this action is pinned to a full commit SHA and executes no repository
+      # code — it only signs a JWT and exchanges it for the installation
+      # token, which carries administration: read and nothing else.
+      - name: Mint a read-only ruleset-reader token
+        id: ruleset_reader
+        # v2.2.1, pinned to the full commit.
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf
+        with:
+          app-id: ${{ secrets.RULESET_READER_APP_ID }}
+          private-key: ${{ secrets.RULESET_READER_APP_PRIVATE_KEY }}
+          permission-administration: read
+
+      - name: Require the live ruleset to enforce the full policy gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.ruleset_reader.outputs.token }}
+          GATE_PUBLISHER_APP_ID: ${{ vars.BOT_REVIEW_GATE_APP_ID }}
+        run: |
+          set -euo pipefail
+          # Native auto-merge waits only on the checks the live main ruleset
+          # marks required. Until that set covers the complete all-green
+          # policy, a dependency PR could land while Coverage, CodeQL, Codacy,
+          # CodeRabbit, Windows (aarch64), or a bot review is still pending or
+          # failing. Read every ruleset that applies to main via the
+          # branch-rules endpoint (the ruleset list endpoint ignores a ref
+          # parameter and would return rulesets for other branches too) and
+          # refuse auto-merge until each policy context below is required with
+          # its expected app binding ("15368" GitHub Actions, "57789" GitHub
+          # Advanced Security/CodeQL, "56611" Codacy, empty = unbound commit
+          # status context, and the Bot Review Gate from the dedicated
+          # gate-publisher App). Fail closed: a query failure or coverage gap
+          # keeps routine auto-merge off.
+          # The Bot Review Gate must be required from the dedicated
+          # gate-publisher App — never from the shared GitHub Actions
+          # integration (15368), whose check runs ANY pull-request-controlled
+          # workflow job can publish under any name, letting a forged green
+          # `Bot Review Gate` satisfy the required context. The app id is
+          # owned by repository administration via the repository variable,
+          # and an unset or non-numeric value refuses auto-merge.
+          case "${GATE_PUBLISHER_APP_ID}" in
+            ''|*[!0-9]*)
+              echo >&2 "vars.BOT_REVIEW_GATE_APP_ID is not set to a numeric app id (found: '${GATE_PUBLISHER_APP_ID:-}'); refusing auto-merge."
+              exit 1
+              ;;
+          esac
+          expected_checks=(
+            "Security Audit|15368"
+            "Linux (x86_64)|15368"
+            "Linux (aarch64)|15368"
+            "macOS (aarch64)|15368"
+            "Windows (x86_64)|15368"
+            "Windows (aarch64)|15368"
+            "Flatpak (Linux)|15368"
+            "MSRV|15368"
+            "Coverage (Linux x86_64)|15368"
+            "Desktop Metadata|15368"
+            "SHA256 Checksums|15368"
+            "Bot Review Gate|${GATE_PUBLISHER_APP_ID}"
+            "CodeQL|57789"
+            "Analyze (python)|57789"
+            "Analyze (rust)|57789"
+            "Analyze (actions)|57789"
+            "Codacy Static Code Analysis|56611"
+            "CodeRabbit|"
+          )
+          summary_file="${RUNNER_TEMP}/main-rulesets.json"
+          required_contexts="${RUNNER_TEMP}/required-contexts.txt"
+          : > "${required_contexts}"
+          if ! gh api --paginate "repos/${GITHUB_REPOSITORY}/rules/branches/main" \
+            > "${summary_file}"; then
+            echo "Unable to read repository rulesets; refusing auto-merge." >&2
+            exit 1
+          fi
+          # The branch-rules endpoint returns per-rule records carrying
+          # `ruleset_id` (there is no top-level `id` or `enforcement` field),
+          # and it only reports rules inherited from active rulesets — so the
+          # IDs need no enforcement filter, only deduplication.
+          rule_ids="$(jq -r '.[].ruleset_id' "${summary_file}" | sort -u)"
+          if [ -z "${rule_ids}" ]; then
+            echo "No active ruleset applies to main; refusing auto-merge." >&2
+            exit 1
+          fi
+          # The per-ruleset detail endpoint is the authoritative source for
+          # the required-check parameters, so each active ruleset that
+          # applies to main is fetched individually.
+          unmet=0
+          # Require-conversation-resolution lives in the ruleset detail as
+          # the `pull_request` rule's `required_review_thread_resolution`
+          # parameter. The same edit that widens the required checks must
+          # switch it on (docs/dependency-updates.md rollout step 2): the
+          # native rule is the only merge-time backstop for a reopened
+          # review thread, which fires no Actions event and therefore
+          # cannot refresh the gate. GitHub applies the rulesets covering
+          # main as a UNION — every rule of every applicable ruleset binds
+          # the pull request — so one ruleset enforcing the flag is enough
+          # for GitHub to enforce it, and a SECOND applicable ruleset
+          # without a pull_request rule (signed commits, deletion,
+          # non-fast-forward) does not dilute that enforcement. Demanding
+          # the flag in EVERY applicable ruleset would therefore refuse
+          # auto-merge permanently on any repository whose extra rulesets
+          # exist for unrelated policy. The flag is aggregated across the
+          # loop and asserted exactly once after it: fail closed only when
+          # NO applicable ruleset enforces it.
+          resolution_enforced=0
+          for rule_id in ${rule_ids}; do
+            if ! gh api "repos/${GITHUB_REPOSITORY}/rulesets/${rule_id}" \
+              > "${RUNNER_TEMP}/ruleset-${rule_id}.json"; then
+              echo "Unable to read ruleset ${rule_id}; refusing auto-merge." >&2
+              exit 1
+            fi
+            jq -r '.rules[]?
+              | select(.type == "required_status_checks")
+              | .parameters.required_status_checks[]
+              | "\(.context)|\(.integration_id // "")"' \
+              "${RUNNER_TEMP}/ruleset-${rule_id}.json" >> "${required_contexts}"
+            enforcement="$(jq -r '
+              [.rules[]?
+                | select(.type == "pull_request")
+                | .parameters.required_review_thread_resolution]
+              | if length == 0 then "absent"
+                elif all then "enforced"
+                else "off" end' \
+              "${RUNNER_TEMP}/ruleset-${rule_id}.json")" || {
+                echo "Unable to evaluate require-conversation-resolution in ruleset ${rule_id}; refusing auto-merge." >&2
+                exit 1
+              }
+            case "${enforcement}" in
+              enforced) resolution_enforced=1 ;;
+              absent|off) : ;; # another applicable ruleset may still enforce it; decided after the loop
+              *)
+                echo >&2 "ruleset ${rule_id} reported an unreadable require-conversation-resolution flag (${enforcement:-<empty>}); refusing auto-merge."
+                exit 1
+                ;;
+            esac
+          done
+          if [ "${resolution_enforced}" -ne 1 ]; then
+            echo >&2 "no ruleset applying to main enforces require-conversation-resolution"
+            unmet=1
+          fi
+          sort -u -o "${required_contexts}" "${required_contexts}"
+          for expected in "${expected_checks[@]}"; do
+            app_id="${expected##*|}"
+            if ! grep -Fxq "${expected}" "${required_contexts}"; then
+              echo >&2 "main ruleset does not yet require '${expected%%|*}' (expected app binding: ${app_id:-unbound})"
+              unmet=1
+            fi
+          done
+          if [ "${unmet}" -ne 0 ]; then
+            echo >&2 "Refusing to enable auto-merge: the live main ruleset does not yet enforce the full policy check set with require-conversation-resolution."
+            exit 1
+          fi
+
       - name: Enable exact-head auto-merge for patch & minor updates
         shell: bash
         run: |

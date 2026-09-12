@@ -1,0 +1,1 @@
+{"data": {"repository": {"pullRequest": {"headRefOid": "1111111111111111111111111111111111111111", "reviewThreads": {"pageInfo": {"hasNextPage": false, "endCursor": "c1"}, "nodes": []}}}}, "errors": [{"type": "INTERNAL_SERVER_ERROR", "message": "stub injected GraphQL error beside a valid head"}]}
