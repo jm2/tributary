@@ -401,3 +401,105 @@ fn mid_copy_cancellation_rolls_back_prior_stages() {
     );
     assert_eq!(entry_names(destination_root.path()), Vec::<String>::new());
 }
+
+/// A progress sink that makes the destination root non-writable when a
+/// given stage completes, so the successful transfer's backup disposal
+/// fails with an ordinary permission error (the tombstone-based discard
+/// cannot create its private leaf).
+struct MakeDestinationReadOnlyAtStageCompletion {
+    destination_root: PathBuf,
+    at_stage: u32,
+}
+impl TransferProgress for MakeDestinationReadOnlyAtStageCompletion {
+    fn on_stage_completed(
+        &mut self,
+        _stage: &Stage,
+        index: u32,
+        _total: u32,
+        _bytes_so_far: u64,
+        _total_bytes: u64,
+    ) {
+        if index == self.at_stage {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                std::fs::set_permissions(
+                    &self.destination_root,
+                    std::fs::Permissions::from_mode(0o555),
+                )
+                .expect("make destination root non-writable");
+            }
+        }
+    }
+}
+
+/// An ORDINARY disposal failure after a fully-committed transfer must not
+/// fail the run: cleanup is best-effort about ordinary errors — a leftover
+/// hidden backup merely occupies space and stays restorable — and only the
+/// identity refusal may fail a transfer whose bytes are already published.
+/// The historical code surfaced any disposal error as `RollbackFailed`,
+/// reporting a fully-landed transfer as failed and inviting
+/// duplicate-output retries.
+#[test]
+#[cfg(unix)]
+fn ordinary_disposal_failure_leaves_a_committed_transfer_successful() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    write_source_file(source_root.path(), "one.flac", b"new one");
+    write_source_file(source_root.path(), "two.flac", b"new two");
+    std::fs::write(destination_root.path().join("one.flac"), b"old one")
+        .expect("write existing original");
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = transfer_request(
+        source,
+        destination,
+        vec![
+            TransferItem::same(PathBuf::from("one.flac")),
+            TransferItem::same(PathBuf::from("two.flac")),
+        ],
+        ConflictPolicy::Overwrite,
+    );
+    let plan = TransferPlanner::new().plan(&request).expect("plan");
+
+    let mut progress = MakeDestinationReadOnlyAtStageCompletion {
+        destination_root: destination_root.path().to_path_buf(),
+        at_stage: 1,
+    };
+    let observer = CancellationObserver::never_cancelled();
+    let summary = TransferExecutor::new(request, plan)
+        .run(&mut progress, &observer)
+        .expect("an ordinary disposal failure must not fail a fully-committed transfer");
+    assert!(summary.completed, "the transfer must report completion");
+
+    // The published bytes are intact and the hidden backup survives the
+    // failed (best-effort) disposal.
+    assert_eq!(
+        std::fs::read(destination_root.path().join("one.flac")).expect("read published one"),
+        b"new one"
+    );
+    assert_eq!(
+        std::fs::read(destination_root.path().join("two.flac")).expect("read published two"),
+        b"new two"
+    );
+    let survivors = entry_names(destination_root.path());
+    let backups: Vec<_> = survivors
+        .iter()
+        .filter(|name| name.starts_with(".tributary-backup-"))
+        .collect();
+    assert_eq!(backups.len(), 1, "the backup must remain: {survivors:?}");
+    assert_eq!(
+        std::fs::read(destination_root.path().join(backups[0])).expect("read retained backup"),
+        b"old one",
+        "the retained backup must still hold the replaced original"
+    );
+
+    std::fs::set_permissions(
+        destination_root.path(),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("restore destination permissions for cleanup");
+}
