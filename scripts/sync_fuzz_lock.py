@@ -399,9 +399,13 @@ def unification_replacements(
     repaired lock leaves exactly one same-name record, cargo resolved every
     requirer of the name onto it, so the observed exact rebind was
     requirement-forced rather than arbitrary; a stable-major survivor with
-    a fully numeric release is therefore admitted as a replacement (0.x
-    minor and 0.0.x patch boundaries stay fail-closed — cross-boundary
-    movement on those axes is operator-policy territory). Every guard below
+    a fully numeric release is therefore admitted as a replacement. The
+    survivor must itself be a stable major: absorbing an evacuated
+    stable-major family into a 0.x or 0.0.x record crosses the 0.x
+    compatibility boundary, and 0.x minor and 0.0.x patch boundaries stay
+    fail-closed — cross-boundary movement on those axes is
+    operator-policy territory whichever side of the boundary the move
+    starts from. Every guard below
     (exact after closure, freshly introduced, same source, and the observed
     exact edge rebind required by validate_bounded_package_changes) still
     applies to these replacements.
@@ -425,13 +429,20 @@ def unification_replacements(
         ):
             # Broad consumer requirements evacuated the removed identity's
             # compatibility family; consider the unique same-name survivor
-            # across families. Requiring exactly one fully numeric release
-            # keeps ambiguous or malformed survivors fail-closed.
+            # across families. Requiring exactly one stable-major, fully
+            # numeric release keeps ambiguous, malformed, and 0.x survivors
+            # fail-closed — substitution into 0.x territory crosses the
+            # same operator-policy boundary as the removed-family guard
+            # above, whichever side of the boundary the move starts from.
             survivors = sorted(
                 candidate
                 for candidate in after_records
                 if candidate[0] == identity[0]
-                and cargo_version_family(candidate[1]) is not None
+                and (
+                    candidate_family := cargo_version_family(candidate[1])
+                )
+                is not None
+                and candidate_family[0] > 0
             )
         if len(survivors) != 1:
             continue
