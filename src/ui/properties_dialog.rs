@@ -107,6 +107,20 @@ fn unique_save_targets(tracks: &[TrackInfo]) -> Vec<SaveTarget> {
     targets
 }
 
+/// Release-enforced gate on the ORIGINAL selection, before any
+/// deduplication: a row still carrying an unresolved removable identity is
+/// a caller wiring fault — the context menu resolves every pending identity
+/// through its exact live session before the dialog may open. A pending
+/// row has no deduplication identity, so dedup alone would silently drop
+/// that row's edit and report success over a partial write set; the check
+/// therefore runs on the original selection, where the whole dialog
+/// refuses instead.
+fn selection_has_unresolved_removable(tracks: &[TrackInfo]) -> bool {
+    tracks
+        .iter()
+        .any(|track| matches!(track.target, SaveTarget::PendingRemovable(_)))
+}
+
 /// Information about a track passed into the dialog.
 #[derive(Debug, Clone)]
 pub struct TrackInfo {
@@ -365,6 +379,27 @@ pub fn show_properties_dialog(
         return;
     }
 
+    // Fail closed on the original selection, before any deduplication: an
+    // unresolved removable identity is a caller wiring fault, and dedup
+    // cannot see such a row — the fault would silently shrink the write
+    // set. This gate is release-enforced (not a debug assertion): the
+    // dialog never opens and the refusal is surfaced, while
+    // `preflight_save_targets`' pending refusal stays as the layered
+    // defense behind it.
+    if selection_has_unresolved_removable(tracks) {
+        tracing::warn!(
+            selection = tracks.len(),
+            "properties dialog refused: selection still carries an unresolved removable identity (caller wiring fault)"
+        );
+        let refusal = adw::AlertDialog::builder()
+            .heading("Cannot Edit These Files")
+            .body(TagEditingAvailability::Unavailable.message(automatic_device))
+            .build();
+        refusal.add_response("ok", "OK");
+        refusal.present(Some(parent));
+        return;
+    }
+
     let is_batch = tracks.len() > 1;
     let heading = if is_batch {
         format!("Properties — {} tracks", tracks.len())
@@ -412,14 +447,10 @@ pub fn show_properties_dialog(
 
     // Repeated playlist rows may refer to the same file or the same
     // removable identity. Probe and write each exact save target once while
-    // retaining every selected row for batch-field presentation.
+    // retaining every selected row for batch-field presentation. Unresolved
+    // removable identities were refused above, on the original selection,
+    // before this deduplication could silently drop one.
     let save_targets = unique_save_targets(tracks);
-    debug_assert!(
-        !tracks
-            .iter()
-            .any(|track| matches!(track.target, SaveTarget::PendingRemovable(_))),
-        "the caller must resolve removable identities before showing the dialog"
-    );
 
     // ── Helper to compute initial value for a field ──────────────────
     let field_value = |getter: fn(&TrackInfo) -> &str| -> String {
@@ -1215,19 +1246,40 @@ mod tests {
         let local = PathBuf::from("/music/album/song.flac");
         let tracks = vec![
             track(SaveTarget::PendingRemovable(pending.clone())),
-            track(SaveTarget::PendingRemovable(pending)),
+            track(SaveTarget::PendingRemovable(pending.clone())),
             local_track(local.clone()),
         ];
 
-        // A pending identity has no deduplication identity: it is skipped
-        // entirely rather than silently folded into another row's target.
+        // Fail closed on the ORIGINAL selection, before any deduplication:
+        // an unresolved removable identity is a caller wiring fault, so the
+        // dialog refuses entirely instead of opening with a partial write
+        // set — in release builds too, not behind a debug assertion.
+        assert!(selection_has_unresolved_removable(&tracks));
+
+        // The reason the gate must precede dedup: a pending value has no
+        // deduplication identity, so dedup alone would silently drop the
+        // row rather than refuse it.
+        let keyed = save_target_key(&SaveTarget::PendingRemovable(pending));
+        assert!(keyed.is_none());
+
+        // A fully resolved selection passes the gate, and deduplication
+        // keeps its exact semantics for identities that carry one.
+        let resolved = vec![
+            local_track(local.clone()),
+            local_track(local.clone()),
+            local_track(local),
+        ];
+        assert!(!selection_has_unresolved_removable(&resolved));
         assert_eq!(
-            unique_save_targets(&tracks),
-            vec![SaveTarget::LocalPath(local)]
+            unique_save_targets(&resolved),
+            vec![SaveTarget::LocalPath(PathBuf::from(
+                "/music/album/song.flac"
+            ))]
         );
 
-        // Defense in depth: the preflight refuses any unresolved identity
-        // that reaches it, so a wiring fault can never authorize a write.
+        // Defense in depth: the preflight still refuses any unresolved
+        // identity that reaches it directly, so a wiring fault can never
+        // authorize a write even past the entry-point gate.
         assert_eq!(
             preflight_save_targets(&[SaveTarget::PendingRemovable(PendingRemovableMutation {
                 source_id: crate::architecture::SourceId::local(),
@@ -1236,6 +1288,28 @@ mod tests {
             })]),
             TagEditingAvailability::Unavailable
         );
+    }
+
+    #[test]
+    fn a_mixed_selection_with_one_pending_identity_is_refused_in_release() {
+        // The release shape of the wiring fault: one local row plus one
+        // unresolved removable identity. Dedup alone would cover only the
+        // local row and report success while losing the pending edit — so
+        // the release-enforced entry-point gate fires on the original
+        // selection first and the whole dialog refuses; no partial write
+        // set is ever built.
+        let pending = PendingRemovableMutation {
+            source_id: crate::architecture::SourceId::local(),
+            session_epoch: 7,
+            track_id: crate::architecture::TrackId::new("unix:6d69786564").expect("track id"),
+        };
+        let local = PathBuf::from("/music/album/song.flac");
+        let tracks = vec![
+            local_track(local),
+            track(SaveTarget::PendingRemovable(pending)),
+        ];
+
+        assert!(selection_has_unresolved_removable(&tracks));
     }
 
     #[test]
