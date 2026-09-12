@@ -134,14 +134,15 @@ impl TransferExecutor {
                                 .to_string(),
                         });
                     }
-                    Err(error) => {
-                        return Err(TransferError::RollbackFailed {
-                            path: backup_relative_path.clone(),
-                            context: format!(
-                                "the saved overwrite backup could not be discarded: {error}"
-                            ),
-                        });
-                    }
+                    // An ORDINARY disposal failure is best-effort, exactly
+                    // as this method's contract states: the transfer's
+                    // bytes are already published, so a leftover hidden
+                    // backup merely occupies space and stays restorable.
+                    // Failing a fully-committed transfer for a transient
+                    // sharing violation or filesystem hiccup would invite
+                    // duplicate-output retries — only the identity refusal
+                    // above may fail the completed run.
+                    Err(_) => {}
                 }
             }
         }
