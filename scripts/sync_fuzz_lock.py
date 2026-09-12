@@ -282,25 +282,22 @@ def resolved_dependency_edges(
 def valid_semver_build_metadata(build: str) -> bool:
     """
     True when build metadata is well-formed SemVer: dot-separated
-    identifiers of ASCII alphanumerics and hyphens, where numeric
-    identifiers forbid leading zeros. Content is irrelevant to cargo's
-    compatibility rules — validity only separates cargo-writable records
-    (real locks hold 1.1.5+spec-1.1.0 and 1.0.4+wasi-0.2.12) from
-    malformed input, which stays fail-closed.
+    identifiers of ASCII alphanumerics and hyphens. Numeric build
+    identifiers MAY carry leading zeros — SemVer 2.0.0 restricts leading
+    zeros to numeric prerelease identifiers, and cargo accepts and
+    re-emits records like 1.0.0+01 and 1.0.0+zlib.01. Content is
+    irrelevant to cargo's compatibility rules — validity only separates
+    cargo-writable records (real locks hold 1.1.5+spec-1.1.0 and
+    1.0.4+wasi-0.2.12) from malformed input, which stays fail-closed.
     """
     identifiers = build.split(".")
-    if not all(
+    return all(
         identifier
         and identifier.isascii()
         and all(
             character.isalnum() or character == "-"
             for character in identifier
         )
-        for identifier in identifiers
-    ):
-        return False
-    return not any(
-        len(identifier) > 1 and identifier.isdigit() and identifier.startswith("0")
         for identifier in identifiers
     )
 

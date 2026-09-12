@@ -1408,18 +1408,62 @@ class FuzzLockPolicyTests(unittest.TestCase):
             )
         )
 
+    def test_compat_family_accepts_leading_zero_build_metadata(self):
+        # SemVer 2.0.0 forbids leading zeros only in numeric PRERELEASE
+        # identifiers; build metadata identifiers are just [0-9A-Za-z-]
+        # and may carry leading zeros ("1.0.0+01", "1.0.0+zlib.01").
+        # Cargo accepts and re-emits such versions (verified with cargo
+        # 1.95: version = "1.0.0+01" lands verbatim in Cargo.lock), so a
+        # leading-zero record must keep its family — rejecting it would
+        # fail the bounded-change check on valid Cargo-generated output.
+        self.assertTrue(
+            sync_fuzz_lock.same_semver_compat_family(
+                "1.0.0+zlib.01", "1.0.5"
+            )
+        )
+        self.assertTrue(
+            sync_fuzz_lock.same_semver_compat_family(
+                "1.0.0+01", "1.0.5"
+            )
+        )
+        self.assertTrue(
+            sync_fuzz_lock.same_semver_compat_family(
+                "1.0.0+007", "1.0.0+zlib.01"
+            )
+        )
+        # Metadata validity never relaxes the compatibility axes: the
+        # 0.x minor axis, the 0.0.x patch axis, and the major axis all
+        # stay enforced on leading-zero-metadata records.
+        self.assertFalse(
+            sync_fuzz_lock.same_semver_compat_family(
+                "0.1.0+01", "0.2.0"
+            )
+        )
+        self.assertFalse(
+            sync_fuzz_lock.same_semver_compat_family(
+                "0.0.1+zlib.01", "0.0.2"
+            )
+        )
+        self.assertFalse(
+            sync_fuzz_lock.same_semver_compat_family(
+                "1.0.0+zlib.01", "2.0.0"
+            )
+        )
+
     def test_compat_family_rejects_malformed_build_metadata(self):
         # Only well-formed metadata is stripped: empty or empty identifiers
         # ("1.0.0+", "1.0.0+z..lib"), a duplicated "+" separator, non-ASCII
-        # or non-identifier characters, and numeric identifiers with
-        # semver-forbidden leading zeros are malformed input that must
+        # or non-identifier characters are malformed input that must
         # never compare equal to a valid version. A prerelease suffix
         # stays malformed even behind a valid build metadata segment.
+        # Leading zeros in numeric build identifiers are NOT malformed:
+        # SemVer 2.0.0 restricts leading zeros to prerelease numerics, and
+        # cargo accepts such records — see
+        # test_compat_family_accepts_leading_zero_build_metadata.
         for malformed in (
             "1.0.0+",
             "1.0.0+z..lib",
             "1.0.0+zlib+more",
-            "1.0.0+zlib.01",
             "1.0.0+ä",
             "1.2.3-rc.1+build",
         ):
