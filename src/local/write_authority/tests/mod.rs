@@ -4,6 +4,7 @@
 mod creation;
 mod publish;
 mod replace_windows;
+mod restore_windows;
 mod reversal;
 mod staged_lifecycle;
 

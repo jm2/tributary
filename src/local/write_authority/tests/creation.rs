@@ -72,3 +72,71 @@ fn adopted_directory_is_never_reported_as_created() {
         b"foreign"
     );
 }
+
+/// A non-writable destination root holding an existing writable `album`
+/// must not fail creating `album/inner`: the walk adopts the existing
+/// component BEFORE any private-name creation, and creating inside `album`
+/// needs write permission only on `album`. The historical create-first
+/// discipline attempted a private leaf in the non-writable root and failed
+/// the whole walk with `PermissionDenied` for a layout that never needed
+/// root write access.
+#[test]
+#[cfg(unix)]
+fn existing_component_under_non_writable_root_is_adopted_before_creation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("temporary root");
+    let authority = authority(&root);
+    std::fs::create_dir(root.path().join("album")).expect("pre-create writable album");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o555))
+        .expect("make the root non-writable");
+
+    let result =
+        authority.create_relative_directory(Path::new("album/inner"), ConflictPolicy::Preserve);
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("restore root permissions for cleanup");
+
+    let (directory, created) =
+        result.expect("creating album/inner must succeed without write access on the root");
+    assert_eq!(directory.relative_path(), Path::new("album/inner"));
+    assert_eq!(
+        created.len(),
+        1,
+        "only the genuinely absent component was created: {created:?}"
+    );
+    assert_eq!(created[0].relative_path, Path::new("album/inner"));
+    assert!(root.path().join("album/inner").is_dir());
+}
+
+/// A genuinely absent component under a non-writable root still fails
+/// closed: the adoption-first discipline opens existing components early,
+/// but it never papers over a missing component the caller's process
+/// cannot create.
+#[test]
+#[cfg(unix)]
+fn absent_component_under_non_writable_root_still_fails_closed() {
+    use std::io;
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("temporary root");
+    let authority = authority(&root);
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o555))
+        .expect("make the root non-writable");
+
+    let error = authority
+        .create_relative_directory(Path::new("album"), ConflictPolicy::Preserve)
+        .err()
+        .expect("a genuinely absent component under a non-writable root must fail closed");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("restore root permissions for cleanup");
+
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied,
+        "the failure must be the underlying permission error: {error}"
+    );
+    assert!(
+        !root.path().join("album").exists(),
+        "nothing may be created in the non-writable root"
+    );
+}
