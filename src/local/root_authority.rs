@@ -1591,6 +1591,29 @@ impl MountedRootAuthority {
             file: Mutex::new(bound),
         })
     }
+
+    /// Verify that one walked directory still sits on this authority's
+    /// mount boundary. Planning walks the source tree by pathname, where a
+    /// same-device Linux bind mount is invisible (`st_dev` equality), while
+    /// execution opens every file through per-component boundary checks
+    /// (the mount ID on Linux) — so a nested mount would be staged, counted,
+    /// and budgeted by the planner and only refused mid-run, after earlier
+    /// stages had already committed. The planner runs this check on every
+    /// walked directory BEFORE staging anything beneath it and rejects the
+    /// whole plan with the nested mount path named when the boundary
+    /// differs ([`CrossedMountBoundary`]). The directory is opened
+    /// no-follow, and the comparison uses the same boundary identity the
+    /// executor enforces.
+    pub(crate) fn validate_walked_directory_boundary(&self, directory: &Path) -> io::Result<()> {
+        let opened = open_walked_directory(directory)?;
+        if boundary_identity(&opened)? == self.boundary {
+            Ok(())
+        } else {
+            Err(io::Error::other(CrossedMountBoundary {
+                path: directory.to_path_buf(),
+            }))
+        }
+    }
 }
 
 /// Typed retained authority to atomically replace one exact regular file
@@ -2863,6 +2886,49 @@ fn validate_mounted_bound(authority: &MountedRootAuthority, bound: &BoundFile) -
     bound.object.validate_live()?;
     validate_retained_objects(&bound.parent_guards)?;
     authority.validate()
+}
+
+/// Error payload for a walked source directory that sits on a mount
+/// boundary other than the source authority's own: a same-device Linux
+/// bind mount is invisible to the planning walk's `st_dev` comparison but
+/// is refused by the executor's per-component mount-ID checks, so planning
+/// rejects the whole plan up front instead of staging a transfer that can
+/// only fail mid-run. Surfaced through an [`io::Error`] payload so it
+/// travels every `?` on the planning path; the transfer planner downcasts
+/// to it and folds it into the typed plan rejection naming the nested
+/// mount path.
+#[derive(Debug)]
+pub(crate) struct CrossedMountBoundary {
+    /// The walked directory whose boundary differs from the authority's.
+    pub(crate) path: PathBuf,
+}
+
+impl fmt::Display for CrossedMountBoundary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "source directory {} sits on a nested mount outside the \
+             retained authority's boundary",
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for CrossedMountBoundary {}
+
+#[cfg(unix)]
+fn open_walked_directory(directory: &Path) -> io::Result<File> {
+    open_unix_directory_path(directory)
+}
+
+#[cfg(windows)]
+fn open_walked_directory(directory: &Path) -> io::Result<File> {
+    open_windows_directory(directory, false, false).map(|opened| opened.target)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_walked_directory(_directory: &Path) -> io::Result<File> {
+    Err(unsupported_platform())
 }
 
 impl RootAuthorityLease {
@@ -5623,7 +5689,16 @@ fn hard_link_bind_and_replace(
 /// Windows Overwrite publish loop. See the Unix [`replace_publish_loop`]
 /// for the contract; the operations are absolute-path based after the
 /// caller revalidated and pinned the retained parent, mirroring the
-/// established Windows publish discipline. Each attempt binds the current
+/// established Windows publish discipline. The published-leaf identity is
+/// the staged object's identity, captured from the staged leaf BEFORE any
+/// publish attempt (see
+/// [`MountedRootAuthority::publish_within_directory`]): the staged
+/// object is constant across rebind attempts and the identity's
+/// creation-sensitive fields are immutable across a rename. A failed
+/// capture fails the publish before anything lands rather than recording
+/// a post-publish lookup of the destination pathname.
+///
+/// Each attempt binds the current
 /// occupant through an object-coupled handle primitive (see
 /// [`hard_link_bind_and_replace`]); when a completed bind's publish
 /// collides with an interposer, the binding is RETAINED — the displaced
@@ -5659,6 +5734,21 @@ fn replace_publish_loop(
     let mut current = (backup_leaf.to_os_string(), backup_relative.to_path_buf());
     let mut first_binding: Option<(PathBuf, LeafIdentity)> = None;
     let mut superseded: Vec<(PathBuf, LeafIdentity)> = Vec::new();
+    // Bind the published-leaf identity to the staged object BEFORE any
+    // publish (see the doc comment above and [`Self::publish_within_directory`]
+    // for the rationale): the staged object is constant across rebind
+    // attempts, and a POST-publish lookup of the destination pathname would
+    // instead record an interposer's identity as the transfer's publication —
+    // letting the identity-coupled rollback destroy foreign data — while a
+    // degraded `None` record would reverse by pathname alone. Nothing has
+    // landed before the loop, so a failed capture fails the publish outright
+    // instead of recording either.
+    let staged_identity = leaf_identity_at_path(from_absolute)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "the staged leaf vanished before the replace publish; its identity cannot be captured",
+        )
+    })?;
     for _ in 0..REPLACE_BIND_ATTEMPTS {
         // Type the occupant no-follow first: a directory is refused with
         // the typed error, and a present non-directory is bound through a
@@ -5706,7 +5796,10 @@ fn replace_publish_loop(
                                     &stale_leaf,
                                 );
                             }
-                            let published_leaf = leaf_identity_at_path(to_absolute).ok().flatten();
+                            // The publication is the staged object captured
+                            // before the loop; the destination pathname is
+                            // never re-resolved for identity.
+                            let published_leaf = Some(staged_identity);
                             let bound =
                                 first_binding.map(|(relative_path, leaf)| BoundOccupantBackup {
                                     relative_path,
@@ -5749,7 +5842,10 @@ fn replace_publish_loop(
                                 &stale_leaf,
                             );
                         }
-                        let published_leaf = leaf_identity_at_path(to_absolute).ok().flatten();
+                        // The publication is the staged object captured
+                        // before the loop; the destination pathname is
+                        // never re-resolved for identity.
+                        let published_leaf = Some(staged_identity);
                         let replaced = first_binding.is_some();
                         let bound =
                             first_binding.map(|(relative_path, leaf)| BoundOccupantBackup {
@@ -5782,16 +5878,71 @@ fn replace_publish_loop(
 
 /// Dispose one superseded rebind backup with identity-verified deletion:
 /// the private name must still hold the object its completed bind backed
-/// up — a swapped name is left untouched, never deleted. Best-effort: a
-/// disposal that cannot run leaves the backup in place rather than failing
-/// a publish that already landed.
+/// up — a swapped name is left untouched, never deleted. The verification
+/// and the disposal are coupled through ONE delete-capable handle: the
+/// identity is read through the handle and the deletion is requested
+/// through that same handle ([`request_object_deletion`]), so the path is
+/// never re-resolved between the check and the removal and a concurrent
+/// writer that swaps the private name in that window cannot make the
+/// disposal delete the foreign replacement (the module's established
+/// handle-coupling discipline; see [`hard_link_bind_and_replace`]).
+/// Best-effort: an open, verification, or disposal failure leaves the
+/// backup in place rather than failing a publish that already landed.
 #[cfg(windows)]
 fn dispose_superseded_binding_windows(backup_absolute: &Path, bound_leaf: &LeafIdentity) {
-    if let Ok(Some(current)) = leaf_identity_at_path(backup_absolute) {
-        if current.same_object(bound_leaf) {
-            let _ = std::fs::remove_file(backup_absolute);
-        }
+    use std::mem::MaybeUninit;
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let mut wide: Vec<u16> = backup_absolute.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path valid for the call;
+    // every other argument is null or a constant. `OPEN_REPARSE_POINT`
+    // keeps a symlink leaf from resolving to its target.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            DELETE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        // The backup is absent, pinned, or otherwise unopenable:
+        // best-effort leaves it in place.
+        return;
     }
+    // Verify the object through the handle, then request the deletion
+    // through the SAME handle: both couple to the object the handle
+    // names, never to the path.
+    let mut verified = false;
+    let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: `handle` is live and `info` is a correctly sized, aligned
+    // output buffer that the API fully initializes on success.
+    let filled = unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) };
+    if filled != 0 {
+        // SAFETY: the successful call above initialized the complete structure.
+        let info = unsafe { info.assume_init() };
+        verified = leaf_identity_from_handle_info(&info).same_object(bound_leaf);
+    }
+    if verified {
+        // An equally best-effort disposal: the deletion commits at close
+        // when the object is not pinned, and any failure leaves the
+        // backup in place.
+        let _ = request_object_deletion(handle);
+    }
+    // SAFETY: `handle` was created above and is closed exactly once on
+    // every path. A requested deletion commits at this close.
+    unsafe { CloseHandle(handle) };
 }
 
 /// Error payload for a Windows replace publish that exhausted its rebind
