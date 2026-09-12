@@ -5277,7 +5277,7 @@ fn replace_verified_publication_windows(
         ));
         match std::fs::hard_link(destination_absolute, &tombstone) {
             Ok(()) => break,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
     }
@@ -5968,9 +5968,8 @@ fn create_directory_tree_by_path(
         // Adopt an existing component before creating anything — see
         // `open_existing_component`. Only an observed-absent component
         // falls through to the private-creation path below.
-        match open_existing_component(&path)? {
-            Some(()) => continue,
-            None => {}
+        if open_existing_component(&path)?.is_some() {
+            continue;
         }
         let parent_dir = path
             .parent()

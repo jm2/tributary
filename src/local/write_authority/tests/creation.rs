@@ -118,6 +118,13 @@ fn absent_component_under_non_writable_root_still_fails_closed() {
     use std::io;
     use std::os::unix::fs::PermissionsExt;
 
+    if !super::process_respects_permission_bits() {
+        // Root bypasses the read-only root below, so creating the absent
+        // component legitimately succeeds; the premise (creating inside a
+        // root the process cannot write) is untestable as root.
+        return;
+    }
+
     let root = tempfile::tempdir().expect("temporary root");
     let authority = authority(&root);
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o555))
