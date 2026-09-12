@@ -227,3 +227,92 @@ fn absolute_path_in_request_is_rejected() {
         .expect_err("absolute path must be rejected");
     assert!(matches!(error, TransferError::InvalidItemPath { .. }));
 }
+
+/// Lazily unmounts the path when dropped, so a failing assertion cannot
+/// leak the bind mount registered by the regression below.
+#[cfg(target_os = "linux")]
+struct LazyUnmount(std::path::PathBuf);
+
+#[cfg(target_os = "linux")]
+impl Drop for LazyUnmount {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("umount")
+            .arg("-l")
+            .arg(&self.0)
+            .status();
+    }
+}
+
+/// The planning-time boundary probe must accept every directory of a
+/// normal (non-mount) tree: only an actual boundary crossing may reject,
+/// so non-mount staging and accounting are unchanged. Deterministic on
+/// every platform, unlike the bind-mount regression below.
+#[test]
+fn walked_directory_boundary_accepts_normal_nested_directories() {
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    write_source_file(source_root.path(), "album/nested/a.flac", b"a");
+    let source = read_authority(source_root.path());
+    source
+        .validate_walked_directory_boundary(&source_root.path().join("album"))
+        .expect("the walked root directory shares the source boundary");
+    source
+        .validate_walked_directory_boundary(&source_root.path().join("album/nested"))
+        .expect("nested non-mount directories share the source boundary");
+}
+
+/// A source subtree containing a nested bind mount must be rejected AT
+/// PLANNING TIME with the nested mount path named — never mid-execution,
+/// after earlier stages had already committed. The walk's `st_dev`
+/// comparison cannot see the bind mount (same device), so without the
+/// planner's per-directory boundary check the nested-mount file would be
+/// staged, counted into the totals, and then refused by the executor's
+/// per-component mount-ID checks. Requires the privilege to create a bind
+/// mount; skips when the environment cannot provide it.
+#[cfg(target_os = "linux")]
+#[test]
+fn nested_bind_mount_is_rejected_at_planning_time() {
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    write_source_file(source_root.path(), "album/a.flac", b"a");
+    write_source_file(source_root.path(), "mounted-src/nested.flac", b"nested");
+    std::fs::create_dir(source_root.path().join("album/mnt")).expect("create bind target");
+
+    // Bind `mounted-src` onto `album/mnt`. Both sit under the walk root on
+    // the same device, so `same_file_system(true)` descends into the mount
+    // — exactly the case the planning-time boundary check must catch.
+    let mounted = std::process::Command::new("mount")
+        .arg("--bind")
+        .arg(source_root.path().join("mounted-src"))
+        .arg(source_root.path().join("album/mnt"))
+        .status()
+        .is_ok_and(|status| status.success());
+    if !mounted {
+        eprintln!("skipping: bind mount unavailable in this environment");
+        return;
+    }
+    let _unmount = LazyUnmount(source_root.path().join("album/mnt"));
+
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = plan_request(
+        source,
+        destination,
+        vec![TransferItem::new(
+            PathBuf::from("album"),
+            PathBuf::from("imported"),
+        )],
+        ConflictPolicy::Preserve,
+        None,
+    );
+    let error = TransferPlanner::new()
+        .plan(&request)
+        .expect_err("a nested bind mount must be rejected at planning time");
+    let TransferError::NestedMountBoundary { path } = error else {
+        panic!("expected NestedMountBoundary, got {error:?}");
+    };
+    assert_eq!(
+        path,
+        source_root.path().join("album/mnt"),
+        "the typed error must name the nested mount path"
+    );
+}
