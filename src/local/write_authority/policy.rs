@@ -89,12 +89,16 @@ pub enum CommitError {
     /// to its destination and nothing was changed there.
     #[error(transparent)]
     Io(#[from] io::Error),
-    /// The publish DID happen — the staged bytes were renamed to the
-    /// destination — but the post-publish mount revalidation failed. The
-    /// outcome is carried so the caller can record the publication for
-    /// rollback before surfacing the failure: dropping it would leave
-    /// committed bytes unrecorded, so a failed transfer could never undo
-    /// them.
+    /// The publish reached a state the caller MUST record before the
+    /// failure surfaces. Either the staged bytes WERE renamed to the
+    /// destination but a post-publish verification failed — dropping the
+    /// outcome would leave committed bytes unrecorded, so a failed
+    /// transfer could never undo them — or a Windows replace publish
+    /// exhausted its rebind bound with a completed binding retained:
+    /// nothing landed, but the displaced original survives at its verified
+    /// backup and the outcome carries it so the caller records the
+    /// replacement for rollback or disposal instead of stranding a hidden
+    /// orphan.
     #[error("staged file was published but post-publish verification failed: {error}")]
     PublishVerification {
         /// What was published, including the backup bind of a replaced

@@ -20,9 +20,12 @@ use crate::local::root_authority::{
     BoundOccupantBackup, LandedPublish, LeafIdentity, MountedRootAuthority, RetainedWriteParent,
 };
 // The displaced-occupant marker exists only where the atomic exchange does
-// (Unix; see `root_authority::RestoreFailure`). The Windows replace loop
-// re-binds on verification mismatch and fails with an ordinary I/O error,
-// so the commit-time downcast below is gated with it.
+// (Unix; see `root_authority::RestoreFailure`), and the exhausted-rebind
+// marker only on Windows (see `root_authority::ExhaustedRebindBackup`):
+// both carry state a plain I/O error would strand, so the commit-time
+// downcasts below are gated per platform.
+#[cfg(windows)]
+use crate::local::root_authority::ExhaustedRebindBackup;
 #[cfg(unix)]
 use crate::local::root_authority::RestoreFailure;
 
@@ -152,14 +155,19 @@ impl PreparedWriteTarget {
     /// swap or remount between staging and commit cannot authorise a
     /// partial publish.
     ///
-    /// Errors are typed: [`CommitError::Io`] means nothing was published,
-    /// while [`CommitError::PublishVerification`] means the staged bytes
-    /// WERE published but a post-publish verification failed — either the
-    /// retained-parent revalidation reported by the publish step itself or
-    /// the trailing authority revalidation here. The verification variant
-    /// carries the [`CommitOutcome`] so the caller can record the
-    /// publication for rollback before surfacing the failure — a committed
-    /// file whose outcome is dropped can never be undone.
+    /// Errors are typed: [`CommitError::Io`] means nothing was published
+    /// and nothing was displaced, while
+    /// [`CommitError::PublishVerification`] means the destination's state
+    /// changed and MUST be recorded before the failure surfaces — either
+    /// the staged bytes WERE published but a post-publish verification
+    /// failed (the retained-parent revalidation reported by the publish
+    /// step itself, or the trailing authority revalidation here), or a
+    /// Windows replace publish exhausted its rebind bound with a completed
+    /// binding retained: nothing landed, but the displaced original
+    /// survives at its verified backup and the outcome carries it so the
+    /// caller records the replacement for rollback. A committed or
+    /// displaced state dropped as a plain I/O error can never be undone or
+    /// disposed.
     // The verified-publication payload grew by the replaced occupant's
     // bind-time identity: the rollback couples the retained backup to that
     // exact object, and boxing the payload to appease the size lint would
@@ -267,6 +275,28 @@ impl PreparedWriteTarget {
         ) {
             Ok((replaced, landed, backup)) => Ok((backup.filter(|_| replaced), landed)),
             Err(error) => {
+                // Windows: an exhausted rebind bound with a completed
+                // binding retained published nothing, but the displaced
+                // original survives at its verified backup — carried by the
+                // error payload. Fold it into a verified-publication
+                // failure carrying the outcome so the caller records the
+                // replacement for rollback; surfacing it as a plain I/O
+                // error would strand the backup as an unrecorded hidden
+                // orphan.
+                #[cfg(windows)]
+                if let Some(exhausted) = error
+                    .get_ref()
+                    .and_then(|payload| payload.downcast_ref::<ExhaustedRebindBackup>())
+                {
+                    let outcome = CommitOutcome {
+                        relative_path: self.final_relative_path.clone(),
+                        resolution: self.resolution,
+                        replaced_original: Some(exhausted.backup_relative.clone()),
+                        replaced_original_leaf: Some(exhausted.backup_leaf),
+                        published_leaf: None,
+                    };
+                    return Err(CommitError::PublishVerification { outcome, error });
+                }
                 #[cfg(not(unix))]
                 return Err(CommitError::from(error));
                 #[cfg(unix)]
@@ -299,8 +329,9 @@ impl PreparedWriteTarget {
     ///
     /// Unix only: the atomic exchange — and so the landed-but-unrestorable
     /// displaced occupant — exists only on platforms with a swap primitive.
-    /// The Windows replace loop surfaces an ordinary I/O error, so there is
-    /// nothing to downcast.
+    /// The Windows exhausted-rebind disposition is downcast in
+    /// [`Self::publish_by_replace`] instead: nothing was published there,
+    /// but a completed binding's retained backup travels with the error.
     #[cfg(unix)]
     fn map_replace_failure(&self, error: io::Error, backup_relative: PathBuf) -> CommitError {
         let displaced = error

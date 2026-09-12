@@ -1005,73 +1005,19 @@ impl MountedRootAuthority {
         })
     }
 
-    /// Rename one leaf to another leaf inside the retained write parent,
-    /// enforcing the trailing retained-parent revalidation.
-    ///
-    /// On Unix the rename is issued relative to the retained parent handle,
-    /// so a parent or mount replacement between validation and publish
-    /// cannot redirect it: the rename lands in the exact audited directory
-    /// object or fails. When `no_replace` is set the publication fails if
-    /// the final leaf already exists; the platform-native no-replace rename
-    /// is tried first, then a link-based publish, and filesystems offering
-    /// neither primitive fail closed with `Unsupported` — see
-    /// [`Self::rename_no_replace_within`]. On Windows the no-replace publish
-    /// mirrors that cascade with safe path operations — a hard-link publish,
-    /// then the same fail-closed refusal — and the retained parent identity
-    /// is revalidated immediately before and after.
-    ///
-    /// On success the no-follow identity of the published leaf is bound to
-    /// the staged object immediately BEFORE the rename: `rename` preserves
-    /// the object it moves, so the identity the staged leaf had in the
-    /// instant before the publish is exactly the identity the destination
-    /// leaf has in the instant after — even if a concurrent writer replaces
-    /// the destination name later. A post-rename pathname lookup would
-    /// instead report whatever replaced the publication in that window (or
-    /// `None` for a leaf it watched vanish), so reversal would refuse or
-    /// destroy the wrong object. Capture is best-effort: an identity that
-    /// cannot be read before the rename reports `Ok(None)` and the reversal
-    /// of that record degrades to the legacy path-only behavior.
-    ///
-    /// The trailing revalidation is ENFORCED here: callers for which a
-    /// landed rename must never be mistaken for a failure (the forward
-    /// publish) use [`Self::publish_within_directory`] instead and handle
-    /// the reported revalidation themselves.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn rename_within_directory(
-        &self,
-        parent: &RetainedWriteParent,
-        from_leaf: &OsStr,
-        from_absolute: &Path,
-        to_leaf: &OsStr,
-        to_absolute: &Path,
-        no_replace: bool,
-    ) -> io::Result<Option<LeafIdentity>> {
-        let landed = self.publish_within_directory(
-            parent,
-            from_leaf,
-            from_absolute,
-            to_leaf,
-            to_absolute,
-            no_replace,
-        )?;
-        landed.post_validate?;
-        Ok(landed.published_leaf)
-    }
-
     /// Publish one leaf onto another inside the retained write parent,
     /// reporting — not enforcing — the trailing retained-parent
     /// revalidation.
     ///
-    /// The rename body is [`Self::rename_within_directory`]'s; the
-    /// difference is the failure discipline after the rename has landed. A
-    /// revalidation failure at that point is a verification failure about a
-    /// publication that already happened: enforcing it here would surface
-    /// an ordinary I/O error for bytes that are already at the destination,
-    /// and a caller that treated that error as "nothing was published"
-    /// would strand the published file — and, on an Overwrite commit, the
-    /// bound backup of the replaced original — with no rollback record.
-    /// The caller therefore receives [`LandedPublish`] and folds a failed
-    /// revalidation into its own verified-publication error path.
+    /// A revalidation failure after the rename has landed is a verification
+    /// failure about a publication that already happened: enforcing it here
+    /// would surface an ordinary I/O error for bytes that are already at
+    /// the destination, and a caller that treated that error as "nothing
+    /// was published" would strand the published file — and, on an
+    /// Overwrite commit, the bound backup of the replaced original — with
+    /// no rollback record. The caller therefore receives [`LandedPublish`]
+    /// and folds a failed revalidation into its own verified-publication
+    /// error path.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn publish_within_directory(
         &self,
@@ -1410,15 +1356,12 @@ impl MountedRootAuthority {
         }
         #[cfg(windows)]
         {
-            self.rename_within_directory(
-                &parent,
-                backup_leaf.as_os_str(),
-                self.root.join(backup_relative).as_path(),
-                destination_leaf.as_os_str(),
-                self.root.join(destination_relative).as_path(),
-                false,
-            )?;
-            Ok(ReversalOutcome::Reversed)
+            restore_backup_object_coupled_windows(
+                &self.root.join(backup_relative),
+                &self.root.join(destination_relative),
+                expected,
+                backup_leaf_identity,
+            )
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -4172,6 +4115,14 @@ fn create_private_directory_leaf(parent: &File) -> io::Result<OsString> {
 
 /// Walk one directory component beneath `current`, creating it when absent.
 ///
+/// An EXISTING component is adopted before anything is created: the walk
+/// first opens the component no-follow and returns its handle when present,
+/// so creating `<root>/<existing>/<new>` needs write permission only on
+/// `<existing>` — a non-writable root holding an existing writable
+/// component must not fail its walk with `PermissionDenied` from an
+/// attempted private-name creation in the root. Only a component observed
+/// ABSENT takes the creation path below.
+///
 /// A creation binds its product BEFORE the name is exposed: the component
 /// is first created under a private unguessable name, that private
 /// directory is opened no-follow, its identity is captured from that very
@@ -4200,7 +4151,6 @@ fn create_private_directory_leaf(parent: &File) -> io::Result<OsString> {
 fn ensure_directory_component(current: &File, component: &OsString) -> io::Result<(File, bool)> {
     use rustix::fs::{AtFlags, RenameFlags};
 
-    let private = create_private_directory_leaf(current)?;
     let open_no_follow = |parent: &File, name: &OsStr| -> io::Result<File> {
         rustix::fs::openat(
             parent,
@@ -4214,6 +4164,23 @@ fn ensure_directory_component(current: &File, component: &OsString) -> io::Resul
         .map_err(io::Error::from)
         .map(File::from)
     };
+    // Adopt an existing component first — see the contract above. Only the
+    // genuinely absent component falls through to the private-creation
+    // path, and a present non-directory occupant is refused with the typed
+    // error the historical behavior used.
+    match open_no_follow(current, component) {
+        Ok(opened) => return Ok((opened, false)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "intermediate path is not a directory",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+
+    let private = create_private_directory_leaf(current)?;
     let opened = match open_no_follow(current, &private) {
         Ok(opened) => opened,
         Err(error) => {
@@ -5085,10 +5052,400 @@ fn copy_bind_occupant_backup(
     }
 }
 
+/// Windows body of the backup restoration: object-coupled end to end,
+/// mirroring the discipline of the Unix exchange arm — nothing is ever
+/// replaced or destroyed unverified. Windows offers no atomic exchange
+/// primitive, so the restore is built from verified object operations:
+///
+/// 1. The backup is opened once through a delete-capable handle and its
+///    identity is read through that handle — never from a later path
+///    lookup — and verified change-instant-exact against the bind-time
+///    capture when one is recorded. The handle is held (without
+///    `FILE_SHARE_DELETE` in its share mode) while the restore runs, so
+///    the backup NAME cannot be swapped while the restore couples to it.
+/// 2. An occupied destination slot is re-verified immediately before the
+///    mutation and must name the exact recorded publication: the verified
+///    publication is first bound to a private tombstone link, then deleted
+///    through its own delete-capable handle — the destruction is bound to
+///    the verified object, never to the path — so the verified object can
+///    always be put back if a concurrent writer races into the vacated
+///    slot.
+/// 3. The backup object is installed into the vacated slot with no-replace
+///    semantics (a hard link from the pinned backup): a concurrent writer
+///    that raced into the slot is refused intact, and the tombstoned
+///    publication is restored to its slot before the refusal surfaces.
+/// 4. After the install, the object at the destination is verified to BE
+///    the pinned backup object; only then are the redundant links removed,
+///    each re-verified object-coupled before its removal.
+///
+/// A filesystem without hard links offers no coupled install primitive and
+/// fails closed with `Unsupported`, exactly like the Unix no-exchange arm
+/// — never an unverified replace.
+#[cfg(windows)]
+fn restore_backup_object_coupled_windows(
+    backup_absolute: &Path,
+    destination_absolute: &Path,
+    expected: Option<&LeafIdentity>,
+    backup_leaf_identity: Option<&LeafIdentity>,
+) -> io::Result<ReversalOutcome> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    // Open the backup through a delete-capable handle whose share mode
+    // withholds DELETE: the pin freezes the backup name against every
+    // concurrent rename, overwrite, and unlink while the restore couples
+    // to it, so the hard link below can only name the verified object.
+    let mut wide: Vec<u16> = backup_absolute.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path valid for the call;
+    // every other argument is null or a constant. `OPEN_REPARSE_POINT`
+    // keeps a symlink backup from resolving to its target, and
+    // `FILE_FLAG_BACKUP_SEMANTICS` admits directory-shaped surprises as
+    // plain typed failures below rather than reparse resolution.
+    let backup_handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            DELETE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if backup_handle == INVALID_HANDLE_VALUE {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "the saved overwrite backup is gone; the replaced original cannot be restored",
+            ))
+        } else {
+            Err(error)
+        };
+    }
+    // The restore closes over a guard so every early return un-pins the
+    // backup exactly once.
+    struct PinnedBackup(windows_sys::Win32::Foundation::HANDLE);
+    impl Drop for PinnedBackup {
+        fn drop(&mut self) {
+            // SAFETY: the handle is live until this drop runs.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+    let pinned = PinnedBackup(backup_handle);
+    let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: `backup_handle` is live and `info` is a correctly sized,
+    // aligned output buffer that the API fully initializes on success.
+    let filled = unsafe { GetFileInformationByHandle(backup_handle, info.as_mut_ptr()) };
+    if filled == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful call above initialized the complete structure.
+    let backup_object = leaf_identity_from_handle_info(unsafe { &info.assume_init() });
+    // A swapped backup never restores: installing a foreign object as
+    // "the original" would destroy the transfer's own history. The
+    // comparison is the same change-instant-exact gate the caller ran on
+    // the path — re-run through the handle, the object the restore will
+    // actually install.
+    if identity_mismatches(
+        backup_leaf_identity,
+        Some(backup_object),
+        IdentityCoupling::Exact,
+    ) {
+        return Ok(ReversalOutcome::RefusedForeignLeaf);
+    }
+
+    // Re-verify the destination slot immediately before the mutation.
+    let current = leaf_identity_at_path(destination_absolute)?;
+    let outcome = match (&current, expected) {
+        // Empty slot: install the pinned backup object no-replace.
+        (None, _) => {
+            install_verified_backup_windows(backup_absolute, destination_absolute, &backup_object)
+        }
+        // Occupied by a different object than the recorded publication —
+        // a concurrent writer's interposition owns that name now, and the
+        // restore refuses without touching it.
+        (Some(publication), Some(expected)) if publication != expected => {
+            Ok(ReversalOutcome::RefusedForeignLeaf)
+        }
+        // Occupied by the object the restore may replace — the exact
+        // recorded publication, or whatever was just observed when no
+        // identity was recorded: tombstone it, delete it through its own
+        // verified handle, install the backup, and put it back if anything
+        // refuses. Even the uncoupled-identity degradation never destroys
+        // unverified on Windows: the delete handle re-verifies the observed
+        // object, and a mid-flight replacement is refused intact.
+        (Some(publication), _) => replace_verified_publication_windows(
+            destination_absolute,
+            backup_absolute,
+            publication,
+            &backup_object,
+        ),
+    };
+    drop(pinned);
+    let restored = outcome?;
+    if restored == ReversalOutcome::Reversed {
+        // Consume the redundant backup link — the destination now names
+        // the restored object. The pin froze this name through every
+        // mutation above; after its release a concurrent writer could
+        // have swapped it, so the removal is re-verified object-coupled
+        // and a swapped name is never deleted.
+        match leaf_identity_at_path(backup_absolute)? {
+            Some(bound) if bound.same_object(&backup_object) => {
+                std::fs::remove_file(backup_absolute)?;
+            }
+            Some(_) => {
+                return Err(io::Error::other(
+                    "the restored backup's sibling name was replaced by a concurrent writer; \
+                     refusing to delete an object the transfer does not own",
+                ));
+            }
+            // The backup name is already gone; the object lives on at the
+            // destination.
+            None => {}
+        }
+    }
+    Ok(restored)
+}
+
+/// Install the pinned backup object at the (empty) destination slot with
+/// no-replace semantics, then verify the installed object IS the pinned
+/// backup object. A concurrent writer that raced into the slot is refused
+/// intact; a filesystem without hard links fails closed rather than
+/// replacing unverified.
+#[cfg(windows)]
+fn install_verified_backup_windows(
+    backup_absolute: &Path,
+    destination_absolute: &Path,
+    backup_object: &LeafIdentity,
+) -> io::Result<ReversalOutcome> {
+    if let Err(error) = std::fs::hard_link(backup_absolute, destination_absolute) {
+        return if error.kind() == io::ErrorKind::AlreadyExists {
+            // An interposer won the vacated slot: it survives untouched,
+            // and the backup keeps the original for a later, unblocked
+            // restore.
+            Ok(ReversalOutcome::RefusedForeignLeaf)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cannot install the verified backup object at the destination; refusing a \
+                 backup restore that could destroy a concurrent writer's interposition \
+                 unverified",
+            ))
+        };
+    }
+    // Post-install proof: the object now at the destination must BE the
+    // pinned backup object.
+    match leaf_identity_at_path(destination_absolute)? {
+        Some(installed) if installed.same_object(backup_object) => Ok(ReversalOutcome::Reversed),
+        Some(_) => Ok(ReversalOutcome::RefusedForeignLeaf),
+        None => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the restored backup vanished from the destination slot before it could be verified",
+        )),
+    }
+}
+
+/// Replace one verified publication with the pinned backup object:
+/// tombstone the publication first (a private extra link), delete the
+/// destination name through the publication's own verified handle, install
+/// the backup no-replace, and put the tombstoned publication back if
+/// anything refuses. Every destruction is bound to the verified object;
+/// every refusal preserves both competing objects.
+#[cfg(windows)]
+fn replace_verified_publication_windows(
+    destination_absolute: &Path,
+    backup_absolute: &Path,
+    publication: &LeafIdentity,
+    backup_object: &LeafIdentity,
+) -> io::Result<ReversalOutcome> {
+    // Bind the verified publication to a private tombstone link before
+    // anything is destroyed, so the refusal path can always put it back.
+    let mut tombstone;
+    loop {
+        tombstone = destination_absolute.with_file_name(format!(
+            ".tributary-restore-{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        ));
+        match std::fs::hard_link(destination_absolute, &tombstone) {
+            Ok(()) => break,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    // The tombstone must name the verified publication: a link that
+    // grabbed a mid-flight interposer is released and refused, never
+    // trusted.
+    match leaf_identity_at_path(&tombstone)? {
+        Some(bound) if bound.same_object(publication) => {}
+        Some(_) => {
+            let _ = std::fs::remove_file(&tombstone);
+            return Ok(ReversalOutcome::RefusedForeignLeaf);
+        }
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "the tombstoned publication vanished before the restore could couple to it",
+            ));
+        }
+    }
+    // Delete the publication's destination name through a fresh
+    // delete-capable handle, verified through that handle: the destruction
+    // is bound to the verified object, never to the path.
+    if let Err(error) = delete_verified_object_windows(destination_absolute, publication) {
+        let _ = std::fs::remove_file(&tombstone);
+        return Err(error);
+    }
+    // Install the backup into the vacated slot; put the tombstoned
+    // publication back if the slot was taken — or the install is
+    // impossible — so the refusal destroys nothing.
+    match install_verified_backup_windows(backup_absolute, destination_absolute, backup_object) {
+        Ok(ReversalOutcome::Reversed) => {
+            // The restore landed. Remove our tombstone link — verified:
+            // it still names the object we tombstoned, and a foreign
+            // object at the private name is never deleted.
+            match leaf_identity_at_path(&tombstone)? {
+                Some(bound) if bound.same_object(publication) => {
+                    std::fs::remove_file(&tombstone)?;
+                }
+                Some(_) => {
+                    return Err(io::Error::other(
+                        "the restore tombstone's name was replaced by a concurrent writer; \
+                         refusing to delete an object the transfer does not own",
+                    ));
+                }
+                None => {}
+            }
+            Ok(ReversalOutcome::Reversed)
+        }
+        Ok(ReversalOutcome::RefusedForeignLeaf) => {
+            restore_tombstoned_publication_windows(&tombstone, destination_absolute, publication)?;
+            Ok(ReversalOutcome::RefusedForeignLeaf)
+        }
+        Ok(ReversalOutcome::AlreadyAbsent) => Ok(ReversalOutcome::AlreadyAbsent),
+        Err(error) => {
+            // The install itself failed: restore the publication's name
+            // best-effort, keep the tombstone if even that fails (the
+            // object stays reachable), and surface the primary failure.
+            if restore_tombstoned_publication_windows(&tombstone, destination_absolute, publication)
+                .is_ok()
+            {
+                let _ = std::fs::remove_file(&tombstone);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Put a tombstoned publication back onto its destination slot (no-replace)
+/// and drop the tombstone link when the publication landed — or keep the
+/// tombstone as the object's last reachable link when it did not, surfacing
+/// the failure. Never destroys: the object is reachable at one of the two
+/// names on every path.
+#[cfg(windows)]
+fn restore_tombstoned_publication_windows(
+    tombstone: &Path,
+    destination_absolute: &Path,
+    publication: &LeafIdentity,
+) -> io::Result<()> {
+    if let Err(error) = std::fs::hard_link(tombstone, destination_absolute) {
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "cannot restore the verified publication after refusing the backup \
+                     install; it remains preserved at the private tombstone: {error}"
+                ),
+            ));
+        }
+        // The slot is occupied again — by the interposer that caused the
+        // refusal. The publication stays at the tombstone.
+        return Err(io::Error::other(
+            "the destination slot stayed occupied after refusing the backup install; the \
+             verified publication remains preserved at the private tombstone",
+        ));
+    }
+    match leaf_identity_at_path(destination_absolute)? {
+        Some(installed) if installed.same_object(publication) => {
+            let _ = std::fs::remove_file(tombstone);
+            Ok(())
+        }
+        _ => Err(io::Error::other(
+            "the restored publication could not be verified at the destination slot; it \
+             remains preserved at the private tombstone",
+        )),
+    }
+}
+
+/// Delete the object at `path` through a fresh delete-capable handle after
+/// re-verifying through that same handle that the object still is
+/// `expected`: the deletion is bound to the verified object, never to the
+/// path. A mid-flight replacement is refused unopened.
+#[cfg(windows)]
+fn delete_verified_object_windows(path: &Path, expected: &LeafIdentity) -> io::Result<()> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path valid for the call;
+    // every other argument is null or a constant.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            DELETE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let outcome = (|| {
+        let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        // SAFETY: `handle` is live and `info` is a correctly sized, aligned
+        // output buffer that the API fully initializes on success.
+        let filled = unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) };
+        if filled == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the successful call above initialized the complete structure.
+        let current = leaf_identity_from_handle_info(unsafe { &info.assume_init() });
+        if !current.same_object(expected) {
+            // The slot changed hands between the observation and the open:
+            // the newcomer is never destroyed.
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the destination publication was replaced before the restore could delete it",
+            ));
+        }
+        request_object_deletion(handle)
+    })();
+    // SAFETY: `handle` was created above and is closed exactly once on
+    // every path. A requested deletion commits at this close.
+    unsafe { CloseHandle(handle) };
+    outcome
+}
 /// Bind the current occupant of `to_absolute` and replace it without ever
 /// destroying an unverified object, using only object-coupled primitives:
-///
-/// 1. The occupant is opened ONCE with a delete-capable handle (no reparse
 ///    following, so a symlink occupant is opened as itself) and its
 ///    identity is read through that handle — never from a later path
 ///    lookup.
@@ -5275,6 +5632,16 @@ fn hard_link_bind_and_replace(
 /// bound. The FIRST binding — the pre-transfer occupant — is the one
 /// reported, so a rollback restores exactly the bytes the transfer
 /// displaced from the slot.
+///
+/// Every superseded binding is tracked: when a later attempt wins, each
+/// earlier completed binding's backup is disposed with identity-verified
+/// deletion — a bound backup that a later attempt superseded is never left
+/// as a hidden orphan. On success exactly one backup survives: the first
+/// binding's, reported to the caller. On exhaustion the retained FIRST
+/// binding travels with the error (see [`ExhaustedRebindBackup`]) so the
+/// caller records the replacement instead of stranding the backup; the
+/// superseded interposer backups stay in place untouched — they hold
+/// foreign data, which a failed publish never destroys.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn replace_publish_loop(
@@ -5291,6 +5658,7 @@ fn replace_publish_loop(
 ) -> io::Result<(bool, Option<LeafIdentity>, Option<BoundOccupantBackup>)> {
     let mut current = (backup_leaf.to_os_string(), backup_relative.to_path_buf());
     let mut first_binding: Option<(PathBuf, LeafIdentity)> = None;
+    let mut superseded: Vec<(PathBuf, LeafIdentity)> = Vec::new();
     for _ in 0..REPLACE_BIND_ATTEMPTS {
         // Type the occupant no-follow first: a directory is refused with
         // the typed error, and a present non-directory is bound through a
@@ -5316,9 +5684,25 @@ fn replace_publish_loop(
                 )? {
                     Some((published, identity)) => {
                         if first_binding.is_none() {
-                            first_binding = Some((relative, identity));
+                            first_binding = Some((relative.clone(), identity));
+                        } else {
+                            superseded.push((relative.clone(), identity));
                         }
                         if published {
+                            // This winning attempt's binding displaced the
+                            // slot's latest occupant into ITS backup — a
+                            // superseded non-original. Dispose it together
+                            // with every earlier superseded backup,
+                            // identity-verified, so no hidden orphan
+                            // survives the successful publish.
+                            let mut stale = std::mem::take(&mut superseded);
+                            stale.push((relative, identity));
+                            for (stale_relative, stale_leaf) in &stale {
+                                dispose_superseded_binding_windows(
+                                    &root.join(stale_relative),
+                                    stale_leaf,
+                                );
+                            }
                             let published_leaf = leaf_identity_at_path(to_absolute).ok().flatten();
                             let bound =
                                 first_binding.map(|(relative_path, leaf)| BoundOccupantBackup {
@@ -5348,12 +5732,21 @@ fn replace_publish_loop(
                     to_absolute,
                 ) {
                     Ok(()) => {
-                        let published_leaf = leaf_identity_at_path(to_absolute).ok().flatten();
                         // An empty slot reached through the no-replace
                         // publish is still a replacement when an earlier
                         // attempt's handle-deletion vacated it: the
                         // displaced object is preserved at the retained
-                        // backup and must be reported.
+                        // backup and must be reported. Every superseded
+                        // binding's backup is disposed — only the first
+                        // binding's backup, the pre-transfer occupant,
+                        // survives for rollback.
+                        for (stale_relative, stale_leaf) in std::mem::take(&mut superseded) {
+                            dispose_superseded_binding_windows(
+                                &root.join(stale_relative),
+                                &stale_leaf,
+                            );
+                        }
+                        let published_leaf = leaf_identity_at_path(to_absolute).ok().flatten();
                         let replaced = first_binding.is_some();
                         let bound =
                             first_binding.map(|(relative_path, leaf)| BoundOccupantBackup {
@@ -5369,23 +5762,77 @@ fn replace_publish_loop(
             Err(error) => return Err(error),
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        match &first_binding {
-            Some((relative, _)) => format!(
-                "destination kept changing through the replace publish; the displaced \
-                 original remains preserved at the private backup sibling {} \
-                 and was never destroyed",
-                relative.display()
-            ),
-            None => "destination kept changing through the replace publish".to_string(),
-        },
-    ))
+    match first_binding {
+        Some((relative, identity)) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            ExhaustedRebindBackup {
+                backup_relative: relative,
+                backup_leaf: identity,
+            },
+        )),
+        None => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "destination kept changing through the replace publish",
+        )),
+    }
 }
+
+/// Dispose one superseded rebind backup with identity-verified deletion:
+/// the private name must still hold the object its completed bind backed
+/// up — a swapped name is left untouched, never deleted. Best-effort: a
+/// disposal that cannot run leaves the backup in place rather than failing
+/// a publish that already landed.
+#[cfg(windows)]
+fn dispose_superseded_binding_windows(backup_absolute: &Path, bound_leaf: &LeafIdentity) {
+    if let Ok(Some(current)) = leaf_identity_at_path(backup_absolute) {
+        if current.same_object(bound_leaf) {
+            let _ = std::fs::remove_file(backup_absolute);
+        }
+    }
+}
+
+/// Error payload for a Windows replace publish that exhausted its rebind
+/// bound with a completed binding retained: nothing of the transfer's was
+/// published at the destination, but the displaced pre-transfer occupant
+/// survives at the private backup sibling. Surfaced through an
+/// [`io::Error`] payload so it travels every `?` on the publish path; the
+/// write authority's commit downcasts to it and folds the retained backup
+/// into a verified-publication failure carrying the outcome, so the caller
+/// records the replacement for rollback — a plain I/O error would strand
+/// the backup as an unrecorded hidden orphan.
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct ExhaustedRebindBackup {
+    /// Relative path of the retained backup sibling holding the
+    /// pre-transfer occupant.
+    pub(crate) backup_relative: PathBuf,
+    /// Bind-time identity of the displaced original the backup holds.
+    pub(crate) backup_leaf: LeafIdentity,
+}
+
+#[cfg(windows)]
+impl fmt::Display for ExhaustedRebindBackup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "destination kept changing through the replace publish; the displaced \
+             original remains preserved at the private backup sibling {} \
+             and was never destroyed",
+            self.backup_relative.display()
+        )
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for ExhaustedRebindBackup {}
 
 /// Windows fallback for [`MountedRootAuthority::create_directories_within`]:
 /// per-component creation under the same private-name discipline as the
-/// Unix arm. Each component that turns out to be absent is first created
+/// Unix arm. An existing component is adopted first — opened no-reparse and
+/// typed — so only a component observed ABSENT is ever created: a
+/// non-writable parent holding an existing writable component must not fail
+/// its walk with a permission error from a private-name creation it never
+/// needed. Each component that turns out to be absent is first created
 /// under a private unguessable name, opened no-reparse, and identity-bound
 /// from that very handle; only then is it published to the final component
 /// name with no-replace semantics (`MoveFileExW` without
@@ -5408,7 +5855,8 @@ fn create_directory_tree_by_path(
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, GetFileInformationByHandle, MoveFileExW, BY_HANDLE_FILE_INFORMATION,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
@@ -5453,10 +5901,77 @@ fn create_directory_tree_by_path(
         let _ = std::fs::remove_dir(private);
     }
 
+    // Open an existing component no-reparse and type it like the historical
+    // behavior: a real directory is adopted (`Ok(Some(()))`), an absent one
+    // reports `Ok(None)` and takes the private-creation path, and a
+    // non-directory or reparse occupant is refused with the typed error.
+    // The adoption runs BEFORE any private-name creation so a non-writable
+    // parent holding an existing writable component never fails for lack
+    // of write permission on the parent — creating
+    // `<root>/<existing>/<new>` needs write access only on `<existing>`.
+    fn open_existing_component(path: &Path) -> io::Result<Option<()>> {
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path valid for the call;
+        // every other argument is null or a constant. `OPEN_REPARSE_POINT`
+        // keeps a reparse occupant from resolving to its target.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                // Absent (or an ancestor is absent, which the ordered walk
+                // prevents): take the private-creation path.
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        let mut info = core::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        // SAFETY: `handle` is live and `info` is a correctly sized, aligned
+        // output buffer that the API fully initializes on success.
+        let filled = unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) };
+        // SAFETY: `handle` was created above and is closed exactly once.
+        unsafe { CloseHandle(handle) };
+        if filled == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the successful call above initialized the complete structure.
+        let info = unsafe { info.assume_init() };
+        // Matches the historical typing: symlink_metadata().is_dir() is
+        // false for reparse points and non-directories alike, and both were
+        // refused with this typed error.
+        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "intermediate path is not a directory",
+            ));
+        }
+        Ok(Some(()))
+    }
+
     let mut path = root.to_path_buf();
     let mut created = Vec::new();
     for (index, component) in components.iter().enumerate() {
         path.push(component);
+        // Adopt an existing component before creating anything — see
+        // `open_existing_component`. Only an observed-absent component
+        // falls through to the private-creation path below.
+        match open_existing_component(&path)? {
+            Some(()) => continue,
+            None => {}
+        }
         let parent_dir = path
             .parent()
             .map(Path::to_path_buf)
