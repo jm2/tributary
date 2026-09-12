@@ -279,34 +279,58 @@ def resolved_dependency_edges(
     }
 
 
+def cargo_version_family(version: str) -> tuple[int, int | None, int | None] | None:
+    """
+    Parse a Cargo lock version into its unification identity components.
+
+    Cargo lock version fields are always full numeric X.Y.Z releases, so
+    anything else is malformed input that must never compare equal to a
+    valid version: incomplete versions, non-numeric or non-ASCII
+    components, semver-forbidden leading zeros, prerelease/build suffixes,
+    and extra components all parse to None and stay fail-closed. The
+    returned triple keeps exactly the components cargo's compatibility
+    rules unify on — (major, None, None) for stable majors, (0, minor,
+    None) for 0.x crates, and (0, 0, patch) for 0.0.x crates, where a
+    ^0.0.P requirement matches only that patch.
+    """
+    components = version.split(".")
+    if len(components) != 3:
+        return None
+    if not all(
+        component.isascii() and component.isdigit()
+        for component in components
+    ):
+        return None
+    if any(
+        len(component) > 1 and component.startswith("0")
+        for component in components
+    ):
+        return None
+    major, minor, patch = (int(component) for component in components)
+    if major > 0:
+        return (major, None, None)
+    if minor > 0:
+        return (0, minor, None)
+    return (0, 0, patch)
+
+
 def same_semver_compat_family(left: str, right: str) -> bool:
     """
     True when two crate versions sit in the same Cargo compatibility family.
 
     Cargo unification merges only requirements that resolve into one
-    compatibility family: the same major and, for 0.x crates, also the same
-    minor — a ^0.60 requirement never matches 0.61.x, so cross-minor 0.x
-    records can never absorb one another's consumers. Versions without an
-    integer leading component never compare equal, which keeps malformed
-    input fail-closed.
+    compatibility family: the same major; for 0.x crates also the same
+    minor (^0.60 never matches 0.61.x); and for 0.0.x crates the same
+    patch (^0.0.1 excludes 0.0.2, so a 0.0.x patch bump can never absorb
+    another record's consumers). Versions that do not fully parse as
+    numeric X.Y.Z never compare equal, which keeps malformed input
+    fail-closed.
     """
-
-    def family(version: str) -> tuple[str, str] | None:
-        components = version.split(".", 2)
-        major = components[0] if components[0].isdigit() else None
-        if major is None:
-            return None
-        if major != "0":
-            return (major, "")
-        minor = (
-            components[1]
-            if len(components) > 1 and components[1].isdigit()
-            else None
-        )
-        return None if minor is None else (major, minor)
-
-    left_family = family(left)
-    return left_family is not None and left_family == family(right)
+    left_family = cargo_version_family(left)
+    return (
+        left_family is not None
+        and left_family == cargo_version_family(right)
+    )
 
 
 def unification_replacements(
@@ -326,7 +350,8 @@ def unification_replacements(
     is attributed to that unification only when the removed identity has
     exactly one surviving same-family record — cargo can never merge
     requirements outside a compatibility family (same major; for 0.x also
-    the same minor), so same-name records in other families are separate
+    the same minor; for 0.0.x the same patch), so same-name records in
+    other families are separate
     graph residents that neither defeat attribution nor qualify as the
     replacement — that record lies inside the exact after closure (so the
     selected production update necessitated it), it preserves the removed

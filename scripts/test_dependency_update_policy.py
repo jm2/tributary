@@ -1274,8 +1274,9 @@ class FuzzLockPolicyTests(unittest.TestCase):
 
     def test_compat_family_scoping_matches_cargo_unification_axes(self):
         # Cargo unification is confined to one compatibility family: same
-        # major, and for 0.x crates the same minor (^0.60 never matches
-        # 0.61.x). The family test must mirror those axes and stay
+        # major, for 0.x crates the same minor (^0.60 never matches
+        # 0.61.x), and for 0.0.x crates the same patch (^0.0.1 excludes
+        # 0.0.2). The family test must mirror those axes and stay
         # fail-closed on malformed input.
         self.assertTrue(
             sync_fuzz_lock.same_semver_compat_family("3.0.2", "3.0.5")
@@ -1298,6 +1299,134 @@ class FuzzLockPolicyTests(unittest.TestCase):
         self.assertFalse(
             sync_fuzz_lock.same_semver_compat_family("3.0.2", "not-a-version")
         )
+
+    def test_compat_family_splits_0_0_x_releases_by_patch(self):
+        # Cargo's compatibility boundary for 0.0.x crates is the patch:
+        # ^0.0.1 resolves only [0.0.1, 0.0.2), so 0.0.1 and 0.0.2 are
+        # separate families and a 0.0.x patch bump can never absorb another
+        # record's consumers via unification.
+        self.assertFalse(
+            sync_fuzz_lock.same_semver_compat_family("0.0.1", "0.0.2")
+        )
+        self.assertFalse(
+            sync_fuzz_lock.same_semver_compat_family("0.0.1", "0.0.9")
+        )
+        self.assertTrue(
+            sync_fuzz_lock.same_semver_compat_family("0.0.1", "0.0.1")
+        )
+        # 0.0.x and 0.x-with-minor are different families on the minor axis.
+        self.assertFalse(
+            sync_fuzz_lock.same_semver_compat_family("0.0.1", "0.1.0")
+        )
+
+    def test_compat_family_rejects_versions_outside_full_numeric_release_shape(
+        self,
+    ):
+        # Cargo lock version fields are always full numeric X.Y.Z releases.
+        # Anything else is malformed input that must never compare equal to
+        # a valid version — incomplete versions, prerelease or build
+        # suffixes, semver-forbidden leading zeros, extra components — so a
+        # crafted lock cannot smuggle a same-family match past the
+        # unification attribution.
+        for malformed in (
+            "3",
+            "3.0",
+            "3.0.2-beta",
+            "1.0.0+zlib",
+            "01.2.3",
+            "1.02.3",
+            "1.2.03",
+            "1.2.3.4",
+            "١.2.3",
+            "x.y.z",
+            "",
+        ):
+            self.assertFalse(
+                sync_fuzz_lock.same_semver_compat_family(malformed, "3.0.5"),
+                malformed,
+            )
+            self.assertFalse(
+                sync_fuzz_lock.same_semver_compat_family("3.0.5", malformed),
+                malformed,
+            )
+
+    def test_bounded_repair_rejects_cross_patch_0_0_x_survivor_substitution(
+        self,
+    ):
+        #lizard forgives
+        # A shared 0.0.1 record consumed outside the upgraded subtree must
+        # not be attributed onto a newly introduced shared 0.0.2: cargo's
+        # compatibility boundary for 0.0.x is the patch (^0.0.1 excludes
+        # 0.0.2), so no unification could have absorbed the consumers. The
+        # removal stays outside the exact old closure and fails closed.
+        base = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "shared": ["0.0.1"],
+                "quote": ["1.0.0"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        # package order: lofty, lofty-attr, shared 0.0.1, quote,
+        # serde-derive. The old lofty subtree never reaches shared 0.0.1
+        # (lofty-attr 0.12.0 carries only its self-edge); serde-derive
+        # consumes shared 0.0.1 from outside the subtree, while the after
+        # closure gains shared 0.0.2 through lofty-attr 0.13.0.
+        base["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        base["package"][3]["dependencies"] = ["quote 1.0.0"]
+        base["package"][4]["dependencies"] = ["shared 0.0.1"]
+        stale_fuzz = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "shared": ["0.0.1"],
+                "quote": ["1.0.0"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        stale_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        stale_fuzz["package"][3]["dependencies"] = ["quote 1.0.0"]
+        stale_fuzz["package"][4]["dependencies"] = ["shared 0.0.1"]
+        current = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "shared": ["0.0.2"],
+                "quote": ["1.0.0"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        current["package"][1]["dependencies"] = ["shared 0.0.2"]
+        current["package"][3]["dependencies"] = ["quote 1.0.0"]
+        current["package"][4]["dependencies"] = ["shared 0.0.2"]
+        repaired_fuzz = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "shared": ["0.0.2"],
+                "quote": ["1.0.0"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        repaired_fuzz["package"][1]["dependencies"] = ["shared 0.0.2"]
+        repaired_fuzz["package"][3]["dependencies"] = ["quote 1.0.0"]
+        repaired_fuzz["package"][4]["dependencies"] = ["shared 0.0.2"]
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError, "removed package identities"
+        ):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                current,
+                stale_fuzz,
+                repaired_fuzz,
+                [sync_fuzz_lock.Transition("lofty", "0.24.0", "0.25.1")],
+            )
 
     def test_bounded_repair_rejects_unused_unification_replacement(self):
         #lizard forgives
