@@ -2,6 +2,24 @@
 
 Status: design record, no implementation in this bead.
 
+Revision 4 (2026-09-12, corrective pass). This revision answers the
+operator corrective review of the `b1e2b74` head with three lifecycle
+fixes to the §4.1/§4.3 contract, each grounded in the existing
+media-proxy ownership and the UI event contract: (1) `OpenCancel` now
+requires interruptible I/O or a bounded race per blocking operation,
+not polls between steps, so a cancellation aborts the operation in
+flight and no stale attempt can mutate the daemon or publish after a
+replacement load; (2) every non-opened outcome — cancellation
+included — revokes its own current media ticket through
+`revoke_if_current` after transport restoration, so a cancelled load
+leaves no retained loopback route while never touching a newer
+replacement's ticket; (3) §4.3 defines natural decode-pump EOS as a
+third pump exit distinct from terminal loss, specifying drain,
+resource disposal, daemon restoration, and exactly one
+generation-scoped `TrackEnded`, with duplicate-EOS and
+superseded-generation cases covered by acceptance item §9.10. It
+changes the design record only.
+
 Revision 3 (2026-09-09, corrective pass). This revision answers the
 operator corrective review of revision 2 at `2cae166` with three
 design-gap fixes, each grounded in primary sources rechecked live on
@@ -387,7 +405,11 @@ trait SenderSession: Send {
 /// Outcome of one `write_pcm` call (§4.1). The decode pump (§4.3)
 /// treats `Backpressure` as retryable and `Terminal` as final; the
 /// distinction is the pump's only guarantee that it will not spin
-/// forever on a session that has already died.
+/// forever on a session that has already died. Natural
+/// end-of-stream is deliberately *not* a variant: the pump detects
+/// EOS from its own decode pipeline and completes the track through
+/// the §4.3 natural-completion path, which is distinct from both
+/// retryable backpressure and terminal session loss.
 enum SenderWriteOutcome {
     /// `n` bytes accepted; continue with the remainder.
     Accepted(usize),
@@ -445,13 +467,26 @@ enum SenderError {
 }
 
 /// Cancellation currency for one `open_session` call, owned by the
-/// load path. The in-flight call polls it at every blocking
-/// checkpoint — ownership re-verification (§4.3), each RTSP
-/// handshake step or daemon RPC, FIFO and API setup — and aborts
-/// negotiation as soon as it observes the flag, without waiting for
-/// the open deadline. The load path sets it when the load is
-/// dropped or its generation is superseded: exactly the conditions
-/// the event contract already keys on. This is deliberately not
+/// load path. Setting it is synchronous and idempotent; observing it
+/// must interrupt *the operation currently in flight*, not merely the
+/// gap after it. The in-flight call therefore does not rely on
+/// polling between blocking steps: every blocking operation —
+/// ownership re-verification, each RTSP handshake read/write, each
+/// daemon RPC, FIFO and API setup, even the lock-acquisition wait —
+/// is performed either on a transport the cancel path can abort
+/// (socket `shutdown`/close, a FIFO write end it can close) or as a
+/// bounded wait raced against this flag (a `select`/timeout that
+/// returns the moment the flag is set). When `cancel()` fires, the
+/// call aborts the operation in flight, discards any late-arriving
+/// result so it can never apply a daemon mutation, install a queue
+/// item, start playback, or publish an event for the cancelled
+/// generation, and unwinds through the §4.3 restoration path within
+/// the documented cleanup deadline. Each blocking operation still
+/// carries its own documented deadline, so an un-cancelled call that
+/// stalls ends as `Failed(SenderError::Deadline)` instead of hanging.
+/// The load path sets the flag when the load is dropped or its
+/// generation is superseded: exactly the conditions the event
+/// contract already keys on. This is deliberately not
 /// `PlayerEventGeneration` itself — a generation
 /// (`src/audio/mod.rs:85-87`) is a `Copy` value the caller compares
 /// after the fact, not a flag an in-flight call can observe, and a
@@ -459,17 +494,22 @@ enum SenderError {
 /// express the abort this contract promises (the module's
 /// non-blocking rule, `src/audio/mod.rs:5`). The concrete type is
 /// the implementation record's choice (an `Arc<AtomicBool>`-shaped
-/// flag or the runtime's cancellation primitive); the contract
-/// requires only that the flag is pollable from the calling thread
-/// and that setting it is synchronous and idempotent.
+/// flag plus per-operation abort handles, or the runtime's
+/// cancellation primitive); the contract requires only that setting
+/// it is synchronous, idempotent, and safe from any thread, and that
+/// an in-flight operation can be aborted or raced against it.
 struct OpenCancel { /* the implementation record's primitive */ }
 
 impl OpenCancel {
     /// Synchronous, idempotent, safe from any thread. After it
-    /// returns, an in-flight `open_session` observes the flag at its
-    /// next checkpoint and unwinds through the restoration path.
+    /// returns, any in-flight `open_session` observes the flag
+    /// immediately — aborting the blocked operation itself, not the
+    /// step after it — and unwinds through the restoration path
+    /// within the documented cleanup deadline.
     fn cancel(&self);
-    /// The poll the in-flight call performs between blocking steps.
+    /// Cheap non-blocking pre/post check. It does not by itself
+    /// satisfy the interruption contract: each blocking operation
+    /// must still be abortable or raced (see the type docs).
     fn is_cancelled(&self) -> bool;
 }
 
@@ -482,12 +522,16 @@ impl OpenCancel {
 enum OpenOutcome {
     /// Negotiation completed; the session is live.
     Opened(Box<dyn SenderSession>),
-    /// Cancellation was observed before negotiation completed.
+    /// Cancellation was observed before negotiation completed, and
+    /// the operation in flight was aborted rather than awaited.
     /// Everything the attempt created — receiver session, queue
     /// items, enabled-output changes — was already torn down through
     /// the same restoration path as failure (§4.1, §4.3) before this
-    /// variant is returned, so `Cancelled` is a terminal,
-    /// fully-unwound state, never a half-open session.
+    /// variant is returned, and the load path revoked its own current
+    /// media ticket (`revoke_if_current`; §4.1, §9.5) without
+    /// touching a newer replacement's. `Cancelled` is a terminal,
+    /// fully-unwound state, never a half-open session and never a
+    /// retained loopback route.
     Cancelled,
     /// A failure inside the seam's taxonomy; the teardown guarantees
     /// are the failure path's — restoration has run before the value
@@ -533,23 +577,42 @@ trait AirplaySender: Send + Sync {
     /// per track — so it cannot capture the URI anywhere else; it is
     /// the same loopback URL today's `open_prepared_session` passes
     /// to `build_raop_pipeline`
-    /// (`src/audio/airplay_output.rs:231-241`). Ticket revocation on
-    /// failure stays in the load path (`open_prepared_media`,
-    /// :199-208), exactly as today; a cancelled open needs no
-    /// revocation step at all — the load that owned the ticket is
-    /// being discarded by definition.
+    /// (`src/audio/airplay_output.rs:231-241`). Ticket revocation for
+    /// every non-opened outcome — failure and cancellation alike —
+    /// stays in the load path (`open_prepared_media`, :199-208),
+    /// which is where today's failure path already calls
+    /// `revoke_if_current`. Dropping the call is *not* sufficient:
+    /// `GstreamerMediaProxy` retains its own `Arc` in `state.active`
+    /// (`src/audio/gstreamer_media.rs:69-72`), independent of the
+    /// discarded load, so a cancelled open that skipped revocation
+    /// would leave the authenticated loopback route and its
+    /// resources live until the next load or output destruction.
+    /// `revoke_if_current` is identity-checked against the proxy's
+    /// newest active lease (`src/audio/gstreamer_media.rs:319-337`),
+    /// so a load can only ever revoke its own current ticket and never
+    /// a newer replacement's. The ordering is the accepted one:
+    /// transport restoration first, revocation after, so the receiver
+    /// session is unwound before the loopback route is invalidated.
     ///
-    /// Bounded and cancellable by contract: the call enforces the
+    /// Bounded and interruptible by contract: the call enforces the
     /// adapter's documented open deadline (again a named constant
-    /// the implementation record states) and polls `cancel` at every
-    /// blocking checkpoint, so cancellation — the load being dropped
-    /// or its generation superseded mid-call — aborts in-flight
-    /// negotiation instead of racing the deadline. On a deadline
-    /// miss, a cancellation, or any failure the implementation tears
-    /// down everything it created so far (receiver session, queue
-    /// items, enabled-output changes) through the same restoration
-    /// path (§4.3) before the outcome surfaces; on the daemon
-    /// adapter a cancellation landing mid-takeover records and
+    /// the implementation record states), and cancellation — the
+    /// load being dropped or its generation superseded mid-call —
+    /// aborts *the operation in flight* rather than waiting for it to
+    /// return. Each blocking operation (ownership re-verification,
+    /// every RTSP handshake step, every daemon RPC, FIFO/API setup,
+    /// the lock-acquisition wait) is abortable (transport
+    /// `shutdown`/close, FIFO close) or raced against `cancel` with a
+    /// bounded wait, so the stale attempt cannot keep mutating the
+    /// daemon, install a queue item, start playback, or publish an
+    /// event after a replacement load has taken over; a result that
+    /// arrives late, after cancellation, is discarded and never
+    /// applied. On cancellation or a deadline miss the implementation
+    /// tears down everything it created so far (receiver session,
+    /// queue items, enabled-output changes) through the same
+    /// restoration path (§4.3) before the outcome surfaces, within a
+    /// documented cleanup deadline bounding the whole unwind; on the
+    /// daemon adapter a cancellation landing mid-takeover records and
     /// reverses its steps through the same incomplete-takeover
     /// discipline as a crash (§4.3). The method never returns a
     /// half-open session, and a load can never remain pending on it
@@ -596,7 +659,7 @@ Key differences from revision 1, and why:
   cancellation as an outcome, not an error.** Pause / resume /
   volume / flush are protocol operations (RTSP SET_PARAMETER /
   PAUSE, daemon RPC), not pipeline state writes, so they belong to
-  the session object; and the open call carries a pollable
+  the session object; and the open call carries an interruptible
   `OpenCancel` handle and returns `OpenOutcome`, whose `Cancelled`
   variant keeps "the caller changed its mind" out of the
   `SenderError` taxonomy entirely (§4.1).
@@ -661,7 +724,34 @@ Tributary talks to an OwnTone instance as a transmission service:
   same `prepared_uri` the seam carries, and pumps the decoded PCM
   into `write_pcm`. The pump wakes on backpressure and stops on the
   first terminal outcome; it holds no retry loop across a terminal
-  session. **The pump also owns the track duration:** it issues a
+  session. **The pump has three exits, and they must not be
+  conflated:** `Backpressure` (healthy, wake and retry), `Terminal`
+  (session loss — §9.4 error + `Stopped`), and **natural EOS**.
+  Natural EOS is detected by the pump from its own decode pipeline
+  (`appsink`/bus `EOS`), never inferred from `write_pcm` — the
+  `SenderWriteOutcome` taxonomy stays backpressure/terminal only.
+  On natural EOS of a finite track the adapter: drains the decoded
+  remainder through `write_pcm` until it is accepted (the pipe is
+  not truncated mid-frame), closes the pipe write end / stops the
+  pipe item so the daemon sees end-of-input, disposes of the owned
+  pipe/queue/session resources, restores the dedicated daemon to
+  the state recorded at takeover (player stopped, our queue items
+  removed, the recorded enabled-output set re-applied, lock
+  released), and publishes **exactly one** generation-scoped
+  `PlayerEvent::TrackEnded` (`PlayerEvent::ended`,
+  `src/audio/mod.rs:116,138`) so queue advance/repeat fires
+  (`src/ui/window.rs:3257-3274`). A per-generation completion record
+  collapses a duplicate EOS — a second EOS publishes nothing. If
+  the generation was superseded (output switch, new load) or
+  cancelled before EOS completes, the completion is dropped: no
+  `TrackEnded`, and no restoration against the new owner, guarded by
+  the same generation identity the publisher already applies.
+  Cancellation and terminal failure must never publish `TrackEnded`
+  — a cancelled load ends as `Stopped` (§9.5) and a failed one as
+  `PlayerEvent::Error` + `Stopped` (§9.4). Without this exit a
+  finite track reaches pipeline EOS and simply stalls on the
+  current item, because the UI advances only on `TrackEnded`.
+  **The pump also owns the track duration:** it issues a
   TIME-format duration query against its own pipeline — re-asking
   until the demuxer patches a known value — and publishes the result
   into the session's §4.1 observation cache as `duration_ms`. It
@@ -742,7 +832,10 @@ Tributary talks to an OwnTone instance as a transmission service:
   unwinds through exactly this path: steps already taken are
   recorded and reversed in order, and the `Cancelled` outcome is
   returned only after restoration completes — never as a shortcut
-  past it (§9.5). A crashed holder releases the lock by OS semantics,
+  past it (§9.5). The load path then revokes its own media ticket
+  via `revoke_if_current` (§4.1, §9.5), so a cancelled open leaves
+  no receiver session, no enabled-output change, and no live
+  loopback route behind. A crashed holder releases the lock by OS semantics,
   and what happens next is defined, not incidental: before the
   first mutating step (the first output, queue, or player change),
   the session persists an incomplete-takeover record next to the
@@ -1160,17 +1253,26 @@ record for the selected path must add, at minimum:
    mid-stream tears the receiver session down in order (audio path
    stopped before the loopback route is invalidated — the ordering
    bug class `close_session`'s doc comment warns about,
-   `src/audio/airplay_output.rs:293-305`), leaves no receiver-side
-   playback continuing, and returns `Stopped` for the exact load
-   generation; on the daemon adapter it also restores the state
-   recorded at takeover — player stopped, our queue items removed,
-   the recorded enabled-output set re-applied (§4.3). The same
-   acceptance covers cancellation *during* negotiation: a load whose
-   `OpenCancel` is set while `open_session` is still in flight
-   unwinds through the restoration path and yields
-   `OpenOutcome::Cancelled` — no user-facing error and no error
-   event for the cancelled generation, no half-taken-over daemon,
-   and a following load opens cleanly (§4.1, §4.3).
+   `src/audio/airplay_output.rs:293-305`), revokes its own media
+   ticket via `revoke_if_current` (never a newer replacement's),
+   leaving zero retained routes or resources for the cancelled
+   load, leaves no receiver-side playback continuing, and returns
+   `Stopped` for the exact load generation; on the daemon adapter
+   it also restores the state recorded at takeover — player
+   stopped, our queue items removed, the recorded enabled-output
+   set re-applied (§4.3). The same acceptance covers cancellation
+   *during* negotiation, including Stop or output replacement
+   landing while a blocking operation (RTSP handshake, daemon RPC,
+   FIFO/API setup) is in flight: the operation is aborted rather
+   than awaited, late results are discarded without mutating or
+   publishing anything, and the load whose `OpenCancel` was set
+   yields `OpenOutcome::Cancelled` after the restoration path
+   completes — no user-facing error, no error event for the
+   cancelled generation, no half-taken-over daemon, and a
+   following load opens cleanly (§4.1, §4.3). A targeted
+   interposition test races `cancel` against an operation the test
+   holds open and asserts the abort happens before that operation
+   would have returned.
 6. **Authentication-failure acceptance:** a password-protected
    receiver with no configured password, and a wrong-password case,
    each surface a distinct, localized, actionable error (pointing at
@@ -1197,8 +1299,23 @@ record for the selected path must add, at minimum:
    removed, the recorded enabled-output set re-applied. A
    restoration failure refuses the new session with localized
    guidance instead of proceeding over a half-taken-over daemon.
+10. **Natural-completion acceptance:** a finite track played
+    through the daemon adapter reaches pipeline EOS without a
+    terminal write outcome; the adapter drains the decoded
+    remainder, closes the pipe item, disposes of its
+    pipe/queue/session resources, restores the dedicated daemon to
+    the state recorded at takeover, and publishes exactly one
+    generation-scoped `TrackEnded` so the queue advances (or
+    repeats) instead of stalling on the finished item
+    (`src/ui/window.rs:3257-3274`). The test covers normal
+    completion, a duplicate EOS (still exactly one `TrackEnded`),
+    and a superseded generation (EOS arriving after the load was
+    replaced or cancelled publishes nothing and mutates nothing).
+    Cancellation and terminal failure are asserted *not* to publish
+    `TrackEnded` — they end as `Stopped`/`Error`+`Stopped` per
+    §9.4/§9.5.
 
-**Platform scope:** items 1-9 run on the package targets the §8
+**Platform scope:** items 1-10 run on the package targets the §8
 matrix marks available for the OwnTone adapter (today: the `.deb`
 target on Debian/Ubuntu **amd64**). On every OwnTone-unavailable
 target — the arm64 `.deb`, Fedora, Arch/AUR, Flatpak, macOS,
