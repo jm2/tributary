@@ -18,7 +18,11 @@
 //!   filename shape.
 //! - **The temp path is unguessable and exclusively created** (`O_EXCL` via
 //!   `create_new`), so two concurrent saves to the same file cannot collide and
-//!   the copy cannot be redirected through a pre-planted symlink.
+//!   the copy cannot be redirected through a pre-planted symlink. For a
+//!   retained-authority write the staging never resolves a pathname at all:
+//!   the sibling is created, written, flushed, and cleaned up beneath the
+//!   retained parent handle, so no displaced ancestor or planted symlink can
+//!   observe or receive any part of the copy.
 //! - **A Windows copy is never exposed through an inherited DACL.** Its handle
 //!   denies competing opens from creation until the source DACL and protection
 //!   state are installed; a fresh exclusive write handle must then pass that
@@ -26,13 +30,22 @@
 //! - **The replacement is durable**: the tagged copy is `fsync`ed before the
 //!   rename, so a crash cannot leave a truncated file in place of the original.
 
+use std::ffi::OsStr;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use lofty::config::WriteOptions;
-use lofty::file::TaggedFileExt;
-use lofty::tag::{Accessor, ItemKey, ItemValue, TagExt, TagItem};
+use lofty::file::{TaggedFile, TaggedFileExt};
+use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem};
 use uuid::Uuid;
+
+use super::root_authority::{MountedMutationCommit, MountedMutationTarget, ObjectIdentity};
+// Only the unix anchored staging flow captures a staged object identity;
+// the Windows and fallback authorities prove staging identity from the
+// pathname-side commit, so the helper import must not gate their builds.
+#[cfg(unix)]
+use super::root_authority::object_identity;
 
 /// Reserved filename prefix for the private sibling used by atomic tag writes.
 const TAG_WRITE_TEMP_PREFIX: &str = ".tributary-tag-";
@@ -280,6 +293,336 @@ impl Drop for WindowsDacl {
 struct TempFile {
     path: PathBuf,
     persisted: bool,
+    /// Unix authority-based staging: the retained parent directory the
+    /// staged sibling is anchored at. Set only when `path` holds the bare
+    /// leaf name of a sibling created beneath a retained parent handle; the
+    /// drop cleanup then unlinks that leaf through the handle — never
+    /// through a pathname — so the cleanup cannot mutate a displaced
+    /// impostor directory.
+    #[cfg(unix)]
+    anchored_parent: Option<File>,
+    /// Unix: dev/ino of the object this section created, read from the
+    /// creation handle. The anchored cleanup unlinks the staged leaf only
+    /// while the leaf still names this exact object, so a name an external
+    /// writer reused after stealing the leaf is preserved debris, never
+    /// destroyed.
+    #[cfg(unix)]
+    created_identity: Option<(u64, u64)>,
+}
+
+/// dev/ino of an open file object — the identity pair the anchored cleanups
+/// compare before unlinking a leaf name.
+#[cfg(unix)]
+fn retained_handle_identity(file: &File) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// dev/ino pair from a rustix `Stat`, normalized to the `u64` the creation
+/// identity carries.
+///
+/// `dev_t` is `i32` on macOS while Linux's is already `u64`; normalize to
+/// the `u64` the creation identity carries (`MetadataExt::dev`). A negative
+/// device id fails closed: an unprovable identity means the caller preserves
+/// the entry, never unlinks it.
+#[cfg(unix)]
+// The `Result` is load-bearing on macOS (a negative `dev_t` fails closed) and
+// keeps every caller platform-uniform; on Linux the conversion is infallible,
+// which is the only target clippy sees here.
+#[allow(clippy::unnecessary_wraps)]
+fn stat_identity(stat: &rustix::fs::Stat) -> std::io::Result<(u64, u64)> {
+    #[cfg(target_os = "macos")]
+    let device = u64::try_from(stat.st_dev)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "negative device id"))?;
+    #[cfg(not(target_os = "macos"))]
+    let device = stat.st_dev;
+    Ok((device, stat.st_ino))
+}
+
+/// dev/ino of whatever entry `leaf` currently names beneath the retained
+/// parent, resolved through the directory handle without following a leaf
+/// symlink.
+#[cfg(unix)]
+fn retained_leaf_identity(parent: &File, leaf: &OsStr) -> std::io::Result<(u64, u64)> {
+    let stat = rustix::fs::statat(parent, leaf, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(std::io::Error::from)?;
+    stat_identity(&stat)
+}
+
+/// Remove the anchored `leaf` only while it is provably still bound to the
+/// object `created` names.
+///
+/// A proof-then-unlink pair (statat, then unlinkat) is two directory
+/// operations: an external writer that swaps the occupant between them has
+/// its newcomer destroyed by the unlink. This binds the removal to the
+/// verified identity instead:
+///
+/// 1. the leaf is opened `O_NOFOLLOW` through the retained parent, pinning
+///    the object a held handle refers to (a planted leaf symlink fails the
+///    open, and an unopenable leaf is unprovable);
+/// 2. the pinned object is fstat-verified against `created` — a mismatch
+///    means a newcomer occupies the name, which is preserved;
+/// 3. the entry is atomically relocated with the commit's own no-replace
+///    primitive onto a fresh randomized private name — a single directory
+///    operation, so the bind cannot tear, and the no-replace refusal on an
+///    occupied candidate preserves that occupant;
+/// 4. the private name is re-verified to name exactly the pinned object (a
+///    swap between the pin and the relocation moved a newcomer, which is
+///    renamed back where it was) — and only then unlinked, with the pin
+///    descriptor held through the removal and the outcome fd-verified.
+///
+/// Every unprovable step reports `false` and preserves every entry: debris
+/// is never destruction. Trust boundary of the final unlink: POSIX has no
+/// unlink-by-fd, so the verify→unlink window on the private name cannot be
+/// made atomic — an external writer can swap the occupant inside it. The
+/// removal is gated on a provable sole link and its outcome fd-verified
+/// (see [`unlink_fd_verified`]): a concurrent removal of an unrelated hard
+/// link can no longer counterfeit the expected link-count delta, and a
+/// wrong-object removal is detected and loudly reported instead of
+/// silently succeeding. The window is not fully closed — a writer
+/// manufacturing a create-link/remove-link pair inside the fstat→fstat
+/// window can still counterfeit the post-condition — and an
+/// operator/coordinator decision (accept the residual or redesign the
+/// cleanup contract to leave contested debris) remains open for the
+/// strictly atomic form.
+#[cfg(unix)]
+fn remove_anchored_leaf_bound_to_identity(
+    parent: &File,
+    leaf: &OsStr,
+    created: (u64, u64),
+) -> bool {
+    // Pin the leaf's current object without following a symlink planted at
+    // the name, and require it to be exactly the object this section
+    // created. An unprovable leaf (vanished, symlinked, unopenable) is
+    // preserved, as is a name a newcomer occupies.
+    let Some(pinned) = pin_created_leaf_identity(parent, leaf, created) else {
+        return false;
+    };
+    // Test-only seam inside the proof→bind window: the pinned object is
+    // verified, and the relocation that binds it to the private name has
+    // not run yet. A swap driven here exercises the relocation's re-verify
+    // and restore paths.
+    #[cfg(all(test, unix))]
+    run_retained_preflight_interpose(RetainedPreflightPhase::AfterProof, parent, leaf, leaf);
+
+    for _ in 0..8 {
+        if let Some(removed) = retire_leaf_bound_to_private_name(parent, leaf, created, &pinned) {
+            return removed;
+        }
+    }
+    false
+}
+
+/// Pin the leaf's current object with an `O_NOFOLLOW` open through the
+/// retained parent and require it to be exactly the object this section
+/// created. Returns the pinning descriptor — held across the bind so the
+/// proven object cannot be recycled mid-sequence — or `None` when the leaf
+/// is unprovable (vanished, symlinked, unopenable) or names a newcomer.
+#[cfg(unix)]
+fn pin_created_leaf_identity(
+    parent: &File,
+    leaf: &OsStr,
+    created: (u64, u64),
+) -> Option<rustix::fd::OwnedFd> {
+    let pinned = rustix::fs::openat(
+        parent,
+        leaf,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .ok()?;
+    let stat = rustix::fs::fstat(&pinned).ok()?;
+    if stat_identity(&stat).ok()? != created {
+        return None;
+    }
+    Some(pinned)
+}
+
+/// Relocate the verified leaf onto a fresh randomized private name with the
+/// no-replace primitive — one atomic directory operation binds the verified
+/// object to a name nothing else created — then prove the private name and
+/// remove it there. `Some(removed)` is definitive; `None` means the
+/// randomized candidate collided (`EXIST`) and another attempt may run.
+/// `pinned` is the descriptor holding the verified object, kept across the
+/// removal so its fd-relative post-condition cannot be spoofed by
+/// directory-entry games.
+#[cfg(unix)]
+fn retire_leaf_bound_to_private_name(
+    parent: &File,
+    leaf: &OsStr,
+    created: (u64, u64),
+    pinned: &rustix::fd::OwnedFd,
+) -> Option<bool> {
+    let retire_name = staged_sibling_name(leaf);
+    match rustix::fs::renameat_with(
+        parent,
+        leaf,
+        parent,
+        &retire_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => Some(unlink_bound_private_name(
+            parent,
+            &retire_name,
+            created,
+            leaf,
+            pinned,
+        )),
+        Err(rustix::io::Errno::EXIST) => None,
+        // An unsupported relocation primitive cannot prove the bind:
+        // preserve the entry exactly where it is.
+        Err(_) => Some(false),
+    }
+}
+
+/// Re-verify the bind: the private name must name exactly the created
+/// object. A mismatch means the leaf was swapped between the pin and the
+/// relocation, so the newcomer — not the probe — moved: put it back where
+/// it was and preserve it. Reports whether the verified object was removed.
+#[cfg(unix)]
+fn unlink_bound_private_name(
+    parent: &File,
+    retire_name: &OsStr,
+    created: (u64, u64),
+    leaf: &OsStr,
+    pinned: &rustix::fd::OwnedFd,
+) -> bool {
+    match retained_leaf_identity(parent, retire_name) {
+        Ok(identity) if identity == created => {
+            // Test-only seam inside the verify→unlink window: the private
+            // name has re-verified as the pinned object and the unlinkat
+            // has not run yet. A swap driven here exercises the
+            // fd-verified post-condition on the removal.
+            #[cfg(all(test, unix))]
+            run_retained_preflight_interpose(
+                RetainedPreflightPhase::AfterRetireVerify,
+                parent,
+                retire_name,
+                retire_name,
+            );
+            unlink_fd_verified(parent, retire_name, pinned)
+        }
+        _ => {
+            // Restore the displaced newcomer best-effort; if the original
+            // name is occupied again, the newcomer stays preserved at the
+            // private name.
+            let _ = rustix::fs::renameat_with(
+                parent,
+                retire_name,
+                parent,
+                leaf,
+                rustix::fs::RenameFlags::NOREPLACE,
+            );
+            false
+        }
+    }
+}
+
+/// Remove the private name with an fd-verified post-condition.
+///
+/// Trust boundary: POSIX has no unlink-by-fd, so the verify→unlink window
+/// on the private name cannot be closed — an external writer can swap the
+/// occupant between the re-verification and the [`unlinkat`]. Two measures
+/// bound what that window can cost:
+///
+/// * *Sole-link gate.* `st_nlink` is inode-global, not per-directory-entry,
+///   so the removal is attempted only when the pinned object has exactly
+///   one link — the private name is its only one. With a second link
+///   alive, a concurrent writer removing THAT link inside the
+///   fstat→fstat window would drop the count by one for an unrelated
+///   reason while the unlinkat destroyed a swapped-in foreign entry,
+///   counterfeiting the expected delta; the gate refuses such a removal
+///   outright and leaves the debris, attempting no unlink at all.
+/// * *fd-verified post-condition.* With one link, no unrelated removal
+///   can decrement the count, so the pinned object's link count dropping
+///   to zero through the held pin descriptor proves the removed entry
+///   referenced the pinned object. An unchanged count means a swap landed
+///   in the window and the unlinkat destroyed a foreign entry — reported
+///   loudly and refused, never reported success. Any other outcome is
+///   unprovable and refused with everything left where it lies.
+///
+/// Narrowed residual, stated precisely: a writer that can manufacture a
+/// create-link/remove-link pair *inside* the fstat→fstat window — unlink
+/// the sole link at the private name, plant a foreign entry, and make the
+/// count fall to zero for the plant — can still counterfeit the
+/// post-condition. The window is not fully closed; POSIX offers no
+/// unlink-by-fd. A strictly atomic identity-conditional unlink remains
+/// the recorded operator/coordinator decision (PR #237 precedent).
+///
+/// [`unlinkat`]: rustix::fs::unlinkat
+// The `u64::from` is load-bearing on macOS (`st_nlink` is `u16` there) and
+// keeps every caller platform-uniform; on Linux it is infallible, which is
+// the only target clippy sees here.
+#[allow(clippy::useless_conversion)]
+#[cfg(unix)]
+fn unlink_fd_verified(parent: &File, retire_name: &OsStr, pinned: &rustix::fd::OwnedFd) -> bool {
+    let Ok(before) = rustix::fs::fstat(pinned) else {
+        // Unprovable: the pin's link count is unreadable, so no removal
+        // outcome could be proven.
+        return false;
+    };
+    let links_before = u64::from(before.st_nlink);
+    // Sole-link gate: with more than one link alive, a concurrent writer
+    // removing an unrelated hard link inside the fstat→fstat window can
+    // counterfeit the expected delta while the unlinkat destroys a
+    // swapped-in foreign entry. Refuse and leave the debris — no unlink
+    // is attempted against an object whose removal outcome could not be
+    // proven.
+    if links_before != 1 {
+        tracing::warn!(
+            "retained-cleanup probe carries extra hard links; refusing the \
+             removal and leaving the debris"
+        );
+        return false;
+    }
+    if rustix::fs::unlinkat(parent, retire_name, rustix::fs::AtFlags::empty()).is_err() {
+        return false;
+    }
+    let Ok(after) = rustix::fs::fstat(pinned) else {
+        // The removal landed but its post-condition is unreadable: refuse
+        // rather than claim a success that cannot be proven.
+        tracing::warn!(
+            "retained-cleanup removal landed but its fd-verified post-condition is unreadable"
+        );
+        return false;
+    };
+    let links_after = u64::from(after.st_nlink);
+    // links_before is provably 1 here, so the proven success shape is
+    // exactly `links_after == 0`: the sole link went away through this
+    // removal.
+    if links_after == 0 {
+        return true;
+    }
+    if links_after == links_before {
+        tracing::error!(
+            "contested retained-cleanup destroyed an external writer's entry swapped \
+             into the verify-to-unlink window; refusing the removal"
+        );
+    }
+    false
+}
+
+/// Randomized staged-sibling leaf name, preserving the final extension.
+///
+/// `lofty` infers the format from the final extension, and the retained
+/// commit machinery addresses the staged copy by this exact leaf, so
+/// preserve only that extension: including the whole source name could
+/// overflow a filesystem's component-length limit for an otherwise valid
+/// long filename.
+fn staged_sibling_name(target_leaf: &OsStr) -> std::ffi::OsString {
+    let extension = Path::new(target_leaf)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let mut candidate_name =
+        std::ffi::OsString::from(format!("{TAG_WRITE_TEMP_PREFIX}{}", Uuid::new_v4()));
+    if let Some(extension) = extension.as_deref() {
+        candidate_name.push(".");
+        candidate_name.push(extension);
+    }
+    candidate_name
 }
 
 impl TempFile {
@@ -289,25 +632,15 @@ impl TempFile {
     /// rename fails with `EXDEV`). The name is randomized and created with
     /// `create_new` (`O_EXCL`) so it cannot collide with a concurrent save or
     /// follow a symlink an attacker planted at a predictable path.
-    fn create_beside(target: &Path) -> Result<(Self, std::fs::File)> {
+    ///
+    /// Error contexts name the target by `target_label`, never by `target`:
+    /// an authority-based caller's target is a native mount path that must
+    /// not leak into logs (see `replacement_path`).
+    fn create_beside(target: &Path, target_label: &str) -> Result<(Self, std::fs::File)> {
         let directory = target.parent().unwrap_or_else(|| Path::new("."));
-        let extension = target
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase);
 
         for _ in 0..8 {
-            // `lofty::read_from_path` infers the format from the final
-            // extension. Preserve only that extension: including the whole
-            // source name could overflow a filesystem's component-length
-            // limit for an otherwise valid long filename.
-            let mut candidate_name =
-                std::ffi::OsString::from(format!("{TAG_WRITE_TEMP_PREFIX}{}", Uuid::new_v4()));
-            if let Some(extension) = extension.as_deref() {
-                candidate_name.push(".");
-                candidate_name.push(extension);
-            }
-            let candidate = directory.join(candidate_name);
+            let candidate = directory.join(staged_sibling_name(target.as_os_str()));
 
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
@@ -339,6 +672,10 @@ impl TempFile {
                         Self {
                             path: candidate,
                             persisted: false,
+                            #[cfg(unix)]
+                            anchored_parent: None,
+                            #[cfg(unix)]
+                            created_identity: None,
                         },
                         file,
                     ))
@@ -346,16 +683,68 @@ impl TempFile {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
                     return Err(error).with_context(|| {
-                        format!("Failed to create a temp file beside {}", target.display())
+                        format!("Failed to create a temp file beside {target_label}")
                     })
                 }
             }
         }
 
-        anyhow::bail!(
-            "Failed to create a unique temp file beside {}",
-            target.display()
-        )
+        anyhow::bail!("Failed to create a unique temp file beside {target_label}")
+    }
+
+    /// Create an empty, exclusively owned temp file beside the admitted leaf
+    /// *through the retained parent handle* — the unix authority-based twin
+    /// of [`TempFile::create_beside`].
+    ///
+    /// The sibling is created with `openat(O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW)`
+    /// beneath the retained parent directory, so creation can neither
+    /// traverse a displaced ancestor nor follow a symlink planted at the
+    /// candidate name, and the copy starts from that handle without a
+    /// reopening window. The temp's `path` records only the bare leaf name:
+    /// every consumer — tagging, flush, commit, and the drop cleanup —
+    /// addresses the staged leaf through the retained parent, never through
+    /// a pathname. Error contexts name the target by `target_label`, never
+    /// by any path.
+    #[cfg(unix)]
+    fn create_beside_retained(
+        parent: &File,
+        leaf: &OsStr,
+        target_label: &str,
+    ) -> Result<(Self, std::fs::File)> {
+        for _ in 0..8 {
+            let candidate_name = staged_sibling_name(leaf);
+            match create_retained_sibling_exclusive(parent, &candidate_name) {
+                Ok(staged) => {
+                    // Capture the sibling's identity from the creation
+                    // handle: every later cleanup of this leaf proves the
+                    // entry still names this exact object before unlinking.
+                    let created_identity =
+                        retained_handle_identity(&staged).with_context(|| {
+                            format!("Failed to identity the staged sibling of {target_label}")
+                        })?;
+                    let cleanup_parent = parent.try_clone().with_context(|| {
+                        format!("Failed to retain the staging parent of {target_label}")
+                    })?;
+                    return Ok((
+                        Self {
+                            path: PathBuf::from(candidate_name),
+                            persisted: false,
+                            anchored_parent: Some(cleanup_parent),
+                            created_identity: Some(created_identity),
+                        },
+                        staged,
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Failed to create a temp file beside {target_label}")
+                    })
+                }
+            }
+        }
+
+        anyhow::bail!("Failed to create a unique temp file beside {target_label}")
     }
 
     fn path(&self) -> &Path {
@@ -389,7 +778,7 @@ impl TempFile {
     /// Atomically move the temp file onto `target`, disarming the cleanup.
     ///
     /// On failure `self` is dropped, so the temp file is still removed.
-    fn persist_to(mut self, target: &Path) -> Result<()> {
+    fn persist_to(&mut self, target: &Path) -> Result<()> {
         std::fs::rename(&self.path, target).with_context(|| {
             format!(
                 "Failed to atomically replace {} with the tagged copy",
@@ -398,6 +787,14 @@ impl TempFile {
         })?;
         self.persisted = true;
         Ok(())
+    }
+
+    /// Disarm the drop cleanup after an external authority renamed this temp
+    /// file into place. The staging name no longer exists, and a failed
+    /// best-effort cleanup of a name that was never persisted must not
+    /// mislead the guard.
+    fn disarm_cleanup(&mut self) {
+        self.persisted = true;
     }
 
     /// Remove a probe sibling and disarm the best-effort drop cleanup.
@@ -420,7 +817,43 @@ impl TempFile {
 impl Drop for TempFile {
     fn drop(&mut self) {
         if !self.persisted {
+            #[cfg(unix)]
+            if let Some(parent) = &self.anchored_parent {
+                // Anchored staging: unlink the staged leaf through the
+                // retained parent. `unlinkat` never follows a symlink at the
+                // leaf and resolves nothing above it, and the removal is
+                // bound to the object this section created (exact dev/ino,
+                // captured from the creation handle): the leaf is pinned by
+                // an O_NOFOLLOW open, verified, atomically relocated onto a
+                // fresh private name, re-verified, and only then unlinked —
+                // the cleanup removes exactly the entry this section created
+                // and can never mutate a directory the authority did not
+                // admit. An entry an external writer swapped into the name
+                // after stealing the staged leaf is debris we must preserve,
+                // never destroy.
+                let _ = self.remove_bound_to_created_identity(parent);
+                return;
+            }
             let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl TempFile {
+    /// Remove this anchored temp's leaf only while it provably still names
+    /// the object this section created.
+    ///
+    /// The removal is bound to the verified identity (see
+    /// [`remove_anchored_leaf_bound_to_identity`]): a swap between proof and
+    /// removal strands the newcomer as preserved debris instead of
+    /// destroying it. An uncaptured creation identity fails closed.
+    #[cfg(unix)]
+    fn remove_bound_to_created_identity(&self, parent: &File) -> bool {
+        match self.created_identity {
+            Some(created) => {
+                remove_anchored_leaf_bound_to_identity(parent, self.path.as_os_str(), created)
+            }
+            None => false,
         }
     }
 }
@@ -496,8 +929,8 @@ pub fn preflight_tag_write_target_access(path: &Path) -> Result<(), TagWritePref
             WindowsDacl::read_from(&source).map_err(|_| TagWritePreflightError::Unavailable)?;
         drop(source);
 
-        let (probe, creation_file) =
-            TempFile::create_beside(path).map_err(|_| TagWritePreflightError::Unavailable)?;
+        let (probe, creation_file) = TempFile::create_beside(path, &path.to_string_lossy())
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
         let dacl_result = source_dacl.apply_to(&creation_file);
         drop(creation_file);
         dacl_result.map_err(|_| TagWritePreflightError::Unavailable)?;
@@ -530,14 +963,15 @@ pub fn preflight_tag_write_directory(path: &Path) -> Result<(), TagWritePrefligh
     // Rehearse the complete metadata-only shape of the atomic replacement:
     // create two exclusive siblings, flush them, replace an existing sibling,
     // and require explicit cleanup. The user's audio file is never modified.
-    let (replacement, replacement_file) =
-        TempFile::create_beside(path).map_err(|_| TagWritePreflightError::Unavailable)?;
+    let (mut replacement, replacement_file) =
+        TempFile::create_beside(path, &path.to_string_lossy())
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
     let replacement_result = replacement_file.sync_all();
     drop(replacement_file);
     replacement_result.map_err(|_| TagWritePreflightError::Unavailable)?;
 
-    let (destination, destination_file) =
-        TempFile::create_beside(path).map_err(|_| TagWritePreflightError::Unavailable)?;
+    let (destination, destination_file) = TempFile::create_beside(path, &path.to_string_lossy())
+        .map_err(|_| TagWritePreflightError::Unavailable)?;
     let destination_result = destination_file.sync_all();
     drop(destination_file);
     destination_result.map_err(|_| TagWritePreflightError::Unavailable)?;
@@ -554,6 +988,105 @@ pub fn preflight_tag_write_directory(path: &Path) -> Result<(), TagWritePrefligh
 pub fn preflight_tag_write(path: &Path) -> Result<(), TagWritePreflightError> {
     preflight_tag_write_target_access(path)?;
     preflight_tag_write_directory(path)
+}
+
+/// Rehearse the anchored replacement's directory mechanics through the
+/// retained parent handle — the anchored twin of
+/// [`preflight_tag_write_directory`].
+///
+/// The rehearsal exclusively creates one private probe sibling beneath the
+/// retained parent, flushes it, renames it onto a fresh vacant candidate
+/// name with the anchored commit's own no-replace install primitive
+/// (`renameat2(RENAME_NOREPLACE)` through the retained directory), and
+/// unlinks the result: the same create, install, and remove shapes the
+/// anchored writer performs, addressed entirely through the directory
+/// handle. No absolute pathname is resolved, so an ancestor displaced
+/// after the authority's validation can neither take the probe outside
+/// the admitted mount directory nor reject a rehearsal the anchored
+/// writer could safely perform.
+///
+/// Rehearsing the no-replace primitive itself is the point: the commit
+/// fails closed on filesystems without `RENAME_NOREPLACE` support, so a
+/// rehearsal that only exercised a plain overwriting rename would report
+/// such volumes write-capable and doom every later commit to fail. Here
+/// the unsupported primitive refuses the rehearsal, surfacing the
+/// limitation before the user edits.
+///
+/// `leaf` is the admitted file's leaf name; it only seeds the randomized
+/// probe names' extension. Error contexts name the target by
+/// `target_label`, never by any path. On any failure the dropped probe
+/// sibling cleans itself up through the retained parent.
+///
+/// This performs blocking filesystem I/O and must not run on the GTK
+/// thread.
+#[cfg(unix)]
+pub fn preflight_tag_write_directory_retained(
+    parent: &std::fs::File,
+    leaf: &OsStr,
+    target_label: &str,
+) -> Result<(), TagWritePreflightError> {
+    // Create and flush one private probe sibling beneath the retained
+    // parent — the create-and-flush shape the anchored commit performs on
+    // its staged copy.
+    let (mut replacement, replacement_file) =
+        TempFile::create_beside_retained(parent, leaf, target_label)
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
+    replacement_file
+        .sync_all()
+        .map_err(|_| TagWritePreflightError::Unavailable)?;
+    drop(replacement_file);
+
+    // Install the probe with the anchored commit's own primitive: a
+    // no-replace rename onto a fresh vacant candidate name through the
+    // retained parent. An occupied destination (or a filesystem without
+    // flag support) refuses the rehearsal instead of being overwritten.
+    let vacant_name = staged_sibling_name(leaf);
+    #[cfg(all(test, unix))]
+    run_retained_preflight_interpose(
+        RetainedPreflightPhase::BeforeInstall,
+        parent,
+        replacement.path().as_os_str(),
+        &vacant_name,
+    );
+    rustix::fs::renameat_with(
+        parent,
+        replacement.path().as_os_str(),
+        parent,
+        &vacant_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|_| TagWritePreflightError::Unavailable)?;
+
+    // The probe now lives at the vacant name. Aim the drop guard's
+    // anchored cleanup at that leaf, then remove it through a removal
+    // bound to the probe's verified identity: the landed leaf is pinned
+    // by an O_NOFOLLOW open, fstat-verified, atomically relocated onto a
+    // fresh private name with the commit's own no-replace primitive,
+    // re-verified there, and only then unlinked. A swap in any window
+    // strands the newcomer on a provably-wrong identity — preserved
+    // debris, never destruction — and the rehearsal refuses, because a
+    // capability check is successful only when its own cleanup provably
+    // succeeded.
+    replacement.path = PathBuf::from(&vacant_name);
+    #[cfg(all(test, unix))]
+    run_retained_preflight_interpose(
+        RetainedPreflightPhase::BeforeCleanup,
+        parent,
+        replacement.path().as_os_str(),
+        &vacant_name,
+    );
+    if !replacement.remove_bound_to_created_identity(parent) {
+        // The landed leaf could not be provably removed as this section's
+        // probe: an external writer swapped the entry inside the
+        // install→cleanup window, or it vanished. Preserve the newcomer
+        // (and the stolen probe, now debris) — debris is never
+        // destruction — disarm the guard, and refuse: a capability check
+        // is successful only when its own cleanup provably succeeded.
+        replacement.disarm_cleanup();
+        return Err(TagWritePreflightError::Unavailable);
+    }
+    replacement.disarm_cleanup();
+    Ok(())
 }
 
 /// Write tag edits to an audio file.
@@ -586,67 +1119,436 @@ pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
         }
     }
 
-    // Copy the file to an exclusively created sibling, tag the copy, then
-    // atomically rename it back, so a power loss, panic, or full disk
-    // mid-write leaves the original audio file untouched. The cost is one full
-    // file copy per save, which is fine for interactive tag editing.
-    //
-    // `temp` removes itself on every early return below.
-    let mut source = std::fs::File::open(path)
+    // The local pathname is user-visible, so naming it in error contexts is
+    // fine here — unlike the authority-based writer below.
+    let target_label = path.to_string_lossy();
+    let source = std::fs::File::open(path)
         .with_context(|| format!("Failed to open {} for tag writing", path.display()))?;
+    atomic_tag_replacement(source, path, &target_label, edits, |temp| {
+        temp.persist_to(path)
+    })
+}
+
+/// Write tag edits to one exact file beneath a retained mounted authority.
+///
+/// This is the removable-media form of [`write_tags`]. The read source is the
+/// retained exact file object — never a pathname lookup — and the atomic
+/// replacement is confirmed and performed by the retained authority itself:
+/// the mounted root, the retained ancestry, and the exact pathname must still
+/// name the file the authority admitted, revalidated immediately before the
+/// rename, and the rename runs relative to the retained parent directory so
+/// no pathname resolution can retarget it. Every failure leaves the target
+/// untouched. This is a blocking operation — call from a background thread.
+pub fn write_tags_with_mutation_target(
+    target: &MountedMutationTarget,
+    edits: &TagEdits,
+) -> Result<()> {
+    if edits.is_empty() {
+        return Ok(());
+    }
+
+    // Reject the whole edit before touching the authority. A file must never
+    // be rewritten for an edit we are going to silently discard.
+    edits.validate()?;
+
+    if !supports_tag_writes(target.replacement_path()) {
+        anyhow::bail!(
+            "Unsupported format for tag writing: {}",
+            target
+                .replacement_path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("unknown")
+        );
+    }
+
+    // Open the serialized commit section first: it revalidates the mount,
+    // the retained ancestry, and the exact retained file before any byte is
+    // read, and holds the target's commit lock through the replacement.
+    let mut commit = target.begin_commit().map_err(|error| {
+        anyhow::anyhow!("The retained mutation authority is no longer valid: {error}")
+    })?;
+    let source = commit
+        .source_file()
+        .with_context(|| "Failed to read the exact retained mutation target".to_string())?;
+    write_tag_edits_for_commit(&mut commit, source, target, edits)
+}
+
+/// Perform the staged tag replacement for an open commit section.
+///
+/// The replacement path is a native mount path whose contract forbids
+/// logging or formatting it, so every error context names the target by a
+/// redacted label instead of the path — the removable-media error branch
+/// surfaces the whole chain to the user.
+#[cfg(unix)]
+#[cfg_attr(
+    not(test),
+    allow(unused_variables) // only the test-only staging seam reads the target
+)]
+fn write_tag_edits_for_commit(
+    commit: &mut MountedMutationCommit<'_>,
+    source: File,
+    target: &MountedMutationTarget,
+    edits: &TagEdits,
+) -> Result<()> {
+    // Anchor the staging at the retained parent before anything is staged:
+    // the pinned parent identity makes staging and the later install agree
+    // on one directory object, and no step below ever resolves an absolute
+    // pathname.
+    let (staging_parent, staged_leaf) = commit.retained_staging_anchor().map_err(|error| {
+        anyhow::Error::new(error).context("The retained mutation authority lost the staging parent")
+    })?;
+    #[cfg(test)]
+    run_pre_staging_interpose(target);
+    anchored_atomic_tag_replacement(
+        source,
+        &staging_parent,
+        &staged_leaf,
+        "the retained mutation target",
+        edits,
+        |temp, expected_staged| {
+            finish_committed_tag_replacement(commit, temp, Some(expected_staged))
+        },
+    )
+}
+
+/// Platforms without retained parent handles keep the documented path-based
+/// staging discipline: the commit re-proves the admitted identity through
+/// the pathname before anything is installed, and a staging area stranded
+/// by a displaced ancestor is refused and cleaned up by pathname.
+#[cfg(not(unix))]
+fn write_tag_edits_for_commit(
+    commit: &mut MountedMutationCommit<'_>,
+    source: File,
+    target: &MountedMutationTarget,
+    edits: &TagEdits,
+) -> Result<()> {
+    let replacement_path = target.replacement_path().to_path_buf();
+    atomic_tag_replacement(
+        source,
+        &replacement_path,
+        "the retained mutation target",
+        edits,
+        |temp| finish_committed_tag_replacement(commit, temp, None),
+    )
+}
+
+/// Rename the staged copy into place through the retained authority and
+/// disarm the staging cleanup once the authority owns the name.
+///
+/// The replacement and the re-anchor of the retained evidence to the
+/// installed object both happen inside the commit section, while its guard
+/// still holds the target's commit lock — the re-anchor is
+/// identity-conditioned on the proven landing, so no pathname is ever
+/// opened outside the guard and no leaf swap between the landing and the
+/// re-anchor can be silently adopted.
+///
+/// `expected_staged_identity` is the identity captured from the tagged
+/// staging handle before the commit reopens the staging leaf: the commit
+/// verifies the leaf still names that exact object before anything is
+/// displaced. Path-based staging flows have no retained handle and pass
+/// `None`.
+fn finish_committed_tag_replacement(
+    commit: &mut MountedMutationCommit<'_>,
+    temp: &mut TempFile,
+    expected_staged_identity: Option<&ObjectIdentity>,
+) -> Result<()> {
+    commit
+        .commit_replacement(temp.path(), expected_staged_identity)
+        .map_err(|error| {
+            anyhow::Error::new(error)
+                .context("The retained mutation authority refused the tagged replacement")
+        })?;
+    // The retained authority renamed the staged copy into place; the
+    // staging name no longer exists for the drop guard to remove.
+    temp.disarm_cleanup();
+    Ok(())
+}
+
+/// Stage and tag the admitted file's replacement with every staged access
+/// anchored at the retained parent handle (unix).
+///
+/// [`TempFile::create_beside_retained`] creates the exclusively-created
+/// sibling beneath the retained parent; the admitted bytes are copied into
+/// that handle; tagging reads and saves through the same handle; and the
+/// flush, permission carry-over, and — on every failure path — the drop
+/// cleanup address the staged leaf through the retained parent as well.
+/// [`finish_committed_tag_replacement`] then consumes the staged copy by
+/// leaf name through the retained parent. No step resolves an absolute
+/// pathname, so an ancestor displaced after the section's validation can
+/// neither strand the staging area in an impostor directory nor leak the
+/// complete tagged copy of the admitted file across a symlink planted at
+/// an old name.
+#[cfg(unix)]
+fn anchored_atomic_tag_replacement(
+    mut source: File,
+    staging_parent: &File,
+    staged_leaf: &OsStr,
+    target_label: &str,
+    edits: &TagEdits,
+    commit_replacement: impl FnOnce(&mut TempFile, &ObjectIdentity) -> Result<()>,
+) -> Result<()> {
+    let (mut temp, mut staged) =
+        TempFile::create_beside_retained(staging_parent, staged_leaf, target_label)?;
+    let copy_result = copy_source_into_destination(&mut source, &mut staged, target_label);
+    // Capture the replacement's Unix permissions from the exact source
+    // object while the handle is still open — never from a lookup at any
+    // pathname, which an external writer can retarget (same discipline as
+    // the path-based flow).
+    let retained_permissions = source
+        .metadata()
+        .ok()
+        .map(|metadata| metadata.permissions());
+    drop(source);
+    copy_result?;
+
+    write_tags_to_retained(&mut staged, target_label, edits)?;
+    flush_and_prepare_tagged_copy_retained(&staged, target_label, retained_permissions)?;
+    // Capture the tagged staging object's identity from its retained
+    // handle before the handle is dropped. The commit reopens the staging
+    // leaf by name and verifies it still names this exact object before
+    // anything is displaced, so a stranger swapped over the staging name
+    // in the drop-to-commit window refuses the commit instead of being
+    // installed as if it were the tagged copy.
+    let staged_identity = object_identity(&staged).with_context(|| {
+        format!("The tagged staging copy of {target_label} could not be identified for the commit")
+    })?;
+    drop(staged);
+    commit_replacement(&mut temp, &staged_identity)?;
+
+    tracing::debug!("Tags written successfully");
+    Ok(())
+}
+
+/// Rewind the staged copy and parse it through its retained handle, guessing
+/// the format from the content — the anchored twin of the path-based read
+/// half of [`write_tags_to`], never touching a pathname.
+#[cfg(unix)]
+fn read_tagged_file_retained(staged: &mut File, target_label: &str) -> Result<TaggedFile> {
+    use std::io::Seek;
+
+    staged
+        .rewind()
+        .with_context(|| format!("Failed to read tags from {target_label}"))?;
+    lofty::probe::Probe::new(&mut *staged)
+        .guess_file_type()
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("Failed to read tags from {target_label}"))?
+        .read()
+        .with_context(|| format!("Failed to read tags from {target_label}"))
+}
+
+/// Probe, edit, and save the staged copy through its retained handle — the
+/// anchored twin of [`write_tags_to`], never touching a pathname.
+///
+/// lofty's own `save_to_path` is *open a fresh read/write handle, then*
+/// `save_to`, so driving the same `save_to` through the anchored sibling
+/// handle at position zero is behavior-identical to the path-based flow;
+/// the format is guessed from the content instead of the staged name, which
+/// the name's random prefix would not identify anyway.
+#[cfg(unix)]
+fn write_tags_to_retained(staged: &mut File, target_label: &str, edits: &TagEdits) -> Result<()> {
+    use std::io::Seek;
+
+    let mut tagged_file = read_tagged_file_retained(staged, target_label)?;
+
+    let tag = ensure_primary_tag(&mut tagged_file, target_label)?;
+    apply_tag_edits(tag, edits)?;
+
+    staged
+        .rewind()
+        .with_context(|| format!("Failed to write tags to {target_label}"))?;
+    tag.save_to(staged, WriteOptions::default())
+        .with_context(|| format!("Failed to write tags to {target_label}"))?;
+    Ok(())
+}
+
+/// Flush the tagged copy and carry over the source permissions, addressing
+/// the staged leaf through its retained handle — the anchored twin of
+/// [`flush_and_prepare_tagged_copy`]. The flush happens *before* the
+/// permission copy, exactly like the path-based flow: a read-only file
+/// cannot be flushed.
+#[cfg(unix)]
+fn flush_and_prepare_tagged_copy_retained(
+    staged: &File,
+    target_label: &str,
+    retained_permissions: Option<std::fs::Permissions>,
+) -> Result<()> {
+    staged
+        .sync_all()
+        .with_context(|| format!("Failed to flush the tagged copy of {target_label}"))?;
+
+    // Best-effort, exactly like the path-based flow: a capture failure
+    // skips the carry-over rather than failing the write.
+    if let Some(permissions) = retained_permissions {
+        let _ = staged.set_permissions(permissions);
+    }
+
+    Ok(())
+}
+
+/// `openat(parent, name, O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0o600)`
+/// — the creation twin of the retained-parent opens the commit machinery
+/// already performs. Resolution starts at the retained parent handle, the
+/// final component never follows a symlink, the exclusive create refuses an
+/// occupied name, and the private mode keeps a full source copy unexposed
+/// before final permissions are applied.
+#[cfg(unix)]
+fn create_retained_sibling_exclusive(
+    parent: &File,
+    name: &OsStr,
+) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(std::fs::File::from(descriptor))
+}
+
+/// Copy `source` to an exclusively created sibling of `target_path`, tag the
+/// copy, flush it, and hand it to `commit_replacement` for the atomic
+/// replacement of `target_path`.
+///
+/// This is the path-based staging flow: the user-visible pathname writer
+/// uses it directly, and platforms without retained parent handles keep it
+/// as their documented authority-based staging discipline (their commit
+/// re-proves the admitted identity through the pathname before anything is
+/// installed). Unix authority-based callers stage through the retained
+/// parent instead — see [`anchored_atomic_tag_replacement`].
+///
+/// `commit_replacement` runs after the flush and permission carry-over and
+/// owns the entire final gate: authority-checked callers prove the exact
+/// target identity there and perform the rename through retained handles.
+/// Path-based callers have no retained identity to compare and simply rename
+/// the staged copy into place; the rename itself is their point-in-time
+/// replacement.
+///
+/// Error contexts never format `target_path`: an authority-based caller's
+/// target is a native mount path that must not leak into logs, so contexts
+/// name the target by `target_label` instead. Path-based callers pass the
+/// user-visible pathname's own text.
+fn atomic_tag_replacement(
+    source: File,
+    target_path: &Path,
+    target_label: &str,
+    edits: &TagEdits,
+    commit_replacement: impl FnOnce(&mut TempFile) -> Result<()>,
+) -> Result<()> {
+    let mut source = source;
     #[cfg(target_os = "windows")]
     let source_dacl = WindowsDacl::read_from(&source)
-        .with_context(|| format!("Failed to read the Windows DACL of {}", path.display()))?;
+        .with_context(|| format!("Failed to read the Windows DACL of {target_label}"))?;
 
-    let (temp, destination) = TempFile::create_beside(path)?;
+    let (mut temp, destination) = TempFile::create_beside(target_path, target_label)?;
     #[cfg(target_os = "windows")]
-    let mut destination = {
-        let security_result = source_dacl.apply_to(&destination).with_context(|| {
-            format!(
-                "Failed to protect the tagged copy of {} with its original Windows DACL",
-                path.display()
-            )
-        });
-        drop(destination);
-        security_result?;
-        temp.reopen_exclusive_for_tagging().with_context(|| {
-            format!(
-                "The original Windows DACL of {} does not permit writing the tagged copy",
-                path.display()
-            )
-        })?
-    };
+    let mut destination = open_tag_copy_destination(source_dacl, destination, &temp, target_label)?;
     #[cfg(not(target_os = "windows"))]
     let mut destination = destination;
-    let copy_result = std::io::copy(&mut source, &mut destination)
-        .map(|_| ())
-        .with_context(|| format!("Failed to copy {} for tag writing", path.display()));
+    let copy_result = copy_source_into_destination(&mut source, &mut destination, target_label);
+    // Capture the replacement's Unix permissions from the exact source
+    // object while the handle is still open. A target_path lookup here would
+    // read whatever occupies the name at commit time — not necessarily the
+    // file whose bytes were just copied — so an external writer that
+    // temporarily swaps the pathname to a permissive file could launder those
+    // permissions onto the committed replacement.
+    #[cfg(unix)]
+    let retained_permissions = source
+        .metadata()
+        .ok()
+        .map(|metadata| metadata.permissions());
     drop(source);
     drop(destination);
     copy_result?;
 
-    write_tags_to(temp.path(), edits)?;
+    write_tags_to(temp.path(), target_label, edits)?;
+    #[cfg(unix)]
+    flush_and_prepare_tagged_copy(&temp, target_label, retained_permissions)?;
+    #[cfg(not(unix))]
+    flush_and_prepare_tagged_copy(&temp, target_label)?;
+    commit_replacement(&mut temp)?;
 
+    tracing::debug!("Tags written successfully");
+    Ok(())
+}
+
+/// Protect the tagged copy with the source file's original DACL and reopen it
+/// exclusively for tagging.
+///
+/// Windows attribute inheritance applies at creation: the complete DACL must
+/// be installed before the first copied byte, and installing it can strip the
+/// creation handle's write access, so tagging reopens a fresh exclusive
+/// handle afterwards.
+#[cfg(target_os = "windows")]
+fn open_tag_copy_destination(
+    source_dacl: WindowsDacl,
+    destination: File,
+    temp: &TempFile,
+    target_label: &str,
+) -> Result<File> {
+    let security_result = source_dacl.apply_to(&destination).with_context(|| {
+        format!(
+            "Failed to protect the tagged copy of {target_label} with its original Windows DACL",
+        )
+    });
+    drop(destination);
+    security_result?;
+    temp.reopen_exclusive_for_tagging().with_context(|| {
+        format!(
+            "The original Windows DACL of {target_label} does not permit writing the tagged copy",
+        )
+    })
+}
+
+/// Copy the source bytes into the tagged copy, reporting but not raising a
+/// copy failure so the caller can release both handles before surfacing it.
+fn copy_source_into_destination(
+    source: &mut File,
+    destination: &mut File,
+    target_label: &str,
+) -> Result<()> {
+    std::io::copy(source, destination)
+        .map(|_| ())
+        .with_context(|| format!("Failed to copy {target_label} for tag writing"))
+}
+
+/// Flush the tagged copy and carry over the source file's Unix permissions
+/// before the caller's final replacement gate runs.
+///
+/// The flush happens *before* the permission copy: replacing a read-only file
+/// would otherwise make the temp read-only too, and a read-only file cannot
+/// be flushed. Windows installs the complete DACL before the first copied
+/// byte; its std Permissions value represents only the DOS read-only
+/// attribute, so the permission carry-over is Unix-only.
+///
+/// `retained_permissions` is captured from the source file handle — the exact
+/// object whose bytes were copied — never from a lookup at the target's name,
+/// which an external writer can retarget between admission and commit. Error
+/// contexts name the target by `target_label`, never by its native pathname.
+fn flush_and_prepare_tagged_copy(
+    temp: &TempFile,
+    target_label: &str,
+    #[cfg(unix)] retained_permissions: Option<std::fs::Permissions>,
+) -> Result<()> {
     // Flush the tagged copy before it becomes the user's file. Without this a
     // crash between rename and writeback can leave a truncated file where the
     // original used to be.
-    //
-    // This happens *before* the permission copy below: replacing a read-only
-    // file would otherwise make the temp read-only too, and a read-only file
-    // cannot be flushed.
     flush_to_disk(temp.path())
-        .with_context(|| format!("Failed to flush the tagged copy of {}", path.display()))?;
+        .with_context(|| format!("Failed to flush the tagged copy of {target_label}"))?;
 
-    // Best-effort: match the Unix permissions of the file being replaced.
-    // Windows installs the complete DACL before the first copied byte above;
-    // its std Permissions value represents only the DOS read-only attribute.
+    // Best-effort: match the Unix permissions of the exact file object the
+    // bytes were copied from. A capture failure skips the carry-over rather
+    // than failing the write; the replacement never invents permissions it
+    // could not prove.
     #[cfg(unix)]
-    if let Ok(metadata) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(temp.path(), metadata.permissions());
+    if let Some(permissions) = retained_permissions {
+        let _ = std::fs::set_permissions(temp.path(), permissions);
     }
 
-    temp.persist_to(path)?;
-    tracing::debug!("Tags written successfully");
     Ok(())
 }
 
@@ -664,28 +1566,59 @@ fn flush_to_disk(path: &Path) -> std::io::Result<()> {
 }
 
 /// Apply `edits` to the tags of the file at `temp_path` in-place.
-fn write_tags_to(temp_path: &Path, edits: &TagEdits) -> Result<()> {
+///
+/// Error contexts name the target by `target_label`, never by `temp_path`:
+/// the staged copy is created beside the target, so its path points inside
+/// the target's own directory — a native mount directory for
+/// authority-based callers — and formatting it would leak exactly the
+/// location the redacted label exists to protect.
+fn write_tags_to(temp_path: &Path, target_label: &str, edits: &TagEdits) -> Result<()> {
     let mut tagged_file = lofty::read_from_path(temp_path)
-        .with_context(|| format!("Failed to read tags from {}", temp_path.display()))?;
+        .with_context(|| format!("Failed to read tags from {target_label}"))?;
 
-    // Get or create the primary tag for this file type. Files with no
-    // existing primary tag (e.g. a stripped MP3, or a FLAC without a Vorbis
-    // comment block) need a fresh tag of the file's primary type so new
-    // metadata can be authored on them — primary_tag_mut() alone never
-    // creates one.
+    let tag = ensure_primary_tag(&mut tagged_file, target_label)?;
+    apply_tag_edits(tag, edits)?;
+
+    // Save back to the temp file.
+    tag.save_to_path(temp_path, WriteOptions::default())
+        .with_context(|| format!("Failed to write tags to {target_label}"))?;
+
+    Ok(())
+}
+
+/// Get or create the primary tag for this file type. Files with no
+/// existing primary tag (e.g. a stripped MP3, or a FLAC without a Vorbis
+/// comment block) need a fresh tag of the file's primary type so new
+/// metadata can be authored on them — primary_tag_mut() alone never
+/// creates one.
+///
+/// Errors name the target by `target_label`, never by any path.
+fn ensure_primary_tag<'a>(
+    tagged_file: &'a mut TaggedFile,
+    target_label: &str,
+) -> Result<&'a mut Tag> {
     if tagged_file.primary_tag_mut().is_none() {
         let tag_type = tagged_file.primary_tag_type();
-        tagged_file.insert_tag(lofty::tag::Tag::new(tag_type));
+        tagged_file.insert_tag(Tag::new(tag_type));
     }
 
-    let tag = tagged_file.primary_tag_mut().ok_or_else(|| {
-        anyhow::anyhow!(
-            "No primary tag found and cannot create one for {}",
-            temp_path.display()
-        )
-    })?;
+    tagged_file.primary_tag_mut().ok_or_else(|| {
+        anyhow::anyhow!("No primary tag found and cannot create one for {target_label}")
+    })
+}
 
-    // Apply edits — only touch fields that are Some.
+/// Apply every requested edit to `tag` — only touch fields that are Some —
+/// in the order the edits were declared, so field application order stays
+/// stable across refactors.
+fn apply_tag_edits(tag: &mut Tag, edits: &TagEdits) -> Result<()> {
+    apply_core_text_edits(tag, edits);
+    apply_contributor_and_genre_edits(tag, edits);
+    apply_number_edits(tag, edits)?;
+    apply_comment_edit(tag, edits);
+    Ok(())
+}
+
+fn apply_core_text_edits(tag: &mut Tag, edits: &TagEdits) {
     if let Some(ref title) = edits.title {
         if title.is_empty() {
             tag.remove_title();
@@ -709,7 +1642,9 @@ fn write_tags_to(temp_path: &Path, edits: &TagEdits) -> Result<()> {
             tag.set_album(album.clone());
         }
     }
+}
 
+fn apply_contributor_and_genre_edits(tag: &mut Tag, edits: &TagEdits) {
     // The album-artist edit was previously declared and counted toward
     // `is_empty()`, but never applied — the file was rewritten and the field
     // silently ignored.
@@ -742,9 +1677,11 @@ fn write_tags_to(temp_path: &Path, edits: &TagEdits) -> Result<()> {
             ));
         }
     }
+}
 
-    // These re-parse rather than trusting the caller: an unparseable value must
-    // fail the write, never vanish.
+/// These re-parse rather than trusting the caller: an unparseable value must
+/// fail the write, never vanish.
+fn apply_number_edits(tag: &mut Tag, edits: &TagEdits) -> Result<()> {
     match parse_tag_number("Year", edits.year.as_deref())? {
         NumberEdit::Unchanged => {}
         NumberEdit::Clear => tag.remove_key(ItemKey::Year),
@@ -768,6 +1705,10 @@ fn write_tags_to(temp_path: &Path, edits: &TagEdits) -> Result<()> {
         NumberEdit::Set(disc) => tag.set_disk(disc),
     }
 
+    Ok(())
+}
+
+fn apply_comment_edit(tag: &mut Tag, edits: &TagEdits) {
     if let Some(ref comment) = edits.comment {
         if comment.is_empty() {
             tag.remove_comment();
@@ -775,12 +1716,131 @@ fn write_tags_to(temp_path: &Path, edits: &TagEdits) -> Result<()> {
             tag.set_comment(comment.clone());
         }
     }
+}
 
-    // Save back to the temp file.
-    tag.save_to_path(temp_path, WriteOptions::default())
-        .with_context(|| format!("Failed to write tags to {}", temp_path.display()))?;
+/// Test-only seam: runs between the commit section's validation and the
+/// staging of the tagged copy, driving the exact window an external writer
+/// needs to displace an ancestor after validation and before staging. The
+/// regression tests plant an impostor directory or symlink at the displaced
+/// ancestor's old name here and assert the staged copy never appears on the
+/// other side.
+#[cfg(all(test, unix))]
+type PreStagingInterpose = dyn Fn(&MountedMutationTarget) + Send + Sync;
 
-    Ok(())
+#[cfg(all(test, unix))]
+static PRE_STAGING_INTERPOSE: std::sync::Mutex<Option<Box<PreStagingInterpose>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, unix))]
+static PRE_STAGING_INTERPOSE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(test, unix))]
+fn run_pre_staging_interpose(target: &MountedMutationTarget) {
+    if let Some(interpose) = PRE_STAGING_INTERPOSE.lock().unwrap().as_ref() {
+        interpose(target);
+    }
+}
+
+/// Serialize tests that use the pre-staging interposition seam.
+#[cfg(all(test, unix))]
+fn with_pre_staging_interpose(interpose: Box<PreStagingInterpose>, run: impl FnOnce()) {
+    let _serial = PRE_STAGING_INTERPOSE_SERIAL.lock().unwrap();
+    *PRE_STAGING_INTERPOSE.lock().unwrap() = Some(interpose);
+    run();
+    *PRE_STAGING_INTERPOSE.lock().unwrap() = None;
+}
+
+/// The retained-preflight rehearsal windows a regression test can observe.
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RetainedPreflightPhase {
+    /// Immediately before the no-replace install rename: the probe sibling
+    /// is staged and the rename candidate is still vacant.
+    BeforeInstall,
+    /// Immediately after the install rename landed, before the landed-probe
+    /// cleanup proves and removes it: the external-swap window the cleanup's
+    /// identity proof guards.
+    BeforeCleanup,
+    /// Inside the bound removal, after the landed leaf's pinned object is
+    /// verified and before the relocation binds it to the private name:
+    /// the proof→bind window the identity-bound removal's re-verify and
+    /// restore paths guard. Both leaf arguments carry the landed leaf.
+    AfterProof,
+    /// Inside the bound removal, after the private name re-verified as the
+    /// pinned object and before the unlinkat removes it: the verify→unlink
+    /// window the fd-verified post-condition guards. Both leaf arguments
+    /// carry the private name about to be removed.
+    AfterRetireVerify,
+}
+
+/// Test-only seam: runs at each [`RetainedPreflightPhase`] of the retained
+/// preflight rehearsal, receiving the phase, the retained parent handle, the
+/// staged probe sibling's leaf, and the fresh vacant candidate leaf the
+/// rehearsal renames onto (for the bound-removal windows, both leaf slots
+/// carry the window's private/landed leaf name instead). The regression
+/// tests observe the rehearsal's exact shape (a staged probe; a rename
+/// target that is vacant; a landed probe before cleanup; a re-verified
+/// private name before removal) — occupying the candidate name proves the
+/// rename refuses a replacement (the no-replace primitive the anchored
+/// commit installs with), and swapping the landed probe or the re-verified
+/// private name proves the cleanup removes exactly the entry the rehearsal
+/// created and reports a contested removal instead of silently succeeding.
+#[cfg(all(test, unix))]
+type RetainedPreflightInterpose =
+    dyn Fn(RetainedPreflightPhase, &std::fs::File, &OsStr, &OsStr) + Send + Sync;
+
+// The seam slot is THREAD-LOCAL: an armed closure is visible only to
+// firings on the thread that armed it. Every seam test drives its own
+// rehearsal synchronously on its own thread, while the Rust harness runs
+// tests in parallel on distinct threads — a process-wide slot let a
+// parallel, seam-less test's rehearsal observe another test's armed
+// closure (every rehearsal passes the same phases, so the windows match),
+// stealing the probe from a foreign fixture and failing an innocent test.
+// Per-thread storage makes cross-test firing structurally impossible.
+#[cfg(all(test, unix))]
+thread_local! {
+    static RETAINED_PREFLIGHT_INTERPOSE:
+        std::cell::RefCell<Option<Box<RetainedPreflightInterpose>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Serialize tests that use the retained-preflight interposition seam.
+#[cfg(all(test, unix))]
+static RETAINED_PREFLIGHT_INTERPOSE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(test, unix))]
+fn run_retained_preflight_interpose(
+    phase: RetainedPreflightPhase,
+    parent: &std::fs::File,
+    probe: &OsStr,
+    vacant: &OsStr,
+) {
+    RETAINED_PREFLIGHT_INTERPOSE.with(|slot| {
+        if let Some(interpose) = slot.borrow().as_ref() {
+            interpose(phase, parent, probe, vacant);
+        }
+    });
+}
+
+/// Arm `interpose` for the duration of `run` on THIS thread, serializing
+/// against other tests that use the seam. A drop guard uninstalls the
+/// closure, so a panicking observation cannot leave a stale seam armed for
+/// a later test on this thread.
+#[cfg(all(test, unix))]
+fn with_retained_preflight_interpose(
+    interpose: Box<RetainedPreflightInterpose>,
+    run: impl FnOnce(),
+) {
+    struct UninstallRetainedPreflightInterpose;
+    impl Drop for UninstallRetainedPreflightInterpose {
+        fn drop(&mut self) {
+            RETAINED_PREFLIGHT_INTERPOSE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    let _serial = RETAINED_PREFLIGHT_INTERPOSE_SERIAL.lock().unwrap();
+    RETAINED_PREFLIGHT_INTERPOSE.with(|slot| *slot.borrow_mut() = Some(interpose));
+    let _uninstall = UninstallRetainedPreflightInterpose;
+    run();
 }
 
 #[cfg(test)]
@@ -934,7 +1994,8 @@ mod tests {
 
         let directory = TestDirectory::new("private-mode");
         let track = directory.path.join("song.flac");
-        let (temp, file) = TempFile::create_beside(&track).expect("create private sibling");
+        let (temp, file) = TempFile::create_beside(&track, &track.to_string_lossy())
+            .expect("create private sibling");
         let mode = std::fs::metadata(temp.path())
             .expect("read sibling metadata")
             .permissions()
@@ -949,6 +2010,61 @@ mod tests {
         temp.remove().expect("remove private sibling");
     }
 
+    /// The replacement must carry the permissions of the exact file object
+    /// the bytes were copied from — captured from the source handle — not
+    /// whatever the target pathname names when the carry-over runs: an
+    /// external writer that temporarily swaps the pathname to a permissive
+    /// file during the commit must not launder those permissions onto the
+    /// replacement.
+    #[cfg(unix)]
+    #[test]
+    fn tagged_copy_carries_permissions_from_the_source_handle_not_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("permissions-from-handle");
+        let track = directory.audio_file("song.flac", b"original audio");
+        std::fs::set_permissions(&track, std::fs::Permissions::from_mode(0o600))
+            .expect("make the admitted file private");
+
+        // The source handle is the exact object being copied. The pathname
+        // meanwhile names a world-readable stranger, as a mid-commit swap
+        // would present it.
+        let source = std::fs::File::open(&track).expect("open the source handle");
+        let stranger = directory.audio_file("stranger.flac", b"stranger audio");
+        std::fs::set_permissions(&stranger, std::fs::Permissions::from_mode(0o644))
+            .expect("make the stranger permissive");
+
+        let (temp, destination) = TempFile::create_beside(&track, &track.to_string_lossy())
+            .expect("create the staging copy");
+        drop(destination);
+
+        // Swap the pathname to the permissive stranger for the carry-over,
+        // as the race would, then prepare the copy with the permissions
+        // captured from the retained handle.
+        let displaced = directory.path.join("displaced.flac");
+        std::fs::rename(&track, &displaced).expect("displace the admitted file");
+        std::fs::rename(&stranger, &track).expect("put the stranger at the target name");
+
+        let retained_permissions = source
+            .metadata()
+            .expect("stat the retained source handle")
+            .permissions();
+        flush_and_prepare_tagged_copy(&temp, &track.to_string_lossy(), Some(retained_permissions))
+            .expect("prepare the tagged copy");
+
+        let mode = std::fs::metadata(temp.path())
+            .expect("read the tagged copy's metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the tagged copy must carry the source handle's permissions, not the swapped pathname's"
+        );
+        drop(source);
+        temp.remove().expect("remove private sibling");
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn writer_siblings_install_the_source_dacl_while_exclusively_held() {
@@ -958,7 +2074,8 @@ mod tests {
         let track = directory.audio_file("song.flac", b"readable fixture bytes");
         let source = std::fs::File::open(&track).expect("open source");
         let source_dacl = WindowsDacl::read_from(&source).expect("read source DACL");
-        let (temp, destination) = TempFile::create_beside(&track).expect("create private sibling");
+        let (temp, destination) = TempFile::create_beside(&track, &track.to_string_lossy())
+            .expect("create private sibling");
 
         source_dacl
             .apply_to(&destination)
@@ -1073,7 +2190,8 @@ mod tests {
     fn probe_cleanup_failure_is_reported_before_success() {
         let directory = TestDirectory::new("preflight-cleanup-failure");
         let track = directory.path.join("song.flac");
-        let (temp, file) = TempFile::create_beside(&track).expect("create private sibling");
+        let (temp, file) = TempFile::create_beside(&track, &track.to_string_lossy())
+            .expect("create private sibling");
         let temp_path = temp.path().to_path_buf();
         drop(file);
 
@@ -1144,6 +2262,1047 @@ mod tests {
         assert_eq!(tag.comment().as_deref(), Some("Fixture comment"));
     }
 
+    /// A removable-media write through a retained mutation target must
+    /// succeed exactly like the path-based happy path, and the in-section
+    /// re-anchor must authorize a follow-up write through the same
+    /// target object.
+    #[test]
+    fn a_mutation_target_write_round_trips_and_reanchors_for_a_follow_up() {
+        let directory = TestDirectory::new("mutation-write");
+        let track = directory.audio_file(
+            "silence.flac",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        );
+        let authority = std::sync::Arc::new(
+            crate::local::root_authority::MountedRootAuthority::acquire(&directory.path)
+                .expect("acquire mounted authority"),
+        );
+        let target = authority
+            .open_mutation_target(Path::new("silence.flac"))
+            .expect("open mutation target");
+
+        write_tags_with_mutation_target(&target, &year("2026"))
+            .expect("write through the retained authority");
+        assert!(
+            directory.temp_files().is_empty(),
+            "a successful write must not leave its sibling temp file behind"
+        );
+
+        // The replacement retired the copied-from object; the in-section
+        // re-anchor must have re-bound the target, so a second edit through
+        // the same retained authority is still authorized.
+        write_tags_with_mutation_target(&target, &year("2027"))
+            .expect("follow-up write after the re-anchor");
+
+        let tagged_file = lofty::read_from_path(&track).expect("reopen tagged FLAC");
+        let tag = tagged_file
+            .primary_tag()
+            .expect("tagged FLAC must have a primary tag");
+        assert_eq!(tag.get_string(ItemKey::Year), Some("2027"));
+    }
+
+    /// The bug this authority exists for: if the pathname is swapped between
+    /// selection and commit, the write must fail closed — the swap stays
+    /// untouched, the admitted file keeps its exact bytes, and no private
+    /// sibling is left behind.
+    #[test]
+    fn a_mutation_target_write_refuses_a_swapped_file_and_leaves_both_untouched() {
+        let directory = TestDirectory::new("mutation-refuse");
+        let track = directory.audio_file(
+            "silence.flac",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        );
+        let original = std::fs::read(&track).expect("read fixture bytes");
+
+        let authority = std::sync::Arc::new(
+            crate::local::root_authority::MountedRootAuthority::acquire(&directory.path)
+                .expect("acquire mounted authority"),
+        );
+        let target = authority
+            .open_mutation_target(Path::new("silence.flac"))
+            .expect("open mutation target");
+
+        // Swap the pathname after the authority admitted the exact file.
+        let displaced = directory.path.join("displaced.flac");
+        std::fs::rename(&track, &displaced).expect("displace the admitted file");
+        std::fs::write(&track, b"not the admitted file").expect("install different bytes");
+
+        write_tags_with_mutation_target(&target, &year("2026"))
+            .expect_err("the pathname no longer names the admitted file; the commit must refuse");
+
+        assert_eq!(
+            std::fs::read(&track).expect("read swapped path back"),
+            b"not the admitted file",
+            "the refused write must not replace whatever took the name"
+        );
+        assert_eq!(
+            std::fs::read(&displaced).expect("read displaced file back"),
+            original,
+            "the admitted file must be byte-for-byte untouched"
+        );
+        assert!(
+            directory.temp_files().is_empty(),
+            "a refused commit leaves no private sibling behind"
+        );
+    }
+
+    /// Create an album directory holding the silence.flac fixture — the
+    /// common arrangement of the anchored-staging regression tests, whose
+    /// retained authority admits `album/silence.flac` through its parent.
+    #[cfg(unix)]
+    fn anchored_album_fixture(name: &str) -> (TestDirectory, PathBuf, PathBuf) {
+        let directory = TestDirectory::new(name);
+        let album = directory.path.join("album");
+        std::fs::create_dir(&album).expect("create album");
+        let track = album.join("silence.flac");
+        std::fs::write(
+            &track,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        )
+        .expect("write fixture");
+        (directory, album, track)
+    }
+
+    /// Acquire the mounted root authority over a test directory.
+    #[cfg(unix)]
+    fn mounted_root_authority(
+        directory: &TestDirectory,
+    ) -> std::sync::Arc<crate::local::root_authority::MountedRootAuthority> {
+        std::sync::Arc::new(
+            crate::local::root_authority::MountedRootAuthority::acquire(&directory.path)
+                .expect("acquire mounted authority"),
+        )
+    }
+
+    /// Assert the replacement landed beside the admitted file in the
+    /// retained (displaced) directory, carrying the written year.
+    #[cfg(unix)]
+    fn assert_replacement_landed_beside_admitted_file(displaced_album: &Path) {
+        let tagged_file = lofty::read_from_path(displaced_album.join("silence.flac"))
+            .expect("reopen the replaced admitted file");
+        assert_eq!(
+            tagged_file
+                .primary_tag()
+                .expect("primary tag")
+                .get_string(ItemKey::Year),
+            Some("2026"),
+            "the replacement must land beside the admitted file in the retained directory"
+        );
+    }
+
+    /// A parent directory displaced between selection and commit must not
+    /// strand the staging area inside whatever now occupies the old
+    /// pathname: the retained authority stages and replaces only through its
+    /// retained parent object, so the write lands beside the admitted file
+    /// in the retained directory and the impostor never receives anything
+    /// at all — not the staged sibling, not the tagged copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_mutation_target_write_lands_beside_the_retained_parent_when_it_was_displaced() {
+        let (directory, album, track) = anchored_album_fixture("mutation-parent-e2e");
+
+        let authority = mounted_root_authority(&directory);
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+
+        let displaced_album = directory.path.join("displaced-album");
+        std::fs::rename(&album, &displaced_album).expect("displace retained parent");
+        std::fs::create_dir(&album).expect("install impostor parent");
+        std::fs::write(&track, b"impostor audio").expect("install impostor file");
+
+        write_tags_with_mutation_target(&target, &year("2026"))
+            .expect("staging and replacement run through the retained parent");
+
+        // The replacement landed beside the admitted file in the retained
+        // (displaced) directory.
+        assert_replacement_landed_beside_admitted_file(&displaced_album);
+
+        // The impostor keeps exactly what it had. Under path-resolved
+        // staging it transiently received the staged sibling and the
+        // complete tagged copy of the admitted file before the commit
+        // refused; anchored staging never resolves its name at all.
+        assert_eq!(
+            std::fs::read(&track).expect("read impostor file"),
+            b"impostor audio",
+            "the impostor directory must never receive the replacement"
+        );
+        let impostor_entries: Vec<std::ffi::OsString> = std::fs::read_dir(&album)
+            .expect("list impostor directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            impostor_entries,
+            [std::ffi::OsString::from("silence.flac")],
+            "the impostor directory must never receive a staged sibling"
+        );
+        assert_no_stranded_tag_write_siblings(&[&album, &displaced_album]);
+    }
+
+    /// The staging of a retained-authority copy must never traverse the
+    /// absolute-path ancestry. This drives the exact window an external
+    /// writer needs — after the commit section validated the retained chain,
+    /// before the writer stages the sibling — and installs a symlink at the
+    /// displaced ancestor's old name, pointing outside the mount. Path-
+    /// resolved staging would create the staged sibling through that symlink
+    /// and leak the complete tagged copy of the admitted file outside the
+    /// retained authority; anchored staging resolves nothing, so the write
+    /// lands beside the admitted file in the retained directory and the
+    /// symlink's target stays empty.
+    #[cfg(unix)]
+    #[test]
+    fn a_mutation_target_write_stages_beside_the_retained_parent_never_through_a_displaced_ancestor(
+    ) {
+        use std::os::unix::fs::symlink;
+
+        let (directory, album, track) = anchored_album_fixture("mutation-stage-anchor");
+        let outside = TestDirectory::new("mutation-stage-outside");
+
+        let authority = mounted_root_authority(&directory);
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+
+        let displaced_album = directory.path.join("displaced-album");
+        let impostor_album = album.clone();
+        let outside_root = outside.path.clone();
+        let watched = track.clone();
+        let closure_displaced_album = displaced_album.clone();
+        with_pre_staging_interpose(
+            Box::new(move |interposed| {
+                if interposed.replacement_path() != watched.as_path() {
+                    return;
+                }
+                // Displace the retained ancestor inside the staging window
+                // and plant a symlink at its old name.
+                std::fs::rename(
+                    watched.parent().expect("album parent"),
+                    &closure_displaced_album,
+                )
+                .expect("displace retained parent");
+                symlink(&outside_root, &impostor_album)
+                    .expect("install symlink impostor at the old name");
+            }),
+            || {
+                write_tags_with_mutation_target(&target, &year("2026"))
+                    .expect("anchored staging must land the write through the retained parent");
+            },
+        );
+
+        // The replacement landed beside the admitted file in the retained
+        // (displaced) directory.
+        assert_replacement_landed_beside_admitted_file(&displaced_album);
+
+        // Nothing — staged sibling or tagged copy — may ever have crossed
+        // the symlink into the impostor's target.
+        let outside_entries: Vec<std::ffi::OsString> = std::fs::read_dir(&outside.path)
+            .expect("list the symlink impostor's target")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            outside_entries.is_empty(),
+            "the displaced ancestor's symlink target must never receive anything: \
+             {outside_entries:?}"
+        );
+        assert_no_stranded_tag_write_siblings(&[&displaced_album]);
+    }
+
+    /// The removable preflight's directory rehearsal must probe the
+    /// retained directory, not the pathname: after the retained parent was
+    /// displaced and an impostor directory installed at the old name, the
+    /// rehearsal's create, replace, and remove siblings happen beside the
+    /// admitted file in the retained (displaced) directory, the impostor
+    /// never receives anything, and no probe sibling survives.
+    #[cfg(unix)]
+    #[test]
+    fn retained_preflight_rehearsal_probes_the_retained_directory_after_displacement() {
+        let (directory, album, _) = anchored_album_fixture("preflight-retained-anchor");
+
+        let authority = mounted_root_authority(&directory);
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+        let (parent, leaf) = target
+            .retained_directory_handle()
+            .expect("retain the directory anchor");
+
+        let displaced_album = directory.path.join("displaced-album");
+        std::fs::rename(&album, &displaced_album).expect("displace retained parent");
+        std::fs::create_dir(&album).expect("install impostor directory at the old name");
+
+        crate::local::tag_writer::preflight_tag_write_directory_retained(
+            &parent,
+            &leaf,
+            "the removable mutation target",
+        )
+        .expect("the rehearsal must run through the retained parent");
+
+        // The impostor at the old pathname never saw a probe sibling.
+        let impostor_entries: Vec<std::ffi::OsString> = std::fs::read_dir(&album)
+            .expect("list the impostor directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            impostor_entries.is_empty(),
+            "the impostor directory must receive no probe siblings: {impostor_entries:?}"
+        );
+
+        // The retained directory holds exactly the admitted file: every
+        // probe sibling was removed again through the retained parent.
+        let retained_entries: Vec<std::ffi::OsString> = std::fs::read_dir(&displaced_album)
+            .expect("list the retained directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            retained_entries,
+            vec![std::ffi::OsString::from("silence.flac")],
+            "the refused rehearsal must leave no probe residue of its own"
+        );
+    }
+
+    /// Drive the rehearsal under an extra-hard-link probe: the sole-link
+    /// gate must refuse the removal with `Unavailable` — no unlink
+    /// attempted, so nothing is destroyed and no contested-destruction
+    /// ERROR event is carried.
+    #[cfg(unix)]
+    fn run_sole_link_rehearsal_expect_refusal(parent: &std::fs::File, leaf: &OsStr) {
+        let errors = capture_error_events(|| {
+            assert_eq!(
+                crate::local::tag_writer::preflight_tag_write_directory_retained(
+                    parent,
+                    leaf,
+                    "the removable mutation target",
+                ),
+                Err(TagWritePreflightError::Unavailable),
+                "a probe with extra hard links must be refused: its removal \
+                 outcome cannot be proven against a concurrent link removal"
+            );
+        });
+        assert!(
+            errors.is_empty(),
+            "the sole-link refusal attempts no unlink, so it must not carry \
+             the contested-destruction ERROR event: {errors:?}"
+        );
+    }
+
+    /// Assert the sole-link refusal's outcomes: the interposed hard link
+    /// ran, the extra link still names the two-link probe (never
+    /// unlinked), exactly the relocated private name and the extra link
+    /// remain beside the untouched admitted file.
+    #[cfg(unix)]
+    fn assert_sole_link_refusal_leaves_debris(
+        linked: &std::sync::atomic::AtomicBool,
+        extra: &std::sync::Mutex<Option<std::ffi::OsString>>,
+        parent: &std::fs::File,
+        album: &Path,
+    ) {
+        use rustix::fs::AtFlags;
+        use std::sync::atomic::Ordering;
+        assert!(
+            linked.load(Ordering::SeqCst),
+            "the interposed hard link must have run"
+        );
+        let extra_leaf = extra
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the probe was hard-linked");
+        let probe_stat = rustix::fs::statat(parent, &extra_leaf, AtFlags::SYMLINK_NOFOLLOW)
+            .expect("the extra hard link's debris is preserved");
+        assert_eq!(
+            probe_stat.st_nlink, 2,
+            "the refused removal never unlinked the probe"
+        );
+        let retained: Vec<std::ffi::OsString> = std::fs::read_dir(album)
+            .expect("list the retained directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            retained.len(),
+            3,
+            "exactly the probe debris remains beside the admitted file: {retained:?}"
+        );
+        assert!(
+            retained.contains(&std::ffi::OsString::from("silence.flac")),
+            "the admitted file is untouched: {retained:?}"
+        );
+        assert!(
+            retained.contains(&extra_leaf),
+            "the extra hard link survives as preserved debris: {retained:?}"
+        );
+    }
+
+    /// The retained rehearsal must exercise the anchored commit's no-replace
+    /// install primitive, not a plain overwriting rename. Its rename target
+    /// must be a fresh vacant name it does not pre-create, and when that
+    /// name is occupied the no-replace rename must refuse the rehearsal
+    /// with the probe cleaned up — the exact behavior that refuses
+    /// no-replace-incapable volumes at preflight instead of reporting them
+    /// write-capable and dooming every later commit to fail closed.
+    #[cfg(unix)]
+    #[test]
+    fn retained_preflight_rehearsal_refuses_an_occupied_rename_target() {
+        use std::sync::{Arc, Mutex};
+
+        let (directory, album, _) = anchored_album_fixture("preflight-no-replace");
+
+        let authority = mounted_root_authority(&directory);
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+        let (parent, leaf) = target
+            .retained_directory_handle()
+            .expect("retain the directory anchor");
+
+        let occupied_candidate = Arc::new(Mutex::new(None::<std::ffi::OsString>));
+        let closure_candidate = occupied_candidate.clone();
+        with_retained_preflight_interpose(
+            Box::new(move |phase, interposed_parent, probe_leaf, vacant_leaf| {
+                use rustix::fs::AtFlags;
+
+                // This regression shapes the install window only; the
+                // landed-probe cleanup window has its own regression.
+                if phase != RetainedPreflightPhase::BeforeInstall {
+                    return;
+                }
+
+                // The rehearsal renames onto a fresh vacant name: the probe
+                // sibling exists and the rename target does not. A rehearsal
+                // that pre-created a second sibling to overwrite fails here.
+                assert!(
+                    rustix::fs::statat(interposed_parent, probe_leaf, AtFlags::empty()).is_ok(),
+                    "the rehearsal must have staged its probe sibling through the retained parent"
+                );
+                assert!(
+                    rustix::fs::statat(interposed_parent, vacant_leaf, AtFlags::empty()).is_err(),
+                    "the rehearsal must rename onto a vacant name, not a pre-created sibling"
+                );
+
+                // Occupy the rename target. A plain overwriting rename would
+                // clobber this occupant and report the volume write-capable;
+                // the no-replace rename the commit installs with must refuse.
+                create_retained_sibling_exclusive(interposed_parent, vacant_leaf)
+                    .expect("occupy the rehearsal's rename target");
+                *closure_candidate.lock().unwrap() = Some(vacant_leaf.to_os_string());
+            }),
+            || {
+                assert_eq!(
+                    crate::local::tag_writer::preflight_tag_write_directory_retained(
+                        &parent,
+                        &leaf,
+                        "the removable mutation target",
+                    ),
+                    Err(TagWritePreflightError::Unavailable),
+                    "an occupied rename target must refuse the rehearsal, never be clobbered"
+                );
+            },
+        );
+
+        // The refusal path cleaned its probe sibling up through the
+        // retained parent; remove the deliberate occupant and require the
+        // directory to hold exactly the admitted file again.
+        assert_refused_rehearsal_left_only_the_admitted_file(
+            &parent,
+            &album,
+            occupied_candidate.lock().unwrap().take(),
+        );
+    }
+
+    /// A refused commit must clean up its stranded staging sibling in every
+    /// directory the retained parent machinery could have staged one in.
+    #[cfg(unix)]
+    fn assert_no_stranded_tag_write_siblings(directories: &[&Path]) {
+        for directory_path in directories {
+            let leftovers: Vec<PathBuf> = std::fs::read_dir(directory_path)
+                .expect("list displaced directories")
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| is_tag_write_temp_file(path))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "a refused commit must clean up its stranded sibling: {leftovers:?}"
+            );
+        }
+    }
+
+    /// Remove the occupant the retained-preflight seam deliberately
+    /// installed at the rehearsal's rename target, then require the
+    /// directory to hold exactly the admitted file again: a refused
+    /// rehearsal must leave no probe sibling behind.
+    #[cfg(unix)]
+    fn assert_refused_rehearsal_left_only_the_admitted_file(
+        parent: &std::fs::File,
+        album: &Path,
+        occupied: Option<std::ffi::OsString>,
+    ) {
+        rustix::fs::unlinkat(
+            parent,
+            occupied
+                .as_deref()
+                .expect("the seam occupied the candidate"),
+            rustix::fs::AtFlags::empty(),
+        )
+        .expect("remove the deliberate occupant");
+
+        let retained_entries: Vec<std::ffi::OsString> = std::fs::read_dir(album)
+            .expect("list the retained directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            retained_entries,
+            vec![std::ffi::OsString::from("silence.flac")],
+            "the refused rehearsal must leave no probe sibling behind"
+        );
+    }
+
+    /// The newcomer an external writer swapped into the cleanup window's
+    /// vacant name, with the exact identity it was installed under.
+    #[cfg(unix)]
+    struct SwappedNewcomer {
+        leaf: std::ffi::OsString,
+        identity: (u64, u64),
+    }
+
+    /// The landed-probe cleanup must remove exactly the entry the rehearsal
+    /// created. An external writer can rename the landed probe away and
+    /// create a newcomer at the vacant name inside the rename→cleanup
+    /// window; the rehearsal must then refuse with the newcomer preserved —
+    /// debris is never destruction — and leave none of its own residue.
+    #[cfg(unix)]
+    #[test]
+    fn retained_preflight_cleanup_preserves_a_swapped_in_newcomer() {
+        use std::sync::{Arc, Mutex};
+
+        let (directory, album, _) = anchored_album_fixture("preflight-swap");
+
+        let authority = mounted_root_authority(&directory);
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+        let (parent, leaf) = target
+            .retained_directory_handle()
+            .expect("retain the directory anchor");
+
+        let newcomer = Arc::new(Mutex::new(None::<SwappedNewcomer>));
+        let stolen = Arc::new(Mutex::new(None::<std::ffi::OsString>));
+        swap_a_newcomer_into_the_cleanup_window(Arc::clone(&newcomer), Arc::clone(&stolen), || {
+            assert_eq!(
+                crate::local::tag_writer::preflight_tag_write_directory_retained(
+                    &parent,
+                    &leaf,
+                    "the removable mutation target",
+                ),
+                Err(TagWritePreflightError::Unavailable),
+                "a swapped-in newcomer must refuse the rehearsal, never be destroyed"
+            );
+        });
+
+        assert_the_swap_survived_the_refused_cleanup(&parent, &album, newcomer, stolen);
+    }
+
+    /// Drive the rehearsal through the cleanup window with an external
+    /// writer's swap: rename the landed probe away (stealing it as debris)
+    /// and install a newcomer at the vacant name before the cleanup runs.
+    #[cfg(unix)]
+    fn swap_a_newcomer_into_the_cleanup_window(
+        newcomer: std::sync::Arc<std::sync::Mutex<Option<SwappedNewcomer>>>,
+        stolen: std::sync::Arc<std::sync::Mutex<Option<std::ffi::OsString>>>,
+        run: impl FnOnce(),
+    ) {
+        with_retained_preflight_interpose(
+            Box::new(move |phase, interposed_parent, _probe_leaf, vacant_leaf| {
+                if phase != RetainedPreflightPhase::BeforeCleanup {
+                    return;
+                }
+                let stolen_leaf = staged_sibling_name(std::ffi::OsStr::new("silence.flac"));
+                rustix::fs::renameat(
+                    interposed_parent,
+                    vacant_leaf,
+                    interposed_parent,
+                    &stolen_leaf,
+                )
+                .expect("steal the landed probe");
+                create_retained_sibling_exclusive(interposed_parent, vacant_leaf)
+                    .expect("install the newcomer at the vacant name");
+                let identity = retained_leaf_identity(interposed_parent, vacant_leaf)
+                    .expect("read the newcomer's identity");
+                *newcomer.lock().unwrap() = Some(SwappedNewcomer {
+                    leaf: vacant_leaf.to_os_string(),
+                    identity,
+                });
+                *stolen.lock().unwrap() = Some(stolen_leaf);
+            }),
+            run,
+        );
+    }
+
+    /// Require the refused cleanup to have preserved the swapped-in
+    /// newcomer and the stolen probe debris, then remove both and require
+    /// the directory to hold exactly the admitted file again: the refused
+    /// rehearsal leaves no probe residue of its own.
+    #[cfg(unix)]
+    fn assert_the_swap_survived_the_refused_cleanup(
+        parent: &std::fs::File,
+        album: &Path,
+        newcomer: std::sync::Arc<std::sync::Mutex<Option<SwappedNewcomer>>>,
+        stolen: std::sync::Arc<std::sync::Mutex<Option<std::ffi::OsString>>>,
+    ) {
+        use rustix::fs::AtFlags;
+
+        let newcomer = newcomer
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the seam swapped a newcomer in");
+        let stolen_leaf = stolen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the seam stole the landed probe");
+        assert_eq!(
+            retained_leaf_identity(parent, &newcomer.leaf).expect("the newcomer survives"),
+            newcomer.identity,
+            "the refused cleanup must preserve the swapped-in newcomer exactly"
+        );
+        assert!(
+            rustix::fs::statat(parent, stolen_leaf.as_os_str(), AtFlags::empty()).is_ok(),
+            "the stolen probe is preserved debris, never destroyed"
+        );
+        rustix::fs::unlinkat(parent, &newcomer.leaf, AtFlags::empty())
+            .expect("remove the newcomer debris");
+        rustix::fs::unlinkat(parent, stolen_leaf.as_os_str(), AtFlags::empty())
+            .expect("remove the stolen-probe debris");
+
+        let retained_entries: Vec<std::ffi::OsString> = std::fs::read_dir(album)
+            .expect("list the retained directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            retained_entries,
+            vec![std::ffi::OsString::from("silence.flac")],
+            "the refused rehearsal must leave no probe residue of its own"
+        );
+    }
+
+    /// Steal the pinned probe from the landed name and install a newcomer
+    /// there, recording both for the post-refusal assertions.
+    #[cfg(unix)]
+    fn steal_pinned_probe_install_newcomer(
+        interposed_parent: &std::fs::File,
+        landed_leaf: &OsStr,
+        newcomer: &std::sync::Arc<std::sync::Mutex<Option<SwappedNewcomer>>>,
+        stolen: &std::sync::Arc<std::sync::Mutex<Option<std::ffi::OsString>>>,
+    ) {
+        let stolen_leaf = staged_sibling_name(std::ffi::OsStr::new("silence.flac"));
+        rustix::fs::renameat(
+            interposed_parent,
+            landed_leaf,
+            interposed_parent,
+            &stolen_leaf,
+        )
+        .expect("steal the pinned probe");
+        create_retained_sibling_exclusive(interposed_parent, landed_leaf)
+            .expect("install the newcomer at the landed name");
+        let identity = retained_leaf_identity(interposed_parent, landed_leaf)
+            .expect("read the newcomer's identity");
+        *newcomer.lock().unwrap() = Some(SwappedNewcomer {
+            leaf: landed_leaf.to_os_string(),
+            identity,
+        });
+        *stolen.lock().unwrap() = Some(stolen_leaf);
+    }
+
+    /// The identity-bound removal must survive a swap that lands between the
+    /// identity proof and the bind itself. The proof pins the landed probe
+    /// with an O_NOFOLLOW open; an external writer can then steal the probe
+    /// from the landed name and install a newcomer there before the
+    /// relocation runs. The relocation moves the newcomer — not the probe —
+    /// onto the private name, the re-verification catches the identity
+    /// mismatch, the newcomer is restored to its own name, and the rehearsal
+    /// refuses with every entry preserved: debris is never destruction.
+    #[cfg(unix)]
+    #[test]
+    fn retained_preflight_bind_preserves_a_newcomer_swapped_after_the_proof() {
+        use std::sync::{Arc, Mutex};
+
+        let (directory, album, _) = anchored_album_fixture("preflight-bind-swap");
+
+        let authority = mounted_root_authority(&directory);
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+        let (parent, leaf) = target
+            .retained_directory_handle()
+            .expect("retain the directory anchor");
+
+        let newcomer = Arc::new(Mutex::new(None::<SwappedNewcomer>));
+        let stolen = Arc::new(Mutex::new(None::<std::ffi::OsString>));
+        let newcomer_closure = Arc::clone(&newcomer);
+        let stolen_closure = Arc::clone(&stolen);
+        with_retained_preflight_interpose(
+            Box::new(move |phase, interposed_parent, landed_leaf, _vacant_leaf| {
+                if phase != RetainedPreflightPhase::AfterProof {
+                    return;
+                }
+                steal_pinned_probe_install_newcomer(
+                    interposed_parent,
+                    landed_leaf,
+                    &newcomer_closure,
+                    &stolen_closure,
+                );
+            }),
+            || {
+                assert_eq!(
+                    crate::local::tag_writer::preflight_tag_write_directory_retained(
+                        &parent,
+                        &leaf,
+                        "the removable mutation target",
+                    ),
+                    Err(TagWritePreflightError::Unavailable),
+                    "a bind broken by a post-proof swap must refuse the rehearsal, \
+                     never destroy the newcomer"
+                );
+            },
+        );
+
+        // The newcomer was restored to its own name and the stolen probe is
+        // preserved debris; the refused rehearsal left nothing of its own.
+        assert_the_swap_survived_the_refused_cleanup(&parent, &album, newcomer, stolen);
+    }
+
+    /// Steal the re-verified probe from the private name and install a
+    /// newcomer there inside the verify→unlink window, recording the
+    /// private name (the newcomer's, briefly) and the stolen probe's
+    /// debris name for the post-refusal assertions.
+    #[cfg(unix)]
+    fn steal_reverified_probe_install_newcomer(
+        interposed_parent: &std::fs::File,
+        retire_leaf: &OsStr,
+        contested: &std::sync::Arc<std::sync::Mutex<Option<std::ffi::OsString>>>,
+        stolen: &std::sync::Arc<std::sync::Mutex<Option<std::ffi::OsString>>>,
+    ) {
+        let stolen_leaf = staged_sibling_name(std::ffi::OsStr::new("silence.flac"));
+        rustix::fs::renameat(
+            interposed_parent,
+            retire_leaf,
+            interposed_parent,
+            &stolen_leaf,
+        )
+        .expect("steal the re-verified probe");
+        create_retained_sibling_exclusive(interposed_parent, retire_leaf)
+            .expect("install the newcomer at the private name");
+        *contested.lock().unwrap() = Some(retire_leaf.to_os_string());
+        *stolen.lock().unwrap() = Some(stolen_leaf);
+    }
+
+    /// A `tracing` layer capturing the message of every ERROR-level event
+    /// emitted under it, so a regression can require the loud signal the
+    /// contested-cleanup refusal must carry.
+    #[cfg(unix)]
+    struct ErrorEventSink(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[cfg(unix)]
+    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for ErrorEventSink {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().level() != &tracing::Level::ERROR {
+                return;
+            }
+            event.record(&mut MessageVisitor(std::sync::Arc::clone(&self.0)));
+        }
+    }
+
+    /// A `tracing` field visitor extracting the `message` field of an
+    /// ERROR-level event into the sink.
+    #[cfg(unix)]
+    struct MessageVisitor(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[cfg(unix)]
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0.lock().unwrap().push(format!("{value:?}"));
+            }
+        }
+    }
+
+    /// Run `body` capturing the message of every ERROR-level tracing event
+    /// it emits on this thread.
+    #[cfg(unix)]
+    fn capture_error_events(body: impl FnOnce()) -> Vec<String> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(ErrorEventSink(std::sync::Arc::clone(&sink)));
+        // The default dispatcher is scoped to `body`; it is restored before
+        // this returns.
+        tracing::subscriber::with_default(subscriber, body);
+        let captured = sink.lock().unwrap().clone();
+        captured
+    }
+
+    /// Drive the contested rehearsal under the armed verify→unlink window:
+    /// the rehearsal must refuse with `Unavailable` — never report success
+    /// for a wrong-object removal — and the refusal must carry exactly one
+    /// ERROR-level event acknowledging the destroyed foreign entry.
+    #[cfg(unix)]
+    fn run_contested_rehearsal_expect_refusal(parent: &std::fs::File, leaf: &OsStr) {
+        let errors = capture_error_events(|| {
+            assert_eq!(
+                crate::local::tag_writer::preflight_tag_write_directory_retained(
+                    parent,
+                    leaf,
+                    "the removable mutation target",
+                ),
+                Err(TagWritePreflightError::Unavailable),
+                "a contested cleanup must refuse the rehearsal, never report \
+                 success for a wrong-object removal"
+            );
+        });
+        assert_eq!(
+            errors.len(),
+            1,
+            "the contested cleanup must report the destroyed foreign entry \
+             loudly exactly once: {errors:?}"
+        );
+    }
+
+    /// Assert the observed outcomes of the refused contested cleanup: the
+    /// verify→unlink window observer ran; the swapped-in newcomer's
+    /// destroyed entry is the acknowledged loss; the stolen probe survives
+    /// as debris (removed here as test cleanup); and the refused rehearsal
+    /// left no probe residue of its own beside the admitted file.
+    #[cfg(unix)]
+    fn assert_contested_removal_refusal_outcomes(
+        window_ran: &std::sync::atomic::AtomicBool,
+        contested: &std::sync::Arc<std::sync::Mutex<Option<std::ffi::OsString>>>,
+        stolen: &std::sync::Arc<std::sync::Mutex<Option<std::ffi::OsString>>>,
+        parent: &std::fs::File,
+        album: &Path,
+    ) {
+        use rustix::fs::AtFlags;
+        use std::sync::atomic::Ordering;
+        assert!(
+            window_ran.load(Ordering::SeqCst),
+            "the verify→unlink window observer must have run"
+        );
+        let contested_leaf = contested
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the seam contested the private name");
+        let stolen_leaf = stolen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the seam stole the re-verified probe");
+        assert!(
+            rustix::fs::statat(parent, &contested_leaf, AtFlags::empty()).is_err(),
+            "the swapped-in newcomer's entry was destroyed by the contested \
+             unlink — the acknowledged, reported loss"
+        );
+        assert!(
+            rustix::fs::statat(parent, stolen_leaf.as_os_str(), AtFlags::empty()).is_ok(),
+            "the stolen probe is preserved debris, never destroyed"
+        );
+        rustix::fs::unlinkat(parent, stolen_leaf.as_os_str(), AtFlags::empty())
+            .expect("remove the stolen-probe debris");
+        let retained_entries: Vec<std::ffi::OsString> = std::fs::read_dir(album)
+            .expect("list the retained directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            retained_entries,
+            vec![std::ffi::OsString::from("silence.flac")],
+            "the refused rehearsal must leave no probe residue of its own"
+        );
+    }
+
+    /// The bound removal must survive — by refusing loudly — an external
+    /// writer's swap inside the verify→unlink window: the re-verified
+    /// private name is stolen and a newcomer installed there before the
+    /// unlinkat runs. POSIX has no unlink-by-fd, so the newcomer's entry is
+    /// destroyed, but the fd-verified post-condition proves the removal did
+    /// not touch the pinned object, reports the contested destruction at
+    /// ERROR level, and refuses — the rehearsal never reports success for a
+    /// wrong-object removal, and the stolen probe survives as preserved
+    /// debris.
+    #[cfg(unix)]
+    #[test]
+    fn retained_preflight_reports_a_newcomer_swapped_between_verify_and_unlink() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let (directory, album, _) = anchored_album_fixture("preflight-retire-verify-swap");
+        let authority = mounted_root_authority(&directory);
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+        let (parent, leaf) = target
+            .retained_directory_handle()
+            .expect("retain the directory anchor");
+
+        let contested = Arc::new(Mutex::new(None::<std::ffi::OsString>));
+        let stolen = Arc::new(Mutex::new(None::<std::ffi::OsString>));
+        let contested_closure = Arc::clone(&contested);
+        let stolen_closure = Arc::clone(&stolen);
+        let window_ran = Arc::new(AtomicBool::new(false));
+        let window_ran_closure = Arc::clone(&window_ran);
+        with_retained_preflight_interpose(
+            Box::new(move |phase, interposed_parent, retire_leaf, _vacant_leaf| {
+                if phase != RetainedPreflightPhase::AfterRetireVerify {
+                    return;
+                }
+                window_ran_closure.store(true, Ordering::SeqCst);
+                steal_reverified_probe_install_newcomer(
+                    interposed_parent,
+                    retire_leaf,
+                    &contested_closure,
+                    &stolen_closure,
+                );
+            }),
+            || run_contested_rehearsal_expect_refusal(&parent, &leaf),
+        );
+
+        assert_contested_removal_refusal_outcomes(
+            &window_ran,
+            &contested,
+            &stolen,
+            &parent,
+            &album,
+        );
+    }
+
+    /// The verify→unlink window must not disturb the clean path: an
+    /// observer that watches the window (reading the re-verified identity,
+    /// touching nothing) still sees the private name removed and the
+    /// rehearsal report success.
+    #[cfg(unix)]
+    #[test]
+    fn retained_preflight_removes_the_probe_across_an_observed_verify_window() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let (directory, album, _) = anchored_album_fixture("preflight-retire-verify-clean");
+        let authority = mounted_root_authority(&directory);
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+        let (parent, leaf) = target
+            .retained_directory_handle()
+            .expect("retain the directory anchor");
+
+        let window_ran = Arc::new(AtomicBool::new(false));
+        let window_ran_closure = Arc::clone(&window_ran);
+        with_retained_preflight_interpose(
+            Box::new(move |phase, interposed_parent, retire_leaf, _vacant_leaf| {
+                if phase != RetainedPreflightPhase::AfterRetireVerify {
+                    return;
+                }
+                window_ran_closure.store(true, Ordering::SeqCst);
+                retained_leaf_identity(interposed_parent, retire_leaf)
+                    .expect("the re-verified private name still names the pinned probe");
+            }),
+            || {
+                assert_eq!(
+                    crate::local::tag_writer::preflight_tag_write_directory_retained(
+                        &parent,
+                        &leaf,
+                        "the removable mutation target",
+                    ),
+                    Ok(()),
+                    "an observed-but-undisturbed window must leave the clean path \
+                     removing the probe and reporting success"
+                );
+            },
+        );
+
+        assert!(
+            window_ran.load(Ordering::SeqCst),
+            "the verify→unlink window observer must have run"
+        );
+        let retained_entries: Vec<std::ffi::OsString> = std::fs::read_dir(&album)
+            .expect("list the retained directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            retained_entries,
+            vec![std::ffi::OsString::from("silence.flac")],
+            "the clean rehearsal removes its probe completely"
+        );
+    }
+
+    /// The fd-verified removal must gate on a provable sole link: a probe
+    /// carrying an extra hard link at removal time has an outcome no
+    /// link-count post-condition can prove — a concurrent writer removing
+    /// that unrelated link inside the fstat→fstat window would counterfeit
+    /// the expected delta while the unlinkat destroyed a swapped-in foreign
+    /// entry — so the removal must be refused before any unlink, the debris
+    /// left, and nothing reported as success.
+    #[cfg(unix)]
+    #[test]
+    fn retained_preflight_refuses_a_probe_with_extra_hard_links_and_leaves_debris() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let (directory, album, _) = anchored_album_fixture("preflight-sole-link");
+        let authority = mounted_root_authority(&directory);
+        let target = authority
+            .open_mutation_target(Path::new("album/silence.flac"))
+            .expect("open mutation target");
+        let (parent, leaf) = target
+            .retained_directory_handle()
+            .expect("retain the directory anchor");
+
+        let extra = Arc::new(Mutex::new(None::<std::ffi::OsString>));
+        let extra_closure = Arc::clone(&extra);
+        let linked = Arc::new(AtomicBool::new(false));
+        let linked_closure = Arc::clone(&linked);
+        with_retained_preflight_interpose(
+            Box::new(move |phase, interposed_parent, landed_leaf, _vacant_leaf| {
+                if phase != RetainedPreflightPhase::BeforeCleanup {
+                    return;
+                }
+                linked_closure.store(true, Ordering::SeqCst);
+                let extra_leaf = staged_sibling_name(std::ffi::OsStr::new("silence.flac"));
+                rustix::fs::linkat(
+                    interposed_parent,
+                    landed_leaf,
+                    interposed_parent,
+                    &extra_leaf,
+                    rustix::fs::AtFlags::empty(),
+                )
+                .expect("hard-link the landed probe");
+                *extra_closure.lock().unwrap() = Some(extra_leaf);
+            }),
+            || run_sole_link_rehearsal_expect_refusal(&parent, &leaf),
+        );
+
+        assert_sole_link_refusal_leaves_debris(&linked, &extra, &parent, &album);
+    }
+
     #[test]
     fn an_unsupported_format_is_refused_before_any_copy() {
         let directory = TestDirectory::new("format");
@@ -1172,8 +3331,10 @@ mod tests {
         let directory = TestDirectory::new("exclusive");
         let track = directory.path.join(format!("{}.FLAC", "x".repeat(220)));
 
-        let (first, first_handle) = TempFile::create_beside(&track).expect("first temp");
-        let (second, second_handle) = TempFile::create_beside(&track).expect("second temp");
+        let (first, first_handle) =
+            TempFile::create_beside(&track, &track.to_string_lossy()).expect("first temp");
+        let (second, second_handle) =
+            TempFile::create_beside(&track, &track.to_string_lossy()).expect("second temp");
 
         assert_ne!(first.path(), second.path());
         assert!(first.path().exists());

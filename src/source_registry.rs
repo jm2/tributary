@@ -21,7 +21,7 @@ use crate::architecture::backend::{
 };
 use crate::architecture::error::BackendError;
 use crate::architecture::media::{
-    MediaRequest, PublicHttpAuthority, PublicHttpEndpoint, RemoteMediaResolver,
+    MediaLease, MediaRequest, PublicHttpAuthority, PublicHttpEndpoint, RemoteMediaResolver,
     ResolvedHttpRequest, ResolvedPublicHttpRequest,
 };
 use crate::architecture::models::{RatingCapability, Track};
@@ -30,7 +30,7 @@ use crate::architecture::{
     ViewOrigin,
 };
 use crate::external_file::{ExternalFileCandidate, ExternalFileHint};
-use crate::local::resolver::ResolvedFileMedia;
+use crate::local::resolver::{MountedMutationTarget, ResolvedFileMedia};
 use crate::source_lifecycle::{
     AdapterCloseFuture, AdapterStream, AdapterTaskResult, CatalogueCommitAuthority,
     CatalogueCommitRequest, CloseAuthority, ConstructionCancellationPolicy, FailureCategory,
@@ -47,6 +47,9 @@ pub type StreamFuture =
     Pin<Box<dyn Future<Output = BackendResult<AdapterStream>> + Send + 'static>>;
 type ArtworkFuture =
     Pin<Box<dyn Future<Output = BackendResult<Option<ResolvedHttpRequest>>> + Send + 'static>>;
+/// One retained mutation target resolved through a live managed adapter.
+pub type MutationTargetFuture =
+    Pin<Box<dyn Future<Output = BackendResult<MountedMutationTarget>> + Send + 'static>>;
 // Record C intentionally stops at an internally tested authority foundation;
 // Record D is the first non-test caller of the server-playlist surface.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -64,6 +67,140 @@ pub type ServerPlaylistSnapshotFuture =
 pub enum ResolvedSourceStream {
     Http(MediaRequest),
     File(ResolvedFileMedia),
+}
+
+/// Typed retained mutation authority over one exact accepted removable file.
+///
+/// The value carries the live mount authority, the exact retained file
+/// object, and the owning session's media lease. A tag write through
+/// [`Self::write_tags`] revalidates the mount, ancestry, exact file, write
+/// rights, and replacement target through commit, and is refused once the
+/// owning session is no longer active. The native mount location is
+/// deliberately absent from errors and debug output.
+#[derive(Clone)]
+pub struct RemovableMutationTarget {
+    inner: Arc<MountedMutationTarget>,
+    lease: MediaLease,
+    source_id: SourceId,
+    track_id: TrackId,
+}
+
+impl RemovableMutationTarget {
+    /// The mount-relative identity this target was admitted under.
+    pub fn relative_path(&self) -> &std::path::Path {
+        self.inner.relative_path()
+    }
+
+    /// The exact source session this target belongs to.
+    pub fn source_id(&self) -> SourceId {
+        self.source_id
+    }
+
+    /// The exact accepted track identity this target may replace.
+    pub fn track_id(&self) -> &TrackId {
+        &self.track_id
+    }
+
+    /// Whether the owning source session is still the live one.
+    ///
+    /// A retirement (device removal, pre-unmount, disconnect, or same-source
+    /// replacement) revokes this immediately; a revoked lease can never
+    /// authorize a commit.
+    pub fn is_active(&self) -> bool {
+        self.lease.is_active()
+    }
+
+    /// Point-in-time write-capability probe for the properties dialog.
+    ///
+    /// Revalidates the owning session, the retained authority, then
+    /// rehearses the complete atomic replacement shape beside the exact
+    /// target. Advisory only: the commit revalidates everything fail-closed.
+    /// Blocking — worker threads only.
+    pub fn preflight_write_capability(
+        &self,
+    ) -> Result<(), crate::local::tag_writer::TagWritePreflightError> {
+        use crate::local::tag_writer::TagWritePreflightError;
+
+        // A retirement (device removal, pre-unmount, disconnect, or
+        // same-source replacement) revokes this immediately; a revoked
+        // lease can never authorize a commit, so the probe reports it
+        // before any filesystem rehearsal runs.
+        if !self.is_active() {
+            return Err(TagWritePreflightError::Unavailable);
+        }
+        self.inner
+            .validate()
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
+        // A leaf renamed or replaced while its retained inode stays open
+        // keeps validate() passing — the swap is proven only inside the
+        // commit section — yet the next write is guaranteed to refuse in
+        // the commit's replacement confirmation. The preflight runs the
+        // same leaf-identity proof so a permanently stale target reports
+        // unavailable before the user edits and saves into a doomed
+        // dialog.
+        self.inner
+            .confirm_leaf_names_admitted_object()
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
+        // The format check reads only the file extension — exactly like the
+        // writer itself; the retained file's liveness and regularity are
+        // already proven by the validate() above.
+        if !crate::local::tag_writer::supports_tag_writes(self.inner.replacement_path()) {
+            return Err(TagWritePreflightError::UnsupportedFormat);
+        }
+        // The directory rehearsal runs through the retained parent handle —
+        // the same directory object the anchored commit resolves — so an
+        // ancestor displaced after admission can neither take the probe
+        // siblings outside the admitted mount directory nor reject a target
+        // the anchored writer could safely update. Platforms without
+        // retained parent handles keep the documented path-based rehearsal.
+        #[cfg(unix)]
+        {
+            let (parent, leaf) = self
+                .inner
+                .retained_directory_handle()
+                .map_err(|_| TagWritePreflightError::Unavailable)?;
+            crate::local::tag_writer::preflight_tag_write_directory_retained(
+                &parent,
+                &leaf,
+                "the removable mutation target",
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            crate::local::tag_writer::preflight_tag_write(self.inner.replacement_path())
+        }
+    }
+
+    /// Write tag edits through the retained authority.
+    ///
+    /// Fails closed when the owning session was retired, when the mount or
+    /// retained evidence changed, or when the exact pathname no longer names
+    /// the admitted file at commit time. A pass through the active check
+    /// atomically acquires one in-flight lease permit and holds it until the
+    /// write commits or rolls back, so a retirement that begins mid-write is
+    /// serialized behind this section instead of revoking the authority
+    /// underneath an observed-but-unadmitted check. Blocking — worker threads
+    /// only.
+    pub fn write_tags(&self, edits: &crate::local::tag_writer::TagEdits) -> anyhow::Result<()> {
+        // Acquire — never merely observe — the lease. `is_active()` followed
+        // by a write leaves a revocation window between the two steps; a
+        // permit makes admission and revocation mutually exclusive, and the
+        // revoker waits until this section ends.
+        let _write_section = self
+            .lease
+            .try_acquire()
+            .ok_or_else(|| anyhow::anyhow!("The removable media source is no longer active"))?;
+        crate::local::tag_writer::write_tags_with_mutation_target(&self.inner, edits)
+    }
+}
+
+impl std::fmt::Debug for RemovableMutationTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemovableMutationTarget")
+            .field("source_id", &self.source_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Whether one managed adapter permits Tributary-owned regular-playlist
@@ -1013,6 +1150,45 @@ pub trait ManagedSourceAdapter: LifecycleAdapter + Send + Sync {
     fn resolve_artwork(self: Arc<Self>, _track_id: TrackId) -> ArtworkFuture {
         Box::pin(async { Ok(None) })
     }
+
+    /// Resolve a typed retained mutation authority for one exact accepted
+    /// file.
+    ///
+    /// The returned target must retain the adapter's own live filesystem
+    /// authority and the exact admitted file object; a commit section through
+    /// it revalidates the mount, ancestry, exact file, and replacement target
+    /// fail-closed. The default and every adapter without a reviewed
+    /// retained-mutation design return unsupported, so pathless rows of
+    /// unreviewed sources stay write-protected.
+    fn resolve_mutation_target(self: Arc<Self>, _track_id: TrackId) -> MutationTargetFuture {
+        Box::pin(async {
+            Err(BackendError::Unsupported {
+                operation: "retained mutation authority".to_string(),
+            })
+        })
+    }
+
+    /// Re-derive accepted catalogue content for exact identities whose
+    /// retained mutations committed.
+    ///
+    /// Called through the catalogue refresh lane after a successful write,
+    /// so republication carries a fresh generation and inherits every exact
+    /// session/catalogue validation the lane performs. The default refuses:
+    /// adapters without reviewed post-mutation refresh semantics never
+    /// republish catalogue content from outside their accepted scan, and
+    /// the registry treats that refusal as a cancelled (never failed)
+    /// refresh lane.
+    fn refresh_catalogue_after_mutation(
+        self: Arc<Self>,
+        _written_track_ids: HashSet<TrackId>,
+        _cancellation: crate::source_lifecycle::CancellationObserver,
+    ) -> CatalogueFuture {
+        Box::pin(async {
+            Err(BackendError::Unsupported {
+                operation: "post-mutation catalogue refresh".to_string(),
+            })
+        })
+    }
 }
 
 mod source_scoped_playlist_sealed {
@@ -1260,6 +1436,24 @@ struct SourceRegistryInner {
     playback_reference_binding: PlaybackReferenceBinding,
     built_ins: Mutex<HashMap<SourceId, BuiltInInstallation>>,
     external_sessions: Mutex<HashMap<SourceId, ProvenanceClaimId>>,
+    /// Written identities per source that no post-mutation refresh has
+    /// published yet, versioned per track: each save bumps every track it
+    /// writes to a version past every earlier save's, so a refresh
+    /// generation's acceptance hook can tell the batch it carried from a
+    /// track a newer save re-wrote between the hook's acceptance and its
+    /// consumption. Every spawned Catalogue-lane refresh task carries the
+    /// accumulated union (with the versions present at carry time), so a
+    /// superseding refresh re-reads an earlier overlapping save's batch
+    /// instead of dropping it.
+    mutation_refresh_pending: Mutex<HashMap<SourceId, HashMap<TrackId, u64>>>,
+    /// Last version minted per source by [`Self::refresh_catalogue_after_mutation`],
+    /// consulted for the next version. This is the monotonicity anchor: it
+    /// never resets when a pending batch drains or its pending entry is
+    /// removed, so a version number is never re-minted for a source — an
+    /// older descheduled generation carrying a consumed version can never
+    /// collide with the current pending version and consume a newer save's
+    /// unpublished mutation.
+    mutation_refresh_versions: Mutex<HashMap<SourceId, u64>>,
 }
 
 impl PublicHttpAuthority for SourceRegistryInner {
@@ -1412,6 +1606,8 @@ impl SourceRegistry {
                 playback_reference_binding: PlaybackReferenceBinding(Arc::new(())),
                 built_ins: Mutex::new(built_ins),
                 external_sessions: Mutex::new(HashMap::new()),
+                mutation_refresh_pending: Mutex::new(HashMap::new()),
+                mutation_refresh_versions: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -2534,6 +2730,295 @@ impl SourceRegistry {
             )
             .await
     }
+
+    /// Resolve a typed retained mutation authority for one exact accepted
+    /// track through the source's current live session.
+    ///
+    /// The caller's captured session epoch must still be current, the exact
+    /// track must be accepted by the live adapter, and the adapter must opt
+    /// in to retained mutation authority. The returned target keeps the
+    /// session's media lease, so a retirement revokes the ability to commit
+    /// even while the target object itself is still held.
+    pub async fn resolve_mutation_target(
+        &self,
+        source_id: SourceId,
+        expected_session_epoch: u64,
+        track_id: TrackId,
+    ) -> BackendResult<RemovableMutationTarget> {
+        let binding_track_id = track_id.clone();
+        let (inner, lease) =
+            self.inner
+                .lifecycle
+                .resolve_exact_session(
+                    source_id,
+                    expected_session_epoch,
+                    move |adapter| async move {
+                        adapter.resolve_mutation_target(binding_track_id).await
+                    },
+                )
+                .await?;
+        Ok(RemovableMutationTarget {
+            inner: Arc::new(inner),
+            lease,
+            source_id,
+            track_id,
+        })
+    }
+
+    /// Refresh exact sources' accepted catalogues after retained removable
+    /// writes committed.
+    ///
+    /// Each affected source refreshes through its existing catalogue lane:
+    /// the refresh mints a fresh generation, captures the exact live session,
+    /// and settlement revalidates that session before replacing the accepted
+    /// catalogue — a late completion after disconnect, replacement, or a
+    /// superseding refresh can never repopulate a retired mount or overwrite
+    /// a newer generation. Only identities whose writes committed are
+    /// re-derived; the adapter republishes every other accepted row
+    /// untouched, and no other source is ever rescanned.
+    ///
+    /// Overlapping saves for one source coalesce rather than supersede with
+    /// disjoint sets: written identities stay pending per source until a
+    /// refresh publishes them, and every spawned task carries the accumulated
+    /// union. `begin_refresh` supersedes — cancels — the pending Catalogue
+    /// lane task, so a second save's refresh would otherwise cancel the
+    /// first save's refresh before it publishes and never re-read its
+    /// identities; carrying the union keeps every committed identity in the
+    /// republished row set. A cancelled or failed refresh consumes nothing:
+    /// its batch stays pending for the next refresh to re-read.
+    ///
+    /// Consumption is settlement-confirmed and version-matched: a task's
+    /// carried batch leaves the pending map only when that exact
+    /// generation's publication is ACCEPTED by the lifecycle, and a carried
+    /// track is consumed only when its CURRENT pending version still equals
+    /// the version the generation carried. Versions are minted from a
+    /// per-source monotonic counter that survives drained batches, so a
+    /// version number is never re-minted after the batch that first used it
+    /// is consumed — an older descheduled generation's carried version can
+    /// never equal a newer save's pending version, and its hook can never
+    /// consume a mutation the newer generation has not published. A
+    /// same-track save that lands
+    /// between the acceptance and the hook's consumption — the two take
+    /// different locks — bumps the track's version, so the older hook
+    /// leaves it pending for the successor or retry lane instead of
+    /// consuming a mutation the successor's own failure could then lose. A
+    /// superseded generation consumes nothing, so no window between its
+    /// adapter result and its settlement can strand a written identity
+    /// outside both the successor's carried set and the pending map — the
+    /// successor re-reads everything not yet published.
+    ///
+    /// Returns the minted refresh generations, one per source that still had
+    /// an exact live session. Fire-and-forget — publication happens on the
+    /// lifecycle runtime and the visible row, subsequent Properties values,
+    /// and playback attribution follow the ordinary catalogue-change
+    /// invalidations.
+    pub fn refresh_catalogue_after_mutation(&self, written: &[(SourceId, TrackId)]) -> Vec<u64> {
+        let mut by_source: HashMap<SourceId, HashSet<TrackId>> = HashMap::new();
+        for (source_id, track_id) in written {
+            by_source
+                .entry(*source_id)
+                .or_default()
+                .insert(track_id.clone());
+        }
+
+        let mut generations = Vec::with_capacity(by_source.len());
+        for (source_id, batch) in by_source {
+            // Accumulate this save into the source's pending identities —
+            // bumping every written track's version past every earlier
+            // save's — and carry the accumulated union with the versions
+            // present at carry time: any earlier save whose refresh has not
+            // published yet is re-read by this task too. The next version
+            // comes from the per-source monotonic counter, never from the
+            // pending map's current maximum: a drained or emptied batch must
+            // not reset the sequence, or the next save would re-mint a
+            // version an older descheduled generation also carried and its
+            // hook could consume this save's unpublished mutation.
+            let carried: HashMap<TrackId, u64> = {
+                let mut pending = lock(&self.inner.mutation_refresh_pending);
+                let mut versions = lock(&self.inner.mutation_refresh_versions);
+                let version = versions.entry(source_id).or_insert(0);
+                *version += 1;
+                let version = *version;
+                let entry = pending.entry(source_id).or_default();
+                for track_id in &batch {
+                    entry.insert(track_id.clone(), version);
+                }
+                entry.clone()
+            };
+            // No exact live session: a retired or replaced mount is never
+            // repopulated, and its pending identities can never publish.
+            let Some(owner) = self
+                .inner
+                .lifecycle
+                .begin_refresh(source_id, RefreshLane::Catalogue)
+            else {
+                lock(&self.inner.mutation_refresh_pending).remove(&source_id);
+                continue;
+            };
+            let generation = owner.generation();
+            let track_ids: HashSet<TrackId> = carried.keys().cloned().collect();
+            let carried_versions = carried;
+            let pending_written = Arc::clone(&self.inner);
+            // The spawned refresh task's test-only Ok seam names its source,
+            // so an armed closure can act only on its own test's generation.
+            #[cfg(test)]
+            let seam_source = source_id;
+            let owner = owner.on_acceptance(Box::new(move || {
+                // Settlement-confirmed, version-matched consumption: this
+                // exact generation's publication was accepted by the
+                // lifecycle, so a carried track whose pending version still
+                // equals the version this generation carried was published
+                // and may leave the pending map. A track a newer save
+                // re-wrote between the acceptance and this hook — the two
+                // take different locks — carries a bumped version and stays
+                // pending for the successor or retry lane. A superseded
+                // generation never runs this hook — its payload was
+                // rejected — and the successor cloned the pending map
+                // including this batch, so every committed identity is
+                // either republished by the successor or stays pending for
+                // the next refresh.
+                #[cfg(test)]
+                run_pending_consumption_interpose(&source_id);
+                if let Some(entry) =
+                    lock(&pending_written.mutation_refresh_pending).get_mut(&source_id)
+                {
+                    entry.retain(|track_id, current| {
+                        carried_versions
+                            .get(track_id)
+                            .is_none_or(|carried| current != carried)
+                    });
+                }
+            }));
+            owner.spawn(move |session, cancellation| async move {
+                let adapter = session.adapter();
+                let regular_playlist_capability = adapter.regular_playlist_capability();
+                match adapter
+                    .refresh_catalogue_after_mutation(track_ids.clone(), cancellation.clone())
+                    .await
+                {
+                    Ok(tracks) => {
+                        // Test-only seam between the adapter's Ok and the
+                        // payload's submission for settlement: the window a
+                        // supersede races the settlement-confirmed batch
+                        // consumption across.
+                        #[cfg(test)]
+                        run_post_mutation_refresh_ok_interpose(&seam_source);
+                        RefreshTaskResult::Refreshed(AcceptedSourcePayload::catalogue(
+                            tracks,
+                            regular_playlist_capability,
+                        ))
+                    }
+                    // A cancelled lane publishes nothing and keeps its batch
+                    // pending, and the default adapter refusal (an adapter
+                    // never reviewed for post-mutation refresh semantics) is
+                    // a no-op, never a source failure: neither may degrade a
+                    // live session.
+                    Err(error)
+                        if cancellation.is_cancelled()
+                            || matches!(error, BackendError::Unsupported { .. }) =>
+                    {
+                        RefreshTaskResult::Cancelled
+                    }
+                    Err(error) => RefreshTaskResult::Failed(failure_category(&error)),
+                }
+            });
+            generations.push(generation);
+        }
+        generations
+    }
+}
+
+/// Test-only hook fired inside a post-mutation refresh task after its adapter
+/// call returned `Ok` and before its payload is submitted for settlement: the
+/// Ok→settlement window whose supersede races the pending batch's
+/// consumption. The armed closure receives the refreshing source's id and
+/// acts only on its own — a foreign test's generation fires this seam on
+/// its own schedule under the parallel harness.
+#[cfg(test)]
+type PostMutationRefreshOkInterpose = dyn Fn(&SourceId) + Send + Sync;
+
+#[cfg(test)]
+static POST_MUTATION_REFRESH_OK_INTERPOSE: std::sync::Mutex<
+    Option<Box<PostMutationRefreshOkInterpose>>,
+> = std::sync::Mutex::new(None);
+
+/// Serializes tests that use the post-mutation Ok interposition seam.
+#[cfg(test)]
+static POST_MUTATION_REFRESH_OK_INTERPOSE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn run_post_mutation_refresh_ok_interpose(source_id: &SourceId) {
+    if let Some(interpose) = lock(&POST_MUTATION_REFRESH_OK_INTERPOSE).as_ref() {
+        interpose(source_id);
+    }
+}
+
+/// Install the post-mutation Ok interposition seam for the duration of
+/// `run`, serializing against other tests that use the seam. A drop guard
+/// uninstalls the closure, so a panicking observation cannot leave a stale
+/// seam armed for a later test's post-mutation hooks.
+#[cfg(test)]
+fn with_post_mutation_refresh_ok_interpose(
+    interpose: Box<PostMutationRefreshOkInterpose>,
+    run: impl FnOnce(),
+) {
+    struct UninstallPostMutationRefreshOkInterpose;
+    impl Drop for UninstallPostMutationRefreshOkInterpose {
+        fn drop(&mut self) {
+            *lock(&POST_MUTATION_REFRESH_OK_INTERPOSE) = None;
+        }
+    }
+    let _serial = lock(&POST_MUTATION_REFRESH_OK_INTERPOSE_SERIAL);
+    *lock(&POST_MUTATION_REFRESH_OK_INTERPOSE) = Some(interpose);
+    let _uninstall = UninstallPostMutationRefreshOkInterpose;
+    run();
+}
+
+/// Test-only hook fired inside a refresh generation's acceptance hook before
+/// it consumes the pending map: the acceptance→consumption window a
+/// same-track save races across, since the acceptance and the pending map
+/// take different locks. The armed closure receives the refreshing source's
+/// id and acts only on its own: under the parallel test harness a foreign
+/// test's refresh generation fires this seam on its own schedule, and an
+/// identity-blind process-wide closure would run its race inside a
+/// stranger's window and desynchronize an innocent test.
+#[cfg(test)]
+type PendingConsumptionInterpose = dyn Fn(&SourceId) + Send + Sync;
+
+#[cfg(test)]
+static PENDING_CONSUMPTION_INTERPOSE: std::sync::Mutex<Option<Box<PendingConsumptionInterpose>>> =
+    std::sync::Mutex::new(None);
+
+/// Serializes tests that use the pending-consumption interposition seam.
+#[cfg(test)]
+static PENDING_CONSUMPTION_INTERPOSE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn run_pending_consumption_interpose(source_id: &SourceId) {
+    if let Some(interpose) = lock(&PENDING_CONSUMPTION_INTERPOSE).as_ref() {
+        interpose(source_id);
+    }
+}
+
+/// Install the pending-consumption interposition seam for the duration of
+/// `run`, serializing against other tests that use the seam. A drop guard
+/// uninstalls the closure, so a panicking observation cannot leave a stale
+/// seam armed for a later test's acceptance hooks.
+#[cfg(test)]
+fn with_pending_consumption_interpose(
+    interpose: Box<PendingConsumptionInterpose>,
+    run: impl FnOnce(),
+) {
+    struct UninstallPendingConsumptionInterpose;
+    impl Drop for UninstallPendingConsumptionInterpose {
+        fn drop(&mut self) {
+            *lock(&PENDING_CONSUMPTION_INTERPOSE) = None;
+        }
+    }
+    let _serial = lock(&PENDING_CONSUMPTION_INTERPOSE_SERIAL);
+    *lock(&PENDING_CONSUMPTION_INTERPOSE) = Some(interpose);
+    let _uninstall = UninstallPendingConsumptionInterpose;
+    run();
 }
 
 /// Closed source-kind/provenance policy for structured playback attribution.
@@ -2815,6 +3300,10 @@ mod tests {
         stream_release: watch::Sender<bool>,
         server_playlist_release: watch::Sender<bool>,
         server_playlist_snapshot_release: watch::Sender<bool>,
+        post_mutation_release: watch::Sender<bool>,
+        post_mutation_calls: AtomicUsize,
+        post_mutation_requests: Mutex<Vec<HashSet<TrackId>>>,
+        post_mutation_failure: AtomicBool,
         view_specs: Mutex<HashMap<ViewOrigin, VecDeque<ViewSpec>>>,
     }
 
@@ -2829,6 +3318,7 @@ mod tests {
             let (stream_release, _receiver) = watch::channel(true);
             let (server_playlist_release, _receiver) = watch::channel(true);
             let (server_playlist_snapshot_release, _receiver) = watch::channel(true);
+            let (post_mutation_release, _receiver) = watch::channel(true);
             Arc::new(Self {
                 close_calls: AtomicUsize::new(0),
                 stream_calls: AtomicUsize::new(0),
@@ -2840,8 +3330,42 @@ mod tests {
                 stream_release,
                 server_playlist_release,
                 server_playlist_snapshot_release,
+                post_mutation_release,
+                post_mutation_calls: AtomicUsize::new(0),
+                post_mutation_requests: Mutex::new(Vec::new()),
+                post_mutation_failure: AtomicBool::new(false),
                 view_specs: Mutex::new(HashMap::new()),
             })
+        }
+
+        /// Hold every subsequent post-mutation refresh inside the adapter
+        /// call until [`FakeProbe::release_post_mutation_refresh`].
+        fn hold_post_mutation_refresh(&self) {
+            self.post_mutation_release.send_replace(false);
+        }
+
+        fn release_post_mutation_refresh(&self) {
+            self.post_mutation_release.send_replace(true);
+        }
+
+        /// Make every unblocked post-mutation refresh call fail with a
+        /// backend error until switched off.
+        fn set_post_mutation_failure(&self, failing: bool) {
+            self.post_mutation_failure.store(failing, Ordering::Release);
+        }
+
+        async fn wait_for_post_mutation_calls(&self, expected: usize) {
+            timeout(Duration::from_secs(2), async {
+                while self.post_mutation_calls.load(Ordering::Acquire) < expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("post-mutation refresh call started");
+        }
+
+        fn post_mutation_requests(&self) -> Vec<HashSet<TrackId>> {
+            lock(&self.post_mutation_requests).clone()
         }
 
         fn queue_public_view(&self, view: ViewOrigin, endpoint: &str, delay: Duration) {
@@ -2871,6 +3395,7 @@ mod tests {
                 server_playlist_snapshot_failure: None,
                 stream_failure: None,
                 artwork_available: false,
+                post_mutation_refresh: None,
             }
         }
 
@@ -2895,6 +3420,7 @@ mod tests {
                 server_playlist_snapshot_failure: None,
                 stream_failure: None,
                 artwork_available: true,
+                post_mutation_refresh: None,
             }
         }
 
@@ -2932,6 +3458,7 @@ mod tests {
                 server_playlist_snapshot_failure: None,
                 stream_failure: None,
                 artwork_available: true,
+                post_mutation_refresh: None,
             }
         }
 
@@ -2996,6 +3523,7 @@ mod tests {
         server_playlist_snapshot_failure: Option<String>,
         stream_failure: Option<String>,
         artwork_available: bool,
+        post_mutation_refresh: Option<Vec<Track>>,
     }
 
     impl FakeAdapter {
@@ -3016,6 +3544,13 @@ mod tests {
                     Some(181),
                 ),
             );
+            self
+        }
+
+        /// Authorize one post-mutation catalogue refresh payload. `None`
+        /// keeps the fixture on the default refusal contract.
+        fn with_post_mutation_refresh(mut self, tracks: Vec<Track>) -> Self {
+            self.post_mutation_refresh = Some(tracks);
             self
         }
     }
@@ -3224,6 +3759,51 @@ mod tests {
 
         fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
             Box::pin(async move { Ok(self.catalogue.clone()) })
+        }
+
+        fn refresh_catalogue_after_mutation(
+            self: Arc<Self>,
+            written_track_ids: HashSet<TrackId>,
+            mut cancellation: crate::source_lifecycle::CancellationObserver,
+        ) -> CatalogueFuture {
+            let refreshed = self.post_mutation_refresh.clone();
+            let mut release = self.probe.post_mutation_release.subscribe();
+            let probe = Arc::clone(&self.probe);
+            Box::pin(async move {
+                // Record exactly which identities each refresh call is
+                // handed, so a test can require the coalesced union.
+                lock(&probe.post_mutation_requests).push(written_track_ids);
+                probe.post_mutation_calls.fetch_add(1, Ordering::AcqRel);
+                // A held gate keeps the call open so a test can overlap
+                // saves; a real device observes cancellation the same way.
+                while !*release.borrow_and_update() {
+                    tokio::select! {
+                        () = cancellation.cancelled() => {
+                            return Err(BackendError::ConnectionFailed {
+                                message: "fixture post-mutation refresh cancelled".to_string(),
+                                source: None,
+                            });
+                        }
+                        changed = release.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if probe.post_mutation_failure.load(Ordering::Acquire) {
+                    return Err(BackendError::ConnectionFailed {
+                        message: "fixture device error".to_string(),
+                        source: None,
+                    });
+                }
+                match refreshed {
+                    Some(tracks) => Ok(tracks),
+                    None => Err(BackendError::Unsupported {
+                        operation: "post-mutation catalogue refresh".to_string(),
+                    }),
+                }
+            })
         }
 
         fn resolve_stream(self: Arc<Self>, track_id: TrackId) -> StreamFuture {
@@ -3712,6 +4292,733 @@ mod tests {
         .await
         .expect("catalogue refresh accepted");
         generation
+    }
+
+    async fn wait_for_post_mutation_refresh_settled(
+        registry: &SourceRegistry,
+        source_id: SourceId,
+    ) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let Some(snapshot) = registry.snapshot(source_id) else {
+                    tokio::task::yield_now().await;
+                    continue;
+                };
+                if !snapshot
+                    .pending_refreshes
+                    .contains_key(&RefreshLane::Catalogue)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("post-mutation catalogue refresh settles");
+    }
+
+    #[tokio::test]
+    async fn post_mutation_refresh_refusal_is_never_a_lane_failure() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let track_id = TrackId::remote("refused-refresh-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        connect_playlist_fixture(
+            &registry,
+            source_id,
+            probe.playlist_adapter("refused-refresh", vec![fixture_track(track_id.clone())]),
+        )
+        .await;
+        let (generation, _epoch) = wait_for_catalogue(&registry, source_id).await;
+
+        let minted = registry.refresh_catalogue_after_mutation(&[(source_id, track_id)]);
+        assert_eq!(
+            minted.len(),
+            1,
+            "one source with an exact live session mints one refresh generation"
+        );
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+
+        // The unreviewed adapter's refusal settles as a cancellation: no
+        // refresh failure is recorded and the accepted catalogue is left
+        // exactly as the scan accepted it.
+        let snapshot = registry
+            .snapshot(source_id)
+            .expect("a refused refresh never retires the source");
+        assert!(
+            !snapshot
+                .refresh_failures
+                .contains_key(&RefreshLane::Catalogue),
+            "the post-mutation refusal is a cancellation, never a lane failure: {:?}",
+            snapshot.refresh_failures
+        );
+        let catalogue = snapshot
+            .catalogue
+            .expect("the accepted catalogue survives the refusal");
+        assert_eq!(catalogue.generation, generation, "nothing is republished");
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn authorized_post_mutation_refresh_republishes_only_the_written_source() {
+        let registry = registry();
+        let written_source = SourceId::random();
+        let untouched_source = SourceId::random();
+        let written_track = TrackId::remote("written-track").expect("track ID");
+        let untouched_track = TrackId::remote("untouched-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+
+        let initial = fixture_track(written_track.clone());
+        let mut replacement = fixture_track(written_track.clone());
+        replacement.title = "Republished After Retained Write".to_string();
+        let adapter = probe
+            .playlist_adapter("written", vec![initial])
+            .with_post_mutation_refresh(vec![replacement]);
+        connect_playlist_fixture(&registry, written_source, adapter).await;
+        connect_playlist_fixture(
+            &registry,
+            untouched_source,
+            probe.playlist_adapter("untouched", vec![fixture_track(untouched_track)]),
+        )
+        .await;
+        let (written_generation, _epoch) = wait_for_catalogue(&registry, written_source).await;
+        let (untouched_generation, _epoch) = wait_for_catalogue(&registry, untouched_source).await;
+
+        let minted = registry.refresh_catalogue_after_mutation(&[(written_source, written_track)]);
+        assert_eq!(minted.len(), 1);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if registry
+                    .snapshot(written_source)
+                    .and_then(|snapshot| snapshot.catalogue)
+                    .is_some_and(|catalogue| catalogue.generation == minted[0])
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the minted refresh generation publishes");
+
+        let written = registry
+            .snapshot(written_source)
+            .expect("the written source stays live");
+        let catalogue = written.catalogue.expect("republished catalogue accepted");
+        assert_eq!(
+            catalogue.generation, minted[0],
+            "the publication carries the minted refresh generation"
+        );
+        assert_ne!(catalogue.generation, written_generation);
+        assert!(catalogue
+            .value
+            .tracks
+            .iter()
+            .any(|track| track.title == "Republished After Retained Write"));
+        assert!(
+            written.refresh_failures.is_empty(),
+            "an authorized refresh never records a failure: {:?}",
+            written.refresh_failures
+        );
+
+        let untouched = registry
+            .snapshot(untouched_source)
+            .expect("the untouched source stays live");
+        assert_eq!(
+            untouched.catalogue.expect("untouched catalogue").generation,
+            untouched_generation,
+            "a source outside the written set is never rescanned"
+        );
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn post_mutation_refresh_without_a_live_session_mints_nothing() {
+        let registry = registry();
+        let ghost = SourceId::random();
+        let track_id = TrackId::remote("ghost-track").expect("track ID");
+        assert!(registry
+            .refresh_catalogue_after_mutation(&[(ghost, track_id)])
+            .is_empty());
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn overlapping_saves_coalesce_into_one_superseding_refresh() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let first_track = TrackId::remote("first-written-track").expect("track ID");
+        let second_track = TrackId::remote("second-written-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        probe.hold_post_mutation_refresh();
+
+        let republished = fixture_track(first_track.clone());
+        let adapter = probe
+            .playlist_adapter("coalescing", vec![fixture_track(first_track.clone())])
+            .with_post_mutation_refresh(vec![republished]);
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+        let (initial_generation, _epoch) = wait_for_catalogue(&registry, source_id).await;
+
+        // The first save's refresh blocks inside the adapter call.
+        let first_generation =
+            registry.refresh_catalogue_after_mutation(&[(source_id, first_track.clone())])[0];
+        probe.wait_for_post_mutation_calls(1).await;
+
+        // A second overlapping save supersedes the blocked lane. Its refresh
+        // must carry the union of both saves' written identities — not only
+        // its own — because the superseded first refresh publishes nothing.
+        let second_generation =
+            registry.refresh_catalogue_after_mutation(&[(source_id, second_track.clone())])[0];
+        assert_ne!(
+            second_generation, first_generation,
+            "the second save supersedes the first save's refresh lane"
+        );
+        probe.wait_for_post_mutation_calls(2).await;
+
+        probe.release_post_mutation_refresh();
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "exactly one refresh per save: {requests:?}"
+        );
+        assert_eq!(
+            requests[0],
+            HashSet::from([first_track.clone()]),
+            "the first save's refresh carries its own identity"
+        );
+        assert_eq!(
+            requests[1],
+            HashSet::from([first_track.clone(), second_track.clone()]),
+            "the superseding refresh coalesces the first save's written identity with its own"
+        );
+
+        let catalogue = registry
+            .snapshot(source_id)
+            .expect("the source stays live")
+            .catalogue
+            .expect("the accepted catalogue survives");
+        assert_ne!(
+            catalogue.generation, initial_generation,
+            "the coalesced refresh republished the catalogue"
+        );
+        assert_eq!(
+            catalogue.generation, second_generation,
+            "the publication carries the superseding generation"
+        );
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn a_failed_coalesced_refresh_keeps_earlier_identities_pending() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let first_track = TrackId::remote("pending-first-track").expect("track ID");
+        let second_track = TrackId::remote("pending-second-track").expect("track ID");
+        let third_track = TrackId::remote("pending-third-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        probe.hold_post_mutation_refresh();
+        probe.set_post_mutation_failure(true);
+
+        let adapter = probe
+            .playlist_adapter("failing-coalesce", vec![fixture_track(first_track.clone())])
+            .with_post_mutation_refresh(vec![fixture_track(first_track.clone())]);
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+        let (_initial_generation, _epoch) = wait_for_catalogue(&registry, source_id).await;
+
+        // Two overlapping saves: the coalesced refresh (carrying both
+        // identities) is the one that fails.
+        registry.refresh_catalogue_after_mutation(&[(source_id, first_track.clone())]);
+        probe.wait_for_post_mutation_calls(1).await;
+        registry.refresh_catalogue_after_mutation(&[(source_id, second_track.clone())]);
+        probe.wait_for_post_mutation_calls(2).await;
+        probe.release_post_mutation_refresh();
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests[1],
+            HashSet::from([first_track.clone(), second_track.clone()]),
+            "the coalesced refresh carried both saves' identities"
+        );
+        let snapshot = registry.snapshot(source_id).expect("the source stays live");
+        assert!(
+            snapshot
+                .refresh_failures
+                .contains_key(&RefreshLane::Catalogue),
+            "the coalesced refresh's failure is recorded: {:?}",
+            snapshot.refresh_failures
+        );
+
+        // A later save's refresh must still re-read the earlier identities:
+        // the failed coalesced batch stayed pending, never vanished.
+        probe.set_post_mutation_failure(false);
+        let third_generation =
+            registry.refresh_catalogue_after_mutation(&[(source_id, third_track.clone())])[0];
+        probe.wait_for_post_mutation_calls(3).await;
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests[2],
+            HashSet::from([
+                first_track.clone(),
+                second_track.clone(),
+                third_track.clone()
+            ]),
+            "the later refresh republishes the failed batch's identities together with its own"
+        );
+        let catalogue = registry
+            .snapshot(source_id)
+            .expect("the source stays live")
+            .catalogue
+            .expect("the accepted catalogue survives");
+        assert_eq!(catalogue.generation, third_generation);
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_during_a_coalesced_refresh_publishes_nothing() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let first_track = TrackId::remote("disconnect-first-track").expect("track ID");
+        let second_track = TrackId::remote("disconnect-second-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        probe.hold_post_mutation_refresh();
+
+        let adapter = probe
+            .playlist_adapter(
+                "disconnect-coalesce",
+                vec![fixture_track(first_track.clone())],
+            )
+            .with_post_mutation_refresh(vec![fixture_track(first_track.clone())]);
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+        let (initial_generation, _epoch) = wait_for_catalogue(&registry, source_id).await;
+
+        // Two overlapping saves coalesce into the second refresh while the
+        // first blocks inside the adapter call.
+        registry.refresh_catalogue_after_mutation(&[(source_id, first_track.clone())]);
+        probe.wait_for_post_mutation_calls(1).await;
+        registry.refresh_catalogue_after_mutation(&[(source_id, second_track.clone())]);
+        probe.wait_for_post_mutation_calls(2).await;
+        assert_eq!(
+            registry
+                .snapshot(source_id)
+                .expect("the source stays live while the refresh is held")
+                .catalogue
+                .expect("the accepted catalogue survives")
+                .generation,
+            initial_generation,
+            "a held refresh publishes nothing"
+        );
+
+        // Disconnecting mid-refresh cancels the coalesced task; releasing
+        // the gate must not let either call publish.
+        let disconnect = registry.disconnect(source_id).expect("disconnect source");
+        probe.release_post_mutation_refresh();
+        disconnect.wait().await;
+
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests[1],
+            HashSet::from([first_track.clone(), second_track.clone()]),
+            "the coalesced refresh was dispatched before the disconnect"
+        );
+        let snapshot = registry
+            .snapshot(source_id)
+            .expect("the retired source keeps its entry");
+        assert_eq!(
+            snapshot.state,
+            crate::source_lifecycle::SourceState::Dormant,
+            "the disconnected source retired to its dormant resting state"
+        );
+        assert!(
+            snapshot.catalogue.is_none(),
+            "the retired mount's catalogue is gone: the cancelled coalesced refresh published nothing"
+        );
+        drop(registry);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_supersede_between_ok_and_settlement_loses_no_committed_identity() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let first_track = TrackId::remote("settle-first-track").expect("track ID");
+        let second_track = TrackId::remote("settle-second-track").expect("track ID");
+        let third_track = TrackId::remote("settle-third-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        probe.hold_post_mutation_refresh();
+
+        let adapter = probe
+            .playlist_adapter(
+                "settlement-supersede",
+                vec![fixture_track(first_track.clone())],
+            )
+            .with_post_mutation_refresh(vec![fixture_track(first_track.clone())]);
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+        let (initial_generation, _epoch) = wait_for_catalogue(&registry, source_id).await;
+
+        // The first save's refresh blocks inside the adapter call, holding
+        // its generation and its carried batch.
+        let first_generation =
+            registry.refresh_catalogue_after_mutation(&[(source_id, first_track.clone())])[0];
+        probe.wait_for_post_mutation_calls(1).await;
+
+        // Drive the exact race the settlement-confirmed consumption guards:
+        // the moment the blocked refresh's adapter call returns Ok — after
+        // the Ok, before its payload is submitted for settlement — an
+        // overlapping save supersedes the lane. The superseding generation
+        // must clone a pending map the superseded generation has not consumed
+        // from: a superseded generation consumes nothing, so the successor
+        // re-reads every identity the rejected payload can no longer publish.
+        let (supersede_landed_signal, supersede_landed) = mpsc::channel::<()>();
+        let interpose_registry = registry.clone();
+        let interpose_source = source_id;
+        let interpose_second = second_track.clone();
+        let successor_generation: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let successor_slot = Arc::clone(&successor_generation);
+        let fired = AtomicBool::new(false);
+        with_post_mutation_refresh_ok_interpose(
+            Box::new(move |fired_source: &SourceId| {
+                // Identity scoping: a foreign test's refresh generation also
+                // fires this seam under the parallel harness; only this
+                // test's own source may spend the one-shot latch.
+                if fired_source != &interpose_source {
+                    return;
+                }
+                if fired.swap(true, Ordering::SeqCst) {
+                    return; // only the superseded generation's Ok drives the race
+                }
+                let written = [(interpose_source, interpose_second.clone())];
+                let generations = interpose_registry.refresh_catalogue_after_mutation(&written);
+                *successor_slot.lock().unwrap() = generations.first().copied();
+                let _ = supersede_landed_signal.send(());
+            }),
+            || {
+                probe.release_post_mutation_refresh();
+                supersede_landed
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("the supersede landed between Ok and settlement");
+            },
+        );
+        probe.wait_for_post_mutation_calls(2).await;
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+
+        // The successor re-read both identities: the superseded refresh's
+        // payload was rejected without consuming, so neither identity was
+        // stranded outside the successor's carried set.
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "exactly one refresh per save: {requests:?}"
+        );
+        assert_eq!(
+            requests[0],
+            HashSet::from([first_track.clone()]),
+            "the superseded refresh was dispatched with its own identity"
+        );
+        assert_eq!(
+            requests[1],
+            HashSet::from([first_track.clone(), second_track.clone()]),
+            "the successor re-reads the identity the superseded generation never consumed"
+        );
+        let successor = successor_generation
+            .lock()
+            .unwrap()
+            .expect("the superseding save minted a refresh generation");
+        assert_ne!(
+            successor, first_generation,
+            "the Ok→settlement supersede minted a newer generation"
+        );
+        let catalogue = registry
+            .snapshot(source_id)
+            .expect("the source stays live")
+            .catalogue
+            .expect("the accepted catalogue survives");
+        assert_ne!(
+            catalogue.generation, initial_generation,
+            "a refresh republished the catalogue"
+        );
+        assert_eq!(
+            catalogue.generation, successor,
+            "the successor's payload published; the superseded payload did not"
+        );
+
+        // Consumption is settlement-confirmed: the successor's acceptance
+        // emptied the batch, so a later save re-reads only its own identity.
+        let third_generation =
+            registry.refresh_catalogue_after_mutation(&[(source_id, third_track.clone())])[0];
+        probe.wait_for_post_mutation_calls(3).await;
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests[2],
+            HashSet::from([third_track]),
+            "the successor's settlement consumed the batch; nothing lingers pending"
+        );
+        let catalogue = registry
+            .snapshot(source_id)
+            .expect("the source stays live")
+            .catalogue
+            .expect("the accepted catalogue survives");
+        assert_eq!(catalogue.generation, third_generation);
+        drop(registry);
+    }
+
+    /// A save of the SAME track landing between an older generation's
+    /// acceptance and its hook's consumption — the two take different
+    /// locks — must not be consumed by the older hook. The track's pending
+    /// version was bumped by the newer save, so the older hook leaves it
+    /// pending; when the successor then fails, the track is still pending
+    /// and a later refresh re-reads it, so the newer mutation is republished
+    /// instead of being lost. A clean save after a successful settlement
+    /// still empties the batch: its acceptance re-reads only its own
+    /// identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_same_track_save_between_acceptance_and_its_hook_stays_pending() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let first_track = TrackId::remote("hook-race-first-track").expect("track ID");
+        let third_track = TrackId::remote("hook-race-third-track").expect("track ID");
+        let fourth_track = TrackId::remote("hook-race-fourth-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        probe.hold_post_mutation_refresh();
+
+        let adapter = probe
+            .playlist_adapter("hook-race", vec![fixture_track(first_track.clone())])
+            .with_post_mutation_refresh(vec![fixture_track(first_track.clone())]);
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+        let (initial_generation, _epoch) = wait_for_catalogue(&registry, source_id).await;
+
+        // The first save's refresh blocks inside the adapter call, holding
+        // its generation and its carried batch.
+        let first_generation =
+            registry.refresh_catalogue_after_mutation(&[(source_id, first_track.clone())])[0];
+        probe.wait_for_post_mutation_calls(1).await;
+
+        // Release the adapter: the blocked generation's payload is accepted
+        // and its acceptance hook fires — but before the hook consumes the
+        // pending map, a save of the SAME track lands, bumping the track's
+        // pending version and minting a successor generation. The failure
+        // fixture arms inside the seam: the blocked generation's adapter
+        // call has already returned Ok by the time the hook runs, so the
+        // flag can only arm the successor's call — which must FAIL: nothing
+        // it carries may be consumed, and the older hook must have left the
+        // re-written track pending for it.
+        let (hook_raced_signal, hook_raced) = mpsc::channel::<()>();
+        let race_probe = Arc::clone(&probe);
+        let race_registry = registry.clone();
+        let race_source = source_id;
+        let race_track = first_track.clone();
+        let successor_generation: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let successor_slot = Arc::clone(&successor_generation);
+        with_pending_consumption_interpose(
+            Box::new(move |fired_source: &SourceId| {
+                // Identity scoping: a foreign test's refresh generation also
+                // fires this seam under the parallel harness; only this
+                // test's own source may drive the race.
+                if fired_source != &race_source {
+                    return;
+                }
+                race_probe.set_post_mutation_failure(true);
+                let written = [(race_source, race_track.clone())];
+                let generations = race_registry.refresh_catalogue_after_mutation(&written);
+                *successor_slot.lock().unwrap() = generations.first().copied();
+                let _ = hook_raced_signal.send(());
+            }),
+            || {
+                probe.release_post_mutation_refresh();
+                hook_raced
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("the same-track save landed between acceptance and consumption");
+            },
+        );
+        probe.wait_for_post_mutation_calls(2).await;
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+        let snapshot = registry.snapshot(source_id).expect("the source stays live");
+        assert!(
+            snapshot
+                .refresh_failures
+                .contains_key(&RefreshLane::Catalogue),
+            "the successor generation failed: {:?}",
+            snapshot.refresh_failures
+        );
+        assert_ne!(
+            successor_generation
+                .lock()
+                .unwrap()
+                .expect("the race save minted a successor"),
+            first_generation,
+            "the acceptance→hook save minted a newer generation"
+        );
+
+        // The older hook consumed nothing: a later save's refresh still
+        // re-reads the twice-written track, so the catalogue eventually
+        // reflects the newer metadata.
+        probe.set_post_mutation_failure(false);
+        let third_generation =
+            registry.refresh_catalogue_after_mutation(&[(source_id, third_track.clone())])[0];
+        probe.wait_for_post_mutation_calls(3).await;
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests[2],
+            HashSet::from([first_track.clone(), third_track.clone()]),
+            "the track re-written between acceptance and consumption stays pending \
+             and is re-read by the next refresh"
+        );
+        let catalogue = registry
+            .snapshot(source_id)
+            .expect("the source stays live")
+            .catalogue
+            .expect("the accepted catalogue survives");
+        assert_ne!(
+            catalogue.generation, initial_generation,
+            "a refresh republished the catalogue"
+        );
+        assert_eq!(
+            catalogue.generation, third_generation,
+            "the re-read published under the newest generation"
+        );
+
+        // The clean single-save path still empties the batch on acceptance:
+        // the third save's settlement consumed its batch, so a later clean
+        // save re-reads only its own identity.
+        let fourth_generation =
+            registry.refresh_catalogue_after_mutation(&[(source_id, fourth_track.clone())])[0];
+        probe.wait_for_post_mutation_calls(4).await;
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests[3],
+            HashSet::from([fourth_track]),
+            "the settled batch is consumed; only the clean save's own identity \
+             lingers for its own refresh"
+        );
+        let catalogue = registry
+            .snapshot(source_id)
+            .expect("the source stays live")
+            .catalogue
+            .expect("the accepted catalogue survives");
+        assert_eq!(catalogue.generation, fourth_generation);
+        drop(registry);
+    }
+
+    /// Arm the pending-consumption seam for the drained-batch race: while
+    /// the older accepted generation's hook is descheduled just before its
+    /// consumption, remove the source's pending entry the way the
+    /// session-loss path removes it, then re-save the same track with the
+    /// successor forced to fail. The re-save must mint the monotonic
+    /// counter's next version — never a version the descheduled generation
+    /// also carried — or the older hook would consume the newer save's
+    /// unpublished marker.
+    #[cfg(test)]
+    fn arm_descheduled_hook_drain_race(
+        probe: &Arc<FakeProbe>,
+        registry: &SourceRegistry,
+        source_id: SourceId,
+        track: &TrackId,
+        raced_signal: mpsc::Sender<()>,
+        raced: mpsc::Receiver<()>,
+    ) {
+        let race_probe = Arc::clone(probe);
+        let race_registry = registry.clone();
+        let race_source = source_id;
+        let race_track = track.clone();
+        with_pending_consumption_interpose(
+            Box::new(move |fired_source: &SourceId| {
+                if fired_source != &race_source {
+                    return;
+                }
+                // Session-loss drain: the pending entry is removed while
+                // the older accepted generation's hook is descheduled.
+                lock(&race_registry.inner.mutation_refresh_pending).remove(&race_source);
+                race_probe.set_post_mutation_failure(true);
+                let _ = race_registry
+                    .refresh_catalogue_after_mutation(&[(race_source, race_track.clone())]);
+                // The re-save must mint the counter's next version, never
+                // a version the descheduled generation already carried.
+                let version = lock(&race_registry.inner.mutation_refresh_pending)
+                    .get(&race_source)
+                    .and_then(|entry| entry.get(&race_track))
+                    .copied();
+                assert_eq!(
+                    version,
+                    Some(2),
+                    "a save after a drained batch mints the counter's next \
+                     version, never a version an older descheduled \
+                     generation also carried"
+                );
+                let _ = raced_signal.send(());
+            }),
+            || {
+                probe.release_post_mutation_refresh();
+                raced
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("the re-save landed while the older hook was descheduled");
+            },
+        );
+    }
+
+    /// The version-matching consumption must stay correct across a drained
+    /// batch: while an older accepted generation's hook is descheduled, the
+    /// source's pending entry is removed (the session-loss drain), and the
+    /// same track is re-saved. The re-save must mint a version the older
+    /// generation never carried — deriving it from the pending map's
+    /// maximum would re-mint the drained version and let the older hook
+    /// consume the newer save's unpublished marker, losing it behind the
+    /// forced successor failure. With the monotonic counter, the marker
+    /// survives and a later clean refresh republishes the mutation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_descheduled_hook_after_a_drained_batch_never_consumes_a_re_minted_version() {
+        let registry = registry();
+        let source_id = SourceId::random();
+        let track = TrackId::remote("rearm-track").expect("track ID");
+        let later_track = TrackId::remote("rearm-later-track").expect("track ID");
+        let probe = FakeProbe::new(true);
+        probe.hold_post_mutation_refresh();
+
+        let adapter = probe
+            .playlist_adapter("pending-rearm", vec![fixture_track(track.clone())])
+            .with_post_mutation_refresh(vec![fixture_track(track.clone())]);
+        connect_playlist_fixture(&registry, source_id, adapter).await;
+        let _ = wait_for_catalogue(&registry, source_id).await;
+
+        // The first save's generation blocks inside the adapter call.
+        registry.refresh_catalogue_after_mutation(&[(source_id, track.clone())]);
+        probe.wait_for_post_mutation_calls(1).await;
+
+        let (raced_signal, raced) = mpsc::channel::<()>();
+        arm_descheduled_hook_drain_race(&probe, &registry, source_id, &track, raced_signal, raced);
+        probe.wait_for_post_mutation_calls(2).await;
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+        let snapshot = registry.snapshot(source_id).expect("the source stays live");
+        assert!(
+            snapshot
+                .refresh_failures
+                .contains_key(&RefreshLane::Catalogue),
+            "the forced-failure successor failed: {:?}",
+            snapshot.refresh_failures
+        );
+
+        // The failed successor published nothing and the descheduled older
+        // hook consumed nothing: a later clean save re-reads BOTH
+        // identities, republishing the mutation the failure would lose.
+        probe.set_post_mutation_failure(false);
+        let _later = registry.refresh_catalogue_after_mutation(&[(source_id, later_track.clone())]);
+        probe.wait_for_post_mutation_calls(3).await;
+        wait_for_post_mutation_refresh_settled(&registry, source_id).await;
+        let requests = probe.post_mutation_requests();
+        assert_eq!(
+            requests[2],
+            HashSet::from([track, later_track]),
+            "the re-saved track's marker survived the descheduled older hook \
+             and is republished after the forced successor failure"
+        );
+        drop(registry);
     }
 
     #[tokio::test]
@@ -7328,6 +8635,210 @@ mod tests {
         assert!(registry.release_provenance(source_id, claim));
         wait_until_pruned(&registry, source_id).await;
         assert!(!resolved.is_active());
+        registry.shutdown().wait().await;
+    }
+
+    /// A resolved removable mutation target authorizes writes only while its
+    /// owning session is live: a full retirement must refuse the next commit
+    /// even though every retained filesystem object is still untouched, and
+    /// the refused write must leave the admitted file byte-identical.
+    #[tokio::test]
+    async fn retired_removable_session_refuses_its_retained_mutation_target() {
+        let registry = registry();
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let path = mount.path().join("tagged.flac");
+        write_tagged_removable_fixture(&path, "Before Retirement", "Fixture Artist", None);
+        let source_id = SourceId::removable("registry:test:mutation-retire")
+            .expect("removable source identity");
+        let claim = registry
+            .claim_provenance(source_id, SourceProvenance::Removable)
+            .expect("claim removable source");
+        registry
+            .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+            .expect("removable connection admitted");
+        let (_, session_epoch) = wait_for_catalogue(&registry, source_id).await;
+        let track_id = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .and_then(|catalogue| catalogue.value.tracks().first().cloned())
+            .and_then(|track| track.native_track_id)
+            .expect("accepted track identity");
+
+        let target = registry
+            .resolve_mutation_target(source_id, session_epoch, track_id)
+            .await
+            .expect("resolve retained mutation target");
+        assert!(target.is_active());
+
+        // The live session admits a write through the retained authority.
+        target
+            .write_tags(&crate::local::tag_writer::TagEdits {
+                title: Some("Retirement Pending".to_string()),
+                ..Default::default()
+            })
+            .expect("a live session authorizes its mutation target");
+
+        // Retirement revokes the lease the target carries: the write
+        // authority must die with the session even though the mount, the
+        // retained ancestry, and the exact file are all still valid.
+        assert!(registry.release_provenance(source_id, claim));
+        wait_until_pruned(&registry, source_id).await;
+        assert!(!target.is_active());
+
+        target
+            .write_tags(&crate::local::tag_writer::TagEdits {
+                title: Some("After Retirement".to_string()),
+                ..Default::default()
+            })
+            .expect_err("a retired session must never authorize a commit");
+
+        let tagged = lofty::read_from_path(&path).expect("reopen untouched fixture");
+        use lofty::file::TaggedFileExt;
+        use lofty::tag::Accessor;
+        assert_eq!(
+            tagged
+                .primary_tag()
+                .expect("primary tag")
+                .title()
+                .as_deref(),
+            Some("Retirement Pending"),
+            "the refused write must leave the admitted file untouched"
+        );
+        registry.shutdown().wait().await;
+    }
+
+    /// Revocation racing a tag write can serialize in either order, and both
+    /// must be consistent: either the write was admitted first — revocation
+    /// waits behind its in-flight permit and the tags land — or retirement
+    /// landed first and the write is refused at admission with the file
+    /// untouched. No order may tear the file or lose the retirement.
+    #[tokio::test]
+    async fn revocation_during_a_removable_tag_write_never_tears_the_outcome() {
+        let registry = registry();
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let path = mount.path().join("tagged.flac");
+        write_tagged_removable_fixture(&path, "Before Retirement", "Fixture Artist", None);
+        let source_id =
+            SourceId::removable("registry:test:mutation-race").expect("removable source identity");
+        let claim = registry
+            .claim_provenance(source_id, SourceProvenance::Removable)
+            .expect("claim removable source");
+        registry
+            .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+            .expect("removable connection admitted");
+        let (_, session_epoch) = wait_for_catalogue(&registry, source_id).await;
+        let track_id = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .and_then(|catalogue| catalogue.value.tracks().first().cloned())
+            .and_then(|track| track.native_track_id)
+            .expect("accepted track identity");
+
+        let target = registry
+            .resolve_mutation_target(source_id, session_epoch, track_id)
+            .await
+            .expect("resolve retained mutation target");
+        let writer_target = target.clone();
+        let writer = std::thread::spawn(move || {
+            writer_target
+                .write_tags(&crate::local::tag_writer::TagEdits {
+                    title: Some("Mid-Flight Title".to_string()),
+                    ..Default::default()
+                })
+                .is_ok()
+        });
+
+        // Retire while the write may be mid-flight. An admitted section
+        // holds its lease permit until commit or rollback, so a revocation
+        // that began after admission cannot invalidate authority underneath
+        // the write; it must wait for the section to end.
+        assert!(registry.release_provenance(source_id, claim));
+        let admitted = writer.join().expect("writer thread finishes");
+        wait_until_pruned(&registry, source_id).await;
+        assert!(!target.is_active());
+
+        let tagged = lofty::read_from_path(&path).expect("reopen fixture");
+        use lofty::file::TaggedFileExt;
+        use lofty::tag::Accessor;
+        let title = tagged
+            .primary_tag()
+            .expect("primary tag")
+            .title()
+            .as_deref()
+            .expect("fixture keeps a title")
+            .to_string();
+        if admitted {
+            assert_eq!(
+                title, "Mid-Flight Title",
+                "an admitted write must complete even when revocation began mid-flight"
+            );
+        } else {
+            assert_eq!(
+                title, "Before Retirement",
+                "a write refused at admission must leave the admitted file untouched"
+            );
+        }
+        registry.shutdown().wait().await;
+    }
+
+    /// A leaf renamed or replaced while its retained inode stays open keeps
+    /// `validate()` passing — the swap is proven only inside the commit
+    /// section — so the advisory preflight must run the same leaf-identity
+    /// proof the commit does. A target whose accepted leaf was swapped after
+    /// admission reports unavailable before the user edits and saves into a
+    /// dialog whose every future commit is guaranteed to refuse, and the
+    /// preflight's refusal must predict the commit's refusal exactly.
+    #[tokio::test]
+    async fn removable_preflight_refuses_a_leaf_replaced_after_admission() {
+        let registry = registry();
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let path = mount.path().join("tagged.flac");
+        write_tagged_removable_fixture(&path, "Admitted Title", "Admitted Artist", None);
+        let source_id = SourceId::removable("registry:test:preflight-leaf-swap")
+            .expect("removable source identity");
+        let claim = registry
+            .claim_provenance(source_id, SourceProvenance::Removable)
+            .expect("claim removable source");
+        registry
+            .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+            .expect("removable connection admitted");
+        let (_, session_epoch) = wait_for_catalogue(&registry, source_id).await;
+        let track_id = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .and_then(|catalogue| catalogue.value.tracks().first().cloned())
+            .and_then(|track| track.native_track_id)
+            .expect("accepted track identity");
+
+        let target = registry
+            .resolve_mutation_target(source_id, session_epoch, track_id)
+            .await
+            .expect("resolve retained mutation target");
+        assert!(
+            target.preflight_write_capability().is_ok(),
+            "the untouched admitted target is write-capable"
+        );
+
+        // Swap the accepted leaf for a different object while the retained
+        // inode stays open, exactly like an external writer would.
+        let impostor = mount.path().join("impostor.flac");
+        write_tagged_removable_fixture(&impostor, "Impostor Title", "Impostor Artist", None);
+        std::fs::rename(&impostor, &path).expect("swap the accepted leaf");
+
+        assert!(matches!(
+            target.preflight_write_capability(),
+            Err(crate::local::tag_writer::TagWritePreflightError::Unavailable)
+        ));
+
+        target
+            .write_tags(&crate::local::tag_writer::TagEdits {
+                title: Some("Post Swap".to_string()),
+                ..Default::default()
+            })
+            .expect_err("a swapped leaf must refuse the commit");
+
+        assert!(registry.release_provenance(source_id, claim));
+        wait_until_pruned(&registry, source_id).await;
         registry.shutdown().wait().await;
     }
 

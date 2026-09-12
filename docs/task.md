@@ -485,12 +485,16 @@ full acceptance is binding; the checklist below indexes it. No new record has a 
 
 ### P3.3 — Authority and queue extensions
 
-- [ ] **P3.3-A** — Add typed retained mutation authority before enabling Properties/tag writes for
+- [x] **P3.3-A** — Add typed retained mutation authority before enabling Properties/tag writes for
   pathless removable rows; revalidate the mount, ancestry, exact file, write rights, and replacement
   target through commit.
 
-  In flight; #232 / `tr-mms4s`. Coordinate common authority with R1 without treating
-  path-only local preflight as removable authority. Retain stale-target rollback and repeat-save tests.
+  Done on #232 / `tr-mms4s`. `MountedRootAuthority::open_mutation_target` binds the mount,
+  ancestry, and exact accepted file into a retained target whose commit sections revalidate
+  everything before any byte moves, and removable Properties edits flow through it — so a remount,
+  rename, or swapped file fails closed instead of retargeting the overwrite. Common authority is
+  coordinated with R1; path-only local preflight is not treated as removable authority.
+  Stale-target rollback and repeat-save tests are retained.
 
 - [ ] **P3.3-B** — If product-approved, turn multi-file OS-open deliveries into an
   occurrence-preserving ephemeral queue; keep the current first-valid-file behavior documented until
