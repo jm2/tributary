@@ -118,7 +118,13 @@ fn restore_refuses_a_foreign_slot_without_touching_it() {
     let backup_leaf = authority
         .relative_leaf_identity(Path::new(".tributary-backup-test.tmp"))
         .expect("capture the backup identity");
-    // A concurrent writer interposes before the restore runs.
+    // A concurrent writer interposes before the restore runs. The slot
+    // must come to name a DIFFERENT object: remove and recreate. An
+    // in-place truncate-rewrite keeps the file id and (on Windows) the
+    // preserved creation time, so the object-coupled gate would correctly
+    // see the transfer's own publication — the very confusion this
+    // regression exists to refuse.
+    std::fs::remove_file(root.path().join("song.flac")).expect("drop the published object");
     std::fs::write(root.path().join("song.flac"), b"interposer bytes")
         .expect("interpose at the destination");
 
