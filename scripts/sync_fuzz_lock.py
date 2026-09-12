@@ -281,14 +281,16 @@ def resolved_dependency_edges(
 
 def valid_semver_build_metadata(build: str) -> bool:
     """
-    True when build metadata is well-formed SemVer: dot-separated
-    identifiers of ASCII alphanumerics and hyphens. Numeric build
-    identifiers MAY carry leading zeros — SemVer 2.0.0 restricts leading
-    zeros to numeric prerelease identifiers, and cargo accepts and
-    re-emits records like 1.0.0+01 and 1.0.0+zlib.01. Content is
-    irrelevant to cargo's compatibility rules — validity only separates
-    cargo-writable records (real locks hold 1.1.5+spec-1.1.0 and
-    1.0.4+wasi-0.2.12) from malformed input, which stays fail-closed.
+    Report whether build metadata is well-formed SemVer.
+
+    Build metadata is dot-separated identifiers of ASCII alphanumerics
+    and hyphens. Numeric build identifiers MAY carry leading zeros —
+    SemVer 2.0.0 restricts leading zeros to numeric prerelease
+    identifiers, and cargo accepts and re-emits records like 1.0.0+01
+    and 1.0.0+zlib.01. Content is irrelevant to cargo's compatibility
+    rules — validity only separates cargo-writable records (real locks
+    hold 1.1.5+spec-1.1.0 and 1.0.4+wasi-0.2.12) from malformed input,
+    which stays fail-closed.
     """
     identifiers = build.split(".")
     return all(
@@ -304,12 +306,14 @@ def valid_semver_build_metadata(build: str) -> bool:
 
 def valid_semver_prerelease(prerelease: str) -> bool:
     """
-    True when prerelease is well-formed SemVer: dot-separated
-    identifiers of ASCII alphanumerics and hyphens, none empty, and
-    numeric identifiers carry no leading zeros (SemVer 2.0.0 restricts
-    leading zeros to numeric build identifiers, which cargo accepts and
-    re-emits). Registry versions are valid semver, so cargo can never
-    write anything else — malformed prereleases stay fail-closed.
+    Report whether prerelease is well-formed SemVer.
+
+    Prerelease is dot-separated identifiers of ASCII alphanumerics and
+    hyphens, none empty, and numeric identifiers carry no leading zeros
+    (SemVer 2.0.0 restricts leading zeros to numeric build identifiers,
+    which cargo accepts and re-emits). Registry versions are valid
+    semver, so cargo can never write anything else — malformed
+    prereleases stay fail-closed.
     """
     for identifier in prerelease.split("."):
         if (
@@ -328,6 +332,50 @@ def valid_semver_prerelease(prerelease: str) -> bool:
         ):
             return False
     return True
+
+
+def parse_numeric_release(core: str) -> tuple[int, int, int] | None:
+    """
+    Parse a release core into its numeric X.Y.Z components.
+
+    Exactly three dot-separated ASCII digit components with no
+    semver-forbidden leading zeros is the only accepted shape; anything
+    else is malformed input and returns None, keeping version forms
+    cargo cannot write fail-closed.
+    """
+    components = core.split(".")
+    if len(components) != 3:
+        return None
+    if not all(
+        component.isascii() and component.isdigit()
+        for component in components
+    ):
+        return None
+    if any(
+        len(component) > 1 and component.startswith("0")
+        for component in components
+    ):
+        return None
+    major, minor, patch = (int(component) for component in components)
+    return (major, minor, patch)
+
+
+def compatibility_axes(
+    release: tuple[int, int, int],
+) -> tuple[int, int | None, int | None]:
+    """
+    Reduce a numeric release to the axes cargo unifies on.
+
+    Stable majors unify on the major alone; 0.x crates also require the
+    minor (^0.60 never matches 0.61.x); 0.0.x crates require the patch
+    (^0.0.1 excludes 0.0.2).
+    """
+    major, minor, patch = release
+    if major > 0:
+        return (major, None, None)
+    if minor > 0:
+        return (0, minor, None)
+    return (0, 0, patch)
 
 
 def cargo_version_family(version: str) -> tuple[int, int | None, int | None] | None:
@@ -362,25 +410,10 @@ def cargo_version_family(version: str) -> tuple[int, int | None, int | None] | N
     core, dash, prerelease = core_and_prerelease.partition("-")
     if dash and not valid_semver_prerelease(prerelease):
         return None
-    components = core.split(".")
-    if len(components) != 3:
+    release = parse_numeric_release(core)
+    if release is None:
         return None
-    if not all(
-        component.isascii() and component.isdigit()
-        for component in components
-    ):
-        return None
-    if any(
-        len(component) > 1 and component.startswith("0")
-        for component in components
-    ):
-        return None
-    major, minor, patch = (int(component) for component in components)
-    if major > 0:
-        return (major, None, None)
-    if minor > 0:
-        return (0, minor, None)
-    return (0, 0, patch)
+    return compatibility_axes(release)
 
 
 def same_semver_compat_family(left: str, right: str) -> bool:
