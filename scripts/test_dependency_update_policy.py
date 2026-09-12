@@ -1322,17 +1322,20 @@ class FuzzLockPolicyTests(unittest.TestCase):
     def test_compat_family_rejects_versions_outside_full_numeric_release_shape(
         self,
     ):
-        # Cargo lock version fields are always full numeric X.Y.Z releases.
+        # Cargo lock version fields are always a full numeric X.Y.Z core.
         # Anything else is malformed input that must never compare equal to
-        # a valid version — incomplete versions, prerelease or build
-        # suffixes, semver-forbidden leading zeros, extra components — so a
-        # crafted lock cannot smuggle a same-family match past the
-        # unification attribution.
+        # a valid version — incomplete versions, prerelease suffixes,
+        # semver-forbidden leading zeros, extra components — so a crafted
+        # lock cannot smuggle a same-family match past the unification
+        # attribution. Build metadata is validated separately: valid
+        # metadata is stripped before the family parse, malformed metadata
+        # (empty, duplicated, or non-identifier content) stays malformed.
         for malformed in (
             "3",
             "3.0",
             "3.0.2-beta",
-            "1.0.0+zlib",
+            "1.0.0+",
+            "1.0.0+zlib+",
             "01.2.3",
             "1.02.3",
             "1.2.03",
@@ -1347,6 +1350,85 @@ class FuzzLockPolicyTests(unittest.TestCase):
             )
             self.assertFalse(
                 sync_fuzz_lock.same_semver_compat_family("3.0.5", malformed),
+                malformed,
+            )
+
+    def test_compat_family_strips_valid_semver_build_metadata(self):
+        # Build metadata is valid SemVer and never affects cargo's
+        # compatibility rules, and real locks carry such records (toml
+        # 1.1.5+spec-1.1.0, wasip2 1.0.4+wasi-0.2.12, umask
+        # 0.9.34+deprecated). A record must not lose its family because it
+        # carries metadata, or the attribution would reject Cargo-generated
+        # output as an unauthorized removal.
+        self.assertTrue(
+            sync_fuzz_lock.same_semver_compat_family(
+                "1.1.5+spec-1.1.0", "1.1.5"
+            )
+        )
+        self.assertTrue(
+            sync_fuzz_lock.same_semver_compat_family(
+                "1.1.5", "1.1.5+spec-1.1.0"
+            )
+        )
+        self.assertTrue(
+            sync_fuzz_lock.same_semver_compat_family(
+                "1.1.5+spec-1.1.0", "1.1.5+wasi-0.2.12"
+            )
+        )
+        self.assertTrue(
+            sync_fuzz_lock.same_semver_compat_family(
+                "0.9.34+deprecated", "0.9.34"
+            )
+        )
+        self.assertTrue(
+            sync_fuzz_lock.same_semver_compat_family(
+                "1.0.4+wasi-0.2.12", "1.0.4+wasi-0.2.12"
+            )
+        )
+        # Metadata is ignored only inside a family: the cargo compatibility
+        # axes stay enforced on every axis.
+        self.assertTrue(
+            sync_fuzz_lock.same_semver_compat_family(
+                "1.1.5+spec-1.1.0", "1.1.6"
+            )
+        )
+        self.assertFalse(
+            sync_fuzz_lock.same_semver_compat_family(
+                "1.1.5+spec-1.1.0", "2.1.5"
+            )
+        )
+        self.assertFalse(
+            sync_fuzz_lock.same_semver_compat_family(
+                "0.60.2+deprecated", "0.61.2"
+            )
+        )
+        self.assertFalse(
+            sync_fuzz_lock.same_semver_compat_family(
+                "0.0.1+spec-1.1.0", "0.0.2"
+            )
+        )
+
+    def test_compat_family_rejects_malformed_build_metadata(self):
+        # Only well-formed metadata is stripped: empty or empty identifiers
+        # ("1.0.0+", "1.0.0+z..lib"), a duplicated "+" separator, non-ASCII
+        # or non-identifier characters, and numeric identifiers with
+        # semver-forbidden leading zeros are malformed input that must
+        # never compare equal to a valid version. A prerelease suffix
+        # stays malformed even behind a valid build metadata segment.
+        for malformed in (
+            "1.0.0+",
+            "1.0.0+z..lib",
+            "1.0.0+zlib+more",
+            "1.0.0+zlib.01",
+            "1.0.0+ä",
+            "1.2.3-rc.1+build",
+        ):
+            self.assertFalse(
+                sync_fuzz_lock.same_semver_compat_family(malformed, "1.0.5"),
+                malformed,
+            )
+            self.assertFalse(
+                sync_fuzz_lock.same_semver_compat_family("1.0.5", malformed),
                 malformed,
             )
 
@@ -1427,6 +1509,100 @@ class FuzzLockPolicyTests(unittest.TestCase):
                 repaired_fuzz,
                 [sync_fuzz_lock.Transition("lofty", "0.24.0", "0.25.1")],
             )
+
+    def test_bounded_repair_allows_unification_onto_build_metadata_survivor(
+        self,
+    ):
+        #lizard forgives
+        # Real locks carry build-metadata records (toml 1.1.5+spec-1.1.0 in
+        # this repository), and build metadata never affects cargo's
+        # compatibility rules. When a repair's graph refresh rebinds the
+        # outside consumers of toml 1.1.4 onto the newly introduced
+        # 1.1.5+spec-1.1.0 survivor inside the after closure, the removal
+        # must attribute as same-family unification — treating the
+        # metadata-bearing version as malformed would falsely reject
+        # Cargo-generated output as an unauthorized removal.
+        base = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "toml": ["1.1.4"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        # package order: lofty, lofty-attr, toml 1.1.4, quote, async-trait,
+        # serde-derive. The old lofty subtree never reaches toml; toml
+        # 1.1.4 is consumed only by crates outside it.
+        base["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        base["package"][4]["dependencies"] = ["toml 1.1.4"]
+        base["package"][6]["dependencies"] = ["toml 1.1.4"]
+        stale_fuzz = lock(
+            ["lofty 0.24.0"],
+            {
+                "lofty": ["0.24.0"],
+                "lofty-attr": ["0.12.0"],
+                "toml": ["1.1.4"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        stale_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.12.0"]
+        stale_fuzz["package"][4]["dependencies"] = ["toml 1.1.4"]
+        stale_fuzz["package"][6]["dependencies"] = ["toml 1.1.4"]
+        current = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "toml": ["1.1.5+spec-1.1.0"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        current["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        current["package"][2]["dependencies"] = ["toml 1.1.5+spec-1.1.0"]
+        current["package"][4]["dependencies"] = ["toml 1.1.5+spec-1.1.0"]
+        current["package"][6]["dependencies"] = ["toml 1.1.5+spec-1.1.0"]
+        repaired_fuzz = lock(
+            ["lofty 0.25.1"],
+            {
+                "lofty": ["0.25.1"],
+                "lofty-attr": ["0.13.0"],
+                "toml": ["1.1.5+spec-1.1.0"],
+                "quote": ["1.0.0"],
+                "async-trait": ["0.1.92"],
+                "serde-derive": ["1.0.229"],
+            },
+        )
+        repaired_fuzz["package"][1]["dependencies"] = ["lofty-attr 0.13.0"]
+        repaired_fuzz["package"][2]["dependencies"] = ["toml 1.1.5+spec-1.1.0"]
+        repaired_fuzz["package"][4]["dependencies"] = ["toml 1.1.5+spec-1.1.0"]
+        repaired_fuzz["package"][6]["dependencies"] = ["toml 1.1.5+spec-1.1.0"]
+
+        requested, remaining = sync_fuzz_lock.validate_submitted_fuzz_update(
+            base,
+            current,
+            stale_fuzz,
+            repaired_fuzz,
+            {"dependencies": {"lofty": "1"}},
+        )
+        self.assertEqual(
+            requested,
+            [sync_fuzz_lock.Transition("lofty", "0.24.0", "0.25.1")],
+        )
+        self.assertEqual(remaining, [])
+        sync_fuzz_lock.validate_bounded_package_changes(
+            base,
+            current,
+            stale_fuzz,
+            repaired_fuzz,
+            requested,
+        )
 
     def test_bounded_repair_rejects_unused_unification_replacement(self):
         #lizard forgives

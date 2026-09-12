@@ -279,21 +279,54 @@ def resolved_dependency_edges(
     }
 
 
+def valid_semver_build_metadata(build: str) -> bool:
+    """
+    True when build metadata is well-formed SemVer: dot-separated
+    identifiers of ASCII alphanumerics and hyphens, where numeric
+    identifiers forbid leading zeros. Content is irrelevant to cargo's
+    compatibility rules — validity only separates cargo-writable records
+    (real locks hold 1.1.5+spec-1.1.0 and 1.0.4+wasi-0.2.12) from
+    malformed input, which stays fail-closed.
+    """
+    identifiers = build.split(".")
+    if not all(
+        identifier
+        and identifier.isascii()
+        and all(
+            character.isalnum() or character == "-"
+            for character in identifier
+        )
+        for identifier in identifiers
+    ):
+        return False
+    return not any(
+        len(identifier) > 1 and identifier.isdigit() and identifier.startswith("0")
+        for identifier in identifiers
+    )
+
+
 def cargo_version_family(version: str) -> tuple[int, int | None, int | None] | None:
     """
     Parse a Cargo lock version into its unification identity components.
 
-    Cargo lock version fields are always full numeric X.Y.Z releases, so
-    anything else is malformed input that must never compare equal to a
-    valid version: incomplete versions, non-numeric or non-ASCII
-    components, semver-forbidden leading zeros, prerelease/build suffixes,
-    and extra components all parse to None and stay fail-closed. The
-    returned triple keeps exactly the components cargo's compatibility
-    rules unify on — (major, None, None) for stable majors, (0, minor,
-    None) for 0.x crates, and (0, 0, patch) for 0.0.x crates, where a
-    ^0.0.P requirement matches only that patch.
+    Cargo lock version fields are full numeric X.Y.Z releases, optionally
+    carrying SemVer build metadata. Build metadata never affects cargo's
+    compatibility rules, so a valid suffix is stripped before the numeric
+    parse; a malformed one (empty, duplicated "+", or non-identifier
+    content) is malformed input. Either way anything that is not a full
+    numeric X.Y.Z release never compares equal to a valid version:
+    incomplete versions, prerelease suffixes, non-numeric or non-ASCII
+    components, semver-forbidden leading zeros, and extra components all
+    parse to None and stay fail-closed. The returned triple keeps exactly
+    the components cargo's compatibility rules unify on — (major, None,
+    None) for stable majors, (0, minor, None) for 0.x crates, and
+    (0, 0, patch) for 0.0.x crates, where a ^0.0.P requirement matches
+    only that patch.
     """
-    components = version.split(".")
+    core, plus, build = version.partition("+")
+    if plus and not valid_semver_build_metadata(build):
+        return None
+    components = core.split(".")
     if len(components) != 3:
         return None
     if not all(
