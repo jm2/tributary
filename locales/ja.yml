@@ -447,3 +447,28 @@ rhythmbox_migration:
       automatic_rating_semantics: "自動プレイリストの評価規則を正確に表現できません"
       invalid_occurrence: "使用できるローカルファイルの場所がありません"
       unmatched_occurrence: "不一致パスとして保持します"
+
+# ── Equalizer ──────────────────────────────────────────────────────
+equalizer:
+  title: "イコライザー"
+  description: "ローカル音声出力向けの、プリアンプとクリップ保護付きの10バンドイコライザー。"
+  enabled: "イコライザーを有効にする"
+  preset: "プリセット"
+  preset_flat: "フラット"
+  preset_pop: "ポップ"
+  preset_rock: "ロック"
+  preset_jazz: "ジャズ"
+  preset_classical: "クラシック"
+  preset_custom: "カスタム"
+  preamp: "プリアンプ"
+  clip_protection: "クリップ保護"
+  clip_off: "オフ"
+  clip_soft: "ソフト"
+  reset_flat: "フラットに戻す"
+  reload: "ディスクから再読み込み"
+  band_a11y: "%{frequency}ヘルツのイコライザーバンド、デシベル単位で調整します"
+  unsupported:
+    local: "イコライザーはTributaryのローカル音声パイプライン内で動作します。"
+    airplay: "AirPlayレシーバーは音声をエンドツーエンドで処理するため、Tributaryのイコライザーはスピーカーに届きません。"
+    chromecast: "Chromecastデバイスはレシーバー側で音声を処理するため、Tributaryのイコライザーはスピーカーに届きません。"
+    mpd: "MPDはサーバー側で音声を処理するため、Tributaryのイコライザーはリモートプレーヤーに届きません。"

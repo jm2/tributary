@@ -447,3 +447,28 @@ rhythmbox_migration:
       automatic_rating_semantics: "beoordelingsregel van automatische afspeellijst kan niet exact worden weergegeven"
       invalid_occurrence: "item heeft geen bruikbare lokale bestandslocatie"
       unmatched_occurrence: "item blijft behouden als niet-gevonden pad"
+
+# ── Equalizer ──────────────────────────────────────────────────────
+equalizer:
+  title: "Equalizer"
+  description: "Tienbands-equalizer met voorversterker en overstuurbescherming voor de lokale audio-uitgang."
+  enabled: "Equalizer inschakelen"
+  preset: "Voorinstelling"
+  preset_flat: "Vlak"
+  preset_pop: "Pop"
+  preset_rock: "Rock"
+  preset_jazz: "Jazz"
+  preset_classical: "Klassiek"
+  preset_custom: "Eigen"
+  preamp: "Voorversterking"
+  clip_protection: "Overstuurbescherming"
+  clip_off: "Uit"
+  clip_soft: "Zacht"
+  reset_flat: "Terugzetten op vlak"
+  reload: "Opnieuw van schijf laden"
+  band_a11y: "Equalizer-band op %{frequency} hertz, ingesteld in decibel"
+  unsupported:
+    local: "De equalizer draait binnen de lokale audiopipeline van Tributary."
+    airplay: "AirPlay-ontvangers verwerken de audio end-to-end, dus de equalizer van Tributary bereikt de luidspreker niet."
+    chromecast: "Chromecast-apparaten verwerken de audio aan de ontvangstkant, dus de equalizer van Tributary bereikt de luidspreker niet."
+    mpd: "MPD verwerkt de audio op de server, dus de equalizer van Tributary bereikt de externe spelers niet."

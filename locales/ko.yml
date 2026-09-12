@@ -447,3 +447,28 @@ rhythmbox_migration:
       automatic_rating_semantics: "자동 재생목록 평점 규칙을 정확히 표현할 수 없음"
       invalid_occurrence: "사용할 수 있는 로컬 파일 위치가 없음"
       unmatched_occurrence: "일치하지 않는 경로로 보존됨"
+
+# ── Equalizer ──────────────────────────────────────────────────────
+equalizer:
+  title: "이퀄라이저"
+  description: "로컬 오디오 출력을 위한 프리앰프 및 클립 방지 기능이 포함된 10밴드 이퀄라이저입니다."
+  enabled: "이퀄라이저 사용"
+  preset: "프리셋"
+  preset_flat: "평탄"
+  preset_pop: "팝"
+  preset_rock: "록"
+  preset_jazz: "재즈"
+  preset_classical: "클래식"
+  preset_custom: "사용자 지정"
+  preamp: "프리앰프"
+  clip_protection: "클립 방지"
+  clip_off: "끄기"
+  clip_soft: "소프트"
+  reset_flat: "평탄으로 초기화"
+  reload: "디스크에서 다시 불러오기"
+  band_a11y: "%{frequency}헤르츠 이퀄라이저 밴드, 데시벨 단위로 조절합니다"
+  unsupported:
+    local: "이퀄라이저는 Tributary의 로컬 오디오 파이프라인 안에서 실행됩니다."
+    airplay: "AirPlay 수신기는 오디오를 끝까지 자체 처리하므로 Tributary의 이퀄라이저가 스피커에 적용되지 않습니다."
+    chromecast: "Chromecast 기기는 수신기 쪽에서 오디오를 처리하므로 Tributary의 이퀄라이저가 스피커에 적용되지 않습니다."
+    mpd: "MPD는 서버 쪽에서 오디오를 처리하므로 Tributary의 이퀄라이저가 원격 플레이어에 적용되지 않습니다."

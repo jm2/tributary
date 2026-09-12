@@ -447,3 +447,28 @@ rhythmbox_migration:
       automatic_rating_semantics: "la regola di valutazione della playlist automatica non può essere rappresentata esattamente"
       invalid_occurrence: "la voce non ha una posizione di file locale utilizzabile"
       unmatched_occurrence: "la voce viene conservata come percorso senza corrispondenza"
+
+# ── Equalizer ──────────────────────────────────────────────────────
+equalizer:
+  title: "Equalizzatore"
+  description: "Equalizzatore a dieci bande con preamplificazione e protezione dal clipping per l’uscita audio locale."
+  enabled: "Attiva equalizzatore"
+  preset: "Preimpostazione"
+  preset_flat: "Piatto"
+  preset_pop: "Pop"
+  preset_rock: "Rock"
+  preset_jazz: "Jazz"
+  preset_classical: "Classica"
+  preset_custom: "Personalizzato"
+  preamp: "Preamplificazione"
+  clip_protection: "Protezione dal clipping"
+  clip_off: "Disattivata"
+  clip_soft: "Leggera"
+  reset_flat: "Reimposta su piatto"
+  reload: "Ricarica dal disco"
+  band_a11y: "Banda dell’equalizzatore a %{frequency} hertz, regolata in decibel"
+  unsupported:
+    local: "L’equalizzatore gira nella pipeline audio locale di Tributary."
+    airplay: "I riceventi AirPlay elaborano l’audio end-to-end, quindi l’equalizzatore di Tributary non può raggiungere l’altoparlante."
+    chromecast: "I dispositivi Chromecast elaborano l’audio sul ricevente, quindi l’equalizzatore di Tributary non può raggiungere l’altoparlante."
+    mpd: "MPD elabora l’audio sul server, quindi l’equalizzatore di Tributary non può raggiungere i riproduttori remoti."
