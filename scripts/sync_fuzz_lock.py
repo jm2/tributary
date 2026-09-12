@@ -399,7 +399,10 @@ def unification_replacements(
     repaired lock leaves exactly one same-name record, cargo resolved every
     requirer of the name onto it, so the observed exact rebind was
     requirement-forced rather than arbitrary; a stable-major survivor with
-    a fully numeric release is therefore admitted as a replacement. The
+    a fully numeric release is therefore admitted as a replacement. That
+    uniqueness is counted across every same-name record — a co-resident
+    0.x or unparseable record shows a requirer that stayed put, breaking
+    the proof, and stays rejected. The
     survivor must itself be a stable major: absorbing an evacuated
     stable-major family into a 0.x or 0.0.x record crosses the 0.x
     compatibility boundary, and 0.x minor and 0.0.x patch boundaries stay
@@ -429,21 +432,25 @@ def unification_replacements(
         ):
             # Broad consumer requirements evacuated the removed identity's
             # compatibility family; consider the unique same-name survivor
-            # across families. Requiring exactly one stable-major, fully
-            # numeric release keeps ambiguous, malformed, and 0.x survivors
-            # fail-closed — substitution into 0.x territory crosses the
-            # same operator-policy boundary as the removed-family guard
-            # above, whichever side of the boundary the move starts from.
-            survivors = sorted(
+            # across families. Uniqueness is counted across EVERY same-name
+            # record: the requirement-forced proof rests on cargo having
+            # resolved all requirers of the name onto one record, and any
+            # co-resident 0.x or unparseable record shows a requirer that
+            # demonstrably stayed put. The sole survivor must still be a
+            # stable-major, fully numeric release — this keeps ambiguous,
+            # malformed, and 0.x survivors fail-closed — substitution into
+            # 0.x territory crosses the same operator-policy boundary as
+            # the removed-family guard above, whichever side of the
+            # boundary the move starts from.
+            same_name = sorted(
                 candidate
                 for candidate in after_records
                 if candidate[0] == identity[0]
-                and (
-                    candidate_family := cargo_version_family(candidate[1])
-                )
-                is not None
-                and candidate_family[0] > 0
             )
+            if len(same_name) == 1:
+                survivor_family = cargo_version_family(same_name[0][1])
+                if survivor_family is not None and survivor_family[0] > 0:
+                    survivors = same_name
         if len(survivors) != 1:
             continue
         replacement = survivors[0]
