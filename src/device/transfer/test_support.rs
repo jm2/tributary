@@ -24,6 +24,26 @@ pub fn authority_pair(root: &Path) -> (Arc<MountedRootAuthority>, MountedWriteAu
     (read, write)
 }
 
+/// Reports whether this process is actually constrained by Unix permission
+/// bits. A privileged (euid 0) process bypasses permission checks, so the
+/// permission-based failure injection some regressions rely on cannot
+/// produce the failure under root; tests using such injection skip when
+/// this returns `false` instead of asserting a failure root never observes.
+#[cfg(unix)]
+pub fn process_respects_permission_bits() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(probe) = tempfile::tempdir() else {
+        return true;
+    };
+    if std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o000)).is_err() {
+        return true;
+    }
+    let constrained = std::fs::write(probe.path().join("probe"), b"").is_err();
+    let _ = std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o755));
+    constrained
+}
+
 /// Write a source fixture file below `root`, creating parent directories.
 pub fn write_source_file(root: &Path, relative: &str, contents: &[u8]) {
     let path = root.join(relative);
