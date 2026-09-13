@@ -316,3 +316,150 @@ fn nested_bind_mount_is_rejected_at_planning_time() {
         "the typed error must name the nested mount path"
     );
 }
+
+/// Bind `source` onto `target` at the driver level. Returns `false` when the
+/// environment cannot create a bind mount, so the file-boundary regressions
+/// below skip instead of failing on an unprivileged host.
+#[cfg(target_os = "linux")]
+fn bind_mount(source: &std::path::Path, target: &std::path::Path) -> bool {
+    std::process::Command::new("mount")
+        .arg("--bind")
+        .arg(source)
+        .arg(target)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// A regular file that is itself a bind mount keeps the walk's `st_dev`
+/// (same device) and satisfies `entry.file_type().is_file()`, so without a
+/// per-file boundary probe the planner would stage and count the
+/// mount-foreign bytes and refuse only mid-run, after earlier stages had
+/// already committed. The whole plan must be rejected at planning time with
+/// the bind-mounted file named.
+#[cfg(target_os = "linux")]
+#[test]
+fn walked_bind_mounted_regular_file_is_rejected_at_planning_time() {
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    write_source_file(source_root.path(), "mounted-src/song.flac", b"foreign");
+    write_source_file(source_root.path(), "album/song.flac", b"target");
+
+    if !bind_mount(
+        &source_root.path().join("mounted-src/song.flac"),
+        &source_root.path().join("album/song.flac"),
+    ) {
+        eprintln!("skipping: bind mount unavailable in this environment");
+        return;
+    }
+    let _unmount = LazyUnmount(source_root.path().join("album/song.flac"));
+
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = plan_request(
+        source,
+        destination,
+        vec![TransferItem::new(
+            PathBuf::from("album"),
+            PathBuf::from("imported"),
+        )],
+        ConflictPolicy::Preserve,
+        None,
+    );
+    let error = TransferPlanner::new()
+        .plan(&request)
+        .expect_err("a bind-mounted regular file must be rejected at planning time");
+    let TransferError::NestedMountBoundary { path } = error else {
+        panic!("expected NestedMountBoundary, got {error:?}");
+    };
+    assert_eq!(
+        path,
+        source_root.path().join("album/song.flac"),
+        "the typed error must name the bind-mounted file"
+    );
+}
+
+/// A directly requested single-file item whose leaf is itself a bind mount is
+/// never walked, so it relies on the per-file boundary probe rather than the
+/// walk's directory probe. It must be refused at planning time with the file
+/// named, exactly like a walked bind-mounted file.
+#[cfg(target_os = "linux")]
+#[test]
+fn direct_bind_mounted_file_item_is_rejected_at_planning_time() {
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    write_source_file(source_root.path(), "mounted-src/song.flac", b"foreign");
+    write_source_file(source_root.path(), "album/song.flac", b"target");
+
+    if !bind_mount(
+        &source_root.path().join("mounted-src/song.flac"),
+        &source_root.path().join("album/song.flac"),
+    ) {
+        eprintln!("skipping: bind mount unavailable in this environment");
+        return;
+    }
+    let _unmount = LazyUnmount(source_root.path().join("album/song.flac"));
+
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = plan_request(
+        source,
+        destination,
+        vec![TransferItem::same(PathBuf::from("album/song.flac"))],
+        ConflictPolicy::Preserve,
+        None,
+    );
+    let error = TransferPlanner::new()
+        .plan(&request)
+        .expect_err("a directly requested bind-mounted file must be rejected at planning time");
+    let TransferError::NestedMountBoundary { path } = error else {
+        panic!("expected NestedMountBoundary, got {error:?}");
+    };
+    assert_eq!(
+        path,
+        source_root.path().join("album/song.flac"),
+        "the typed error must name the directly requested bind-mounted file"
+    );
+}
+
+/// A directly requested single-file item whose path traverses a bind-mounted
+/// directory must be refused at planning time with the file named. The file
+/// itself carries the nested mount's identity even though the walk is not
+/// involved at all.
+#[cfg(target_os = "linux")]
+#[test]
+fn direct_file_beneath_nested_bind_mount_is_rejected_at_planning_time() {
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    write_source_file(source_root.path(), "mounted-src/nested.flac", b"nested");
+    std::fs::create_dir_all(source_root.path().join("album/mnt")).expect("create bind target");
+
+    if !bind_mount(
+        &source_root.path().join("mounted-src"),
+        &source_root.path().join("album/mnt"),
+    ) {
+        eprintln!("skipping: bind mount unavailable in this environment");
+        return;
+    }
+    let _unmount = LazyUnmount(source_root.path().join("album/mnt"));
+
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = plan_request(
+        source,
+        destination,
+        vec![TransferItem::same(PathBuf::from("album/mnt/nested.flac"))],
+        ConflictPolicy::Preserve,
+        None,
+    );
+    let error = TransferPlanner::new()
+        .plan(&request)
+        .expect_err("a file beneath a nested bind mount must be rejected at planning time");
+    let TransferError::NestedMountBoundary { path } = error else {
+        panic!("expected NestedMountBoundary, got {error:?}");
+    };
+    assert_eq!(
+        path,
+        source_root.path().join("album/mnt/nested.flac"),
+        "the typed error must name the file beneath the nested mount"
+    );
+}
