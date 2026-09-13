@@ -2,6 +2,33 @@
 
 Status: design record, no implementation in this bead.
 
+Revision 15 (2026-09-13, corrective pass). This revision answers the
+round-15 finding at the `2b499b5` head (thread
+`PRRT_kwDOR1IXks6h8I56`) with one contract fix to §4.1/§4.3/§9,
+docs-only: the pre-registration superseded outcome is now distinct and
+constructible. Revision 14 made cancellation registration
+superseded-checked, but then wrote that a load superseded *before* it
+registered yields the same terminal quiesced outcome as the
+post-registration case — including
+`Failed(SenderError::RecoveryPending)`. That is unconstructible:
+registration is the call's first step, so a load superseded before it
+registers has transmitted no mutating daemon RPC, and
+`RecoveryPending` is defined as the outcome for a transmitted mutation
+still unsettled at the cleanup deadline. The contract now states that
+a load superseded before it registers yields `Cancelled` after the
+(no-op) restoration path — never `RecoveryPending` — and reserves
+`Failed(SenderError::RecoveryPending)` for a cancellation or
+replacement *after* negotiation has transmitted a mutation that is
+still unsettled at the cleanup deadline. The N4 mechanism is
+unchanged: registration still runs under the proxy's state lock, is
+superseded-checked, installs nothing on an already-custodied /
+superseded load, and returns the already-superseded guard. N1/N2/N3 and
+acceptance items 5/12/13 are not weakened; item 12's replacement-first
+case keeps both registration-boundary sub-cases, asserting
+`RecoveryPending` for the already-registered unsettled-mutation case
+and `Cancelled` only for the replaced-before-registration case. It
+changes the design record only.
+
 Revision 14 (2026-09-13, corrective pass). This revision answers the
 round-14 finding at the `b5c594f` head (thread
 `PRRT_kwDOR1IXks6h6tMN`) with one contract fix to §4.1/§4.3/§9,
@@ -21,8 +48,11 @@ and atomically detects that this load's lease is already custodied (or
 its generation superseded); on that observation it installs nothing and
 returns a guard reporting the already-superseded state, and
 `open_session` immediately yields its terminal quiesced outcome
-(`Cancelled`/`RecoveryPending`) through the §4.3 restoration path
-without reaching negotiation. The ordering contract is stated
+through the §4.3 restoration path without reaching negotiation — on
+that pre-registration branch the outcome is `Cancelled`, never
+`RecoveryPending`, because no mutating RPC can have been transmitted
+before registration (revision 15 corrects the conflation first written
+here). The ordering contract is stated
 explicitly — registration is superseded-checked, not merely lock-safe —
 and acceptance item 5 (teardown-before-registration) and item 12
 (both sides of the registration boundary) assert it, without weakening
@@ -774,10 +804,14 @@ impl MediaTicketCustody {
     /// to cancel. On that observation registration must not install
     /// the token. It installs nothing, leaves the lease in custody,
     /// and returns a guard reporting the already-superseded state, so
-    /// `open_session` immediately yields its terminal quiesced outcome
-    /// (`Cancelled`, or `RecoveryPending` when a transmitted mutating
-    /// RPC is unsettled) through the §4.3 restoration path and never
-    /// reaches negotiation. The concrete type is the implementation
+    /// `open_session` immediately yields its `Cancelled` outcome
+    /// through the §4.3 restoration path and never reaches
+    /// negotiation. On this pre-registration branch no mutating RPC
+    /// has been transmitted — registration is the call's first step —
+    /// so `Failed(SenderError::RecoveryPending)` is unconstructible
+    /// and `RecoveryPending` is reserved for a post-negotiation
+    /// cancellation or replacement with a transmitted, still-unsettled
+    /// mutation. The concrete type is the implementation
     /// record's choice; the contract requires only that the handle is
     /// cancellable from the teardown thread, that registration and
     /// deregistration run under the proxy's state lock, that
@@ -803,7 +837,7 @@ impl MediaTicketCustody {
 /// (or its generation superseded) at the instant of registration, the
 /// guard is returned in its **already-superseded** state instead of
 /// installing a token — no handle is registered, and the caller
-/// (`open_session`) immediately yields its terminal quiesced outcome
+/// (`open_session`) immediately yields its `Cancelled` outcome
 /// without negotiating. The guard exposes that state to its caller
 /// (the concrete accessor is the implementation record's choice), so
 /// an open can distinguish "registration succeeded, proceed" from
@@ -931,8 +965,8 @@ enum SenderError {
 /// compared after the fact. That registration is itself
 /// superseded-checked: it runs under the same state lock and observes
 /// a lease already custodied before the handle was installed, in
-/// which case it installs nothing and the open yields its terminal
-/// quiesced outcome without negotiating (§4.1). This is deliberately not
+/// which case it installs nothing and the open yields its `Cancelled`
+/// outcome without negotiating (§4.1). This is deliberately not
 /// `PlayerEventGeneration` itself — a generation
 /// (`src/audio/mod.rs:85-87`) is a `Copy` value the caller compares
 /// after the fact, not a flag an in-flight call can observe, and a
@@ -1177,11 +1211,15 @@ trait AirplaySender: Send + Sync {
     /// `Drop`, or replacement preparation in the interval since it
     /// became active, registration observes the already-superseded
     /// state and installs no token, and the call immediately yields
-    /// its terminal quiesced outcome (`Cancelled`, or
-    /// `Failed(SenderError::RecoveryPending)` when a transmitted
-    /// mutating RPC is unsettled) through the §4.3 restoration path —
+    /// its `Cancelled` outcome through the §4.3 restoration path —
     /// it never reaches negotiation and can never return `Opened` for
-    /// a superseded route. Registration is therefore
+    /// a superseded route. Registration is the call's first step, so
+    /// a pre-registration supersession has transmitted no mutating
+    /// RPC and `Failed(SenderError::RecoveryPending)` is
+    /// unconstructible on this branch; `RecoveryPending` is reserved
+    /// for a post-negotiation cancellation or replacement with a
+    /// transmitted mutation still unsettled at the cleanup deadline.
+    /// Registration is therefore
     /// superseded-checked, not merely lock-safe; a successful
     /// registration is what authorizes the call to proceed.
     ///
@@ -1567,7 +1605,13 @@ Tributary talks to an OwnTone instance as a transmission service:
   registration), there is no handle to cancel; moving the lease into
   custody in that same locked step is sufficient, because the call's
   superseded-checked registration observes the custody and installs no
-  token (§4.1). It either
+  token, and the call then yields `Cancelled` through the restoration
+  path without negotiating. That pre-registration branch has
+  transmitted no mutating RPC — registration is the call's first
+  step — so it is `Cancelled` only and never `RecoveryPending`; the
+  latter stays reserved for a post-negotiation cancellation or
+  replacement whose transmitted mutation is still unsettled at the
+  cleanup deadline (§4.1). It either
   drives the adapter's quiescence
   (terminate/restart) so this outcome is reached promptly, or
   transfers custody to this recovery owner, which revokes once the
@@ -1998,8 +2042,11 @@ record for the selected path must add, at minimum:
    the call registered its handle: registration is
    superseded-checked under the proxy's state lock (§4.1), so it
    observes the lease already custodied, installs no token, and the
-   open yields `Cancelled`/`Failed(SenderError::RecoveryPending)`
-   through the restoration path without negotiating — the test holds
+   open yields `Cancelled` through the restoration path without
+   negotiating — `Cancelled` only, never
+   `Failed(SenderError::RecoveryPending)`, because registration is
+   the call's first step and no mutating RPC has been transmitted on
+   this branch. The test holds
    the teardown between the lease becoming active and `open_session`
    registering, and asserts the open never reaches negotiation and
    never returns `Opened`. The load whose
@@ -2152,24 +2199,38 @@ record for the selected path must add, at minimum:
       proxy-registered in-flight `OpenCancel` — cancelling the
       registered handle, not bumping the generation, being what
       reaches the blocked call — so the open observes the cancellation
-      with the lease already custodied and still returns
-      `Failed(SenderError::RecoveryPending)` on the missed-deadline path
-      per §4.1 `:1017-1026` — supersession does not force `Cancelled`.
-      This case spans both sides of the registration boundary: when
-      the open has already registered, replacement cancels the
-      registered handle; when replacement wins *before* the open
-      registers, there is no token to cancel, and the open's
-      superseded-checked registration (§4.1) observes the lease
-      already custodied, installs nothing, and yields the same
-      terminal quiesced outcome without negotiating. Either way the
-      open cannot remain blocked, keep mutating, or return `Opened`.
-      Here the replacement arrived *before* the outcome, which is the
-      other window the hand-off must cover; there is no post-outcome
-      arrival to assert in this case.
-    In both cases the test then releases recovery, asserts the old
-    route is revoked only after the carried `RecoveryCompletion`
-    reaches its terminal outcome, and asserts the replacement's own
-    ticket was never touched (the identity check). A third case
+      with the lease already custodied. This case spans both sides of
+      the registration boundary, and the two sub-cases have distinct,
+      both-constructible outcomes: **already-registered** — the open
+      installed its registered handle before replacement prepared, so
+      replacement cancels that handle and the open follows
+      post-registration semantics: it still returns
+      `Failed(SenderError::RecoveryPending)` when a transmitted
+      mutating RPC is unsettled at the cleanup deadline (the
+      missed-deadline path, §4.1) — supersession does not force
+      `Cancelled` — and returns `Cancelled` when its server side
+      quiesced inside that deadline; **replaced-before-registration**
+      — replacement wins *before* the open registers, so there is no
+      token to cancel, the open's superseded-checked registration
+      (§4.1) observes the lease already custodied and installs
+      nothing, and the open yields `Cancelled` only, through the
+      restoration path, without negotiating. Because registration is
+      the call's first step, no mutating RPC has been transmitted in
+      the replaced-before-registration sub-case, so
+      `Failed(SenderError::RecoveryPending)` is unconstructible there
+      and must not be asserted. Either way the open cannot remain
+      blocked, keep mutating, or return `Opened`. Here the replacement
+      arrived *before* the outcome, which is the other window the
+      hand-off must cover; there is no post-outcome arrival to assert
+      in this case.
+    In the recovery-first case and the already-registered sub-case the
+    test then releases recovery, asserts the old route is revoked only
+    after the carried `RecoveryCompletion` reaches its terminal
+    outcome, and asserts the replacement's own ticket was never
+    touched (the identity check); in the replaced-before-registration
+    sub-case the outcome is `Cancelled`, so the route is revoked on
+    receipt through `revoke_if_current` and the replacement's own
+    ticket is likewise never touched. A third case
     covers **Stop winning the race before the transition**: an
     explicit Stop (`GstreamerMediaProxy::revoke`) lands while the
     open's ticket is still the proxy's active lease, before the
