@@ -3291,6 +3291,40 @@ fn with_pre_exchange_interpose(interpose: Box<PreExchangeInterpose>, run: impl F
 #[cfg(all(test, unix))]
 static PRE_EXCHANGE_INTERPOSE_SERIAL: Mutex<()> = Mutex::new(());
 
+/// Test-only seam: run the registered post-exchange interposition, if any.
+///
+/// The Unix Overwrite replace has landed its atomic exchange when the
+/// post-swap verification runs. A concurrent writer replacing the backup
+/// NAME (N1) or the destination name (N2) at that point is what the coupled
+/// removal and the identity-coupled restore must survive; a regression test
+/// registers a closure here that performs the replacement deterministically
+/// between the exchange and the verification. Never compiled outside
+/// `cargo test`.
+#[cfg(all(test, unix))]
+fn run_post_exchange_interpose(parent: &File, to_leaf: &OsStr, backup_leaf: &OsStr) {
+    if let Some(interpose) = POST_EXCHANGE_INTERPOSE.lock().unwrap().as_ref() {
+        interpose(parent, to_leaf, backup_leaf);
+    }
+}
+
+#[cfg(all(test, unix))]
+type PostExchangeInterpose = dyn Fn(&File, &OsStr, &OsStr) + Send + Sync;
+
+#[cfg(all(test, unix))]
+static POST_EXCHANGE_INTERPOSE: Mutex<Option<Box<PostExchangeInterpose>>> = Mutex::new(None);
+
+/// Serialize tests that use the post-exchange interposition seam.
+#[cfg(all(test, unix))]
+fn with_post_exchange_interpose(interpose: Box<PostExchangeInterpose>, run: impl FnOnce()) {
+    let _serial = POST_EXCHANGE_INTERPOSE_SERIAL.lock().unwrap();
+    *POST_EXCHANGE_INTERPOSE.lock().unwrap() = Some(interpose);
+    run();
+    *POST_EXCHANGE_INTERPOSE.lock().unwrap() = None;
+}
+
+#[cfg(all(test, unix))]
+static POST_EXCHANGE_INTERPOSE_SERIAL: Mutex<()> = Mutex::new(());
+
 /// Verify a mounted bound against its retained mount authority.
 fn validate_mounted_bound(authority: &MountedRootAuthority, bound: &BoundFile) -> io::Result<()> {
     validate_bound_token(authority, bound.lease_token)?;
@@ -4944,7 +4978,7 @@ fn replace_publish_loop(
     to_leaf: &OsStr,
     to_absolute: &Path,
     backup_leaf: &OsStr,
-    _backup_absolute: &Path,
+    backup_absolute: &Path,
     backup_relative: &Path,
     _rebinding_backup: &mut dyn FnMut() -> (OsString, PathBuf),
 ) -> io::Result<(bool, Option<LeafIdentity>, Option<BoundOccupantBackup>)> {
@@ -4956,6 +4990,7 @@ fn replace_publish_loop(
             to_leaf,
             to_absolute,
             backup_leaf,
+            backup_absolute,
         )? {
             let bound = bound_leaf.map(|leaf| BoundOccupantBackup {
                 relative_path: backup_relative.to_path_buf(),
@@ -4985,6 +5020,7 @@ fn replace_publish_attempt(
     to_leaf: &OsStr,
     to_absolute: &Path,
     backup_leaf: &OsStr,
+    backup_absolute: &Path,
 ) -> io::Result<Option<ReplaceAttemptOutcome>> {
     use rustix::fs::{statat, AtFlags};
 
@@ -5040,6 +5076,7 @@ fn replace_publish_attempt(
         to_leaf,
         to_absolute,
         backup_leaf,
+        backup_absolute,
         &bound_identity,
         bound_object.as_ref(),
     )
@@ -5188,10 +5225,11 @@ fn release_occupant_backup(parent: &File, backup_leaf: &OsStr) {
 fn swap_and_verify_replace(
     parent: &File,
     from_leaf: &OsStr,
-    _from_absolute: &Path,
+    from_absolute: &Path,
     to_leaf: &OsStr,
-    _to_absolute: &Path,
+    to_absolute: &Path,
     backup_leaf: &OsStr,
+    backup_absolute: &Path,
     bound_identity: &LeafIdentity,
     bound_object: Option<&File>,
 ) -> io::Result<Option<ReplaceAttemptOutcome>> {
@@ -5218,8 +5256,11 @@ fn swap_and_verify_replace(
             verify_atomic_swap(
                 parent,
                 from_leaf,
+                from_absolute,
                 to_leaf,
+                to_absolute,
                 backup_leaf,
+                backup_absolute,
                 bound_identity,
                 bound_object,
                 published,
@@ -5247,138 +5288,322 @@ fn swap_and_verify_replace(
 }
 
 /// The exchange landed: verify the displaced object at the private staged
-/// leaf against the bind-time identity. A mismatch means a writer
-/// interposed a new occupant between the bind and the swap: that writer's
-/// file is intact at the private staged name and is renamed back to
-/// `to_leaf`, the stale backup is released, and the caller re-binds.
-/// `Ok(None)` reports that interposition.
+/// leaf against the bind-time identity, then either drop the redundant
+/// staged link (coupling the removal to the retained object and to the
+/// backup name, never a check-then-unlink on a mutable name) or restore a
+/// writer's interposed occupant to the destination without clobbering a
+/// slot a concurrent writer has since claimed.
 ///
-/// A failed restore never releases the backup and never unlinks the
+/// A mismatch means a writer interposed a new occupant between the bind and
+/// the swap: that writer's file is intact at the private staged name and is
+/// returned to `to_leaf` through an identity-coupled exchange, the stale
+/// backup is released, and the caller re-binds. `Ok(None)` reports that
+/// interposition.
+///
+/// A refused restore never releases the backup and never unlinks the
 /// displaced object: the destination still names the transfer's published
-/// bytes, the backup still names the bind-time occupant, and the displaced
-/// object is preserved at the private staged leaf. The failure carries the
-/// [`DisplacedOccupantFailure`] marker so the caller can record the
-/// publication — and the backup's bind-time identity — for rollback and
-/// shield the staged leaf from cleanup.
+/// bytes or a writer's replacement, the backup still names the bind-time
+/// occupant, and the displaced object is preserved at the private staged
+/// leaf. The failure carries the [`DisplacedOccupantFailure`] marker so the
+/// caller can record the publication — and the backup's bind-time identity
+/// — for rollback and shield the staged leaf from cleanup.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn verify_atomic_swap(
     parent: &File,
     from_leaf: &OsStr,
+    from_absolute: &Path,
     to_leaf: &OsStr,
+    to_absolute: &Path,
     backup_leaf: &OsStr,
+    backup_absolute: &Path,
     bound_identity: &LeafIdentity,
     bound_object: Option<&File>,
     published_leaf: Option<LeafIdentity>,
 ) -> io::Result<Option<ReplaceAttemptOutcome>> {
-    use rustix::fs::{renameat, unlinkat, AtFlags};
-
+    // Test-only seam: a regression interposes a concurrent writer's
+    // replacement of the backup NAME (N1) or the destination name (N2) after
+    // the exchange has landed and before the post-swap verification runs.
+    #[cfg(test)]
+    run_post_exchange_interpose(parent, to_leaf, backup_leaf);
     match leaf_identity_at(parent, from_leaf) {
         // Same object check, not full equality: the exchange itself updates
         // the displaced object's change time, so the post-swap capture
         // cannot equal the bind-time capture on the instant fields.
         Ok(Some(displaced)) if displaced.same_object(bound_identity) => {
-            // Confirm the backup NAME still names the exact object the bind
-            // created before dropping the displaced link. The bind retained
-            // a no-follow handle on that object; a concurrent writer that
-            // removed or replaced the backup name between the capture and
-            // this exchange leaves `from_leaf` as the displaced original's
-            // ONLY link, so unlinking it here would destroy the object the
-            // backup was supposed to preserve and record a foreign
-            // replacement for rollback.
+            // The bind retained a no-follow handle on the bound object; it
+            // supplies the settled identity the backup must match, because
+            // the atomic exchange legitimately updated the object's change
+            // instant after the bind-time capture.
             let retained_identity = bound_object
                 .and_then(retained_handle_identity)
-                .unwrap_or(*bound_identity);
-            let backup_names_retained = matches!(
-                leaf_identity_at(parent, backup_leaf),
-                Ok(Some(current)) if current.same_object(&retained_identity)
-            );
-            if !backup_names_retained {
-                // Fail closed WITHOUT path-unlinking the backup entry — it
-                // may be a foreign object's only link. Put the displaced
-                // original back at the destination (the transfer's own
-                // published bytes remain retryable) and report an
-                // unpublished failure; the displaced object is never
-                // destroyed.
-                return match renameat(parent, from_leaf, parent, to_leaf) {
-                    Ok(()) => Err(io::Error::other(
-                        "the bound backup was replaced after the capture; the displaced \
-                         occupant was restored instead of destroyed",
-                    )),
-                    Err(restore) => Err(displaced_occupant_failure(
+                .unwrap_or(displaced);
+            if drop_redundant_staged_link_coupled(
+                parent,
+                from_leaf,
+                backup_leaf,
+                backup_absolute,
+                &retained_identity,
+            )? {
+                // The staged link is gone and the backup NAME holds the
+                // retained original. Re-capture its identity now so the
+                // recorded instant is the object's settled post-commit
+                // state: a legitimate backup compares exactly equal at every
+                // later reversal gate, while a same-index swap-in after the
+                // commit cannot inherit the recorded instant.
+                let settled = leaf_identity_at(parent, backup_leaf).ok().flatten();
+                Ok(Some((true, published_leaf, settled)))
+            } else {
+                // A concurrent writer replaced the backup NAME after the
+                // bind: the displaced original is NOT safely droppable and
+                // survives at the private staged leaf. Put it back at the
+                // destination without clobbering a writer's object, then
+                // report an unpublished failure.
+                match restore_displaced_occupant(
+                    parent,
+                    from_leaf,
+                    from_absolute,
+                    to_leaf,
+                    to_absolute,
+                    published_leaf,
+                )? {
+                    ReversalOutcome::Reversed | ReversalOutcome::AlreadyAbsent => {
+                        Err(io::Error::other(
+                            "the bound backup was replaced after the capture; the displaced \
+                             occupant was restored instead of destroyed",
+                        ))
+                    }
+                    ReversalOutcome::RefusedForeignLeaf => Err(displaced_occupant_failure(
                         published_leaf,
                         Some(retained_identity),
                         io::Error::other(
                             "the bound backup was replaced after the capture and the \
                              displaced occupant could not be restored",
                         ),
-                        Some(io::Error::from(restore)),
+                        None,
                     )),
-                };
+                }
             }
-            // The swap displaced exactly the object the backup names. The
-            // displaced bytes live on in the backup; drop the now-redundant
-            // link at the staged name. The published identity is the one
-            // bound to the staged object before the exchange.
-            let _ = unlinkat(parent, from_leaf, AtFlags::empty());
-            // The publish machinery has now finished moving the bound
-            // object around (the exchange) and dropping its redundant
-            // staged link (the unlink) — both of which update its change
-            // instant. Re-capture the backup's identity NOW so the
-            // recorded instant is the object's settled post-commit state:
-            // a legitimate backup compares exactly equal at every later
-            // reversal gate, while a same-index swap-in after the commit
-            // cannot inherit the recorded instant.
-            let settled = leaf_identity_at(parent, backup_leaf).ok().flatten();
-            Ok(Some((true, published_leaf, settled)))
         }
         Ok(_) => {
             // An interposed writer's object was displaced: restore it to
             // the destination before reporting the interposition. The
-            // restore replaces the transfer's published bytes at
-            // `to_leaf` — nothing published remains, so this is an
-            // ordinary retryable interposition.
-            if let Err(error) = renameat(parent, from_leaf, parent, to_leaf) {
-                // The exchange moved the bound object (updating its
-                // instant), so the retained identity must be captured at
-                // the settled post-exchange state.
-                let settled = leaf_identity_at(parent, backup_leaf).ok().flatten();
-                return Err(displaced_occupant_failure(
-                    published_leaf,
-                    settled,
-                    io::Error::from(error),
-                    None,
-                ));
+            // identity-coupled restore replaces the transfer's published
+            // bytes at `to_leaf` only while that slot still names the
+            // recorded publication; a slot a concurrent writer has since
+            // claimed is refused intact rather than overwritten.
+            match restore_displaced_occupant(
+                parent,
+                from_leaf,
+                from_absolute,
+                to_leaf,
+                to_absolute,
+                published_leaf,
+            )? {
+                ReversalOutcome::Reversed | ReversalOutcome::AlreadyAbsent => {
+                    release_occupant_backup(parent, backup_leaf);
+                    Ok(None)
+                }
+                ReversalOutcome::RefusedForeignLeaf => {
+                    let settled = leaf_identity_at(parent, backup_leaf).ok().flatten();
+                    Err(displaced_occupant_failure(
+                        published_leaf,
+                        settled,
+                        io::Error::other(
+                            "the interposed occupant could not be restored to the destination \
+                             without clobbering a concurrent writer's entry",
+                        ),
+                        None,
+                    ))
+                }
             }
-            release_occupant_backup(parent, backup_leaf);
-            Ok(None)
         }
         // The displaced leaf cannot be read back: fail closed with the
         // destination restored to the swap-instant state (the displaced
         // object returns to `to_leaf`) rather than leaving an unverifiable
-        // publication. The backup is released only once the restoration is
-        // confirmed; if the restore itself fails, the backup and the
-        // displaced object are kept and the failure carries the
-        // displaced-occupant marker.
-        Err(verification) => match renameat(parent, from_leaf, parent, to_leaf) {
-            Ok(()) => {
+        // publication. The identity-coupled restore refuses to clobber a
+        // slot a concurrent writer has claimed; the backup is released only
+        // once the restoration is confirmed.
+        Err(verification) => match restore_displaced_occupant(
+            parent,
+            from_leaf,
+            from_absolute,
+            to_leaf,
+            to_absolute,
+            published_leaf,
+        )? {
+            ReversalOutcome::Reversed | ReversalOutcome::AlreadyAbsent => {
                 release_occupant_backup(parent, backup_leaf);
                 Err(verification)
             }
-            Err(restore) => {
-                // The exchange moved the bound object (updating its
-                // instant), so the retained identity must be captured at
-                // the settled post-exchange state.
+            ReversalOutcome::RefusedForeignLeaf => {
                 let settled = leaf_identity_at(parent, backup_leaf).ok().flatten();
                 Err(displaced_occupant_failure(
                     published_leaf,
                     settled,
                     verification,
-                    Some(io::Error::from(restore)),
+                    None,
                 ))
             }
         },
     }
+}
+
+/// Drop the redundant staged link the atomic exchange left behind, coupling
+/// the removal to the retained original AND to the backup name so a
+/// concurrent writer that swaps the discoverable backup name can never turn
+/// the removal into the destruction of the original's last link.
+///
+/// The backup name is first moved under a fresh private tombstone by an
+/// atomic exchange, so no concurrent writer can swap it while the staged
+/// link is dropped. The object parked there is verified to be the retained
+/// original; on a mismatch it is exchanged back exactly where the writer
+/// left it and the function reports `false` without removing anything. When
+/// it IS the retained original, that object is pinned at the private name
+/// (and at the staged name) for the whole removal: the staged link is
+/// unlinked while the original survives at the private name, and the
+/// original is then moved back under the public backup name by a second
+/// exchange, which always lands the quarantined object at the backup name.
+/// Only the tombstone file this call created is ever released from the
+/// private name; any foreign object a writer raced into the backup name is
+/// preserved, never deleted.
+///
+/// A filesystem without an atomic exchange primitive cannot couple the
+/// removal, so the backup is reported as not retained (`false`) rather than
+/// racing an uncoupled check-then-unlink.
+#[cfg(unix)]
+fn drop_redundant_staged_link_coupled(
+    parent: &File,
+    from_leaf: &OsStr,
+    backup_leaf: &OsStr,
+    backup_absolute: &Path,
+    retained_identity: &LeafIdentity,
+) -> io::Result<bool> {
+    use rustix::fs::{renameat_with, unlinkat, AtFlags, RenameFlags};
+
+    let quarantine = create_reversal_tombstone(parent)?;
+    let tombstone_identity = leaf_identity_at(parent, &quarantine).ok().flatten();
+    // Move the backup NAME under the private quarantine name. A missing
+    // backup name (a writer removed it) means the original is not retained
+    // there; report that without touching anything else.
+    match renameat_with(
+        parent,
+        backup_leaf,
+        parent,
+        &quarantine,
+        RenameFlags::EXCHANGE,
+    ) {
+        Ok(()) => {}
+        Err(
+            rustix::io::Errno::NOENT
+            | rustix::io::Errno::NOSYS
+            | rustix::io::Errno::INVAL
+            | rustix::io::Errno::OPNOTSUPP,
+        ) => {
+            release_occupant_backup(parent, &quarantine);
+            return Ok(false);
+        }
+        Err(error) => {
+            release_occupant_backup(parent, &quarantine);
+            return Err(io::Error::from(error));
+        }
+    }
+    let quarantined = leaf_identity_at(parent, &quarantine).ok().flatten();
+    let coupled = quarantined
+        .as_ref()
+        .is_some_and(|candidate| candidate.same_object(retained_identity));
+    if !coupled {
+        // The backup named a foreign object: put it back exactly where the
+        // writer left it and refuse. The displaced original stays at the
+        // staged name; nothing was destroyed.
+        let _ = renameat_with(
+            parent,
+            backup_leaf,
+            parent,
+            &quarantine,
+            RenameFlags::EXCHANGE,
+        );
+        release_occupant_backup(parent, &quarantine);
+        return Ok(false);
+    }
+    // The retained original is pinned at the private quarantine name, and
+    // the staged name is a redundant second link to it. Dropping the staged
+    // link cannot destroy the original: it survives at the quarantine name
+    // whatever a concurrent writer does to the public backup name.
+    let _ = unlinkat(parent, from_leaf, AtFlags::empty());
+    // Move the original back under the public backup name. The exchange
+    // always lands the quarantined object (the original) at the backup name
+    // and parks whatever now bears the backup name at the private name.
+    match renameat_with(
+        parent,
+        backup_leaf,
+        parent,
+        &quarantine,
+        RenameFlags::EXCHANGE,
+    ) {
+        Ok(()) => {}
+        // The backup name vanished while the original was quarantined (a
+        // writer removed the parked tombstone): take the now-free name with
+        // a no-replace move so a concurrent creation is never clobbered.
+        Err(rustix::io::Errno::NOENT) => {
+            rename_no_replace_within_parent(
+                parent,
+                &quarantine,
+                Path::new(""),
+                backup_leaf,
+                backup_absolute,
+            )?;
+            return Ok(true);
+        }
+        Err(error) => return Err(io::Error::from(error)),
+    }
+    // Release the private parking name only when it still holds the empty
+    // tombstone this call created; a foreign object a writer raced into the
+    // backup name is preserved, never deleted.
+    let parked = leaf_identity_at(parent, &quarantine).ok().flatten();
+    let parked_is_tombstone = parked.as_ref().is_some_and(|candidate| {
+        tombstone_identity
+            .as_ref()
+            .is_some_and(|tombstone| candidate.same_object(tombstone))
+    });
+    if parked_is_tombstone {
+        release_occupant_backup(parent, &quarantine);
+    }
+    Ok(true)
+}
+
+/// Restore the object the atomic exchange left at the private staged leaf to
+/// its destination, coupling the restore to the recorded publication so a
+/// slot a concurrent writer has claimed is never clobbered.
+///
+/// The destination is verified against the recorded publication and then
+/// swapped with the staged object atomically; the captured prior occupant
+/// (the transfer's publication, or a writer's interposition that raced past
+/// the verification) is preserved at the private staged name until an
+/// object-level check confirms it is the publication and discards it. A
+/// missing publication identity cannot be verified, so the restore refuses
+/// (`RefusedForeignLeaf`) rather than moving an unverifiable object.
+#[cfg(unix)]
+fn restore_displaced_occupant(
+    parent: &File,
+    from_leaf: &OsStr,
+    from_absolute: &Path,
+    to_leaf: &OsStr,
+    to_absolute: &Path,
+    published_leaf: Option<LeafIdentity>,
+) -> io::Result<ReversalOutcome> {
+    let Some(published) = published_leaf else {
+        return Ok(ReversalOutcome::RefusedForeignLeaf);
+    };
+    restore_backup_by_exchange_unix(
+        parent,
+        from_leaf,
+        to_leaf,
+        from_absolute,
+        to_absolute,
+        Some(&published),
+        RestoreSlot::IdentityCoupled,
+    )
 }
 
 /// Error payload for a replace publish whose atomic exchange landed but
@@ -9520,6 +9745,169 @@ mod tests {
             fs::read(directory.path().join("moved-backup")).expect("read the moved backup"),
             b"original bytes",
             "the bind-created backup must survive untouched wherever it was moved"
+        );
+    }
+
+    /// A concurrent writer that replaces the visible `.tributary-backup-*`
+    /// entry AFTER the atomic exchange but BEFORE the redundant staged link
+    /// is dropped must not make that removal destroy the displaced original.
+    /// The coupled drop quarantines the backup name under a private
+    /// tombstone and refuses when it does not name the retained original, so
+    /// the original is restored to the destination instead of being
+    /// unlinked as its last link.
+    #[cfg(unix)]
+    #[test]
+    fn raced_backup_replacement_after_the_exchange_preserves_the_original() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::local::write_authority::{ConflictPolicy, MountedWriteAuthority};
+
+        let directory = TestDirectory::new("raced-backup-post-exchange");
+        let destination = directory.path().join("song.flac");
+        fs::write(&destination, b"original bytes").expect("write the original");
+
+        let authority =
+            MountedWriteAuthority::acquire(directory.path()).expect("acquire write authority");
+        let mut staged = authority
+            .prepare_write_relative_file(Path::new("song.flac"), ConflictPolicy::Overwrite)
+            .expect("prepare overwrite");
+        staged.write_all(b"new bytes").expect("write staged");
+
+        // Interpose the replacement of the backup name after the exchange
+        // has landed and before the post-swap verification drops the
+        // redundant staged link. The seam is global, so a concurrent test's
+        // commit can invoke it too; only act for this test's directory.
+        let once = AtomicBool::new(false);
+        let directory_for_closure = directory.path().to_path_buf();
+        with_post_exchange_interpose(
+            Box::new(move |parent, _to_leaf, backup_leaf| {
+                let backup_path = directory_for_closure.join(backup_leaf);
+                if !handle_is_directory(parent, &directory_for_closure)
+                    || !backup_path.exists()
+                    || once.swap(true, Ordering::SeqCst)
+                {
+                    return;
+                }
+                let moved_backup = directory_for_closure.join("moved-backup");
+                // Move the bound backup aside and install a genuinely
+                // different object at the (discoverable) backup name.
+                fs::rename(&backup_path, &moved_backup).expect("move the bound backup aside");
+                fs::write(&backup_path, b"foreign backup").expect("install the foreign object");
+            }),
+            || {
+                let _ = staged.commit();
+            },
+        );
+
+        // The displaced original must survive: the coupled drop must not
+        // unlink it when the backup name no longer names the bound object.
+        // It is restored to the destination instead.
+        assert_eq!(
+            fs::read(&destination).expect("read the destination"),
+            b"original bytes",
+            "a backup replaced after the exchange must not destroy the original"
+        );
+        // The foreign object the writer installed at the backup name is never
+        // path-unlinked.
+        let foreign = fs::read_dir(directory.path())
+            .expect("read the transfer directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .find(|name| name.to_string_lossy().starts_with(".tributary-backup-"))
+            .expect("the foreign backup must survive the failed publish");
+        assert_eq!(
+            fs::read(directory.path().join(&foreign)).expect("read the foreign backup"),
+            b"foreign backup",
+            "the foreign replacement of the backup name must never be deleted"
+        );
+        // The bound backup survives where the writer moved it.
+        assert_eq!(
+            fs::read(directory.path().join("moved-backup")).expect("read the moved backup"),
+            b"original bytes",
+            "the bound backup must survive untouched wherever it was moved"
+        );
+    }
+
+    /// A concurrent writer that claims the destination slot AFTER the
+    /// exchange while the displaced original is being restored must not have
+    /// its entry overwritten by the restore. The identity-coupled restore
+    /// refuses a slot that no longer names the recorded publication, keeps
+    /// the original at the private staged leaf, and destroys nothing.
+    #[cfg(unix)]
+    #[test]
+    fn raced_destination_replacement_before_the_restore_is_refused_without_clobbering() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::local::write_authority::{ConflictPolicy, MountedWriteAuthority};
+
+        let directory = TestDirectory::new("raced-destination-post-exchange");
+        let destination = directory.path().join("song.flac");
+        fs::write(&destination, b"original bytes").expect("write the original");
+
+        let authority =
+            MountedWriteAuthority::acquire(directory.path()).expect("acquire write authority");
+        let mut staged = authority
+            .prepare_write_relative_file(Path::new("song.flac"), ConflictPolicy::Overwrite)
+            .expect("prepare overwrite");
+        staged.write_all(b"new bytes").expect("write staged");
+
+        // Interpose two replacements after the exchange: the backup name
+        // (which forces the displaced original down the restore path) and
+        // the destination name (which the restore must refuse to clobber).
+        let once = AtomicBool::new(false);
+        let directory_for_closure = directory.path().to_path_buf();
+        let destination_for_closure = destination.clone();
+        with_post_exchange_interpose(
+            Box::new(move |parent, to_leaf, backup_leaf| {
+                let backup_path = directory_for_closure.join(backup_leaf);
+                let to_path = directory_for_closure.join(to_leaf);
+                if !handle_is_directory(parent, &directory_for_closure)
+                    || !backup_path.exists()
+                    || !to_path.exists()
+                    || once.swap(true, Ordering::SeqCst)
+                {
+                    return;
+                }
+                let moved_backup = directory_for_closure.join("moved-backup");
+                fs::rename(&backup_path, &moved_backup).expect("move the bound backup aside");
+                fs::write(&backup_path, b"foreign backup").expect("install the foreign backup");
+                let moved_publication = directory_for_closure.join("moved-publication");
+                fs::rename(&destination_for_closure, &moved_publication)
+                    .expect("move the transfer publication aside");
+                fs::write(&destination_for_closure, b"foreign destination")
+                    .expect("install the foreign destination");
+            }),
+            || {
+                let _ = staged.commit();
+            },
+        );
+
+        // The writer's destination entry is refused intact, never
+        // overwritten by the restore.
+        assert_eq!(
+            fs::read(&destination).expect("read the destination"),
+            b"foreign destination",
+            "the restore must not overwrite a destination a concurrent writer claimed"
+        );
+        // The displaced original survives at the private staged leaf: the
+        // failed publish shields it from cleanup.
+        let staged_original = fs::read_dir(directory.path())
+            .expect("read the transfer directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .find(|name| name.to_string_lossy().starts_with(".tributary-stage-"))
+            .expect("the displaced original must be preserved at the staged leaf");
+        assert_eq!(
+            fs::read(directory.path().join(&staged_original)).expect("read the staged original"),
+            b"original bytes",
+            "the displaced original must survive at the shielded staged leaf"
+        );
+        // The publication the writer moved aside survives untouched.
+        assert_eq!(
+            fs::read(directory.path().join("moved-publication"))
+                .expect("read the moved publication"),
+            b"new bytes",
+            "the transfer's publication must survive wherever the writer moved it"
         );
     }
 }
