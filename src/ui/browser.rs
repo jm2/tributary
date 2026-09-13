@@ -671,6 +671,16 @@ pub fn attach_app_config(
     state.album_art_controller.attach_app_config(app_config);
 }
 
+/// Attach the application's Tokio runtime to the album-art coordinator.
+/// Must be called once after `build_browser`. The built-in local
+/// library's retained artwork authority polls Tokio time/blocking APIs,
+/// which panic on the runtime-less GTK main context the pane fetch is
+/// driven on, so the controller runs that arm on this handle
+/// (2026-09-13 review finding).
+pub fn attach_runtime(state: &BrowserState, rt_handle: tokio::runtime::Handle) {
+    state.album_art_controller.attach_runtime(rt_handle);
+}
+
 /// Lightweight snapshot of track fields for filtering (avoids borrowing GObjects).
 #[derive(Clone)]
 struct TrackSnapshot {
@@ -931,9 +941,9 @@ fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
 
 /// Build the album pane's bind factory for the current
 /// `(album_pane_artwork, album_pane_artwork_size)` knob values: the
-/// artwork-thumbnail factory when artwork is enabled, the plain-label
-/// factory otherwise. Extracted from [`build_album_pane`] so the
-/// layout-change path can rebuild the factory and swap it into the
+/// artwork-thumbnail factory when artwork is enabled, the standard
+/// browser-row factory otherwise. Extracted from [`build_album_pane`] so
+/// the layout-change path can rebuild the factory and swap it into the
 /// existing `ListView` (keeping the pane, its model, and the
 /// selection-changed wiring alive) instead of replacing the pane
 /// widget. When artwork is enabled the freshly-built
@@ -945,53 +955,37 @@ fn build_album_factory(
     album_pane_artwork_size: Rc<Cell<i32>>,
     binder_slot: Option<&Rc<RefCell<Option<AlbumArtBinder>>>>,
 ) -> gtk::SignalListItemFactory {
-    let factory = gtk::SignalListItemFactory::new();
+    if !album_pane_artwork_visible.get() {
+        // Artwork disabled: reuse the SAME browser-row factory the genre
+        // and artist panes use, so the album pane keeps the established
+        // list-row accessibility contract — presentational label/count
+        // children plus the combined album/count accessible name on the
+        // GtkListItem — instead of an ad-hoc `gtk::Label` that lost both
+        // (2026-09-13 review finding). The visible text now matches the
+        // sibling panes (primary label + dimmed count), not a bespoke
+        // "label (count)" string.
+        return browser_row_factory();
+    }
 
-    if album_pane_artwork_visible.get() {
-        let (setup, bind, unbind, teardown, binder) =
-            album_art_controller.build_binder_with_size(album_pane_artwork_size.clone());
-        factory.connect_setup(setup);
-        factory.connect_bind(bind);
-        factory.connect_unbind(unbind);
-        // Release each row's cell state when GTK discards the list
-        // item — otherwise toggles and size changes accumulate dead
-        // `AlbumArtCellState` entries (widget tree included) until the
-        // next rebuild.
-        factory.connect_teardown(teardown);
-        // Stash the binder so the factory-swap path can revoke every
-        // in-flight fetch on this pane before swapping the factory.
-        // Without this, a quick toggle would leave the old fetches
-        // racing the new bind factory until each cell's `unbind`
-        // eventually fires — and the worker-side generation check
-        // alone does not stop a fetch from running to completion.
-        if let Some(slot) = binder_slot {
-            slot.replace(Some(binder));
-        }
-    } else {
-        factory.connect_setup(|_, list_item| {
-            let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
-            let label = gtk::Label::builder()
-                .halign(gtk::Align::Start)
-                .margin_start(8)
-                .margin_end(8)
-                .margin_top(2)
-                .margin_bottom(2)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .build();
-            list_item.set_child(Some(&label));
-        });
-        factory.connect_bind(|_, list_item| {
-            let list_item = list_item.downcast_ref::<gtk::ListItem>().expect("ListItem");
-            let item = list_item
-                .item()
-                .and_downcast::<BrowserItem>()
-                .expect("BrowserItem");
-            let label = list_item
-                .child()
-                .and_downcast::<gtk::Label>()
-                .expect("Label");
-            label.set_text(&item.display());
-        });
+    let factory = gtk::SignalListItemFactory::new();
+    let (setup, bind, unbind, teardown, binder) =
+        album_art_controller.build_binder_with_size(album_pane_artwork_size.clone());
+    factory.connect_setup(setup);
+    factory.connect_bind(bind);
+    factory.connect_unbind(unbind);
+    // Release each row's cell state when GTK discards the list
+    // item — otherwise toggles and size changes accumulate dead
+    // `AlbumArtCellState` entries (widget tree included) until the
+    // next rebuild.
+    factory.connect_teardown(teardown);
+    // Stash the binder so the factory-swap path can revoke every
+    // in-flight fetch on this pane before swapping the factory.
+    // Without this, a quick toggle would leave the old fetches
+    // racing the new bind factory until each cell's `unbind`
+    // eventually fires — and the worker-side generation check
+    // alone does not stop a fetch from running to completion.
+    if let Some(slot) = binder_slot {
+        slot.replace(Some(binder));
     }
 
     factory
@@ -1647,6 +1641,34 @@ mod tests {
         );
     }
 
+    /// With artwork disabled the album pane must keep the standard
+    /// browser-row accessibility contract: its factory setup must attach
+    /// the shared [`BrowserRow`] (presentational label/count children)
+    /// that bind publishes the combined accessible name on, not an ad-hoc
+    /// `gtk::Label` that regressed both (2026-09-13 review finding).
+    fn album_artwork_disabled_keeps_browser_row_contract() {
+        let controller = Rc::new(AlbumArtController::new(FALLBACK_PLACEHOLDER_ICON));
+        let factory = build_album_factory(
+            controller,
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(48)),
+            None,
+        );
+        let list_item: gtk::ListItem = glib::Object::new();
+        factory.emit_by_name::<()>("setup", &[&list_item]);
+        let row = list_item
+            .child()
+            .and_downcast::<BrowserRow>()
+            .expect("disabled album factory must reuse the shared BrowserRow");
+        assert_row_roles_presentational(&row);
+        bind_browser_row(&list_item, &BrowserItem::new("Kind of Blue", 9));
+        assert_eq!(
+            list_item.accessible_label(),
+            "Kind of Blue, (9)",
+            "disabled album rows must publish the combined accessible name"
+        );
+    }
+
     /// The crate's single consolidated GTK widget test, all run on the ONE
     /// thread that owns the GTK session:
     ///
@@ -1702,5 +1724,6 @@ mod tests {
         crate::ui::album_pane_art::widget_tests::album_art_row_zero_count_announces_bare_label();
         factory_swap_preserves_album_filters_and_selection();
         rebuild_bumps_album_art_content_generation();
+        album_artwork_disabled_keeps_browser_row_contract();
     }
 }

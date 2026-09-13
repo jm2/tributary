@@ -32,6 +32,12 @@ pub(super) struct PaneFetch {
     pub(super) source_registry: Rc<RefCell<Option<crate::source_registry::SourceRegistry>>>,
     pub(super) album_source: Option<SourceId>,
     pub(super) source_epoch: Option<u64>,
+    /// The application's Tokio runtime, snapshotted when the fetch was
+    /// scheduled. The built-in local library's retained authority polls
+    /// Tokio time/blocking APIs, which panic on the runtime-less GTK main
+    /// context the pane fetch runs on, so that arm is executed on this
+    /// handle (2026-09-13 review finding).
+    pub(super) rt_handle: Option<tokio::runtime::Handle>,
     /// Configured library roots, snapshotted on the main thread when the
     /// fetch was scheduled. The built-in local library's retained
     /// authority resolves against exactly these roots; the async
@@ -82,9 +88,8 @@ pub(super) fn orchestrate_pane_fetch(
             fetch.album_source,
             fetch.source_epoch,
             fetch.configured_roots.clone(),
+            fetch.rt_handle.clone(),
             &candidate,
-            candidate.cover_art_url.clone(),
-            candidate.uri.clone(),
         )
         .await;
         finish_pane_fetch(

@@ -1886,6 +1886,10 @@ pub(crate) fn build_window(
     // may run as soon as the user scrolls the album pane) then snapshots
     // the roots on the main thread.
     browser::attach_app_config(&browser_state, app_config.clone());
+    // The built-in local library's retained artwork authority polls Tokio
+    // time/blocking APIs, so the controller must run that arm on the
+    // application runtime rather than the runtime-less GTK main context.
+    browser::attach_runtime(&browser_state, rt_handle.clone());
 
     // ── Right content ────────────────────────────────────────────────
     let right_paned = gtk::Paned::builder()
