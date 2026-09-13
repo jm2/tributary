@@ -2,6 +2,25 @@
 
 Status: design record, no implementation in this bead.
 
+Revision 11 (2026-09-13, corrective pass). This revision answers the
+round-11 Codex findings at the `7eb2c4e` head with three contract fixes
+to §4.1/§4.3/§9, all docs-only: (1) the `open_session` contract now
+carries the app-owned ticket-custody capability as an explicit
+`custody: &MediaTicketCustody` parameter, so the transition that
+produces `Failed(SenderError::RecoveryPending)` can itself perform the
+proxy-locked custody move the prose promises — the sender is no longer
+asked to move a lease it has no handle for; (2) replacement preparation
+(`prepare_with_server_start`) no longer takes and unconditionally
+revokes the superseded active lease: whichever side wins the proxy
+state-lock race the route is preserved in custody until the canceled
+open reaches its terminal quiesced outcome, and the open can still
+return `RecoveryPending` on the mutating-RPC-missed-deadline path
+rather than being forced to `Cancelled`; (3) the `RecoveryCompletion`
+contract is terminal when the recovery deadline expires after
+quiescence but before any restoration attempt, so the documented
+no-attempt deadline outcome (`RestorationFailed`) no longer contradicts
+the handle's completion precondition. It changes the design record only.
+
 Revision 10 (2026-09-13, corrective pass). This revision answers the
 round-11 Codex findings at the `cc83477` head with three ordering fixes
 to §4.1/§4.3/§9, all docs-only: (1) ticket custody is now atomic with
@@ -602,17 +621,20 @@ enum RecoveryOutcome {
 /// outcome returns while restoration is still pending, so it cannot
 /// report a completed unwind; carrying this handle is how the load
 /// path learns how the unwind actually ended. It resolves with a
-/// terminal `RecoveryOutcome` once the adapter's recovery has run
-/// restoration — the outstanding mutating request settled, or the
-/// dedicated daemon was terminated/restarted to cancel it — and
-/// either released the incomplete-takeover record (`Restored`) or
-/// retained it for the supervisor after a restoration failure
-/// (`RestorationFailed`), whichever happened within the documented
-/// recovery deadline (§4.1, §4.3). That deadline is a named constant
-/// in the implementation record, distinct from the cleanup deadline:
-/// it caps the whole serialized recovery after `RecoveryPending` —
-/// the settle-or-restart quiescence plus the restoration attempt —
-/// so an unbounded restoration retry cannot keep the handle pending.
+/// terminal `RecoveryOutcome` as soon as recovery reaches a terminal
+/// state, bounded by the documented recovery deadline (§4.1, §4.3):
+/// `Restored` once the outstanding mutating request settled (or the
+/// dedicated daemon was terminated/restarted to cancel it) and
+/// restoration then ran and released the incomplete-takeover record;
+/// or `RestorationFailed` when a restoration step failed, **or when
+/// the recovery deadline expires after quiescence but before any
+/// restoration attempt**, with the record retained for the supervisor.
+/// That deadline is a named constant in the implementation record,
+/// distinct from the cleanup deadline: it caps the whole serialized
+/// recovery after `RecoveryPending` — the settle-or-restart quiescence
+/// plus any restoration attempt — so the handle is terminal even when
+/// restoration never starts, and an unbounded restoration retry cannot
+/// keep it pending.
 /// It is cloneable and safe to hold
 /// across threads, so the load path may await it inline or register a
 /// continuation; either way the wait terminates, because recovery is
@@ -621,15 +643,46 @@ struct RecoveryCompletion { /* the implementation record's primitive */ }
 
 impl RecoveryCompletion {
     /// Block until the serialized recovery reaches a terminal state:
-    /// restoration ran and the record cleared (`Restored`), or
-    /// restoration failed — or the recovery deadline passed — and the
-    /// record was retained for the supervisor (`RestorationFailed`).
+    /// restoration ran and the record cleared (`Restored`); or
+    /// restoration failed — or the recovery deadline passed after
+    /// quiescence without a restoration attempt — and the record was
+    /// retained for the supervisor (`RestorationFailed`).
     /// Returns immediately if recovery already finished. Safe from any
     /// thread, and never reports `Restored` before restoration has
     /// actually run. Callers that must not block register a
     /// continuation instead (the concrete primitive is the
     /// implementation record's choice).
     fn wait(&self) -> RecoveryOutcome;
+}
+
+/// The app-owned capability to move this load's loopback media ticket
+/// off the proxy's active lease (`src/audio/gstreamer_media.rs:69-72`)
+/// into recovery custody, atomically, under the proxy's state lock.
+/// The load path owns it — it is the `GstreamerMediaProxy` owner — and
+/// lends it to `open_session`, so the transition that produces
+/// `Failed(SenderError::RecoveryPending)` performs the proxy-locked
+/// custody move itself, before the outcome value is constructed,
+/// rather than leaving it to a post-receipt step by the load path
+/// (§4.1). Without this capability the sender is an immutable backend
+/// that cannot identify or move the per-load lease, and a replacement
+/// load's supersession revocation would run in the interval between
+/// the recovery decision and the hand-off. The concrete type is the
+/// implementation record's choice; the contract requires only that the
+/// move is atomic with the production of the outcome, that it is
+/// identity-checked against the proxy's newest active lease, and that
+/// `prepare_with_server_start` can never revoke a custody-held route.
+struct MediaTicketCustody { /* the implementation record's primitive */ }
+
+impl MediaTicketCustody {
+    /// Move the active lease for this load's current ticket into the
+    /// proxy's recovery-custody slot under the proxy's state lock, so
+    /// no other load can observe it as active afterwards and the
+    /// replacement path's supersession revocation cannot reach it.
+    /// Idempotent for the load's own ticket: a ticket already in
+    /// custody — for example because replacement preparation moved it
+    /// there first — is left in place, and the call never touches a
+    /// newer replacement's lease.
+    fn move_to_recovery_custody(&self);
 }
 
 /// Stable, machine-distinguishable seam failures. The load path's
@@ -663,9 +716,11 @@ enum SenderError {
     /// ticket may be revoked only after recovery reaches a terminal,
     /// quiesced outcome, and on this branch that has not happened yet.
     /// The ticket is therefore moved off the proxy's active lease into
-    /// recovery custody under the proxy's state lock **as part of the
-    /// transition that creates this variant** — not by the load path
-    /// after it receives the outcome — so a replacement load's
+    /// recovery custody, under the proxy's state lock and through the
+    /// `custody: &MediaTicketCustody` capability the seam is handed,
+    /// **as part of the transition that creates this variant** — not by
+    /// the load path after it receives the outcome — so a replacement
+    /// load's
     /// unconditional supersession revocation
     /// (`src/audio/gstreamer_media.rs:255-271`) can never observe it in
     /// the active lease and invalidate the route in the interval before
@@ -885,11 +940,13 @@ trait AirplaySender: Send + Sync {
     ///   instead moved off the proxy's active lease
     ///   (`src/audio/gstreamer_media.rs:69-72`) into recovery custody
     ///   **as part of the transition that produces this variant** — the
-    ///   seam carries the app-owned custody handle alongside
-    ///   `prepared_uri`, and the recovery transition performs the
-    ///   move under the proxy's state lock before the outcome is
-    ///   constructed, so no other load can observe the lease as active
-    ///   in between — and the load path then awaits the
+    ///   seam carries the app-owned custody capability as the
+    ///   `custody: &MediaTicketCustody` parameter alongside
+    ///   `prepared_uri`, and the recovery transition calls
+    ///   `custody.move_to_recovery_custody()` under the proxy's state
+    ///   lock before the outcome is constructed, so no other load can
+    ///   observe the lease as active in between — and the load path then
+    ///   awaits the
     ///   `RecoveryCompletion` handle it carries. The transfer is not a
     ///   post-receipt step by the load path: the proxy's replacement
     ///   path takes the active lease and unconditionally calls
@@ -900,12 +957,25 @@ trait AirplaySender: Send + Sync {
     ///   be revoked before this recovery ran. The proxy therefore
     ///   exposes the custody slot and a single atomic transition over
     ///   it, and `prepare_with_server_start` acquires the same state
-    ///   lock: a replacement either supersedes the generation before
-    ///   the recovery transition (in which case the open observes the
-    ///   supersession and cannot return `RecoveryPending` for that
-    ///   lease) or finds the lease already custodied and removes
-    ///   nothing. Custody is a dedicated slot the replacement path
-    ///   never touches, and **explicit teardown does not drain it
+    ///   lock — but it no longer takes and unconditionally revokes the
+    ///   superseded active lease (`src/audio/gstreamer_media.rs:255-271`):
+    ///   whichever side wins the state-lock race, the route is preserved
+    ///   in custody until the canceled open reaches its terminal quiesced
+    ///   outcome. If the recovery transition runs first, the replacement
+    ///   finds the lease already custodied and removes nothing; if
+    ///   replacement preparation runs first, it moves the still-active
+    ///   lease into the same custody slot and signals supersession, and
+    ///   the open then observes the supersession with the lease already
+    ///   custodied. Supersession therefore does not force `Cancelled`: a
+    ///   canceled open still returns
+    ///   `Failed(SenderError::RecoveryPending)` when a transmitted
+    ///   mutating RPC missed the cleanup deadline (never `Cancelled`,
+    ///   `:950-959`), and returns `Cancelled` only when its server side
+    ///   quiesced inside that deadline — at which point restoration has
+    ///   run and the load path revokes the custodied route through the
+    ///   identity-checked path. The replacement revokes only its own
+    ///   ticket. Custody is a dedicated slot the replacement path never
+    ///   revokes from, and **explicit teardown does not drain it
     ///   early**: Stop (`GstreamerMediaProxy::revoke`) and the proxy's
     ///   `Drop` must not revoke a custodied route while recovery is
     ///   unresolved. They either drive recovery to its terminal
@@ -988,6 +1058,7 @@ trait AirplaySender: Send + Sync {
         &self,
         target: &AirplayTarget,
         prepared_uri: &str,
+        custody: &MediaTicketCustody,
         event_tx: async_channel::Sender<PlayerEvent>,
         generation: PlayerEventGeneration,
         cancel: &OpenCancel,
@@ -1251,9 +1322,10 @@ Tributary talks to an OwnTone instance as a transmission service:
   the `RecoveryCompletion` handle resolves, where recovery has
   not reached a terminal outcome yet and the ticket was first moved
   out of the proxy's active lease into recovery custody as part of the
-  transition that produced `RecoveryPending` (under the proxy's state
-  lock, atomic with that transition, so no replacement load can revoke
-  it early) — so the unwound load leaves no receiver
+  transition that produced `RecoveryPending` — through the
+  `MediaTicketCustody` capability the seam is handed, under the
+  proxy's state lock, atomic with that transition, so no replacement
+  load can revoke it early — so the unwound load leaves no receiver
   session, no enabled-output change, and, once recovery reaches its
   terminal outcome, no live loopback route behind. A crashed holder releases the lock by OS semantics,
   and what happens next is defined, not incidental: before the
@@ -1849,14 +1921,19 @@ record for the selected path must add, at minimum:
     (or the restoration step) so recovery is still pending, then
     starts the replacement load through `prepare_with_server_start`
     (`src/audio/gstreamer_media.rs:255-271`) and asserts the pending
-    load's loopback route is **not** revoked: because that supersession
-    path takes and unconditionally revokes the active lease, the test
-    proves the ticket had already been moved off the active lease into
-    recovery custody **as part of the transition that produced
-    `RecoveryPending`** — not by the load path after receipt — and is
-    therefore absent from the active lease the replacement takes. The
-    replacement arrives *after* the recovery outcome is observable, so
-    the test exercises the window the atomic hand-off must close, not
+    load's loopback route is **not** revoked: replacement preparation
+    must preserve the superseded lease — moving it into recovery
+    custody rather than taking and unconditionally revoking the active
+    lease — until the canceled open reaches its terminal quiesced
+    outcome. The test exercises both state-lock race orders: the
+    recovery transition running first (the replacement then finds the
+    lease already custodied and removes nothing), and replacement
+    preparation running first (the open then observes the supersession
+    with the lease already custodied, and still returns
+    `Failed(SenderError::RecoveryPending)` on the missed-deadline path
+    per §4.1 `:950-959` — supersession does not force `Cancelled`).
+    The replacement arrives *after* the recovery outcome is observable,
+    so the test exercises the window the atomic hand-off must close, not
     just the steady state. It then releases recovery, asserts the old
     route is revoked only after the carried `RecoveryCompletion`
     reaches its terminal outcome, and asserts the replacement's own
@@ -1900,9 +1977,12 @@ already-pinned tests (§1) are unchanged.
 1. **Seam refactor (mechanical).** Land the §4.1 contract with the
    existing GStreamer path as the first `AirplaySender`; the contract
    carries the prepared URI exactly as `open_prepared_session` does
-   today (`src/audio/airplay_output.rs:231-241`), so no behavior
-   change; the §9.1-§9.3 tests land here. Locked `cargo check`,
-   `cargo clippy` (debug + release), `cargo test --all-targets`.
+   today (`src/audio/airplay_output.rs:231-241`) and adds the
+   app-owned `MediaTicketCustody` capability the `RecoveryPending`
+   transition needs, so behavior is unchanged for every
+   non-`RecoveryPending` outcome; the §9.1-§9.3 tests land here.
+   Locked `cargo check`, `cargo clippy` (debug + release),
+   `cargo test --all-targets`.
 2. **OwnTone daemon adapter.** Dependency documentation per §8,
    daemon lifecycle, JSON API integration, FIFO transport, §9.4-§9.6
    acceptance, real-device validation. Update
