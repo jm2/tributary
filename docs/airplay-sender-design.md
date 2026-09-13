@@ -2,6 +2,20 @@
 
 Status: design record, no implementation in this bead.
 
+Revision 8 (2026-09-13, corrective pass). This revision answers the
+round-9 Codex findings at the `af12b255` head with two fixes to
+§3/§4.1/§9: (1) the recovery-pending failure state now carries a
+completion handle, and the ticket ordering is stated per outcome class
+— because `Failed(SenderError::RecoveryPending)` returns before
+restoration runs, the load path may not revoke its own media ticket on
+receipt; it awaits the handle and only then calls `revoke_if_current`,
+so revocation still follows transport restoration, and acceptance item
+5 asserts both branches; (2) the retained-identifier prerequisite now
+also replaces the UI output selector's display-name deduplication and
+carries the identifier on each output row through activation, so a
+second same-named receiver is selectable and the §9 item 11 mapping is
+exercised through the real UI flow. It changes the design record only.
+
 Revision 7 (2026-09-13, corrective pass). This revision answers the
 round-8 Codex findings at the `162b263` head with three correctness
 fixes to §3/§4.1/§4.3: (1) the cleanup-deadline branch no longer
@@ -361,6 +375,13 @@ tree, not by data revision 1 imagined. Today:
   and output activation reconstructs
   `OutputTarget::AirPlay { host, port }`
   ([`src/ui/output_switch.rs:329-339`](../src/ui/output_switch.rs)).
+  Before a row is even built, `handle_airplay_found` dedups by
+  **display name** —
+  `is_device_in_output_list(output_list, &airplay_name)`
+  ([`src/ui/discovery_handler.rs:286`](../src/ui/discovery_handler.rs),
+  helper at :439-459, comparing the row label text) — so a second
+  receiver advertising the same name is dropped at the selector and
+  can never be selected.
 - AirPlay-2-tagged rows are dropped at the UI boundary until a sender
   exists ([`src/ui/discovery_handler.rs:45-55`](../src/ui/discovery_handler.rs)).
 - `requires_password` is `None` for every discovered AirPlay device;
@@ -402,10 +423,16 @@ Consequences for the design:
    carries a prerequisite discovery change (consequence 2, §10 item
    3): retain the normalized device MAC/`deviceid` on
    `DiscoveredServer`, carry it through to the seam's target type
-   (consequence 1), and map the selected receiver to OwnTone's
-   output by that identifier, refusing when it is absent or does not
-   resolve to exactly one output (§4.3 receiver selection, §9 item
-   11).
+   (consequence 1), **replace the selector's display-name
+   deduplication with that identifier and retain it on each output
+   row through activation** — otherwise the second same-named
+   receiver is discarded by `is_device_in_output_list`
+   (`src/ui/discovery_handler.rs:286`, :439-459) before any
+   identifier could be retained, and the mapping below can never be
+   exercised through the real UI — and map the selected receiver to
+   OwnTone's output by that identifier, refusing when it is absent or
+   does not resolve to exactly one output (§4.3 receiver selection,
+   §9 item 11).
 
 ## 4. Seam design
 
@@ -507,6 +534,30 @@ struct SenderPosition {
     stale: bool,
 }
 
+/// Completion handle for the serialized recovery that a
+/// `Failed(SenderError::RecoveryPending)` open leaves behind. That
+/// outcome returns while restoration is still pending, so it cannot
+/// report a completed unwind; carrying this handle is how the load
+/// path learns when the unwind has actually happened. It resolves
+/// after the adapter's recovery has run restoration — the outstanding
+/// mutating request settled, or the dedicated daemon was
+/// terminated/restarted to cancel it — and released the
+/// incomplete-takeover record (§4.1, §4.3). It is cloneable and safe
+/// to hold across threads, so the load path may await it inline or
+/// register a continuation; either way the wait terminates, because
+/// recovery is bounded by settle-or-restart.
+struct RecoveryCompletion { /* the implementation record's primitive */ }
+
+impl RecoveryCompletion {
+    /// Block until restoration has run and the incomplete-takeover
+    /// record has cleared; return immediately if recovery already
+    /// completed. Safe from any thread, and never reports success
+    /// before restoration has run. Callers that must not block
+    /// register a continuation instead (the concrete primitive is the
+    /// implementation record's choice).
+    fn wait(&self);
+}
+
 /// Stable, machine-distinguishable seam failures. The load path's
 /// deadline, dependency, authentication, and receiver-failure
 /// contracts (§9.1, §9.6) are error *kinds* callers must branch on,
@@ -532,8 +583,20 @@ enum SenderError {
     /// settles — or the dedicated daemon is terminated/restarted to
     /// cancel it — before restoration runs and ownership is released
     /// (§4.1, §4.3). Callers surface this as recovery-pending
-    /// guidance, distinct from `Deadline`.
-    RecoveryPending(String),
+    /// guidance, distinct from `Deadline`. The variant also carries
+    /// the `RecoveryCompletion` handle for the serialized recovery,
+    /// because the load path owes a second ordering: its own media
+    /// ticket may be revoked only *after* restoration, and on this
+    /// branch restoration has not run yet, so the load path awaits the
+    /// handle before calling `revoke_if_current` (§4.1).
+    RecoveryPending {
+        /// The user-actionable, localized recovery-pending guidance
+        /// the load path surfaces immediately.
+        message: String,
+        /// Resolves when restoration has run and the
+        /// incomplete-takeover record has cleared.
+        completion: RecoveryCompletion,
+    },
     /// The dependency is absent, unreachable, unsupported on this
     /// platform, or not the dedicated Tributary-owned instance the
     /// daemon adapter requires (§4.3). Includes today's
@@ -647,9 +710,12 @@ enum OpenOutcome {
     /// made. The incomplete-takeover record stays in place and
     /// recovery stays serialized until that request settles or the
     /// dedicated daemon is terminated/restarted, after which
-    /// restoration runs and the record clears (§4.1, §4.3). The load
-    /// path surfaces its localized recovery-pending guidance rather
-    /// than a completed-unwind message.
+    /// restoration runs and the record clears (§4.1, §4.3). The
+    /// variant carries the `RecoveryCompletion` handle that resolves
+    /// at that point; the load path surfaces its localized
+    /// recovery-pending guidance rather than a completed-unwind
+    /// message, and revokes its own media ticket only once the handle
+    /// resolves (§4.1 ordering).
     Failed(SenderError),
 }
 
@@ -704,9 +770,29 @@ trait AirplaySender: Send + Sync {
     /// `revoke_if_current` is identity-checked against the proxy's
     /// newest active lease (`src/audio/gstreamer_media.rs:319-337`),
     /// so a load can only ever revoke its own current ticket and never
-    /// a newer replacement's. The ordering is the accepted one:
-    /// transport restoration first, revocation after, so the receiver
-    /// session is unwound before the loopback route is invalidated.
+    /// a newer replacement's. **The ordering is transport restoration
+    /// first, revocation after**, so the receiver session is unwound
+    /// before the loopback route is invalidated — and the two outcome
+    /// classes satisfy it differently, which the seam contract now
+    /// states explicitly:
+    ///
+    /// - `Cancelled` and `Failed(Deadline)`, `Failed(Dependency)`,
+    ///   `Failed(Authentication)`, and `Failed(Receiver)` report
+    ///   restoration complete, so the load path revokes its own ticket
+    ///   via `revoke_if_current` as the outcome returns, exactly as
+    ///   today.
+    /// - `Failed(SenderError::RecoveryPending)` reports the opposite:
+    ///   restoration has *not* run. Revoking on receipt would
+    ///   invalidate the loopback route while the unsettled request or
+    ///   the not-yet-unwound receiver session can still reference it,
+    ///   so the load path must **not** revoke on receipt. It awaits the
+    ///   `RecoveryCompletion` handle carried by that variant — which
+    ///   resolves only after restoration has run and the
+    ///   incomplete-takeover record has cleared — and then calls
+    ///   `revoke_if_current`. The route is retained exactly as long as
+    ///   the ordering requires, the identity check still protects a
+    ///   newer replacement's ticket, and no route is leaked because
+    ///   recovery is bounded by settle-or-restart.
     ///
     /// Bounded and interruptible by contract: the call enforces the
     /// adapter's documented open deadline (again a named constant
@@ -754,7 +840,9 @@ trait AirplaySender: Send + Sync {
     /// `Failed(SenderError::Deadline)` carrying explicit, localized
     /// guidance (§9.1 contract), or `Failed(SenderError::RecoveryPending)`
     /// when a mutating RPC is still unsettled, carrying the
-    /// recovery-pending guidance. `Cancelled` and `Deadline` stay
+    /// recovery-pending guidance and the `RecoveryCompletion` handle
+    /// the load path awaits before ticket revocation. `Cancelled` and
+    /// `Deadline` stay
     /// distinct outcomes, so the UI never renders a cancelled load as
     /// an error and never reports one (§9.5); a caller-requested abort
     /// whose quiescence wait misses the deadline is `RecoveryPending`,
@@ -1023,8 +1111,11 @@ Tributary talks to an OwnTone instance as a transmission service:
   then does restoration run — so neither the supervisor nor a next
   opener can interleave a restoration with the unsettled request.
   The load path then revokes its own media ticket
-  via `revoke_if_current` (§4.1, §9.5), so a cancelled open leaves
-  no receiver session, no enabled-output change, and no live
+  via `revoke_if_current` (§4.1, §9.5) — immediately for a clean
+  `Cancelled` return, and only after the `RecoveryCompletion` handle
+  resolves for the `RecoveryPending` branch, where restoration has
+  not run yet — so the unwound load leaves no receiver session, no
+  enabled-output change, and, once recovery completes, no live
   loopback route behind. A crashed holder releases the lock by OS semantics,
   and what happens next is defined, not incidental: before the
   first mutating step (the first output, queue, or player change),
@@ -1495,10 +1586,21 @@ record for the selected path must add, at minimum:
     for a genuinely cancelled load, no error event for the cancelled
     generation, no half-taken-over daemon adopted while a request is
     unsettled, and a following load opens cleanly once the outstanding
-    request has settled or been cancelled (§4.1, §4.3). A targeted
-   interposition test races `cancel` against an operation the test
-   holds open and asserts the abort happens before that operation
-   would have returned.
+    request has settled or been cancelled (§4.1, §4.3). The same
+    acceptance asserts the ticket ordering across both branches: with
+    the outcome `Cancelled` (restoration complete) the load path
+    revokes its own media ticket via `revoke_if_current` on receipt;
+    with `Failed(SenderError::RecoveryPending)` (restoration still
+    pending) it does **not** revoke on receipt — the test observes the
+    loopback route still live while recovery is outstanding and
+    asserts revocation happens only after the carried
+    `RecoveryCompletion` resolves, i.e. after restoration has run. A
+    load whose ticket was superseded while awaiting completion must
+    not revoke the newer replacement's ticket (the `revoke_if_current`
+    identity check). A targeted
+    interposition test races `cancel` against an operation the test
+    holds open and asserts the abort happens before that operation
+    would have returned.
 6. **Authentication-failure acceptance:** a password-protected
    receiver with no configured password, and a wrong-password case,
    each surface a distinct, localized, actionable error (pointing at
@@ -1564,7 +1666,16 @@ record for the selected path must add, at minimum:
     read back from `/api/outputs`. A selected receiver whose retained
     identifier is missing or does not resolve to exactly one output is
     refused with localized guidance before any mutating call, so no
-    output is enabled and no receiver state is touched.
+    output is enabled and no receiver state is touched. The same
+    acceptance covers the selector the user actually drives: with two
+    same-named receivers discovered, both appear as distinct selector
+    rows (the display-name dedup of `is_device_in_output_list`,
+    `src/ui/discovery_handler.rs:286`, :439-459, is replaced by the
+    retained identifier), each row keeps its identifier through
+    activation, and selecting the second receiver streams to the
+    second device — so the mapping is exercised through the real UI
+    flow, not only the adapter API, and the second same-named receiver
+    is never silently unselectable.
 
 **Platform scope:** items 1-11 run on the package targets the §8
 matrix marks available for the OwnTone adapter (today: the `.deb`
@@ -1595,9 +1706,15 @@ already-pinned tests (§1) are unchanged.
    conclusion explicitly).
 3. **Discovery identifier retention (prerequisite of the daemon
    mapping in 2).** Retain the normalized device MAC/`deviceid` on
-   `DiscoveredServer` and add the endpoint-to-output mapping before
-   the daemon adapter may enable a receiver, so it never has to
-   name-match (§3 consequence 4, §4.3, §9 item 11). **AirPlay-2
+   `DiscoveredServer` and carry it through to the seam target; replace
+   the UI output selector's display-name deduplication
+   (`is_device_in_output_list`, `src/ui/discovery_handler.rs:286`,
+   :439-459) with an identifier-based check and retain the identifier
+   on each output row through activation, so a second same-named
+   receiver stays selectable and reaches the mapping; then add the
+   endpoint-to-output mapping before the daemon adapter may enable a
+   receiver, so it never has to name-match (§3 consequences 3-4,
+   §4.3, §9 item 11). **AirPlay-2
    enablement (separate, only after 2 validates):** extend
    `DiscoveredServer` for whatever else the daemon mapping needs
    (§3, consequence 2), flip the §3 discovery filter, add AP2
