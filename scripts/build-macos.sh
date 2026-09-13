@@ -412,6 +412,22 @@ FRAMEWORKS_DIR="${APP_BUNDLE}/Contents/Frameworks"
 # not the bash wrapper we just created.
 BIN="${APP_BUNDLE}/Contents/MacOS/${APP_NAME}-bin"
 
+# >>> macOS rpath helpers
+#
+# copy_dylib and fix_rpaths do the repetitive per-dependency work for the
+# bundle. They preserve every policy decision above, but stop inspecting the
+# same immutable Homebrew source once per consumer and stop spawning one
+# install_name_tool process per equivalent edit.
+#
+# Validation results are keyed by the exact absolute source path, never by the
+# destination basename, so a basename collision cannot let one artifact's
+# inspection authorize a different one. Homebrew prefixes are immutable for the
+# life of a build, so each distinct source is inspected once before its first
+# copy; the counters below surface the avoided work in the build log.
+MACOS_VALIDATED_SOURCE_CACHE=$'\n'
+MACOS_SOURCE_VALIDATIONS=0
+MACOS_SOURCE_CACHE_HITS=0
+
 # Copy a single dylib into Frameworks/ if not already there.
 copy_dylib() {
   local src="$1"
@@ -419,8 +435,14 @@ copy_dylib() {
   basename="$(basename "$src")"
   local dest="${FRAMEWORKS_DIR}/${basename}"
 
-  if ! macos_validate_macho_copy_control "$src"; then
-    error "Refusing recursive dylib dependency: ${MACOS_PACKAGE_POLICY_REASON}"
+  if [[ "$MACOS_VALIDATED_SOURCE_CACHE" == *$'\n'"${src}"$'\n'* ]]; then
+    MACOS_SOURCE_CACHE_HITS=$((MACOS_SOURCE_CACHE_HITS + 1))
+  else
+    if ! macos_validate_macho_copy_control "$src"; then
+      error "Refusing recursive dylib dependency: ${MACOS_PACKAGE_POLICY_REASON}"
+    fi
+    MACOS_VALIDATED_SOURCE_CACHE+="${src}"$'\n'
+    MACOS_SOURCE_VALIDATIONS=$((MACOS_SOURCE_VALIDATIONS + 1))
   fi
 
   [[ -f "$dest" ]] && return 1
@@ -434,6 +456,7 @@ copy_dylib() {
 fix_rpaths() {
   local bin="$1"
   local new_libs=()
+  local change_args=()
   while IFS= read -r libpath; do
     local basename
     basename="$(basename "$libpath")"
@@ -450,15 +473,22 @@ fix_rpaths() {
       fi
     fi
     
-    install_name_tool -change "$libpath" \
-      "@executable_path/../Frameworks/${basename}" "$bin" 2>/dev/null || true
+    # install_name_tool applies every -change in a single invocation. Collect
+    # the equivalent edits for this binary and apply them together instead of
+    # spawning one subprocess per dependency.
+    change_args+=(-change "$libpath" "@executable_path/../Frameworks/${basename}")
       
   # The updated regex catches /opt/homebrew, /usr/local, AND @rpath/@loader_path
   done < <(otool -L "$bin" 2>/dev/null \
     | awk '/\/opt\/homebrew|\/usr\/local|@rpath\/|@loader_path\// {print $1}')
-    
+
+  if [[ ${#change_args[@]} -gt 0 ]]; then
+    install_name_tool "${change_args[@]}" "$bin" 2>/dev/null || true
+  fi
+
   NEWLY_COPIED=("${new_libs[@]+"${new_libs[@]}"}")
 }
+# <<< macOS rpath helpers
 
 # Fix the main binary
 fix_rpaths "$BIN"
@@ -493,6 +523,7 @@ done
 
 TOTAL_DYLIBS=$(ls -1 "${FRAMEWORKS_DIR}"/*.dylib 2>/dev/null | wc -l | tr -d ' ')
 info "Bundled ${TOTAL_DYLIBS} dylibs into Frameworks/."
+info "Dylib source policy inspections: ${MACOS_SOURCE_VALIDATIONS}; repeated inspections avoided: ${MACOS_SOURCE_CACHE_HITS}."
 
 # Fix GStreamer plugins
 if [[ -d "$GST_PLUGIN_DEST" ]]; then
