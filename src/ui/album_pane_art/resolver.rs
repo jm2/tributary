@@ -147,22 +147,27 @@ pub(super) async fn resolve_kind(
             );
             ResolvedArtKind::NoArtwork
         }
-        PaneAuthority::External => {
-            // Truly external rows with no authority chain at all
-            // (e.g., OS-opened external files) keep the transitional
-            // direct path.
-            if candidate.uri.starts_with("file://") {
-                ResolvedArtKind::DirectFile {
-                    uri: candidate.uri.clone(),
-                }
-            } else if !candidate.cover_art_url.is_empty() {
-                ResolvedArtKind::DirectUrl {
-                    url: candidate.cover_art_url.clone(),
-                }
-            } else {
-                ResolvedArtKind::NoArtwork
-            }
+        // Truly external rows with no authority chain at all (e.g.,
+        // OS-opened external files) keep the transitional direct path.
+        PaneAuthority::External => resolve_external_art(candidate),
+    }
+}
+
+/// Resolve a truly external row (no authority chain) through the
+/// transitional direct path: its raw `file://` locator then its snapshot
+/// URL, else the placeholder. Extracted from [`resolve_kind`] so the
+/// authority match stays inside the per-method size budget.
+fn resolve_external_art(candidate: &AlbumArtCandidate) -> ResolvedArtKind {
+    if candidate.uri.starts_with("file://") {
+        ResolvedArtKind::DirectFile {
+            uri: candidate.uri.clone(),
         }
+    } else if !candidate.cover_art_url.is_empty() {
+        ResolvedArtKind::DirectUrl {
+            url: candidate.cover_art_url.clone(),
+        }
+    } else {
+        ResolvedArtKind::NoArtwork
     }
 }
 
