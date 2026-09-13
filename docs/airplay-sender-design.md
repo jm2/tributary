@@ -2,6 +2,25 @@
 
 Status: design record, no implementation in this bead.
 
+Revision 7 (2026-09-13, corrective pass). This revision answers the
+round-8 Codex findings at the `162b263` head with three correctness
+fixes to §3/§4.1/§4.3: (1) the cleanup-deadline branch no longer
+claims complete teardown — a transmitted mutating RPC that is still
+unsettled at the deadline now surfaces as an explicit
+`SenderError::RecoveryPending` failure state that defers every
+restoration/teardown claim until the request settles or the dedicated
+daemon is terminated/restarted, because an implementation cannot both
+return within the deadline and prove teardown; (2) crash recovery now
+quiesces the dead holder's already-transmitted mutating requests
+before restoring or admitting another session — most reliably by
+terminating/restarting the dedicated instance, since OS lock release
+alone cannot retract a request the daemon is already applying — and
+acceptance item 9 asserts it; (3) the daemon path now requires a
+retained, correlatable discovery device identifier (the device MAC
+OwnTone parses into its `/api/outputs` `id`) and refuses rather than
+display-name-matching, so two same-named receivers cannot be
+confused. It changes the design record only.
+
 Revision 6 (2026-09-13, corrective pass). This revision answers the
 round-7 Codex findings at the `4814ef4` head with two correctness fixes
 to §4.1/§4.3: (1) the quiescence-timeout branch no longer claims the
@@ -349,8 +368,10 @@ tree, not by data revision 1 imagined. Today:
 
 Consequences for the design:
 
-1. **The sender contract takes `{ display_name, host, port }` and
-   nothing else.** Any protocol decision that needs `pw`, `et`, `sf`,
+1. **The sender contract takes `{ display_name, host, port }` — plus,
+   for the daemon path, the retained device identifier of consequence
+   4 — and nothing else.** Any protocol decision that needs `pw`,
+   `et`, `sf`,
    or `pk` must either be delegated to a component that re-resolves the
    device itself (the daemon-based path in §5.4 keeps its own device
    table), or proceed without the flag and surface the receiver's
@@ -366,6 +387,25 @@ Consequences for the design:
    play to them**; flipping that filter is part of the implementation
    record for whichever path ships AirPlay 2 (§6), together with a
    discovery change if receiver dedup needs the device id.
+4. **The daemon path requires a retained, correlatable device
+   identifier before it can be enabled.** OwnTone derives its
+   `/api/outputs` `id` from the receiver's device MAC: for the
+   `_raop._tcp` output it parses the leading hex `MAC@` prefix of the
+   mDNS instance name (`src/outputs/raop.c:4220` `safe_hextou64`,
+   `:4272` `rd->id = id`), and for the `_airplay._tcp` output it
+   parses the TXT `deviceid` MAC (`src/outputs/airplay.c:3945-3957`,
+   `:4004`). Its JSON `output` object exposes that `id` and a `name`
+   but no receiver host/port (pinned `docs/json-api.md`, §Get a list
+   of available outputs). Display names are not unique — two
+   receivers can share one — so name-matching cannot disambiguate and
+   can stream to the wrong device. Enabling the daemon path therefore
+   carries a prerequisite discovery change (consequence 2, §10 item
+   3): retain the normalized device MAC/`deviceid` on
+   `DiscoveredServer`, carry it through to the seam's target type
+   (consequence 1), and map the selected receiver to OwnTone's
+   output by that identifier, refusing when it is absent or does not
+   resolve to exactly one output (§4.3 receiver selection, §9 item
+   11).
 
 ## 4. Seam design
 
@@ -478,10 +518,22 @@ struct SenderPosition {
 /// user.
 enum SenderError {
     /// A documented probe/open deadline (a named constant in the
-    /// implementation record) was exceeded. Everything the attempt
-    /// created was torn down through the restoration path before
-    /// this variant is returned (§4.1).
+    /// implementation record) was exceeded, and the server side
+    /// quiesced inside the cleanup deadline, so everything the
+    /// attempt created was torn down through the restoration path
+    /// before this variant is returned (§4.1).
     Deadline(String),
+    /// The cleanup deadline was missed while a transmitted mutating
+    /// daemon RPC was still unsettled. This is deliberately not a
+    /// clean unwind and not a plain deadline: no claim is made that
+    /// everything the attempt created was torn down, because the late
+    /// request can still land. The incomplete-takeover record stays
+    /// in place and recovery stays serialized until the request
+    /// settles — or the dedicated daemon is terminated/restarted to
+    /// cancel it — before restoration runs and ownership is released
+    /// (§4.1, §4.3). Callers surface this as recovery-pending
+    /// guidance, distinct from `Deadline`.
+    RecoveryPending(String),
     /// The dependency is absent, unreachable, unsupported on this
     /// platform, or not the dedicated Tributary-owned instance the
     /// daemon adapter requires (§4.3). Includes today's
@@ -519,9 +571,10 @@ enum SenderError {
 /// compensating restoration *after* the last in-flight mutating RPC
 /// settles, so no mutation can land on state the restoration already
 /// unwound. A mutating RPC that has neither settled nor acknowledged
-/// within the deadline makes the outcome a failure, never
-/// `Cancelled`, and leaves the §4.3 incomplete-takeover record in
-/// place. That branch is *not* a claim that no mutation landed: a
+/// within the deadline makes the outcome
+/// `Failed(SenderError::RecoveryPending)`, never `Cancelled` and
+/// never a plain `Deadline`, and leaves the §4.3 incomplete-takeover
+/// record in place. That branch is *not* a claim that no mutation landed: a
 /// `queue/add` or `player/play` transmitted but unacknowledged at
 /// the deadline can still execute after the method returns, so the
 /// adapter keeps recovery serialized until that request settles —
@@ -584,9 +637,19 @@ enum OpenOutcome {
     /// `Cancelled` is a terminal, fully-unwound state, never a
     /// half-open session and never a retained loopback route.
     Cancelled,
-    /// A failure inside the seam's taxonomy; the teardown guarantees
-    /// are the failure path's — restoration has run before the value
-    /// is returned.
+    /// A failure inside the seam's taxonomy. `Failed(Deadline)`,
+    /// `Failed(Dependency)`, `Failed(Authentication)`, and
+    /// `Failed(Receiver)` carry the failure path's teardown
+    /// guarantee — restoration has run before the value is returned.
+    /// `Failed(RecoveryPending)` is the one exception and says so:
+    /// it reports a cleanup deadline missed with a transmitted
+    /// mutating RPC still unsettled, so no complete-teardown claim is
+    /// made. The incomplete-takeover record stays in place and
+    /// recovery stays serialized until that request settles or the
+    /// dedicated daemon is terminated/restarted, after which
+    /// restoration runs and the record clears (§4.1, §4.3). The load
+    /// path surfaces its localized recovery-pending guidance rather
+    /// than a completed-unwind message.
     Failed(SenderError),
 }
 
@@ -664,34 +727,39 @@ trait AirplaySender: Send + Sync {
     /// generation can land on state the restoration has unwound or
     /// after a replacement load has taken over. A mutating RPC that
     /// neither settles nor acknowledges within the deadline makes the
-    /// outcome `Failed(SenderError::Deadline)` — never `Cancelled` —
-    /// and leaves the §4.3 incomplete-takeover record in place rather
-    /// than reporting a clean unwind it cannot prove. That timeout
-    /// branch is likewise not reported as mutation-free: an
-    /// unacknowledged `queue/add` or `player/play` can still execute
-    /// after the outcome surfaces, so the call keeps recovery
-    /// serialized until that request settles — or terminates/restarts
-    /// the dedicated daemon to cancel it — before any ownership is
-    /// released, and neither the supervisor nor a next opener can
-    /// interleave a restoration with the unsettled request. The stale
-    /// attempt publishes no event for its generation. On cancellation
-    /// or a deadline miss the implementation tears down everything it
-    /// created so far (receiver session, queue items, enabled-output
-    /// changes) through the same restoration path (§4.3) before the
-    /// outcome surfaces, within a documented cleanup deadline
-    /// bounding the whole unwind; on the daemon adapter a cancellation
+    /// outcome `Failed(SenderError::RecoveryPending)` — never
+    /// `Cancelled`, never a plain `Deadline` — because there is no
+    /// clean unwind to report: the unacknowledged `queue/add` or
+    /// `player/play` can still execute, so no claim is made that
+    /// everything the attempt created was torn down. That branch
+    /// leaves the §4.3 incomplete-takeover record in place and keeps
+    /// recovery serialized until the request settles — or the
+    /// dedicated daemon is terminated/restarted to cancel it — before
+    /// any ownership is released and restoration runs, so neither the
+    /// supervisor nor a next opener can interleave a restoration with
+    /// the unsettled request. The stale attempt publishes no event for
+    /// its generation. Every *other* non-opened outcome restores
+    /// within the documented cleanup deadline, before the outcome
+    /// surfaces: the implementation tears down everything it created
+    /// so far (receiver session, queue items, enabled-output changes)
+    /// through the same restoration path (§4.3); a caller-requested
+    /// abort whose server side quiesced inside the deadline is
+    /// `Cancelled`; and an open/probe deadline miss with no unsettled
+    /// mutating RPC is `Failed(SenderError::Deadline)`, both with
+    /// restoration complete. On the daemon adapter a cancellation
     /// landing mid-takeover records and reverses its steps through the
-    /// same incomplete-takeover discipline as a crash (§4.3). The method never returns a
-    /// half-open session, and a load can never remain pending on it
-    /// indefinitely: after timeout the outcome is
+    /// same incomplete-takeover discipline as a crash (§4.3). The
+    /// method never returns a half-open session, and a load can never
+    /// remain pending on it indefinitely: after timeout the outcome is
     /// `Failed(SenderError::Deadline)` carrying explicit, localized
-    /// guidance (§9.1 contract), while a caller-requested abort whose
-    /// server side quiesced inside the deadline is `Cancelled` —
+    /// guidance (§9.1 contract), or `Failed(SenderError::RecoveryPending)`
+    /// when a mutating RPC is still unsettled, carrying the
+    /// recovery-pending guidance. `Cancelled` and `Deadline` stay
     /// distinct outcomes, so the UI never renders a cancelled load as
     /// an error and never reports one (§9.5); a caller-requested abort
-    /// whose quiescence wait misses the deadline is `Deadline`, not
-    /// `Cancelled`, because the unwind cannot be proven complete. If
-    /// cancellation and the deadline fire in the same window, the
+    /// whose quiescence wait misses the deadline is `RecoveryPending`,
+    /// not `Cancelled`, because the unwind cannot be proven complete.
+    /// If cancellation and the deadline fire in the same window, the
     /// call returns whichever it observed first and never both.
     fn open_session(
         &self,
@@ -859,10 +927,25 @@ Tributary talks to an OwnTone instance as a transmission service:
   including the password and PIN-verification flows Tributary cannot
   see from `host:port` alone (§3).
 - **Receiver selection:** OwnTone's JSON API (`/api/outputs`) selects
-  which output(s) receive the stream; the adapter maps
-  `{ display_name, host, port }` onto the daemon's device list at
-  open time and re-checks it, so a receiver that vanished or renamed
-  fails loudly instead of playing to the wrong device. The enabled
+  which output(s) receive the stream; the adapter maps its selected
+  receiver onto the daemon's device list by the retained discovery
+  device identifier — the normalized device MAC/`deviceid` that
+  OwnTone itself parses into its output `id`
+  (`src/outputs/raop.c:4220,4272`; `src/outputs/airplay.c:3945-3957,4004`)
+  — at open time and re-checks it. The match is on the parsed
+  numeric id: OwnTone parses the hex MAC to a `u64` and the API
+  renders that `u64` as a decimal string, so a raw-string compare
+  would miss. The display name is not the key:
+  two receivers can share one, and `/api/outputs` exposes the output
+  `id` and `name` but no receiver host/port or address (pinned
+  `docs/json-api.md`, §Get a list of available outputs), so a
+  name-only map — or a discovery record that had its `MAC@`/TXT
+  identity stripped (§3) — would fail to disambiguate and could
+  stream to the wrong receiver. A selected receiver with no retained
+  identifier, or an identifier that does not resolve to exactly one
+  output, fails closed with localized actionable guidance before any
+  state is read or mutated, so a receiver that vanished or renamed
+  also fails loudly. The enabled
   set is server-wide — `PUT /api/outputs/set` "enables all outputs
   with the given ids and disables the remaining outputs" — so
   isolating one receiver reconfigures the whole instance; the
@@ -927,10 +1010,12 @@ Tributary talks to an OwnTone instance as a transmission service:
   every transmitted mutating RPC has settled, or re-runs the
   reversal after the last in-flight one settles, so no mutation
   from the cancelled generation can land after the lock is
-  released. A quiescence wait that misses the deadline is a failure
-  (`Failed(SenderError::Deadline)`), never `Cancelled`, and the
+  released. A quiescence wait that misses the deadline is
+  `Failed(SenderError::RecoveryPending)`, never `Cancelled`, and the
   incomplete-takeover record stays in place rather than reporting a
-  clean unwind the adapter cannot prove. Because a request left
+  clean unwind the adapter cannot prove; the resulting
+  recovery-pending state defers every teardown/restoration claim
+  until the request settles or the daemon is restarted. Because a request left
   unacknowledged at the deadline can still land afterwards, the
   adapter does not hand ownership on as mutation-free: it keeps
   recovery serialized until the outstanding request settles, or
@@ -947,9 +1032,21 @@ Tributary talks to an OwnTone instance as a transmission service:
   lock file — the pre-takeover enabled-output set, which queue
   items are ours, and which takeover steps already ran. The record
   survives the crash, so the supervisor — or the next opener,
-  before its own takeover — detects it and runs recovery: stop the
+  before its own takeover — detects it and runs recovery. **OS lock
+  release alone does not quiesce a request the dead holder already
+  transmitted:** OwnTone may still apply an in-flight `outputs/set`,
+  `queue/add`, or `player/play` after the OS-released lock lets the
+  acquirer restore, and the persisted step record cannot serialize a
+  request the server is already running, so a restore-first recovery
+  could be overwritten by the dead holder's late mutation or
+  interleave with the next opener. Recovery therefore quiesces the
+  old daemon *first* — most reliably by terminating and restarting
+  the dedicated instance, which is exactly what §4.3's owned,
+  Tributary-spawned daemon makes safe, since a restart drops every
+  connection and any in-flight request — or otherwise proves every
+  request from the dead holder has settled. Only then does it stop the
   player if it is playing, remove Tributary-owned queue items,
-  re-apply the recorded enabled set, verify, and only then remove
+  re-apply the recorded enabled set, verify, and remove
   the record and admit the new session. If a restoration step
   fails, the acquirer refuses with its own localized actionable
   error and leaves the record in place for the supervisor to
@@ -1237,7 +1334,9 @@ What the implementation record must nail down, per §4.3:
   not hidden.
 - **Multi-room:** out of scope unless separately approved (task.md
   P2.4); the adapter enables exactly the one discovered device the
-  user activated — which, given the server-wide enabled-output set
+  user activated — resolved to the daemon's output by the retained
+  device identifier, never by display name (§4.3) — which, given the
+  server-wide enabled-output set
   (§4.3), means the dedicated instance streams to that receiver
   alone, and close or failure restores the set recorded at takeover.
 
@@ -1381,12 +1480,16 @@ record for the selected path must add, at minimum:
    the cancel and asserts the daemon state it produced is unwound
     before `Cancelled` is returned. A mutating RPC that neither
     settles nor acknowledges within the deadline yields
-    `OpenOutcome::Failed(SenderError::Deadline)`, never `Cancelled`,
-    and leaves the incomplete-takeover record in place. That timeout
-    branch must not be asserted mutation-free: the test holds the
-    request unsettled past the deadline and asserts the adapter keeps
+    `OpenOutcome::Failed(SenderError::RecoveryPending)`, never
+    `Cancelled` and never a plain `Deadline`, and leaves the
+    incomplete-takeover record in place. That timeout
+    branch must not be asserted mutation-free and must not be
+    asserted to have completed teardown: the test holds the
+    request unsettled past the deadline, asserts the outcome is the
+    recovery-pending failure state, and asserts the adapter keeps
     recovery serialized until it settles — or terminates/restarts the
-    dedicated daemon to cancel it — before releasing ownership, and
+    dedicated daemon to cancel it — before releasing ownership and
+    before any restoration is claimed, and
     that a supervisor or next opener cannot interleave a restoration
     with the unsettled request. The result is no user-facing error
     for a genuinely cancelled load, no error event for the cancelled
@@ -1415,11 +1518,20 @@ record for the selected path must add, at minimum:
    receiver (HomePod/Apple TV class) for any record that flips the
    §3 discovery filter.
 9. **Process-death acceptance:** the lock holder is killed
-   mid-playback (SIGKILL, no cleanup path) after takeover; the
+   mid-playback (SIGKILL, no cleanup path) after takeover, including
+   with a mutating request (`outputs/set`, `queue/add`, or
+   `player/play`) already transmitted and in flight; the
    supervisor or the next opener detects the persisted
-   incomplete-takeover record (§4.3) and restores the daemon before
-   admitting the new session — player stopped, our queue items
-   removed, the recorded enabled-output set re-applied. A
+   incomplete-takeover record (§4.3) and, **before restoring or
+   admitting the new session**, quiesces the dead holder — terminating
+   and restarting the dedicated instance, or proving every request
+   from the dead holder has settled — because OS lock release alone
+   cannot retract a request OwnTone is already applying. Only then
+   does it restore the daemon — player stopped, our queue items
+   removed, the recorded enabled-output set re-applied — and admit
+   the new session. The test holds a mutating request from the killed
+   holder in flight, completes recovery, and asserts no late mutation
+   from the dead generation lands after the restore. A
    restoration failure refuses the new session with localized
    guidance instead of proceeding over a half-taken-over daemon.
 10. **Natural-completion acceptance:** a finite track played
@@ -1444,8 +1556,17 @@ record for the selected path must add, at minimum:
     Cancellation and terminal failure are asserted *not* to publish
     `TrackEnded` — they end as `Stopped`/`Error`+`Stopped` per
     §9.4/§9.5.
+11. **Receiver-identity mapping acceptance:** with two receivers
+    advertising the same display name and different device MACs, the
+    adapter enables exactly the output whose OwnTone `/api/outputs`
+    `id` equals the retained discovery identifier of the selected
+    receiver — never a name-match — and asserts the enabled `id` set
+    read back from `/api/outputs`. A selected receiver whose retained
+    identifier is missing or does not resolve to exactly one output is
+    refused with localized guidance before any mutating call, so no
+    output is enabled and no receiver state is touched.
 
-**Platform scope:** items 1-10 run on the package targets the §8
+**Platform scope:** items 1-11 run on the package targets the §8
 matrix marks available for the OwnTone adapter (today: the `.deb`
 target on Debian/Ubuntu **amd64**). On every OwnTone-unavailable
 target — the arm64 `.deb`, Fedora, Arch/AUR, Flatpak, macOS,
@@ -1472,10 +1593,15 @@ already-pinned tests (§1) are unchanged.
    `docs/release-component-policy.md`'s follow-on section to record
    the dependency decision (no exception required — document that
    conclusion explicitly).
-3. **Discovery/AirPlay-2 enablement (separate, only after 2
-   validates).** Extend `DiscoveredServer` for whatever the daemon
-   mapping needs (§3, consequence 2), flip the §3 discovery filter,
-   add AP2 real-device coverage.
+3. **Discovery identifier retention (prerequisite of the daemon
+   mapping in 2).** Retain the normalized device MAC/`deviceid` on
+   `DiscoveredServer` and add the endpoint-to-output mapping before
+   the daemon adapter may enable a receiver, so it never has to
+   name-match (§3 consequence 4, §4.3, §9 item 11). **AirPlay-2
+   enablement (separate, only after 2 validates):** extend
+   `DiscoveredServer` for whatever else the daemon mapping needs
+   (§3, consequence 2), flip the §3 discovery filter, add AP2
+   real-device coverage.
 4. **Only if validation fails:** fall back to §5.6 with its dedicated
    key-provenance review as a prerequisite.
 
