@@ -365,6 +365,18 @@ impl MountedWriteAuthority {
     pub fn relative_leaf_identity(&self, relative: &Path) -> Option<LeafIdentity> {
         self.mounted.relative_leaf_identity(relative)
     }
+
+    /// Whether `relative` names a leaf beneath the retained destination root,
+    /// probed with per-component no-follow traversal exactly as execution
+    /// traverses the destination. `Ok(false)` means the leaf is absent (the
+    /// leaf or one of its parents is missing); a symlink/reparse-point
+    /// ancestor, a non-directory parent, a boundary crossing, or any other
+    /// traversal failure is an error. Callers classifying a destination
+    /// conflict MUST use this rather than an absolute-path `symlink_metadata`,
+    /// which follows an ancestor symlink outside the retained authority.
+    pub fn relative_leaf_exists(&self, relative: &Path) -> io::Result<bool> {
+        self.mounted.relative_leaf_exists(relative)
+    }
 }
 
 /// One directory component a creation call actually created, paired with
