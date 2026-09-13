@@ -523,7 +523,6 @@ done
 
 TOTAL_DYLIBS=$(ls -1 "${FRAMEWORKS_DIR}"/*.dylib 2>/dev/null | wc -l | tr -d ' ')
 info "Bundled ${TOTAL_DYLIBS} dylibs into Frameworks/."
-info "Dylib source policy inspections: ${MACOS_SOURCE_VALIDATIONS}; repeated inspections avoided: ${MACOS_SOURCE_CACHE_HITS}."
 
 # Fix GStreamer plugins
 if [[ -d "$GST_PLUGIN_DEST" ]]; then
@@ -558,6 +557,12 @@ if [[ -d "$PIXBUF_LOADERS_DEST" ]]; then
     fix_rpaths "$loader"
   done
 fi
+
+# Emit the full optimization counters only after every fix_rpaths consumer
+# (main binary, dylib closure, GStreamer plugins, scanner, pixbuf generator and
+# loaders) has run, so the native CI metrics include the dominant source
+# validations and cache hits rather than a partial pre-plugin prefix.
+info "Dylib source policy inspections: ${MACOS_SOURCE_VALIDATIONS}; repeated inspections avoided: ${MACOS_SOURCE_CACHE_HITS}."
 
 # A copied Homebrew cache contains builder paths and is mutable runtime state.
 # Runtime setup generates a relocated cache below the user's cache directory.

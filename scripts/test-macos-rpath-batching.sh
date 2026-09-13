@@ -68,6 +68,7 @@ mkdir -p "$FRAMEWORKS_DIR" "${BREW_PREFIX}/lib"
 
 VALIDATION_LOG="${TEST_ROOT}/validations.log"
 INSTALL_NAME_LOG="${TEST_ROOT}/install-name.log"
+REASON_CAPTURE_FILE="${TEST_ROOT}/policy-reason.txt"
 export INSTALL_NAME_LOG
 VALIDATION_REJECT=""
 
@@ -80,10 +81,12 @@ macos_validate_macho_copy_control() {
   if [[ -n "$VALIDATION_REJECT" && "$artifact" == "$VALIDATION_REJECT" ]]; then
     MACOS_PACKAGE_POLICY_REASON="fixture rejection for ${artifact}"
     # Mirror the reason through the same variable the production helper sets,
-    # but deliberately do NOT print it here: scenario 3 asserts that copy_dylib's
-    # production error call propagates this exact reason, so the output must come
-    # only from that path (a fixture that printed it too would mask a weakened
-    # error call that dropped ${MACOS_PACKAGE_POLICY_REASON}).
+    # capturing it to a fixture-side file rather than stdout: scenario 3 asserts
+    # that copy_dylib's production error call propagates this exact reason, so the
+    # rejection output must come only from that path (a fixture that printed the
+    # reason too would mask a weakened error call that dropped it). Reading the
+    # variable for the capture also consumes the assignment for static analysis.
+    printf '%s' "$MACOS_PACKAGE_POLICY_REASON" > "$REASON_CAPTURE_FILE"
     return 1
   fi
   return 0
@@ -97,6 +100,7 @@ error() {
 reset_fixture_state() {
   : > "$VALIDATION_LOG"
   : > "$INSTALL_NAME_LOG"
+  : > "$REASON_CAPTURE_FILE"
   VALIDATION_REJECT=""
   MACOS_VALIDATED_SOURCE_CACHE=$'\n'
   MACOS_SOURCE_VALIDATIONS=0
@@ -204,6 +208,13 @@ change_edits="$(grep -c -- '-change' "$INSTALL_NAME_LOG" || true)"
 expected_rejection="Refusing recursive dylib dependency: fixture rejection for ${BREW_PREFIX}/lib/libbad.dylib"
 [[ "$rejection_output" == *"$expected_rejection"* ]] \
   || fail "rejection did not propagate the complete production error message for the exact rejected source"
+# The fixture mirrors the rejected source's reason through the production
+# variable and captures it beside the build. Assert that captured value so the
+# fixture genuinely consumes MACOS_PACKAGE_POLICY_REASON, while the output
+# assertion above remains the sole proof that copy_dylib's production error call
+# propagates the reason.
+[[ "$(cat "$REASON_CAPTURE_FILE")" == "fixture rejection for ${BREW_PREFIX}/lib/libbad.dylib" ]] \
+  || fail "fixture did not mirror the rejected source's policy reason through the production variable"
 ok "a rejected source aborts before any batched edit is applied"
 
 echo "1..${pass_count}"
