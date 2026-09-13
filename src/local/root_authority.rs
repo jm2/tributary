@@ -1584,9 +1584,17 @@ impl MountedRootAuthority {
         }
         #[cfg(windows)]
         {
+            // The retained parent handle cannot open a child through the
+            // standard library on Windows, so re-traverse from the retained
+            // root with the same per-component no-reparse opens the executor
+            // uses. An absolute `leaf_identity_at_path(root.join(components))`
+            // here opens every component with `FILE_FLAG_BACKUP_SEMANTICS`
+            // and no `FILE_FLAG_OPEN_REPARSE_POINT`, so a symlink/junction
+            // ancestor installed after the parent walk could redirect the
+            // probe outside the retained root to a same-named entry.
             let _ = (parent, leaf);
-            leaf_identity_at_path(&join_components(&self.root, &components))
-                .map(|identity| identity.is_some())
+            let path = join_components(&self.root, &components);
+            windows_relative_leaf_present(self, &path, &components)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -5015,6 +5023,19 @@ fn bind_occupant_backup(
 ) -> io::Result<Option<LeafIdentity>> {
     use rustix::fs::{linkat, AtFlags};
 
+    // Capture the current occupant's identity BEFORE the hard link. After
+    // `linkat` both the backup name and `to_leaf` MUST reference this exact
+    // object, so a later divergence between the two captures means a
+    // concurrent writer replaced one of the two names inside the capture
+    // window. Distinguishing which name was replaced is what keeps the
+    // fail-closed response from deleting a foreign object that occupies the
+    // backup name.
+    // A vanishing occupant is the ordinary "vanished" case: no backup was
+    // bound, so there is nothing to release and the caller re-binds.
+    let Some(original) = leaf_identity_at(parent, to_leaf)? else {
+        return Ok(None);
+    };
+
     // `linkat` never follows the old path unless `AT_SYMLINK_FOLLOW` is
     // supplied — passing `SYMLINK_NOFOLLOW` here would be an unknown flag
     // bit and fail with `EINVAL` — so a symlink occupant is bound as
@@ -5045,7 +5066,31 @@ fn bind_occupant_backup(
                     release_occupant_backup(parent, backup_leaf);
                     Err(error)
                 }
-                (Ok(Some(identity)), Ok(Some(_))) => Ok(Some(identity)),
+                (Ok(Some(bound)), Ok(Some(destination))) => {
+                    // After `linkat` the backup name and `to_leaf` reference
+                    // the same inode; they can differ only because a
+                    // concurrent replacement touched one of the two names in
+                    // the capture window.
+                    if !bound.same_object(&destination) && !bound.same_object(&original) {
+                        // The visible `.tributary-backup-*` entry no longer
+                        // names the object the hard link created: a
+                        // concurrent writer installed a foreign object at
+                        // the backup name. Fail closed WITHOUT path-unlinking
+                        // that entry — it may be the foreign object's only
+                        // link. The caller re-observes with a fresh bind
+                        // name; this one is left exactly as the writer
+                        // placed it.
+                        return Err(io::Error::other(
+                            "the backup leaf was replaced after the occupant was bound",
+                        ));
+                    }
+                    // When only the destination was replaced, the backup
+                    // still names the object the hard link created. Hand
+                    // that bind-time identity to the exchange, whose
+                    // post-swap verification detects the replacement and
+                    // restores the writer's object.
+                    Ok(Some(bound))
+                }
                 (Ok(_), Ok(None)) | (Ok(None), Ok(Some(_))) => {
                     release_occupant_backup(parent, backup_leaf);
                     Ok(None)
@@ -7324,6 +7369,38 @@ fn open_descendant_from_root(
     Err(unsupported_platform())
 }
 
+/// Probe whether the final component of `components`, addressed from the
+/// retained root, names an existing entry — traversing every parent
+/// component no-follow exactly as [`open_descendant_from_root`] does, so a
+/// symlink/junction ancestor cannot redirect the probe outside the retained
+/// root to a same-named entry.
+///
+/// The leaf may be a regular file or a directory; both classify as present.
+/// A missing leaf (or parent) reports `Ok(false)`; every other traversal or
+/// retained-boundary failure fails the probe closed.
+#[cfg(windows)]
+fn windows_relative_leaf_present(
+    authority: &MountedRootAuthority,
+    path: &Path,
+    components: &[OsString],
+) -> io::Result<bool> {
+    match open_descendant_from_root(authority, path, components, DescendantKind::RegularFile) {
+        Ok(_) => Ok(true),
+        // A directory-shaped leaf is refused by the regular-file open with a
+        // typed kind mismatch; classify it through the directory traversal.
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            match open_descendant_from_root(authority, path, components, DescendantKind::Directory)
+            {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(unix)]
 fn validate_absent_at(parent: &File, _path: &Path, leaf: &OsString) -> io::Result<()> {
     use rustix::fs::AtFlags;
@@ -9152,6 +9229,87 @@ mod tests {
             fs::read(&moved_original).expect("read the moved original"),
             b"original bytes",
             "the original occupant must survive untouched wherever it was moved"
+        );
+    }
+
+    /// A concurrent writer that replaces the visible `.tributary-backup-*`
+    /// entry between the hard link that binds the destination occupant and
+    /// the identity capture must not have its object deleted. The bind must
+    /// fail closed WITHOUT path-unlinking the foreign entry, because that
+    /// entry may be the replacement's only link.
+    #[cfg(unix)]
+    #[test]
+    fn raced_backup_replacement_is_refused_without_unlinking_the_foreign_object() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::local::write_authority::{ConflictPolicy, MountedWriteAuthority};
+
+        let directory = TestDirectory::new("raced-backup-replacement");
+        let destination = directory.path().join("song.flac");
+        fs::write(&destination, b"original bytes").expect("write the original");
+
+        let authority =
+            MountedWriteAuthority::acquire(directory.path()).expect("acquire write authority");
+        let mut staged = authority
+            .prepare_write_relative_file(Path::new("song.flac"), ConflictPolicy::Overwrite)
+            .expect("prepare overwrite");
+        staged.write_all(b"new bytes").expect("write staged");
+
+        // Interpose a replacement of the backup name exactly between the
+        // hard link that created it and the identity capture that must name
+        // it.
+        let once = AtomicBool::new(false);
+        let directory_for_closure = directory.path().to_path_buf();
+        with_bind_backup_interpose(
+            Box::new(move |_parent, to_leaf| {
+                if to_leaf != OsStr::new("song.flac") || once.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let backup = fs::read_dir(&directory_for_closure)
+                    .expect("read the transfer directory")
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.file_name())
+                    .find(|name| name.to_string_lossy().starts_with(".tributary-backup-"))
+                    .expect("a backup sibling must exist after the hard link");
+                let backup_path = directory_for_closure.join(&backup);
+                let moved_backup = directory_for_closure.join("moved-backup");
+                // Move the bind-created backup aside (the destination still
+                // holds the original) and install a genuinely different
+                // object at the backup name.
+                fs::rename(&backup_path, &moved_backup)
+                    .expect("move the bind-created backup aside");
+                fs::write(&backup_path, b"foreign backup").expect("install the foreign object");
+            }),
+            || {
+                let _ = staged.commit();
+            },
+        );
+
+        // The foreign object the writer installed at the backup name must
+        // survive the refused bind: the bind must not path-unlink an entry
+        // that is no longer the object the hard link created.
+        let survived = fs::read_dir(directory.path())
+            .expect("read the transfer directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .find(|name| name.to_string_lossy().starts_with(".tributary-backup-"))
+            .expect("the foreign backup must survive the refused bind, not be path-unlinked");
+        assert_eq!(
+            fs::read(directory.path().join(&survived)).expect("read the surviving backup"),
+            b"foreign backup",
+            "the foreign replacement of the backup name must never be deleted"
+        );
+        // The bind-created backup survives where the writer moved it, and
+        // the destination occupant is left untouched by the refused bind.
+        assert_eq!(
+            fs::read(directory.path().join("moved-backup")).expect("read the moved backup"),
+            b"original bytes",
+            "the bind-created backup must survive untouched wherever it was moved"
+        );
+        assert_eq!(
+            fs::read(&destination).expect("read the destination"),
+            b"original bytes",
+            "the refused bind must not disturb the destination occupant"
         );
     }
 }

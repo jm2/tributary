@@ -552,3 +552,49 @@ fn destination_file_beneath_symlinked_ancestor_is_rejected_at_planning_time() {
         "the planning probe must refuse the symlink ancestor, got {error:?}"
     );
 }
+
+/// The Windows counterpart of
+/// [`destination_file_beneath_symlinked_ancestor_is_rejected_at_planning_time`]:
+/// a destination whose ancestor is a directory reparse point must be refused
+/// at planning time rather than followed through an absolute-path lookup that
+/// re-resolves every component. Skipped where the environment forbids
+/// creating a symlink (no developer mode or privilege).
+#[cfg(windows)]
+#[test]
+fn destination_file_beneath_reparse_ancestor_is_rejected_at_planning_time() {
+    use std::os::windows::fs::symlink_dir;
+
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    let outside = tempfile::tempdir().expect("temporary outside root");
+    write_source_file(source_root.path(), "song.flac", b"audio");
+    // The external directory already holds a same-named entry: an
+    // absolute-path probe would follow the destination's `link` ancestor and
+    // classify it as an existing destination, silently skipping the copy.
+    std::fs::write(outside.path().join("song.flac"), b"outside").expect("write outside entry");
+    if symlink_dir(outside.path(), destination_root.path().join("link")).is_err() {
+        // The runner forbids symlink creation (no developer mode/privilege);
+        // the reparse traversal cannot be exercised here.
+        return;
+    }
+
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = plan_request(
+        source,
+        destination,
+        vec![TransferItem::new(
+            PathBuf::from("song.flac"),
+            PathBuf::from("link/song.flac"),
+        )],
+        ConflictPolicy::Skip,
+        None,
+    );
+    let error = TransferPlanner::new()
+        .plan(&request)
+        .expect_err("a destination beneath a reparse ancestor must be rejected at planning time");
+    assert!(
+        matches!(error, TransferError::Io { .. }),
+        "the planning probe must refuse the reparse ancestor, got {error:?}"
+    );
+}
