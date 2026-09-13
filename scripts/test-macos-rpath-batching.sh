@@ -79,6 +79,9 @@ macos_validate_macho_copy_control() {
   printf '%s\n' "$artifact" >> "$VALIDATION_LOG"
   if [[ -n "$VALIDATION_REJECT" && "$artifact" == "$VALIDATION_REJECT" ]]; then
     MACOS_PACKAGE_POLICY_REASON="fixture rejection for ${artifact}"
+    # Surface the recorded reason so the rejection scenario can assert that the
+    # failure names the exact rejected source (and not a same-basename one).
+    printf 'policy_reason=%s\n' "$MACOS_PACKAGE_POLICY_REASON"
     return 1
   fi
   return 0
@@ -127,10 +130,14 @@ fix_rpaths "$PLUGIN_B"
 inspect_count="$(wc -l < "$VALIDATION_LOG" | tr -d ' ')"
 [[ "$inspect_count" -eq 3 ]] \
   || fail "expected 3 distinct source inspections, saw ${inspect_count}"
+[[ "$MACOS_SOURCE_VALIDATIONS" -eq "$inspect_count" ]] \
+  || fail "validator counter recorded ${MACOS_SOURCE_VALIDATIONS} of ${inspect_count} distinct-source inspections"
 [[ "$MACOS_SOURCE_CACHE_HITS" -eq 1 ]] \
   || fail "expected 1 cached reuse, saw ${MACOS_SOURCE_CACHE_HITS}"
 [[ "$(grep -Fc "${BREW_PREFIX}/lib/libshared.dylib" "$VALIDATION_LOG")" -eq 1 ]] \
   || fail "shared source was inspected more than once"
+[[ "$MACOS_VALIDATED_SOURCE_CACHE" == *$'\n'"${BREW_PREFIX}/lib/libshared.dylib"$'\n'* ]] \
+  || fail "validation cache did not record the exact inspected source path"
 
 change_lines="$(grep -c -- '-change' "$INSTALL_NAME_LOG" || true)"
 change_tokens="$(grep -o -- '-change' "$INSTALL_NAME_LOG" | wc -l | tr -d ' ')"
@@ -155,6 +162,12 @@ fix_rpaths "$PLUGIN_C"
   || fail "first exact source was not inspected exactly once"
 [[ "$(grep -Fc "$DUP_TWO" "$VALIDATION_LOG")" -eq 1 ]] \
   || fail "a same-basename source was skipped by an inexact cache key"
+[[ "$MACOS_SOURCE_VALIDATIONS" -eq 2 ]] \
+  || fail "expected 2 distinct-source validations, saw ${MACOS_SOURCE_VALIDATIONS}"
+[[ "$MACOS_VALIDATED_SOURCE_CACHE" == *$'\n'"$DUP_ONE"$'\n'* ]] \
+  || fail "validation cache did not key on the first exact source path"
+[[ "$MACOS_VALIDATED_SOURCE_CACHE" == *$'\n'"$DUP_TWO"$'\n'* ]] \
+  || fail "validation cache did not key on the second exact source path"
 [[ "$MACOS_SOURCE_CACHE_HITS" -eq 0 ]] \
   || fail "distinct sources must not register as cache hits"
 ok "validation cache keys on the exact source path, not the basename"
@@ -167,7 +180,10 @@ PLUGIN_D="${TEST_ROOT}/libgstmixed.dylib"
 make_binary "$PLUGIN_D" '@rpath/libok.dylib' '@rpath/libbad.dylib'
 
 set +e
-( VALIDATION_REJECT="${BREW_PREFIX}/lib/libbad.dylib"; fix_rpaths "$PLUGIN_D" ) >/dev/null 2>&1
+rejection_output="$(
+  VALIDATION_REJECT="${BREW_PREFIX}/lib/libbad.dylib"
+  fix_rpaths "$PLUGIN_D" 2>&1
+)"
 rejection_status=$?
 set -e
 
@@ -178,6 +194,10 @@ set -e
 change_edits="$(grep -c -- '-change' "$INSTALL_NAME_LOG" || true)"
 [[ "$change_edits" -eq 0 ]] \
   || fail "no batched -change edit may run once a source is rejected"
+[[ "$rejection_output" == *"policy_reason=fixture rejection for ${BREW_PREFIX}/lib/libbad.dylib"* ]] \
+  || fail "rejection did not surface the policy reason for the exact rejected source"
+[[ "$rejection_output" == *"Refusing recursive dylib dependency"* ]] \
+  || fail "rejection did not use the production error path"
 ok "a rejected source aborts before any batched edit is applied"
 
 echo "1..${pass_count}"
