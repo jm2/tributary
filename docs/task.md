@@ -439,7 +439,8 @@ full acceptance is binding; the checklist below indexes it. No new record has a 
 
 - [ ] **P3.1-A** — Design persistent source-scoped offline identity, authenticated/resumable
   download jobs, atomic storage, server capability, credential, licensing, and reconciliation
-  contracts ([#11](https://github.com/jm2/tributary/issues/11)).
+  contracts ([#11](https://github.com/jm2/tributary/issues/11),
+  [`offline-media.md`](offline-media.md)).
 
   In flight; #181 / `tr-92a`, draft. Accept resume validators, integrity provenance,
   atomic publication, source identity/licensing, credential policy and quota semantics first.
