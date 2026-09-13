@@ -2,6 +2,23 @@
 
 Status: design record, no implementation in this bead.
 
+Revision 5 (2026-09-12, corrective pass). This revision answers the
+refinery re-review of the `3846818` head with three fixes, two of them
+server-side lifecycle corrections to §4.1/§4.3 and one a mechanical
+counter correction: (1) cancelling a transmitted *mutating* daemon RPC
+does not retract it — the daemon applies `outputs/set`, `queue/add`,
+and `player/play` even when the response is never read — so before
+`Cancelled` is reported and the lock is released, the adapter now
+quiesces those requests within the cleanup deadline (or re-runs the
+reversal after the last one settles), and a quiescence miss is a
+deadline failure, never `Cancelled`; (2) the natural-EOS path now
+waits for daemon-confirmed item completion, bounded by a drain
+deadline, before disposing resources, restoring the daemon, or
+publishing `TrackEnded`, and a drain timeout or transport loss ends as
+error + `Stopped`; (3) the `docs/task.md` and §11 backlog counters are
+corrected to 17/57 (29.8%), baseline 17/39. It changes the design
+record only.
+
 Revision 4 (2026-09-12, corrective pass). This revision answers the
 operator corrective review of the `b1e2b74` head with three lifecycle
 fixes to the §4.1/§4.3 contract, each grounded in the existing
@@ -477,13 +494,25 @@ enum SenderError {
 /// (socket `shutdown`/close, a FIFO write end it can close) or as a
 /// bounded wait raced against this flag (a `select`/timeout that
 /// returns the moment the flag is set). When `cancel()` fires, the
-/// call aborts the operation in flight, discards any late-arriving
-/// result so it can never apply a daemon mutation, install a queue
-/// item, start playback, or publish an event for the cancelled
-/// generation, and unwinds through the §4.3 restoration path within
-/// the documented cleanup deadline. Each blocking operation still
-/// carries its own documented deadline, so an un-cancelled call that
-/// stalls ends as `Failed(SenderError::Deadline)` instead of hanging.
+/// call aborts the operation in flight and unwinds through the §4.3
+/// restoration path within the documented cleanup deadline. Aborting
+/// a *mutating* daemon RPC that has already been transmitted is not
+/// the same as retracting it: the daemon applies the request whether
+/// or not the client reads the response, so dropping a late response
+/// cannot prevent the mutation. Before `Cancelled` is reported — and
+/// before the §4.3 lock is released — the unwinding call therefore
+/// either waits, bounded by the cleanup deadline, for acknowledgement
+/// that every transmitted mutating RPC has settled, or re-runs a
+/// compensating restoration *after* the last in-flight mutating RPC
+/// settles, so no mutation can land on state the restoration already
+/// unwound. A mutating RPC that has neither settled nor acknowledged
+/// within the deadline makes the outcome a failure, never
+/// `Cancelled`, and leaves the §4.3 incomplete-takeover record in
+/// place. No queue item is installed, no playback starts, and no
+/// event is published for the cancelled generation. Each blocking
+/// operation still carries its own documented deadline, so an
+/// un-cancelled call that stalls ends as
+/// `Failed(SenderError::Deadline)` instead of hanging.
 /// The load path sets the flag when the load is dropped or its
 /// generation is superseded: exactly the conditions the event
 /// contract already keys on. This is deliberately not
@@ -524,14 +553,17 @@ enum OpenOutcome {
     Opened(Box<dyn SenderSession>),
     /// Cancellation was observed before negotiation completed, and
     /// the operation in flight was aborted rather than awaited.
-    /// Everything the attempt created — receiver session, queue
-    /// items, enabled-output changes — was already torn down through
-    /// the same restoration path as failure (§4.1, §4.3) before this
-    /// variant is returned, and the load path revoked its own current
-    /// media ticket (`revoke_if_current`; §4.1, §9.5) without
-    /// touching a newer replacement's. `Cancelled` is a terminal,
-    /// fully-unwound state, never a half-open session and never a
-    /// retained loopback route.
+    /// Every transmitted mutating RPC settled, or was compensated by
+    /// a restoration re-run after it settled, before this variant was
+    /// returned, so no mutation from the cancelled generation can
+    /// land after the teardown (§4.1). Everything the attempt created
+    /// — receiver session, queue items, enabled-output changes — was
+    /// already torn down through the same restoration path as failure
+    /// (§4.1, §4.3) before this variant is returned, and the load
+    /// path revoked its own current media ticket (`revoke_if_current`;
+    /// §4.1, §9.5) without touching a newer replacement's.
+    /// `Cancelled` is a terminal, fully-unwound state, never a
+    /// half-open session and never a retained loopback route.
     Cancelled,
     /// A failure inside the seam's taxonomy; the teardown guarantees
     /// are the failure path's — restoration has run before the value
@@ -603,24 +635,37 @@ trait AirplaySender: Send + Sync {
     /// every RTSP handshake step, every daemon RPC, FIFO/API setup,
     /// the lock-acquisition wait) is abortable (transport
     /// `shutdown`/close, FIFO close) or raced against `cancel` with a
-    /// bounded wait, so the stale attempt cannot keep mutating the
-    /// daemon, install a queue item, start playback, or publish an
-    /// event after a replacement load has taken over; a result that
-    /// arrives late, after cancellation, is discarded and never
-    /// applied. On cancellation or a deadline miss the implementation
-    /// tears down everything it created so far (receiver session,
-    /// queue items, enabled-output changes) through the same
-    /// restoration path (§4.3) before the outcome surfaces, within a
-    /// documented cleanup deadline bounding the whole unwind; on the
-    /// daemon adapter a cancellation landing mid-takeover records and
-    /// reverses its steps through the same incomplete-takeover
-    /// discipline as a crash (§4.3). The method never returns a
+    /// bounded wait. Aborting a transmitted mutating daemon RPC does
+    /// not retract it — the daemon applies the request even when the
+    /// response is never read — so, before the outcome surfaces, the
+    /// call quiesces the server side: it waits, bounded by the cleanup
+    /// deadline, for acknowledgement that every transmitted mutating
+    /// RPC has settled, or re-runs the restoration *after* the last
+    /// in-flight mutating RPC settles, so no mutation from the stale
+    /// generation can land on state the restoration has unwound or
+    /// after a replacement load has taken over. A mutating RPC that
+    /// neither settles nor acknowledges within the deadline makes the
+    /// outcome `Failed(SenderError::Deadline)` — never `Cancelled` —
+    /// and leaves the §4.3 incomplete-takeover record in place rather
+    /// than reporting a clean unwind it cannot prove; the stale
+    /// attempt cannot install a queue item, start playback, leave an
+    /// output selection applied, or publish an event. On cancellation
+    /// or a deadline miss the implementation tears down everything it
+    /// created so far (receiver session, queue items, enabled-output
+    /// changes) through the same restoration path (§4.3) before the
+    /// outcome surfaces, within a documented cleanup deadline
+    /// bounding the whole unwind; on the daemon adapter a cancellation
+    /// landing mid-takeover records and reverses its steps through the
+    /// same incomplete-takeover discipline as a crash (§4.3). The method never returns a
     /// half-open session, and a load can never remain pending on it
     /// indefinitely: after timeout the outcome is
     /// `Failed(SenderError::Deadline)` carrying explicit, localized
-    /// guidance (§9.1 contract), while a caller-requested abort is
-    /// `Cancelled` — distinct outcomes, so the UI never renders a
-    /// cancelled load as an error and never reports one (§9.5). If
+    /// guidance (§9.1 contract), while a caller-requested abort whose
+    /// server side quiesced inside the deadline is `Cancelled` —
+    /// distinct outcomes, so the UI never renders a cancelled load as
+    /// an error and never reports one (§9.5); a caller-requested abort
+    /// whose quiescence wait misses the deadline is `Deadline`, not
+    /// `Cancelled`, because the unwind cannot be proven complete. If
     /// cancellation and the deadline fire in the same window, the
     /// call returns whichever it observed first and never both.
     fn open_session(
@@ -732,12 +777,26 @@ Tributary talks to an OwnTone instance as a transmission service:
   `SenderWriteOutcome` taxonomy stays backpressure/terminal only.
   On natural EOS of a finite track the adapter: drains the decoded
   remainder through `write_pcm` until it is accepted (the pipe is
-  not truncated mid-frame), closes the pipe write end / stops the
-  pipe item so the daemon sees end-of-input, disposes of the owned
-  pipe/queue/session resources, restores the dedicated daemon to
+  not truncated mid-frame) and closes the pipe write end / stops the
+  pipe item so the daemon sees end-of-input; then, before touching
+  resources or daemon state, it waits, bounded by a drain deadline,
+  for the daemon to confirm the item actually completed. The
+  acceptance of the final `write_pcm` proves only that the FIFO
+  write succeeded, not that OwnTone (or the receiver) rendered those
+  samples, so disposing the pipe item and restoring the player on a
+  client-local EOS alone can truncate the track tail and report
+  completion early. The wait polls the daemon's own player/item
+  state through its JSON API (`/api/player`) until the item reports
+  finished with its end-of-input consumed — never from the client's
+  closed write end alone. A drain timeout or transport loss during
+  the wait is not natural completion and must not publish
+  `TrackEnded`: it ends as failure per §9.4 (`PlayerEvent::Error` +
+  `Stopped`), because the tail was not proven rendered. Only after
+  daemon-confirmed completion does the adapter dispose of the owned
+  pipe/queue/session resources, restore the dedicated daemon to
   the state recorded at takeover (player stopped, our queue items
   removed, the recorded enabled-output set re-applied, lock
-  released), and publishes **exactly one** generation-scoped
+  released), and publish **exactly one** generation-scoped
   `PlayerEvent::TrackEnded` (`PlayerEvent::ended`,
   `src/audio/mod.rs:116,138`) so queue advance/repeat fires
   (`src/ui/window.rs:3257-3274`). A per-generation completion record
@@ -832,7 +891,19 @@ Tributary talks to an OwnTone instance as a transmission service:
   unwinds through exactly this path: steps already taken are
   recorded and reversed in order, and the `Cancelled` outcome is
   returned only after restoration completes — never as a shortcut
-  past it (§9.5). The load path then revokes its own media ticket
+  past it (§9.5). Because a mutating daemon RPC that has already
+  been transmitted lands on the daemon whether or not the client
+  reads its response, restoration is not complete until the server
+  side is quiesced: before returning `Cancelled` the unwinding call
+  waits, bounded by the cleanup deadline, for acknowledgement that
+  every transmitted mutating RPC has settled, or re-runs the
+  reversal after the last in-flight one settles, so no mutation
+  from the cancelled generation can land after the lock is
+  released. A quiescence wait that misses the deadline is a failure
+  (`Failed(SenderError::Deadline)`), never `Cancelled`, and the
+  incomplete-takeover record stays in place for the next opener or
+  the supervisor rather than reporting a clean unwind the adapter
+  cannot prove. The load path then revokes its own media ticket
   via `revoke_if_current` (§4.1, §9.5), so a cancelled open leaves
   no receiver session, no enabled-output change, and no live
   loopback route behind. A crashed holder releases the lock by OS semantics,
@@ -1264,12 +1335,23 @@ record for the selected path must add, at minimum:
    *during* negotiation, including Stop or output replacement
    landing while a blocking operation (RTSP handshake, daemon RPC,
    FIFO/API setup) is in flight: the operation is aborted rather
-   than awaited, late results are discarded without mutating or
-   publishing anything, and the load whose `OpenCancel` was set
-   yields `OpenOutcome::Cancelled` after the restoration path
-   completes — no user-facing error, no error event for the
-   cancelled generation, no half-taken-over daemon, and a
-   following load opens cleanly (§4.1, §4.3). A targeted
+   than awaited, and the load whose `OpenCancel` was set yields
+   `OpenOutcome::Cancelled` only after the restoration path
+   completes **and** every mutating daemon RPC already transmitted
+   has been quiesced — acknowledged settled within the cleanup
+   deadline, or followed by a compensating restoration re-run after
+   the last in-flight one settles — so a late server-side effect
+   cannot land after the teardown. Discarding a late client response
+   is not by itself sufficient: the test holds a mutating RPC
+   (`outputs/set`, `queue/add`, or `player/play`) in flight across
+   the cancel and asserts the daemon state it produced is unwound
+   before `Cancelled` is returned. A mutating RPC that neither
+   settles nor acknowledges within the deadline yields
+   `OpenOutcome::Failed(SenderError::Deadline)`, never `Cancelled`,
+   and leaves the incomplete-takeover record in place. The result is
+   no user-facing error for a genuinely cancelled load, no error
+   event for the cancelled generation, no half-taken-over daemon,
+   and a following load opens cleanly (§4.1, §4.3). A targeted
    interposition test races `cancel` against an operation the test
    holds open and asserts the abort happens before that operation
    would have returned.
@@ -1302,15 +1384,22 @@ record for the selected path must add, at minimum:
 10. **Natural-completion acceptance:** a finite track played
     through the daemon adapter reaches pipeline EOS without a
     terminal write outcome; the adapter drains the decoded
-    remainder, closes the pipe item, disposes of its
+    remainder, closes the pipe write end so the daemon sees
+    end-of-input, and then waits, bounded by a drain deadline, for
+    daemon-confirmed item completion (polling the daemon's
+    player/item state) before it disposes of its
     pipe/queue/session resources, restores the dedicated daemon to
     the state recorded at takeover, and publishes exactly one
     generation-scoped `TrackEnded` so the queue advances (or
     repeats) instead of stalling on the finished item
-    (`src/ui/window.rs:3257-3274`). The test covers normal
-    completion, a duplicate EOS (still exactly one `TrackEnded`),
-    and a superseded generation (EOS arriving after the load was
-    replaced or cancelled publishes nothing and mutates nothing).
+    (`src/ui/window.rs:3257-3274`). The test asserts that a final
+    accepted `write_pcm` alone does not trigger disposal or
+    `TrackEnded`, and that a drain deadline miss or transport loss
+    during the wait ends as failure (`Error` + `Stopped`) and
+    publishes no `TrackEnded`. It covers normal completion, a
+    duplicate EOS (still exactly one `TrackEnded`), and a
+    superseded generation (EOS arriving after the load was replaced
+    or cancelled publishes nothing and mutates nothing).
     Cancellation and terminal failure are asserted *not* to publish
     `TrackEnded` — they end as `Stopped`/`Error`+`Stopped` per
     §9.4/§9.5.
@@ -1360,8 +1449,8 @@ already-pinned tests (§1) are unchanged.
   types (`et=3/4`), or multi-room sync.
 - It does not promise a target date; the P2.1 feature focus leading
   the current active-backlog count
-  ([`docs/task.md:31-33`](task.md) — **16/57** implementation
-  records complete, retained baseline **16/39**, kept synchronized
+  ([`docs/task.md:31-33`](task.md) — **17/57 (29.8%)** implementation
+  records complete, retained baseline **17/39**, kept synchronized
   with that file's literal counters) stays ahead of this work in the
   backlog order.
 - Its only changes outside its own file are the two cross-references
@@ -1369,7 +1458,10 @@ already-pinned tests (§1) are unchanged.
   [`docs/task.md`](task.md) (checkbox intentionally unchanged; the
   item closes on an accepted design, not on this record) and the
   follow-on note in
-  [`docs/release-component-policy.md`](release-component-policy.md).
+  [`docs/release-component-policy.md`](release-component-policy.md)
+  — plus the mechanical status-counter correction in
+  `docs/task.md:31-33` (and the dated implementation-log entry that
+  records it) so the synchronized count above is true.
   The substantive updates to both — the dependency decision, the
   shared-policy containment run, the changelog entry — belong to the
   implementation records that accept this design.
