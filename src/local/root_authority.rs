@@ -233,6 +233,23 @@ pub enum ReversalOutcome {
     RefusedForeignLeaf,
 }
 
+/// Which occupant a backup restoration will accept at the destination slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RestoreSlot {
+    /// The slot may hold the transfer's recorded publication (identity
+    /// coupled), or — when no publication identity was recorded — any
+    /// occupant, which the platform body replaces through observed-object
+    /// verification. This is the legacy reversal of a PUBLISHED change.
+    IdentityCoupled,
+    /// The slot must be ABSENT. The reversal of a displaced-only commit —
+    /// nothing of the transfer's ever landed — installs the retained
+    /// backup with no-replace semantics and refuses any occupant intact:
+    /// that occupant belongs to a concurrent writer the transfer never
+    /// owned. Distinct from `IdentityCoupled` so the legacy `None`
+    /// identity degradation is never redefined into a refusal.
+    MustBeAbsent,
+}
+
 /// A publish whose rename already landed: the published-leaf identity bound
 /// to the staged object before the winning rename, and the trailing
 /// retained-parent revalidation.
@@ -1280,6 +1297,14 @@ impl MountedRootAuthority {
     /// change-instant-exact) before it is moved. See
     /// [`MountedWriteAuthority::restore_relative_file_verified`](crate::local::write_authority::MountedWriteAuthority::restore_relative_file_verified)
     /// for the full contract.
+    ///
+    /// `slot` selects which occupant the destination may hold.
+    /// [`RestoreSlot::IdentityCoupled`] is the reversal of a published
+    /// change and keeps every legacy behavior unchanged;
+    /// [`RestoreSlot::MustBeAbsent`] is the displaced-only reversal, where
+    /// the platform bodies refuse any occupant through an atomic no-replace
+    /// install instead of consulting a (necessarily identity-less)
+    /// publication record.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn restore_relative_file_verified(
         &self,
@@ -1287,6 +1312,7 @@ impl MountedRootAuthority {
         destination_relative: &Path,
         expected: Option<&LeafIdentity>,
         backup_leaf_identity: Option<&LeafIdentity>,
+        slot: RestoreSlot,
     ) -> io::Result<ReversalOutcome> {
         let backup_components = strict_relative_components(backup_relative)?;
         let destination_components = strict_relative_components(destination_relative)?;
@@ -1304,14 +1330,21 @@ impl MountedRootAuthority {
         // Identity gate on the destination slot before anything is moved:
         // a slot occupied by a different object than the recorded
         // publication belongs to a concurrent writer and must not be
-        // replaced by the backup.
-        if destination_slot_is_foreign(
-            &self.root,
-            &parent,
-            &destination_leaf,
-            &destination_components,
-            expected,
-        )? {
+        // replaced by the backup. This gate only has an identity to compare
+        // for the identity-coupled reversal; the displaced-only reversal
+        // instead requires an ABSENT slot, which the platform bodies
+        // enforce atomically at install time (a no-replace primitive), so
+        // an occupant — identifiable or not — is refused there rather than
+        // ever being replaced.
+        if slot == RestoreSlot::IdentityCoupled
+            && destination_slot_is_foreign(
+                &self.root,
+                &parent,
+                &destination_leaf,
+                &destination_components,
+                expected,
+            )?
+        {
             return Ok(ReversalOutcome::RefusedForeignLeaf);
         }
         // Identity gate on the BACKUP itself: the backup must still name
@@ -1352,6 +1385,7 @@ impl MountedRootAuthority {
                 self.root.join(backup_relative).as_path(),
                 self.root.join(destination_relative).as_path(),
                 expected,
+                slot,
             )
         }
         #[cfg(windows)]
@@ -1361,6 +1395,7 @@ impl MountedRootAuthority {
                 &self.root.join(destination_relative),
                 expected,
                 backup_leaf_identity,
+                slot,
             )
         }
         #[cfg(not(any(unix, windows)))]
@@ -1370,9 +1405,44 @@ impl MountedRootAuthority {
                 destination_leaf,
                 backup_relative,
                 destination_relative,
+                slot,
             );
             Err(unsupported_platform())
         }
+    }
+
+    /// Restore a displaced-only backup into an ABSENT destination slot,
+    /// refusing any occupant.
+    ///
+    /// Unlike [`Self::restore_relative_file_verified`], whose identity
+    /// coupled reversal may replace an occupant it can prove is the
+    /// transfer's own publication, this restoration is the counterpart of a
+    /// publish that landed NOTHING: the Windows replace loop exhausted its
+    /// rebind bound against a concurrent occupant, and the retained backup
+    /// holds the pre-transfer occupant. The slot currently names a
+    /// concurrent writer's occupant (or is vacant), never anything the
+    /// transfer published, so the backup is installed only with no-replace
+    /// semantics into an absent slot and any occupant — identifiable or
+    /// not — is refused intact.
+    ///
+    /// The backup's bind-time identity is still verified exactly; a swapped
+    /// backup is refused with the foreign object retained. On refusal or
+    /// failure the verified backup is never deleted, so the displaced
+    /// original is never lost and remains restorable once the slot is
+    /// vacant.
+    pub(super) fn restore_displaced_only_verified(
+        &self,
+        backup_relative: &Path,
+        destination_relative: &Path,
+        backup_leaf_identity: Option<&LeafIdentity>,
+    ) -> io::Result<ReversalOutcome> {
+        self.restore_relative_file_verified(
+            backup_relative,
+            destination_relative,
+            None,
+            backup_leaf_identity,
+            RestoreSlot::MustBeAbsent,
+        )
     }
 
     /// Discard the saved original of a successful overwrite commit,
@@ -3504,6 +3574,7 @@ fn restore_backup_by_exchange_unix(
     backup_absolute: &Path,
     destination_absolute: &Path,
     expected: Option<&LeafIdentity>,
+    slot: RestoreSlot,
 ) -> io::Result<ReversalOutcome> {
     use rustix::fs::{statat, unlinkat, AtFlags, RenameFlags};
 
@@ -3516,8 +3587,17 @@ fn restore_backup_by_exchange_unix(
     ) {
         // The slot was empty: the backup took the name atomically.
         Ok(()) => return Ok(ReversalOutcome::Reversed),
-        // The slot is occupied: verify-then-exchange below.
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        // The slot is occupied. A displaced-only reversal must never
+        // replace an occupant: the transfer published nothing, so the
+        // current occupant belongs to a concurrent writer and is refused
+        // intact, with the verified backup retained for a later, unblocked
+        // restore. The identity-coupled reversal verifies-then-exchanges
+        // below.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if slot == RestoreSlot::MustBeAbsent {
+                return Ok(ReversalOutcome::RefusedForeignLeaf);
+            }
+        }
         Err(error) => return Err(error),
     }
     // Verify the occupied slot BEFORE anything moves. The recorded
@@ -5200,6 +5280,7 @@ fn restore_backup_object_coupled_windows(
     destination_absolute: &Path,
     expected: Option<&LeafIdentity>,
     backup_leaf_identity: Option<&LeafIdentity>,
+    slot: RestoreSlot,
 ) -> io::Result<ReversalOutcome> {
     use std::mem::MaybeUninit;
     use std::os::windows::ffi::OsStrExt;
@@ -5287,6 +5368,14 @@ fn restore_backup_object_coupled_windows(
         // a concurrent writer's interposition owns that name now, and the
         // restore refuses without touching it.
         (Some(publication), Some(expected)) if publication != expected => {
+            Ok(ReversalOutcome::RefusedForeignLeaf)
+        }
+        // A displaced-only reversal published nothing, so ANY occupant
+        // belongs to a concurrent writer: refuse it intact rather than
+        // tombstoning and replacing a file the transfer never owned. Only
+        // the identity-coupled reversal may replace an occupant through
+        // observed-object verification below.
+        (Some(_), _) if slot == RestoreSlot::MustBeAbsent => {
             Ok(ReversalOutcome::RefusedForeignLeaf)
         }
         // Occupied by the object the restore may replace — the exact

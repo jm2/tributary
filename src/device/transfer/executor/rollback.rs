@@ -13,7 +13,7 @@ use super::super::types::TransferError;
 use super::{RunContext, TransferExecutor};
 use crate::local::root_authority::LeafIdentity;
 use crate::local::write_authority::{
-    CommitOutcome, ConflictResolution, PreparedWriteTarget, ReversalOutcome,
+    CommitDisposition, CommitOutcome, ConflictResolution, PreparedWriteTarget, ReversalOutcome,
 };
 
 /// One destination mutation the executor owns and must undo on rollback.
@@ -54,6 +54,19 @@ pub(super) enum OwnedChange {
         backup_leaf: Option<LeafIdentity>,
         published_leaf: Option<LeafIdentity>,
     },
+    /// A Windows rebind-exhaustion disposition: nothing of the transfer's
+    /// was published, but the pre-transfer occupant was displaced into the
+    /// retained backup. The destination slot is never the transfer's own —
+    /// it holds a concurrent writer's occupant, or is vacant — so rollback
+    /// may restore the backup ONLY into an absent slot and must refuse any
+    /// occupant intact. Unlike [`OwnedChange::ReplacedFile`], there is no
+    /// published-leaf identity to couple a replacement to; the absent-slot
+    /// requirement is what protects the concurrent writer's file.
+    DisplacedOnlyFile {
+        relative_path: PathBuf,
+        backup_relative_path: PathBuf,
+        backup_leaf: Option<LeafIdentity>,
+    },
     /// A directory (or directory ancestor) the executor created; it must be
     /// empty once every file inside it has been rolled back. Recorded only
     /// when the directory was provably absent immediately before creation.
@@ -71,7 +84,24 @@ pub(super) enum OwnedChange {
 /// replaced nothing (the occupant vanished before the publish), a fresh
 /// publish, and a preserved sibling all roll back by removing the actual
 /// published path.
+///
+/// A [`CommitDisposition::DisplacedOnly`] outcome is classified separately
+/// from every published change: the commit landed nothing, so the retained
+/// backup must be restored only into an absent slot rather than over the
+/// concurrent occupant that owns the destination now. Folding it into
+/// [`OwnedChange::ReplacedFile`] with an identity-less `published_leaf`
+/// would let rollback replace — and destroy — a file the transfer never
+/// published.
 pub(super) fn owned_change_for_copy(outcome: CommitOutcome) -> OwnedChange {
+    if outcome.disposition == CommitDisposition::DisplacedOnly {
+        return OwnedChange::DisplacedOnlyFile {
+            relative_path: outcome.relative_path,
+            backup_relative_path: outcome.replaced_original.expect(
+                "a displaced-only commit always retains the displaced pre-transfer occupant",
+            ),
+            backup_leaf: outcome.replaced_original_leaf,
+        };
+    }
     match outcome.resolution {
         ConflictResolution::Overwrite => match outcome.replaced_original {
             Some(backup_relative_path) => OwnedChange::ReplacedFile {
@@ -108,6 +138,13 @@ impl TransferExecutor {
     /// deleted, and the refusal surfaces as a transfer failure instead of
     /// a silently successful summary. The backups also remain restorable
     /// on the failure path, which never reaches this method.
+    ///
+    /// Only [`OwnedChange::ReplacedFile`] backups are disposed. A
+    /// [`OwnedChange::DisplacedOnlyFile`] backup holds the displaced
+    /// pre-transfer occupant of a commit that published nothing; it can
+    /// only be recorded behind a stage failure, so this success-path
+    /// method never sees one — and if one were ever present it must be
+    /// left for the rollback restore, never discarded.
     pub(super) fn discard_superseded_backups(
         &self,
         context: &RunContext<'_>,
@@ -227,6 +264,18 @@ impl TransferExecutor {
                     backup_leaf.as_ref(),
                 ),
             ),
+            OwnedChange::DisplacedOnlyFile {
+                relative_path,
+                backup_relative_path,
+                backup_leaf,
+            } => Self::reverse(
+                &relative_path,
+                self.request.destination.restore_displaced_only_verified(
+                    &backup_relative_path,
+                    &relative_path,
+                    backup_leaf.as_ref(),
+                ),
+            ),
             OwnedChange::CreatedDirectory {
                 relative_path,
                 created_directory,
@@ -262,6 +311,35 @@ impl TransferExecutor {
                 context: error.to_string(),
             }),
         }
+    }
+
+    /// Test-only: drive one already-classified owned change through the
+    /// executor's real rollback path.
+    ///
+    /// The Windows replace loop emits [`OwnedChange::DisplacedOnlyFile`] on
+    /// rebind exhaustion, but that requires a live concurrent writer winning
+    /// several races and cannot be reproduced deterministically in a unit
+    /// test. The regression feeds the exact recorded state the loop emits
+    /// through the actual reversal, pinning both the occupied-slot refusal
+    /// and the vacant-slot restore.
+    #[cfg(all(test, windows))]
+    pub(super) fn rollback_change_for_test(
+        &self,
+        change: OwnedChange,
+    ) -> Result<(), TransferError> {
+        use crate::source_lifecycle::CancellationObserver;
+
+        let mut progress = ();
+        let observer = CancellationObserver::never_cancelled();
+        let mut context = RunContext {
+            progress: &mut progress,
+            cancellation: &observer,
+            bytes_so_far: 0,
+            total_bytes: 0,
+            total_stages: 0,
+            committed: vec![change],
+        };
+        self.rollback(&mut context)
     }
 }
 

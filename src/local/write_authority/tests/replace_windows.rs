@@ -21,7 +21,7 @@ use std::thread::JoinHandle;
 
 use super::authority;
 use crate::local::write_authority::{
-    CommitError, CommitOutcome, ConflictPolicy, ConflictResolution,
+    CommitDisposition, CommitError, CommitOutcome, ConflictPolicy, ConflictResolution,
 };
 
 /// An Overwrite commit must report the replaced occupant's bind-time
@@ -163,6 +163,11 @@ fn retained_backup_names(root: &Path) -> Vec<String> {
 /// backup may survive, it must be the reported one, and it must hold the
 /// pre-transfer occupant's bytes.
 fn assert_winning_publish_keeps_only_the_reported_backup(root: &Path, committed: CommitOutcome) {
+    assert_eq!(
+        committed.disposition,
+        CommitDisposition::Published,
+        "a winning reboot publish lands the staged bytes"
+    );
     let backup = committed
         .replaced_original
         .expect("a completed binding must be reported");
@@ -193,6 +198,12 @@ fn assert_winning_publish_keeps_only_the_reported_backup(root: &Path, committed:
 /// backup must survive on disk holding the pre-transfer occupant.
 fn assert_exhausted_rebind_records_the_retained_backup(root: &Path, outcome: CommitOutcome) {
     assert_eq!(outcome.resolution, ConflictResolution::Overwrite);
+    assert_eq!(
+        outcome.disposition,
+        CommitDisposition::DisplacedOnly,
+        "exhaustion published nothing, so it must be recorded as displaced-only, \
+         never as an identity-less publication"
+    );
     let backup = outcome
         .replaced_original
         .expect("the exhausted rebind must record the retained backup");
