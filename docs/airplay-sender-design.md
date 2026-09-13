@@ -2,6 +2,29 @@
 
 Status: design record, no implementation in this bead.
 
+Revision 13 (2026-09-13, corrective pass). This revision answers the
+round-12 finding at the `4d77115` head (thread
+`PRRT_kwDOR1IXks6h6FrF`) with one contract fix to §4.1/§4.3/§9,
+docs-only: teardown supersession is wired to the in-flight open's
+actual abort signal. The record previously told Stop, `Drop`, and
+replacement preparation to "signal supersession" by bumping the
+preparation generation, while the same record states the generation is
+not observable in flight — it is a `Copy` value compared after the
+fact — and the open's real abort signal is the separate `OpenCancel`
+passed to `open_session`. The proxy now owns and registers that
+in-flight handle in its state for the duration of the call, and the
+state-locked teardown step that custodies the still-active ticket also
+cancels the registered handle in the same critical section, so a stale
+open cannot remain blocked, cannot keep mutating, and cannot return
+`Opened`; it surfaces its terminal quiesced outcome (`Cancelled` when
+the server side quiesced inside the cleanup deadline, otherwise the
+terminal `RecoveryOutcome` behind the `RecoveryCompletion` handle).
+"Signaling supersession" for an in-flight open now means cancelling the
+registered handle, not merely bumping the generation. §9 item 12's
+Stop-wins case and item 9's during-negotiation case assert the
+cancellation atomically with the custody move. It changes the design
+record only.
+
 Revision 12 (2026-09-13, corrective pass). This revision answers the
 round-12 Codex findings at the `28b09d1` head with two contract fixes
 to §4.1/§4.3/§9, all docs-only: (1) the explicit-teardown contract now
@@ -674,9 +697,11 @@ impl RecoveryCompletion {
 
 /// The app-owned capability to move this load's loopback media ticket
 /// off the proxy's active lease (`src/audio/gstreamer_media.rs:69-72`)
-/// into recovery custody, atomically, under the proxy's state lock.
-/// The load path owns it — it is the `GstreamerMediaProxy` owner — and
-/// lends it to `open_session`, so the transition that produces
+/// into recovery custody, atomically, under the proxy's state lock,
+/// **and** to register the call's cancellation handle with the proxy
+/// for as long as that call is in flight. The load path owns it — it
+/// is the `GstreamerMediaProxy` owner — and lends it to
+/// `open_session`, so the transition that produces
 /// `Failed(SenderError::RecoveryPending)` performs the proxy-locked
 /// custody move itself, before the outcome value is constructed,
 /// rather than leaving it to a post-receipt step by the load path
@@ -700,7 +725,40 @@ impl MediaTicketCustody {
     /// there first — is left in place, and the call never touches a
     /// newer replacement's lease.
     fn move_to_recovery_custody(&self);
+
+    /// Register this call's `OpenCancel` with the proxy for the
+    /// duration of one `open_session` call, returning an RAII guard
+    /// that deregisters when the call returns. Registration is what
+    /// lets explicit teardown and replacement preparation reach the
+    /// in-flight open: they cancel the registered handle in the same
+    /// state-locked step that custodies the still-active ticket, so
+    /// the blocked operation is aborted rather than awaited, and a
+    /// stale open cannot remain blocked, keep mutating, or return
+    /// `Opened`. The concrete type is the implementation record's
+    /// choice; the contract requires only that the handle is
+    /// cancellable from the teardown thread, that registration and
+    /// deregistration are safe against the proxy's state lock, and
+    /// that no registered handle is left installed once
+    /// `open_session` returns.
+    fn register_in_flight_cancel(&self, cancel: &OpenCancel) -> InFlightCancelRegistration;
 }
+
+/// RAII registration of the `open_session` call currently in flight
+/// against the proxy. It holds a cloneable `OpenCancel` handle so the
+/// state-locked teardown paths — Stop
+/// (`GstreamerMediaProxy::revoke`), the proxy's `Drop`, and
+/// replacement preparation (`prepare_with_server_start`) — can cancel
+/// it in the same critical section that moves the still-active ticket
+/// into recovery custody and then signal the open (§4.1, §4.3). It
+/// exists because the preparation generation is not a signal an
+/// in-flight call can observe: the generation
+/// (`src/audio/mod.rs:85-87`) is a `Copy` value the caller compares
+/// after the fact, while the in-flight open's abort signal is its
+/// `OpenCancel`. Registration begins before the call blocks and ends
+/// when it returns (the guard's `Drop`), so at most one handle is
+/// installed per proxy at a time and a cancelled open cannot outlive
+/// its own registration.
+struct InFlightCancelRegistration { /* the implementation record's primitive */ }
 
 /// Stable, machine-distinguishable seam failures. The load path's
 /// deadline, dependency, authentication, and receiver-failure
@@ -809,7 +867,14 @@ enum SenderError {
 /// `Failed(SenderError::Deadline)` instead of hanging.
 /// The load path sets the flag when the load is dropped or its
 /// generation is superseded: exactly the conditions the event
-/// contract already keys on. This is deliberately not
+/// contract already keys on. For an open that is *in flight*, the
+/// proxy registers this handle in its state
+/// (`MediaTicketCustody::register_in_flight_cancel`, §4.1) and the
+/// state-locked teardown step — Stop, the proxy's `Drop`, or
+/// replacement preparation — cancels it in the same critical section
+/// that moves the still-active ticket into recovery custody, so the
+/// flag is set synchronously with supersession rather than only
+/// compared after the fact. This is deliberately not
 /// `PlayerEventGeneration` itself — a generation
 /// (`src/audio/mod.rs:85-87`) is a `Copy` value the caller compares
 /// after the fact, not a flag an in-flight call can observe, and a
@@ -980,14 +1045,18 @@ trait AirplaySender: Send + Sync {
     ///   in custody until the canceled open reaches its terminal quiesced
     ///   outcome. If the recovery transition runs first, the replacement
     ///   finds the lease already custodied and removes nothing; if
-    ///   replacement preparation runs first, it moves the still-active
-    ///   lease into the same custody slot and signals supersession, and
-    ///   the open then observes the supersession with the lease already
-    ///   custodied. Supersession therefore does not force `Cancelled`: a
+    ///   replacement preparation runs first, in one state-locked step
+    ///   it moves the still-active lease into the same custody slot and
+    ///   cancels the proxy-registered in-flight `OpenCancel` handle
+    ///   (cancelling that handle — not bumping the preparation
+    ///   generation — is the signal an in-flight open actually
+    ///   observes, `:868-877`), and the open then observes the
+    ///   cancellation with the lease already custodied. Supersession
+    ///   therefore does not force `Cancelled`: a
     ///   canceled open still returns
     ///   `Failed(SenderError::RecoveryPending)` when a transmitted
     ///   mutating RPC missed the cleanup deadline (never `Cancelled`,
-    ///   `:950-959`), and returns `Cancelled` only when its server side
+    ///   `:1017-1026`), and returns `Cancelled` only when its server side
     ///   quiesced inside that deadline — at which point restoration has
     ///   run and the load path revokes the custodied route through the
     ///   identity-checked path. The replacement revokes only its own
@@ -1000,13 +1069,21 @@ trait AirplaySender: Send + Sync {
     ///   must not revoke it while recovery is unresolved. And if Stop/Drop
     ///   win the state-lock race **before** the open's `RecoveryPending`
     ///   transition — the ticket is still the proxy's active lease — they
-    ///   must not take and unconditionally revoke it either: they move
-    ///   that in-flight active ticket into the same custody slot under the
-    ///   state lock (bumping the generation to signal supersession),
-    ///   exactly as `prepare_with_server_start` now does, so the open
-    ///   observes the supersession with the lease already custodied and
-    ///   its recovery transition finds a route to preserve instead of an
-    ///   empty active slot. Having preserved the route, they either drive
+    ///   must not take and unconditionally revoke it either. In one
+    ///   atomic step under the state lock they (a) move that in-flight
+    ///   active ticket into the same custody slot and (b) cancel the
+    ///   in-flight open's registered `OpenCancel` handle — cancelling
+    ///   that handle, not a generation comparison, is how supersession
+    ///   reaches a blocked call — exactly as
+    ///   `prepare_with_server_start` now does, so the open observes
+    ///   cancellation with the lease already custodied and its recovery
+    ///   transition finds a route to preserve instead of an empty active
+    ///   slot. The preparation generation is still bumped for the
+    ///   after-the-fact `is_current_generation` comparison, but it is
+    ///   the cancelled registered handle that aborts the operation in
+    ///   flight; a bump alone would leave a stale open blocked, still
+    ///   mutating, or able to return `Opened`. Having preserved the
+    ///   route and signalled the open, they either drive
     ///   recovery to its terminal
     ///   quiesced outcome first — synchronously requesting the
     ///   adapter's terminate-and-restart quiescence, which cancels the
@@ -1406,7 +1483,10 @@ Tributary talks to an OwnTone instance as a transmission service:
   whether the ticket is already custodied or is still the proxy's
   active lease for an in-flight open whose canceled outcome has not
   reached its terminal quiesced state, teardown must move that active
-  ticket into custody (signaling supersession) — exactly as the
+  ticket into custody and, in the same state-locked critical section,
+  cancel the proxy's registered in-flight open handle — cancelling
+  that handle, not bumping the preparation generation, is the signal
+  an in-flight open actually observes (§4.1) — exactly as the
   replacement path does — rather than take and revoke it. It either
   drives the adapter's quiescence
   (terminate/restart) so this outcome is reached promptly, or
@@ -1830,7 +1910,11 @@ record for the selected path must add, at minimum:
    *during* negotiation, including Stop or output replacement
    landing while a blocking operation (RTSP handshake, daemon RPC,
    FIFO/API setup) is in flight: the operation is aborted rather
-   than awaited, and the load whose `OpenCancel` was set yields
+   than awaited — teardown reaches the blocked call by cancelling
+   the proxy-registered in-flight handle in the same state-locked
+   step that custodies the still-active ticket (§4.1), so the open
+   cannot remain blocked or return `Opened` — and the load whose
+   `OpenCancel` was set yields
    `OpenOutcome::Cancelled` only after the restoration path
    completes **and** every mutating daemon RPC already transmitted
    has been quiesced — acknowledged settled within the cleanup
@@ -1974,11 +2058,14 @@ record for the selected path must add, at minimum:
       post-outcome arrival, so it exercises the window the atomic
       hand-off must close, not just the steady state.
     - **Replacement-first case.** Replacement preparation wins the
-      state-lock race and moves the still-active lease into custody;
-      the open then observes the supersession with the lease already
-      custodied and still returns
+      state-lock race; in one state-locked step it moves the
+      still-active lease into custody and cancels the
+      proxy-registered in-flight `OpenCancel` — cancelling the
+      registered handle, not bumping the generation, being what
+      reaches the blocked call — so the open observes the cancellation
+      with the lease already custodied and still returns
       `Failed(SenderError::RecoveryPending)` on the missed-deadline path
-      per §4.1 `:950-959` — supersession does not force `Cancelled`.
+      per §4.1 `:1017-1026` — supersession does not force `Cancelled`.
       Here the replacement arrived *before* the outcome, which is the
       other window the hand-off must cover; there is no post-outcome
       arrival to assert in this case.
@@ -1990,11 +2077,20 @@ record for the selected path must add, at minimum:
     explicit Stop (`GstreamerMediaProxy::revoke`) lands while the
     open's ticket is still the proxy's active lease, before the
     `RecoveryPending` transition has custodied it. The test asserts
-    Stop does **not** take and revoke that active route: Stop moves
-    the ticket into custody (signaling supersession) — exactly as
-    replacement preparation does — or drives recovery to its terminal
-    quiesced outcome (terminating/restarting the dedicated daemon)
-    before the route is revoked. In either form the route stays valid
+    Stop does **not** take and revoke that active route: in one
+    state-locked step Stop moves the ticket into custody and cancels
+    the proxy-registered in-flight `OpenCancel` — cancelling the
+    registered handle, not bumping the generation, being what reaches
+    the blocked call — exactly as replacement preparation does — or
+    drives recovery to its terminal quiesced outcome
+    (terminating/restarting the dedicated daemon) before the route is
+    revoked. The test asserts the blocked operation is aborted rather
+    than awaited and the open surfaces its terminal quiesced outcome
+    — `Cancelled` once its server side quiesced inside the cleanup
+    deadline, or `Failed(SenderError::RecoveryPending)` carrying the
+    `RecoveryCompletion` handle otherwise — and never `Opened` and
+    never a stall, so teardown cannot leave a stale open mutating or
+    publishing after Stop. In either form the route stays valid
     until the canceled open reaches its terminal quiesced outcome:
     the test observes it live while recovery is unresolved and
     revoked only then, never before quiescence. The proxy's `Drop`
