@@ -64,6 +64,8 @@ mod executor_rollback_tests;
 #[cfg(test)]
 mod executor_tests;
 #[cfg(test)]
+mod planner_boundary_tests;
+#[cfg(test)]
 mod planner_tests;
 #[cfg(test)]
 mod test_support;
