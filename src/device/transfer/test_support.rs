@@ -7,8 +7,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use super::types::{TransferItem, TransferRequest};
 use crate::local::root_authority::MountedRootAuthority;
-use crate::local::write_authority::MountedWriteAuthority;
+use crate::local::write_authority::{ConflictPolicy, MountedWriteAuthority};
 
 /// Acquire a read authority rooted at a temporary directory.
 pub fn read_authority(root: &Path) -> Arc<MountedRootAuthority> {
@@ -50,4 +51,26 @@ pub fn write_source_file(root: &Path, relative: &str, contents: &[u8]) {
     std::fs::create_dir_all(path.parent().expect("relative path has a parent"))
         .expect("create parent");
     std::fs::write(path, contents).expect("write source");
+}
+
+/// Build a recursive, budgeted transfer request in one call.
+///
+/// Shared by the planner regression modules; kept here rather than in either
+/// test file so the planning and boundary suites exercise the same request
+/// shape.
+pub fn plan_request(
+    source: Arc<MountedRootAuthority>,
+    destination: MountedWriteAuthority,
+    items: Vec<TransferItem>,
+    conflict_policy: ConflictPolicy,
+    capacity_budget: Option<u64>,
+) -> TransferRequest {
+    TransferRequest {
+        source,
+        destination,
+        items,
+        conflict_policy,
+        capacity_budget,
+        recurse_directories: true,
+    }
 }
