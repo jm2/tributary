@@ -1671,18 +1671,13 @@ impl MountedRootAuthority {
     /// stages had already committed. The planner runs this check on every
     /// walked directory BEFORE staging anything beneath it and rejects the
     /// whole plan with the nested mount path named when the boundary
-    /// differs ([`CrossedMountBoundary`]). The directory is opened
-    /// no-follow, and the comparison uses the same boundary identity the
-    /// executor enforces.
+    /// differs ([`CrossedMountBoundary`]). The directory is probed through
+    /// the retained root with per-component no-follow opens, exactly as the
+    /// executor traverses it, so the comparison uses the same boundary
+    /// identity the executor enforces and a symlink/reparse-point ancestor
+    /// leading outside the root is refused instead of followed.
     pub(crate) fn validate_walked_directory_boundary(&self, directory: &Path) -> io::Result<()> {
-        let opened = open_walked_directory(directory)?;
-        if boundary_identity(&opened)? == self.boundary {
-            Ok(())
-        } else {
-            Err(io::Error::other(CrossedMountBoundary {
-                path: directory.to_path_buf(),
-            }))
-        }
+        self.validate_planned_boundary(directory, DescendantKind::Directory)
     }
 
     /// Verify that one planned source regular file still sits on this
@@ -1694,16 +1689,37 @@ impl MountedRootAuthority {
     /// committed. The planner probes every planned source file (walked
     /// entries and directly requested items) before staging it and rejects
     /// the whole plan with the offending path named when the boundary
-    /// differs ([`CrossedMountBoundary`]). The file is opened no-follow.
+    /// differs ([`CrossedMountBoundary`]). The probe traverses from the
+    /// retained root through the source-relative components with
+    /// per-component no-follow opens — exactly as the executor does — so an
+    /// absolute-path symlink or reparse-point ancestor cannot redirect it
+    /// outside the retained source root.
     pub(crate) fn validate_source_file_boundary(&self, file: &Path) -> io::Result<()> {
-        let opened = open_walked_regular_file(file)?;
-        if boundary_identity(&opened)? == self.boundary {
-            Ok(())
-        } else {
-            Err(io::Error::other(CrossedMountBoundary {
-                path: file.to_path_buf(),
-            }))
+        self.validate_planned_boundary(file, DescendantKind::RegularFile)
+    }
+
+    /// Traverse one planned source entry from the retained root, one
+    /// no-follow component at a time, and enforce this authority's boundary
+    /// on every component (including the final one). The traversal mirrors
+    /// the executor's descendant open, so a planning probe can neither
+    /// follow a symlink/reparse-point ancestor outside the retained root nor
+    /// accept an entry the executor would refuse only mid-run. A boundary
+    /// crossing surfaces as the typed [`CrossedMountBoundary`] naming
+    /// `entry`; every other traversal failure (a symlink ancestor, a
+    /// vanished component) propagates as-is and fails the plan closed.
+    fn validate_planned_boundary(&self, entry: &Path, kind: DescendantKind) -> io::Result<()> {
+        let relative = entry.strip_prefix(&self.root).map_err(|_| {
+            invalid_input("planned source entry must descend from its retained root")
+        })?;
+        if relative.as_os_str().is_empty() {
+            // The entry IS the retained root: its boundary is this authority's
+            // by construction.
+            return Ok(());
         }
+        let components = strict_relative_components(relative)?;
+        self.validate()?;
+        let path = join_components(&self.root, &components);
+        open_descendant_from_root(self, &path, &components, kind).map(|_| ())
     }
 }
 
@@ -3006,47 +3022,6 @@ impl fmt::Display for CrossedMountBoundary {
 }
 
 impl std::error::Error for CrossedMountBoundary {}
-
-#[cfg(unix)]
-fn open_walked_directory(directory: &Path) -> io::Result<File> {
-    open_unix_directory_path(directory)
-}
-
-#[cfg(windows)]
-fn open_walked_directory(directory: &Path) -> io::Result<File> {
-    open_windows_directory(directory, false, false).map(|opened| opened.target)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_walked_directory(_directory: &Path) -> io::Result<File> {
-    Err(unsupported_platform())
-}
-
-/// Open a planned source regular file no-follow for a boundary probe. The
-/// parent directory is opened no-follow first so the final component can be
-/// opened relative to a retained directory handle, exactly as the executor
-/// opens its final file component.
-#[cfg(unix)]
-fn open_walked_regular_file(file: &Path) -> io::Result<File> {
-    let parent = file
-        .parent()
-        .ok_or_else(|| invalid_input("source file has no parent directory"))?;
-    let name = file
-        .file_name()
-        .ok_or_else(|| invalid_input("source file has no final component"))?;
-    let parent_handle = open_unix_directory_path(parent)?;
-    open_unix_regular_at(&parent_handle, name)
-}
-
-#[cfg(windows)]
-fn open_walked_regular_file(file: &Path) -> io::Result<File> {
-    open_windows_regular(file, false, false)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_walked_regular_file(_file: &Path) -> io::Result<File> {
-    Err(unsupported_platform())
-}
 
 impl RootAuthorityLease {
     /// Open and retain the exact root and marker currently at `root`.
@@ -5268,8 +5243,10 @@ fn copy_bind_occupant_backup(
 ///    that raced into the slot is refused intact, and the tombstoned
 ///    publication is restored to its slot before the refusal surfaces.
 /// 4. After the install, the object at the destination is verified to BE
-///    the pinned backup object; only then are the redundant links removed,
-///    each re-verified object-coupled before its removal.
+///    the pinned backup object; only then is the redundant backup link
+///    consumed through the SAME pinned delete-capable handle, so the removal
+///    is bound to the verified object and a concurrent writer can never swap
+///    the backup name into the check-then-delete window.
 ///
 /// A filesystem without hard links offers no coupled install primitive and
 /// fails closed with `Unsupported`, exactly like the Unix no-exchange arm
@@ -5392,29 +5369,19 @@ fn restore_backup_object_coupled_windows(
             &backup_object,
         ),
     };
-    drop(pinned);
     let restored = outcome?;
     if restored == ReversalOutcome::Reversed {
-        // Consume the redundant backup link — the destination now names
-        // the restored object. The pin froze this name through every
-        // mutation above; after its release a concurrent writer could
-        // have swapped it, so the removal is re-verified object-coupled
-        // and a swapped name is never deleted.
-        match leaf_identity_at_path(backup_absolute)? {
-            Some(bound) if bound.same_object(&backup_object) => {
-                std::fs::remove_file(backup_absolute)?;
-            }
-            Some(_) => {
-                return Err(io::Error::other(
-                    "the restored backup's sibling name was replaced by a concurrent writer; \
-                     refusing to delete an object the transfer does not own",
-                ));
-            }
-            // The backup name is already gone; the object lives on at the
-            // destination.
-            None => {}
-        }
+        // Consume the redundant backup link through the SAME delete-capable
+        // handle that pinned its name: the handle names the verified backup
+        // (the pin withheld delete sharing, so the name could not be swapped
+        // while it was held), and the deletion commits at close bound to that
+        // object. Dropping the pin first and then re-resolving the path would
+        // race a concurrent writer — it could rename the verified backup away
+        // and install its own file between the path lookup and the removal,
+        // making rollback delete the writer's replacement.
+        request_object_deletion(pinned.0)?;
     }
+    drop(pinned);
     Ok(restored)
 }
 
@@ -5836,23 +5803,24 @@ fn hard_link_bind_and_replace(
 ///
 /// Each attempt binds the current
 /// occupant through an object-coupled handle primitive (see
-/// [`hard_link_bind_and_replace`]); when a completed bind's publish
-/// collides with an interposer, the binding is RETAINED — the displaced
-/// object survives only through its backup — and the interposer is bound
-/// on a fresh private name minted by `rebinding_backup` within the retry
-/// bound. The FIRST binding — the pre-transfer occupant — is the one
-/// reported, so a rollback restores exactly the bytes the transfer
-/// displaced from the slot.
+/// [`hard_link_bind_and_replace`]). A completed bind either publishes
+/// (success) or collides with an interposer that took the slot first. On a
+/// collision the binding is RETAINED — the displaced object survives only
+/// through its backup — and the loop STOPS instead of rebinding. Rebinding
+/// would displace the interposer too, and a later exhaustion could then
+/// neither destroy its backup without losing a concurrent writer's data nor
+/// report it; stopping keeps at most ONE displaced object per publish: the
+/// FIRST binding, the pre-transfer occupant. On success that binding is the
+/// single backup reported to the caller, so rollback restores exactly the
+/// bytes the transfer displaced from the slot; on exhaustion it travels with
+/// the error (see [`ExhaustedRebindBackup`]) so the caller records the
+/// displaced-only replacement and rollback restores/reports exactly that
+/// object. Later interposers are never touched.
 ///
-/// Every superseded binding is tracked: when a later attempt wins, each
-/// earlier completed binding's backup is disposed with identity-verified
-/// deletion — a bound backup that a later attempt superseded is never left
-/// as a hidden orphan. On success exactly one backup survives: the first
-/// binding's, reported to the caller. On exhaustion the retained FIRST
-/// binding travels with the error (see [`ExhaustedRebindBackup`]) so the
-/// caller records the replacement instead of stranding the backup; the
-/// superseded interposer backups stay in place untouched — they hold
-/// foreign data, which a failed publish never destroys.
+/// Bindings superseded by a later winning attempt are still disposed with
+/// identity-verified deletion on the successful path, so a bound backup is
+/// never left as a hidden orphan; under the stop-at-first-collision rule
+/// above there is simply at most one retained binding to dispose.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn replace_publish_loop(
@@ -5945,9 +5913,18 @@ fn replace_publish_loop(
                         }
                         // The bind completed and the deletion committed, but
                         // an interposer took the slot before the no-replace
-                        // publish: the binding above is retained, and the
-                        // interposer is bound on a fresh private name.
-                        current = rebinding_backup();
+                        // publish. This is the first collision, and the loop
+                        // stops here rather than rebinding: rebinding would
+                        // displace the interposer too, and if a later attempt
+                        // then exhausted, its backup could only be destroyed
+                        // (losing a concurrent writer's data) or left behind
+                        // as an unreported hidden orphan. Falling out of the
+                        // loop surfaces the exhausted failure with the
+                        // retained FIRST binding — the pre-transfer occupant —
+                        // so rollback restores/reports exactly the one object
+                        // this transfer displaced, and later interposers are
+                        // never touched.
+                        break;
                     }
                     // Nothing was bound: re-type and retry. A fresh private
                     // name keeps a released bind's leaf from ever being
@@ -6489,6 +6466,30 @@ fn ensure_boundary(expected: BoundaryIdentity, file: &File) -> io::Result<()> {
     }
 }
 
+/// Same boundary check as [`ensure_boundary`], but a crossing is reported as
+/// the typed [`CrossedMountBoundary`] naming the planned `entry`. The kind
+/// stays `PermissionDenied`, exactly as [`ensure_boundary`] / the executor
+/// expect for an authority-boundary failure, while the payload lets the
+/// planner downcast the offending source path into its typed plan rejection.
+/// `entry` is the entry the caller planned (the full native source path),
+/// not necessarily the component whose boundary differed.
+fn ensure_boundary_reported(
+    expected: BoundaryIdentity,
+    file: &File,
+    entry: &Path,
+) -> io::Result<()> {
+    if boundary_identity(file)? == expected {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            CrossedMountBoundary {
+                path: entry.to_path_buf(),
+            },
+        ))
+    }
+}
+
 fn parse_root_marker(contents: &str) -> io::Result<String> {
     let value = contents.strip_suffix('\n').unwrap_or(contents);
     if value.is_empty() || value.contains(char::is_whitespace) {
@@ -6888,7 +6889,7 @@ fn open_marker(_root: &Path, _root_file: &File) -> io::Result<File> {
 #[cfg(unix)]
 fn open_descendant_from_root(
     authority: &impl RootBinding,
-    _path: &Path,
+    path: &Path,
     components: &[OsString],
     kind: DescendantKind,
 ) -> io::Result<OpenedDescendant> {
@@ -6910,7 +6911,7 @@ fn open_descendant_from_root(
         } else {
             open_unix_directory_at(&parent, component)?
         };
-        ensure_boundary(authority.boundary(), &file)?;
+        ensure_boundary_reported(authority.boundary(), &file, path)?;
         if is_last {
             return Ok(OpenedDescendant {
                 object: RetainedObject::new(file)?,
@@ -6927,7 +6928,7 @@ fn open_descendant_from_root(
 #[cfg(windows)]
 fn open_descendant_from_root(
     authority: &impl RootBinding,
-    _path: &Path,
+    path: &Path,
     components: &[OsString],
     kind: DescendantKind,
 ) -> io::Result<OpenedDescendant> {
@@ -6965,7 +6966,7 @@ fn open_descendant_from_root(
         } else {
             open_windows_directory(&current_path, false, false)?.target
         };
-        ensure_boundary(authority.boundary(), &file)?;
+        ensure_boundary_reported(authority.boundary(), &file, path)?;
         let object = RetainedObject::new(file)?;
         if is_last {
             return Ok(OpenedDescendant {

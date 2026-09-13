@@ -463,3 +463,46 @@ fn direct_file_beneath_nested_bind_mount_is_rejected_at_planning_time() {
         "the typed error must name the file beneath the nested mount"
     );
 }
+
+/// A directly requested source file whose path traverses a symlink ancestor
+/// beneath the root must be rejected AT PLANNING TIME. An absolute-path
+/// probe follows the ancestor (it only refuses the final component) and
+/// accepts the file, so the planner would enumerate metadata outside the
+/// retained source root and emit a plan the executor's per-component
+/// no-follow traversal rejects mid-run, possibly after earlier stages had
+/// committed. The planning probe must traverse from the retained root
+/// component by component, exactly like the executor, and refuse the
+/// symlink ancestor before any stage is planned. Deterministic on Unix,
+/// where creating a symlink needs no privilege.
+#[cfg(unix)]
+#[test]
+fn direct_file_beneath_symlinked_ancestor_is_rejected_at_planning_time() {
+    use std::os::unix::fs::symlink;
+
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    let outside = tempfile::tempdir().expect("temporary outside root");
+    write_source_file(outside.path(), "real/song.flac", b"outside");
+    // The symlink is an ANCESTOR of the requested leaf, not its immediate
+    // parent: the immediate parent is a real directory, so only a
+    // per-component traversal can see the crossing.
+    symlink(outside.path(), source_root.path().join("link")).expect("create symlinked ancestor");
+
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = plan_request(
+        source,
+        destination,
+        vec![TransferItem::same(PathBuf::from("link/real/song.flac"))],
+        ConflictPolicy::Preserve,
+        None,
+    );
+    let error = TransferPlanner::new()
+        .plan(&request)
+        .expect_err("a file beneath a symlinked ancestor must be rejected at planning time");
+    assert!(
+        matches!(error, TransferError::Io { .. }),
+        "the planning probe must refuse the symlink ancestor (a crossing, not a typed \
+         nested-mount error), got {error:?}"
+    );
+}

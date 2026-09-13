@@ -113,14 +113,16 @@ fn pinned_occupant_fails_closed_without_destruction() {
 
 /// A concurrent writer hammering the destination name must land the
 /// replace publish in a state the caller can always undo — never in the
-/// historical blind spot. When attempts EXHAUST with a completed binding
-/// retained, the commit must surface a state-carrying verified-publication
-/// failure whose outcome records the retained backup of the pre-transfer
-/// occupant (rollback restores or disposes it) — never a plain I/O error,
-/// which would strand the backup as an unrecorded hidden orphan. When a
-/// later attempt WINS, every superseded rebind backup must be disposed
-/// with identity-verified deletion: exactly one backup — the first
-/// binding's, holding the pre-transfer occupant — may survive.
+/// historical blind spot. The loop stops at the FIRST collision rather
+/// than rebinding the interposer, so exactly ONE object is ever displaced:
+/// the pre-transfer occupant. When attempts EXHAUST with a completed
+/// binding retained, the commit must surface a state-carrying
+/// verified-publication failure whose outcome records that occupant's
+/// retained backup (rollback restores or disposes it) — never a plain I/O
+/// error, which would strand the backup as an unrecorded hidden orphan.
+/// When a publish WINS, exactly one backup — the first binding's, holding
+/// the pre-transfer occupant — may survive, and no interposer backup is
+/// ever orphaned.
 /// Spawns the concurrent writer that keeps re-creating `target` the instant
 /// it is vacated, so the replace loop must re-bind within its bound. Each
 /// writer file is uniquely named so the caller can tell the pre-transfer
@@ -216,9 +218,11 @@ fn assert_exhausted_rebind_records_the_retained_backup(root: &Path, outcome: Com
         "nothing of the transfer's may be recorded as published after exhaustion"
     );
     let names = retained_backup_names(root);
-    assert!(
-        !names.is_empty(),
-        "the recorded backup must survive on disk: {names:?}"
+    assert_eq!(
+        names.len(),
+        1,
+        "stopping at the first collision must leave exactly the one retained \
+         pre-transfer backup and never orphan a later interposer backup: {names:?}"
     );
     assert_eq!(
         std::fs::read(root.join(&backup)).expect("read retained backup"),
