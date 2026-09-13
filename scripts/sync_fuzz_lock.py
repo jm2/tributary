@@ -279,6 +279,164 @@ def resolved_dependency_edges(
     }
 
 
+def valid_semver_build_metadata(build: str) -> bool:
+    """
+    Report whether build metadata is well-formed SemVer.
+
+    Build metadata is dot-separated identifiers of ASCII alphanumerics
+    and hyphens. Numeric build identifiers MAY carry leading zeros —
+    SemVer 2.0.0 restricts leading zeros to numeric prerelease
+    identifiers, and cargo accepts and re-emits records like 1.0.0+01
+    and 1.0.0+zlib.01. Content is irrelevant to cargo's compatibility
+    rules — validity only separates cargo-writable records (real locks
+    hold 1.1.5+spec-1.1.0 and 1.0.4+wasi-0.2.12) from malformed input,
+    which stays fail-closed.
+    """
+    identifiers = build.split(".")
+    return all(
+        identifier
+        and identifier.isascii()
+        and all(
+            character.isalnum() or character == "-"
+            for character in identifier
+        )
+        for identifier in identifiers
+    )
+
+
+def valid_semver_prerelease(prerelease: str) -> bool:
+    """
+    Report whether prerelease is well-formed SemVer.
+
+    Prerelease is dot-separated identifiers of ASCII alphanumerics and
+    hyphens, none empty, and numeric identifiers carry no leading zeros
+    (SemVer 2.0.0 restricts leading zeros to numeric build identifiers,
+    which cargo accepts and re-emits). Registry versions are valid
+    semver, so cargo can never write anything else — malformed
+    prereleases stay fail-closed.
+    """
+    for identifier in prerelease.split("."):
+        if (
+            not identifier
+            or not identifier.isascii()
+            or not all(
+                character.isalnum() or character == "-"
+                for character in identifier
+            )
+        ):
+            return False
+        if (
+            identifier.isdigit()
+            and len(identifier) > 1
+            and identifier.startswith("0")
+        ):
+            return False
+    return True
+
+
+def parse_numeric_release(core: str) -> tuple[int, int, int] | None:
+    """
+    Parse a release core into its numeric X.Y.Z components.
+
+    Exactly three dot-separated ASCII digit components with no
+    semver-forbidden leading zeros is the only accepted shape; anything
+    else is malformed input and returns None, keeping version forms
+    cargo cannot write fail-closed.
+    """
+    components = core.split(".")
+    if len(components) != 3:
+        return None
+    if not all(
+        component.isascii() and component.isdigit()
+        for component in components
+    ):
+        return None
+    if any(
+        len(component) > 1 and component.startswith("0")
+        for component in components
+    ):
+        return None
+    major, minor, patch = (int(component) for component in components)
+    return (major, minor, patch)
+
+
+def compatibility_axes(
+    release: tuple[int, int, int],
+) -> tuple[int, int | None, int | None]:
+    """
+    Reduce a numeric release to the axes cargo unifies on.
+
+    Stable majors unify on the major alone; 0.x crates also require the
+    minor (^0.60 never matches 0.61.x); 0.0.x crates require the patch
+    (^0.0.1 excludes 0.0.2).
+    """
+    major, minor, patch = release
+    if major > 0:
+        return (major, None, None)
+    if minor > 0:
+        return (0, minor, None)
+    return (0, 0, patch)
+
+
+def cargo_version_family(version: str) -> tuple[int, int | None, int | None] | None:
+    """
+    Parse a Cargo lock version into its unification identity components.
+
+    Cargo lock version fields are full numeric X.Y.Z releases, optionally
+    carrying a SemVer prerelease and/or build metadata. Build metadata
+    never affects cargo's compatibility rules, and a prerelease only ever
+    narrows matching inside its release's own compatibility family (cargo
+    matches a prerelease comparator solely within the same
+    major.minor.patch triple), so valid suffixes are stripped before the
+    numeric parse and the family axes stay purely numeric; a malformed
+    suffix (empty, duplicated separator, non-identifier content,
+    leading-zero numeric prerelease identifiers) is malformed input.
+    Either way anything that is not a full numeric X.Y.Z core never
+    compares equal to a valid version: incomplete versions, non-numeric
+    or non-ASCII components, semver-forbidden leading zeros, and extra
+    components all parse to None and stay fail-closed. The returned
+    triple keeps exactly the components cargo's compatibility rules
+    unify on — (major, None, None) for stable majors, (0, minor, None)
+    for 0.x crates, and (0, 0, patch) for 0.0.x crates, where a ^0.0.P
+    requirement matches only that patch. A validated prerelease record
+    shares its release's family — cargo can resolve a prerelease
+    requirer onto the same-core release, and real locks carry such
+    records (sea-orm-arrow 2.0.0-rc.4) — while cross-axis moves stay
+    fail-closed.
+    """
+    core_and_prerelease, plus, build = version.partition("+")
+    if plus and not valid_semver_build_metadata(build):
+        return None
+    core, dash, prerelease = core_and_prerelease.partition("-")
+    if dash and not valid_semver_prerelease(prerelease):
+        return None
+    release = parse_numeric_release(core)
+    if release is None:
+        return None
+    return compatibility_axes(release)
+
+
+def same_semver_compat_family(left: str, right: str) -> bool:
+    """
+    True when two crate versions sit in the same Cargo compatibility family.
+
+    Cargo unification merges only requirements that resolve into one
+    compatibility family: the same major; for 0.x crates also the same
+    minor (^0.60 never matches 0.61.x); and for 0.0.x crates the same
+    patch (^0.0.1 excludes 0.0.2, so a 0.0.x patch bump can never absorb
+    another record's consumers). A validated prerelease shares its
+    numeric core's family — cargo matches a prerelease comparator solely
+    within the same major.minor.patch triple. Versions that do not fully
+    parse as a numeric X.Y.Z core with well-formed optional suffixes
+    never compare equal, which keeps malformed input fail-closed.
+    """
+    left_family = cargo_version_family(left)
+    return (
+        left_family is not None
+        and left_family == cargo_version_family(right)
+    )
+
+
 def unification_replacements(
     before_records: dict[tuple[str, str], dict[str, Any]],
     after_records: dict[tuple[str, str], dict[str, Any]],
@@ -294,20 +452,89 @@ def unification_replacements(
     for crates outside the transitioned subtree, and the repaired lock
     resolves every requirer onto one surviving (name, new) record. A removal
     is attributed to that unification only when the removed identity has
-    exactly one surviving same-name record, that record lies inside the exact
-    after closure (so the selected production update necessitated it), it
-    preserves the removed record's source identity, and the repair itself
-    introduced it. Unrelated removals, ambiguous survivors, pre-existing
-    survivors, and cross-source substitutions stay rejected.
+    exactly one surviving same-family record — cargo can never merge
+    requirements outside a compatibility family (same major; for 0.x also
+    the same minor; for 0.0.x the same patch), so same-name records in
+    other families are separate
+    graph residents that neither defeat attribution nor qualify as the
+    replacement — that record lies inside the exact after closure (so the
+    selected production update necessitated it), it preserves the removed
+    record's source identity, and the repair itself introduced it. Unrelated
+    removals, ambiguous same-family survivors, pre-existing survivors,
+    cross-family substitutions with a same-family co-resident, and
+    cross-source substitutions stay rejected.
+
+    One cross-family shape is also cargo's own doing: a retained consumer
+    whose requirement is broad (for example "*" or a range spanning
+    releases) does not bound the resolver to the removed identity's family,
+    so introducing a consumer outside that family can evacuate it entirely
+    — verified against cargo 1.98 (consumer on "*" rebinds 1.0.0 -> 2.0.0
+    and the 1.x record disappears when a "^2" consumer joins). When the
+    repaired lock leaves exactly one same-name record, cargo resolved every
+    requirer of the name onto it, so the observed exact rebind was
+    requirement-forced rather than arbitrary; a stable-major survivor with
+    a fully numeric release is therefore admitted as a replacement. That
+    uniqueness is counted across every same-name record — a co-resident
+    0.x or unparseable record shows a requirer that stayed put, breaking
+    the proof, and stays rejected. The
+    survivor must itself be a stable major: absorbing an evacuated
+    stable-major family into a 0.x or 0.0.x record crosses the 0.x
+    compatibility boundary, and 0.x minor and 0.0.x patch boundaries stay
+    fail-closed — cross-boundary movement on those axes is
+    operator-policy territory whichever side of the boundary the move
+    starts from — and it stays a fully numeric release, the shape the
+    evacuation carve-out was verified against, so prerelease survivors
+    remain fail-closed. Every guard below
+    (exact after closure, freshly introduced, same source, and the observed
+    exact edge rebind required by validate_bounded_package_changes) still
+    applies to these replacements.
     """
     replacements: dict[tuple[str, str], tuple[str, str]] = {}
     candidates = sorted(
         before_records.keys() - after_records.keys() - old_identities
     )
     for identity in candidates:
+        removed_family = cargo_version_family(identity[1])
         survivors = sorted(
-            candidate for candidate in after_records if candidate[0] == identity[0]
+            candidate
+            for candidate in after_records
+            if candidate[0] == identity[0]
+            and same_semver_compat_family(candidate[1], identity[1])
         )
+        if (
+            not survivors
+            and removed_family is not None
+            and removed_family[0] > 0
+        ):
+            # Broad consumer requirements evacuated the removed identity's
+            # compatibility family; consider the unique same-name survivor
+            # across families. Uniqueness is counted across EVERY same-name
+            # record: the requirement-forced proof rests on cargo having
+            # resolved all requirers of the name onto one record, and any
+            # co-resident 0.x or unparseable record shows a requirer that
+            # demonstrably stayed put. The sole survivor must still be a
+            # stable-major, fully numeric release — this keeps ambiguous,
+            # malformed, and 0.x survivors fail-closed — substitution into
+            # 0.x territory crosses the same operator-policy boundary as
+            # the removed-family guard above, whichever side of the
+            # boundary the move starts from.
+            same_name = sorted(
+                candidate
+                for candidate in after_records
+                if candidate[0] == identity[0]
+            )
+            if len(same_name) == 1:
+                survivor_version = same_name[0][1]
+                survivor_family = cargo_version_family(survivor_version)
+                # The cargo-verified evacuation shape resolves every
+                # requirer onto a fully numeric stable-major release; a
+                # prerelease survivor keeps this carve-out fail-closed.
+                if (
+                    survivor_family is not None
+                    and survivor_family[0] > 0
+                    and "-" not in survivor_version.partition("+")[0]
+                ):
+                    survivors = same_name
         if len(survivors) != 1:
             continue
         replacement = survivors[0]

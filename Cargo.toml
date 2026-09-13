@@ -51,7 +51,7 @@ sea-orm = { version = "2", features = ["sqlx-sqlite", "runtime-tokio-rustls", "m
 sea-orm-migration = { version = "2", features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
 
 # Local backend — audio tag parsing
-lofty = "0.24"
+lofty = "0.25"
 
 # Local backend — filesystem watching
 notify = "8"
