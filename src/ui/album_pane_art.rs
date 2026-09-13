@@ -45,8 +45,6 @@ use crate::ui::album_art;
 use crate::ui::objects::{AlbumArtCandidate, BrowserItem};
 #[cfg(test)]
 use crate::ui::preferences::AlbumArtSize;
-#[cfg(test)]
-use resolver::{local_file_art_route, LocalFileArtRoute};
 
 // The bounded display-side texture cache lives in `album_art_cache`;
 // re-exported here so the pane's controller (and the browser module's
@@ -82,6 +80,12 @@ pub const FALLBACK_PLACEHOLDER_ICON: &str = "audio-x-generic-symbolic";
 pub struct AlbumArtController {
     cache: AlbumArtCache,
     source_registry: Rc<RefCell<Option<crate::source_registry::SourceRegistry>>>,
+    /// Live application config, used only to read the configured library
+    /// roots when resolving the built-in local library's retained
+    /// artwork authority. Wired in later by the window (like the source
+    /// registry); until then a local row resolves with no configured
+    /// roots and fails closed to the placeholder.
+    app_config: Rc<RefCell<Option<Rc<RefCell<crate::ui::preferences::AppConfig>>>>>,
     /// Side length (in device pixels) of each rendered thumbnail.
     /// Wired in from the browser's `BrowserState::album_pane_artwork_size`
     /// cell so the bind factory and the cache probe both read the
@@ -98,6 +102,7 @@ impl AlbumArtController {
         Self {
             cache: AlbumArtCache::new(),
             source_registry: Rc::new(RefCell::new(None)),
+            app_config: Rc::new(RefCell::new(None)),
             pixel_size: Rc::new(RefCell::new(None)),
             placeholder_icon,
         }
@@ -109,6 +114,14 @@ impl AlbumArtController {
     /// resolution path and falls back to the URI/placeholder paths.
     pub fn attach_source_registry(&self, source_registry: crate::source_registry::SourceRegistry) {
         *self.source_registry.borrow_mut() = Some(source_registry);
+    }
+
+    /// Wire the live application config in so the controller can read
+    /// the configured library roots when resolving the built-in local
+    /// library's retained artwork authority. Wired next to
+    /// [`Self::attach_source_registry`] at window construction.
+    pub fn attach_app_config(&self, app_config: Rc<RefCell<crate::ui::preferences::AppConfig>>) {
+        *self.app_config.borrow_mut() = Some(app_config);
     }
 
     /// Wire the live size knob in. The bind factory and the cache probe
@@ -247,24 +260,21 @@ impl AlbumArtBinder {
 
             let candidate = item.artwork_candidate();
             let label_text = item.display();
-            let accessible_label = item.label();
+            // Publish the combined album/count accessible name on the
+            // GtkListItem boundary before either paint path runs; the
+            // cell's image and label are presentational, so the row is
+            // announced as one utterance (matches `bind_browser_row`).
+            bind_album_row_accessibility(list_item, &item);
             if paint_cached_texture(
                 &controller,
                 &cell_state,
                 candidate.as_ref(),
                 pixel_size,
                 &label_text,
-                &accessible_label,
             ) {
                 return;
             }
-            stage_placeholder_fetch(
-                &controller,
-                &cell_state,
-                candidate,
-                &label_text,
-                &accessible_label,
-            );
+            stage_placeholder_fetch(&controller, &cell_state, candidate, &label_text);
         }
     }
 
@@ -284,6 +294,10 @@ impl AlbumArtBinder {
                 *state.bound_source.borrow_mut() = None;
                 disconnect_paintable_listener(&state.cell.image, &state);
             }
+            // A recycled list item must not announce a stale album name
+            // while it waits for its next bind (matches
+            // `unbind_browser_row`).
+            unbind_album_row_accessibility(list_item);
         }
     }
 
@@ -317,6 +331,35 @@ impl AlbumArtBinder {
             state.revoke();
         }
     }
+}
+
+/// The combined accessible name for one album row: the album label plus
+/// its track count, or the bare label when the count is zero. Mirrors
+/// `bind_browser_row`'s `"<label>, (<count>)"` contract so all three
+/// browser panes announce rows consistently.
+pub fn album_row_accessible_label(item: &BrowserItem) -> String {
+    let count = item.count();
+    if count > 0 {
+        format!("{}, ({})", item.label(), count)
+    } else {
+        item.label()
+    }
+}
+
+/// Publish the combined album/count accessible name on the
+/// [`gtk::ListItem`] boundary — the list-row node assistive technology
+/// actually navigates — and leave the cell's children presentational.
+/// Split out (like `bind_browser_row`) so the consolidated GTK test can
+/// drive the exact production contract on a standalone `GtkListItem`.
+pub fn bind_album_row_accessibility(list_item: &gtk::ListItem, item: &BrowserItem) {
+    list_item.set_accessible_label(&album_row_accessible_label(item));
+}
+
+/// Clear the [`gtk::ListItem`]'s accessible name so a recycled row never
+/// announces a stale album while it waits for its next bind. Mirrors
+/// `unbind_browser_row`.
+pub fn unbind_album_row_accessibility(list_item: &gtk::ListItem) {
+    list_item.set_accessible_label("");
 }
 
 impl AlbumArtController {
@@ -353,12 +396,23 @@ impl AlbumArtController {
         let liveness = album_art::ScopedArtFetch::new();
         *cell_state.fetch_liveness.borrow_mut() = Some(liveness.clone());
 
+        // Snapshot the configured library roots for the built-in local
+        // retained-authority route. Captured synchronously on the main
+        // thread; the resolver re-reads nothing from GTK.
+        let configured_roots = self
+            .app_config
+            .borrow()
+            .as_ref()
+            .map(|config| config.borrow().library_paths.clone())
+            .unwrap_or_default();
+
         let fetch = PaneFetch {
             image: cell_state.cell.image.clone(),
             cache: self.cache.clone(),
             source_registry: self.source_registry.clone(),
             album_source: candidate.source_id,
             source_epoch: candidate.source_session_epoch,
+            configured_roots,
             album_key: candidate.track_id.clone(),
             pixel_size: self.current_pixel_size(),
         };
@@ -381,7 +435,6 @@ fn paint_cached_texture(
     candidate: Option<&AlbumArtCandidate>,
     pixel_size: i32,
     label_text: &str,
-    accessible_label: &str,
 ) -> bool {
     let Some(candidate) = candidate else {
         return false;
@@ -396,9 +449,7 @@ fn paint_cached_texture(
     };
     let generation = cell_state.current_generation().next();
     cell_state.generation.set(generation);
-    cell_state
-        .cell
-        .show_texture(&texture, label_text, Some(accessible_label));
+    cell_state.cell.show_texture(&texture, label_text);
     *cell_state.bound_album_key.borrow_mut() = Some(candidate.track_id.clone());
     *cell_state.bound_source.borrow_mut() = candidate.source_id;
     true
@@ -417,13 +468,10 @@ fn stage_placeholder_fetch(
     cell_state: &AlbumArtCellState,
     candidate: Option<AlbumArtCandidate>,
     label_text: &str,
-    accessible_label: &str,
 ) {
     let generation = cell_state.current_generation().next();
     cell_state.generation.set(generation);
-    cell_state
-        .cell
-        .show_placeholder(label_text, Some(accessible_label));
+    cell_state.cell.show_placeholder(label_text);
     *cell_state.bound_album_key.borrow_mut() = candidate.as_ref().map(|cand| cand.track_id.clone());
     *cell_state.bound_source.borrow_mut() = None;
 
@@ -435,18 +483,21 @@ fn stage_placeholder_fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::architecture::SourceId;
+    use resolver::{classify_pane_authority, PaneAuthority};
 
-    /// A `file://` row that carries a registry identity (source id +
-    /// session epoch) must resolve retained authority — the former code
-    /// returned the raw file:// URI and freshly opened its pathname,
-    /// silently bypassing retained removable-media authority
-    /// (2026-09-10 review finding). This decision seam is the gate: the
-    /// raw path is unreachable for identity rows.
+    /// A `file://` row that carries a complete registry identity
+    /// (source id + session epoch + attached registry) must resolve
+    /// retained authority — the former code returned the raw file:// URI
+    /// and freshly opened its pathname, silently bypassing retained
+    /// removable-media authority (2026-09-10 review finding). This
+    /// decision seam is the gate: the raw path is unreachable for
+    /// identity rows.
     #[test]
     fn pane_file_rows_with_source_identity_resolve_retained_authority() {
         assert_eq!(
-            local_file_art_route(true),
-            LocalFileArtRoute::RetainedAuthority,
+            classify_pane_authority(true, Some(SourceId::radio_browser()), Some(7)),
+            PaneAuthority::Registry,
             "identity rows must extract through retained authority, never the raw path"
         );
     }
@@ -458,9 +509,21 @@ mod tests {
     #[test]
     fn pane_file_rows_without_identity_keep_the_transitional_direct_path() {
         assert_eq!(
-            local_file_art_route(false),
-            LocalFileArtRoute::TransitionalDirect,
+            classify_pane_authority(false, None, None),
+            PaneAuthority::External,
             "authority-less rows keep the transitional direct path"
+        );
+    }
+
+    /// The built-in local library row (`SourceId::local()`, no epoch) is
+    /// neither external nor denied: it resolves through the built-in
+    /// local retained authority (2026-09-12 review finding).
+    #[test]
+    fn pane_local_library_rows_resolve_builtin_local_authority() {
+        assert_eq!(
+            classify_pane_authority(false, Some(SourceId::local()), None),
+            PaneAuthority::BuiltinLocal,
+            "built-in local rows must resolve through local retained authority"
         );
     }
 
@@ -582,5 +645,63 @@ mod tests {
         assert_eq!(controller.placeholder_icon(), "audio-x-generic-symbolic");
         let controller2 = AlbumArtController::new("image-missing-symbolic");
         assert_eq!(controller2.placeholder_icon(), "image-missing-symbolic");
+    }
+}
+
+/// Widget-level contracts for the album-artwork row, exercised from the
+/// crate's SINGLE consolidated GTK test (`browser.rs`'s
+/// `gtk_widget_contracts_hold_on_one_session`). Never spawn a second
+/// GTK-initializing `#[test]` — join that test's body instead (see
+/// `ui::widget_test_session`).
+#[cfg(all(test, not(target_os = "macos")))]
+pub mod widget_tests {
+    use super::*;
+
+    /// The album-artwork row must publish its combined album/count
+    /// accessible name on the `GtkListItem` — the list-row boundary —
+    /// and keep the thumbnail and text label presentational so the row
+    /// is announced as one utterance rather than duplicate child
+    /// announcements (2026-09-12 review finding, matching
+    /// `bind_browser_row` / `unbind_browser_row`).
+    pub fn album_art_row_publishes_combined_accessible_name() {
+        let cell = AlbumArtCell::new(FALLBACK_PLACEHOLDER_ICON);
+        let list_item: gtk::ListItem = glib::Object::new();
+        list_item.set_child(Some(&cell.row));
+
+        assert_eq!(
+            cell.label.accessible_role(),
+            gtk::AccessibleRole::Presentation,
+            "the album text label must be presentational"
+        );
+        assert_eq!(
+            cell.image.accessible_role(),
+            gtk::AccessibleRole::Presentation,
+            "the album thumbnail must be presentational"
+        );
+
+        let item = BrowserItem::new("Kind of Blue", 9);
+        bind_album_row_accessibility(&list_item, &item);
+        assert_eq!(
+            list_item.accessible_label(),
+            "Kind of Blue, (9)",
+            "the combined album/count name belongs on the GtkListItem boundary"
+        );
+
+        unbind_album_row_accessibility(&list_item);
+        assert_eq!(
+            list_item.accessible_label(),
+            "",
+            "unbind must clear the accessible name so a recycled row is not stale"
+        );
+    }
+
+    /// A zero-count album row (only the synthetic "All" row when the
+    /// library is empty) announces the bare label, never a meaningless
+    /// "(0)"; mirrors the zero-count browser-row contract.
+    pub fn album_art_row_zero_count_announces_bare_label() {
+        let list_item: gtk::ListItem = glib::Object::new();
+        let item = BrowserItem::new("All", 0);
+        bind_album_row_accessibility(&list_item, &item);
+        assert_eq!(list_item.accessible_label(), "All");
     }
 }

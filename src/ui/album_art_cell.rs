@@ -45,7 +45,12 @@ impl AlbumArtCell {
             .icon_name(placeholder_icon)
             .pixel_size(Self::PLACEHOLDER_PIXEL_SIZE)
             .build();
-        image.set_accessible_role(gtk::AccessibleRole::Img);
+        // Presentational: the album row publishes its combined
+        // album/count accessible name on the GtkListItem boundary (the
+        // list-row node assistive technology navigates), so the
+        // thumbnail and text label must not be announced as separate
+        // children. Mirrors `bind_browser_row`'s presentational labels.
+        image.set_accessible_role(gtk::AccessibleRole::Presentation);
         let label = gtk::Label::builder()
             .halign(gtk::Align::Start)
             .margin_start(8)
@@ -54,6 +59,7 @@ impl AlbumArtCell {
             .margin_bottom(2)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
+        label.set_accessible_role(gtk::AccessibleRole::Presentation);
         let row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(0)
@@ -78,31 +84,18 @@ impl AlbumArtCell {
     /// which cleared the freshly installed icon paintable and rendered
     /// the missing-art state as a blank square (2026-09-07 review
     /// finding).
-    pub(crate) fn show_placeholder(&self, label_text: &str, accessible_label: Option<&str>) {
+    pub(crate) fn show_placeholder(&self, label_text: &str) {
         self.image.set_icon_name(Some(self.placeholder_icon));
         self.label.set_text(label_text);
         self.label.set_tooltip_text(Some(label_text));
-        if let Some(text) = accessible_label {
-            self.image
-                .update_property(&[gtk::accessible::Property::Label(text)]);
-        }
     }
 
     /// Replace the placeholder with the supplied texture.
-    pub(crate) fn show_texture(
-        &self,
-        texture: &gdk::Texture,
-        label_text: &str,
-        accessible_label: Option<&str>,
-    ) {
+    pub(crate) fn show_texture(&self, texture: &gdk::Texture, label_text: &str) {
         self.image.set_icon_name(None);
         self.image.set_paintable(Some(texture));
         self.label.set_text(label_text);
         self.label.set_tooltip_text(Some(label_text));
-        if let Some(text) = accessible_label {
-            self.image
-                .update_property(&[gtk::accessible::Property::Label(text)]);
-        }
     }
 }
 
@@ -349,7 +342,7 @@ pub mod widget_tests {
         let cell = AlbumArtCell::new("audio-x-generic-symbolic");
         // Simulate a recycled row that previously painted a texture: the
         // placeholder reset must replace — not blank — the image content.
-        cell.show_placeholder("Album", Some("Album"));
+        cell.show_placeholder("Album");
         assert_eq!(
             cell.image.icon_name().as_deref(),
             Some("audio-x-generic-symbolic"),

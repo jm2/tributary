@@ -460,62 +460,99 @@ struct LocalArtJob {
     reply_tx: async_channel::Sender<Vec<u8>>,
 }
 
-/// Get (or lazily create) the bounded job queue for the local-art pool.
+/// Get (or lazily create) the isolated local-art extraction lanes.
 ///
-/// The pool runs a fixed [`MAX_LOCAL_ART_WORKERS`] threads fed by one
-/// queue bounded at [`MAX_PENDING_LOCAL_ART_JOBS`]. The former design
-/// spawned one OS thread per scheduled extraction — one per visible-row
-/// bind in a virtualized pane — so a fast scroll could mint dozens of
-/// threads (2026-09-10 review finding). Jobs beyond the queue bound are
-/// refused at enqueue time and their receivers observe a closed channel.
-fn local_art_queue() -> Option<&'static async_channel::Sender<LocalArtJob>> {
-    static QUEUE: OnceLock<Option<async_channel::Sender<LocalArtJob>>> = OnceLock::new();
-    QUEUE
+/// The now-playing header and the browser album pane must not share one
+/// queue: a fast scroll can enqueue dozens of slow pane extractions, and
+/// a shared two-worker/64-job pool then either delays the header's one
+/// request behind every pane parser or drops it outright when the pane
+/// lane is saturated (2026-09-12 review finding). Each side therefore
+/// gets its own lane:
+///
+/// * `header_tx` — unbounded, served by one dedicated worker. Header
+///   volume is one request per track change, so the queue cannot grow
+///   without bound in practice, and the header can never queue behind
+///   pane work.
+/// * `pane_tx` — bounded at [`MAX_PENDING_LOCAL_ART_JOBS`] and served by
+///   [`MAX_LOCAL_ART_WORKERS`] workers. A saturated pane lane refuses new
+///   pane jobs at enqueue time instead of growing pending work, and never
+///   touches header capacity.
+struct LocalArtLanes {
+    header_tx: std::sync::mpsc::Sender<LocalArtJob>,
+    pane_tx: async_channel::Sender<LocalArtJob>,
+}
+
+fn local_art_lanes() -> Option<&'static LocalArtLanes> {
+    static LANES: OnceLock<Option<LocalArtLanes>> = OnceLock::new();
+    LANES
         .get_or_init(|| {
-            let (job_tx, job_rx) =
+            let (header_tx, header_rx) = std::sync::mpsc::channel::<LocalArtJob>();
+            let header_spawned = std::thread::Builder::new()
+                .name("local-art-worker-header".to_string())
+                .spawn(move || {
+                    while let Ok(job) = header_rx.recv() {
+                        run_local_art_job(job);
+                    }
+                })
+                .map_err(|error| {
+                    tracing::warn!(%error, "Failed to spawn local album-art header worker");
+                })
+                .is_ok();
+
+            let (pane_tx, pane_rx) =
                 async_channel::bounded::<LocalArtJob>(MAX_PENDING_LOCAL_ART_JOBS);
-            let mut spawned = 0;
+            let mut pane_workers = 0;
             for worker_index in 0..MAX_LOCAL_ART_WORKERS {
-                let job_rx = job_rx.clone();
+                let pane_rx = pane_rx.clone();
                 let spawn_result = std::thread::Builder::new()
                     .name(format!("local-art-worker-{worker_index}"))
                     .spawn(move || {
-                        while let Ok(job) = job_rx.recv_blocking() {
-                            let LocalArtJob {
-                                liveness,
-                                extract,
-                                reply_tx,
-                            } = job;
-                            if !liveness.is_valid() {
-                                continue;
-                            }
-                            // A panicking extractor must cost the job its
-                            // reply, not the pool its worker: the panic is
-                            // contained here, dropping the reply sender
-                            // closes the awaiting receiver, and this thread
-                            // re-enters the loop at full pool capacity.
-                            let extracted =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                                    extract()
-                                }))
-                                .ok()
-                                .flatten();
-                            if let Some(bytes) = extracted {
-                                if liveness.is_valid() {
-                                    let _ = reply_tx.send_blocking(bytes);
-                                }
-                            }
+                        while let Ok(job) = pane_rx.recv_blocking() {
+                            run_local_art_job(job);
                         }
                     });
                 if let Err(error) = spawn_result {
                     tracing::warn!(%error, "Failed to spawn local album-art worker");
                     break;
                 }
-                spawned += 1;
+                pane_workers += 1;
             }
-            (spawned > 0).then_some(job_tx)
+
+            (header_spawned || pane_workers > 0).then_some(LocalArtLanes { header_tx, pane_tx })
         })
         .as_ref()
+}
+
+/// The pane lane's queue, exposed so the pool-bound regression test can
+/// saturate exactly the bounded lane without disturbing the header lane.
+#[cfg(test)]
+fn local_art_pane_queue() -> Option<&'static async_channel::Sender<LocalArtJob>> {
+    local_art_lanes().map(|lanes| &lanes.pane_tx)
+}
+
+/// Run one local embedded-art extraction on whichever lane dequeued it.
+///
+/// A panicking extractor must cost the job its reply, not the lane its
+/// worker: the panic is contained here, dropping the reply sender closes
+/// the awaiting receiver, and the worker re-enters its loop at full
+/// capacity (2026-09-11 suite-hang fix).
+fn run_local_art_job(job: LocalArtJob) {
+    let LocalArtJob {
+        liveness,
+        extract,
+        reply_tx,
+    } = job;
+    if !liveness.is_valid() {
+        return;
+    }
+    let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(extract))
+        .ok()
+        .flatten();
+    if let Some(bytes) = extracted {
+        if liveness.is_valid() {
+            let _ = reply_tx.send_blocking(bytes);
+        }
+    }
 }
 
 fn enqueue_local_art_job<F>(
@@ -534,17 +571,26 @@ where
     if !liveness.is_valid() {
         return rx;
     }
-    let queued = local_art_queue().is_some_and(|queue| {
-        queue
-            .try_send(LocalArtJob {
-                liveness,
-                extract: Box::new(extract),
-                reply_tx: tx,
-            })
-            .is_ok()
-    });
+    let job = LocalArtJob {
+        liveness: liveness.clone(),
+        extract: Box::new(extract),
+        reply_tx: tx,
+    };
+    let queued = match liveness {
+        // Header lane: dedicated and unbounded, so the header's request
+        // is never refused by pane backlog and never queued behind pane
+        // extraction.
+        RequestLiveness::GlobalGeneration(_) => {
+            local_art_lanes().is_some_and(|lanes| lanes.header_tx.send(job).is_ok())
+        }
+        // Pane lane: bounded; a full lane refuses this job at enqueue
+        // time instead of growing pending work without bound.
+        RequestLiveness::Scoped(_) => {
+            local_art_lanes().is_some_and(|lanes| lanes.pane_tx.try_send(job).is_ok())
+        }
+    };
     if !queued {
-        // The job was refused (pool queue full) or the pool is gone; the
+        // The job was refused (pane queue full) or no lane exists; the
         // job — including its reply sender — is dropped and the awaiting
         // reply observes a closed channel.
     }
@@ -1604,7 +1650,7 @@ mod tests {
 
         // Fill the pending backlog to capacity (job three occupies one
         // pending slot), then refuse one more.
-        let queue = local_art_queue().expect("local art pool initialized");
+        let queue = local_art_pane_queue().expect("local art pane pool initialized");
         fill_pending_backlog(queue, 1);
         let (seen4_tx, _seen4_rx) = mpsc::sync_channel(0);
         let refused = enqueue_local_art_job(scoped(), move || {
@@ -1629,6 +1675,62 @@ mod tests {
         assert_eq!(
             reply3.recv_blocking().expect("worker three reply"),
             b"three"
+        );
+    }
+
+    /// A saturated pane lane must not delay or drop the header's local
+    /// (now-playing) extraction: the lanes are isolated, so the header
+    /// job runs on its dedicated worker while BOTH pane workers and the
+    /// full pane backlog are blocked. Previously the shared
+    /// two-worker/64-job pool let a saturated pane backlog delay the
+    /// header behind every pane extraction or refuse it outright with
+    /// `try_send` (2026-09-12 review finding).
+    #[test]
+    fn saturated_pane_lane_does_not_starve_the_header_lane() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let scoped = || RequestLiveness::Scoped(ScopedArtFetch::new());
+
+        // Occupy BOTH pane workers with blocking extractions.
+        let (_reply1, release1_tx) = occupy_pool_worker(scoped(), b"pane-one");
+        let (_reply2, release2_tx) = occupy_pool_worker(scoped(), b"pane-two");
+
+        // Saturate the pane backlog exactly to capacity. The two blocked
+        // jobs are held by the workers, not queued, so fill every slot.
+        let queue = local_art_pane_queue().expect("local art pane pool initialized");
+        fill_pending_backlog(queue, 0);
+
+        // The header job must still be admitted and run promptly on its
+        // own lane while the pane lane is completely saturated.
+        let generation = next_generation();
+        let (header_seen_tx, header_seen_rx) = mpsc::sync_channel(0);
+        let header_reply =
+            enqueue_local_art_job(RequestLiveness::GlobalGeneration(generation), move || {
+                header_seen_tx.send(()).expect("report header worker");
+                Some(b"header-art".to_vec())
+            });
+        header_seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("header extraction must run despite a saturated pane lane");
+        assert_eq!(
+            header_reply.recv_blocking().expect("header reply"),
+            b"header-art"
+        );
+
+        // Release the pane workers and wait for the queued fillers to
+        // drain so the exact-bound pool test that follows under the same
+        // lock starts from an empty pane lane.
+        release1_tx.send(()).expect("release pane worker one");
+        release2_tx.send(()).expect("release pane worker two");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !queue.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            queue.is_empty(),
+            "the pane backlog must drain after release"
         );
     }
 

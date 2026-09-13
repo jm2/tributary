@@ -1,13 +1,16 @@
 //! The album pane's artwork resolution tree.
 //!
 //! Split verbatim from `album_pane_art.rs` so each module stays under
-//! the file-size budget. Every boundary is unchanged: a row that
-//! carries a registry identity resolves its `file://` artwork through
-//! the retained local-media authority (exact retained file
-//! capability, never a reopened pathname); remote rows go through
-//! the lease-isolated `SourceRegistry::resolve_artwork`; only rows
+//! the file-size budget, then extended with an explicit authority
+//! classification (2026-09-12 review finding). Every boundary is
+//! unchanged in spirit: a row that carries a complete registry identity
+//! resolves its `file://` artwork through the retained local-media
+//! authority (exact retained file capability, never a reopened
+//! pathname) and its remote artwork through the lease-isolated
+//! `SourceRegistry::resolve_artwork`; the built-in local library row
+//! resolves through the built-in local retained authority; only rows
 //! with no authority chain at all keep the transitional direct path,
-//! and every failure fails closed for the local path.
+//! and every failure fails closed.
 
 use crate::architecture::media::ResolvedHttpRequest;
 use crate::architecture::SourceId;
@@ -33,34 +36,47 @@ pub(super) enum ResolvedArtKind {
     ResolvedRequest(Box<ResolvedHttpRequest>),
 }
 
-/// Which extraction route a `file://` album row must take.
+/// The authority chain one album-pane row actually carries.
 ///
-/// A row that carries a registry identity (source + session epoch) MUST
-/// resolve its artwork through the retained local-media authority: the
-/// former code returned the raw `file://` URI and freshly opened its
-/// pathname, silently bypassing retained removable-media authority
-/// (2026-09-10 review finding). Only rows with no authority chain at all
-/// (external OS-opened files) keep the transitional direct path.
+/// The former code collapsed "the row carries a source identity but the
+/// registry/epoch is missing" into "no identity", so an incomplete or
+/// revoked retained identity could fall through to the row's stale raw
+/// `cover_art_url` (or reopen a raw `file://` pathname). Truly external
+/// rows with no source identity are the only class that may use the
+/// transitional direct path; every source-bearing class must resolve
+/// through its authority or leave the placeholder (2026-09-12 review
+/// finding).
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum LocalFileArtRoute {
-    /// Resolve `ResolvedLocalMedia` through the registry, then extract
-    /// through the retained handle.
-    RetainedAuthority,
-    /// No authority chain exists; keep the transitional direct path.
-    TransitionalDirect,
+pub(super) enum PaneAuthority {
+    /// Registry handle, source id, and a current source session epoch.
+    Registry,
+    /// The built-in local library: `SourceId::local()` with no session
+    /// epoch (`arch_track_to_object` never mints one). Resolves through
+    /// the built-in local retained authority.
+    BuiltinLocal,
+    /// A retained source identity is present, but the registry handle or
+    /// the session epoch is missing. Never fall back to a raw path/URL.
+    IncompleteRetained,
+    /// No source identity at all (e.g., OS-opened external files).
+    External,
 }
 
-pub(super) fn local_file_art_route(has_registry_identity: bool) -> LocalFileArtRoute {
-    if has_registry_identity {
-        LocalFileArtRoute::RetainedAuthority
-    } else {
-        LocalFileArtRoute::TransitionalDirect
+/// Classify one row's authority chain from its raw candidate inputs.
+pub(super) fn classify_pane_authority(
+    has_registry: bool,
+    source_id: Option<SourceId>,
+    source_epoch: Option<u64>,
+) -> PaneAuthority {
+    match (has_registry, source_id, source_epoch) {
+        // The built-in local library is identified by its reserved source
+        // id, independent of whether a registry handle is attached: it
+        // has no registry session to resolve through.
+        (_, Some(id), _) if id == SourceId::local() => PaneAuthority::BuiltinLocal,
+        (true, Some(_), Some(_)) => PaneAuthority::Registry,
+        (_, Some(_), _) => PaneAuthority::IncompleteRetained,
+        (_, None, _) => PaneAuthority::External,
     }
 }
-
-/// The pane's registry-backed identity for one row: the registry handle,
-/// the source id, and the source session epoch.
-type PaneRegistryIdentity<'a> = (&'a crate::source_registry::SourceRegistry, SourceId, u64);
 
 /// Build the architecture `TrackId` for one pane resolution, logging and
 /// rejecting the row when its track id is invalid.
@@ -82,70 +98,109 @@ pub(super) async fn resolve_kind(
     source_registry: Option<crate::source_registry::SourceRegistry>,
     source_id: Option<SourceId>,
     source_epoch: Option<u64>,
+    configured_roots: Vec<String>,
     candidate: &AlbumArtCandidate,
     cover_art_url: String,
     uri: String,
 ) -> ResolvedArtKind {
-    let registry_identity = match (source_registry.as_ref(), source_id, source_epoch) {
-        (Some(registry), Some(id), Some(epoch)) => Some((registry, id, epoch)),
-        _ => None,
-    };
-    // Retained local-media authority first: a row whose playable locator
-    // is a file:// URI keeps its authority through the album pane — no
-    // remote resolver is consulted first, no opaque credentials are
-    // minted, and no pathname is reopened.
-    if uri.starts_with("file://") {
-        if let Some(resolved) =
-            resolve_local_file_art(registry_identity.as_ref(), candidate, &uri).await
-        {
-            return resolved;
+    match classify_pane_authority(source_registry.is_some(), source_id, source_epoch) {
+        PaneAuthority::Registry => {
+            let (registry, id, epoch) = (
+                source_registry
+                    .as_ref()
+                    .expect("registry authority requires a handle"),
+                source_id.expect("registry authority requires a source id"),
+                source_epoch.expect("registry authority requires a session epoch"),
+            );
+            // Retained local-media authority first: a row whose playable
+            // locator is a file:// URI keeps its authority through the
+            // album pane — no remote resolver is consulted first, no
+            // opaque credentials are minted, and no pathname is reopened.
+            if uri.starts_with("file://") {
+                if let Some(resolved) =
+                    resolve_retained_file_art(registry, &id, epoch, candidate).await
+                {
+                    return resolved;
+                }
+                // `Ok(Http)` or an error means the retained local route
+                // did not produce a file capability; fall through to the
+                // lease-isolated remote resolver for this registry-backed
+                // row. Never a raw pathname.
+            }
+            // Lease-isolated remote resolver. For a registry-backed row
+            // this is TERMINAL: an explicit no-artwork or a refused
+            // resolution leaves the placeholder rather than falling
+            // through to the row's stale snapshot URL (2026-09-12 review
+            // finding).
+            resolve_remote_artwork(registry, &id, epoch, candidate).await
+        }
+        PaneAuthority::BuiltinLocal => {
+            resolve_builtin_local_art(candidate, &configured_roots).await
+        }
+        PaneAuthority::IncompleteRetained => {
+            // A retained source identity whose registry handle or session
+            // epoch is missing (revoked/refused/stale). Do NOT fall back
+            // to the raw snapshot URL or reopen a raw file URI: leave the
+            // placeholder.
+            tracing::debug!(
+                track_id = %candidate.track_id,
+                "Album pane left placeholder for an incomplete retained identity"
+            );
+            ResolvedArtKind::NoArtwork
+        }
+        PaneAuthority::External => {
+            // Truly external rows with no authority chain at all
+            // (e.g., OS-opened external files) keep the transitional
+            // direct path.
+            if uri.starts_with("file://") {
+                ResolvedArtKind::DirectFile { uri }
+            } else if !cover_art_url.is_empty() {
+                ResolvedArtKind::DirectUrl { url: cover_art_url }
+            } else {
+                ResolvedArtKind::NoArtwork
+            }
         }
     }
-    // Lease-isolated remote resolver.
-    if let Some(resolved) =
-        resolve_remote_artwork(registry_identity.as_ref(), candidate, &cover_art_url).await
-    {
-        return resolved;
-    }
-    // Legacy direct URL fallback for rows that ship one and do not
-    // resolve through any source registry.
-    if !cover_art_url.is_empty() {
-        return ResolvedArtKind::DirectUrl { url: cover_art_url };
-    }
-    ResolvedArtKind::NoArtwork
 }
 
-/// The `file://` arm of the pane resolver. A row that carries a registry
-/// identity resolves an exact retained file capability and extracts
-/// through it — never a reopened pathname (2026-09-10 review finding).
-/// Only rows with no authority chain at all (external OS-opened files)
-/// take the transitional direct path.
+/// The built-in local library's artwork arm.
 ///
-/// Returns `None` when resolution should fall through to the remote
-/// artwork resolver: the authority reported the stream as remote, or the
-/// retained authority refused and the lease-isolated route may still
-/// serve the artwork. Any `Some(_)` is terminal.
-async fn resolve_local_file_art(
-    registry_identity: Option<&PaneRegistryIdentity<'_>>,
+/// A local row carries `SourceId::local()` with no session epoch, so it
+/// has no registry session to resolve through. It must still resolve
+/// through the built-in local retained authority
+/// ([`crate::local::resolver::resolve_track`]) rather than reopening its
+/// raw `file://` pathname; a refused/absent resolution leaves the
+/// placeholder. This preserves local artwork without classifying every
+/// local row as external (2026-09-12 review finding).
+async fn resolve_builtin_local_art(
     candidate: &AlbumArtCandidate,
-    uri: &str,
-) -> Option<ResolvedArtKind> {
-    match local_file_art_route(registry_identity.is_some()) {
-        LocalFileArtRoute::RetainedAuthority => {
-            let Some((registry, id, epoch)) = registry_identity else {
-                // Unreachable by construction — the route above was chosen
-                // from this very predicate — but fail closed regardless:
-                // never fall back to a raw pathname open.
-                return Some(ResolvedArtKind::NoArtwork);
-            };
-            resolve_retained_file_art(registry, id, *epoch, candidate).await
+    configured_roots: &[String],
+) -> ResolvedArtKind {
+    if candidate.track_id.is_empty() {
+        return ResolvedArtKind::NoArtwork;
+    }
+    let db = match crate::db::connection::init_db().await {
+        Ok(db) => db,
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                track_id = %candidate.track_id,
+                "Album pane local library database unavailable"
+            );
+            return ResolvedArtKind::NoArtwork;
         }
-        LocalFileArtRoute::TransitionalDirect => {
-            // Transitional path for rows with NO retained authority
-            // chain (e.g., OS-opened external files).
-            Some(ResolvedArtKind::DirectFile {
-                uri: uri.to_string(),
-            })
+    };
+    match crate::local::resolver::resolve_track(&db, candidate.track_id.as_str(), configured_roots)
+        .await
+    {
+        Ok(media) => ResolvedArtKind::ResolvedFile { media },
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                track_id = %candidate.track_id,
+                "Album pane built-in local artwork authority unavailable"
+            );
+            ResolvedArtKind::NoArtwork
         }
     }
 }
@@ -203,40 +258,236 @@ async fn resolve_retained_file_art(
 
 /// The remote arm of the pane resolver: one lease-isolated
 /// [`SourceRegistry::resolve_artwork`] call for a registry-backed row.
-/// Returns `None` when resolution should fall through to the legacy
-/// direct-URL path (no registry identity, or the backend errored);
-/// any `Some(_)` is terminal.
+///
+/// Terminal by construction: `Ok(Some(_))` produces the resolved
+/// request; an explicit `Ok(None)` (authoritative no-artwork) and an
+/// `Err` (refused/errored authority) both leave the placeholder. A
+/// registry-backed row never regains access through its stale snapshot
+/// URL (2026-09-12 review finding).
 async fn resolve_remote_artwork(
-    registry_identity: Option<&PaneRegistryIdentity<'_>>,
+    registry: &crate::source_registry::SourceRegistry,
+    id: &SourceId,
+    epoch: u64,
     candidate: &AlbumArtCandidate,
-    cover_art_url: &str,
-) -> Option<ResolvedArtKind> {
-    let (registry, id, epoch) = registry_identity?;
+) -> ResolvedArtKind {
     let Some(track_id) = pane_track_id(candidate) else {
-        return Some(ResolvedArtKind::NoArtwork);
+        return ResolvedArtKind::NoArtwork;
     };
-    match registry.resolve_artwork(*id, *epoch, track_id).await {
-        Ok(Some(request)) => Some(ResolvedArtKind::ResolvedRequest(Box::new(request))),
+    match registry.resolve_artwork(*id, epoch, track_id).await {
+        Ok(Some(request)) => ResolvedArtKind::ResolvedRequest(Box::new(request)),
         Ok(None) => {
-            // Remote source returned no artwork for this track — try
-            // the legacy embedded cover URL on the row before giving
-            // up, so a row that has both a remote and a URL still
-            // gets a thumbnail.
-            if !cover_art_url.is_empty() {
-                return Some(ResolvedArtKind::DirectUrl {
-                    url: cover_art_url.to_string(),
-                });
-            }
-            Some(ResolvedArtKind::NoArtwork)
+            tracing::debug!(
+                source_id = %id,
+                track_id = %candidate.track_id,
+                "Album pane source authority reported no artwork; leaving placeholder"
+            );
+            ResolvedArtKind::NoArtwork
         }
         Err(error) => {
             tracing::debug!(
                 %error,
                 source_id = %id,
                 track_id = %candidate.track_id,
-                "Album pane artwork resolver fell back after backend error"
+                "Album pane artwork authority refused; leaving placeholder"
             );
-            None
+            ResolvedArtKind::NoArtwork
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local() -> SourceId {
+        SourceId::local()
+    }
+
+    /// Any non-local source identity (a network adapter, removable
+    /// filesystem, or the built-in radio adapter).
+    fn other_source() -> SourceId {
+        SourceId::radio_browser()
+    }
+
+    /// A row with a complete registry identity resolves through the
+    /// registry (retained local authority first for file rows, the
+    /// lease-isolated remote resolver otherwise) — never the transitional
+    /// direct path.
+    #[test]
+    fn complete_registry_identity_is_registry_authority() {
+        assert_eq!(
+            classify_pane_authority(true, Some(other_source()), Some(7)),
+            PaneAuthority::Registry
+        );
+    }
+
+    /// The normal built-in local library row: `SourceId::local()` with no
+    /// session epoch. It must resolve through the built-in local retained
+    /// authority, not be denied and not be classified as external.
+    #[test]
+    fn local_library_row_without_epoch_is_builtin_local() {
+        assert_eq!(
+            classify_pane_authority(false, Some(local()), None),
+            PaneAuthority::BuiltinLocal
+        );
+        // A registry handle being present does not change the local
+        // classification: the built-in library has no registry session.
+        assert_eq!(
+            classify_pane_authority(true, Some(local()), None),
+            PaneAuthority::BuiltinLocal
+        );
+    }
+
+    /// A retained source identity whose session epoch was revoked/stripped
+    /// must fail closed, never fall through to a raw URL/path.
+    #[test]
+    fn retained_identity_without_epoch_is_incomplete() {
+        assert_eq!(
+            classify_pane_authority(true, Some(other_source()), None),
+            PaneAuthority::IncompleteRetained
+        );
+    }
+
+    /// A retained source identity whose registry handle is missing must
+    /// also fail closed — a late/unwired registry is not "no identity".
+    #[test]
+    fn retained_identity_without_registry_is_incomplete() {
+        assert_eq!(
+            classify_pane_authority(false, Some(other_source()), Some(7)),
+            PaneAuthority::IncompleteRetained
+        );
+    }
+
+    /// Only rows with no authority chain at all keep the transitional
+    /// direct path (external OS-opened files).
+    #[test]
+    fn no_source_identity_is_external() {
+        assert_eq!(
+            classify_pane_authority(false, None, None),
+            PaneAuthority::External
+        );
+        assert_eq!(
+            classify_pane_authority(true, None, None),
+            PaneAuthority::External
+        );
+        // An epoch without a source id is meaningless and still external.
+        assert_eq!(
+            classify_pane_authority(false, None, Some(7)),
+            PaneAuthority::External
+        );
+    }
+
+    fn candidate(
+        uri: &str,
+        cover_art_url: &str,
+        source_id: Option<SourceId>,
+        epoch: Option<u64>,
+    ) -> AlbumArtCandidate {
+        AlbumArtCandidate {
+            track_id: "track-1".to_string(),
+            uri: uri.to_string(),
+            cover_art_url: cover_art_url.to_string(),
+            source_id,
+            source_session_epoch: epoch,
+        }
+    }
+
+    /// End-to-end resolution for an incomplete retained identity: a row
+    /// that still carries a source id but whose session epoch was
+    /// revoked/stripped (or whose registry handle is absent) must leave
+    /// the placeholder. It must never fall through to the stale snapshot
+    /// `cover_art_url`, and never reopen the raw `file://` pathname
+    /// (2026-09-12 review finding).
+    #[tokio::test]
+    async fn incomplete_retained_identity_leaves_the_placeholder() {
+        // Epoch revoked while the source id survives.
+        let no_epoch = candidate(
+            "file:///media/music/album/01.flac",
+            "https://stale.example/cover.jpg",
+            Some(other_source()),
+            None,
+        );
+        let resolved = resolve_kind(
+            None,
+            no_epoch.source_id,
+            no_epoch.source_session_epoch,
+            Vec::new(),
+            &no_epoch,
+            no_epoch.cover_art_url.clone(),
+            no_epoch.uri.clone(),
+        )
+        .await;
+        assert!(
+            matches!(resolved, ResolvedArtKind::NoArtwork),
+            "a revoked epoch must not regain access through the stale URL"
+        );
+
+        // Registry handle missing while the source identity survives.
+        let no_registry = candidate(
+            "file:///media/music/album/01.flac",
+            "https://stale.example/cover.jpg",
+            Some(other_source()),
+            Some(7),
+        );
+        let resolved = resolve_kind(
+            None,
+            no_registry.source_id,
+            no_registry.source_session_epoch,
+            Vec::new(),
+            &no_registry,
+            no_registry.cover_art_url.clone(),
+            no_registry.uri.clone(),
+        )
+        .await;
+        assert!(
+            matches!(resolved, ResolvedArtKind::NoArtwork),
+            "an unwired registry is not 'no identity' and must fail closed"
+        );
+    }
+
+    /// The genuinely external compatibility path survives: a row with NO
+    /// source identity at all keeps its transitional direct locator, and
+    /// a row with neither locator leaves the placeholder rather than
+    /// fabricating one (2026-09-12 review finding).
+    #[tokio::test]
+    async fn external_rows_keep_the_transitional_direct_path() {
+        let file_row = candidate("file:///tmp/external.flac", "", None, None);
+        let resolved = resolve_kind(
+            None,
+            None,
+            None,
+            Vec::new(),
+            &file_row,
+            String::new(),
+            file_row.uri.clone(),
+        )
+        .await;
+        assert!(matches!(resolved, ResolvedArtKind::DirectFile { .. }));
+
+        let url_row = candidate("", "https://example.test/cover.jpg", None, None);
+        let resolved = resolve_kind(
+            None,
+            None,
+            None,
+            Vec::new(),
+            &url_row,
+            url_row.cover_art_url.clone(),
+            String::new(),
+        )
+        .await;
+        assert!(matches!(resolved, ResolvedArtKind::DirectUrl { .. }));
+
+        let empty_row = candidate("", "", None, None);
+        let resolved = resolve_kind(
+            None,
+            None,
+            None,
+            Vec::new(),
+            &empty_row,
+            String::new(),
+            String::new(),
+        )
+        .await;
+        assert!(matches!(resolved, ResolvedArtKind::NoArtwork));
     }
 }

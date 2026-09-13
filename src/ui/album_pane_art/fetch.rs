@@ -32,6 +32,11 @@ pub(super) struct PaneFetch {
     pub(super) source_registry: Rc<RefCell<Option<crate::source_registry::SourceRegistry>>>,
     pub(super) album_source: Option<SourceId>,
     pub(super) source_epoch: Option<u64>,
+    /// Configured library roots, snapshotted on the main thread when the
+    /// fetch was scheduled. The built-in local library's retained
+    /// authority resolves against exactly these roots; the async
+    /// resolver must not re-read GTK/preferences state.
+    pub(super) configured_roots: Vec<String>,
     pub(super) album_key: String,
     pub(super) pixel_size: i32,
 }
@@ -56,6 +61,16 @@ pub(super) fn orchestrate_pane_fetch(
     liveness: album_art::ScopedArtFetch,
 ) {
     let registry_handle = fetch.source_registry.borrow().clone();
+    // Capture the catalogue content generation SYNCHRONOUSLY, before the
+    // resolver's first await. `finish_pane_fetch` used to sample
+    // `cache.content_generation()` only AFTER awaiting the resolver and
+    // dispatching the paint, so a FullSync that landed during that await
+    // labelled a texture resolved from the OLD catalogue with the NEW
+    // generation — exactly the schedule-time/admission-time disagreement
+    // `CacheAdmission` documents against (2026-09-12 review finding). The
+    // schedule-time generation is carried through paint and admission, and
+    // admission additionally rejects the result if the generation moved.
+    let content_generation = fetch.cache.content_generation();
     glib::MainContext::default().spawn_local(async move {
         // Step 1: resolve the artwork path. The decision tree mirrors
         // the playback-time resolver: authority-backed local rows extract
@@ -66,12 +81,20 @@ pub(super) fn orchestrate_pane_fetch(
             registry_handle,
             fetch.album_source,
             fetch.source_epoch,
+            fetch.configured_roots.clone(),
             &candidate,
             candidate.cover_art_url.clone(),
             candidate.uri.clone(),
         )
         .await;
-        finish_pane_fetch(fetch, cell_state, generation, liveness, resolved);
+        finish_pane_fetch(
+            fetch,
+            cell_state,
+            generation,
+            liveness,
+            resolved,
+            content_generation,
+        );
     });
 }
 
@@ -84,6 +107,7 @@ fn finish_pane_fetch(
     generation: BindGeneration,
     liveness: album_art::ScopedArtFetch,
     resolved: ResolvedArtKind,
+    content_generation: u64,
 ) {
     // Mid-flight cancellation: if the row was unbound or
     // re-bound while the resolver was running, exit silently.
@@ -106,27 +130,35 @@ fn finish_pane_fetch(
         pixel_size,
         ..
     } = fetch;
-    paint_resolved_art(resolved, &image, &liveness);
 
-    // Cache the texture only once the worker publishes it. The
-    // worker delivers bytes through `gdk::Texture::from_bytes`
-    // synchronously on the GTK main loop, so we listen for the
-    // resulting `paintable` property change.
-    let content_generation = cache.content_generation();
+    // Install the cache-admission listener BEFORE dispatching the paint.
+    // The painter hands work to the persistent album-art worker, and the
+    // worker's reply is delivered on the main context; connecting the
+    // listener first makes the "no synchronous paint can precede listener
+    // installation" invariant explicit instead of relying on every
+    // current reply path happening to be deferred (2026-09-12 review
+    // finding). The probe admits only a `gdk::Texture` — the placeholder
+    // icon is a `GtkIconPaintable`, so the explicit placeholder set in
+    // [`paint_resolved_art`] cannot seed the cache.
     install_cache_probe(
         CacheAdmission {
             cache,
             source: album_source,
             source_epoch,
+            // Schedule-time catalogue identity, captured before the
+            // resolver awaited; admission rejects the result if the live
+            // generation has since moved.
             content_generation,
             album_key,
             pixel_size,
         },
-        image,
-        cell_state,
+        image.clone(),
+        cell_state.clone(),
         generation,
-        liveness,
+        liveness.clone(),
     );
+
+    paint_resolved_art(resolved, &image, &liveness);
 }
 
 /// Paint one resolved artwork outcome onto the row's image. Extracted
@@ -156,7 +188,7 @@ fn paint_resolved_art(
             // Transitional path for rows with NO retained authority
             // chain (e.g., OS-opened external files). Rows carrying a
             // source identity never reach this arm — see
-            // [`resolve_kind`] and [`LocalFileArtRoute`].
+            // [`resolve_kind`] and [`super::resolver::PaneAuthority`].
             album_art::update_direct_file_album_art_scoped(image, &uri, liveness);
         }
         ResolvedArtKind::DirectUrl { url } => {
@@ -218,6 +250,22 @@ pub(super) fn disconnect_paintable_listener(image: &gtk::Image, cell_state: &Alb
     }
 }
 
+/// Whether a texture resolved against `scheduled_generation` may be
+/// admitted now that the live catalogue generation is
+/// `current_generation`.
+///
+/// The catalogue generation is sampled synchronously when the fetch is
+/// scheduled and carried through resolution and paint. A `FullSync` that
+/// lands while the resolver is awaiting advances the cache's generation,
+/// so a texture decoded from the pre-sync candidate must not enter the
+/// cache under the new catalogue: equality is required. The row still
+/// displays the texture it received; only its cache retention is
+/// declined, and the next bind re-resolves against the new catalogue
+/// (2026-09-12 review finding).
+fn admit_scheduled_generation(scheduled_generation: u64, current_generation: u64) -> bool {
+    scheduled_generation == current_generation
+}
+
 fn install_cache_probe(
     admission: CacheAdmission,
     image: gtk::Image,
@@ -242,10 +290,19 @@ fn install_cache_probe(
     let gen = generation;
     let state = cell_state.clone();
     let handler_id = image.connect_notify_local(Some("paintable"), move |img, _| {
-        // All three gates must agree before we cache: a stale generation,
+        // All gates must agree before we cache: a stale generation,
         // a revoked fetch, or a revoked worker-side token must not
         // pollute the cache with a texture the user never sees.
         if state.is_revoked() || state.current_generation() != gen || !liveness.is_live() {
+            return;
+        }
+        // Reject a texture resolved from the pre-FullSync catalogue: the
+        // schedule-time generation is authoritative for this result, and
+        // the live generation moving means the catalogue changed while the
+        // resolution was pending (2026-09-12 review finding). The row
+        // still displays the texture; it is simply not admitted, so the
+        // next bind re-resolves against the new catalogue.
+        if !admit_scheduled_generation(content_generation, cache.content_generation()) {
             return;
         }
         if let Some(paintable) = img.paintable() {
@@ -262,4 +319,46 @@ fn install_cache_probe(
         }
     });
     cell_state.paintable_notify_id.replace(Some(handler_id));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A texture resolved before an interposed `FullSync` must not be
+    /// admitted once the catalogue generation has moved. The fetch
+    /// captures the generation synchronously at schedule time
+    /// (`orchestrate_pane_fetch`), the probe compares it against the live
+    /// generation at admission (`install_cache_probe`), and this gate is
+    /// that comparison. Without it a pre-sync texture would be inserted
+    /// under a generation the new catalogue never queries — a silent
+    /// stale admission (2026-09-12 review finding).
+    #[test]
+    fn interposed_fullsync_rejects_a_pre_sync_admission() {
+        let cache = AlbumArtCache::new();
+
+        // Schedule time: capture the catalogue generation before the
+        // resolver's first await.
+        let scheduled = cache.content_generation();
+        assert!(
+            admit_scheduled_generation(scheduled, cache.content_generation()),
+            "an unperturbed fetch admits under its schedule-time generation"
+        );
+
+        // FullSync lands while the resolution is still pending and bumps
+        // the catalogue generation.
+        cache.bump_content_generation();
+
+        assert!(
+            !admit_scheduled_generation(scheduled, cache.content_generation()),
+            "a pre-FullSync texture must not be admitted under the new catalogue"
+        );
+
+        // The next bind schedules against the new generation and admits.
+        let rescheduled = cache.content_generation();
+        assert!(admit_scheduled_generation(
+            rescheduled,
+            cache.content_generation()
+        ));
+    }
 }

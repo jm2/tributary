@@ -657,6 +657,20 @@ pub fn attach_source_registry(
         .attach_source_registry(source_registry);
 }
 
+/// Attach the live application config to the album-art coordinator. Must
+/// be called once after `build_browser`. The built-in local library's
+/// retained artwork authority resolves against the configured library
+/// roots, which live in `AppConfig`; the controller snapshots them per
+/// bind. The pointer is intentional (mirrors
+/// [`attach_source_registry`]): only the resolver path needs it, and a
+/// later preferences edit is observed through the shared cell.
+pub fn attach_app_config(
+    state: &BrowserState,
+    app_config: Rc<RefCell<crate::ui::preferences::AppConfig>>,
+) {
+    state.album_art_controller.attach_app_config(app_config);
+}
+
 /// Lightweight snapshot of track fields for filtering (avoids borrowing GObjects).
 #[derive(Clone)]
 struct TrackSnapshot {
@@ -1684,6 +1698,8 @@ mod tests {
         crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones();
         crate::ui::album_art_cell::widget_tests::show_placeholder_keeps_the_missing_art_visible();
         crate::ui::album_art_cell::widget_tests::revoking_a_cell_revokes_its_outstanding_fetch_token();
+        crate::ui::album_pane_art::widget_tests::album_art_row_publishes_combined_accessible_name();
+        crate::ui::album_pane_art::widget_tests::album_art_row_zero_count_announces_bare_label();
         factory_swap_preserves_album_filters_and_selection();
         rebuild_bumps_album_art_content_generation();
     }
