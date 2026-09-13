@@ -1880,6 +1880,12 @@ pub(crate) fn build_window(
     // the first bind (which may run as soon as the user scrolls the
     // album pane) sees the registry.
     browser::attach_source_registry(&browser_state, source_registry.clone());
+    // The controller also needs the configured library roots to resolve
+    // the built-in local library's retained artwork authority. Wire the
+    // live config in here, next to the registry: the first bind (which
+    // may run as soon as the user scrolls the album pane) then snapshots
+    // the roots on the main thread.
+    browser::attach_app_config(&browser_state, app_config.clone());
 
     // ── Right content ────────────────────────────────────────────────
     let right_paned = gtk::Paned::builder()
