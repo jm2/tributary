@@ -86,6 +86,13 @@ pub struct AlbumArtController {
     /// registry); until then a local row resolves with no configured
     /// roots and fails closed to the placeholder.
     app_config: Rc<RefCell<Option<Rc<RefCell<crate::ui::preferences::AppConfig>>>>>,
+    /// The application's Tokio runtime, wired in by the window at
+    /// construction. The built-in local library's retained artwork
+    /// authority polls Tokio time/blocking APIs, which panic on the
+    /// runtime-less GTK main context the pane fetch is driven on, so the
+    /// controller hands this handle to that resolution arm; until it is
+    /// attached, a built-in local row fails closed to the placeholder.
+    rt_handle: Rc<RefCell<Option<tokio::runtime::Handle>>>,
     /// Side length (in device pixels) of each rendered thumbnail.
     /// Wired in from the browser's `BrowserState::album_pane_artwork_size`
     /// cell so the bind factory and the cache probe both read the
@@ -103,6 +110,7 @@ impl AlbumArtController {
             cache: AlbumArtCache::new(),
             source_registry: Rc::new(RefCell::new(None)),
             app_config: Rc::new(RefCell::new(None)),
+            rt_handle: Rc::new(RefCell::new(None)),
             pixel_size: Rc::new(RefCell::new(None)),
             placeholder_icon,
         }
@@ -122,6 +130,16 @@ impl AlbumArtController {
     /// [`Self::attach_source_registry`] at window construction.
     pub fn attach_app_config(&self, app_config: Rc<RefCell<crate::ui::preferences::AppConfig>>) {
         *self.app_config.borrow_mut() = Some(app_config);
+    }
+
+    /// Wire the application's Tokio runtime in. The built-in local
+    /// library's retained artwork authority polls Tokio time/blocking
+    /// APIs, so its resolution is hopped onto this runtime instead of the
+    /// runtime-less GTK main context (which would panic). Wired next to
+    /// [`Self::attach_source_registry`] and [`Self::attach_app_config`] at
+    /// window construction.
+    pub fn attach_runtime(&self, rt_handle: tokio::runtime::Handle) {
+        *self.rt_handle.borrow_mut() = Some(rt_handle);
     }
 
     /// Wire the live size knob in. The bind factory and the cache probe
@@ -406,12 +424,18 @@ impl AlbumArtController {
             .map(|config| config.borrow().library_paths.clone())
             .unwrap_or_default();
 
+        // Snapshot the application runtime alongside the roots: the
+        // built-in local arm must run off the runtime-less GTK main context
+        // (2026-09-13 review finding).
+        let rt_handle = self.rt_handle.borrow().clone();
+
         let fetch = PaneFetch {
             image: cell_state.cell.image.clone(),
             cache: self.cache.clone(),
             source_registry: self.source_registry.clone(),
             album_source: candidate.source_id,
             source_epoch: candidate.source_session_epoch,
+            rt_handle,
             configured_roots,
             album_key: candidate.track_id.clone(),
             pixel_size: self.current_pixel_size(),

@@ -99,9 +99,8 @@ pub(super) async fn resolve_kind(
     source_id: Option<SourceId>,
     source_epoch: Option<u64>,
     configured_roots: Vec<String>,
+    rt_handle: Option<tokio::runtime::Handle>,
     candidate: &AlbumArtCandidate,
-    cover_art_url: String,
-    uri: String,
 ) -> ResolvedArtKind {
     match classify_pane_authority(source_registry.is_some(), source_id, source_epoch) {
         PaneAuthority::Registry => {
@@ -116,7 +115,7 @@ pub(super) async fn resolve_kind(
             // locator is a file:// URI keeps its authority through the
             // album pane — no remote resolver is consulted first, no
             // opaque credentials are minted, and no pathname is reopened.
-            if uri.starts_with("file://") {
+            if candidate.uri.starts_with("file://") {
                 if let Some(resolved) =
                     resolve_retained_file_art(registry, &id, epoch, candidate).await
                 {
@@ -135,7 +134,7 @@ pub(super) async fn resolve_kind(
             resolve_remote_artwork(registry, &id, epoch, candidate).await
         }
         PaneAuthority::BuiltinLocal => {
-            resolve_builtin_local_art(candidate, &configured_roots).await
+            resolve_builtin_local_art_on_runtime(rt_handle, candidate, &configured_roots).await
         }
         PaneAuthority::IncompleteRetained => {
             // A retained source identity whose registry handle or session
@@ -152,10 +151,14 @@ pub(super) async fn resolve_kind(
             // Truly external rows with no authority chain at all
             // (e.g., OS-opened external files) keep the transitional
             // direct path.
-            if uri.starts_with("file://") {
-                ResolvedArtKind::DirectFile { uri }
-            } else if !cover_art_url.is_empty() {
-                ResolvedArtKind::DirectUrl { url: cover_art_url }
+            if candidate.uri.starts_with("file://") {
+                ResolvedArtKind::DirectFile {
+                    uri: candidate.uri.clone(),
+                }
+            } else if !candidate.cover_art_url.is_empty() {
+                ResolvedArtKind::DirectUrl {
+                    url: candidate.cover_art_url.clone(),
+                }
             } else {
                 ResolvedArtKind::NoArtwork
             }
@@ -203,6 +206,46 @@ async fn resolve_builtin_local_art(
             ResolvedArtKind::NoArtwork
         }
     }
+}
+
+/// Run the built-in local library's retained-authority resolution on the
+/// application's Tokio runtime.
+///
+/// [`crate::local::resolver::resolve_track`] polls `tokio::time::timeout`
+/// and `tokio::task::spawn_blocking`. The pane fetch is driven on the GTK
+/// main context, which has no entered runtime (`src/main.rs` parks the
+/// runtime on a background thread), so polling those APIs there panics and
+/// the row silently never loads local artwork (2026-09-13 review finding).
+/// The resolution therefore runs on the runtime handle the window attaches
+/// at construction, and its result is delivered back to the pane's async
+/// task — mirroring the playback resolver's `rt_handle.spawn` hand-off.
+async fn resolve_builtin_local_art_on_runtime(
+    rt_handle: Option<tokio::runtime::Handle>,
+    candidate: &AlbumArtCandidate,
+    configured_roots: &[String],
+) -> ResolvedArtKind {
+    let Some(rt_handle) = rt_handle else {
+        // No application runtime is attached (the controller was built
+        // without one). Local extraction needs the runtime's timer and
+        // blocking pool, so fail closed to the placeholder instead of
+        // polling those APIs from the main context and panicking.
+        tracing::debug!(
+            track_id = %candidate.track_id,
+            "Album pane built-in local artwork skipped without an attached runtime"
+        );
+        return ResolvedArtKind::NoArtwork;
+    };
+    let candidate = candidate.clone();
+    let configured_roots = configured_roots.to_vec();
+    let (resolved_tx, resolved_rx) = async_channel::bounded(1);
+    rt_handle.spawn(async move {
+        let resolved = resolve_builtin_local_art(&candidate, &configured_roots).await;
+        let _ = resolved_tx.send(resolved).await;
+    });
+    resolved_rx
+        .recv()
+        .await
+        .unwrap_or(ResolvedArtKind::NoArtwork)
 }
 
 /// Resolve one identity-carrying `file://` row through the retained
@@ -298,6 +341,7 @@ async fn resolve_remote_artwork(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gtk::glib;
 
     fn local() -> SourceId {
         SourceId::local()
@@ -412,9 +456,8 @@ mod tests {
             no_epoch.source_id,
             no_epoch.source_session_epoch,
             Vec::new(),
+            None,
             &no_epoch,
-            no_epoch.cover_art_url.clone(),
-            no_epoch.uri.clone(),
         )
         .await;
         assert!(
@@ -434,9 +477,8 @@ mod tests {
             no_registry.source_id,
             no_registry.source_session_epoch,
             Vec::new(),
+            None,
             &no_registry,
-            no_registry.cover_art_url.clone(),
-            no_registry.uri.clone(),
         )
         .await;
         assert!(
@@ -452,42 +494,48 @@ mod tests {
     #[tokio::test]
     async fn external_rows_keep_the_transitional_direct_path() {
         let file_row = candidate("file:///tmp/external.flac", "", None, None);
-        let resolved = resolve_kind(
-            None,
-            None,
-            None,
-            Vec::new(),
-            &file_row,
-            String::new(),
-            file_row.uri.clone(),
-        )
-        .await;
+        let resolved = resolve_kind(None, None, None, Vec::new(), None, &file_row).await;
         assert!(matches!(resolved, ResolvedArtKind::DirectFile { .. }));
 
         let url_row = candidate("", "https://example.test/cover.jpg", None, None);
-        let resolved = resolve_kind(
-            None,
-            None,
-            None,
-            Vec::new(),
-            &url_row,
-            url_row.cover_art_url.clone(),
-            String::new(),
-        )
-        .await;
+        let resolved = resolve_kind(None, None, None, Vec::new(), None, &url_row).await;
         assert!(matches!(resolved, ResolvedArtKind::DirectUrl { .. }));
 
         let empty_row = candidate("", "", None, None);
-        let resolved = resolve_kind(
+        let resolved = resolve_kind(None, None, None, Vec::new(), None, &empty_row).await;
+        assert!(matches!(resolved, ResolvedArtKind::NoArtwork));
+    }
+
+    /// The built-in local library arm must resolve on the application's
+    /// Tokio runtime, never the GTK main context: the pane fetch is driven
+    /// on a glib main context with no entered runtime, and
+    /// [`crate::local::resolver::resolve_track`] polls
+    /// `tokio::time::timeout` / `spawn_blocking`, which panic without one
+    /// (2026-09-13 review finding). This drives the real resolution path on
+    /// a glib context whose only runtime is the supplied handle, so the old
+    /// direct call panics while the runtime hand-off resolves.
+    #[test]
+    fn builtin_local_artwork_resolves_on_the_application_runtime() {
+        // The runtime lives on its own thread — exactly the production
+        // shape, and NOT entered on the glib context thread below.
+        let runtime = tokio::runtime::Runtime::new().expect("application tokio runtime");
+        let handle = runtime.handle().clone();
+
+        let row = candidate("file:///media/music/album/01.flac", "", Some(local()), None);
+        let context = glib::MainContext::new();
+        let resolved = context.block_on(resolve_kind(
             None,
-            None,
-            None,
+            row.source_id,
+            row.source_session_epoch,
             Vec::new(),
-            &empty_row,
-            String::new(),
-            String::new(),
-        )
-        .await;
+            Some(handle),
+            &row,
+        ));
+
+        // The track is not in this process's library, so the retained
+        // authority resolves to no artwork; the contract under test is that
+        // it resolves on the runtime rather than panicking on the main
+        // context.
         assert!(matches!(resolved, ResolvedArtKind::NoArtwork));
     }
 }
