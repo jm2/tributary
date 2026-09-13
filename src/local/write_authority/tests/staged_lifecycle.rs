@@ -296,7 +296,8 @@ fn prepared_target_resolves_only_one_preserved_name() {
 /// candidate can collide with a name it never saw) and rewrites the requested
 /// leaf's bytes to replacement characters (so the "sibling" is not a sibling
 /// of the requested name at all). Deterministic on Unix, where non-UTF-8
-/// filenames are representable.
+/// filenames are representable; skips on a filesystem that refuses native
+/// byte names (macOS APFS/HFS+ reject them with EILSEQ).
 #[cfg(unix)]
 #[test]
 fn preserved_sibling_keeps_native_name_bytes() {
@@ -304,6 +305,18 @@ fn preserved_sibling_keeps_native_name_bytes() {
     use std::os::unix::ffi::OsStrExt;
 
     let root = tempfile::tempdir().expect("temporary root");
+    // Probe with a throwaway non-UTF-8 name before the real setup. A name the
+    // filesystem cannot represent is an environment limit, not a failure of
+    // the byte-preserving composition, so skip rather than fail where the
+    // fix cannot be exercised (mirrors the permission-bit and bind-mount
+    // probes elsewhere in this suite).
+    let probe = root.path().join(OsStr::from_bytes(b"native-probe\xFF"));
+    if let Err(error) = std::fs::write(&probe, b"probe") {
+        eprintln!("skipping: filesystem cannot represent non-UTF-8 names: {error}");
+        return;
+    }
+    std::fs::remove_file(&probe).expect("remove non-UTF-8 probe");
+
     let requested = OsStr::from_bytes(b"song\xFF.flac");
     let existing_sibling = OsStr::from_bytes(b"song\xFF (1).flac");
     std::fs::write(root.path().join(requested), b"original").expect("write requested");
