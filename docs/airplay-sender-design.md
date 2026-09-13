@@ -2,6 +2,32 @@
 
 Status: design record, no implementation in this bead.
 
+Revision 14 (2026-09-13, corrective pass). This revision answers the
+round-14 finding at the `b5c594f` head (thread
+`PRRT_kwDOR1IXks6h6tMN`) with one contract fix to §4.1/§4.3/§9,
+docs-only: cancellation registration is now superseded-checked, not
+merely lock-safe. Revision 13 wired teardown supersession to the
+in-flight `OpenCancel`, but left the prepare-to-open boundary —
+between a ticket becoming the proxy's active lease
+(`open_prepared_media` → `open_prepared_session`,
+`src/audio/airplay_output.rs:199-208`, :212-241) and `open_session`
+registering its handle — not atomic with the teardown critical
+section: Stop, `Drop`, or replacement preparation could win the state
+lock in that window, custody the lease, and find nothing registered to
+cancel, after which the stale open installed a fresh, untouched token
+and could still negotiate, mutate, or return `Opened`.
+`register_in_flight_cancel` now runs **under the proxy's state lock**
+and atomically detects that this load's lease is already custodied (or
+its generation superseded); on that observation it installs nothing and
+returns a guard reporting the already-superseded state, and
+`open_session` immediately yields its terminal quiesced outcome
+(`Cancelled`/`RecoveryPending`) through the §4.3 restoration path
+without reaching negotiation. The ordering contract is stated
+explicitly — registration is superseded-checked, not merely lock-safe —
+and acceptance item 5 (teardown-before-registration) and item 12
+(both sides of the registration boundary) assert it, without weakening
+any prior behavioral assertion. It changes the design record only.
+
 Revision 13 (2026-09-13, corrective pass). This revision answers the
 round-12 finding at the `4d77115` head (thread
 `PRRT_kwDOR1IXks6h6FrF`) with one contract fix to §4.1/§4.3/§9,
@@ -734,12 +760,30 @@ impl MediaTicketCustody {
     /// state-locked step that custodies the still-active ticket, so
     /// the blocked operation is aborted rather than awaited, and a
     /// stale open cannot remain blocked, keep mutating, or return
-    /// `Opened`. The concrete type is the implementation record's
-    /// choice; the contract requires only that the handle is
+    /// `Opened`. **Registration runs under the proxy's state lock and
+    /// is superseded-checked, not merely lock-safe.** In that same
+    /// locked step it observes whether this load's lease is already
+    /// custodied — or its preparation generation already superseded —
+    /// because the prepare-to-open boundary between the lease becoming
+    /// active (`open_prepared_media` → `open_prepared_session`,
+    /// `src/audio/airplay_output.rs:199-208`, :212-241) and this
+    /// registration is not atomic with the teardown critical section:
+    /// Stop, the proxy's `Drop`, or replacement preparation can move
+    /// the lease into custody after it became active but before the
+    /// call's `OpenCancel` was installed, leaving no registered handle
+    /// to cancel. On that observation registration must not install
+    /// the token. It installs nothing, leaves the lease in custody,
+    /// and returns a guard reporting the already-superseded state, so
+    /// `open_session` immediately yields its terminal quiesced outcome
+    /// (`Cancelled`, or `RecoveryPending` when a transmitted mutating
+    /// RPC is unsettled) through the §4.3 restoration path and never
+    /// reaches negotiation. The concrete type is the implementation
+    /// record's choice; the contract requires only that the handle is
     /// cancellable from the teardown thread, that registration and
-    /// deregistration are safe against the proxy's state lock, and
-    /// that no registered handle is left installed once
-    /// `open_session` returns.
+    /// deregistration run under the proxy's state lock, that
+    /// registration atomically observes a prior supersession before
+    /// installing anything, and that no registered handle is left
+    /// installed once `open_session` returns.
     fn register_in_flight_cancel(&self, cancel: &OpenCancel) -> InFlightCancelRegistration;
 }
 
@@ -754,8 +798,18 @@ impl MediaTicketCustody {
 /// in-flight call can observe: the generation
 /// (`src/audio/mod.rs:85-87`) is a `Copy` value the caller compares
 /// after the fact, while the in-flight open's abort signal is its
-/// `OpenCancel`. Registration begins before the call blocks and ends
-/// when it returns (the guard's `Drop`), so at most one handle is
+/// `OpenCancel`. Registration under the proxy's state lock is
+/// **superseded-checked**: if this load's lease was already custodied
+/// (or its generation superseded) at the instant of registration, the
+/// guard is returned in its **already-superseded** state instead of
+/// installing a token — no handle is registered, and the caller
+/// (`open_session`) immediately yields its terminal quiesced outcome
+/// without negotiating. The guard exposes that state to its caller
+/// (the concrete accessor is the implementation record's choice), so
+/// an open can distinguish "registration succeeded, proceed" from
+/// "this load was superseded before it could register" and never
+/// confuse the two. Registration begins before the call blocks and
+/// ends when it returns (the guard's `Drop`), so at most one handle is
 /// installed per proxy at a time and a cancelled open cannot outlive
 /// its own registration.
 struct InFlightCancelRegistration { /* the implementation record's primitive */ }
@@ -874,7 +928,11 @@ enum SenderError {
 /// replacement preparation — cancels it in the same critical section
 /// that moves the still-active ticket into recovery custody, so the
 /// flag is set synchronously with supersession rather than only
-/// compared after the fact. This is deliberately not
+/// compared after the fact. That registration is itself
+/// superseded-checked: it runs under the same state lock and observes
+/// a lease already custodied before the handle was installed, in
+/// which case it installs nothing and the open yields its terminal
+/// quiesced outcome without negotiating (§4.1). This is deliberately not
 /// `PlayerEventGeneration` itself — a generation
 /// (`src/audio/mod.rs:85-87`) is a `Copy` value the caller compares
 /// after the fact, not a flag an in-flight call can observe, and a
@@ -1109,6 +1167,23 @@ trait AirplaySender: Send + Sync {
     ///   is bounded by settle-or-restart **and** by the documented
     ///   recovery deadline, after which it reports `RestorationFailed`
     ///   rather than waiting forever (§4.3).
+    ///
+    /// Registration is the call's first step and is atomic with
+    /// supersession. Before any negotiation the call registers its
+    /// `OpenCancel` through
+    /// `custody.register_in_flight_cancel` **under the proxy's state
+    /// lock**, so no teardown can win the prepare-to-open boundary
+    /// unseen: if the lease was already custodied by Stop, the proxy's
+    /// `Drop`, or replacement preparation in the interval since it
+    /// became active, registration observes the already-superseded
+    /// state and installs no token, and the call immediately yields
+    /// its terminal quiesced outcome (`Cancelled`, or
+    /// `Failed(SenderError::RecoveryPending)` when a transmitted
+    /// mutating RPC is unsettled) through the §4.3 restoration path —
+    /// it never reaches negotiation and can never return `Opened` for
+    /// a superseded route. Registration is therefore
+    /// superseded-checked, not merely lock-safe; a successful
+    /// registration is what authorizes the call to proceed.
     ///
     /// Bounded and interruptible by contract: the call enforces the
     /// adapter's documented open deadline (again a named constant
@@ -1487,7 +1562,12 @@ Tributary talks to an OwnTone instance as a transmission service:
   cancel the proxy's registered in-flight open handle — cancelling
   that handle, not bumping the preparation generation, is the signal
   an in-flight open actually observes (§4.1) — exactly as the
-  replacement path does — rather than take and revoke it. It either
+  replacement path does — rather than take and revoke it. If the open
+  has not yet registered (it is between the lease becoming active and
+  registration), there is no handle to cancel; moving the lease into
+  custody in that same locked step is sufficient, because the call's
+  superseded-checked registration observes the custody and installs no
+  token (§4.1). It either
   drives the adapter's quiescence
   (terminate/restart) so this outcome is reached promptly, or
   transfers custody to this recovery owner, which revokes once the
@@ -1913,7 +1993,16 @@ record for the selected path must add, at minimum:
    than awaited — teardown reaches the blocked call by cancelling
    the proxy-registered in-flight handle in the same state-locked
    step that custodies the still-active ticket (§4.1), so the open
-   cannot remain blocked or return `Opened` — and the load whose
+   cannot remain blocked or return `Opened`. The acceptance also
+   covers teardown landing in the prepare-to-open boundary *before*
+   the call registered its handle: registration is
+   superseded-checked under the proxy's state lock (§4.1), so it
+   observes the lease already custodied, installs no token, and the
+   open yields `Cancelled`/`Failed(SenderError::RecoveryPending)`
+   through the restoration path without negotiating — the test holds
+   the teardown between the lease becoming active and `open_session`
+   registering, and asserts the open never reaches negotiation and
+   never returns `Opened`. The load whose
    `OpenCancel` was set yields
    `OpenOutcome::Cancelled` only after the restoration path
    completes **and** every mutating daemon RPC already transmitted
@@ -2066,6 +2155,14 @@ record for the selected path must add, at minimum:
       with the lease already custodied and still returns
       `Failed(SenderError::RecoveryPending)` on the missed-deadline path
       per §4.1 `:1017-1026` — supersession does not force `Cancelled`.
+      This case spans both sides of the registration boundary: when
+      the open has already registered, replacement cancels the
+      registered handle; when replacement wins *before* the open
+      registers, there is no token to cancel, and the open's
+      superseded-checked registration (§4.1) observes the lease
+      already custodied, installs nothing, and yields the same
+      terminal quiesced outcome without negotiating. Either way the
+      open cannot remain blocked, keep mutating, or return `Opened`.
       Here the replacement arrived *before* the outcome, which is the
       other window the hand-off must cover; there is no post-outcome
       arrival to assert in this case.
