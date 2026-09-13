@@ -2,6 +2,23 @@
 
 Status: design record, no implementation in this bead.
 
+Revision 12 (2026-09-13, corrective pass). This revision answers the
+round-12 Codex findings at the `28b09d1` head with two contract fixes
+to §4.1/§4.3/§9, all docs-only: (1) the explicit-teardown contract now
+binds Stop (`GstreamerMediaProxy::revoke`) and `Drop` when they win the
+proxy state-lock race **before** the open's `RecoveryPending`
+transition, while the ticket is still the proxy's active lease: they
+must move that in-flight active ticket into the recovery-custody slot
+under the state lock (signaling supersession), exactly as
+`prepare_with_server_start` now does, or synchronously drive recovery
+to its terminal quiesced outcome before revoking it, so the canceled
+open's recovery transition always finds a route to preserve and the
+route stays valid until that open reaches its terminal quiesced
+outcome; (2) acceptance item 12's two state-lock race orders are
+separate cases, with post-outcome arrival required only for the
+recovery-first case, and the item adds the Stop-wins-before-transition
+coverage. It changes the design record only.
+
 Revision 11 (2026-09-13, corrective pass). This revision answers the
 round-11 Codex findings at the `7eb2c4e` head with three contract fixes
 to §4.1/§4.3/§9, all docs-only: (1) the `open_session` contract now
@@ -977,13 +994,30 @@ trait AirplaySender: Send + Sync {
     ///   ticket. Custody is a dedicated slot the replacement path never
     ///   revokes from, and **explicit teardown does not drain it
     ///   early**: Stop (`GstreamerMediaProxy::revoke`) and the proxy's
-    ///   `Drop` must not revoke a custodied route while recovery is
-    ///   unresolved. They either drive recovery to its terminal
+    ///   `Drop` must not revoke a route an in-flight open still needs.
+    ///   That obligation covers both states of the lease, not just the
+    ///   custodied one. If recovery has already custodied the route, they
+    ///   must not revoke it while recovery is unresolved. And if Stop/Drop
+    ///   win the state-lock race **before** the open's `RecoveryPending`
+    ///   transition — the ticket is still the proxy's active lease — they
+    ///   must not take and unconditionally revoke it either: they move
+    ///   that in-flight active ticket into the same custody slot under the
+    ///   state lock (bumping the generation to signal supersession),
+    ///   exactly as `prepare_with_server_start` now does, so the open
+    ///   observes the supersession with the lease already custodied and
+    ///   its recovery transition finds a route to preserve instead of an
+    ///   empty active slot. Having preserved the route, they either drive
+    ///   recovery to its terminal
     ///   quiesced outcome first — synchronously requesting the
     ///   adapter's terminate-and-restart quiescence, which cancels the
     ///   unsettled request within the bounded recovery — or hand
     ///   custody to the recovery owner, which revokes at that terminal
-    ///   outcome. The load path revokes the custodied route exactly
+    ///   outcome. The ordering is fixed: the route stays valid until the
+    ///   canceled open reaches its terminal quiesced outcome — `Cancelled`
+    ///   once its server side quiesced inside the cleanup deadline, or the
+    ///   terminal `RecoveryOutcome` behind the `RecoveryCompletion` handle
+    ///   otherwise — and is revoked only then, never before quiescence.
+    ///   The load path revokes the custodied route exactly
     ///   once, when the handle resolves — after restoration on
     ///   `Restored`, and on `RestorationFailed` too, where quiescence
     ///   (settle-or-restart) already guarantees no request referencing
@@ -1368,8 +1402,13 @@ Tributary talks to an OwnTone instance as a transmission service:
   the retained record's recovery does not depend on the load path's
   loopback ticket; the load path may therefore stop waiting and
   revoke its own route at that outcome. Until that terminal outcome,
-  explicit Stop or output destruction must not revoke the custodied
-  route: it either drives the adapter's quiescence
+  explicit Stop or output destruction must not revoke the route:
+  whether the ticket is already custodied or is still the proxy's
+  active lease for an in-flight open whose canceled outcome has not
+  reached its terminal quiesced state, teardown must move that active
+  ticket into custody (signaling supersession) — exactly as the
+  replacement path does — rather than take and revoke it. It either
+  drives the adapter's quiescence
   (terminate/restart) so this outcome is reached promptly, or
   transfers custody to this recovery owner, which revokes once the
   outcome is terminal. No reader of the handle is
@@ -1925,25 +1964,41 @@ record for the selected path must add, at minimum:
     must preserve the superseded lease — moving it into recovery
     custody rather than taking and unconditionally revoking the active
     lease — until the canceled open reaches its terminal quiesced
-    outcome. The test exercises both state-lock race orders: the
-    recovery transition running first (the replacement then finds the
-    lease already custodied and removes nothing), and replacement
-    preparation running first (the open then observes the supersession
-    with the lease already custodied, and still returns
-    `Failed(SenderError::RecoveryPending)` on the missed-deadline path
-    per §4.1 `:950-959` — supersession does not force `Cancelled`).
-    The replacement arrives *after* the recovery outcome is observable,
-    so the test exercises the window the atomic hand-off must close, not
-    just the steady state. It then releases recovery, asserts the old
+    outcome. The two state-lock race orders are **separate cases**,
+    because the post-outcome arrival they assert cannot both hold in
+    one execution:
+    - **Recovery-first case.** The recovery transition wins the
+      state-lock race; the replacement then arrives *after* the
+      recovery outcome is observable, finds the lease already
+      custodied, and removes nothing. Only this case asserts
+      post-outcome arrival, so it exercises the window the atomic
+      hand-off must close, not just the steady state.
+    - **Replacement-first case.** Replacement preparation wins the
+      state-lock race and moves the still-active lease into custody;
+      the open then observes the supersession with the lease already
+      custodied and still returns
+      `Failed(SenderError::RecoveryPending)` on the missed-deadline path
+      per §4.1 `:950-959` — supersession does not force `Cancelled`.
+      Here the replacement arrived *before* the outcome, which is the
+      other window the hand-off must cover; there is no post-outcome
+      arrival to assert in this case.
+    In both cases the test then releases recovery, asserts the old
     route is revoked only after the carried `RecoveryCompletion`
     reaches its terminal outcome, and asserts the replacement's own
-    ticket was never touched (the identity check). It also asserts an
-    explicit Stop during the same window does **not** revoke the
-    custodied route while recovery is unresolved: the Stop must either
-    drive recovery to its terminal quiesced outcome
-    (terminating/restarting the dedicated daemon) before the route is
-    revoked, or leave the revocation to the recovery owner that owns
-    custody.
+    ticket was never touched (the identity check). A third case
+    covers **Stop winning the race before the transition**: an
+    explicit Stop (`GstreamerMediaProxy::revoke`) lands while the
+    open's ticket is still the proxy's active lease, before the
+    `RecoveryPending` transition has custodied it. The test asserts
+    Stop does **not** take and revoke that active route: Stop moves
+    the ticket into custody (signaling supersession) — exactly as
+    replacement preparation does — or drives recovery to its terminal
+    quiesced outcome (terminating/restarting the dedicated daemon)
+    before the route is revoked. In either form the route stays valid
+    until the canceled open reaches its terminal quiesced outcome:
+    the test observes it live while recovery is unresolved and
+    revoked only then, never before quiescence. The proxy's `Drop`
+    is asserted to obey the same ordering.
 13. **Persistent-restoration-failure acceptance:** a restoration step
     fails while a `RecoveryPending` recovery is serialized. The test
     asserts the incomplete-takeover record is retained for the
