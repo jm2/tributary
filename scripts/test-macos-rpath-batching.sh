@@ -79,9 +79,11 @@ macos_validate_macho_copy_control() {
   printf '%s\n' "$artifact" >> "$VALIDATION_LOG"
   if [[ -n "$VALIDATION_REJECT" && "$artifact" == "$VALIDATION_REJECT" ]]; then
     MACOS_PACKAGE_POLICY_REASON="fixture rejection for ${artifact}"
-    # Surface the recorded reason so the rejection scenario can assert that the
-    # failure names the exact rejected source (and not a same-basename one).
-    printf 'policy_reason=%s\n' "$MACOS_PACKAGE_POLICY_REASON"
+    # Mirror the reason through the same variable the production helper sets,
+    # but deliberately do NOT print it here: scenario 3 asserts that copy_dylib's
+    # production error call propagates this exact reason, so the output must come
+    # only from that path (a fixture that printed it too would mask a weakened
+    # error call that dropped ${MACOS_PACKAGE_POLICY_REASON}).
     return 1
   fi
   return 0
@@ -194,10 +196,14 @@ set -e
 change_edits="$(grep -c -- '-change' "$INSTALL_NAME_LOG" || true)"
 [[ "$change_edits" -eq 0 ]] \
   || fail "no batched -change edit may run once a source is rejected"
-[[ "$rejection_output" == *"policy_reason=fixture rejection for ${BREW_PREFIX}/lib/libbad.dylib"* ]] \
-  || fail "rejection did not surface the policy reason for the exact rejected source"
-[[ "$rejection_output" == *"Refusing recursive dylib dependency"* ]] \
-  || fail "rejection did not use the production error path"
+# The fixture no longer prints the reason, so the only possible source of the
+# complete production message is copy_dylib's
+# `error "Refusing recursive dylib dependency: ${MACOS_PACKAGE_POLICY_REASON}"`
+# call. Assert the whole message, including the exact rejected source path, so a
+# weakened error call that drops the reason (or the source identity) fails.
+expected_rejection="Refusing recursive dylib dependency: fixture rejection for ${BREW_PREFIX}/lib/libbad.dylib"
+[[ "$rejection_output" == *"$expected_rejection"* ]] \
+  || fail "rejection did not propagate the complete production error message for the exact rejected source"
 ok "a rejected source aborts before any batched edit is applied"
 
 echo "1..${pass_count}"
