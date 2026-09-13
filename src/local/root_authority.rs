@@ -1504,6 +1504,47 @@ impl MountedRootAuthority {
         }
     }
 
+    /// Probe whether `relative` names a leaf beneath the retained root,
+    /// traversing every parent component no-follow from the retained root —
+    /// exactly as the executor traverses a destination — before the leaf is
+    /// classified. `Ok(false)` means the leaf is absent: either the leaf
+    /// itself or a parent component is missing, so nothing beneath that
+    /// parent can exist yet. A symlink/reparse-point ancestor, a
+    /// non-directory parent, a retained-boundary crossing, or any other
+    /// traversal or lookup failure is an error, so a planning probe can never
+    /// follow an ancestor outside the retained root to a same-named entry.
+    pub(super) fn relative_leaf_exists(&self, relative: &Path) -> io::Result<bool> {
+        let components = strict_relative_components(relative)?;
+        if components.is_empty() {
+            return Err(invalid_input("a destination leaf path is required"));
+        }
+        let parent_components = parent_components_of(&components);
+        let leaf = components.last().expect("non-empty").clone();
+        let parent = match self.retain_write_parent(&parent_components) {
+            Ok(parent) => parent,
+            // A missing parent means nothing beneath it can exist yet: the
+            // destination is fresh. Every other failure (a symlinked or
+            // non-directory parent, a boundary crossing) fails closed.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        #[cfg(unix)]
+        {
+            leaf_identity_at(parent.handle(), &leaf).map(|identity| identity.is_some())
+        }
+        #[cfg(windows)]
+        {
+            let _ = (parent, leaf);
+            leaf_identity_at_path(&join_components(&self.root, &components))
+                .map(|identity| identity.is_some())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (parent, leaf);
+            Err(unsupported_platform())
+        }
+    }
+
     /// Remove the final component of `components` through the retained
     /// parent as an empty directory, refusing a non-directory leaf with the
     /// typed `InvalidInput` error. When `expected` is supplied and the leaf
@@ -2986,6 +3027,39 @@ fn with_pre_reanchor_interpose(interpose: Box<PreReanchorInterpose>, run: impl F
 
 #[cfg(test)]
 static PRE_REANCHOR_INTERPOSE_SERIAL: Mutex<()> = Mutex::new(());
+
+/// Test-only seam: run the registered bind-to-backup interposition, if any.
+///
+/// The Unix Overwrite bind captures the replaced occupant's identity right
+/// after hard-linking it into the backup. A concurrent writer replacing the
+/// destination in that microsecond window is what the capture must survive; a
+/// regression test registers a closure here that performs the replacement
+/// deterministically between the link and the capture. Never compiled outside
+/// `cargo test`.
+#[cfg(all(test, unix))]
+fn run_bind_backup_interpose(parent: &File, to_leaf: &OsStr) {
+    if let Some(interpose) = BIND_BACKUP_INTERPOSE.lock().unwrap().as_ref() {
+        interpose(parent, to_leaf);
+    }
+}
+
+#[cfg(all(test, unix))]
+type BindBackupInterpose = dyn Fn(&File, &OsStr) + Send + Sync;
+
+#[cfg(all(test, unix))]
+static BIND_BACKUP_INTERPOSE: Mutex<Option<Box<BindBackupInterpose>>> = Mutex::new(None);
+
+/// Serialize tests that use the bind-to-backup interposition seam.
+#[cfg(all(test, unix))]
+fn with_bind_backup_interpose(interpose: Box<BindBackupInterpose>, run: impl FnOnce()) {
+    let _serial = BIND_BACKUP_INTERPOSE_SERIAL.lock().unwrap();
+    *BIND_BACKUP_INTERPOSE.lock().unwrap() = Some(interpose);
+    run();
+    *BIND_BACKUP_INTERPOSE.lock().unwrap() = None;
+}
+
+#[cfg(all(test, unix))]
+static BIND_BACKUP_INTERPOSE_SERIAL: Mutex<()> = Mutex::new(());
 
 /// Verify a mounted bound against its retained mount authority.
 fn validate_mounted_bound(authority: &MountedRootAuthority, bound: &BoundFile) -> io::Result<()> {
@@ -4756,21 +4830,38 @@ fn bind_occupant_backup(
     // bit and fail with `EINVAL` — so a symlink occupant is bound as
     // itself.
     match linkat(parent, to_leaf, parent, backup_leaf, AtFlags::empty()) {
-        Ok(()) => match leaf_identity_at(parent, to_leaf) {
-            Ok(Some(identity)) => Ok(Some(identity)),
-            // The occupant was deleted after our bind: the backup is now
-            // the only link to a file its owner destroyed. Release it —
-            // restoring a deliberately deleted file would resurrect bytes
-            // the destination no longer wants — and re-observe.
-            Ok(None) => {
-                release_occupant_backup(parent, backup_leaf);
-                Ok(None)
+        Ok(()) => {
+            // Test-only seam: a regression interposes a replacement between
+            // the hard link and the identity capture below.
+            #[cfg(test)]
+            run_bind_backup_interpose(parent, to_leaf);
+            // Capture the identity of the object the hard link actually
+            // names, never a fresh lookup of `to_leaf`. A concurrent writer
+            // that atomically replaces `to_leaf` between the link and a
+            // lookup there would bind the writer's object to the backup's
+            // identity, so [`swap_and_verify_replace`]'s post-exchange
+            // verification would compare the displaced object against
+            // itself, miss the interposition, and destroy the writer's only
+            // remaining link while recording the original in the backup.
+            let bound = leaf_identity_at(parent, backup_leaf);
+            // A deleted (not replaced) occupant leaves nothing to exchange:
+            // the backup is then the only link to a file its owner
+            // destroyed, so release it and re-observe. A replacement is
+            // left for the exchange's post-verification to detect against
+            // the bound identity.
+            let destination = leaf_identity_at(parent, to_leaf);
+            match (bound, destination) {
+                (Err(error), _) | (_, Err(error)) => {
+                    release_occupant_backup(parent, backup_leaf);
+                    Err(error)
+                }
+                (Ok(Some(identity)), Ok(Some(_))) => Ok(Some(identity)),
+                (Ok(_), Ok(None)) | (Ok(None), Ok(Some(_))) => {
+                    release_occupant_backup(parent, backup_leaf);
+                    Ok(None)
+                }
             }
-            Err(error) => {
-                release_occupant_backup(parent, backup_leaf);
-                Err(error)
-            }
-        },
+        }
         // Absent at bind time: loop back and publish no-replace.
         Err(rustix::io::Errno::NOENT) => Ok(None),
         // Hard links unavailable: copy-bind the occupant at commit time.
@@ -8756,5 +8847,67 @@ mod tests {
                 "the private scratch name must be vacant afterwards"
             );
         }
+    }
+
+    /// A concurrent writer that atomically replaces the destination between
+    /// the hard link that binds the original into the backup and the identity
+    /// capture must not be destroyed. The bound identity must name the object
+    /// the hard link actually holds (the backup), so the atomic exchange's
+    /// post-swap verification detects the interposition and restores the
+    /// writer's file instead of comparing the displaced object against itself.
+    #[cfg(unix)]
+    #[test]
+    fn bound_backup_identity_names_the_hard_linked_object_not_a_swap_in() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::local::write_authority::{ConflictPolicy, MountedWriteAuthority};
+
+        let directory = TestDirectory::new("bind-backup-identity");
+        let destination = directory.path().join("song.flac");
+        fs::write(&destination, b"original bytes").expect("write the original");
+        let moved_original = directory.path().join("moved-original.flac");
+
+        let authority =
+            MountedWriteAuthority::acquire(directory.path()).expect("acquire write authority");
+        let mut staged = authority
+            .prepare_write_relative_file(Path::new("song.flac"), ConflictPolicy::Overwrite)
+            .expect("prepare overwrite");
+        staged.write_all(b"new bytes").expect("write staged");
+
+        // Interpose a replacement exactly between the hard link into the
+        // backup and the identity capture that must name it.
+        let once = AtomicBool::new(false);
+        let destination_for_closure = destination.clone();
+        let moved_original_for_closure = moved_original.clone();
+        with_bind_backup_interpose(
+            Box::new(move |_parent, to_leaf| {
+                if to_leaf != OsStr::new("song.flac") || once.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                // Move the bound original aside (its backup link survives)
+                // and install a genuinely different object at the name.
+                fs::rename(&destination_for_closure, &moved_original_for_closure)
+                    .expect("move the hard-linked original aside");
+                fs::write(&destination_for_closure, b"writer bytes")
+                    .expect("install the writer's replacement");
+            }),
+            || {
+                let _ = staged.commit();
+            },
+        );
+
+        // The writer's object must survive: with the identity bound to the
+        // hard-linked original, the exchange detects the swap-in and restores
+        // the writer's file to the destination.
+        assert_eq!(
+            fs::read(&destination).expect("read the destination after the commit"),
+            b"writer bytes",
+            "a post-bind replacement must be restored to the destination, never destroyed"
+        );
+        assert_eq!(
+            fs::read(&moved_original).expect("read the moved original"),
+            b"original bytes",
+            "the original occupant must survive untouched wherever it was moved"
+        );
     }
 }
