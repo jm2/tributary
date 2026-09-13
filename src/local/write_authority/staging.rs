@@ -89,22 +89,24 @@ pub(super) fn preserved_sibling_path(
         }
         Err(error) => return Err(error),
     };
-    let existing: Vec<String> = entries
+    // Compare and compose on native path data: a filesystem that permits
+    // non-UTF-8 names must neither drop an existing sibling from the
+    // collision set (an `into_string` failure silently omits it) nor fold
+    // the requested leaf's bytes to replacement characters (a lossy
+    // conversion renames it), or the chosen `stem (n).ext` sibling is not a
+    // sibling of the requested name and can collide with a name it never saw.
+    let existing: Vec<OsString> = entries
         .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.file_name().into_string().ok())
+        .map(|entry| entry.file_name())
         .collect();
-    let original = leaf.to_string_lossy().into_owned();
-    let (stem, extension) = match original.rsplit_once('.') {
-        Some((stem, extension)) if !stem.is_empty() => {
-            (stem.to_string(), Some(extension.to_string()))
-        }
-        _ => (original.clone(), None),
-    };
+    // `file_stem` returns the whole leaf when there is no extension (and for
+    // a leading-dot name), matching the previous `rsplit_once('.')` rule while
+    // preserving non-UTF-8 bytes.
+    let leaf_path = Path::new(leaf);
+    let stem: &OsStr = leaf_path.file_stem().unwrap_or(leaf.as_os_str());
+    let extension: Option<&OsStr> = leaf_path.extension();
     for index in 1..=u32::MAX {
-        let candidate = match &extension {
-            Some(extension) => format!("{stem} ({index}).{extension}"),
-            None => format!("{stem} ({index})"),
-        };
+        let candidate = preserved_candidate(stem, extension, index);
         if !existing.iter().any(|name| name == &candidate) {
             // Compose the final relative path (parent + leaf candidate).
             let mut relative = PathBuf::new();
@@ -119,6 +121,21 @@ pub(super) fn preserved_sibling_path(
         io::ErrorKind::AlreadyExists,
         "no preserved name available for conflict",
     ))
+}
+
+/// Compose the `stem (n).ext` disambiguated sibling name on native path data,
+/// so a non-UTF-8 stem or extension keeps its exact bytes.
+fn preserved_candidate(stem: &OsStr, extension: Option<&OsStr>, index: u32) -> OsString {
+    let mut candidate = OsString::new();
+    candidate.push(stem);
+    candidate.push(" (");
+    candidate.push(index.to_string());
+    candidate.push(")");
+    if let Some(extension) = extension {
+        candidate.push(".");
+        candidate.push(extension);
+    }
+    candidate
 }
 
 /// Create the staged file exclusively with `O_CREAT | O_EXCL | O_NOFOLLOW`

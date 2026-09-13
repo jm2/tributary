@@ -506,3 +506,49 @@ fn direct_file_beneath_symlinked_ancestor_is_rejected_at_planning_time() {
          nested-mount error), got {error:?}"
     );
 }
+
+/// A destination file beneath a symlinked ancestor that points outside the
+/// retained destination root must be refused AT PLANNING TIME. An
+/// absolute-path probe follows the ancestor (it only refuses the final
+/// component) and classifies the destination from the external entry — under
+/// `Skip` it silently omits the transfer, so execution can report success
+/// without copying the requested file. The planning probe must traverse the
+/// destination through the retained authority, exactly as execution does,
+/// and refuse the symlink ancestor before any stage is planned.
+/// Deterministic on Unix, where creating a symlink needs no privilege.
+#[cfg(unix)]
+#[test]
+fn destination_file_beneath_symlinked_ancestor_is_rejected_at_planning_time() {
+    use std::os::unix::fs::symlink;
+
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    let outside = tempfile::tempdir().expect("temporary outside root");
+    write_source_file(source_root.path(), "song.flac", b"audio");
+    // The external directory already holds a same-named entry: an
+    // absolute-path probe would follow the destination's `link` ancestor and
+    // classify it as an existing destination, silently skipping the copy.
+    std::fs::write(outside.path().join("song.flac"), b"outside").expect("write outside entry");
+    symlink(outside.path(), destination_root.path().join("link"))
+        .expect("create symlinked destination ancestor");
+
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = plan_request(
+        source,
+        destination,
+        vec![TransferItem::new(
+            PathBuf::from("song.flac"),
+            PathBuf::from("link/song.flac"),
+        )],
+        ConflictPolicy::Skip,
+        None,
+    );
+    let error = TransferPlanner::new()
+        .plan(&request)
+        .expect_err("a destination beneath a symlinked ancestor must be rejected at planning time");
+    assert!(
+        matches!(error, TransferError::Io { .. }),
+        "the planning probe must refuse the symlink ancestor, got {error:?}"
+    );
+}

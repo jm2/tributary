@@ -408,33 +408,32 @@ fn ensure_ancestor_directory_stages(
 
 /// Resolve the conflict policy for one destination against the live
 /// filesystem. `Ok(None)` means the stage should be skipped entirely.
+///
+/// The destination is probed through the retained [`MountedWriteAuthority`]
+/// with per-component no-follow traversal, exactly as execution traverses
+/// it, so a symlink/reparse-point ancestor can neither redirect the probe
+/// outside the retained destination root (making a same-named external
+/// entry look like the requested destination) nor yield a plan the
+/// executor's no-follow traversal would reject only mid-run.
 fn resolve_conflict(
     destination: &MountedWriteAuthority,
     destination_relative: &Path,
     policy: ConflictPolicy,
 ) -> Result<Option<ConflictResolution>, TransferError> {
-    let final_path = destination.root().join(destination_relative);
-    let exists = match std::fs::symlink_metadata(&final_path) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(TransferError::io(
-                "failed to stat destination during planning",
-                error,
-            ));
-        }
-    };
+    let exists = destination
+        .relative_leaf_exists(destination_relative)
+        .map_err(|error| TransferError::io("failed to probe destination during planning", error))?;
     match (policy, exists) {
-        (ConflictPolicy::Skip, None) => Ok(Some(ConflictResolution::Fresh)),
-        (ConflictPolicy::Fail, None) => Ok(Some(ConflictResolution::Fresh)),
-        (ConflictPolicy::Overwrite, None) => Ok(Some(ConflictResolution::Fresh)),
-        (ConflictPolicy::Preserve, None) => Ok(Some(ConflictResolution::Fresh)),
-        (ConflictPolicy::Skip, Some(_)) => Ok(None),
-        (ConflictPolicy::Fail, Some(_)) => Err(TransferError::ConflictRejected {
+        (ConflictPolicy::Skip, false) => Ok(Some(ConflictResolution::Fresh)),
+        (ConflictPolicy::Fail, false) => Ok(Some(ConflictResolution::Fresh)),
+        (ConflictPolicy::Overwrite, false) => Ok(Some(ConflictResolution::Fresh)),
+        (ConflictPolicy::Preserve, false) => Ok(Some(ConflictResolution::Fresh)),
+        (ConflictPolicy::Skip, true) => Ok(None),
+        (ConflictPolicy::Fail, true) => Err(TransferError::ConflictRejected {
             path: destination_relative.to_path_buf(),
         }),
-        (ConflictPolicy::Overwrite, Some(_)) => Ok(Some(ConflictResolution::Overwrite)),
-        (ConflictPolicy::Preserve, Some(_)) => Ok(Some(ConflictResolution::Preserved)),
+        (ConflictPolicy::Overwrite, true) => Ok(Some(ConflictResolution::Overwrite)),
+        (ConflictPolicy::Preserve, true) => Ok(Some(ConflictResolution::Preserved)),
     }
 }
 

@@ -289,3 +289,41 @@ fn prepared_target_resolves_only_one_preserved_name() {
     assert!(names.iter().any(|name| name == "song (1).flac"));
     assert!(names.iter().any(|name| name == "song (2).flac"));
 }
+
+/// A non-UTF-8-encoded sibling must participate in the collision set, and the
+/// disambiguated candidate must preserve the requested leaf's native bytes.
+/// Round-tripping through `String` both drops non-UTF-8 siblings (so a chosen
+/// candidate can collide with a name it never saw) and rewrites the requested
+/// leaf's bytes to replacement characters (so the "sibling" is not a sibling
+/// of the requested name at all). Deterministic on Unix, where non-UTF-8
+/// filenames are representable.
+#[cfg(unix)]
+#[test]
+fn preserved_sibling_keeps_native_name_bytes() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let root = tempfile::tempdir().expect("temporary root");
+    let requested = OsStr::from_bytes(b"song\xFF.flac");
+    let existing_sibling = OsStr::from_bytes(b"song\xFF (1).flac");
+    std::fs::write(root.path().join(requested), b"original").expect("write requested");
+    std::fs::write(root.path().join(existing_sibling), b"sibling").expect("write sibling");
+
+    let authority = authority(&root);
+    let mut staged = authority
+        .prepare_write_relative_file(Path::new(requested), ConflictPolicy::Preserve)
+        .expect("prepare preserve");
+    staged.write_all(b"payload").expect("write staged");
+    let outcome = staged.commit().expect("commit preserve");
+
+    assert_eq!(
+        outcome.relative_path.file_name().expect("leaf name"),
+        OsStr::from_bytes(b"song\xFF (2).flac"),
+        "the collision set must include the non-UTF-8 sibling and the candidate must \
+         keep the requested leaf's native bytes"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join(&outcome.relative_path)).expect("read preserved"),
+        b"payload"
+    );
+}
