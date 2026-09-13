@@ -1031,34 +1031,41 @@ fn enqueue_remote_album_art(image: &gtk::Image, source: ArtSource, liveness: Req
         let token = token.clone();
         glib::MainContext::default().spawn_local(async move {
             let reply_rx = admit_pane_art_request(source, token.clone()).await;
-            paint_remote_album_art_reply(image, reply_rx, RequestLiveness::Scoped(token)).await;
+            paint_remote_album_art_reply(image, reply_rx, RequestLiveness::Scoped(token));
         });
         return;
     }
 
     // Header lane: dedicated and unbounded, so no retry is needed.
     let reply_rx = enqueue_art_request(source, liveness.clone());
-    glib::MainContext::default().spawn_local(async move {
-        paint_remote_album_art_reply(image, reply_rx, liveness).await;
-    });
+    paint_remote_album_art_reply(image, reply_rx, liveness);
 }
 
 /// Receive one remote-artwork reply on the GTK main thread and paint it,
 /// re-checking liveness so a superseded request (newer header generation or
 /// a revoked/rebound pane row) cannot publish bytes the user will never see.
-async fn paint_remote_album_art_reply(
+///
+/// Deliberately a plain `fn` that spawns on the GTK main context rather than
+/// an `async fn` awaited by its callers: the future owns a `gtk::Image`,
+/// which is `!Send`, so it must never reach a multithreaded executor.
+/// `spawn_local` is that guarantee, and clippy's `future_not_send` lint
+/// (aimed at `async fn`s that look spawnable on any executor) would
+/// otherwise fire on the helper.
+fn paint_remote_album_art_reply(
     image: gtk::Image,
     reply_rx: async_channel::Receiver<Vec<u8>>,
     liveness: RequestLiveness,
 ) {
-    if let Ok(data) = reply_rx.recv().await {
-        if liveness.is_valid() {
-            let bytes = glib::Bytes::from_owned(data);
-            if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
-                image.set_paintable(Some(&texture));
+    glib::MainContext::default().spawn_local(async move {
+        if let Ok(data) = reply_rx.recv().await {
+            if liveness.is_valid() {
+                let bytes = glib::Bytes::from_owned(data);
+                if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
+                    image.set_paintable(Some(&texture));
+                }
             }
         }
-    }
+    });
 }
 
 /// Submit one request through the production persistent workers and return its
