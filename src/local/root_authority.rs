@@ -1614,6 +1614,27 @@ impl MountedRootAuthority {
             }))
         }
     }
+
+    /// Verify that one planned source regular file still sits on this
+    /// authority's mount boundary. The planner walks a directory by pathname,
+    /// where a same-device Linux bind mount — of the file itself, or of any
+    /// directory on its path — is invisible (`st_dev` equality), while the
+    /// executor opens every path component through mount-ID boundary checks
+    /// and would refuse the file mid-run, after earlier stages had already
+    /// committed. The planner probes every planned source file (walked
+    /// entries and directly requested items) before staging it and rejects
+    /// the whole plan with the offending path named when the boundary
+    /// differs ([`CrossedMountBoundary`]). The file is opened no-follow.
+    pub(crate) fn validate_source_file_boundary(&self, file: &Path) -> io::Result<()> {
+        let opened = open_walked_regular_file(file)?;
+        if boundary_identity(&opened)? == self.boundary {
+            Ok(())
+        } else {
+            Err(io::Error::other(CrossedMountBoundary {
+                path: file.to_path_buf(),
+            }))
+        }
+    }
 }
 
 /// Typed retained authority to atomically replace one exact regular file
@@ -2888,7 +2909,7 @@ fn validate_mounted_bound(authority: &MountedRootAuthority, bound: &BoundFile) -
     authority.validate()
 }
 
-/// Error payload for a walked source directory that sits on a mount
+/// Error payload for a planned source entry that sits on a mount
 /// boundary other than the source authority's own: a same-device Linux
 /// bind mount is invisible to the planning walk's `st_dev` comparison but
 /// is refused by the executor's per-component mount-ID checks, so planning
@@ -2899,7 +2920,7 @@ fn validate_mounted_bound(authority: &MountedRootAuthority, bound: &BoundFile) -
 /// mount path.
 #[derive(Debug)]
 pub(crate) struct CrossedMountBoundary {
-    /// The walked directory whose boundary differs from the authority's.
+    /// The planned source entry whose boundary differs from the authority's.
     pub(crate) path: PathBuf,
 }
 
@@ -2907,7 +2928,7 @@ impl fmt::Display for CrossedMountBoundary {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "source directory {} sits on a nested mount outside the \
+            "source entry {} sits on a nested mount outside the \
              retained authority's boundary",
             self.path.display()
         )
@@ -2928,6 +2949,32 @@ fn open_walked_directory(directory: &Path) -> io::Result<File> {
 
 #[cfg(not(any(unix, windows)))]
 fn open_walked_directory(_directory: &Path) -> io::Result<File> {
+    Err(unsupported_platform())
+}
+
+/// Open a planned source regular file no-follow for a boundary probe. The
+/// parent directory is opened no-follow first so the final component can be
+/// opened relative to a retained directory handle, exactly as the executor
+/// opens its final file component.
+#[cfg(unix)]
+fn open_walked_regular_file(file: &Path) -> io::Result<File> {
+    let parent = file
+        .parent()
+        .ok_or_else(|| invalid_input("source file has no parent directory"))?;
+    let name = file
+        .file_name()
+        .ok_or_else(|| invalid_input("source file has no final component"))?;
+    let parent_handle = open_unix_directory_path(parent)?;
+    open_unix_regular_at(&parent_handle, name)
+}
+
+#[cfg(windows)]
+fn open_walked_regular_file(file: &Path) -> io::Result<File> {
+    open_windows_regular(file, false, false)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_walked_regular_file(_file: &Path) -> io::Result<File> {
     Err(unsupported_platform())
 }
 
