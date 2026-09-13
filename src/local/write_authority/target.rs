@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use super::policy::{CommitError, CommitOutcome, ConflictPolicy, ConflictResolution};
+use super::policy::{
+    CommitDisposition, CommitError, CommitOutcome, ConflictPolicy, ConflictResolution,
+};
 #[cfg(unix)]
 use super::staging::discard_staged_file;
 #[cfg(not(unix))]
@@ -164,8 +166,10 @@ impl PreparedWriteTarget {
     /// step itself, or the trailing authority revalidation here), or a
     /// Windows replace publish exhausted its rebind bound with a completed
     /// binding retained: nothing landed, but the displaced original
-    /// survives at its verified backup and the outcome carries it so the
-    /// caller records the replacement for rollback. A committed or
+    /// survives at its verified backup. The latter outcome carries
+    /// [`CommitDisposition::DisplacedOnly`], so the caller records the
+    /// retained backup for a restore that requires an absent slot instead
+    /// of reversing it as an identity-less replacement. A committed or
     /// displaced state dropped as a plain I/O error can never be undone or
     /// disposed.
     // The verified-publication payload grew by the replaced occupant's
@@ -183,6 +187,7 @@ impl PreparedWriteTarget {
         let outcome = CommitOutcome {
             relative_path: self.final_relative_path.clone(),
             resolution: self.resolution,
+            disposition: CommitDisposition::Published,
             replaced_original: replaced.as_ref().map(|backup| backup.relative_path.clone()),
             replaced_original_leaf: replaced.and_then(|backup| backup.leaf),
             published_leaf: landed.published_leaf,
@@ -291,6 +296,15 @@ impl PreparedWriteTarget {
                     let outcome = CommitOutcome {
                         relative_path: self.final_relative_path.clone(),
                         resolution: self.resolution,
+                        // Nothing of the transfer's landed: the destination
+                        // still holds a concurrent occupant (or is vacant),
+                        // and only the pre-transfer occupant's backup was
+                        // retained. Recording this as `Published` with an
+                        // identity-less `published_leaf` would let rollback
+                        // reverse it as a replacement and delete a
+                        // concurrent writer's file; `DisplacedOnly` requires
+                        // an absent slot instead.
+                        disposition: CommitDisposition::DisplacedOnly,
                         replaced_original: Some(exhausted.backup_relative.clone()),
                         replaced_original_leaf: Some(exhausted.backup_leaf),
                         published_leaf: None,
@@ -343,6 +357,7 @@ impl PreparedWriteTarget {
             let outcome = CommitOutcome {
                 relative_path: self.final_relative_path.clone(),
                 resolution: self.resolution,
+                disposition: CommitDisposition::Published,
                 replaced_original: Some(backup_relative),
                 replaced_original_leaf: backup_leaf,
                 published_leaf,

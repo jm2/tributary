@@ -40,6 +40,8 @@ pub use crate::local::root_authority::{LeafIdentity, ReversalOutcome};
 #[allow(unused_imports)]
 pub use authority::{CreatedDirectoryEntry, MountedWriteAuthority};
 #[allow(unused_imports)]
-pub use policy::{CommitError, CommitOutcome, ConflictPolicy, ConflictResolution};
+pub use policy::{
+    CommitDisposition, CommitError, CommitOutcome, ConflictPolicy, ConflictResolution,
+};
 #[allow(unused_imports)]
 pub use target::{MountedDirectory, PreparedWriteTarget};
