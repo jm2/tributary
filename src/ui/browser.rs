@@ -14,7 +14,10 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
 
-use super::objects::{BrowserItem, TrackObject};
+use super::album_pane_art::{
+    AlbumArtBinder, AlbumArtCache, AlbumArtController, FALLBACK_PLACEHOLDER_ICON,
+};
+use super::objects::{AlbumArtCandidate, BrowserItem, TrackObject};
 use crate::ui::folder_browser::{FolderBrowser, RootBrowseError};
 use tracing::debug;
 
@@ -52,6 +55,27 @@ pub struct BrowserState {
     /// Re-entrancy guard shared with the pane handlers (attach/clear also
     /// repopulate the folder store programmatically).
     updating: Rc<Cell<bool>>,
+    /// Whether the album pane should render artwork thumbnails alongside
+    /// its text labels. Toggled by the preferences dialog and read by
+    /// the album pane's bind factory.
+    album_pane_artwork: Rc<Cell<bool>>,
+    /// Side length (in device pixels) of each album-pane thumbnail.
+    /// Persisted across restarts and forwarded to the cache probe.
+    album_pane_artwork_size: Rc<Cell<i32>>,
+    /// Coordinator for the album pane artwork path. Owned by the state
+    /// so the bind factory's closures stay valid for the life of the
+    /// browser even if the controller's internal references move.
+    album_art_controller: Rc<AlbumArtController>,
+    /// In-memory texture cache keyed by
+    /// `(source, track_id, pixel_size)`. Shared with the album pane bind
+    /// factory and exposed so callers can clear it on layout/preference
+    /// changes.
+    album_art_cache: Rc<AlbumArtCache>,
+    /// Most-recently installed binder for the album pane. Held by the
+    /// state so the rebuild path can revoke every in-flight fetch
+    /// before swapping the bind factory, instead of waiting for each
+    /// row's `unbind` to fire.
+    album_art_binder: Rc<RefCell<Option<AlbumArtBinder>>>,
 }
 
 /// Where the folder pane currently points.
@@ -72,9 +96,14 @@ enum FolderLocation {
 pub fn build_browser(
     all_tracks: &[TrackObject],
     use_album_artist: bool,
+    initial_album_pane_artwork: bool,
+    initial_album_pane_artwork_size: i32,
     on_filter_changed: FilterCallback,
 ) -> (gtk::Box, BrowserState) {
     let use_album_artist: Rc<Cell<bool>> = Rc::new(Cell::new(use_album_artist));
+    let album_pane_artwork: Rc<Cell<bool>> = Rc::new(Cell::new(initial_album_pane_artwork));
+    let album_pane_artwork_size: Rc<Cell<i32>> =
+        Rc::new(Cell::new(initial_album_pane_artwork_size));
     // Shared filter state
     let selected_genre: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let selected_artist: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
@@ -85,6 +114,12 @@ pub fn build_browser(
     // the sibling's selection_changed fires.  The guard prevents that
     // from cascading into further repopulation.
     let updating: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
+    // Album-art coordinator: virtualized, accessible, bounded cache for
+    // the album pane's per-row thumbnails. The source registry is wired
+    // in later by the window so the controller can resolve credential-
+    // isolated remote artwork without exposing endpoints here.
+    let album_art_controller = Rc::new(AlbumArtController::new(FALLBACK_PLACEHOLDER_ICON));
 
     // Stores for each pane
     let genre_store = gio::ListStore::new::<BrowserItem>();
@@ -129,7 +164,13 @@ pub fn build_browser(
     // ── Build the 3 panes ────────────────────────────────────────────
     let genre_pane = build_pane("Genre", &genre_store);
     let artist_pane = build_pane("Artist", &artist_store);
-    let album_pane = build_pane("Album", &album_store);
+    let album_pane = build_album_pane(
+        &album_store,
+        album_art_controller.clone(),
+        album_pane_artwork.clone(),
+        album_pane_artwork_size.clone(),
+        None,
+    );
     let folder_pane = build_pane("Folder", &folder_store);
 
     // ── Genre selection ──────────────────────────────────────────────
@@ -464,6 +505,11 @@ pub fn build_browser(
         folder_store,
         folder_selection: get_selection(&folder_pane),
         updating,
+        album_pane_artwork,
+        album_pane_artwork_size,
+        album_art_cache: Rc::new(album_art_controller.cache().clone()),
+        album_art_controller,
+        album_art_binder: Rc::new(RefCell::new(None)),
     };
     (browser_box, state)
 }
@@ -471,6 +517,169 @@ pub fn build_browser(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Switch the album pane between the artwork thumbnail bind factory and
+/// the plain label bind factory used by genre and artist.
+///
+/// The pane widget itself stays put: the swap goes through
+/// `ListView::set_factory`, which keeps the `SingleSelection` — and
+/// with it the selection-changed handler that drives the genre/artist
+/// cross-filter chain — alive. An earlier revision replaced the whole
+/// pane widget, which orphaned that handler and silently froze
+/// cross-filtering from the first toggle onward.
+pub fn set_album_pane_artwork(browser_box: &gtk::Box, state: &BrowserState, enabled: bool) {
+    if state.album_pane_artwork.get() == enabled {
+        return;
+    }
+    state.album_pane_artwork.set(enabled);
+    rebuild_album_pane(browser_box, state);
+}
+
+/// Update the album-pane thumbnail size. The bind factory reads the
+/// size knob on every bind, so the change applies to the next set of
+/// rows that scroll into view. We swap the bind factory here so the
+/// cached textures (keyed by `(album_key, pixel_size)`) are dropped
+/// alongside the old factory — a stale entry from the previous
+/// size would never be queried again, and leaving it in the cache
+/// would still consume the bounded-memory budget.
+pub fn set_album_pane_artwork_size(browser_box: &gtk::Box, state: &BrowserState, pixel_size: i32) {
+    if state.album_pane_artwork_size.get() == pixel_size {
+        return;
+    }
+    state.album_pane_artwork_size.set(pixel_size);
+    rebuild_album_pane(browser_box, state);
+}
+
+/// Swap the album pane's bind factory in place for one wired to the
+/// current `(album_pane_artwork, album_pane_artwork_size)` knobs.
+///
+/// The pane widget, its `ListView`, and — critically — its
+/// `SingleSelection` all survive the swap: the selection-changed
+/// handler that drives the genre/artist cross-filter chain is wired
+/// exactly once, in `build_browser`, onto that selection object.
+/// Replacing the whole pane (as an earlier revision did) silently
+/// orphaned that handler, so the first artwork toggle or size change
+/// froze cross-filtering for the rest of the session.
+/// `ListView::set_factory` is GTK's supported way to change how rows
+/// are built at runtime: the old rows are unbound and torn down, and
+/// the new factory rebuilds them against the same model.
+///
+/// The existing `gio::ListStore` and its selection are likewise left
+/// completely untouched: this is a presentation-only factory swap, so
+/// the store keeps its CURRENT (genre/artist-filtered) content and the
+/// selected album keeps its highlight. An earlier revision repopulated
+/// the store with the filters cleared and reset the selection to "All",
+/// which expanded the pane to unrelated albums and — through the
+/// selection-changed callback — silently cleared the user's active
+/// album filter (2026-09-08 PR #171 review). Fresh artwork candidates
+/// are not a layout concern: every library change repopulates the store
+/// through [`rebuild_browser_data`].
+///
+/// The cache is cleared because every entry was decoded at the previous
+/// size and would never match a new `(album_key, pixel_size)` lookup
+/// under the recompiled bind factory.
+fn rebuild_album_pane(browser_box: &gtk::Box, state: &BrowserState) {
+    let panes_box = browser_box
+        .last_child()
+        .and_then(|w| w.downcast::<gtk::Box>().ok());
+    let Some(panes_box) = panes_box else {
+        return;
+    };
+
+    let mut child = panes_box.first_child();
+    let mut panes = Vec::new();
+    while let Some(widget) = child {
+        if let Some(pane) = widget.downcast_ref::<gtk::Box>() {
+            panes.push(pane.clone());
+        }
+        child = widget.next_sibling();
+    }
+
+    if panes.len() < 3 {
+        return;
+    }
+
+    // Album pane is the 3rd child (index 2). Keep the pane in place and
+    // swap only its bind factory.
+    let album_pane = panes[2].clone();
+    let Some(list_view) = pane_list_view(&album_pane) else {
+        return;
+    };
+
+    // Revoke every in-flight fetch on the previous bind factory before
+    // we swap it out. The worker-side liveness tokens stop stale
+    // results from painting, but they do not stop a fetch from
+    // running to completion and burning CPU; revoking here short-
+    // circuits the future at its next poll. The `album_art_binder`
+    // slot is cleared so the factory build below records the
+    // freshly-built binder.
+    if let Some(binder) = state.album_art_binder.borrow_mut().take() {
+        binder.revoke_all();
+    }
+
+    // Clear the cache so the new bind factory doesn't serve stale
+    // textures from before the layout change — they're decoded at the
+    // old size, and a stale hit would bypass the new bind path
+    // entirely.
+    state.album_art_cache.clear();
+
+    let new_factory = build_album_factory(
+        state.album_art_controller.clone(),
+        state.album_pane_artwork.clone(),
+        state.album_pane_artwork_size.clone(),
+        Some(&state.album_art_binder),
+    );
+    list_view.set_factory(Some(&new_factory));
+
+    // Deliberately NO store repopulation and NO selection reset here:
+    // the model keeps its filtered content and the user's selected album
+    // row keeps its highlight across the swap. See the function docs.
+}
+
+/// Extract the `ListView` from an album pane Box — the shared anchor
+/// for the factory-swap path.
+fn pane_list_view(pane: &gtk::Box) -> Option<gtk::ListView> {
+    let scrolled = pane.last_child()?.downcast::<gtk::ScrolledWindow>().ok()?;
+    scrolled.child()?.downcast::<gtk::ListView>().ok()
+}
+
+/// Attach the live source registry to the album-art coordinator. Must
+/// be called once after `build_browser` and once per registry
+/// replacement (the controller will see the new handle on the next
+/// bind). The pointer is intentional: only the resolver path needs
+/// it, and lazy attachment keeps the coordinator construction cheap.
+pub fn attach_source_registry(
+    state: &BrowserState,
+    source_registry: crate::source_registry::SourceRegistry,
+) {
+    state
+        .album_art_controller
+        .attach_source_registry(source_registry);
+}
+
+/// Attach the live application config to the album-art coordinator. Must
+/// be called once after `build_browser`. The built-in local library's
+/// retained artwork authority resolves against the configured library
+/// roots, which live in `AppConfig`; the controller snapshots them per
+/// bind. The pointer is intentional (mirrors
+/// [`attach_source_registry`]): only the resolver path needs it, and a
+/// later preferences edit is observed through the shared cell.
+pub fn attach_app_config(
+    state: &BrowserState,
+    app_config: Rc<RefCell<crate::ui::preferences::AppConfig>>,
+) {
+    state.album_art_controller.attach_app_config(app_config);
+}
+
+/// Attach the application's Tokio runtime to the album-art coordinator.
+/// Must be called once after `build_browser`. The built-in local
+/// library's retained artwork authority polls Tokio time/blocking APIs,
+/// which panic on the runtime-less GTK main context the pane fetch is
+/// driven on, so the controller runs that arm on this handle
+/// (2026-09-13 review finding).
+pub fn attach_runtime(state: &BrowserState, rt_handle: tokio::runtime::Handle) {
+    state.album_art_controller.attach_runtime(rt_handle);
+}
 
 /// Lightweight snapshot of track fields for filtering (avoids borrowing GObjects).
 #[derive(Clone)]
@@ -482,6 +691,21 @@ struct TrackSnapshot {
     /// Album artist (used for browser grouping when the preference is on).
     album_artist: String,
     album: String,
+    /// Stable track identifier. The album-pane artwork resolver reads
+    /// this to call `SourceRegistry::resolve_artwork`.
+    track_id: String,
+    /// Playable locator or `file://` URI. Local album rows go through
+    /// the embedded-art extractor when the resolver finds no remote art.
+    uri: String,
+    /// Track-provided cover URL string. Used as a third-tier fallback
+    /// when no remote artwork can be resolved.
+    cover_art_url: String,
+    /// Source identity for the credential-isolated remote resolver.
+    /// `None` for local / non-networked tracks.
+    source_id: Option<crate::architecture::SourceId>,
+    /// Source session epoch paired with `source_id`; the resolver
+    /// rejects resolutions that cross an active replacement.
+    source_session_epoch: Option<u64>,
 }
 
 impl TrackSnapshot {
@@ -492,6 +716,11 @@ impl TrackSnapshot {
             artist: t.artist(),
             album_artist: t.album_artist(),
             album: t.album(),
+            track_id: t.track_id(),
+            uri: t.uri(),
+            cover_art_url: t.cover_art_url(),
+            source_id: t.source_id(),
+            source_session_epoch: t.source_session_epoch(),
         }
     }
 
@@ -710,6 +939,114 @@ fn build_pane(title: &str, store: &gio::ListStore) -> gtk::Box {
     pane
 }
 
+/// Build the album pane's bind factory for the current
+/// `(album_pane_artwork, album_pane_artwork_size)` knob values: the
+/// artwork-thumbnail factory when artwork is enabled, the standard
+/// browser-row factory otherwise. Extracted from [`build_album_pane`] so
+/// the layout-change path can rebuild the factory and swap it into the
+/// existing `ListView` (keeping the pane, its model, and the
+/// selection-changed wiring alive) instead of replacing the pane
+/// widget. When artwork is enabled the freshly-built
+/// [`AlbumArtBinder`] is recorded into `binder_slot` so the swap path
+/// can revoke its in-flight fetches before building the next factory.
+fn build_album_factory(
+    album_art_controller: Rc<AlbumArtController>,
+    album_pane_artwork_visible: Rc<Cell<bool>>,
+    album_pane_artwork_size: Rc<Cell<i32>>,
+    binder_slot: Option<&Rc<RefCell<Option<AlbumArtBinder>>>>,
+) -> gtk::SignalListItemFactory {
+    if !album_pane_artwork_visible.get() {
+        // Artwork disabled: reuse the SAME browser-row factory the genre
+        // and artist panes use, so the album pane keeps the established
+        // list-row accessibility contract — presentational label/count
+        // children plus the combined album/count accessible name on the
+        // GtkListItem — instead of an ad-hoc `gtk::Label` that lost both
+        // (2026-09-13 review finding). The visible text now matches the
+        // sibling panes (primary label + dimmed count), not a bespoke
+        // "label (count)" string.
+        return browser_row_factory();
+    }
+
+    let factory = gtk::SignalListItemFactory::new();
+    let (setup, bind, unbind, teardown, binder) =
+        album_art_controller.build_binder_with_size(album_pane_artwork_size.clone());
+    factory.connect_setup(setup);
+    factory.connect_bind(bind);
+    factory.connect_unbind(unbind);
+    // Release each row's cell state when GTK discards the list
+    // item — otherwise toggles and size changes accumulate dead
+    // `AlbumArtCellState` entries (widget tree included) until the
+    // next rebuild.
+    factory.connect_teardown(teardown);
+    // Stash the binder so the factory-swap path can revoke every
+    // in-flight fetch on this pane before swapping the factory.
+    // Without this, a quick toggle would leave the old fetches
+    // racing the new bind factory until each cell's `unbind`
+    // eventually fires — and the worker-side generation check
+    // alone does not stop a fetch from running to completion.
+    if let Some(slot) = binder_slot {
+        slot.replace(Some(binder));
+    }
+
+    factory
+}
+
+/// Build the album pane with an optional artwork column.
+///
+/// When `album_pane_artwork_visible` is on, the bind factory uses the
+/// `AlbumArtController` to fetch a thumbnail for each row. When off,
+/// the factory falls back to the plain label used by genre and artist.
+///
+/// `binder_slot` is supplied on rebuild so the freshly-built binder can
+/// be recorded into [`BrowserState::album_art_binder`]. The first build
+/// path passes `None` because the state is already being constructed.
+fn build_album_pane(
+    store: &gio::ListStore,
+    album_art_controller: Rc<AlbumArtController>,
+    album_pane_artwork_visible: Rc<Cell<bool>>,
+    album_pane_artwork_size: Rc<Cell<i32>>,
+    binder_slot: Option<&Rc<RefCell<Option<AlbumArtBinder>>>>,
+) -> gtk::Box {
+    let header = gtk::Label::builder()
+        .label(rust_i18n::t!("browser.album").as_ref())
+        .css_classes(["heading"])
+        .halign(gtk::Align::Start)
+        .margin_start(8)
+        .margin_top(4)
+        .margin_bottom(2)
+        .build();
+
+    let selection = gtk::SingleSelection::new(Some(store.clone()));
+    selection.set_autoselect(true);
+
+    let factory = build_album_factory(
+        album_art_controller,
+        album_pane_artwork_visible,
+        album_pane_artwork_size,
+        binder_slot,
+    );
+
+    let list_view = gtk::ListView::builder()
+        .model(&selection)
+        .factory(&factory)
+        .build();
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .child(&list_view)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .build();
+
+    let pane = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    pane.append(&header);
+    pane.append(&scrolled);
+
+    pane
+}
+
 /// Extract the `SingleSelection` from a browser pane box.
 fn get_selection(pane: &gtk::Box) -> gtk::SingleSelection {
     let scrolled = pane
@@ -829,6 +1166,11 @@ fn populate_albums(
     use_album_artist: bool,
 ) {
     store.remove_all();
+    // Track the first representative per album so the browser pane can
+    // resolve artwork lazily — only the chosen representative's source
+    // identity and URI need to be retained in the BrowserItem.
+    let mut candidates: std::collections::BTreeMap<String, AlbumArtCandidate> =
+        std::collections::BTreeMap::new();
     let mut map = std::collections::BTreeMap::<String, u32>::new();
     for t in tracks {
         if let Some(g) = genre_filter {
@@ -842,11 +1184,28 @@ fn populate_albums(
             }
         }
         *map.entry(t.album.clone()).or_insert(0) += 1;
+        candidates
+            .entry(t.album.clone())
+            .or_insert_with(|| AlbumArtCandidate {
+                track_id: t.track_id.clone(),
+                uri: t.uri.clone(),
+                cover_art_url: t.cover_art_url.clone(),
+                source_id: t.source_id,
+                source_session_epoch: t.source_session_epoch,
+            });
     }
     let total: u32 = map.values().sum();
     store.append(&BrowserItem::new("All", total));
     for (album, count) in &map {
-        store.append(&BrowserItem::new(album, *count));
+        if let Some(candidate) = candidates.get(album) {
+            store.append(&BrowserItem::new_with_artwork(
+                album,
+                *count,
+                candidate.clone(),
+            ));
+        } else {
+            store.append(&BrowserItem::new(album, *count));
+        }
     }
 }
 
@@ -860,6 +1219,17 @@ fn populate_albums(
 /// selection changes use fresh data, then repopulates all three stores
 /// with filters reset to "All".
 pub fn rebuild_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks: &[TrackObject]) {
+    // The track set just changed (FullSync, source switch, snapshot
+    // refresh). Bump the album-art cache's content generation so covers
+    // changed by the new data are re-resolved within the SAME source
+    // session instead of serving the previous contents of
+    // `(source, epoch, album)` (2026-09-10 review finding — the key
+    // carried the source epoch but no artwork/content generation, so a
+    // same-session FullSync left changed covers stale). Old-generation
+    // entries become unqueryable and age out through the bounded
+    // eviction.
+    state.album_art_controller.cache().bump_content_generation();
+
     // Update the shared snapshot that selection handlers reference.
     let snapshots: Vec<TrackSnapshot> = tracks.iter().map(TrackSnapshot::from_object).collect();
     *state.tracks.borrow_mut() = snapshots;
@@ -876,33 +1246,41 @@ pub fn rebuild_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks
 
     let borrowed = state.tracks.borrow();
     let use_aa = state.use_album_artist.get();
+    populate_all_panes(browser_box, &borrowed, use_aa);
+}
 
-    // The browser_box layout is: SearchEntry, panes_box (horizontal Box).
-    // The panes_box contains 3 children (genre_pane, artist_pane, album_pane).
-    let panes_box = browser_box
+/// Repopulate the genre, artist and album pane stores from the shared
+/// track snapshot with their filters reset to "All".
+///
+/// The browser_box layout is: SearchEntry, panes_box (horizontal Box);
+/// the panes_box contains 3 children (genre_pane, artist_pane,
+/// album_pane).
+fn populate_all_panes(browser_box: &gtk::Box, tracks: &[TrackSnapshot], use_aa: bool) {
+    let Some(panes_box) = browser_box
         .last_child()
-        .and_then(|w| w.downcast::<gtk::Box>().ok());
+        .and_then(|w| w.downcast::<gtk::Box>().ok())
+    else {
+        return;
+    };
 
-    if let Some(ref panes_box) = panes_box {
-        let mut child = panes_box.first_child();
-        let mut panes = Vec::new();
-        while let Some(widget) = child {
-            if let Some(pane) = widget.downcast_ref::<gtk::Box>() {
-                panes.push(pane.clone());
-            }
-            child = widget.next_sibling();
+    let mut child = panes_box.first_child();
+    let mut panes = Vec::new();
+    while let Some(widget) = child {
+        if let Some(pane) = widget.downcast_ref::<gtk::Box>() {
+            panes.push(pane.clone());
         }
+        child = widget.next_sibling();
+    }
 
-        if panes.len() >= 3 {
-            if let Some(genre_store) = get_store_from_pane(&panes[0]) {
-                populate_genres(&genre_store, &borrowed, &None, &None, use_aa);
-            }
-            if let Some(artist_store) = get_store_from_pane(&panes[1]) {
-                populate_artists(&artist_store, &borrowed, &None, &None, use_aa);
-            }
-            if let Some(album_store) = get_store_from_pane(&panes[2]) {
-                populate_albums(&album_store, &borrowed, &None, &None, use_aa);
-            }
+    if panes.len() >= 3 {
+        if let Some(genre_store) = get_store_from_pane(&panes[0]) {
+            populate_genres(&genre_store, tracks, &None, &None, use_aa);
+        }
+        if let Some(artist_store) = get_store_from_pane(&panes[1]) {
+            populate_artists(&artist_store, tracks, &None, &None, use_aa);
+        }
+        if let Some(album_store) = get_store_from_pane(&panes[2]) {
+            populate_albums(&album_store, tracks, &None, &None, use_aa);
         }
     }
 }
@@ -1157,6 +1535,140 @@ mod tests {
         assert_eq!(row.count().text(), "");
     }
 
+    /// Compact track fixture for the pane tests (the real constructor
+    /// takes 14 arguments; only these five vary here).
+    fn fixture_track(
+        number: u32,
+        artist: &str,
+        album: &str,
+        genre: &str,
+        uri: &str,
+    ) -> TrackObject {
+        TrackObject::new(
+            number, "T", 60, artist, album, genre, "", 0, "", 0, 0, 0, "", uri,
+        )
+    }
+
+    /// Collect the three pane boxes from the browser widget tree
+    /// (browser_box = [SearchEntry, panes_box], panes_box = [genre,
+    /// artist, album] — mirrors `rebuild_browser_data`).
+    fn collect_browser_panes(browser_box: &gtk::Box) -> Vec<gtk::Box> {
+        let panes_box = browser_box
+            .last_child()
+            .and_then(|w| w.downcast::<gtk::Box>().ok())
+            .expect("panes box");
+        let mut child = panes_box.first_child();
+        let mut panes = Vec::new();
+        while let Some(widget) = child {
+            if let Some(pane) = widget.downcast_ref::<gtk::Box>() {
+                panes.push(pane.clone());
+            }
+            child = widget.next_sibling();
+        }
+        assert_eq!(panes.len(), 3, "genre, artist and album panes");
+        panes
+    }
+
+    /// A presentation-only factory swap must keep the album store
+    /// filtered and the album/genre selections in place.
+    fn assert_album_pane_preserved(panes: &[gtk::Box], album_store: &gio::ListStore) {
+        assert_eq!(
+            album_store.n_items(),
+            3,
+            "the genre-filtered album store must survive the swap"
+        );
+        assert_eq!(
+            get_selection(&panes[2]).selected(),
+            2,
+            "the selected album row must survive the swap"
+        );
+        assert_eq!(get_selection(&panes[0]).selected(), 1);
+    }
+
+    /// Codex P2 (PR #171 discussion r3962112844): toggling album-pane
+    /// artwork or changing its thumbnail size is a presentation-only
+    /// factory swap. The rebuild must keep the album store filtered to
+    /// the active genre selection and keep the selected album row; the
+    /// previous implementation repopulated the store with the filters
+    /// cleared and reset the selection to "All", which expanded the pane
+    /// to unrelated albums and — through the selection-changed callback
+    /// — silently cleared the user's active album filter.
+    fn factory_swap_preserves_album_filters_and_selection() {
+        let tracks = vec![
+            fixture_track(1, "AR", "A1", "G1", "file:///t1.flac"),
+            fixture_track(2, "AR", "A2", "G1", "file:///t2.flac"),
+            fixture_track(3, "AR2", "A3", "G2", "file:///t3.flac"),
+        ];
+        let (browser_box, state) =
+            build_browser(&tracks, false, false, 48, Box::new(|_, _, _, _, _| {}));
+        let panes = collect_browser_panes(&browser_box);
+
+        // Filter to genre G1 (genre store: "All", "G1", "G2" → index 1).
+        // The album store narrows to G1's albums: "All", "A1", "A2".
+        get_selection(&panes[0]).set_selected(1);
+        let album_store = get_store_from_pane(&panes[2]).expect("album store");
+        assert_eq!(
+            album_store.n_items(),
+            3,
+            "the genre filter must narrow the album pane before the swap"
+        );
+        // Select the second album row ("A2").
+        get_selection(&panes[2]).set_selected(2);
+
+        // Layout toggle: swap the artwork factory in place.
+        set_album_pane_artwork(&browser_box, &state, true);
+        assert_album_pane_preserved(&panes, &album_store);
+
+        // Thumbnail size change: same contract.
+        set_album_pane_artwork_size(&browser_box, &state, 72);
+        assert_album_pane_preserved(&panes, &album_store);
+    }
+
+    /// FullSync and any other full data rebuild must invalidate cached
+    /// covers: the rebuild bumps the album-art cache's content
+    /// generation, so artwork decoded before the rebuild can never be
+    /// queried afterwards (2026-09-10 review finding — same-session
+    /// FullSync used to leave changed covers stale).
+    fn rebuild_bumps_album_art_content_generation() {
+        let tracks = vec![fixture_track(1, "AR", "A1", "G1", "file:///t1.flac")];
+        let (browser_box, state) =
+            build_browser(&tracks, false, false, 48, Box::new(|_, _, _, _, _| {}));
+        let before = state.album_art_controller.cache().content_generation();
+        rebuild_browser_data(&browser_box, &state, &[]);
+        assert!(
+            state.album_art_controller.cache().content_generation() > before,
+            "a full data rebuild must advance the album-art content generation"
+        );
+    }
+
+    /// With artwork disabled the album pane must keep the standard
+    /// browser-row accessibility contract: its factory setup must attach
+    /// the shared [`BrowserRow`] (presentational label/count children)
+    /// that bind publishes the combined accessible name on, not an ad-hoc
+    /// `gtk::Label` that regressed both (2026-09-13 review finding).
+    fn album_artwork_disabled_keeps_browser_row_contract() {
+        let controller = Rc::new(AlbumArtController::new(FALLBACK_PLACEHOLDER_ICON));
+        let factory = build_album_factory(
+            controller,
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(48)),
+            None,
+        );
+        let list_item: gtk::ListItem = glib::Object::new();
+        factory.emit_by_name::<()>("setup", &[&list_item]);
+        let row = list_item
+            .child()
+            .and_downcast::<BrowserRow>()
+            .expect("disabled album factory must reuse the shared BrowserRow");
+        assert_row_roles_presentational(&row);
+        bind_browser_row(&list_item, &BrowserItem::new("Kind of Blue", 9));
+        assert_eq!(
+            list_item.accessible_label(),
+            "Kind of Blue, (9)",
+            "disabled album rows must publish the combined accessible name"
+        );
+    }
+
     /// The crate's single consolidated GTK widget test, all run on the ONE
     /// thread that owns the GTK session:
     ///
@@ -1206,5 +1718,12 @@ mod tests {
 
         crate::ui::context_menu::tests::popover_from_menu_model_attaches_a_visible_child_widget();
         crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones();
+        crate::ui::album_art_cell::widget_tests::show_placeholder_keeps_the_missing_art_visible();
+        crate::ui::album_art_cell::widget_tests::revoking_a_cell_revokes_its_outstanding_fetch_token();
+        crate::ui::album_pane_art::widget_tests::album_art_row_publishes_combined_accessible_name();
+        crate::ui::album_pane_art::widget_tests::album_art_row_zero_count_announces_bare_label();
+        factory_swap_preserves_album_filters_and_selection();
+        rebuild_bumps_album_art_content_generation();
+        album_artwork_disabled_keeps_browser_row_contract();
     }
 }
