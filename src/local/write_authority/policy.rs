@@ -38,6 +38,30 @@ pub enum ConflictResolution {
     Preserved,
 }
 
+/// What a commit left at the destination, and therefore which reversal the
+/// caller's rollback owes.
+///
+/// This is deliberately a distinct disposition rather than an encoding on
+/// [`CommitOutcome::published_leaf`]: an identity-less `published_leaf`
+/// already has a legacy meaning (a reversal degrades to path-only
+/// behavior), and redefining it would silently change every uncoupled
+/// reversal. Only the Windows rebind-exhaustion disposition is an explicit
+/// "nothing of the transfer's landed" state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommitDisposition {
+    /// The staged bytes landed at the destination: a fresh write, a
+    /// preserved sibling, or an identity-coupled replacement. Rollback
+    /// removes the published leaf or restores an identity-verified backup.
+    Published,
+    /// Nothing of the transfer's landed at the destination. A Windows
+    /// replace publish exhausted its rebind bound against a concurrent
+    /// occupant and retained the pre-transfer occupant's backup; the
+    /// destination still holds an occupant the transfer never owned (or is
+    /// vacant). Rollback may restore the retained backup ONLY into an
+    /// absent slot and must refuse any occupant intact.
+    DisplacedOnly,
+}
+
 /// Detail of what `commit` actually published, for callers that need to log,
 /// report, or roll back the publish outcome.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,6 +70,12 @@ pub struct CommitOutcome {
     pub relative_path: PathBuf,
     /// How the conflict policy was resolved against the live filesystem.
     pub resolution: ConflictResolution,
+    /// What the commit left at the destination, and therefore which
+    /// reversal rollback owes. `Published` for every ordinary commit;
+    /// `DisplacedOnly` only for the Windows rebind-exhaustion disposition,
+    /// where `replaced_original` names a retained displaced occupant but no
+    /// transfer bytes were published.
+    pub disposition: CommitDisposition,
     /// Relative path of the backup sibling bound to a replaced occupant's
     /// bytes during an Overwrite commit. The bind happens at commit time
     /// against whatever the destination name resolves to in that instant,
@@ -96,9 +126,12 @@ pub enum CommitError {
     /// transfer could never undo them — or a Windows replace publish
     /// exhausted its rebind bound with a completed binding retained:
     /// nothing landed, but the displaced original survives at its verified
-    /// backup and the outcome carries it so the caller records the
+    /// backup and the outcome carries it (with
+    /// [`CommitDisposition::DisplacedOnly`]) so the caller records the
     /// replacement for rollback or disposal instead of stranding a hidden
-    /// orphan.
+    /// orphan. A `DisplacedOnly` outcome must never be reversed with the
+    /// identity-coupled replacement path: no transfer bytes were ever
+    /// published, so its restoration is valid only into an absent slot.
     #[error("staged file was published but post-publish verification failed: {error}")]
     PublishVerification {
         /// What was published, including the backup bind of a replaced

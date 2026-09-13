@@ -20,6 +20,9 @@ use crate::source_lifecycle::CancellationObserver;
 
 mod rollback;
 
+#[cfg(all(test, windows))]
+mod displaced_only_tests;
+
 use self::rollback::{discard_staged_copy, owned_change_for_copy, OwnedChange};
 
 /// A copy-stage failure. A no-replace publish that refused a destination
@@ -401,11 +404,15 @@ impl TransferExecutor {
                 context: error.to_string(),
             })),
             Err(CommitError::PublishVerification { outcome, error }) => {
-                // The publish happened; only the post-publish mount
-                // revalidation failed. Record the owned change so the outer
-                // rollback reverses (identity-verified) exactly what landed,
-                // then fail the stage — committed bytes must never be left
-                // unrecorded behind a failure.
+                // The publish reached a state that must be recorded: either
+                // the staged bytes landed and only the post-publish mount
+                // revalidation failed, or (Windows) the replace exhausted
+                // its rebind bound with nothing of the transfer's published
+                // and the displaced original retained at a backup. Distinguish
+                // the two through the outcome's disposition so rollback
+                // reverses (identity-verified) exactly what the commit left,
+                // then fail the stage — a committed or displaced state must
+                // never be left unrecorded behind a failure.
                 context.committed.push(owned_change_for_copy(outcome));
                 Err(StageFailure::Final(TransferError::CommitFailed {
                     context: error.to_string(),

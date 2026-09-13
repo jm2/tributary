@@ -14,7 +14,7 @@ use super::staging::{
 };
 use super::target::{MountedDirectory, PreparedWriteTarget};
 use crate::local::root_authority::{
-    LeafIdentity, MountedRootAuthority, RetainedWriteParent, ReversalOutcome,
+    LeafIdentity, MountedRootAuthority, RestoreSlot, RetainedWriteParent, ReversalOutcome,
 };
 /// Retained write authority over one exact mounted filesystem.
 ///
@@ -288,6 +288,31 @@ impl MountedWriteAuthority {
             backup_relative,
             destination_relative,
             expected,
+            backup_leaf_identity,
+            RestoreSlot::IdentityCoupled,
+        )
+    }
+
+    /// Restore a displaced-only backup into an ABSENT destination slot,
+    /// refusing any occupant.
+    ///
+    /// The counterpart of a Windows replace publish that exhausted its
+    /// rebind bound: nothing of the transfer's ever landed, and the
+    /// retained backup holds the displaced pre-transfer occupant. Because
+    /// no publication identity exists to couple a replacement, the backup
+    /// is installed only with no-replace semantics and any occupant is
+    /// refused intact. The backup is verified against its bind-time
+    /// identity and never deleted on refusal or failure, so the displaced
+    /// original survives for a later, unblocked restore.
+    pub fn restore_displaced_only_verified(
+        &self,
+        backup_relative: &Path,
+        destination_relative: &Path,
+        backup_leaf_identity: Option<&LeafIdentity>,
+    ) -> io::Result<ReversalOutcome> {
+        self.mounted.restore_displaced_only_verified(
+            backup_relative,
+            destination_relative,
             backup_leaf_identity,
         )
     }
