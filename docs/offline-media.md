@@ -51,7 +51,7 @@ the download/cache engine must satisfy.
 | Identity | Cache entries use the same `SourceId` + `TrackId` shape as live playback. The download engine adopts the live per-source `MediaKey`; it never invents a new identity kind. | New persisted media identifier kinds, new schema migrations for media identity, on-disk naming conventions beyond `task.md` and the credential-boundary section. The durable `SourceIncarnationId` of [restart authorization](#authenticated-resumable-download-jobs) is a registry-side durable field, not a media identifier kind. |
 | Authority | Every cached media entry remains owned by its source. The source registry's exact-snapshot capability gates download admission, reconciliation, and retirement. A committed snapshot renders offline without a live registry round-trip; disconnect and refresh never gate playback of committed bytes. No offline bypass of the registry for admission. | Concurrent access contracts for the registry's offline catalogue; specific read-side materialisation policies. |
 | Download jobs | A bounded resumable job model keyed by exact `(SourceId, TrackId)` with a durable, `fsync`'d progress journal, entity validators (`If-Range`) on every range request, opaque server caps, deterministic cancellation, and structured redacted failures. Job state survives restart; it is never memory-only. Restart authorization is by durable source-incarnation identity (`SourceId` + `SourceIncarnationId`), never by the transient accepted-generation number, applied consistently to lease reacquisition, resumption, and publish-intent adoption. | Concrete worker pool scheduling, threading model, runtime selection, telemetry. |
-| Storage | Verify-then-publish: the temp file lives in the same directory (same filesystem) as its final cache path, integrity is verified on the temp file before any rename, and publish is an atomic rename — durability-ordered on Unix by a parent-directory `fsync` chain that re-derives and re-syncs the complete ancestor chain on every attempt, and on Windows by the documented `MOVEFILE_WRITE_THROUGH` barrier ([Atomic storage](#atomic-storage)). The final path is snapshot-scoped, so a refresh publishes a sibling instead of overwriting a predecessor's bytes; a journaled publish intent makes the rename-to-commit window crash-recoverable, and a durable delete intent — the publish intent itself, or the `fsync`'d terminal-verdict record that supersedes it on a post-rename terminal transition — is the delete owner for a file published without a row. Cross-filesystem publish is refused at admission, never emulated with copy+sync+delete. A `tracks` row may link to a cache path only when integrity passed, the per-track cap held before the rename, and the file is current. | Database migrations, schema, table layout, index choice, cache placement, encryption. |
+| Storage | Verify-then-publish: the temp file lives in the same directory (same filesystem) as its final cache path, integrity is verified on the temp file before any rename, and publish is an atomic rename — durability-ordered on Unix by a parent-directory `fsync` chain that re-derives and re-syncs the complete ancestor chain on every attempt, and on Windows by the documented `MOVEFILE_WRITE_THROUGH` barrier ([Atomic storage](#atomic-storage)). The final path is snapshot-scoped, so a refresh publishes a sibling instead of overwriting a predecessor's bytes; a journaled publish intent makes the rename-to-commit window crash-recoverable — adoption at startup completes the pending publication barrier, re-syncing the directory entry for the already-renamed file, before it may insert the row or clear the intent — and a durable delete intent — the publish intent itself, or the `fsync`'d terminal-verdict record that supersedes it on a post-rename terminal transition — is the delete owner for a file published without a row. Cross-filesystem publish is refused at admission, never emulated with copy+sync+delete. A `tracks` row may link to a cache path only when integrity passed, the per-track cap held before the rename, and the file is current. | Database migrations, schema, table layout, index choice, cache placement, encryption. |
 | Integrity | SHA-256 is computed over the bytes on disk and compared against an expected digest whose provenance is declared per backend (capability matrix below). A backend that advertises no digest is verified by independent double-fetch; the absence of any verification path is terminal, never a silent pass. Verification completes before publish. | Hashing algorithm extension, content-defined chunking, content-addressable stores. |
 | Capabilities | The remote source owns a default-deny `OfflineSnapshot` capability. Only the same set of backends that opt into live `ServerPlaylist`-style read authority may opt in. Radio-Browser, removable, external-file, and built-in local sources cannot. | Adapter-specific download strategies beyond HTTP(S) `Range` and Subsonic/Jellyfin/Plex/DAAP download endpoints. |
 | Credentials | Cached media may carry no credential, password, signed URL, or session cookie in metadata, file name, sidecar, log, or GTK-visible row. Bearer URLs are minted only by the existing exact-origin proxy and consumed through the same opaque revocable ticket used by live playback. | New credential storage paths, new vault tables, package or build-credential integration, distribution-time-key loading. |
@@ -375,7 +375,16 @@ directory.
    the previous process's in-memory creation set. The journal records the
    pass as outstanding until it completes, so a crash mid-pass re-enters it
    from the top on the next attempt and the rename is never reached with an
-   unsynced chain.
+   unsynced chain. The outstanding-pass record is consumed by the post-rename
+   adoption path as well, not only by the renaming path: when a crash lands
+   after the rename but before the snapshot directory is `fsync`'d, adoption
+   completes the identical path-derived, top-down, idempotent pass —
+   re-syncing the entries derived from the recorded final path, including the
+   snapshot directory that now contains the already-renamed file — before it
+   may insert the cache row or clear the intent, and it never repeats the
+   rename, whose temp no longer exists. If that pass cannot complete,
+   adoption creates no row and clears no intent, so the durability ordering is
+   never abandoned by recovery.
 
    Windows is bounded differently, and the design states the bound instead
    of asserting a flush the platform does not document. Windows has no
@@ -579,9 +588,25 @@ the window and its single recovery resolution:
    standing. That cleanup is reachable only when no committed row was
    recognized and no verdict owns the file. For an eligible job:
    - The file is present and its SHA-256 matches the journaled digest: the
-     rename happened. The engine completes step 6 — inserting the cache
+     rename happened. Adoption must first complete and verify every pending
+     platform publication barrier the crash interrupted — the outstanding
+     durability pass of step 5, consumed here from the outstanding-pass
+     record rather than re-derived from a temp file. On Unix that means
+     re-deriving the complete ancestor chain from the recorded final path
+     and re-syncing every entry top-down and idempotently, including the
+     snapshot directory's own entry for the already-renamed file, and it
+     never repeats the rename, because the temp is gone and the published
+     name already exists. On Windows the published file's own bytes and
+     entry barrier completed inside the rename call, so adoption adds no
+     undocumented flush and the named ancestor-entry residual remains
+     bounded by the post-commit loss row. Only once every applicable
+     barrier holds does the engine complete step 6 — inserting the cache
      row; the `(source_key, track_key, snapshot_key)` key makes the insert
-     idempotent — and clears the intent.
+     idempotent — and clear the intent. If a required barrier cannot be
+     completed, adoption creates no row and clears no intent: the pending
+     intent remains the durable recovery/cleanup owner and a later recovery
+     pass retries, so a committed Unix row never references a path whose
+     rename entry is not durable.
    - The file is present and the digest does not match: the bytes are not
      the verified publication. The engine unlinks the file, clears the
      intent, and restarts the job from zero.
@@ -613,10 +638,11 @@ the window and its single recovery resolution:
    | --- | --- | --- | --- |
    | Ancestors created (step 1 or an earlier attempt), process crash before the step-5 ancestor-durability pass | No commit; temp present; final absent; ancestor directories may exist but their entry durability is unproven; no intent, or a pending one. | Ordinary journal recovery resumes or restarts per the journal; on reaching step 5 it re-derives the complete ancestor chain from the recorded final path and re-runs the top-down, idempotent pass before the rename, never trusting the crashed process's creation set. | The pass is path-derived and idempotent, so a resumed process completes it without the creator's memory. |
    | Power loss before or during the step-5 ancestor-durability pass, before the rename | No commit; final absent; the temp or some created ancestors may or may not have survived; a pending intent may be present. | File-absent resolution for any pending intent; on the next attempt the complete chain pass runs from the top before the rename. | Nothing was published; re-syncing the chain is unconditional and cannot double-publish. |
-   | Power loss after the rename, before the snapshot-directory `fsync` and the commit | Intent present; the published name may or may not have survived, because the rename's own entry was not yet synced; the ancestor chain is already durable from the pass. | Final present with the intent's digest → the adoption path completes step 6; final absent → clear the intent and resume or restart per the journal. | Ancestors are durable before the rename, so only the rename's own entry is at stake, and either arm resolves without an orphan beyond one pass. |
+   | Power loss after the rename, before the snapshot-directory `fsync` and the commit | Intent present; the published name may or may not have survived, because the rename's own entry was not yet synced; the ancestor chain is already durable from the pass. | Final present with the intent's digest → the adoption path first completes the interrupted publication barrier — on Unix re-deriving the recorded final path's complete ancestor chain and `fsync`-ing the snapshot directory that holds the already-renamed file, without repeating the rename — and only then inserts the row and clears the intent; if that barrier fails, no row is created and the intent stays as the durable owner. Final absent → clear the intent and resume or restart per the journal. | Ancestors are durable before the rename, so only the rename's own entry is at stake, and either arm resolves without an orphan beyond one pass; no committed Unix row exists until that entry is durable. |
+   | Process crash after the rename, before the snapshot-directory `fsync` and the commit | Intent present; the published name resolves in the still-running kernel and matches the intent's digest; the rename's own entry is not yet durable; the ancestor chain is durable from the pass; job `Committing`. | Adoption first completes the pending publication barrier — on Unix re-derives the recorded final path's complete ancestor chain and `fsync`s the snapshot directory holding the already-renamed file, never repeating the rename — then inserts the row and clears the intent; if the barrier fails, no row is created and the intent remains the durable owner. Because the barrier precedes the row insert, the recovery's own commit is durable and a subsequent power loss cannot lose the name. | The step-5 ordering is completed by recovery: a committed Unix row never exists before its publish-directory entry is durable. |
    | Verify passed, publish-intent record not yet durable | No intent; temp present; final absent; job pre-`Committing`. | Ordinary journal recovery; the job proceeds from its journaled state. | Nothing was published; no recovery protocol engages. |
    | Intent `fsync`'d, before the rename | Intent present; temp present; final absent; job `Committing`. | File absent → clear the intent; resume or restart per the journal. | No publish without a commit; temp resume intact. |
-   | Rename applied, before the step-6 commit | Intent present; final present with the intent's digest; temp gone; job `Committing`; no verdict record. | Adoption path: digest match → idempotent row insert completes step 6; intent cleared. | A row exists only after a verified rename; no orphan beyond one pass. |
+   | Rename applied, before the step-6 commit | Intent present; final present with the intent's digest; temp gone; job `Committing`; no verdict record. | Adoption path: digest match → complete the pending publication barrier first (on Unix re-derive the recorded final path's chain and `fsync` the snapshot directory of the already-renamed file; never repeat the rename), then the idempotent row insert completes step 6 and the intent is cleared; a barrier failure creates no row and retains the intent. | A row exists only after a verified rename and a completed durable publish barrier; no orphan beyond one pass. |
    | Rename applied, then a newly created ancestor entry lost for want of durability | Intent present; final absent (the published name did not survive); job `Committing`. | File-absent resolution: clear the intent; the job continues per the journal — resume or restart from zero; missing ancestor directories are rebuilt under the ordinary creation rules. | On Unix, step 5's chain-durability ordering confines this row below the commit. On Windows the same crash before the commit resolves through this row; the same loss after the commit resolves through the post-commit loss row below. |
    | Row committed (Windows), then power loss loses a newly created ancestor entry or the published name | Intent cleared at the commit; row present; the recorded path does not resolve. | Post-commit loss path: the row is never served — lookup and the startup reconciliation pass mark it non-playable and recoverable, a fresh download job may republish a new snapshot, and the never-a-silent-pass rule applies. The predecessor snapshot, if any, is untouched. | Windows documents no normal-user ancestor-entry durability barrier; detection and repair, not an undocumented flush, bound this case. Unix excludes it by the step-5 `fsync` chain. |
    | Crash during the step-6 commit (row inserted, intent not yet cleared) | Intent present; row present; final present. | Row-recognition path: the exact committed row — identity, recorded path, and recorded digest all matching the intent — stands; preserve its bytes, clear the intent. The insert an adoption would re-run is an idempotent no-op. | Completion is idempotent; a committed row is never re-adjudicated by adoption gates. |
@@ -635,8 +661,9 @@ ever served without its bytes, and no engine-owned file is ever stranded
 without a row beyond one recovery pass. The publish-window rows of the
 crash-point matrix are absolute on every platform: Unix re-derives and
 chains directory `fsync`s from every ancestor entry through the rename to
-the commit on every attempt, so a resumed process completes the ordering
-the crashed process began, and
+the commit on every attempt — including a post-rename adoption, which
+completes the same barrier before it may insert the row — so a resumed
+process completes the ordering the crashed process began, and
 Windows orders the published file's own bytes and entry through the
 documented `MOVEFILE_WRITE_THROUGH` barrier before the commit. The one
 platform-shaped residual — a Windows post-commit loss of a newly created
