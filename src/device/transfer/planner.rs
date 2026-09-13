@@ -90,6 +90,7 @@ impl<'a> PlanBuilder<'a> {
                 self.collect_directory_stages(item)?;
             }
         } else if metadata.is_file() {
+            self.ensure_source_file_boundary(&source_absolute)?;
             self.plan_file_item(item, metadata.len())?;
         } else {
             return Err(TransferError::UnsupportedSourceEntry {
@@ -155,6 +156,7 @@ impl<'a> PlanBuilder<'a> {
             if !entry.file_type().is_file() {
                 continue;
             }
+            self.ensure_source_file_boundary(entry.path())?;
             self.plan_walked_file(item, &entry)?;
         }
         Ok(())
@@ -170,25 +172,30 @@ impl<'a> PlanBuilder<'a> {
     /// at planning time with the nested mount path named; non-mount trees
     /// stage and account exactly as before.
     fn ensure_walked_directory_boundary(&self, directory: &Path) -> Result<(), TransferError> {
-        if let Err(error) = self
-            .request
+        self.request
             .source
             .validate_walked_directory_boundary(directory)
-        {
-            if let Some(crossing) = error
-                .get_ref()
-                .and_then(|payload| payload.downcast_ref::<CrossedMountBoundary>())
-            {
-                return Err(TransferError::NestedMountBoundary {
-                    path: crossing.path.clone(),
-                });
-            }
-            return Err(TransferError::io(
-                "failed to validate source directory mount boundary",
-                error,
-            ));
-        }
-        Ok(())
+            .map_err(|error| {
+                source_boundary_error("failed to validate source directory mount boundary", error)
+            })
+    }
+
+    /// Validate one planned source file's mount boundary BEFORE it is staged.
+    /// The walk's `st_dev` comparison cannot see a same-device Linux bind
+    /// mount of a regular file, nor one of any directory on the file's path,
+    /// while the executor's per-component mount-ID checks refuse the file —
+    /// after earlier stages had already committed and with the mount-foreign
+    /// bytes already counted into the plan. Probing every planned file (walked
+    /// entries and directly requested items) rejects the whole plan at
+    /// planning time with the offending path named; non-mount trees stage and
+    /// account exactly as before.
+    fn ensure_source_file_boundary(&self, file: &Path) -> Result<(), TransferError> {
+        self.request
+            .source
+            .validate_source_file_boundary(file)
+            .map_err(|error| {
+                source_boundary_error("failed to validate source file mount boundary", error)
+            })
     }
 
     /// Plan one file discovered by the directory walk, honouring the
@@ -294,6 +301,20 @@ impl<'a> PlanBuilder<'a> {
             directory_count: self.directory_count,
         })
     }
+}
+
+/// Convert a source-boundary probe failure into the typed plan rejection,
+/// preserving the named nested-mount path when the probe crossed one.
+fn source_boundary_error(context: &str, error: io::Error) -> TransferError {
+    if let Some(crossing) = error
+        .get_ref()
+        .and_then(|payload| payload.downcast_ref::<CrossedMountBoundary>())
+    {
+        return TransferError::NestedMountBoundary {
+            path: crossing.path.clone(),
+        };
+    }
+    TransferError::io(context, error)
 }
 
 /// Validate every item path in the request: non-empty, relative, and made of

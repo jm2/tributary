@@ -137,13 +137,13 @@ pub enum TransferError {
         /// The offending path.
         path: PathBuf,
     },
-    /// A walked source directory sits on a nested mount outside the source
+    /// A planned source entry sits on a nested mount outside the source
     /// authority's retained boundary — a same-device Linux bind mount is
     /// invisible to the planning walk's `st_dev` comparison but would be
     /// refused by the executor's per-component mount-ID checks after
     /// earlier stages had already committed. The plan is rejected up front
     /// with the nested mount path named.
-    #[error("source directory {path:?} crosses a nested mount boundary and cannot be transferred")]
+    #[error("source entry {path:?} crosses a nested mount boundary and cannot be transferred")]
     NestedMountBoundary {
         /// The nested mount path the planner refused.
         path: PathBuf,
