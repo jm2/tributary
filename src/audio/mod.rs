@@ -2261,7 +2261,8 @@ mod tests {
         let settings = eq_enabled_settings(equalizer::ClipProtection::Soft);
         let mut chain = equalizer::EqChain::build(&settings).expect("chain builds");
         // Refuse the direct relink once at the real surgery boundary.
-        chain.inject_limiter_remove_fault(equalizer::chain::LimiterRemoveFault::DirectRelink);
+        chain
+            .inject_limiter_remove_fault(equalizer::chain::LimiterRemoveFault::DirectRelinkBlocked);
         let player = eq_test_player(playbin.clone(), eq_state_with(Some(chain), settings));
 
         let next = EqSettings {
