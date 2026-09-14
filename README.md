@@ -695,13 +695,20 @@ Open **Preferences** from the hamburger menu (☰) to:
 
 ## AirPlay roadmap
 
-Legacy RAOP receivers are discovered today, but Tributary's AirPlay 1 path is only an integration
-seam for a GStreamer element named `raopsink`. Current official GStreamer, Homebrew, and MSYS2
-packages do not ship that element, so supported builds report AirPlay 1 as unavailable. AirPlay 2
-receivers (HomePod, recent Apple TVs, and AirPlay-2-certified third-party speakers) advertise via
-`_airplay._tcp.local.` and are also detected, but remain filtered out because AirPlay 2 needs a
-different sender protocol stack. Both paths need a maintained sender implementation and
-real-device validation.
+AirPlay sending runs behind a GStreamer-independent sender seam and can use a maintained
+OwnTone 29.x daemon as its transport when explicitly configured
+(`TRIBUTARY_AIRPLAY_SENDER=owntone`, alongside the dedicated instance's
+`TRIBUTARY_OWNTONE_API`, `TRIBUTARY_OWNTONE_PIPE`, and `TRIBUTARY_OWNTONE_STATE_DIR`). The
+adapter maps the selected receiver to the daemon by its retained device identifier — never
+by display name — and restores the daemon's pre-takeover output set when the session ends.
+Without a configured sender — or on a target with no supported OwnTone acquisition path,
+which today is anything other than Debian/Ubuntu amd64 — AirPlay 1 reports unavailable
+rather than silently falling back: current official GStreamer, Homebrew, and MSYS2 packages
+still do not ship the `raopsink` element, and the `raopsink` adapter stays probe-gated for
+user-supplied elements. AirPlay 2 receivers (HomePod, recent Apple TVs, and
+AirPlay-2-certified third-party speakers) advertise via `_airplay._tcp.local.` and are
+detected, but remain filtered out until a path that can actually play to them ships. Both
+the OwnTone path and the eventual AirPlay 2 path need real-device validation.
 
 Sender-side AirPlay 2 support requires, at minimum:
 

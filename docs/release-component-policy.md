@@ -114,12 +114,17 @@ not place them in Tributary's package payload, but it is a valid least-privilege
 both changes as a separate cross-platform packaging improvement with a real playback matrix, not
 as an unreviewed tightening of this emergency gate.
 
-The first P2.4 AirPlay sender design investigation is recorded in
-[`airplay-sender-design.md`](airplay-sender-design.md). It scopes a maintained RAOP-1
-sender selection without yet shipping one; the next implementation record must call this
-document back to the review-boundary section above, run the shared-policy containment
-pipeline against the bundled artifact, and update the changelog in the same PR. No
-sending-path change is in scope until that review record is complete.
+The P2.4 AirPlay sender design investigation is recorded in
+[`airplay-sender-design.md`](airplay-sender-design.md). It selects the maintained OwnTone
+29.x daemon as the shipping sender path, and the implementation record lands that path
+behind the GStreamer-independent sender seam. The adapter drives an operator-provisioned,
+Tributary-owned OwnTone instance acquired from OwnTone's own documented sources; it does
+not bundle a daemon, codec, media framework, or protocol key material, and Tributary's
+artifacts gain no new files. The dependency decision this review boundary requires is
+therefore **no exception required**: the change adds a documented runtime dependency, not
+a bundled component and not an embedded key. The shared-policy containment pipeline still
+runs on the implementation PR and records artifact evidence, and the changelog is updated
+in that same PR.
 
 ## Reference boundary
 
