@@ -163,7 +163,7 @@ fn finish_pane_fetch(
         liveness.clone(),
     );
 
-    paint_resolved_art(resolved, &image, &liveness);
+    paint_resolved_art(resolved, &image, &liveness, pixel_size);
 }
 
 /// Paint one resolved artwork outcome onto the row's image. Extracted
@@ -173,10 +173,17 @@ fn finish_pane_fetch(
 /// per-request liveness token, never the process-wide header generation,
 /// so concurrent rows fetch independently — and the no-artwork case
 /// leaves the existing placeholder visible.
+///
+/// `pixel_size` is the live 32/48/72 preference snapshotted when this
+/// fetch was scheduled. Every arm passes it through so the decoded texture
+/// is downscaled to the preference before painting (and before the cache
+/// probe charges its retained surface): `set_pixel_size` alone does not
+/// bound an installed `gdk::Texture` (2026-09-13 review finding).
 fn paint_resolved_art(
     resolved: ResolvedArtKind,
     image: &gtk::Image,
     liveness: &album_art::ScopedArtFetch,
+    pixel_size: i32,
 ) {
     match resolved {
         ResolvedArtKind::NoArtwork => {
@@ -187,21 +194,21 @@ fn paint_resolved_art(
             // already-authorized file handle; it never reopens a
             // pathname. The fetch's scoped token stops the extractor
             // and drops the reply if the row is re-bound mid-flight.
-            album_art::update_resolved_file_album_art_scoped(image, media, liveness);
+            album_art::update_resolved_file_album_art_scoped(image, media, liveness, pixel_size);
         }
         ResolvedArtKind::DirectFile { uri } => {
             // Transitional path for rows with NO retained authority
             // chain (e.g., OS-opened external files). Rows carrying a
             // source identity never reach this arm — see
             // [`resolve_kind`] and [`super::resolver::PaneAuthority`].
-            album_art::update_direct_file_album_art_scoped(image, &uri, liveness);
+            album_art::update_direct_file_album_art_scoped(image, &uri, liveness, pixel_size);
         }
         ResolvedArtKind::DirectUrl { url } => {
-            album_art::fetch_remote_album_art_scoped(image, &url, liveness);
+            album_art::fetch_remote_album_art_scoped(image, &url, liveness, pixel_size);
         }
         ResolvedArtKind::ResolvedRequest(request) => {
             image.set_icon_name(Some(FALLBACK_PLACEHOLDER_ICON));
-            album_art::fetch_resolved_album_art_scoped(image, *request, liveness);
+            album_art::fetch_resolved_album_art_scoped(image, *request, liveness, pixel_size);
         }
     }
 }

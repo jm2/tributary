@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use gtk::gdk::prelude::TextureExt;
 use gtk::glib;
 
 const REMOTE_ART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -40,6 +41,11 @@ const MAX_LOCAL_ART_WORKERS: usize = 2;
 /// Local extraction jobs may sit in the pool queue before new jobs are
 /// refused. This bounds pending work independently of the worker count.
 const MAX_PENDING_LOCAL_ART_JOBS: usize = 64;
+/// Side length (device pixels) the now-playing header thumbnail renders
+/// at. Mirrors the header bar's `set_pixel_size(36)` so a decoded header
+/// texture is bounded to the same on-screen size as its placeholder icon
+/// (see [`bound_texture_side`]).
+const HEADER_ART_SIDE: i32 = 36;
 
 /// Global generation counter for album art requests.  Incremented on
 /// every track change; the worker checks this before sending results
@@ -379,6 +385,7 @@ pub fn update_direct_file_album_art(image: &gtk::Image, uri: &str) {
         image,
         reply_rx,
         RequestLiveness::GlobalGeneration(generation),
+        HEADER_ART_SIDE,
     );
 }
 
@@ -393,17 +400,16 @@ pub fn update_direct_file_album_art_scoped(
     image: &gtk::Image,
     uri: &str,
     liveness: &ScopedArtFetch,
+    max_side: i32,
 ) {
     let Some(path) = direct_file_art_target(uri) else {
         image.set_icon_name(Some("audio-x-generic-symbolic"));
         return;
     };
 
-    image.set_icon_name(Some("audio-x-generic-symbolic"));
-    let reply_rx = enqueue_local_art_job(RequestLiveness::Scoped(liveness.clone()), move || {
+    spawn_scoped_local_art(image, liveness, max_side, move || {
         extract_direct_file_album_art_bytes(&path)
     });
-    display_local_album_art_reply(image, reply_rx, RequestLiveness::Scoped(liveness.clone()));
 }
 
 /// Scoped variant of [`update_resolved_file_album_art`] for the browser
@@ -420,12 +426,36 @@ pub fn update_resolved_file_album_art_scoped(
     image: &gtk::Image,
     media: crate::local::resolver::ResolvedLocalMedia,
     liveness: &ScopedArtFetch,
+    max_side: i32,
 ) {
-    image.set_icon_name(Some("audio-x-generic-symbolic"));
-    let reply_rx = enqueue_local_art_job(RequestLiveness::Scoped(liveness.clone()), move || {
+    spawn_scoped_local_art(image, liveness, max_side, move || {
         extract_resolved_file_album_art_bytes(&media)
     });
-    display_local_album_art_reply(image, reply_rx, RequestLiveness::Scoped(liveness.clone()));
+}
+
+/// Placeholder + retrying-admission entry point shared by the pane's two
+/// scoped local-art functions.
+///
+/// The placeholder is installed synchronously so the row is never blank while
+/// admission is pending. The extraction job is then handed to
+/// [`admit_local_art_job`], which retains it across a saturated bounded lane
+/// instead of dropping it, and the eventual bytes are bounded to `max_side`
+/// before painting.
+fn spawn_scoped_local_art<F>(
+    image: &gtk::Image,
+    liveness: &ScopedArtFetch,
+    max_side: i32,
+    extract: F,
+) where
+    F: FnOnce() -> Option<Vec<u8>> + Send + 'static,
+{
+    image.set_icon_name(Some("audio-x-generic-symbolic"));
+    let image = image.clone();
+    let token = liveness.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let reply_rx = admit_local_art_job(extract, token.clone()).await;
+        display_local_album_art_reply(&image, reply_rx, RequestLiveness::Scoped(token), max_side);
+    });
 }
 
 /// Resolve the filesystem path behind a `file://` URI for embedded-art
@@ -458,6 +488,7 @@ pub fn update_resolved_file_album_art(
         image,
         reply_rx,
         RequestLiveness::GlobalGeneration(generation),
+        HEADER_ART_SIDE,
     );
 }
 
@@ -605,10 +636,65 @@ where
     rx
 }
 
+/// Submit one SCOPED local extraction job, RETAINING it while the bounded pane
+/// lane is saturated so a still-visible row is not silently dropped
+/// (2026-09-13 review finding).
+///
+/// The remote pane lane already retries admission (`admit_pane_art_request`),
+/// but the local lane kept the old drop-on-`Full` behaviour:
+/// `pane_tx.try_send(..).is_ok()` discarded live scoped work. This mirrors the
+/// remote contract for local extraction — a live job waits on the main
+/// context and re-attempts admission until capacity returns, stopping when the
+/// row's token is revoked (the row scrolled away or was re-bound) or the lane
+/// is disconnected/unavailable. The lane's bound and worker count are
+/// unchanged: the retry never grows pending work, it only avoids losing work
+/// that already fits.
+async fn admit_local_art_job<F>(
+    extract: F,
+    liveness: ScopedArtFetch,
+) -> async_channel::Receiver<Vec<u8>>
+where
+    F: FnOnce() -> Option<Vec<u8>> + Send + 'static,
+{
+    let (reply_tx, reply_rx) = async_channel::bounded::<Vec<u8>>(1);
+    // Never schedule extraction for an already-revoked request (mirrors
+    // `enqueue_local_art_job`): dropping `reply_tx` closes the channel.
+    if !liveness.is_live() {
+        return reply_rx;
+    }
+    let mut pending = Some(LocalArtJob {
+        liveness: RequestLiveness::Scoped(liveness.clone()),
+        extract: Box::new(extract),
+        reply_tx,
+    });
+    loop {
+        if !liveness.is_live() {
+            // Revoked while waiting: dropping `pending` (and its reply
+            // sender) closes the channel so the caller observes completion.
+            return reply_rx;
+        }
+        let Some(job) = pending.take() else {
+            return reply_rx;
+        };
+        let Some(lanes) = local_art_lanes() else {
+            return reply_rx;
+        };
+        match lanes.pane_tx.try_send(job) {
+            Ok(()) => return reply_rx,
+            // Full hands the job back; keep it and wait for capacity.
+            Err(async_channel::TrySendError::Full(job)) => pending = Some(job),
+            // Disconnected lane: waiting cannot restore it.
+            Err(async_channel::TrySendError::Closed(_)) => return reply_rx,
+        }
+        glib::timeout_future(PANE_ADMISSION_RETRY_INTERVAL).await;
+    }
+}
+
 fn display_local_album_art_reply(
     image: &gtk::Image,
     reply_rx: async_channel::Receiver<Vec<u8>>,
     liveness: RequestLiveness,
+    max_side: i32,
 ) {
     let image = image.clone();
     glib::MainContext::default().spawn_local(async move {
@@ -616,11 +702,67 @@ fn display_local_album_art_reply(
             if liveness.is_valid() {
                 let bytes = glib::Bytes::from_owned(data);
                 if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
+                    let texture = bound_texture_side(&texture, max_side);
                     image.set_paintable(Some(&texture));
                 }
             }
         }
     });
+}
+
+/// Aspect-preserving longest-side bound for a decoded artwork texture.
+///
+/// `GtkImage::set_pixel_size` only sizes an icon-name placeholder: a texture
+/// installed with `set_paintable` renders at its natural decoded size and
+/// retains that full surface. A 2000×2000 embedded cover therefore stayed a
+/// 2000×2000 texture in the row AND in the display cache no matter how small
+/// the live 32/48/72 preference was (2026-09-13 review finding). Every decode
+/// path funnels through this bound first, so the displayed and retained
+/// surface is the preference-sized thumbnail on local, direct, resolved
+/// remote, and cache-hit paints alike.
+fn bound_texture_side(texture: &gtk::gdk::Texture, max_side: i32) -> gtk::gdk::Texture {
+    let (dest_width, dest_height) = bounded_dimensions(texture.width(), texture.height(), max_side);
+    if dest_width == texture.width() && dest_height == texture.height() {
+        return texture.clone();
+    }
+    // `GdkTexture` exposes no scaler of its own; GDK-Pixbuf's `scale_simple`
+    // is the documented texture → pixels → texture route and performs the
+    // resample. Bilinear keeps the cover legible at thumbnail sizes. The
+    // `pixbuf_get_from_texture` binding is deprecated for GTK ≥ 4.12, but
+    // there is no replacement for rescaling an arbitrary texture yet.
+    #[allow(deprecated)]
+    let Some(pixbuf) = gtk::gdk::pixbuf_get_from_texture(texture) else {
+        return texture.clone();
+    };
+    let Some(scaled) = pixbuf.scale_simple(
+        dest_width,
+        dest_height,
+        gtk::gdk::gdk_pixbuf::InterpType::Bilinear,
+    ) else {
+        return texture.clone();
+    };
+    gtk::gdk::Texture::for_pixbuf(&scaled)
+}
+
+/// Pure longest-side bound shared by [`bound_texture_side`] and its unit
+/// tests. Never upscales: dimensions already within `max_side` are returned
+/// unchanged, otherwise the longest side becomes `max_side` and the shorter
+/// side keeps its ratio (rounded down, never below one pixel).
+fn bounded_dimensions(width: i32, height: i32, max_side: i32) -> (i32, i32) {
+    if max_side <= 0 || width <= 0 || height <= 0 {
+        // Defensive: an unwired preference must not collapse artwork to
+        // nothing. Callers pass a positive AlbumArtSize side.
+        return (width.max(1), height.max(1));
+    }
+    let longest = width.max(height);
+    if longest <= max_side {
+        return (width, height);
+    }
+    let scaled = |side: i32| -> i32 {
+        let value = (i64::from(side) * i64::from(max_side)) / i64::from(longest);
+        value.max(1) as i32
+    };
+    (scaled(width), scaled(height))
 }
 
 fn extract_direct_file_album_art_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
@@ -909,6 +1051,7 @@ pub fn fetch_remote_album_art(image: &gtk::Image, cover_art_url: &str) {
         image,
         ArtSource::Url(cover_art_url.to_string()),
         RequestLiveness::GlobalGeneration(generation),
+        HEADER_ART_SIDE,
     );
 }
 
@@ -920,11 +1063,13 @@ pub fn fetch_remote_album_art_scoped(
     image: &gtk::Image,
     cover_art_url: &str,
     liveness: &ScopedArtFetch,
+    max_side: i32,
 ) {
     enqueue_remote_album_art(
         image,
         ArtSource::Url(cover_art_url.to_string()),
         RequestLiveness::Scoped(liveness.clone()),
+        max_side,
     );
 }
 
@@ -950,6 +1095,7 @@ pub fn fetch_resolved_album_art(
         image,
         ArtSource::Resolved(Box::new(request)),
         RequestLiveness::GlobalGeneration(generation),
+        HEADER_ART_SIDE,
     );
 }
 
@@ -961,6 +1107,7 @@ pub fn fetch_resolved_album_art_scoped(
     image: &gtk::Image,
     request: crate::architecture::media::ResolvedHttpRequest,
     liveness: &ScopedArtFetch,
+    max_side: i32,
 ) {
     if !liveness.is_live() || !request.is_active() {
         return;
@@ -969,6 +1116,7 @@ pub fn fetch_resolved_album_art_scoped(
         image,
         ArtSource::Resolved(Box::new(request)),
         RequestLiveness::Scoped(liveness.clone()),
+        max_side,
     );
 }
 
@@ -1018,7 +1166,12 @@ fn build_resolved_art_request(
         .headers(resolved.sensitive_headers().clone())
 }
 
-fn enqueue_remote_album_art(image: &gtk::Image, source: ArtSource, liveness: RequestLiveness) {
+fn enqueue_remote_album_art(
+    image: &gtk::Image,
+    source: ArtSource,
+    liveness: RequestLiveness,
+    max_side: i32,
+) {
     let image = image.clone();
 
     if let RequestLiveness::Scoped(token) = &liveness {
@@ -1031,14 +1184,14 @@ fn enqueue_remote_album_art(image: &gtk::Image, source: ArtSource, liveness: Req
         let token = token.clone();
         glib::MainContext::default().spawn_local(async move {
             let reply_rx = admit_pane_art_request(source, token.clone()).await;
-            paint_remote_album_art_reply(image, reply_rx, RequestLiveness::Scoped(token));
+            paint_remote_album_art_reply(image, reply_rx, RequestLiveness::Scoped(token), max_side);
         });
         return;
     }
 
     // Header lane: dedicated and unbounded, so no retry is needed.
     let reply_rx = enqueue_art_request(source, liveness.clone());
-    paint_remote_album_art_reply(image, reply_rx, liveness);
+    paint_remote_album_art_reply(image, reply_rx, liveness, max_side);
 }
 
 /// Receive one remote-artwork reply on the GTK main thread and paint it,
@@ -1055,12 +1208,14 @@ fn paint_remote_album_art_reply(
     image: gtk::Image,
     reply_rx: async_channel::Receiver<Vec<u8>>,
     liveness: RequestLiveness,
+    max_side: i32,
 ) {
     glib::MainContext::default().spawn_local(async move {
         if let Ok(data) = reply_rx.recv().await {
             if liveness.is_valid() {
                 let bytes = glib::Bytes::from_owned(data);
                 if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
+                    let texture = bound_texture_side(&texture, max_side);
                     image.set_paintable(Some(&texture));
                 }
             }
@@ -2167,5 +2322,187 @@ mod tests {
             "Basic private-authorization"
         );
         assert_eq!(request.headers().len(), 3);
+    }
+
+    /// A texture with exact decoded dimensions for the bounding tests.
+    /// `gdk::MemoryTexture` wraps in-memory RGBA8888 rows, so a large
+    /// "decoded cover" can be built without a crafted image fixture.
+    fn solid_texture(width: i32, height: i32) -> gtk::gdk::Texture {
+        let stride = width as usize * 4;
+        let data = vec![0x80_u8; stride * height as usize];
+        gtk::gdk::MemoryTexture::new(
+            width,
+            height,
+            gtk::gdk::MemoryFormat::R8g8b8a8,
+            &glib::Bytes::from_owned(data),
+            stride,
+        )
+        .into()
+    }
+
+    /// The pure longest-side bound across every preference: a large decoded
+    /// cover must be scaled down to the live 32/48/72 side, preserving
+    /// aspect ratio in both orientations, and never upscaled. This is the
+    /// integer half of the 2026-09-13 review finding (the icon pixel size
+    /// alone did not bound an arbitrary texture).
+    #[test]
+    fn bounded_dimensions_cover_every_preference_and_aspect_ratio() {
+        use crate::ui::preferences::AlbumArtSize;
+        let sides = [
+            AlbumArtSize::Small.pixel_size(),
+            AlbumArtSize::Medium.pixel_size(),
+            AlbumArtSize::Large.pixel_size(),
+        ];
+        // 2048×1536 landscape (4:3) and its portrait transpose.
+        for (width, height) in [(2048, 1536), (1536, 2048)] {
+            let ratio = f64::from(width) / f64::from(height);
+            for side in sides {
+                let (bounded_w, bounded_h) = bounded_dimensions(width, height, side);
+                assert_eq!(
+                    bounded_w.max(bounded_h),
+                    side,
+                    "longest side must equal the preference {side}: got {bounded_w}×{bounded_h}"
+                );
+                assert!(
+                    bounded_w.min(bounded_h) >= 1,
+                    "shorter side must not vanish"
+                );
+                let bounded_ratio = f64::from(bounded_w) / f64::from(bounded_h);
+                assert!(
+                    (bounded_ratio - ratio).abs() < 0.01,
+                    "aspect ratio must be preserved: {bounded_w}×{bounded_h} vs {width}×{height}"
+                );
+            }
+        }
+
+        // A thumbnail already within the bound is untouched (no upscale).
+        assert_eq!(bounded_dimensions(32, 32, 72), (32, 32));
+        // A non-positive/unwired bound leaves the texture alone.
+        assert_eq!(bounded_dimensions(64, 48, 0), (64, 48));
+        assert_eq!(bounded_dimensions(0, 0, 48), (1, 1));
+    }
+
+    /// The production bound must downscale the ACTUAL decoded texture, not
+    /// merely record an integer preference: a 2048×1536 RGBA cover painted
+    /// at each 32/48/72 preference must come out with a bounded retained
+    /// surface, and re-bounding the same source at a different preference (a
+    /// size change on a recycled cell) must produce that preference's
+    /// dimensions independently.
+    #[test]
+    fn bound_texture_side_downscales_a_large_decoded_cover_per_preference() {
+        use crate::ui::preferences::AlbumArtSize;
+        let source = solid_texture(2048, 1536);
+        assert_eq!((source.width(), source.height()), (2048, 1536));
+
+        for side in [
+            AlbumArtSize::Small.pixel_size(),
+            AlbumArtSize::Medium.pixel_size(),
+            AlbumArtSize::Large.pixel_size(),
+        ] {
+            let bounded = bound_texture_side(&source, side);
+            assert_eq!(
+                bounded.width().max(bounded.height()),
+                side,
+                "the retained texture's longest side must be bounded to the preference"
+            );
+            assert_eq!(
+                (bounded.width(), bounded.height()),
+                (side, side * 3 / 4),
+                "aspect ratio must survive the resample at preference {side}"
+            );
+        }
+
+        // A texture already at or below the bound is not resampled.
+        let already_small = bound_texture_side(&source, 4096);
+        assert_eq!(
+            (already_small.width(), already_small.height()),
+            (2048, 1536)
+        );
+    }
+
+    /// Saturate the local pane lane (both workers blocked, every pending slot
+    /// filled), then drive the production [`admit_local_art_job`] retry on a
+    /// private glib main context: a still-visible row's job must be retained
+    /// through saturation and run once capacity returns. A regression back
+    /// to the drop-on-`Full` `try_send` would close the reply immediately and
+    /// fail the bytes assertion below (2026-09-13 review finding).
+    #[test]
+    fn saturated_local_lane_retries_until_the_still_visible_row_runs() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let scoped = || RequestLiveness::Scoped(ScopedArtFetch::new());
+
+        // Occupy both pane workers with blocking extractions and fill every
+        // pending slot, so the lane is provably saturated.
+        let (_reply1, release1_tx) = occupy_pool_worker(scoped(), b"local-one");
+        let (_reply2, release2_tx) = occupy_pool_worker(scoped(), b"local-two");
+        let queue = local_art_pane_queue().expect("local art pane pool initialized");
+        fill_pending_backlog(queue, 0);
+
+        // Release from another thread only after the admission future has had
+        // ample opportunity to observe saturation and park on its retry timer.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(PANE_ADMISSION_RETRY_INTERVAL * 20);
+            let _ = release1_tx.send(());
+            let _ = release2_tx.send(());
+        });
+
+        let token = ScopedArtFetch::new();
+        let context = glib::MainContext::new();
+        let reply = context.block_on(admit_local_art_job(
+            move || Some(b"retried-local-art".to_vec()),
+            token,
+        ));
+
+        releaser.join().expect("join local releaser");
+        assert_eq!(
+            wait_for_reply(&reply, Duration::from_secs(10)).as_deref(),
+            Some(b"retried-local-art".as_slice()),
+            "a still-visible row's local job must run once pane capacity returns"
+        );
+    }
+
+    /// A scoped local job whose row is revoked while it waits for lane
+    /// capacity must stop retrying and publish nothing: the revoked
+    /// extractor is never run. This is the local-lane half of "revoked work
+    /// must not extract or keep retries alive".
+    #[test]
+    fn saturated_local_lane_stops_retrying_when_the_row_is_revoked() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let scoped = || RequestLiveness::Scoped(ScopedArtFetch::new());
+
+        let (_reply1, release1_tx) = occupy_pool_worker(scoped(), b"revoke-one");
+        let (_reply2, release2_tx) = occupy_pool_worker(scoped(), b"revoke-two");
+        let queue = local_art_pane_queue().expect("local art pane pool initialized");
+        fill_pending_backlog(queue, 0);
+
+        let token = ScopedArtFetch::new();
+        let revoker = token.clone();
+        // Revoke shortly after the admission future parks on its retry timer.
+        let revoke_thread = std::thread::spawn(move || {
+            std::thread::sleep(PANE_ADMISSION_RETRY_INTERVAL * 4);
+            revoker.revoke();
+        });
+
+        let context = glib::MainContext::new();
+        let reply = context.block_on(admit_local_art_job(
+            || panic!("a revoked local job must not run its extractor"),
+            token,
+        ));
+        revoke_thread.join().expect("join revoker");
+
+        assert!(
+            matches!(reply.try_recv(), Err(TryRecvError::Closed)),
+            "a revoked job must leave its reply closed, not pending"
+        );
+
+        // Leave the pool clean for the next test under the same lock.
+        let _ = release1_tx.send(());
+        let _ = release2_tx.send(());
     }
 }
