@@ -41,6 +41,14 @@ pub struct DiscoveredServer {
     /// `Some(true)` = password required, `Some(false)` = open,
     /// `None` = unknown (probe not yet completed or not applicable).
     pub requires_password: Option<bool>,
+    /// Normalized device identifier (the AirPlay `deviceid`/MAC) when the
+    /// service advertises one.
+    ///
+    /// Retained so a receiver can be addressed by stable identity rather than
+    /// by display name: two receivers can share one name, and a name-only
+    /// match could stream to the wrong device. `None` for services that
+    /// publish no identifier.
+    pub device_id: Option<String>,
     /// Ephemeral direct-connection route advertised with this service.
     ///
     /// The URL remains hostname-based so HTTP `Host` and TLS identity are
@@ -519,6 +527,14 @@ fn process_mdns_event(
                     strip_avahi_name_suffix(&raw_name)
                 });
 
+            // Retain the receiver's stable identity before the display-name
+            // normalization consumes the raw instance name below.
+            let device_id = if service_type == "airplay" || service_type == "airplay2" {
+                airplay_device_identifier(&info, &raw_name)
+            } else {
+                None
+            };
+
             // AirPlay / RAOP devices often use "MAC@DeviceName" as
             // their mDNS instance name (e.g. "8EE58A500A56@Rear Lounge TV").
             // Strip the MAC prefix for a cleaner display name.
@@ -552,6 +568,7 @@ fn process_mdns_event(
                 url,
                 service_type: service_type.to_string(),
                 requires_password: None,
+                device_id,
             };
             let events = publications.upsert(
                 ServiceInstanceKey::new(service_type, &fullname),
@@ -730,6 +747,7 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
                             service_type: "jellyfin".to_string(),
                             requires_password: None,
                             advertised_route: None,
+                            device_id: None,
                         }));
                     }
 
@@ -898,6 +916,7 @@ fn process_chromecast_event(
                 service_type: service_type.to_string(),
                 requires_password: None,
                 advertised_route: None,
+                device_id: None,
             };
             let events = publications.upsert(
                 key,
@@ -952,6 +971,37 @@ fn strip_airplay_mac_prefix(name: &str) -> String {
         }
     }
     name.to_string()
+}
+
+/// Retain the normalized AirPlay device identifier a receiver advertises.
+///
+/// Prefers the TXT `deviceid` property and falls back to the `HEXMAC@Name`
+/// mDNS instance prefix. The value is normalized to uppercase hex without
+/// separators so two publications of the same receiver compare equal. Returns
+/// `None` when neither source yields a plausible identifier — a receiver
+/// without one must fail closed rather than be addressed by display name.
+fn airplay_device_identifier(info: &mdns_sd::ResolvedService, raw_name: &str) -> Option<String> {
+    if let Some(txt) = info.get_property_val_str("deviceid") {
+        if let Some(normalized) = normalize_airplay_device_id(txt) {
+            return Some(normalized);
+        }
+    }
+    let at_pos = raw_name.find('@')?;
+    normalize_airplay_device_id(&raw_name[..at_pos])
+}
+
+/// Normalize a MAC/`deviceid` string to uppercase hex without separators.
+///
+/// Accepts the common `AA:BB:CC:DD:EE:FF`, `AA-BB-...`, and bare-hex forms.
+/// Requires at least six hex digits so a short non-identifier property cannot
+/// be mistaken for a device identity.
+fn normalize_airplay_device_id(raw: &str) -> Option<String> {
+    let filtered: String = raw.chars().filter(|c| *c != ':' && *c != '-').collect();
+    if filtered.len() >= 6 && filtered.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(filtered.to_ascii_uppercase())
+    } else {
+        None
+    }
 }
 
 // ── Avahi hostname helpers ──────────────────────────────────────────────
@@ -1018,11 +1068,12 @@ fn strip_avahi_name_suffix(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        process_chromecast_event, process_mdns_event, strip_airplay_mac_prefix,
-        strip_avahi_display_suffix, strip_avahi_name_suffix, usable_chromecast_control_address,
-        validate_jellyfin_discovery_address, DiscoveredServer, DiscoveryEvent, MdnsPublication,
-        MdnsPublications, PublishedOrigin, ServiceInstanceKey, CHROMECAST_SERVICE,
-        MAX_MDNS_INSTANCES_PER_ORIGIN, MAX_MDNS_PUBLICATIONS, SUBSONIC_SERVICE,
+        normalize_airplay_device_id, process_chromecast_event, process_mdns_event,
+        strip_airplay_mac_prefix, strip_avahi_display_suffix, strip_avahi_name_suffix,
+        usable_chromecast_control_address, validate_jellyfin_discovery_address, DiscoveredServer,
+        DiscoveryEvent, MdnsPublication, MdnsPublications, PublishedOrigin, ServiceInstanceKey,
+        CHROMECAST_SERVICE, MAX_MDNS_INSTANCES_PER_ORIGIN, MAX_MDNS_PUBLICATIONS,
+        SUBSONIC_SERVICE,
     };
 
     fn resolved_event(
@@ -1523,6 +1574,7 @@ mod tests {
                     service_type: "subsonic".to_string(),
                     requires_password: None,
                     advertised_route: None,
+                    device_id: None,
                 },
                 advertised_addresses: vec!["192.0.2.1:4533".parse().unwrap()],
             },
@@ -1664,5 +1716,50 @@ mod tests {
         assert_eq!(strip_airplay_mac_prefix("ABCD@Device"), "ABCD@Device");
         // Exactly 6 hex chars — stripped.
         assert_eq!(strip_airplay_mac_prefix("AABBCC@Speaker"), "Speaker");
+    }
+
+    #[test]
+    fn normalize_airplay_device_id_accepts_common_forms() {
+        assert_eq!(
+            normalize_airplay_device_id("8EE58A500A56").as_deref(),
+            Some("8EE58A500A56")
+        );
+        assert_eq!(
+            normalize_airplay_device_id("8e:e5:8a:50:0a:56").as_deref(),
+            Some("8EE58A500A56")
+        );
+        assert_eq!(
+            normalize_airplay_device_id("8E-E5-8A-50-0A-56").as_deref(),
+            Some("8EE58A500A56")
+        );
+        // Too short, non-hex, and empty inputs are refused rather than
+        // mistaken for an identity.
+        assert_eq!(normalize_airplay_device_id("ABCD"), None);
+        assert_eq!(normalize_airplay_device_id("not-a-mac"), None);
+        assert_eq!(normalize_airplay_device_id(""), None);
+    }
+
+    /// Two receivers that advertise the same display name must still be
+    /// distinguishable by their retained device identifier.
+    #[test]
+    fn airplay_device_id_disambiguates_same_named_receivers() {
+        let first = DiscoveredServer {
+            name: "Living Room".to_string(),
+            url: "http://host-a:7000".to_string(),
+            service_type: "airplay".to_string(),
+            requires_password: None,
+            advertised_route: None,
+            device_id: normalize_airplay_device_id("8EE58A500A56"),
+        };
+        let second = DiscoveredServer {
+            name: "Living Room".to_string(),
+            url: "http://host-b:7000".to_string(),
+            service_type: "airplay".to_string(),
+            requires_password: None,
+            advertised_route: None,
+            device_id: normalize_airplay_device_id("8A79AB138BA9"),
+        };
+        assert_eq!(first.name, second.name);
+        assert_ne!(first.device_id, second.device_id);
     }
 }
