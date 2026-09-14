@@ -381,7 +381,7 @@ not re-enable non-Dependabot auto-merge.
 0. **(tr-rcvys)** Register the two minimal GitHub Apps named in
    `.github/bot-review-gate-rollout.json`:
 
-   * `tributary-bot-review-gate-publisher` with only `checks: write`, installed
+   - `tributary-bot-review-gate-publisher` with only `checks: write`, installed
      on this repository, with its credentials stored **exclusively** as secrets
      of the protected environment `bot-review-gate-publisher` (names
      `BOT_REVIEW_GATE_APP_ID` and `BOT_REVIEW_GATE_PRIVATE_KEY`); the
@@ -392,7 +392,7 @@ not re-enable non-Dependabot auto-merge.
      Never store them as repository-level Actions secrets: every
      same-repository pull-request workflow can read those, which is the exact
      forged-verdict exposure the identity-bound context exists to prevent.
-   * `tributary-ruleset-reader` with only `Administration: read`, whose
+   - `tributary-ruleset-reader` with only `Administration: read`, whose
      credentials are stored as repository-level **Dependabot secrets** (Settings
      → Secrets and variables → Dependabot → Repository secrets) named
      `RULESET_READER_APP_ID` and `RULESET_READER_APP_PRIVATE_KEY`. Dependabot
