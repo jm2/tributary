@@ -2,10 +2,18 @@
 //! transactions (contract: *Filter graph* and *Band and preamp
 //! mechanics*).
 
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use gst::prelude::*;
 use gstreamer as gst;
 
 use super::{ClipProtection, EqSettings};
+
+/// How long the dynamic limiter edit waits for its blocking pad probe to
+/// engage before deferring to the caller's pause/relink fallback. Bounded
+/// so a pad that never reports idle can never stall the UI thread.
+const LIMITER_PROBE_ENGAGE_TIMEOUT: Duration = Duration::from_millis(200);
 
 // ── Bin construction ────────────────────────────────────────────────────
 
@@ -273,117 +281,107 @@ impl EqChain {
     }
 
     /// Insert or remove the `rglimiter` element inside the installed bin
-    /// (clip-protection toggle). The caller owns the pause/resume seam.
-    /// Returns `false` when the surgery failed and the chain degraded to
-    /// the no-limiter layout (recoverable per the contract).
+    /// (clip-protection toggle) as a direct synchronous edit. The caller
+    /// owns whichever flow-stopping mechanism guards the edit: the dynamic
+    /// blocking pad probe ([`Self::swap_clip_protection_under_block_probe`])
+    /// or, as a fallback after a failed dynamic re-link, the pause/relink
+    /// seam. Returns `false` when the surgery failed and the chain degraded
+    /// to the no-limiter layout (recoverable per the contract).
     pub fn set_clip_protection(&mut self, soft: ClipProtection) -> bool {
-        match (soft, self.clipper.take()) {
-            (ClipProtection::Soft, None) => self.insert_limiter(),
-            (ClipProtection::Off, Some(clipper)) => self.remove_limiter(clipper),
-            (ClipProtection::Off, None) => true,
-            (ClipProtection::Soft, Some(clipper)) => {
-                // Already installed: the `take()` above must be undone so
-                // the stored handle keeps matching the element linked in
-                // the bin (`clip_protection_installed` stays truthful).
-                // Re-sync the state first so a live pipeline can never
-                // keep the limiter stranded out of step with its bin.
-                let _ = clipper.sync_state_with_parent();
-                self.clipper = Some(clipper);
-                true
-            }
+        let graph = self.limiter_graph();
+        // Precompute the test-fault decisions in the order the surgery
+        // consumes them: the direct relink is always attempted, the
+        // restoration only after the direct relink is refused.
+        let direct_blocked = self.fault_blocks_direct_relink();
+        let restore_blocked = self.fault_blocks_restore();
+        edit_limiter_topology(
+            &graph,
+            soft,
+            &mut self.clipper,
+            direct_blocked,
+            restore_blocked,
+        )
+    }
+
+    /// The element handles one in-bin limiter edit rewires. Cheap clones of
+    /// the running graph, so the edit can also run from the blocking probe
+    /// callback on the streaming thread without borrowing the chain.
+    fn limiter_graph(&self) -> LimiterGraph {
+        LimiterGraph {
+            bin: self.bin.clone(),
+            eq: self.eq.clone(),
+            post_convert: self.post_convert.clone(),
         }
     }
 
-    /// Insert `rglimiter` between the EQ stage and the post-convert
-    /// stage, then state-sync it with the bin (contract:
-    /// *Live-reconfiguration boundary* — on add: link it, then
-    /// `gst_element_sync_state_with_parent` so the element's state
-    /// follows the running bin). On any failure, degrade to the
-    /// no-limiter layout and report `false`.
-    fn insert_limiter(&mut self) -> bool {
-        let Ok(clipper) = make_element("rglimiter", "clipper") else {
-            return false;
-        };
-        clipper.set_property("enabled", true);
-        if self.bin.add(&clipper).is_err() {
-            return false;
-        }
-        // The EQ stage already feeds the post-convert stage directly;
-        // break that link to make room for the limiter.
-        let was_linked = self
-            .eq
-            .static_pad("src")
-            .map(|src| src.peer().is_some())
-            .unwrap_or(false);
-        if was_linked {
-            // `Element::unlink` returns `()`.
-            self.eq.unlink(&self.post_convert);
-        }
-        if self.eq.link(&clipper).is_ok()
-            && clipper.link(&self.post_convert).is_ok()
-            && clipper.sync_state_with_parent().is_ok()
-        {
-            self.clipper = Some(clipper);
-            return true;
-        }
-        // Degrade to the no-limiter layout: restore the direct
-        // eq → post-convert link.
-        self.eq.unlink(&clipper);
-        clipper.unlink(&self.post_convert);
-        drop_limiter_from_bin(&self.bin, &clipper);
-        let _ = self.eq.link(&self.post_convert);
-        false
-    }
-
-    /// Remove the installed `rglimiter` and restore the direct
-    /// eq → post-convert link, putting the owned handle back whenever
-    /// the limiter stays routed.
+    /// Perform the limiter insert/remove as the documented dynamic in-bin
+    /// topology edit, inside a blocking pad probe on the
+    /// `equalizer-10bands` src pad (contract:
+    /// *Live-reconfiguration boundary* — `Clip protection`).
     ///
-    /// Both old links are unlinked **before** the direct relink is
-    /// attempted (the `post-convert` sink pad stays busy until the
-    /// limiter's link is gone). If the relink fails, the previous
-    /// eq → clipper → post-convert path is re-established **and the
-    /// owned handle is restored into `self.clipper`**, so a failed
-    /// removal leaves the chain with a working (limiter-installed) data
-    /// path instead of a dangling `eq` source pad, and
-    /// `clip_protection_installed` keeps matching the routed graph — the
-    /// caller can no longer record `Off` while the limiter is in the bin
-    /// (which previously invited a second `clipper` on the next enable).
+    /// `GST_PAD_PROBE_TYPE_BLOCK_DOWNSTREAM | GST_PAD_PROBE_TYPE_IDLE`
+    /// stops data flow at the EQ output — the boundary every rewired pad
+    /// sits behind — before the graph is touched, so no buffer can reach
+    /// the unlinked pads and `GST_FLOW_NOT_LINKED` cannot reach the bus
+    /// from this path. The probe callback performs the whole edit and
+    /// returns `GST_PAD_PROBE_REMOVE` only over a validated topology: the
+    /// new layout on success, or the pre-edit layout the surgery restores
+    /// on a failed re-link, so blocked flow resumes across a valid chain.
+    /// A pipeline that never reports the pad idle within the bounded
+    /// window is left untouched and the caller falls back to the
+    /// pause/relink seam.
     ///
-    /// If restoration itself fails, the graph is never resumed with an
-    /// unlinked `eq` source: the partial links are torn down, the
-    /// limiter leaves the bin, and the direct path is forced. The handle
-    /// is cleared (no limiter remains installed) and the return value
-    /// reports whether the requested removal landed.
-    fn remove_limiter(&mut self, clipper: gst::Element) -> bool {
-        self.eq.unlink(&clipper);
-        clipper.unlink(&self.post_convert);
-        let direct_linked =
-            !self.fault_blocks_direct_relink() && self.eq.link(&self.post_convert).is_ok();
-        if direct_linked {
-            drop_limiter_from_bin(&self.bin, &clipper);
-            return true;
+    /// Returns `Some(true)` when the requested toggle is installed,
+    /// `Some(false)` when the dynamic re-link failed and the pre-edit
+    /// layout was restored (the caller retries via the pause/relink
+    /// seam), and `None` when the probe could not engage or no EQ src pad
+    /// exists.
+    pub fn swap_clip_protection_under_block_probe(&mut self, soft: ClipProtection) -> Option<bool> {
+        let eq_src = self.eq.static_pad("src")?;
+        let graph = self.limiter_graph();
+        // The probe callback runs on the streaming thread, so it cannot
+        // borrow the chain: the owned `rglimiter` handle is threaded
+        // through a shared slot and the result is reported over a channel.
+        let slot = Arc::new(Mutex::new(self.clipper.take()));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
+        let signal = Mutex::new(tx);
+        let slot_cb = Arc::clone(&slot);
+        let probe_id = eq_src.add_probe(
+            gst::PadProbeType::BLOCK_DOWNSTREAM | gst::PadProbeType::IDLE,
+            move |_pad, _info| {
+                let installed = {
+                    let mut current = slot_cb
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    edit_limiter_topology(&graph, soft, &mut current, false, false)
+                };
+                if let Ok(tx) = signal.lock() {
+                    let _ = tx.try_send(installed);
+                }
+                // Uninstall the probe only now, over the validated
+                // topology, so blocked data flow resumes across a valid
+                // chain (and the caller learns the outcome).
+                gst::PadProbeReturn::Remove
+            },
+        );
+        // A pad that reports idle synchronously runs the callback before
+        // `add_probe` returns and reports no id; either way the outcome
+        // arrives over the channel. A missing outcome means the probe
+        // could not engage (or the pad never went idle), so the graph is
+        // left untouched for the caller's pause/relink fallback.
+        let installed = rx.recv_timeout(LIMITER_PROBE_ENGAGE_TIMEOUT).ok();
+        if let Some(probe_id) = probe_id {
+            // Harmless when the callback already uninstalled itself.
+            eq_src.remove_probe(probe_id);
         }
-        // Relink failed: restore the working limiter path so the chain
-        // stays playable and its tracked ownership keeps matching the
-        // routed graph.
-        let restored = !self.fault_blocks_restore()
-            && self.eq.link(&clipper).is_ok()
-            && clipper.link(&self.post_convert).is_ok();
-        if restored {
-            let _ = clipper.sync_state_with_parent();
-            self.clipper = Some(clipper);
-            return false;
-        }
-        // Restoration itself failed: do not resume an unlinked graph.
-        // Tear down any partial restoration link, remove the limiter, and
-        // force the direct path so the chain keeps a working route. The
-        // handle is cleared because no limiter remains in the bin.
-        self.eq.unlink(&clipper);
-        clipper.unlink(&self.post_convert);
-        drop_limiter_from_bin(&self.bin, &clipper);
-        self.clipper = None;
-        self.eq.link(&self.post_convert).is_ok()
+        // Adopt the handle the callback left in the slot (or the original
+        // handle when the callback never ran).
+        let retained = slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        self.clipper = retained;
+        installed
     }
 
     /// Test-only: whether the armed fault refuses the direct relink.
@@ -449,6 +447,147 @@ impl EqChain {
     pub fn clip_protection_installed(&self) -> bool {
         self.clipper.is_some()
     }
+}
+
+// ── Limiter surgery ─────────────────────────────────────────────────────
+
+/// The element handles one in-bin limiter edit rewires. Cheap clones of the
+/// running graph, so the edit can run from the blocking probe callback on
+/// the streaming thread without borrowing the chain.
+#[derive(Clone)]
+struct LimiterGraph {
+    bin: gst::Bin,
+    eq: gst::Element,
+    post_convert: gst::Element,
+}
+
+/// Apply one limiter topology edit to `clipper`, the chain's owned
+/// `rglimiter` handle (`None` when clip protection is off). The handle is
+/// left matching the routed graph, so `clip_protection_installed` stays
+/// truthful. Returns whether the requested toggle is installed.
+///
+/// `direct_blocked`/`restore_blocked` are the test-only fault decisions for
+/// the removal surgery; production callers pass `false`.
+fn edit_limiter_topology(
+    graph: &LimiterGraph,
+    soft: ClipProtection,
+    clipper: &mut Option<gst::Element>,
+    direct_blocked: bool,
+    restore_blocked: bool,
+) -> bool {
+    match (soft, clipper.take()) {
+        (ClipProtection::Soft, None) => match insert_limiter(graph) {
+            Ok(installed) => {
+                *clipper = Some(installed);
+                true
+            }
+            Err(()) => false,
+        },
+        (ClipProtection::Off, Some(installed)) => {
+            let (landed, retained) =
+                remove_limiter(graph, installed, direct_blocked, restore_blocked);
+            *clipper = retained;
+            landed
+        }
+        (ClipProtection::Off, None) => true,
+        (ClipProtection::Soft, Some(installed)) => {
+            // Already installed: re-sync the state so a live pipeline can
+            // never keep the limiter stranded out of step with its bin.
+            let _ = installed.sync_state_with_parent();
+            *clipper = Some(installed);
+            true
+        }
+    }
+}
+
+/// Insert `rglimiter` between the EQ stage and the post-convert stage, then
+/// state-sync it with the bin (contract: *Live-reconfiguration boundary* —
+/// on add: link it, then `gst_element_sync_state_with_parent` so the
+/// element's state follows the running bin). On any failure, degrade to the
+/// no-limiter layout and report `Err`.
+fn insert_limiter(graph: &LimiterGraph) -> Result<gst::Element, ()> {
+    let Ok(clipper) = make_element("rglimiter", "clipper") else {
+        return Err(());
+    };
+    clipper.set_property("enabled", true);
+    if graph.bin.add(&clipper).is_err() {
+        return Err(());
+    }
+    // The EQ stage already feeds the post-convert stage directly; break
+    // that link to make room for the limiter.
+    let was_linked = graph
+        .eq
+        .static_pad("src")
+        .map(|src| src.peer().is_some())
+        .unwrap_or(false);
+    if was_linked {
+        // `Element::unlink` returns `()`.
+        graph.eq.unlink(&graph.post_convert);
+    }
+    if graph.eq.link(&clipper).is_ok()
+        && clipper.link(&graph.post_convert).is_ok()
+        && clipper.sync_state_with_parent().is_ok()
+    {
+        return Ok(clipper);
+    }
+    // Degrade to the no-limiter layout: restore the direct
+    // eq → post-convert link.
+    graph.eq.unlink(&clipper);
+    clipper.unlink(&graph.post_convert);
+    drop_limiter_from_bin(&graph.bin, &clipper);
+    let _ = graph.eq.link(&graph.post_convert);
+    Err(())
+}
+
+/// Remove the installed `rglimiter` and restore the direct
+/// eq → post-convert link, returning the owned handle whenever the limiter
+/// stays routed.
+///
+/// Both old links are unlinked **before** the direct relink is attempted
+/// (the `post-convert` sink pad stays busy until the limiter's link is
+/// gone). If the relink fails, the previous eq → clipper → post-convert
+/// path is re-established **and the owned handle is returned in the
+/// retained slot**, so a failed removal leaves the chain with a working
+/// (limiter-installed) data path instead of a dangling `eq` source pad, and
+/// `clip_protection_installed` keeps matching the routed graph — the caller
+/// can no longer record `Off` while the limiter is in the bin (which
+/// previously invited a second `clipper` on the next enable).
+///
+/// If restoration itself fails, the graph is never resumed with an unlinked
+/// `eq` source: the partial links are torn down, the limiter leaves the bin,
+/// and the direct path is forced. The handle is cleared (no limiter remains
+/// installed) and the first tuple member reports whether the requested
+/// removal landed.
+fn remove_limiter(
+    graph: &LimiterGraph,
+    clipper: gst::Element,
+    direct_blocked: bool,
+    restore_blocked: bool,
+) -> (bool, Option<gst::Element>) {
+    graph.eq.unlink(&clipper);
+    clipper.unlink(&graph.post_convert);
+    let direct_linked = !direct_blocked && graph.eq.link(&graph.post_convert).is_ok();
+    if direct_linked {
+        drop_limiter_from_bin(&graph.bin, &clipper);
+        return (true, None);
+    }
+    // Relink failed: restore the working limiter path so the chain stays
+    // playable and its tracked ownership keeps matching the routed graph.
+    let restored = !restore_blocked
+        && graph.eq.link(&clipper).is_ok()
+        && clipper.link(&graph.post_convert).is_ok();
+    if restored {
+        let _ = clipper.sync_state_with_parent();
+        return (false, Some(clipper));
+    }
+    // Restoration itself failed: do not resume an unlinked graph. Tear down
+    // any partial restoration link, remove the limiter, and force the direct
+    // path so the chain keeps a working route. The handle is cleared because
+    // no limiter remains in the bin.
+    graph.eq.unlink(&clipper);
+    clipper.unlink(&graph.post_convert);
+    drop_limiter_from_bin(&graph.bin, &clipper);
+    (graph.eq.link(&graph.post_convert).is_ok(), None)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

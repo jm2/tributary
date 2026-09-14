@@ -235,6 +235,13 @@ fn settled_zero_state(
 #[cfg(test)]
 type EqSeamHook = Box<dyn FnOnce(&mut dyn FnMut() -> bool) -> bool>;
 
+/// Test-only seam hook: consumes one dynamic clip-protection attempt and
+/// reports its outcome (`Some(installed)` reached a validated topology,
+/// `None` probe could not engage), letting the caller-discipline tests
+/// drive the dynamic path without a live pipeline.
+#[cfg(test)]
+type EqDynamicHook = Box<dyn FnOnce() -> Option<bool>>;
+
 /// GStreamer playback engine.
 ///
 /// Wraps a `playbin3` (with `playbin` fallback) and exposes a safe,
@@ -279,6 +286,16 @@ pub struct Player {
     /// discipline are exercisable deterministically in tests.
     #[cfg(test)]
     seam_override: RefCell<Option<EqSeamHook>>,
+    /// Test-only seam override for the dynamic blocking-pad-probe path:
+    /// when set, the dynamic attempt delegates to this hook instead of a
+    /// real probe, so the probe-vs-seam caller discipline is exercisable
+    /// without a live pipeline.
+    #[cfg(test)]
+    dynamic_seam_override: RefCell<Option<EqDynamicHook>>,
+    /// Test-only override of the settled `Playing` query, so the dynamic
+    /// probe path can be exercised on a bare test pipeline.
+    #[cfg(test)]
+    playing_override: RefCell<Option<bool>>,
 }
 
 impl Player {
@@ -374,6 +391,10 @@ impl Player {
             _windows_audio_route: windows_audio_route,
             #[cfg(test)]
             seam_override: RefCell::new(None),
+            #[cfg(test)]
+            dynamic_seam_override: RefCell::new(None),
+            #[cfg(test)]
+            playing_override: RefCell::new(None),
         };
 
         Ok((player, event_rx))
@@ -724,11 +745,33 @@ impl Player {
 
     /// Limiter-only topology change inside the installed bin (clip
     /// protection toggle while the equalizer stays enabled). Returns
-    /// `false` when the seam deferred the edit or the surgery failed —
-    /// recoverable per the contract; the caller then records the
-    /// protection the installed chain actually carries (see
-    /// [`Player::installed_clip_protection`]).
+    /// `false` when the dynamic edit was deferred and the seam deferred
+    /// the retry, or the surgery failed — recoverable per the contract;
+    /// the caller then records the protection the installed chain
+    /// actually carries (see [`Player::installed_clip_protection`]).
+    ///
+    /// The edit is delivered as the documented dynamic in-bin topology
+    /// change under a blocking pad probe on the `equalizer-10bands` src
+    /// pad, which never pauses the pipeline — an ordinary toggle therefore
+    /// cannot interrupt playback. The pause/relink seam is reserved for
+    /// the failed-dynamic-re-link fallback: after the probe path restores
+    /// the pre-edit layout and reports the toggle unmet, the seam pauses,
+    /// retries the edit, and resumes.
     fn toggle_clip_protection(&self, protection: equalizer::ClipProtection) -> bool {
+        if self.pipeline_is_confirmed_playing() {
+            if let Some(installed) = self.dynamic_clip_swap(protection) {
+                info!(
+                    clip_protection = ?protection,
+                    installed,
+                    "Clip protection element toggled under a blocking pad probe"
+                );
+                if installed {
+                    return true;
+                }
+                // The dynamic re-link failed and the surgery restored the
+                // pre-edit layout: retry through the pause/relink seam.
+            }
+        }
         self.with_pipeline_suspended(|| {
             let mut state = self.eq_state.borrow_mut();
             let Some(chain) = state.chain.as_mut() else {
@@ -738,10 +781,37 @@ impl Player {
             info!(
                 clip_protection = ?protection,
                 installed,
-                "Clip protection element toggled in local pipeline"
+                "Clip protection element toggled via the pause/relink seam"
             );
             installed
         })
+    }
+
+    /// Attempt the clip-protection toggle through the dynamic blocking
+    /// pad-probe edit. `Some(installed)` when the edit reached a validated
+    /// topology, `None` when no chain is installed or the probe could not
+    /// engage so the caller falls back to the pause/relink seam.
+    fn dynamic_clip_swap(&self, protection: equalizer::ClipProtection) -> Option<bool> {
+        #[cfg(test)]
+        if let Some(hook) = self.dynamic_seam_override.borrow_mut().take() {
+            return hook();
+        }
+        let mut state = self.eq_state.borrow_mut();
+        let chain = state.chain.as_mut()?;
+        chain.swap_clip_protection_under_block_probe(protection)
+    }
+
+    /// Whether the pipeline is settled in `Playing`. Only a confirmed
+    /// `Playing` pipeline can be audibly interrupted by a topology edit, so
+    /// only then is the non-pausing dynamic probe used; a stopped or
+    /// unsettled pipeline is left to the seam (which edits directly when
+    /// not playing and defers on a transition in flight).
+    fn pipeline_is_confirmed_playing(&self) -> bool {
+        #[cfg(test)]
+        if let Some(playing) = *self.playing_override.borrow() {
+            return playing;
+        }
+        settled_zero_state(self.playbin.state(gst::ClockTime::ZERO)) == Some(true)
     }
 
     /// Buffer-boundary property-write transaction for band/preamp
@@ -1996,6 +2066,8 @@ mod tests {
             #[cfg(target_os = "windows")]
             _windows_audio_route: None,
             seam_override: RefCell::new(None),
+            dynamic_seam_override: RefCell::new(None),
+            playing_override: RefCell::new(None),
         }
     }
 
@@ -2318,6 +2390,93 @@ mod tests {
             let chain = state.chain.as_ref().expect("chain stays installed");
             assert!(!chain.clip_protection_installed());
         }
+    }
+
+    /// Regression (review finding G, PR #220): an ordinary clip-protection
+    /// toggle on a playing pipeline is delivered by the dynamic blocking
+    /// pad probe and must never touch the pause/relink seam — the toggle
+    /// cannot interrupt playback. The seam hook is set to panic, so any
+    /// pause-path use fails the test loudly instead of silently pausing.
+    #[test]
+    fn ordinary_clip_toggle_does_not_use_the_pause_seam() {
+        if !eq_engine_plugins_available() {
+            return;
+        }
+        let playbin = eq_test_playbin();
+        let settings = eq_enabled_settings(equalizer::ClipProtection::Soft);
+        let chain = equalizer::EqChain::build(&settings).expect("chain builds");
+        playbin.set_property("audio-filter", Some(&chain.bin));
+        let player = eq_test_player(playbin.clone(), eq_state_with(Some(chain), settings));
+        // A playing pipeline is exactly the case the probe path exists for.
+        *player.playing_override.borrow_mut() = Some(true);
+        *player.seam_override.borrow_mut() = Some(Box::new(|_edit| {
+            panic!("the pause/relink seam must not run for an ordinary live toggle")
+        }));
+
+        let next = EqSettings {
+            clip_protection: equalizer::ClipProtection::Off,
+            ..settings
+        };
+        apply_serialized(&player, next);
+
+        {
+            let state = player.eq_state.borrow();
+            assert_eq!(
+                state.settings.clip_protection,
+                equalizer::ClipProtection::Off,
+                "the dynamic probe edit must land the requested removal"
+            );
+            let chain = state.chain.as_ref().expect("chain stays installed");
+            assert!(!chain.clip_protection_installed());
+        }
+        assert!(
+            player.seam_override.borrow().is_some(),
+            "the pause/relink seam must remain unused after a dynamic edit"
+        );
+    }
+
+    /// Regression (review finding G, PR #220): the pause/relink seam is the
+    /// failed-dynamic-re-link fallback. When the dynamic probe edit reports
+    /// a failed re-link (the surgery restored the pre-edit layout), the
+    /// seam retries the edit and lands the removal. If the seam did not run
+    /// as the fallback, the requested toggle would never be reached.
+    #[test]
+    fn clip_toggle_falls_back_to_the_pause_seam_after_a_failed_dynamic_relink() {
+        if !eq_engine_plugins_available() {
+            return;
+        }
+        let playbin = eq_test_playbin();
+        let settings = eq_enabled_settings(equalizer::ClipProtection::Soft);
+        let chain = equalizer::EqChain::build(&settings).expect("chain builds");
+        playbin.set_property("audio-filter", Some(&chain.bin));
+        let player = eq_test_player(playbin.clone(), eq_state_with(Some(chain), settings));
+        *player.playing_override.borrow_mut() = Some(true);
+        // The dynamic probe edit reports a failed re-link: the surgery
+        // restored the pre-edit layout, so the toggle is unmet.
+        *player.dynamic_seam_override.borrow_mut() = Some(Box::new(|| Some(false)));
+        // The seam then retries and lands the removal.
+        *player.seam_override.borrow_mut() = Some(Box::new(|edit| edit()));
+
+        let next = EqSettings {
+            clip_protection: equalizer::ClipProtection::Off,
+            ..settings
+        };
+        apply_serialized(&player, next);
+
+        {
+            let state = player.eq_state.borrow();
+            assert_eq!(
+                state.settings.clip_protection,
+                equalizer::ClipProtection::Off,
+                "the seam fallback must land the removal after the dynamic re-link failed"
+            );
+            let chain = state.chain.as_ref().expect("chain stays installed");
+            assert!(!chain.clip_protection_installed());
+        }
+        assert!(
+            player.seam_override.borrow().is_none(),
+            "the pause/relink seam must have been exercised as the fallback"
+        );
     }
 
     /// Regression (review finding r3985258424 P2): the pending member of
