@@ -24,6 +24,24 @@ pub use super::root_authority::{MountedMutationTarget, MountedRootAuthority};
 /// same outer budget for the point-in-time file probe.
 const FILE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum number of retained-authority filesystem probes that may run at once.
+const MAX_CONCURRENT_AUTHORITY_PROBES: usize = 8;
+
+/// Bounds concurrent retained-authority filesystem probes.
+///
+/// [`resolve_track`] submits its pre-extraction probe with
+/// `tokio::task::spawn_blocking`. A blocking closure cannot be unwound once
+/// it starts, and dropping its `JoinHandle` detaches rather than cancels it,
+/// so a caller that cancels a pending resolution (the album pane's
+/// `run_until_revoked`) would otherwise let recycled rows accumulate
+/// expensive probes without bound on Tokio's shared blocking pool
+/// (2026-09-14 review finding). The permit is acquired *before* the probe is
+/// submitted and moved INTO the blocking closure, so it is released only
+/// when the probe actually completes — never early on task abort — and at
+/// most [`MAX_CONCURRENT_AUTHORITY_PROBES`] probes can ever be in flight.
+static AUTHORITY_PROBE_GATE: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_AUTHORITY_PROBES);
+
 /// A closed, path-free local resolution failure safe for application logs.
 #[derive(Debug, Error)]
 pub enum LocalMediaResolutionError {
@@ -365,11 +383,37 @@ pub async fn resolve_track(
         .clone()
         .ok_or(LocalMediaResolutionError::RootUnavailable)?;
     let expected_root_state = ExpectedRootAuthorityState::from_model(state);
+    // Bound the probe before submitting it. A cancelled caller must not be
+    // able to free gate capacity while its detached blocking closure still
+    // runs, so the permit is moved into the closure below. The existing
+    // five-second budget covers both waiting for capacity and running the
+    // probe: a saturated gate can delay a resolution but never stretch it
+    // past `FILE_PROBE_TIMEOUT`, and a callback whose row was recycled while
+    // it queued is dropped before it ever submits a blocking probe.
+    let deadline = tokio::time::Instant::now() + FILE_PROBE_TIMEOUT;
+    let probe_permit = tokio::time::timeout_at(deadline, AUTHORITY_PROBE_GATE.acquire())
+        .await
+        .map_err(|_| LocalMediaResolutionError::AuthorityCheckTimedOut)?
+        .map_err(|_| LocalMediaResolutionError::AuthorityUnavailable {
+            source: std::io::Error::other("local authority probe gate unavailable"),
+        })?;
     let authority_path = path.clone();
     let authority_root = root.clone();
-    let acquired = tokio::time::timeout(
-        FILE_PROBE_TIMEOUT,
+    #[cfg(test)]
+    let probe_track_id = track_id.to_string();
+    let acquired = tokio::time::timeout_at(
+        deadline,
         tokio::task::spawn_blocking(move || {
+            // Hold the gate permit for the entire blocking closure so an
+            // aborted async caller cannot release it while this probe is
+            // still queued or running (2026-09-14 review finding).
+            let _probe_permit = probe_permit;
+            #[cfg(test)]
+            let _park = probe_park::enter_if_watched(&probe_track_id);
+            #[cfg(test)]
+            if let Some(park) = _park.as_ref() {
+                park.wait_for_release();
+            }
             let authority = Arc::new(RootAuthorityLease::acquire(
                 &authority_root,
                 &expected_marker,
@@ -419,6 +463,110 @@ pub async fn resolve_track(
         }),
         lease: None,
     })
+}
+
+/// Test-only instrumentation for [`AUTHORITY_PROBE_GATE`].
+///
+/// Records how many watched probe closures are concurrently executing and
+/// parks them behind a condvar, so a regression can observe the bound
+/// deterministically through the real [`resolve_track`] seam. Production
+/// builds compile this module away entirely.
+#[cfg(test)]
+mod probe_park {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    struct Park {
+        enabled: AtomicBool,
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+        watcher: Mutex<Option<String>>,
+        waiting: Mutex<()>,
+        release: Condvar,
+    }
+
+    fn park() -> &'static Park {
+        static PARK: OnceLock<Park> = OnceLock::new();
+        PARK.get_or_init(|| Park {
+            enabled: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            watcher: Mutex::new(None),
+            waiting: Mutex::new(()),
+            release: Condvar::new(),
+        })
+    }
+
+    /// Watch exactly `track_id` and park its probe closures until released.
+    pub(super) fn watch(track_id: &str) {
+        let state = park();
+        *state.watcher.lock().expect("probe park watcher") = Some(track_id.to_string());
+        state.in_flight.store(0, Ordering::SeqCst);
+        state.peak.store(0, Ordering::SeqCst);
+        state.enabled.store(true, Ordering::SeqCst);
+    }
+
+    /// Disarm the park and wake every parked closure.
+    pub(super) fn release() {
+        let state = park();
+        state.enabled.store(false, Ordering::SeqCst);
+        state.release.notify_all();
+    }
+
+    pub(super) fn in_flight() -> usize {
+        park().in_flight.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn peak() -> usize {
+        park().peak.load(Ordering::SeqCst)
+    }
+
+    fn is_watched(track_id: &str) -> bool {
+        park()
+            .watcher
+            .lock()
+            .map(|watcher| watcher.as_deref() == Some(track_id))
+            .unwrap_or(false)
+    }
+
+    /// Enter one watched probe, returning a guard that keeps the in-flight
+    /// count and parks the closure until [`release`]. Unwatched probes get
+    /// `None` and pay nothing.
+    pub(super) fn enter_if_watched(track_id: &str) -> Option<Guard> {
+        if !is_watched(track_id) {
+            return None;
+        }
+        let state = park();
+        let now = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        state.peak.fetch_max(now, Ordering::SeqCst);
+        Some(Guard { state })
+    }
+
+    pub(super) struct Guard {
+        state: &'static Park,
+    }
+
+    impl Guard {
+        pub(super) fn wait_for_release(&self) {
+            if !self.state.enabled.load(Ordering::SeqCst) {
+                return;
+            }
+            let mut guard = self.state.waiting.lock().expect("probe park wait");
+            while self.state.enabled.load(Ordering::SeqCst) {
+                guard = self
+                    .state
+                    .release
+                    .wait(guard)
+                    .expect("probe park wait poisoned");
+            }
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.state.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -833,5 +981,92 @@ mod tests {
             resolve_track(&db, "escaped", &configured(root.path())).await,
             Err(LocalMediaResolutionError::AuthorityUnavailable { .. })
         ));
+    }
+
+    /// Release the process-global probe park even when an assertion unwinds.
+    struct ParkGuard;
+
+    impl Drop for ParkGuard {
+        fn drop(&mut self) {
+            probe_park::release();
+        }
+    }
+
+    #[tokio::test]
+    async fn recycled_rows_cannot_grow_the_authority_probe_backlog_past_the_bound() {
+        let db = database().await;
+        let root = tempfile::tempdir().expect("library root");
+        authorize_root(&db, root.path()).await;
+        let roots = configured(root.path());
+        let path = root.path().join("track.flac");
+        std::fs::write(&path, b"authorized").expect("write authorized file");
+        // `probe_park` is process-global, so watch a private id: sibling
+        // tests run in parallel and resolve their own tracks.
+        const TRACK: &str = "bounded-probe-track";
+        model(TRACK, &path)
+            .insert(&db)
+            .await
+            .expect("insert track");
+
+        let db = Arc::new(db);
+        probe_park::watch(TRACK);
+        let _park = ParkGuard;
+
+        // Submit several times the permitted concurrency, then let the
+        // resolutions reach the point where their blocking probes run.
+        let attempt_count = MAX_CONCURRENT_AUTHORITY_PROBES * 3;
+        let mut attempts = Vec::with_capacity(attempt_count);
+        for _ in 0..attempt_count {
+            let db = Arc::clone(&db);
+            let roots = roots.clone();
+            attempts.push(tokio::spawn(async move {
+                resolve_track(&db, TRACK, &roots).await
+            }));
+        }
+
+        // The gate is the only thing that can keep the rest of the probes
+        // out; wait until every permit is held by a parked probe.
+        let bound_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while probe_park::in_flight() < MAX_CONCURRENT_AUTHORITY_PROBES {
+            assert!(
+                tokio::time::Instant::now() < bound_deadline,
+                "fewer than {MAX_CONCURRENT_AUTHORITY_PROBES} probes entered the gate"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            probe_park::peak(),
+            MAX_CONCURRENT_AUTHORITY_PROBES,
+            "the gate must cap concurrent authority probes at the declared bound"
+        );
+
+        // Recycled rows abandon their resolution (the album pane's
+        // `run_until_revoked` drops the pending future). The probe already
+        // running is detached and keeps its permit, so cancelling the async
+        // callers must not hand that capacity to a new probe.
+        for attempt in &attempts {
+            attempt.abort();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            probe_park::in_flight(),
+            MAX_CONCURRENT_AUTHORITY_PROBES,
+            "a cancelled caller must not release capacity held by a running probe"
+        );
+
+        probe_park::release();
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while probe_park::in_flight() != 0 {
+            assert!(
+                tokio::time::Instant::now() < drain_deadline,
+                "parked probes did not finish after release"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            probe_park::peak(),
+            MAX_CONCURRENT_AUTHORITY_PROBES,
+            "the backlog never exceeded the bound"
+        );
     }
 }
