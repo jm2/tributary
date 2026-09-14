@@ -2,6 +2,40 @@
 
 Status: design record, no implementation in this bead.
 
+Revision 17 (2026-09-14, corrective pass). This revision answers the
+fresh exact-head Codex review at the `d0c71f4` head (review `5193475063`,
+threads `PRRT_kwDOR1IXks6h-bFc` and `PRRT_kwDOR1IXks6h-bFg`) with two
+contract fixes to §4.1/§4.3/§9, docs-only.
+
+(1) Recovery custody is **keyed per ticket**, not a single slot.
+Revision 16 gave the proxy one recovery-custody slot and stated
+idempotence only for the load's **own** ticket, so with a recovery
+outstanding and a replacement load active, a later Stop/supersession of
+that replacement had no slot for its different ticket: an implementation
+would have had to overwrite or leak the first entry, or revoke the
+second before quiescence. Custody is now a map keyed by the ticket's
+pointer identity: `move_to_recovery_custody` inserts or keeps only this
+load's entry, every concurrently custodied ticket keeps its own entry,
+and `take_and_release` removes exactly the entry keyed by the ticket it
+names and never another's. This preserves immediate replacement
+activation — no preparation is refused or blocked behind an outstanding
+recovery — while guaranteeing no custody entry is overwritten, leaked,
+or released early. The §4.1/§4.3 contract and acceptance item 12 (new
+trace E) state the keyed invariant and cover the second concurrently
+custodied ticket.
+
+(2) Ticket release sits on **one side** of the `open_session` return.
+The `OpenOutcome::Cancelled` doc said the load path released its ticket
+through `take_and_release` "before this variant is returned", while the
+trait contract requires release **on receipt** — after restoration,
+never before — and `open_session` is handed no `MediaTicket` with which
+to release. The variant doc now guarantees only restoration/quiescence
+(what the seam can do), and names the load path's on-receipt release as
+the single release point, agreeing with the trait contract and item 12
+sub-traces B2/C.
+
+It changes the design record only.
+
 Revision 16 (2026-09-14, corrective pass). This revision answers the
 operator review at the `2e6b4e8` head (review comments 4001484324 and
 4001484328) with one contract fix and one acceptance rewrite in
@@ -9,15 +43,15 @@ operator review at the `2e6b4e8` head (review comments 4001484324 and
 
 (1) Revocation after a route had been custodied was still directed
 through `revoke_if_current`. That call's non-active branch revokes the
-route's server routes but leaves the custody slot's
+route's server routes but leaves the custodied
 `Arc<GstreamerMediaTicket>` — and therefore the `CastHttpServer`, whose
 shutdown runs only in `Drop` — alive, and the pre-registration
 `Cancelled` path has no `RecoveryCompletion` owner that could release it
 later, so the server and its loopback slot could be retained
 indefinitely. `MediaTicketCustody` now carries one identity-bound
 take-and-release operation, `take_and_release`: under the proxy's state
-lock it takes the named ticket out of whichever slot holds it — the
-recovery-custody slot if the route was custodied, else the active lease
+lock it takes the named ticket out of whichever structure holds it —
+its custody entry if the route was custodied, else the active lease
 while it is still this load's own ticket — drops the taken handle
 (shutting a retained server down through `Drop`) and revokes the
 loopback route, identity-bound by pointer equality so it can never
@@ -794,7 +828,8 @@ impl RecoveryCompletion {
 /// `Arc<GstreamerMediaTicket>` the proxy's active lease stores
 /// (`src/audio/gstreamer_media.rs:54-72`). The concrete type is the
 /// implementation record's choice; the contract requires only
-/// pointer-identity comparison against the proxy's slots.
+/// pointer-identity comparison against the proxy's active lease and
+/// keyed custody entries.
 struct MediaTicket { /* the implementation record's primitive */ }
 
 /// The app-owned capability to move this load's loopback media ticket
@@ -802,7 +837,7 @@ struct MediaTicket { /* the implementation record's primitive */ }
 /// into recovery custody, atomically, under the proxy's state lock,
 /// **and** to register the call's cancellation handle with the proxy
 /// for as long as that call is in flight, **and** to release a ticket
-/// from whichever slot holds it. The load path owns it — it
+/// from whichever structure holds it. The load path owns it — it
 /// is the `GstreamerMediaProxy` owner — and lends it to
 /// `open_session`, so the transition that produces
 /// `Failed(SenderError::RecoveryPending)` performs the proxy-locked
@@ -822,25 +857,32 @@ struct MediaTicketCustody { /* the implementation record's primitive */ }
 
 impl MediaTicketCustody {
     /// Move the active lease for this load's current ticket into the
-    /// proxy's recovery-custody slot under the proxy's state lock, so
-    /// no other load can observe it as active afterwards and the
-    /// replacement path's supersession revocation cannot reach it.
-    /// Idempotent for the load's own ticket: a ticket already in
-    /// custody — for example because replacement preparation moved it
-    /// there first — is left in place, and the call never touches a
-    /// newer replacement's lease.
+    /// proxy's recovery custody under the proxy's state lock, storing
+    /// it under the ticket's own pointer-identity key, so no other
+    /// load can observe it as active afterwards and the replacement
+    /// path's supersession revocation cannot reach it. Custody is
+    /// **keyed, not a single slot**: every concurrently custodied
+    /// ticket keeps its own entry, so a second superseded ticket never
+    /// contends for, overwrites, or leaks the first's entry, and each
+    /// entry is released only by the identity-bound call naming its
+    /// ticket. Idempotent for the load's own ticket: an entry already
+    /// present — for example because replacement preparation inserted
+    /// it first — is left in place, and the call never touches another
+    /// load's entry or a newer replacement's active lease.
     fn move_to_recovery_custody(&self);
 
-    /// Release this load's ticket from whichever proxy slot holds it,
-    /// after its server side is quiesced: take it out of the
-    /// recovery-custody slot if it was custodied, or out of the active
+    /// Release this load's ticket from whichever proxy structure holds
+    /// it, after its server side is quiesced: take its custody entry
+    /// out of the custody map if it was custodied, or out of the active
     /// lease while it is still this load's own, drop the taken handle —
     /// so a `CastHttpServer` retained only by custody is shut down by
     /// its `Drop` (`src/audio/gstreamer_media.rs:54-67`) — and revoke
     /// the loopback route. Identity-bound by pointer equality (the same
     /// check `revoke_if_current` applies to the active lease,
-    /// `src/audio/gstreamer_media.rs:319-337`), so it can never release
-    /// a newer replacement's ticket. This is the single release
+    /// `src/audio/gstreamer_media.rs:319-337`): it removes only the
+    /// entry keyed by the named ticket and leaves any other outstanding
+    /// recovery's entry in place, so it can never release a newer
+    /// replacement's ticket. This is the single release
     /// primitive on every terminal path, and it is what makes cleanup
     /// complete once a route has been custodied: `revoke_if_current`'s
     /// non-active branch revokes the route's server routes but leaves
@@ -1081,14 +1123,20 @@ enum OpenOutcome {
     /// land after the teardown (§4.1). Everything the attempt created
     /// — receiver session, queue items, enabled-output changes — was
     /// already torn down through the same restoration path as failure
-    /// (§4.1, §4.3) before this variant is returned, and the load
-    /// path released its own current media ticket through the
-    /// identity-bound `MediaTicketCustody::take_and_release` (§4.1,
-    /// §9.5) — clearing the custody slot and dropping the retained
-    /// server if the route had been custodied — without touching a
-    /// newer replacement's.
-    /// `Cancelled` is a terminal, fully-unwound state, never a
-    /// half-open session and never a retained loopback route.
+    /// (§4.1, §4.3) before this variant is returned. Ticket release is
+    /// **not** part of what the seam does before returning:
+    /// `open_session` is handed no ticket, so this variant guarantees
+    /// only that restoration has completed, and the load path — which
+    /// owns the `MediaTicketCustody` capability — releases its own
+    /// current media ticket **on receipt** through the identity-bound
+    /// `MediaTicketCustody::take_and_release` (§4.1, §9.5), after
+    /// restoration, never before. That call removes exactly the entry
+    /// keyed by the named ticket — clearing its custody entry and
+    /// dropping the retained server if the route had been custodied —
+    /// without touching a newer replacement's.
+    /// `Cancelled` is a terminal, fully-unwound state — restoration is
+    /// complete when it is returned — and the load path's on-receipt
+    /// release leaves no retained loopback route behind.
     Cancelled,
     /// A failure inside the seam's taxonomy. `Failed(Deadline)`,
     /// `Failed(Dependency)`, `Failed(Authentication)`, and
@@ -1163,16 +1211,16 @@ trait AirplaySender: Send + Sync {
     /// `MediaTicketCustody::take_and_release` (§4.1); its active-lease
     /// arm applies the same identity check today's failure path's
     /// `revoke_if_current` applies, and its custody arm additionally
-    /// clears the custody slot. Dropping the call is *not* sufficient:
+    /// removes that ticket's keyed custody entry. Dropping the call is *not* sufficient:
     /// `GstreamerMediaProxy` retains its own `Arc` in `state.active`
     /// (`src/audio/gstreamer_media.rs:69-72`), or in the
-    /// recovery-custody slot once a route is custodied, independent of
+    /// recovery-custody map once a route is custodied, independent of
     /// the discarded load, so a cancelled open that skipped release
     /// would leave the authenticated loopback route and its
     /// resources — including the `CastHttpServer`, whose shutdown runs
     /// only in `Drop` (:54-67) — live until the next load or output
     /// destruction. `take_and_release` is identity-checked against
-    /// both slots by pointer equality (the active-lease arm being
+    /// both structures by pointer equality (the active-lease arm being
     /// `revoke_if_current`'s check, `src/audio/gstreamer_media.rs:
     /// 319-337`), so a load can only ever release its own current
     /// ticket and never a newer replacement's, and it drops the taken
@@ -1187,9 +1235,10 @@ trait AirplaySender: Send + Sync {
     ///   `Failed(Authentication)`, and `Failed(Receiver)` report
     ///   restoration complete, so the load path calls
     ///   `custody.take_and_release(..)` on receipt — after restoration,
-    ///   never before — and the operation clears whichever slot holds
-    ///   the ticket (custody, or this load's own active lease) and
-    ///   drops it, so no custodied `Arc`/server resource survives.
+    ///   never before — and the operation removes the ticket's keyed
+    ///   custody entry (or takes it out of this load's own active lease
+    ///   if it was never custodied) and drops it, so no custodied
+    ///   `Arc`/server resource survives.
     /// - `Failed(SenderError::RecoveryPending)` reports the opposite:
     ///   restoration has *not* run. Revoking on receipt would
     ///   invalidate the loopback route while the unsettled request or
@@ -1213,8 +1262,9 @@ trait AirplaySender: Send + Sync {
     ///   identity-checked revocation — so a ticket still active in the
     ///   interval between the recovery decision and the hand-off would
     ///   be revoked before this recovery ran. The proxy therefore
-    ///   exposes the custody slot and a single atomic transition over
-    ///   it, and `prepare_with_server_start` acquires the same state
+    /// exposes keyed custody and a single atomic transition over the
+    /// named ticket's entry, and `prepare_with_server_start` acquires
+    /// the same state
     ///   lock — but it no longer takes and unconditionally revokes the
     ///   superseded active lease (`src/audio/gstreamer_media.rs:255-271`):
     ///   whichever side wins the state-lock race, the route is preserved
@@ -1222,8 +1272,9 @@ trait AirplaySender: Send + Sync {
     ///   outcome. If the recovery transition runs first, the replacement
     ///   finds the lease already custodied and removes nothing; if
     ///   replacement preparation runs first, in one state-locked step
-    ///   it moves the still-active lease into the same custody slot and
-    ///   cancels the proxy-registered in-flight `OpenCancel` handle
+    ///   it moves the still-active lease into that ticket's keyed
+    ///   custody entry and cancels the proxy-registered in-flight
+    ///   `OpenCancel` handle
     ///   (cancelling that handle — not bumping the preparation
     ///   generation — is the signal an in-flight open actually
     ///   observes, `:868-877`), and the open then observes the
@@ -1236,8 +1287,9 @@ trait AirplaySender: Send + Sync {
     ///   quiesced inside that deadline — at which point restoration has
     ///   run and the load path releases the custodied route through
     ///   `take_and_release`. The replacement releases only its own
-    ///   ticket. Custody is a dedicated slot the replacement path never
-    ///   revokes from, and **explicit teardown does not drain it
+    ///   ticket. Each custody entry is dedicated to the ticket that
+    ///   keys it and the replacement path never revokes from any of
+    ///   them, and **explicit teardown does not drain custody
     ///   early**: Stop (`GstreamerMediaProxy::revoke`) and the proxy's
     ///   `Drop` must not revoke a route an in-flight open still needs.
     ///   That obligation covers both states of the lease, not just the
@@ -1247,14 +1299,14 @@ trait AirplaySender: Send + Sync {
     ///   transition — the ticket is still the proxy's active lease — they
     ///   must not take and unconditionally revoke it either. In one
     ///   atomic step under the state lock they (a) move that in-flight
-    ///   active ticket into the same custody slot and (b) cancel the
+    ///   active ticket into its keyed custody entry and (b) cancel the
     ///   in-flight open's registered `OpenCancel` handle — cancelling
     ///   that handle, not a generation comparison, is how supersession
     ///   reaches a blocked call — exactly as
     ///   `prepare_with_server_start` now does, so the open observes
     ///   cancellation with the lease already custodied and its recovery
-    ///   transition finds a route to preserve instead of an empty active
-    ///   slot. The preparation generation is still bumped for the
+    ///   transition finds a route to preserve instead of an empty
+    ///   active lease. The preparation generation is still bumped for the
     ///   after-the-fact `is_current_generation` comparison, but it is
     ///   the cancelled registered handle that aborts the operation in
     ///   flight; a bump alone would leave a stale open blocked, still
@@ -1276,15 +1328,17 @@ trait AirplaySender: Send + Sync {
     ///   (settle-or-restart) already guarantees no request referencing
     ///   the route survives and the retained-record recovery does not
     ///   depend on the route — by calling
-    ///   `custody.take_and_release(..)`: it takes the ticket out of the
-    ///   custody slot (or out of this load's own active lease if the
-    ///   ticket was never custodied), drops the taken handle so the
+    ///   `custody.take_and_release(..)`: it takes the ticket's keyed
+    ///   custody entry out of the custody map (or out of this load's
+    ///   own active lease if the ticket was never custodied), drops the
+    ///   taken handle so the
     ///   `CastHttpServer` is shut down by `Drop`
     ///   (`src/audio/gstreamer_media.rs:54-67`), and revokes the
     ///   loopback route. The operation is identity-bound, so it can
-    ///   never touch a newer replacement's ticket. The route is
+    ///   never touch a newer replacement's ticket or another
+    ///   recovery's entry. The route is
     ///   retained exactly as long as the ordering requires, and no
-    ///   route or custody slot is leaked because the handle always
+    ///   route or custody entry is leaked because the handle always
     ///   terminates — recovery is bounded by settle-or-restart **and**
     ///   by the documented recovery deadline, after which it reports
     ///   `RestorationFailed` rather than waiting forever (§4.3) — and
@@ -1306,8 +1360,9 @@ trait AirplaySender: Send + Sync {
     /// a superseded route. On this branch the restoration path performs
     /// the release: the clean `Cancelled` carries no
     /// `RecoveryCompletion` owner, so the load path calls
-    /// `custody.take_and_release(..)` on receipt, which clears the
-    /// custody slot and drops the `Arc`/`CastHttpServer` the
+    /// `custody.take_and_release(..)` on receipt, which removes that
+    /// ticket's keyed custody entry and drops the
+    /// `Arc`/`CastHttpServer` the
     /// pre-registration supersession moved there — no custodied route
     /// or server resource survives it.
     /// Registration is the call's first step, so
@@ -1648,13 +1703,15 @@ Tributary talks to an OwnTone instance as a transmission service:
   transition that produced `RecoveryPending` — through the
   `MediaTicketCustody` capability the seam is handed, under the
   proxy's state lock, atomic with that transition, so no replacement
-  load can revoke it early. `take_and_release` takes the ticket out of
-  whichever slot holds it, drops the taken handle (shutting down a
+  load can revoke it early. `take_and_release` removes the entry keyed
+  by the named ticket (or takes the ticket out of the active lease if
+  it was never custodied), drops the taken handle (shutting down a
   custodied `CastHttpServer` through its `Drop`) and revokes the
   loopback route, identity-bound so it never touches a newer
-  replacement's ticket — so the unwound load leaves no receiver
-  session, no enabled-output change, and, on every terminal path, no
-  live loopback route and no retained custody slot behind. A crashed
+  replacement's ticket or another outstanding recovery's entry — so the
+  unwound load leaves no receiver session, no enabled-output change,
+  and, on every terminal path, no live loopback route and no retained
+  custody entry behind. A crashed
   holder releases the lock by OS semantics,
   and what happens next is defined, not incidental: before the
   first mutating step (the first output, queue, or player change),
@@ -1713,7 +1770,8 @@ Tributary talks to an OwnTone instance as a transmission service:
   path without negotiating — a path that performs the release itself,
   because the clean `Cancelled` has no `RecoveryCompletion` owner: the
   load path calls `custody.take_and_release(..)` on receipt, which
-  clears the custody slot and drops the `Arc`/`CastHttpServer` the
+  removes that ticket's keyed custody entry and drops the
+  `Arc`/`CastHttpServer` the
   pre-registration supersession moved there rather than leaving a
   custodied route with no later release. That pre-registration branch has
   transmitted no mutating RPC — registration is the call's first
@@ -2213,8 +2271,9 @@ record for the selected path must add, at minimum:
     server resource survives either clean-`Cancelled` trace: on the
     pre-registration branch — which carries no `RecoveryCompletion`
     owner — and on the already-registered branch whose server side
-    quiesced inside the cleanup deadline, `take_and_release` clears the
-    custody slot and drops the retained `CastHttpServer`, so no
+    quiesced inside the cleanup deadline, `take_and_release` removes
+    that ticket's keyed custody entry and drops the retained
+    `CastHttpServer`, so no
     loopback route or server/listener is retained after the outcome. A targeted
     interposition test races `cancel` against an operation the test
     holds open and asserts the abort happens before that operation
@@ -2300,11 +2359,15 @@ record for the selected path must add, at minimum:
     The scenarios below are **independent, each-constructible traces**
     — each states its own initial state, trigger, possible outcome, and
     final resource ownership — because their setups and asserted
-    outcomes cannot all hold in one execution. Every scenario asserts
+    outcomes cannot all hold in one execution. Custody is keyed by
+    ticket identity (§4.1), not a single slot: every concurrently
+    custodied ticket keeps its own entry, so no trace relies on a
+    shared slot and a second superseded ticket can neither overwrite or
+    leak the first entry nor be released early. Every scenario asserts
     the open's own loopback route is **not** revoked early:
     replacement preparation must preserve the superseded lease —
-    moving it into recovery custody rather than taking and
-    unconditionally revoking the active lease
+    moving it into that ticket's keyed custody entry rather than taking
+    and unconditionally revoking the active lease
     (`src/audio/gstreamer_media.rs:255-271`) — until the open reaches
     its terminal quiesced outcome; that the replacement's own ticket is
     never touched (the pointer-identity check); and that the terminal
@@ -2377,6 +2440,25 @@ record for the selected path must add, at minimum:
       and released only then, never before quiescence, and asserts no
       custodied resource survives. The proxy's `Drop` is asserted to
       obey the same ordering.
+    - **E. Second concurrently custodied ticket.** *Initial state:*
+      trace A's recovery is still outstanding — load A returned
+      `Failed(SenderError::RecoveryPending)` and A's ticket occupies its
+      own keyed custody entry — and a replacement load B has since
+      become active (B's preparation moved A's still-active lease into
+      A's entry and installed B's own lease). *Trigger:* B is stopped or
+      superseded before A's recovery reaches a terminal outcome.
+      *Outcome and assertion:* B's ticket moves into **its own** keyed
+      custody entry in the same state-locked teardown step; the two
+      entries coexist, A's entry is neither overwritten nor leaked, and
+      B's route is not revoked before its own server side quiesces. Each
+      recovery releases exactly its own ticket — `take_and_release`
+      keyed by pointer identity — A's at its `RecoveryCompletion`
+      terminal outcome and B's per its own outcome; the test asserts no
+      custodied `Arc`/`CastHttpServer` survives once both are terminal
+      and that neither release touched the other load's ticket. This is
+      the trace the single-slot contract could not represent: with one
+      slot, either A would be overwritten/leaked or B revoked before
+      quiescence.
 13. **Persistent-restoration-failure acceptance:** a restoration step
     fails while a `RecoveryPending` recovery is serialized. The test
     asserts the incomplete-takeover record is retained for the
@@ -2384,7 +2466,7 @@ record for the selected path must add, at minimum:
     terminally as `RecoveryOutcome::RestorationFailed` rather than
     leaving the waiter pending, that the load path then revokes its
     own loopback ticket through `custody.take_and_release(..)` and no
-    route or custody slot is stranded, and that the
+    route or custody entry is stranded, and that the
     supervisor's later retry clears the retained record. A second
     variant holds recovery past the documented recovery deadline with
     no restoration attempt and asserts the same terminal outcome, so
