@@ -164,7 +164,9 @@ name: Bot review gate publisher
 # protected environment (see the job block): pull-request-controlled
 # workflows — which receive repository secrets on same-repository pull
 # requests — can neither read environment-scoped secrets nor pass the
-# environment's main-only branch policy.
+# environment's main-only branch policy. The publishing job is additionally
+# gated behind the default-off repository activation flag, so merely
+# provisioning credentials does not activate App-authored publication.
 #
 # The required context carries an identity no pull-request-controlled job
 # can produce. Every Actions workflow job — including anything a pull
@@ -195,6 +197,26 @@ name: Bot review gate publisher
 # because a refresh that publishes nothing would leave the head's previous
 # verdict standing. A publication failure also leaves the previous verdict
 # standing; the failed job is the operator's re-run signal.
+#
+# Staged activation (default off): this workflow ships INERT until the
+# operator explicitly activates it. The `activation` job reads the trusted,
+# repository-owned activation flag (the repository variable
+# `BOT_REVIEW_GATE_ACTIVATION`, set only by trusted administrators and never
+# by a pull request) BEFORE the publishing job can request its environment or
+# mint a token. The flag is unset or `inactive` by default; the publishing job
+# is then skipped entirely, so no App-authored check run is published and no
+# merge authority is claimed. Structural absence of the required context is
+# what keeps staging safe: if the live `main` ruleset already requires the
+# App-bound `Bot Review Gate` context while the publisher is inactive, the
+# absence blocks the merge — the workflow deliberately publishes no
+# workflow-token success to paper over that gap. Any value other than unset,
+# `inactive`, or `active` fails the activation job closed rather than being
+# silently treated as inactive. Once explicitly `active`, a missing or wrong
+# credential, binding, or API failure fails the publishing job — an active
+# gate never silently skips. The exact rollout, prerequisites, and the
+# read-only preflight validator live in `.github/bot-review-gate-rollout.json`
+# and `scripts/preflight_bot_review_gate.sh`; external activation itself
+# belongs to the operator validation bead tr-rcvys, not to this branch.
 on:
   workflow_run:
     workflows: ["Bot review gate"]
@@ -218,8 +240,55 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The default-off activation gate: a cheap, credential-free job that reads
+  # the trusted repository activation flag and decides whether the publishing
+  # job may run at all. It requests no environment and mints no token, so the
+  # App credentials are not even reachable while staging is inactive. Its
+  # check-run name is deliberately distinct from the required context.
+  activation:
+    name: Bot Review Gate activation gate
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      active: ${{ steps.activation.outputs.active }}
+    steps:
+      - name: Evaluate the trusted repository activation flag
+        id: activation
+        shell: bash
+        env:
+          ACTIVATION: ${{ vars.BOT_REVIEW_GATE_ACTIVATION }}
+        run: |
+          set -euo pipefail
+          case "${ACTIVATION:-}" in
+            ''|inactive)
+              echo "active=false" >> "${GITHUB_OUTPUT}"
+              echo "Bot Review Gate publisher is staged inactive (vars.BOT_REVIEW_GATE_ACTIVATION=${ACTIVATION:-<unset>}): no App-authored verdict is published and no merge authority is claimed. If the live main ruleset requires the App-bound Bot Review Gate context, its structural absence blocks the merge."
+              ;;
+            active)
+              echo "active=true" >> "${GITHUB_OUTPUT}"
+              echo "Bot Review Gate publisher activation is 'active': the publishing job must find complete credentials and correct bindings, and fails closed on any missing or wrong value."
+              ;;
+            *)
+              # An unrecognized value must fail the whole run, never be
+              # treated as inactive: silence here would let a typo quietly
+              # disable a required gate. The message goes to stderr (the
+              # failure a human reads) and the same text is re-emitted as a
+              # GitHub annotation.
+              message="vars.BOT_REVIEW_GATE_ACTIVATION must be unset, 'inactive', or 'active' (found '${ACTIVATION}'); refusing to run the publisher."
+              printf '%s\n' "${message}" >&2
+              echo "::error::${message}"
+              exit 1
+              ;;
+          esac
+
   publish:
     name: Bot Review Gate Publisher
+    needs: activation
+    # Default off: unset or `inactive` skips this job before it can request
+    # the protected environment or mint a token. An unrecognized value fails
+    # the activation job, so the publish job is skipped for a failed need and
+    # the whole run is red rather than silently inert.
+    if: needs.activation.outputs.active == 'true'
     runs-on: ubuntu-latest
     # The publishing key must be reachable ONLY from trusted default-branch
     # execution. The gate-publisher App credentials are stored exclusively as

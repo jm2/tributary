@@ -17,6 +17,7 @@
 
 #![cfg(unix)]
 
+mod activation;
 mod evidence;
 mod fail_closed;
 mod harness;
