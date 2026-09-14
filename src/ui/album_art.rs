@@ -2002,6 +2002,13 @@ mod tests {
             reply3.recv_blocking().expect("worker three reply"),
             b"three"
         );
+
+        // Leave the pool clean for the next test under the same lock: freeing
+        // the workers above started the queued fillers, so wait for the pane
+        // lane to fully drain before the guard drops. A successor's
+        // `occupy_pool_worker` would otherwise see `Full` and drop its job
+        // (the 2026-09-14 full-suite failure this covers).
+        drain_local_pane_lane(queue);
     }
 
     /// A saturated pane lane must not delay or drop the header's local
