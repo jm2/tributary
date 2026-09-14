@@ -3368,6 +3368,7 @@ mod tests {
                 repeated_up_activations_climb_three_levels_to_roots();
                 folder_status_rows_never_navigate();
                 folder_navigation_survives_same_source_refresh();
+                crate::ui::equalizer::widget_tests::equalizer_panel_widget_contracts();
             },
         ) else {
             return;
