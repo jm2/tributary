@@ -23,6 +23,14 @@
 //! to the pattern used by [`LibraryEngine`](crate::local::engine::LibraryEngine).
 
 pub mod airplay_output;
+// The seam lands the complete §4.1 sender contract (design revision 18, PR
+// #170) ahead of its second implementation. Parts that only the forthcoming
+// OwnTone process adapter exercises — pushed PCM, `RecoveryPending` custody,
+// the `Deadline`/`Authentication` failure variants — are deliberately present
+// and not yet constructed by the GStreamer adapter, which owns its decode and
+// transmits no mutating daemon RPC (design §10 step 2). Silence dead-code
+// noise for that forward contract rather than deleting the accepted shape.
+#[allow(dead_code)]
 mod airplay_sender;
 pub mod cast_http_server;
 pub mod chromecast_output;
