@@ -1936,6 +1936,23 @@ mod tests {
         }
     }
 
+    /// Wait until the local pane lane has fully drained so the next test under
+    /// [`GENERATION_TEST_LOCK`] starts from an empty pool. A saturation guard
+    /// joins its fixture server, not the queue, so a test that releases its
+    /// workers must not hand the lock to a successor while fillers remain —
+    /// the successor's `occupy_pool_worker` would see `Full` and drop its job
+    /// (the 2026-09-14 full-suite failure this covers).
+    fn drain_local_pane_lane(queue: &async_channel::Sender<LocalArtJob>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !queue.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            queue.is_empty(),
+            "the local pane backlog must drain before the lock is released"
+        );
+    }
+
     #[test]
     fn local_art_pool_bounds_workers_and_pending_jobs() {
         let _guard = GENERATION_TEST_LOCK
@@ -2462,6 +2479,7 @@ mod tests {
             Some(b"retried-local-art".as_slice()),
             "a still-visible row's local job must run once pane capacity returns"
         );
+        drain_local_pane_lane(queue);
     }
 
     /// A scoped local job whose row is revoked while it waits for lane
@@ -2501,8 +2519,10 @@ mod tests {
             "a revoked job must leave its reply closed, not pending"
         );
 
-        // Leave the pool clean for the next test under the same lock.
+        // Leave the pool clean for the next test under the same lock: release
+        // the blocked workers, then wait for the queued fillers to drain.
         let _ = release1_tx.send(());
         let _ = release2_tx.send(());
+        drain_local_pane_lane(queue);
     }
 }
