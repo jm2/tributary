@@ -100,6 +100,23 @@ fn drop_limiter_from_bin(bin: &gst::Bin, clipper: &gst::Element) {
     let _ = bin.remove(clipper);
 }
 
+/// Test-only deterministic fault injection for the limiter-removal
+/// surgery. The variants model the two failure shapes the production
+/// code path must survive: the direct relink is refused once, or both
+/// the direct relink and the limiter-path restoration are refused. Each
+/// fault is consumed when it fires, so a subsequent call retries against
+/// the real graph — exactly the retry the caller's recorded-state
+/// discipline depends on.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimiterRemoveFault {
+    /// The direct `eq → post-convert` relink is refused; the
+    /// limiter-path restoration then succeeds.
+    DirectRelink,
+    /// Both the direct relink and the limiter-path restoration fail.
+    DirectRelinkAndRestore,
+}
+
 // ── Installed chain ─────────────────────────────────────────────────────
 
 /// Handles into one installed equalizer bin. Retained by the local
@@ -115,6 +132,9 @@ pub struct EqChain {
     post_convert: gst::Element,
     /// `rglimiter` stage (`clipper`), present iff clip protection is on.
     clipper: Option<gst::Element>,
+    /// Test-only armed surgery fault; production builds never carry it.
+    #[cfg(test)]
+    remove_fault: Option<LimiterRemoveFault>,
 }
 
 impl EqChain {
@@ -146,6 +166,8 @@ impl EqChain {
                 .iter()
                 .find(|element| element.name() == "clipper")
                 .cloned(),
+            #[cfg(test)]
+            remove_fault: None,
         };
         chain.apply_band_transaction(settings);
         Ok(chain)
@@ -257,7 +279,7 @@ impl EqChain {
     pub fn set_clip_protection(&mut self, soft: ClipProtection) -> bool {
         match (soft, self.clipper.take()) {
             (ClipProtection::Soft, None) => self.insert_limiter(),
-            (ClipProtection::Off, Some(clipper)) => self.remove_limiter(&clipper),
+            (ClipProtection::Off, Some(clipper)) => self.remove_limiter(clipper),
             (ClipProtection::Off, None) => true,
             (ClipProtection::Soft, Some(clipper)) => {
                 // Already installed: the `take()` above must be undone so
@@ -314,28 +336,112 @@ impl EqChain {
     }
 
     /// Remove the installed `rglimiter` and restore the direct
-    /// eq → post-convert link.
+    /// eq → post-convert link, putting the owned handle back whenever
+    /// the limiter stays routed.
     ///
     /// Both old links are unlinked **before** the direct relink is
     /// attempted (the `post-convert` sink pad stays busy until the
-    /// limiter's link is gone), and if the relink fails the previous
-    /// eq → clipper → post-convert path is re-established, so a failed
+    /// limiter's link is gone). If the relink fails, the previous
+    /// eq → clipper → post-convert path is re-established **and the
+    /// owned handle is restored into `self.clipper`**, so a failed
     /// removal leaves the chain with a working (limiter-installed) data
-    /// path instead of a dangling `eq` source pad — unchanged, never
-    /// broken.
-    fn remove_limiter(&self, clipper: &gst::Element) -> bool {
-        self.eq.unlink(clipper);
+    /// path instead of a dangling `eq` source pad, and
+    /// `clip_protection_installed` keeps matching the routed graph — the
+    /// caller can no longer record `Off` while the limiter is in the bin
+    /// (which previously invited a second `clipper` on the next enable).
+    ///
+    /// If restoration itself fails, the graph is never resumed with an
+    /// unlinked `eq` source: the partial links are torn down, the
+    /// limiter leaves the bin, and the direct path is forced. The handle
+    /// is cleared (no limiter remains installed) and the return value
+    /// reports whether the requested removal landed.
+    fn remove_limiter(&mut self, clipper: gst::Element) -> bool {
+        self.eq.unlink(&clipper);
         clipper.unlink(&self.post_convert);
-        if self.eq.link(&self.post_convert).is_ok() {
-            drop_limiter_from_bin(&self.bin, clipper);
+        let direct_linked =
+            !self.fault_blocks_direct_relink() && self.eq.link(&self.post_convert).is_ok();
+        if direct_linked {
+            drop_limiter_from_bin(&self.bin, &clipper);
             return true;
         }
         // Relink failed: restore the working limiter path so the chain
-        // stays playable and truthful (`clip_protection_installed`
-        // keeps matching the routed graph).
-        let _ = self.eq.link(clipper);
-        let _ = clipper.link(&self.post_convert);
-        false
+        // stays playable and its tracked ownership keeps matching the
+        // routed graph.
+        let restored = !self.fault_blocks_restore()
+            && self.eq.link(&clipper).is_ok()
+            && clipper.link(&self.post_convert).is_ok();
+        if restored {
+            let _ = clipper.sync_state_with_parent();
+            self.clipper = Some(clipper);
+            return false;
+        }
+        // Restoration itself failed: do not resume an unlinked graph.
+        // Tear down any partial restoration link, remove the limiter, and
+        // force the direct path so the chain keeps a working route. The
+        // handle is cleared because no limiter remains in the bin.
+        self.eq.unlink(&clipper);
+        clipper.unlink(&self.post_convert);
+        drop_limiter_from_bin(&self.bin, &clipper);
+        self.clipper = None;
+        self.eq.link(&self.post_convert).is_ok()
+    }
+
+    /// Test-only: whether the armed fault refuses the direct relink.
+    /// Fires once (the fault is consumed), so a later call retries the
+    /// real graph. Always `false` in production builds.
+    // The production body never reads the (test-only) fault field, so the
+    // receiver is genuinely unused there; allow the pedantic lints rather
+    // than split the method across cfg signatures.
+    #[cfg_attr(
+        not(test),
+        allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)
+    )]
+    fn fault_blocks_direct_relink(&mut self) -> bool {
+        #[cfg(test)]
+        {
+            match self.remove_fault {
+                Some(LimiterRemoveFault::DirectRelink) => {
+                    self.remove_fault = None;
+                    true
+                }
+                // Consumed by the restoration step below.
+                Some(LimiterRemoveFault::DirectRelinkAndRestore) => true,
+                None => false,
+            }
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    /// Test-only: whether the armed fault refuses the limiter-path
+    /// restoration. Fires once. Always `false` in production builds.
+    #[cfg_attr(
+        not(test),
+        allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)
+    )]
+    fn fault_blocks_restore(&mut self) -> bool {
+        #[cfg(test)]
+        {
+            if self.remove_fault == Some(LimiterRemoveFault::DirectRelinkAndRestore) {
+                self.remove_fault = None;
+                true
+            } else {
+                false
+            }
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    /// Test-only seam: arm a deterministic limiter-removal fault at the
+    /// real surgery boundary.
+    #[cfg(test)]
+    pub(crate) fn inject_limiter_remove_fault(&mut self, fault: LimiterRemoveFault) {
+        self.remove_fault = Some(fault);
     }
 
     /// True when the `rglimiter` element is currently inside the bin.
@@ -544,6 +650,84 @@ mod tests {
         assert!(chain.set_clip_protection(ClipProtection::Off));
         assert!(chain.bin.by_name("clipper").is_none());
         chain.bin.set_state(gst::State::Null).expect("bin to NULL");
+    }
+
+    /// Regression (operator F1, PR #220): a failed direct relink in the
+    /// limiter-removal surgery must put the owned handle back and leave
+    /// the working limiter path routed — `clip_protection_installed`
+    /// must never report `Off` while a `clipper` is still in the bin.
+    /// The injected fault fires once, so the retried removal lands.
+    #[test]
+    fn failed_limiter_removal_keeps_the_handle_and_a_routed_graph() {
+        if !bin_requires_plugins() {
+            return;
+        }
+        let mut chain = EqChain::build(&EqSettings {
+            enabled: true,
+            clip_protection: ClipProtection::Soft,
+            ..EqSettings::default()
+        })
+        .expect("eq-bin builds");
+        assert!(chain.clip_protection_installed());
+
+        // Refuse the direct relink once at the real surgery boundary.
+        chain.inject_limiter_remove_fault(LimiterRemoveFault::DirectRelink);
+        assert!(
+            !chain.set_clip_protection(ClipProtection::Off),
+            "a failed removal must report that Off was not installed"
+        );
+        assert!(
+            chain.clip_protection_installed(),
+            "the owned handle must be restored when the limiter stays routed"
+        );
+        assert!(
+            chain.bin.by_name("clipper").is_some(),
+            "the limiter must still be inside the bin"
+        );
+        assert_links_eq_through_clipper(&chain.bin);
+
+        // The fault fired once: the retried surgery uses the real graph.
+        assert!(
+            chain.set_clip_protection(ClipProtection::Off),
+            "the retried removal must succeed"
+        );
+        assert!(!chain.clip_protection_installed());
+        assert!(chain.bin.by_name("clipper").is_none());
+        assert_links_eq_directly_to_post_convert(&chain.bin);
+    }
+
+    /// Regression (operator F1, restoration arm): when the direct relink
+    /// *and* the limiter-path restoration both fail, the surgery must not
+    /// resume an unlinked `eq` source. It tears the partial links down,
+    /// removes the limiter, forces the direct path, and reports the
+    /// requested `Off` as installed — a truthful, working no-limiter
+    /// topology a later enable can still edit.
+    #[test]
+    fn doubly_failed_limiter_removal_leaves_no_unlinked_graph() {
+        if !bin_requires_plugins() {
+            return;
+        }
+        let mut chain = EqChain::build(&EqSettings {
+            enabled: true,
+            clip_protection: ClipProtection::Soft,
+            ..EqSettings::default()
+        })
+        .expect("eq-bin builds");
+
+        chain.inject_limiter_remove_fault(LimiterRemoveFault::DirectRelinkAndRestore);
+        assert!(
+            chain.set_clip_protection(ClipProtection::Off),
+            "the forced direct path must satisfy the requested removal"
+        );
+        assert!(!chain.clip_protection_installed());
+        assert!(chain.bin.by_name("clipper").is_none());
+        assert_links_eq_directly_to_post_convert(&chain.bin);
+
+        // The fault fired once: a later enable still edits the graph.
+        assert!(chain.set_clip_protection(ClipProtection::Soft));
+        assert_links_eq_through_clipper(&chain.bin);
+        assert!(chain.set_clip_protection(ClipProtection::Off));
+        assert_links_eq_directly_to_post_convert(&chain.bin);
     }
 
     #[test]
