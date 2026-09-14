@@ -32,6 +32,11 @@ pub mod airplay_output;
 // noise for that forward contract rather than deleting the accepted shape.
 #[allow(dead_code)]
 mod airplay_sender;
+// The OwnTone process adapter (design §4.3, §5.4, §6, §10 step 2): the
+// selected maintained AirPlay sender path. Selected only by explicit
+// configuration and fail-closed everywhere else.
+#[allow(dead_code)]
+mod airplay_owntone;
 pub mod cast_http_server;
 pub mod chromecast_output;
 mod gstreamer_media;

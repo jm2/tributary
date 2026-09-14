@@ -412,6 +412,20 @@ fn position_sample_event(
         .map(|position_ms| PlayerEvent::position(generation, position_ms, duration_ms.unwrap_or(0)))
 }
 
+/// Select the transmission path for a new output.
+///
+/// Selection is explicit configuration, never a silent fallback (design §4.4):
+/// the OwnTone process adapter is used only when
+/// `TRIBUTARY_AIRPLAY_SENDER=owntone`, and the GStreamer `raopsink` adapter
+/// remains the default. Both are independently probe-gated at load time.
+fn select_sender() -> Box<dyn AirplaySender> {
+    if super::airplay_owntone::OwnToneSender::selected() {
+        Box::new(super::airplay_owntone::OwnToneSender::from_env())
+    } else {
+        Box::new(GstreamerRaopSender)
+    }
+}
+
 /// AirPlay audio output — streams to a RAOP receiver.
 pub struct AirPlayOutput {
     /// Human-readable name from mDNS discovery (e.g. "Living Room").
@@ -470,7 +484,7 @@ impl AirPlayOutput {
             // first track load.
             volume: initial_volume.clamp(0.0, 1.0),
             media_proxy: Arc::new(GstreamerMediaProxy::new(None)),
-            sender: Box::new(GstreamerRaopSender),
+            sender: select_sender(),
             session: Arc::new(Mutex::new(None)),
         }
     }
