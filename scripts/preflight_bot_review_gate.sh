@@ -531,7 +531,8 @@ esac
 # ── Result ──────────────────────────────────────────────────────────────────
 if [ -s "$parse_errors" ]; then
   cat "$parse_errors" >&2
-  failures=$((failures + $(grep -c . "$parse_errors")))
+  parse_errors_seen="$(grep -c . "$parse_errors" || true)"
+  failures=$((failures + parse_errors_seen))
 fi
 
 if [ "$failures" -ne 0 ]; then
