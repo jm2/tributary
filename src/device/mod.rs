@@ -1,4 +1,4 @@
-//! Mounted portable-device discovery.
+//! Mounted portable-device discovery and transfer.
 //!
 //! GIO's native [`gtk::gio::VolumeMonitor`] supplies a cached snapshot of the
 //! user-visible mounts selected by each platform backend. The UI owns that
@@ -6,10 +6,16 @@
 //! and wires its mount-added, changed, pre-unmount, and removed signals for live
 //! hotplug updates. Filesystem traversal remains separate background work.
 //!
-//! This layer currently supports browsing mounted filesystems. Device sync,
-//! transfer, MTP-only access, and mounting an unmounted volume remain outside
-//! its scope; see GitHub issue #8 and `docs/roadmap.md`.
+//! The [`transfer`] module adds a generic mounted-filesystem transfer planner
+//! and executor that satisfies the P3.2 / GitHub issue #8 requirements:
+//! retained write authority, capacity and conflict policy, atomic copy where
+//! possible, progress reporting, cancellation, and rollback. It builds on the
+//! same root-lease model used by the read paths in
+//! [`crate::local::root_authority`] and
+//! [`crate::local::write_authority`].
 
+pub mod mtp;
+pub mod transfer;
 pub mod usb;
 
 /// Information about one mounted, browseable device.
