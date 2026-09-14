@@ -228,6 +228,13 @@ fn apply_unsupported_rendering(
     describe_with_note(&controls.clip_dropdown, unsupported_note);
     controls.preamp_scale.set_sensitive(false);
     describe_with_note(&controls.preamp_scale, unsupported_note);
+    // The two contract affordances are exposed controls in their own
+    // right: they are the actionable buttons inside the row, so they
+    // each need their own accessible-description relation. Relying on
+    // the parent row alone would leave the buttons insensitive but
+    // described by nothing (the relation does not cascade).
+    describe_with_note(&controls.reset_button, unsupported_note);
+    describe_with_note(&controls.reload_button, unsupported_note);
 }
 
 /// Attach the explanation label as the widget's accessible description
@@ -236,4 +243,43 @@ fn apply_unsupported_rendering(
 /// focusable.
 fn describe_with_note(widget: &impl IsA<gtk::Accessible>, note: &gtk::Label) {
     widget.update_relation(&[gtk::accessible::Relation::DescribedBy(&[note.upcast_ref()])]);
+    #[cfg(all(test, not(target_os = "macos")))]
+    described_by_log::record(widget);
+}
+
+/// Test-only record of every accessible-description relation attached by
+/// the real panel build path.
+///
+/// GTK exposes `gtk_accessible_update_relation` with no matching getter,
+/// so a widget test cannot read a relation back. Recording each
+/// described control here lets the consolidated widget test prove the
+/// explanation relation reached the controls the contract names —
+/// including the reset/reload buttons, whose parent row alone is not
+/// enough — rather than a proxy for it.
+#[cfg(all(test, not(target_os = "macos")))]
+pub(super) mod described_by_log {
+    use std::cell::RefCell;
+
+    use gtk::glib::prelude::*;
+
+    thread_local! {
+        static DESCRIBED: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Record that `widget` received a described-by relation.
+    pub fn record(widget: &impl IsA<gtk::Accessible>) {
+        let ptr = widget.as_ptr() as usize;
+        DESCRIBED.with(|log| log.borrow_mut().push(ptr));
+    }
+
+    /// Whether the build path attached a described-by relation to the
+    /// widget at `ptr` (an `ObjectType::as_ptr` address).
+    pub fn was_described(ptr: usize) -> bool {
+        DESCRIBED.with(|log| log.borrow().contains(&ptr))
+    }
+
+    /// Clear the record before building another panel.
+    pub fn clear() {
+        DESCRIBED.with(|log| log.borrow_mut().clear());
+    }
 }

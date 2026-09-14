@@ -23,6 +23,12 @@ mod wiring;
 #[allow(clippy::float_cmp)] // snapped gains land on exactly representable half-steps
 mod tests;
 
+// Real-widget contracts run inside the crate's single GTK-initializing
+// `#[test]` (GTK must be exercised from one thread); see
+// `widget_tests` and `crate::ui::widget_test_session`.
+#[cfg(all(test, not(target_os = "macos")))]
+pub mod widget_tests;
+
 pub use build::build_equalizer_group;
 
 use std::rc::Rc;

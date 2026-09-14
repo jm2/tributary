@@ -1206,5 +1206,6 @@ mod tests {
 
         crate::ui::context_menu::tests::popover_from_menu_model_attaches_a_visible_child_widget();
         crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones();
+        crate::ui::equalizer::widget_tests::equalizer_panel_widget_contracts();
     }
 }
