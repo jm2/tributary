@@ -335,8 +335,10 @@ impl PreparedWriteTarget {
     /// Classify a failed replace publish. A landed atomic exchange whose
     /// displaced-occupant restore failed means the transfer's bytes ARE
     /// published at the destination, the bind-time backup is retained for
-    /// restoration, and the displaced object survives at the staged leaf:
-    /// shield the staged leaf from cleanup and surface the publication as a
+    /// restoration, and the displaced object survives at the staged leaf —
+    /// or, when a post-removal failure stranded the retained original under
+    /// a private quarantine name, at that recorded name: shield the staged
+    /// leaf from cleanup and surface the publication as a
     /// verified-publication failure carrying the outcome, so the caller
     /// records it for rollback — a committed file whose outcome is dropped
     /// can never be undone. Any other failure published nothing.
@@ -351,14 +353,33 @@ impl PreparedWriteTarget {
         let displaced = error
             .get_ref()
             .and_then(|payload| payload.downcast_ref::<RestoreFailure>())
-            .map(|failure| (failure.payload.published_leaf, failure.payload.backup_leaf));
-        if let Some((published_leaf, backup_leaf)) = displaced {
+            .map(|failure| {
+                (
+                    failure.payload.published_leaf,
+                    failure.payload.backup_leaf,
+                    failure.payload.stranded_original_leaf.clone(),
+                )
+            });
+        if let Some((published_leaf, backup_leaf, stranded_original_leaf)) = displaced {
             self.staged_leaf_holds_displaced_occupant.set(true);
+            // The recorded backup path only names the retained original when
+            // the post-removal move returned it to the backup name. When the
+            // original was stranded at a private quarantine name, record
+            // that actual location instead, so rollback can find it rather
+            // than a backup path that no longer names anything.
+            let replaced_original = match stranded_original_leaf {
+                Some(leaf) if Some(leaf.as_os_str()) != backup_relative.file_name() => self
+                    .final_relative_path
+                    .parent()
+                    .map(|parent| parent.join(&leaf))
+                    .unwrap_or_else(|| PathBuf::from(&leaf)),
+                _ => backup_relative,
+            };
             let outcome = CommitOutcome {
                 relative_path: self.final_relative_path.clone(),
                 resolution: self.resolution,
                 disposition: CommitDisposition::Published,
-                replaced_original: Some(backup_relative),
+                replaced_original: Some(replaced_original),
                 replaced_original_leaf: backup_leaf,
                 published_leaf,
             };
