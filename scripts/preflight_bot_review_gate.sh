@@ -352,25 +352,48 @@ names_of() {
 }
 
 # ── Live main required contexts, as "context|integration_id" ────────────────
+
+# Referenced-record completeness: every ruleset named by the applicable branch
+# rules must have a recorded detail. In live mode `fetch_live` already plants a
+# `.failed` sentinel for an unreadable referenced ruleset; this pass covers
+# offline recordings and any referenced record that is simply absent (neither a
+# detail nor a sentinel). An absent record is an incomplete observation, not an
+# absent gate.
+referenced_rulesets="$scratch/referenced-rulesets.txt"
+: > "$referenced_rulesets"
+if [ -f "$src/branch-rules.json" ]; then
+  if jq -e 'type == "array"' "$src/branch-rules.json" >/dev/null 2>&1; then
+    jq -r '.[] | select(type == "object") | .ruleset_id | select(type == "number") | tostring' \
+      "$src/branch-rules.json" > "$referenced_rulesets" 2>/dev/null || true
+  else
+    parse_error "malformed branch-rules inventory: $src/branch-rules.json"
+  fi
+fi
+while IFS= read -r id; do
+  [ -n "$id" ] || continue
+  if [ ! -f "$src/rulesets/$id.json" ] && [ ! -f "$src/rulesets/$id.json.failed" ]; then
+    parse_error "missing referenced ruleset record: $src/rulesets/$id.json"
+  fi
+done < "$referenced_rulesets"
+
 live_contexts="$scratch/live-contexts.txt"
 : > "$live_contexts"
-if [ -f "$src/branch-rules.json" ] && ! jq -e 'type == "array"' "$src/branch-rules.json" >/dev/null 2>&1; then
-  parse_error "malformed branch-rules inventory: $src/branch-rules.json"
-fi
 for detail in "$src"/rulesets/*.json; do
   [ -e "$detail" ] || continue
-  if ! jq -e 'type == "object" and ((.rules // null) | type == "array" or . == null)' "$detail" >/dev/null 2>&1; then
-    parse_error "malformed ruleset detail: $detail"
+  # A ruleset detail is an object whose `.rules` is an EXPLICIT array. GitHub
+  # always returns an array (empty when no rules apply); a missing or null
+  # `.rules` is an incomplete structural observation, not a ruleset with no
+  # required contexts, so it fails closed. A genuine empty array stays valid.
+  if ! jq -e 'type == "object" and (.rules | type) == "array"' "$detail" >/dev/null 2>&1; then
+    parse_error "malformed ruleset detail (missing or non-array .rules): $detail"
     continue
   fi
-  if ! jq -r 'if (.rules | type) == "array" then
-      .rules[]
+  if ! jq -r '.rules[]
       | select(type == "object" and .type == "required_status_checks")
       | (.parameters.required_status_checks // [])
       | if type == "array" then .[] else empty end
       | select(type == "object")
-      | "\(.context // "")|\(.integration_id // "")"
-    else empty end' "$detail" >> "$live_contexts" 2>>"$scratch/jq.err"; then
+      | "\(.context // "")|\(.integration_id // "")"' "$detail" >> "$live_contexts" 2>>"$scratch/jq.err"; then
     parse_error "could not read required contexts from $detail"
   fi
 done
@@ -379,9 +402,10 @@ sort -u -o "$live_contexts" "$live_contexts"
 resolution_enforced=0
 for detail in "$src"/rulesets/*.json; do
   [ -e "$detail" ] || continue
-  jq -e 'type == "object"' "$detail" >/dev/null 2>&1 || continue
+  # Invalid details were already reported above; skip them here.
+  jq -e 'type == "object" and (.rules | type) == "array"' "$detail" >/dev/null 2>&1 || continue
   enforcement="$(jq -r '
-    [.rules[]?
+    [.rules[]
       | select(type == "object" and .type == "pull_request")
       | .parameters.required_review_thread_resolution]
     | if length == 0 then "absent"

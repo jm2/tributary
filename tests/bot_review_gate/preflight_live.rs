@@ -125,6 +125,77 @@ fn live_malformed_ruleset_detail_fails_closed() {
 }
 
 #[test]
+fn live_missing_ruleset_rules_fails_closed() {
+    // A readable ruleset detail that omits `.rules` is an incomplete
+    // observation. Staged-inactive validation must not read it as "no required
+    // contexts" and declare the configuration consistent.
+    let fixture = LiveFixture::new("live-rules-missing");
+    fixture
+        .page(
+            "rules_branches_main.page.1.json",
+            r#"[{"ruleset_id":17650907}]"#,
+        )
+        .page("rulesets_17650907.json", "{}");
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a ruleset detail without .rules must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("PARSE-FAILED"),
+        "the incomplete detail must be reported:\n{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn live_null_ruleset_rules_fails_closed() {
+    let fixture = LiveFixture::new("live-rules-null");
+    fixture
+        .page(
+            "rules_branches_main.page.1.json",
+            r#"[{"ruleset_id":17650907}]"#,
+        )
+        .page("rulesets_17650907.json", r#"{"rules":null}"#);
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a ruleset detail with null .rules must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("PARSE-FAILED"),
+        "the null rules array must be reported:\n{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn live_empty_ruleset_rules_remains_valid() {
+    // The valid-empty control: a genuine empty array still passes the
+    // staged-inactive preflight, so the missing/null rejection is targeted at
+    // incompleteness, not at rulesets without required checks.
+    let fixture = LiveFixture::new("live-rules-empty");
+    fixture
+        .page(
+            "rules_branches_main.page.1.json",
+            r#"[{"ruleset_id":17650907}]"#,
+        )
+        .page("rulesets_17650907.json", r#"{"rules":[]}"#);
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "a genuine empty .rules array must stay valid:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(stdout_of(&output).contains("configuration is consistent"));
+}
+
+#[test]
 fn live_malformed_activation_document_fails_closed() {
     // A present-but-unparseable activation document must not read as unset.
     let fixture = LiveFixture::new("live-malformed-activation");

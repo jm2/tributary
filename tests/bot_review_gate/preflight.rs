@@ -137,6 +137,89 @@ fn unrecognized_activation_value_is_incompatible() {
 }
 
 #[test]
+fn offline_missing_ruleset_rules_fails_closed() {
+    // A referenced ruleset detail that omits `.rules` is an incomplete
+    // structural observation, not a ruleset with no required contexts.
+    let fixture = Fixture::new("ruleset-rules-missing");
+    fixture
+        .file("branch-rules.json", r#"[{"ruleset_id":17650907}]"#)
+        .file("rulesets/17650907.json", "{}");
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a ruleset detail with missing .rules must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("PARSE-FAILED"),
+        "the incomplete ruleset detail must be reported:\n{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn offline_null_ruleset_rules_fails_closed() {
+    // `{"rules":null}` is also incomplete: GitHub never reports a null rules
+    // array, so it must not read as an empty one.
+    let fixture = Fixture::new("ruleset-rules-null");
+    fixture
+        .file("branch-rules.json", r#"[{"ruleset_id":17650907}]"#)
+        .file("rulesets/17650907.json", r#"{"rules":null}"#);
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a ruleset detail with null .rules must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("PARSE-FAILED"),
+        "the null rules array must be reported:\n{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn offline_empty_ruleset_rules_remains_valid() {
+    // A genuine empty array is a valid observation: the ruleset exists and
+    // applies no rules. This is the control that keeps the fix from rejecting
+    // every ruleset without required status checks.
+    let fixture = Fixture::new("ruleset-rules-empty");
+    fixture
+        .file("branch-rules.json", r#"[{"ruleset_id":17650907}]"#)
+        .file("rulesets/17650907.json", r#"{"rules":[]}"#);
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "a genuine empty .rules array must stay valid:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(stdout_of(&output).contains("configuration is consistent"));
+}
+
+#[test]
+fn offline_missing_referenced_ruleset_record_fails_closed() {
+    // The applicable branch rules name a ruleset whose recorded detail is
+    // absent; the inventory is incomplete and cannot be validated as consistent.
+    let fixture = Fixture::new("referenced-record-missing");
+    fixture.file("branch-rules.json", r#"[{"ruleset_id":17650907}]"#);
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "an absent referenced ruleset record must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("missing referenced ruleset record"),
+        "the absent referenced record must be reported:\n{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
 fn validator_is_strictly_read_only() {
     let script =
         std::fs::read_to_string(repository_root().join("scripts/preflight_bot_review_gate.sh"))
