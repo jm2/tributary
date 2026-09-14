@@ -4,6 +4,19 @@
 //! output holds, apply the delta, push the whole typed struct back
 //! through `apply_equalizer_settings`. Persistence (debounce, default
 //! suppression) is owned by the audio module, not the UI.
+//!
+//! **Applied-state discipline.** `apply_equalizer_settings` is the
+//! authority: it walks the recorded `enabled`/`clip_protection` back to
+//! the *installed* topology whenever a deferred seam or a failed limiter
+//! surgery refuses the request. Every handler therefore reflects the
+//! state the output reports *after* the apply — never the requested
+//! delta — so a refused choice cannot leave a widget displaying a value
+//! that is not in effect (for example a switch reading `Off` while EQ
+//! processing is still active, or a combo reading `Soft` while no
+//! limiter is routed). The reflection runs under the shared re-entrancy
+//! guard, so the programmatic widget updates are never re-interpreted as
+//! manual edits (no recursive callback loop), and a later user retry
+//! applies.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -42,7 +55,15 @@ pub(super) fn wire_equalizer_controls(
     wire_reload_button(active_output, controls, updating);
 }
 
-/// Enable switch: flip the typed state's `enabled` flag.
+/// Enable switch: flip the typed state's `enabled` flag, then reflect
+/// the **authoritative applied state** back onto the switch. A deferred
+/// or rejected install/uninstall walks the recorded `enabled` back to
+/// the installed truth (`Player::apply_equalizer_settings`), so the
+/// clicked widget must not keep displaying the refused choice — the
+/// switch would otherwise read `Off` while EQ processing is still
+/// active. The widget sync runs under the shared re-entrancy guard, so
+/// the programmatic `set_active` cannot be re-interpreted as a manual
+/// edit (no recursive callback loop), and a later user retry applies.
 fn wire_enable_switch(
     active_output: &SharedAudioOutput,
     enable_row: &adw::SwitchRow,
@@ -57,11 +78,19 @@ fn wire_enable_switch(
         let mut settings = active_output.borrow().equalizer_settings();
         settings.enabled = row.is_active();
         active_output.borrow().apply_equalizer_settings(settings);
+        // The apply is the authority: a deferred install/uninstall keeps
+        // the installed `enabled`, and the switch must show that, not the
+        // click.
+        let applied = active_output.borrow().equalizer_settings();
+        updating.set(true);
+        row.set_active(applied.enabled);
+        updating.set(false);
     });
 }
 
-/// Preset combo: load the named preset's band vector and preamp, then
-/// reflect the full preset write across the sliders.
+/// Preset combo: load the named preset's band vector and preamp, apply,
+/// then reflect the full preset write across the sliders from the
+/// **authoritative applied state**.
 fn wire_preset_dropdown(
     active_output: &SharedAudioOutput,
     preset_dropdown: &gtk::DropDown,
@@ -90,23 +119,24 @@ fn wire_preset_dropdown(
         settings.bands_db = preset.band_gains_db();
         settings.preamp_db = preset.recommended_preamp_db();
         active_output.borrow().apply_equalizer_settings(settings);
+        let applied = active_output.borrow().equalizer_settings();
         updating.set(true);
-        for (scale, gain) in band_scales.iter().zip(settings.bands_db) {
+        for (scale, gain) in band_scales.iter().zip(applied.bands_db) {
             scale.set_value(gain);
         }
-        preamp_scale.set_value(settings.preamp_db);
+        preamp_scale.set_value(applied.preamp_db);
         updating.set(false);
     });
 }
 
 /// Preamp and band sliders: snap the dragged value to the contract's
-/// half-step grid, mirror the snapped DSP value back onto the
-/// originating slider (so the visible and accessible values cannot
-/// drift from the applied state), then apply. Every manual edit also
-/// moves the preset combo to `Custom` (contract acceptance 5: the
-/// persisted `preset` field becomes `custom` and the UI combo displays
-/// `Custom`) — the combo update runs under the same re-entrancy guard
-/// so it cannot be mistaken for a menu choice.
+/// half-step grid, apply, then mirror the applied DSP value back onto
+/// the originating slider (so the visible and accessible values cannot
+/// drift from the applied state). Every manual edit also moves the
+/// preset combo to `Custom` (contract acceptance 5: the persisted
+/// `preset` field becomes `custom` and the UI combo displays `Custom`)
+/// — sourced from the applied state and running under the same
+/// re-entrancy guard so it cannot be mistaken for a menu choice.
 fn wire_gain_sliders(
     active_output: &SharedAudioOutput,
     preset_dropdown: &gtk::DropDown,
@@ -125,13 +155,14 @@ fn wire_gain_sliders(
             let mut settings = output_for_preamp.borrow().equalizer_settings();
             settings.preamp_db = snap_gain(scale.value());
             settings.mark_custom();
-            updating_for_preamp.set(true);
-            scale.set_value(settings.preamp_db);
-            preset_dropdown_for_preamp.set_selected(preset_menu_position(Preset::Custom));
-            updating_for_preamp.set(false);
             output_for_preamp
                 .borrow()
                 .apply_equalizer_settings(settings);
+            let applied = output_for_preamp.borrow().equalizer_settings();
+            updating_for_preamp.set(true);
+            scale.set_value(applied.preamp_db);
+            preset_dropdown_for_preamp.set_selected(preset_menu_position(applied.preset));
+            updating_for_preamp.set(false);
         });
     }
 
@@ -146,16 +177,27 @@ fn wire_gain_sliders(
             let mut settings = output_for_band.borrow().equalizer_settings();
             settings.bands_db[index] = snap_gain(scale.value());
             settings.mark_custom();
-            updating_for_band.set(true);
-            scale.set_value(settings.bands_db[index]);
-            preset_dropdown_for_band.set_selected(preset_menu_position(Preset::Custom));
-            updating_for_band.set(false);
             output_for_band.borrow().apply_equalizer_settings(settings);
+            let applied = output_for_band.borrow().equalizer_settings();
+            updating_for_band.set(true);
+            scale.set_value(applied.bands_db[index]);
+            preset_dropdown_for_band.set_selected(preset_menu_position(applied.preset));
+            updating_for_band.set(false);
         });
     }
 }
 
-/// Clip-protection combo: map the fixed menu position to the policy.
+/// Clip-protection combo: map the fixed menu position to the policy,
+/// then reflect the **authoritative applied state** back onto the
+/// dropdown. `Player::apply_equalizer_settings` records the protection
+/// the installed chain actually carries when the toggle is deferred or
+/// the limiter surgery fails, so a refused request must not leave the
+/// combo showing a policy that is not in effect — the dropdown would
+/// otherwise read `Soft` while no limiter is routed (or `Off` while the
+/// limiter is still in the bin). The widget sync runs under the shared
+/// re-entrancy guard, so the programmatic `set_selected` cannot be
+/// re-interpreted as a manual choice (no recursive callback loop), and a
+/// later user retry applies.
 fn wire_clip_dropdown(
     active_output: &SharedAudioOutput,
     clip_dropdown: &gtk::DropDown,
@@ -173,11 +215,28 @@ fn wire_clip_dropdown(
             _ => ClipProtection::Off,
         };
         active_output.borrow().apply_equalizer_settings(settings);
+        let applied = active_output.borrow().equalizer_settings();
+        updating.set(true);
+        dropdown.set_selected(clip_menu_position(applied.clip_protection));
+        updating.set(false);
     });
 }
 
+/// Menu position of a clip-protection policy in the fixed two-entry
+/// combo (`0 = Off`, `1 = Soft`). Shared by the initial build, the
+/// reload path, and the applied-state read-back so the mapping cannot
+/// drift between them.
+pub(super) fn clip_menu_position(protection: ClipProtection) -> u32 {
+    match protection {
+        ClipProtection::Off => 0,
+        ClipProtection::Soft => 1,
+    }
+}
+
 /// Reset to Flat: bands and preamp to zero, preset to Flat; Enabled and
-/// Clip protection keep their current values.
+/// Clip protection keep their current values. The slider/combo writes
+/// reflect the applied state so the compound update stays consistent
+/// with every other handler.
 fn wire_reset_button(
     active_output: &SharedAudioOutput,
     controls: &EqualizerControls,
@@ -194,19 +253,27 @@ fn wire_reset_button(
         settings.bands_db = Preset::Flat.band_gains_db();
         settings.preamp_db = Preset::Flat.recommended_preamp_db();
         active_output.borrow().apply_equalizer_settings(settings);
+        let applied = active_output.borrow().equalizer_settings();
         updating.set(true);
-        for scale in &band_scales {
-            scale.set_value(0.0);
+        for (scale, gain) in band_scales.iter().zip(applied.bands_db) {
+            scale.set_value(gain);
         }
-        preamp_scale.set_value(0.0);
-        preset_dropdown.set_selected(preset_menu_position(Preset::Flat));
+        preamp_scale.set_value(applied.preamp_db);
+        preset_dropdown.set_selected(preset_menu_position(applied.preset));
         updating.set(false);
     });
 }
 
 /// Reload from disk: the only escape hatch from a malformed file,
 /// performed by the audio module (which owns the path), then reflect
-/// the loaded state across every control.
+/// the loaded state across every control. A supported output reloads
+/// through its own state and the panel shows the **authoritative
+/// applied state** afterwards; an unsupported active renderer parks the
+/// local settings on disk, so the reload surfaces the parked persisted
+/// state — the disabled panel must keep showing the last-saved values,
+/// never defaults (contract: *Capability matrix*), and the shared
+/// reader keeps the repair-and-diagnose behavior identical to
+/// startup's.
 fn wire_reload_button(
     active_output: &SharedAudioOutput,
     controls: &EqualizerControls,
@@ -220,17 +287,14 @@ fn wire_reload_button(
     let band_scales = controls.band_scales.clone();
     let preamp_scale = controls.preamp_scale.clone();
     controls.reload_button.connect_clicked(move |_| {
-        // A supported output re-reads through its own state (the local
-        // pipeline reloads the file it owns). An unsupported active
-        // renderer parks the local settings on disk, so the reload
-        // surfaces the parked persisted state — the disabled panel must
-        // keep showing the last-saved values, never defaults (contract:
-        // *Capability matrix*), and the shared reader keeps the
-        // repair-and-diagnose behavior identical to startup's.
         let settings = {
             let output = active_output.borrow();
             if output.supports_equalizer() {
-                output.reload_equalizer_settings()
+                output.reload_equalizer_settings();
+                // The apply above is the authority; reflect the state the
+                // output now reports (a deferred edit keeps the installed
+                // topology) rather than the freshly loaded file.
+                output.equalizer_settings()
             } else {
                 crate::audio::equalizer::config::load_settings_with_status().0
             }
@@ -242,10 +306,7 @@ fn wire_reload_button(
         }
         preamp_scale.set_value(settings.preamp_db);
         preset_dropdown.set_selected(preset_menu_position(settings.preset));
-        clip_dropdown.set_selected(match settings.clip_protection {
-            ClipProtection::Off => 0,
-            ClipProtection::Soft => 1,
-        });
+        clip_dropdown.set_selected(clip_menu_position(settings.clip_protection));
         updating.set(false);
     });
 }
