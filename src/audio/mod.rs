@@ -2263,6 +2263,63 @@ mod tests {
         assert!(!chain.clip_protection_installed());
     }
 
+    /// Regression (operator F1, PR #220, caller arm): when a limiter
+    /// removal fails at the direct relink but the limiter path is
+    /// restored, the chain keeps the owned handle, so the recorded
+    /// (persisted) protection must stay the installed `Soft` — not the
+    /// requested `Off` — and the next apply must retry the removal. The
+    /// pre-fix code dropped the handle, recorded `Off` while the limiter
+    /// stayed in the bin, and invited a second `clipper` on the next
+    /// enable.
+    #[test]
+    fn failed_limiter_removal_records_installed_soft_and_retries() {
+        if !eq_engine_plugins_available() {
+            return;
+        }
+        let playbin = eq_test_playbin();
+        let settings = eq_enabled_settings(equalizer::ClipProtection::Soft);
+        let mut chain = equalizer::EqChain::build(&settings).expect("chain builds");
+        // Refuse the direct relink once at the real surgery boundary.
+        chain.inject_limiter_remove_fault(equalizer::chain::LimiterRemoveFault::DirectRelink);
+        let player = eq_test_player(playbin.clone(), eq_state_with(Some(chain), settings));
+
+        let next = EqSettings {
+            clip_protection: equalizer::ClipProtection::Off,
+            ..settings
+        };
+        // Let the edit run against the chain; the surgery fails once.
+        *player.seam_override.borrow_mut() = Some(Box::new(|edit| edit()));
+        apply_serialized(&player, next);
+
+        {
+            let state = player.eq_state.borrow();
+            assert_eq!(
+                state.settings.clip_protection,
+                equalizer::ClipProtection::Soft,
+                "a failed removal that stays routed must record the installed Soft limiter"
+            );
+            let chain = state.chain.as_ref().expect("chain stays installed");
+            assert!(
+                chain.clip_protection_installed(),
+                "the owned limiter handle must survive the failed removal"
+            );
+        }
+
+        // The injected fault fired once: the next apply retries and lands Off.
+        *player.seam_override.borrow_mut() = Some(Box::new(|edit| edit()));
+        apply_serialized(&player, next);
+        {
+            let state = player.eq_state.borrow();
+            assert_eq!(
+                state.settings.clip_protection,
+                equalizer::ClipProtection::Off,
+                "the retried removal must record the now-installed Off"
+            );
+            let chain = state.chain.as_ref().expect("chain stays installed");
+            assert!(!chain.clip_protection_installed());
+        }
+    }
+
     /// Regression (review finding r3985258424 P2): the pending member of
     /// a zero-timeout state query must never be discarded — a query
     /// that finds a transition in flight reports the *origin* state in
