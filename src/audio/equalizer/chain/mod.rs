@@ -389,7 +389,15 @@ impl EqChain {
         let probe_id = eq_src.add_probe(
             gst::PadProbeType::BLOCK_DOWNSTREAM | gst::PadProbeType::IDLE,
             move |_pad, _info| {
-                limiter_edit_probe_callback(&slot_cb, &signal, &graph, soft, decisions)
+                limiter_edit_probe_callback(
+                    &slot_cb,
+                    &signal,
+                    LimiterProbeEdit {
+                        graph: &graph,
+                        soft,
+                        decisions,
+                    },
+                )
             },
         );
         // A pad that reports idle synchronously runs the callback before
@@ -528,6 +536,17 @@ fn post_wedged_topology_error(graph: &LimiterGraph) {
     );
 }
 
+/// The per-edit inputs the blocking-probe callback needs, bundled into one
+/// value so the callback stays within the file's parameter budget while the
+/// streaming-thread closure captures the pieces once.
+struct LimiterProbeEdit<'a> {
+    graph: &'a LimiterGraph,
+    soft: ClipProtection,
+    /// `(direct_blocked, restore_blocked, forced_blocked)`, in the order the
+    /// removal surgery consumes them.
+    decisions: (bool, bool, bool),
+}
+
 /// Run one limiter edit inside the blocking-probe callback and choose the
 /// probe's fate. Returns `gst::PadProbeReturn::Remove` only once a linked
 /// topology is validated (so blocked flow resumes across a valid chain), or
@@ -540,10 +559,14 @@ fn post_wedged_topology_error(graph: &LimiterGraph) {
 fn limiter_edit_probe_callback(
     slot: &Mutex<Option<gst::Element>>,
     signal: &Mutex<std::sync::mpsc::SyncSender<LimiterEditOutcome>>,
-    graph: &LimiterGraph,
-    soft: ClipProtection,
-    (direct_blocked, restore_blocked, forced_blocked): (bool, bool, bool),
+    edit: LimiterProbeEdit<'_>,
 ) -> gst::PadProbeReturn {
+    let LimiterProbeEdit {
+        graph,
+        soft,
+        decisions,
+    } = edit;
+    let (direct_blocked, restore_blocked, forced_blocked) = decisions;
     let outcome = {
         let mut current = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         edit_limiter_topology(
