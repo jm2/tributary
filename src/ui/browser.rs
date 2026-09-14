@@ -1253,8 +1253,8 @@ pub fn rebuild_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks
 /// track snapshot with their filters reset to "All".
 ///
 /// The browser_box layout is: SearchEntry, panes_box (horizontal Box);
-/// the panes_box contains 3 children (genre_pane, artist_pane,
-/// album_pane).
+/// the panes_box contains 4 panes (genre_pane, artist_pane, album_pane,
+/// folder_pane) separated by 1px `.browser-separator` gutters.
 fn populate_all_panes(browser_box: &gtk::Box, tracks: &[TrackSnapshot], use_aa: bool) {
     let Some(panes_box) = browser_box
         .last_child()
@@ -1549,9 +1549,12 @@ mod tests {
         )
     }
 
-    /// Collect the three pane boxes from the browser widget tree
+    /// Collect the four pane boxes from the browser widget tree
     /// (browser_box = [SearchEntry, panes_box], panes_box = [genre,
-    /// artist, album] — mirrors `rebuild_browser_data`).
+    /// artist, album, folder] with separators between them — mirrors
+    /// `rebuild_browser_data`). The separators are `gtk::Separator`s, so
+    /// filtering to `gtk::Box` children drops them and the album pane
+    /// stays at index 2.
     fn collect_browser_panes(browser_box: &gtk::Box) -> Vec<gtk::Box> {
         let panes_box = browser_box
             .last_child()
@@ -1565,7 +1568,11 @@ mod tests {
             }
             child = widget.next_sibling();
         }
-        assert_eq!(panes.len(), 3, "genre, artist and album panes");
+        // `build_browser` appends four pane boxes (genre, artist, album,
+        // folder) with 1px separators between them; the separators are not
+        // `gtk::Box` children, so exactly four panes remain and the album
+        // pane is still indexed at position 2.
+        assert_eq!(panes.len(), 4, "genre, artist, album and folder panes");
         panes
     }
 

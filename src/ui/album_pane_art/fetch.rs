@@ -90,6 +90,7 @@ pub(super) fn orchestrate_pane_fetch(
             fetch.configured_roots.clone(),
             fetch.rt_handle.clone(),
             &candidate,
+            &liveness,
         )
         .await;
         finish_pane_fetch(

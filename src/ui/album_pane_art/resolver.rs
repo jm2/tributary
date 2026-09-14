@@ -15,6 +15,7 @@
 use crate::architecture::media::ResolvedHttpRequest;
 use crate::architecture::SourceId;
 
+use crate::ui::album_art;
 use crate::ui::objects::AlbumArtCandidate;
 
 pub(super) enum ResolvedArtKind {
@@ -101,6 +102,7 @@ pub(super) async fn resolve_kind(
     configured_roots: Vec<String>,
     rt_handle: Option<tokio::runtime::Handle>,
     candidate: &AlbumArtCandidate,
+    liveness: &album_art::ScopedArtFetch,
 ) -> ResolvedArtKind {
     match classify_pane_authority(source_registry.is_some(), source_id, source_epoch) {
         PaneAuthority::Registry => {
@@ -134,7 +136,8 @@ pub(super) async fn resolve_kind(
             resolve_remote_artwork(registry, &id, epoch, candidate).await
         }
         PaneAuthority::BuiltinLocal => {
-            resolve_builtin_local_art_on_runtime(rt_handle, candidate, &configured_roots).await
+            resolve_builtin_local_art_on_runtime(rt_handle, candidate, &configured_roots, liveness)
+                .await
         }
         PaneAuthority::IncompleteRetained => {
             // A retained source identity whose registry handle or session
@@ -183,8 +186,11 @@ fn resolve_external_art(candidate: &AlbumArtCandidate) -> ResolvedArtKind {
 async fn resolve_builtin_local_art(
     candidate: &AlbumArtCandidate,
     configured_roots: &[String],
+    liveness: &album_art::ScopedArtFetch,
 ) -> ResolvedArtKind {
-    if candidate.track_id.is_empty() {
+    // Cheap admission gate, re-checked by the caller before scheduling and
+    // again here so the task performs no work at all for a revoked row.
+    if candidate.track_id.is_empty() || !liveness.is_live() {
         return ResolvedArtKind::NoArtwork;
     }
     let db = match crate::db::connection::init_db().await {
@@ -198,6 +204,13 @@ async fn resolve_builtin_local_art(
             return ResolvedArtKind::NoArtwork;
         }
     };
+    // Stop before the retained-authority probe if the row was revoked
+    // while the database connection was being established. The probe
+    // queues `spawn_blocking` work on the shared pool; a revoked row must
+    // not add to that backlog (2026-09-14 review finding).
+    if !liveness.is_live() {
+        return ResolvedArtKind::NoArtwork;
+    }
     match crate::local::resolver::resolve_track(&db, candidate.track_id.as_str(), configured_roots)
         .await
     {
@@ -228,7 +241,15 @@ async fn resolve_builtin_local_art_on_runtime(
     rt_handle: Option<tokio::runtime::Handle>,
     candidate: &AlbumArtCandidate,
     configured_roots: &[String],
+    liveness: &album_art::ScopedArtFetch,
 ) -> ResolvedArtKind {
+    // Bound admission: a row whose fetch was already revoked (rebind,
+    // unbind, teardown, factory swap) never schedules resolution work at
+    // all, so rapid scrolling cannot pile up authority probes for rows
+    // that can no longer paint (2026-09-14 review finding).
+    if !liveness.is_live() {
+        return ResolvedArtKind::NoArtwork;
+    }
     let Some(rt_handle) = rt_handle else {
         // No application runtime is attached (the controller was built
         // without one). Local extraction needs the runtime's timer and
@@ -242,15 +263,45 @@ async fn resolve_builtin_local_art_on_runtime(
     };
     let candidate = candidate.clone();
     let configured_roots = configured_roots.to_vec();
-    let (resolved_tx, resolved_rx) = async_channel::bounded(1);
-    rt_handle.spawn(async move {
-        let resolved = resolve_builtin_local_art(&candidate, &configured_roots).await;
-        let _ = resolved_tx.send(resolved).await;
-    });
-    resolved_rx
-        .recv()
-        .await
-        .unwrap_or(ResolvedArtKind::NoArtwork)
+    let task_liveness = liveness.clone();
+    let resolved = run_until_revoked(&rt_handle, liveness, async move {
+        resolve_builtin_local_art(&candidate, &configured_roots, &task_liveness).await
+    })
+    .await;
+    resolved.unwrap_or(ResolvedArtKind::NoArtwork)
+}
+
+/// Drive one runtime-hosted resolution to completion, cancelling it the
+/// moment the row's liveness token is revoked.
+///
+/// The built-in local arm runs
+/// [`crate::local::resolver::resolve_track`] on the application runtime
+/// because it polls Tokio time/blocking APIs. That work is expensive (a
+/// database lookup plus a five-second retained-authority probe), so a row
+/// that is unbound or re-bound while its resolution is pending must stop
+/// it: [`album_art::ScopedArtFetch::wait_revoked`] wakes this waiter and
+/// the task is aborted before it continues past its current await. A
+/// `revoke` landing while the probe's `spawn_blocking` closure is already
+/// running cannot unwind that OS thread, but aborting the task stops the
+/// async work that would otherwise queue behind it, and the pre-probe
+/// liveness re-check in [`resolve_builtin_local_art`] avoids starting the
+/// probe at all once the row is gone (2026-09-14 review finding).
+async fn run_until_revoked<T>(
+    handle: &tokio::runtime::Handle,
+    liveness: &album_art::ScopedArtFetch,
+    work: impl std::future::Future<Output = T> + Send + 'static,
+) -> Option<T>
+where
+    T: Send + 'static,
+{
+    let mut task = handle.spawn(work);
+    tokio::select! {
+        result = &mut task => result.ok(),
+        () = liveness.wait_revoked() => {
+            task.abort();
+            None
+        }
+    }
 }
 
 /// Resolve one identity-carrying `file://` row through the retained
@@ -449,6 +500,7 @@ mod tests {
     /// (2026-09-12 review finding).
     #[tokio::test]
     async fn incomplete_retained_identity_leaves_the_placeholder() {
+        let liveness = album_art::ScopedArtFetch::new();
         // Epoch revoked while the source id survives.
         let no_epoch = candidate(
             "file:///media/music/album/01.flac",
@@ -463,6 +515,7 @@ mod tests {
             Vec::new(),
             None,
             &no_epoch,
+            &liveness,
         )
         .await;
         assert!(
@@ -484,6 +537,7 @@ mod tests {
             Vec::new(),
             None,
             &no_registry,
+            &liveness,
         )
         .await;
         assert!(
@@ -498,16 +552,18 @@ mod tests {
     /// fabricating one (2026-09-12 review finding).
     #[tokio::test]
     async fn external_rows_keep_the_transitional_direct_path() {
+        let liveness = album_art::ScopedArtFetch::new();
         let file_row = candidate("file:///tmp/external.flac", "", None, None);
-        let resolved = resolve_kind(None, None, None, Vec::new(), None, &file_row).await;
+        let resolved = resolve_kind(None, None, None, Vec::new(), None, &file_row, &liveness).await;
         assert!(matches!(resolved, ResolvedArtKind::DirectFile { .. }));
 
         let url_row = candidate("", "https://example.test/cover.jpg", None, None);
-        let resolved = resolve_kind(None, None, None, Vec::new(), None, &url_row).await;
+        let resolved = resolve_kind(None, None, None, Vec::new(), None, &url_row, &liveness).await;
         assert!(matches!(resolved, ResolvedArtKind::DirectUrl { .. }));
 
         let empty_row = candidate("", "", None, None);
-        let resolved = resolve_kind(None, None, None, Vec::new(), None, &empty_row).await;
+        let resolved =
+            resolve_kind(None, None, None, Vec::new(), None, &empty_row, &liveness).await;
         assert!(matches!(resolved, ResolvedArtKind::NoArtwork));
     }
 
@@ -527,6 +583,7 @@ mod tests {
         let handle = runtime.handle().clone();
 
         let row = candidate("file:///media/music/album/01.flac", "", Some(local()), None);
+        let liveness = album_art::ScopedArtFetch::new();
         let context = glib::MainContext::new();
         let resolved = context.block_on(resolve_kind(
             None,
@@ -535,12 +592,91 @@ mod tests {
             Vec::new(),
             Some(handle),
             &row,
+            &liveness,
         ));
 
         // The track is not in this process's library, so the retained
         // authority resolves to no artwork; the contract under test is that
         // it resolves on the runtime rather than panicking on the main
         // context.
+        assert!(matches!(resolved, ResolvedArtKind::NoArtwork));
+    }
+
+    /// N3 regression (2026-09-14 review finding): a built-in-local row
+    /// whose token is revoked mid-resolution must not continue its
+    /// resolution. This drives the runtime-handoff cancellation seam with
+    /// a controllable future, so cancellation — not merely the final
+    /// placeholder — is observable: the parked work is dropped before it
+    /// can complete, mirroring a rebind that revokes a row whose
+    /// `resolve_track` authority probe is still pending.
+    #[test]
+    fn revoked_builtin_local_resolution_is_cancelled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let runtime = tokio::runtime::Runtime::new().expect("application tokio runtime");
+        let handle = runtime.handle().clone();
+        let liveness = album_art::ScopedArtFetch::new();
+
+        let started = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let work_started = started.clone();
+        let work_completed = completed.clone();
+        let work = async move {
+            work_started.store(true, Ordering::SeqCst);
+            // Park where the real resolution awaits its authority probe.
+            let _ = release_rx.await;
+            work_completed.store(true, Ordering::SeqCst);
+            0usize
+        };
+
+        // Revoke only once the work is definitely running, exactly like a
+        // rebind that lands while the row's resolution is in flight.
+        let revoker_token = liveness.clone();
+        let revoker_started = started.clone();
+
+        let result = runtime.block_on(async move {
+            let revoker = tokio::spawn(async move {
+                while !revoker_started.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                revoker_token.revoke();
+            });
+            let result = run_until_revoked(&handle, &liveness, work).await;
+            revoker.await.expect("revoker task");
+            result
+        });
+
+        assert_eq!(result, None, "a revoked row yields no resolved value");
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "the runtime resolution must be cancelled once the row is revoked"
+        );
+
+        // Release the parked work so a late completion cannot leak.
+        let _ = release_tx.send(());
+    }
+
+    /// A pre-revoked token must be refused at admission, before any
+    /// runtime work is scheduled: the row is already gone by the time the
+    /// fetch is driven.
+    #[test]
+    fn pre_revoked_builtin_local_row_is_refused_at_admission() {
+        let liveness = album_art::ScopedArtFetch::new();
+        liveness.revoke();
+        let row = candidate("file:///media/music/album/01.flac", "", Some(local()), None);
+        let context = glib::MainContext::new();
+        let resolved = context.block_on(resolve_kind(
+            None,
+            row.source_id,
+            row.source_session_epoch,
+            Vec::new(),
+            None,
+            &row,
+            &liveness,
+        ));
         assert!(matches!(resolved, ResolvedArtKind::NoArtwork));
     }
 }
