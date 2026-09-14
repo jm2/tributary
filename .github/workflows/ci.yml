@@ -36,6 +36,7 @@ jobs:
           build-aux/linux/test-package-compliance.sh
           scripts/test-macos-icon-bundle-policy.sh
           scripts/test-macos-package-policy.sh
+          scripts/test-macos-rpath-batching.sh
           python3 scripts/test_build_helpers.py
 
       - name: Test dependency update policy
