@@ -25,9 +25,8 @@ fn write_file(root: &Path, relative: &str, content: &str) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("fixture directory must be creatable");
     }
-    std::fs::write(&path, content).unwrap_or_else(|error| {
-        panic!("fixture {} must be writable: {error}", path.display())
-    });
+    std::fs::write(&path, content)
+        .unwrap_or_else(|error| panic!("fixture {} must be writable: {error}", path.display()));
 }
 
 struct Fixture {
@@ -103,9 +102,11 @@ fn validated_ruleset(app_id: u64) -> String {
     ];
     let items: Vec<String> = checks
         .iter()
-        .map(|(context, integration)| match integration {
-            Some(id) => format!(r#"{{"context":"{context}","integration_id":{id}}}"#),
-            None => format!(r#"{{"context":"{context}"}}"#),
+        .map(|(context, integration)| {
+            integration.as_ref().map_or_else(
+                || format!(r#"{{"context":"{context}"}}"#),
+                |id| format!(r#"{{"context":"{context}","integration_id":{id}}}"#),
+            )
         })
         .collect();
     format!(
@@ -207,7 +208,7 @@ fn externally_validated_configuration_passes() {
             r#"{"total_count":2,"secrets":[{"name":"RULESET_READER_APP_ID"},{"name":"RULESET_READER_APP_PRIVATE_KEY"}]}"#,
         )
         .file("branch-rules.json", r#"[{"ruleset_id":17650907}]"#)
-        .file("rulesets/17650907.json", &validated_ruleset(424242));
+        .file("rulesets/17650907.json", &validated_ruleset(424_242));
     let output = fixture.run();
     assert!(
         output.status.success(),
@@ -240,10 +241,9 @@ fn unrecognized_activation_value_is_incompatible() {
 
 #[test]
 fn validator_is_strictly_read_only() {
-    let script = std::fs::read_to_string(
-        repository_root().join("scripts/preflight_bot_review_gate.sh"),
-    )
-    .expect("the preflight validator must be readable");
+    let script =
+        std::fs::read_to_string(repository_root().join("scripts/preflight_bot_review_gate.sh"))
+            .expect("the preflight validator must be readable");
     for forbidden in [
         "-X POST",
         "-X PATCH",

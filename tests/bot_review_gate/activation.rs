@@ -48,7 +48,10 @@ fn run_activation(activation: Option<&str>) -> (Output, String) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = scratch_root().join(format!("activation-fixture-{}-{serial}", std::process::id()));
+    let root = scratch_root().join(format!(
+        "activation-fixture-{}-{serial}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("activation scratch must be creatable");
 

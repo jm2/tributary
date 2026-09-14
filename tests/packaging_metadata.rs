@@ -1472,11 +1472,13 @@ fn dependabot_automerge_readiness_is_read_only_action_free_and_exact_head_guarde
         Some("read")
     );
     assert!(
-        readiness["permissions"].as_mapping().is_some_and(|permissions| {
-            permissions
-                .values()
-                .all(|value| value.as_str() == Some("read"))
-        }),
+        readiness["permissions"]
+            .as_mapping()
+            .is_some_and(|permissions| {
+                permissions
+                    .values()
+                    .all(|value| value.as_str() == Some("read"))
+            }),
         "the readiness inspection must hold only read scopes"
     );
     assert!(
@@ -1525,6 +1527,15 @@ fn dependabot_automerge_readiness_is_read_only_action_free_and_exact_head_guarde
         "workflow concurrency must be scoped to the exact pull request"
     );
 
+    assert_dependabot_automation_is_pinned_and_exact_head_bound();
+    assert_no_dependabot_write_path_survives();
+}
+
+// Dependabot automation must stay pinned, checkout-free, exact-head
+// API-preflighted, narrowly admitted, race-contained, mixed-path
+// self-update-safe, and refuse toolchain auto-merge.
+// #lizard forgives
+fn assert_dependabot_automation_is_pinned_and_exact_head_bound() {
     assert!(
         DEPENDABOT_AUTOMERGE.contains("pull_request:")
             && !DEPENDABOT_AUTOMERGE.contains("\non: pull_request_target\n")
@@ -1563,7 +1574,10 @@ fn dependabot_automerge_readiness_is_read_only_action_free_and_exact_head_guarde
             ),
         "Dependabot automation must be pinned, checkout-free, exact-head API-preflighted, narrowly admitted, race-contained, mixed-path self-update-safe, and refuse toolchain auto-merge"
     );
-    // The staged boundary: no write path may survive anywhere in the workflow.
+}
+
+// The staged boundary: no write path may survive anywhere in the workflow.
+fn assert_no_dependabot_write_path_survives() {
     assert!(
         !DEPENDABOT_AUTOMERGE.contains("gh pr merge")
             && !DEPENDABOT_AUTOMERGE.contains("--match-head-commit")
