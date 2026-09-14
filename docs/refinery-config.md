@@ -69,13 +69,21 @@ refinery's own fail-closed check polling (which observes every check on the
 head, required or not) and by review discipline — not by the repository
 refusing the merge.
 
-**Routine auto-merge stays off until the live gate matches the policy.** The
-`dependabot-automerge` workflow enables GitHub native auto-merge on clean
-patch/minor dependency PRs, and native auto-merge waits only for the
-ruleset's required checks. So while the ruleset is narrower than the policy,
-auto-merge can land a dependency PR while a bot check is pending or failing.
-Widening the gate is a precondition for trusting auto-merge, not an optional
-follow-up; do not enable or rely on it before then.
+**Routine auto-merge is staged off entirely.** The `dependabot-automerge`
+workflow is now a strictly read-only readiness *diagnostic*: it inspects the
+live `main` rulesets and reports whether they require the full policy set with
+`require-conversation-resolution`, but it enables no merge and holds no write
+permission of any kind. Native auto-merge enablement was removed from the
+workflow and may be re-introduced only by a separate reviewed change with live
+freshness and rollout evidence; a passing diagnostic is never merge authority.
+The publisher that authenticates the repo-owned `Bot Review Gate` context ships
+**staged inert** behind the default-off repository variable
+`BOT_REVIEW_GATE_ACTIVATION`, and `scripts/preflight_bot_review_gate.sh`
+validates the staged/active phases strictly read-only. Widening the ruleset and
+activating publication remain operator prerequisites (bead tr-rcvys), not
+optional follow-ups; do not enable or rely on auto-merge before then. Neither a
+configured manifest nor a prior green head proves active enforcement — only a
+live, freshly published App-authored verdict bound to the evaluated head does.
 
 **Closing the gap (the machine gate).** Widen "Require CI before merge
 (main)" to require the full policy set: the Coverage (Linux x86_64),
@@ -136,7 +144,12 @@ outstanding change request.
 That is a repository-settings and workflow change: it goes through its own
 bead and full CI validation, never an out-of-band ruleset edit, and it must
 be validated against a live pull request before the refinery treats the
-widened gate as authoritative.
+widened gate as authoritative. The publisher side of that change ships staged
+inert (the default-off `BOT_REVIEW_GATE_ACTIVATION` flag), so landing the code
+is not activation: the protected environment, the two Apps, the widened
+ruleset, and the live validation all remain the operator's rollout on bead
+tr-rcvys. Configuration intent and a prior green head are never proof of active
+enforcement.
 
 ### Addressing Codacy/CodeRabbit findings
 

@@ -4,14 +4,17 @@ Tributary keeps Dependabot enabled for the root Cargo package, the independent
 fuzz workspace, and GitHub Actions. The policy separates routine updates from
 changes which need coordinated repair:
 
-- Compatible Cargo and Actions patch/minor updates may use native GitHub
-  auto-merge, but only once the live gate enforces the repository's
-  all-checks policy. The auto-merge workflow reads the active `main` rulesets
-  first and refuses to enable auto-merge until the complete policy check set
-  (see "Deployment gate migration" below) is required, so until that widened
-  ruleset is live and verified, routine auto-merge stays off by construction:
-  a green required-check set alone never authorizes a merge while any other
-  check or bot review is pending or failing.
+- Compatible Cargo and Actions patch/minor updates are merged through the
+  normal reviewed path. **Native GitHub auto-merge enablement is staged off in
+  this change** and is not re-introduced here: the
+  `dependabot-automerge.yml` workflow is now a strictly read-only readiness
+  *diagnostic* that inspects the live `main` rulesets and reports whether they
+  require the complete policy check set (see "Deployment gate migration"
+  below). It contains no merge request, no auto-merge enablement, and no write
+  permission of any kind. Re-enabling unattended merge requires a separate
+  reviewed change with live freshness/rollout evidence; a passing inspection is
+  a diagnostic, never merge authority. A green required-check set alone never
+  authorizes a merge while any other check or bot review is pending or failing.
 - `sea-orm` and `sea-orm-migration` always share one Dependabot group and must
   retain matching manifest requirements and resolved versions.
 - Cargo major updates remain reviewed changes and normally arrive
@@ -126,12 +129,17 @@ Tributary hosted-check configuration already emits `MSRV` rather than the old
 versioned `MSRV (1.92)` context. Future Rust bumps therefore keep the stable
 context and need no additional gate rename.
 
-The auto-merge workflow's writer mechanically reads the active rulesets that
-apply to `main` and refuses to enable auto-merge until they require the
-complete policy check set below. Until that live rollout is done, a routine
-Dependabot patch/minor PR simply never gets auto-merge enabled (the workflow
-run fails loudly at the precondition) and must be merged through the normal
-reviewed path.
+The `dependabot-automerge.yml` workflow is a read-only readiness diagnostic:
+it reads the active rulesets that apply to `main`, reports whether they require
+the complete policy check set below with `require-conversation-resolution`, and
+fails loudly when the rollout is incomplete. It does **not** enable GitHub
+native auto-merge — that write path is deliberately absent from this staged
+change — so a routine Dependabot patch/minor PR is merged through the normal
+reviewed path, and a passing inspection never merges anything. The
+machine-readable rollout prerequisites live in
+`.github/bot-review-gate-rollout.json`, and the operator-facing, strictly
+read-only validator is `scripts/preflight_bot_review_gate.sh`; external
+activation itself belongs to the operator validation bead tr-rcvys.
 
 The enforcement gap being closed: at the time of this change, the live
 ruleset "Require CI before merge (main)" (id 17650907) requires only seven
@@ -193,8 +201,8 @@ holds no `checks` grant at all and structurally cannot publish, and the
 verdict is posted only with a minted installation token of the dedicated
 bot-review-gate-publisher GitHub App — so the check run is authored by that
 App's integration, which no pull-request-controlled job can produce a check
-run under. The ruleset entry and the auto-merge precondition both require
-the context from that App's id (the repository variable
+run under. The ruleset entry and the Dependabot readiness diagnostic both
+require the context from that App's id (the repository variable
 `BOT_REVIEW_GATE_APP_ID`, never 15368), and the publisher refuses to
 publish anything if the App credentials are missing — the head's verdict
 keeps its previous value and the failed job is the re-run signal. The
@@ -228,7 +236,31 @@ exact head, which is re-verified immediately before the green result. The
 CodeQL
 `Analyze (…)` contexts follow the languages configured in the CodeQL default
 setup; adding or removing a language changes those contexts and must update
-this ruleset and the auto-merge precondition in the same reviewed change.
+this ruleset and the Dependabot readiness diagnostic in the same reviewed
+change.
+
+### Staged activation (default off)
+
+The publisher ships **inert**. Its first job reads the trusted,
+repository-owned activation variable `BOT_REVIEW_GATE_ACTIVATION` — set only by
+trusted administrators, never by a pull request — before the publishing job
+can request its protected environment or mint an App token. The variable is
+unset by default; while it is unset or `inactive`, the publishing job is
+skipped entirely, no App-authored check run is published, and no merge
+authority is claimed. Any value other than unset, `inactive`, or `active`
+fails the activation job closed rather than being silently treated as
+inactive.
+
+Staging is kept safe by structural absence, not by a forged success: the
+activation job holds no token scopes and publishes nothing, so an inactive
+refresh leaves the required `Bot Review Gate` context absent. If the live
+`main` ruleset already requires that App-bound context while the publisher is
+inactive, its absence blocks the merge; the workflow deliberately does not
+publish a workflow-token success to paper over that gap. Once the variable is
+explicitly `active`, a missing or wrong credential, binding, or API failure
+fails the publishing job — an active gate never silently skips.
+`scripts/preflight_bot_review_gate.sh` validates the three phases (staged
+inactive, active-but-incomplete, externally validated) strictly read-only.
 
 ### Refreshing the gate after thread resolution
 
@@ -320,91 +352,81 @@ not re-enable non-Dependabot auto-merge.
 
 ### Rollout order and live validation
 
-0. Register the ruleset-reader GitHub App before the auto-merge precondition
-   can ever pass: the precondition must read rulesets, and the workflow
-   `GITHUB_TOKEN` cannot (see "Workflow security boundary" below). Create a
-   GitHub App with only the `Administration: read` repository permission
-   (nothing else), install it on this repository, and store its credentials
-   as repository-level **Dependabot secrets** (Settings → Secrets and
-   variables → Dependabot → Repository secrets) named `RULESET_READER_APP_ID`
-   and `RULESET_READER_APP_PRIVATE_KEY`. Dependabot secrets, not Actions
-   secrets, are the only secret store available to this workflow: it runs
-   exclusively on Dependabot-initiated pull requests, where GitHub withholds
-   every Actions repository secret and exposes only Dependabot secrets and
-   the read-only `GITHUB_TOKEN`. Credentials stored as plain Actions secrets
-   reach the writer job as empty inputs and the pinned
-   `actions/create-github-app-token` action fails — the same fail-closed
-   outcome as a missing prerequisite, but the rollout instruction as written
-   would have made the failure permanent. The writer mints a single-purpose
-   installation token from those Dependabot secrets with the pinned
-   GitHub-org `actions/create-github-app-token` action; without this
-   prerequisite the precondition fails closed and routine Dependabot
-   auto-merge stays off, which is the safe direction.
-1. Land the gate pair first (this change): the announcer
+0. **(tr-rcvys)** Register the two minimal GitHub Apps named in
+   `.github/bot-review-gate-rollout.json`:
+
+   * `tributary-bot-review-gate-publisher` with only `checks: write`, installed
+     on this repository, with its credentials stored **exclusively** as secrets
+     of the protected environment `bot-review-gate-publisher` (names
+     `BOT_REVIEW_GATE_APP_ID` and `BOT_REVIEW_GATE_PRIVATE_KEY`); the
+     environment is locked to a protected-branch deployment policy restricted
+     to `main`, with no required reviewers. The environment's branch policy is
+     what makes the credentials reachable exactly where they are trusted —
+     `workflow_run` completions from default-branch content — and nowhere else.
+     Never store them as repository-level Actions secrets: every
+     same-repository pull-request workflow can read those, which is the exact
+     forged-verdict exposure the identity-bound context exists to prevent.
+   * `tributary-ruleset-reader` with only `Administration: read`, whose
+     credentials are stored as repository-level **Dependabot secrets** (Settings
+     → Secrets and variables → Dependabot → Repository secrets) named
+     `RULESET_READER_APP_ID` and `RULESET_READER_APP_PRIVATE_KEY`. Dependabot
+     secrets, not Actions secrets, are the only secret store a
+     Dependabot-triggered run can read; credentials stored as plain Actions
+     secrets reach the job empty and the pinned
+     `actions/create-github-app-token` action fails closed.
+
+   Then set the repository variables `BOT_REVIEW_GATE_APP_ID` (the publisher's
+   numeric App id) and `BOT_REVIEW_GATE_ACTIVATION`. Run
+   `scripts/preflight_bot_review_gate.sh`: while activation is off it must
+   report a consistent **staged-inactive** phase.
+1. Land the gate pair (this change): the announcer
    `.github/workflows/bot-review-gate.yml` and the trusted publisher
    `.github/workflows/bot-review-gate-publisher.yml`, so the
-   `Bot Review Gate` check actually reports on pull requests from
-   default-branch content before it can be marked required. Register the
-   dedicated gate-publisher GitHub App in the same step, before the
-   ruleset edit in the next step can bind to it: create a GitHub App with
-   only the `Checks: write` repository permission (nothing else), install
-   it on this repository, create the GitHub environment
-   `bot-review-gate-publisher` that the publisher job names, locked on the
-   repository side to a protected-branch deployment policy restricted to
-   `main` (and no required reviewers, which would strand the automation),
-   and store its credentials **exclusively as that environment's
-   secrets**, named `BOT_REVIEW_GATE_APP_ID` and
-   `BOT_REVIEW_GATE_PRIVATE_KEY`. Never store them as repository-level
-   Actions secrets: every same-repository pull-request workflow can read
-   those, which would put the publishing key in the hands of the exact
-   forged-verdict exposure the identity-bound context exists to prevent.
-   The environment's branch policy is what makes the credentials
-   reachable exactly where they are trusted — `workflow_run` completions
-   from default-branch content — and nowhere else; creating that
-   environment is an operator-side repository prerequisite (tracked
-   separately from this branch), and until it exists the publisher mints
-   no token and behaves exactly as the fail-closed paragraph below
-   describes. Then set the repository variable `BOT_REVIEW_GATE_APP_ID`
-   to the App's numeric id. Without the App credentials the publisher
-   fails before it can
-   publish anything — the head's verdict keeps its previous value and the
-   failed job is the re-run signal after the credentials are fixed; the
-   publisher must never fall back to the shared workflow token, because
-   every pull-request-controlled job publishes check runs under that same
-   GitHub Actions integration and a forged same-named check would then
-   satisfy the required context. While the ruleset is still narrow, the
-   gate is advisory
-   and the auto-merge precondition keeps routine Dependabot auto-merge off.
-2. Edit ruleset 17650907 to add every context in the table above with the
-   listed app binding (`CodeRabbit` unbound), and switch on **require
+   `Bot Review Gate` check can report on pull requests from default-branch
+   content before it is marked required. The publisher ships **staged inert**:
+   until `BOT_REVIEW_GATE_ACTIVATION` is explicitly `active`, the publishing
+   job is skipped before it can request its environment or mint a token, no
+   App-authored verdict is published, and no merge authority is claimed. Any
+   value other than unset, `inactive`, or `active` fails closed. While the
+   ruleset is still narrow, the gate is advisory and routine Dependabot
+   auto-merge remains staged off.
+2. **(tr-rcvys)** Edit ruleset 17650907 to add every context in the table above
+   with the listed app binding (`CodeRabbit` unbound), and switch on **require
    conversation resolution** in the same edit — the Actions-trigger gap for
    reopened threads (see "Refreshing the gate after thread resolution") is
-   enforced by that native rule, so it must be live before the widened gate
-   is treated as authoritative. Verify the saved ruleset
-   actually lists all eighteen required checks — the seven the ruleset
-   already required (Security Audit, Linux (x86_64), Linux (aarch64),
-   macOS (aarch64), Windows (x86_64), Flatpak (Linux), MSRV) plus the
-   eleven additions in the table above — and that require-conversation-
-   resolution is enabled; the save, not the intent, is
-   what the auto-merge precondition reads.
-3. Validate against a live pull request before treating the widened gate as
-   authoritative: confirm all widened checks report on that PR, address and
-   resolve any actionable bot review threads, exercise the refresh path by
-   confirming the gate re-runs green at the same head after the last
-   resolution (via the automatic triggers or the documented re-run/dispatch
-   path), then confirm the next
-   Dependabot patch/minor PR's "Dependabot auto-merge" run passes the
-   "Require the live ruleset to enforce the full policy gate" step and reaches
-   the guarded merge enablement. That run passing is live proof both that the
-   widened ruleset is active and that the precondition agrees with it. Do not
-   claim enforcement is active until this verification has passed on
-   GitHub's side of the settings.
+   enforced by that native rule, so it must be live before the widened gate is
+   treated as authoritative. Verify the saved ruleset actually lists all
+   eighteen required checks — the seven the ruleset already required (Security
+   Audit, Linux (x86_64), Linux (aarch64), macOS (aarch64), Windows (x86_64),
+   Flatpak (Linux), MSRV) plus the eleven additions in the table above — and
+   that require-conversation-resolution is enabled; the save, not the intent,
+   is what is enforced. Only after the ruleset is saved **and** the publisher
+   is explicitly `active` does the gate become authoritative.
+3. **(tr-rcvys)** Set `BOT_REVIEW_GATE_ACTIVATION=active`, re-run
+   `scripts/preflight_bot_review_gate.sh` (expect a validated, active result),
+   then validate against a live pull request: confirm all widened checks report
+   on that PR, address and resolve any actionable bot review threads, exercise
+   the refresh path by confirming the gate re-runs green at the same head after
+   the last resolution (via the automatic triggers or the documented
+   re-run/dispatch path), and confirm the `Dependabot auto-merge` readiness
+   diagnostic reaches its "readiness met" report. That report is live proof
+   that the widened ruleset is active and agrees with the manifest; it is a
+   diagnostic, not an enablement. Do not claim enforcement is active until this
+   verification has passed on GitHub's side of the settings.
+4. **(separate reviewed change)** Only after (1)–(3) are verified may a separate
+   change re-introduce unattended Dependabot auto-merge enablement with live
+   freshness/rollout evidence. Until then, routine Dependabot auto-merge stays
+   off and manual operator merges remain the supported path.
 
 Until that rollout completes, the ruleset is still narrower than the
 repository's all-checks policy: it does not yet require Coverage, CodeQL,
 Codacy Static Code Analysis, the CodeRabbit status context, or bot-review
-gating. Routine Dependabot auto-merge stays off (see "Closing the gap (the
-machine gate)" in docs/refinery-config.md).
+gating. Routine Dependabot auto-merge stays off, and the enablement path is
+staged out of the workflow entirely (see "Closing the gap (the machine gate)"
+in docs/refinery-config.md). Neither a configured manifest nor a prior green
+head proves active enforcement: only a live, freshly published App-authored
+verdict bound to the evaluated head counts, and the activation flag plus saved
+ruleset are what make the gate authoritative.
 
 The stable `MSRV` context above is part of the required set for the same
 reason it was introduced — that migration has already landed, as described at
@@ -414,34 +436,32 @@ Rust bumps keep the stable context and need no additional gate rename.
 
 ## Workflow security boundary
 
-This Dependabot auto-merge workflow does not check out pull-request code while
-holding a write token. (Other repository workflows, including semantic review,
-have separate permission and trust boundaries and are not covered by that
-claim.) The workflow uses `pull_request`, verifies the actor, PR author, and
-repository, and enables GitHub's native guarded auto-merge without checking
-out the branch.
+The Dependabot readiness workflow is strictly read-only. It uses
+`pull_request` (NOT `pull_request_target`) and never checks out pull-request
+code. Its first job has read-only pull-request access: it verifies the event's
+exact head before and after paginated changed-file enumeration, requires the
+observed file count, rejects current or previous names for the privileged
+workflow, and revalidates the head immediately before and after running the
+pinned metadata action with read authority. Per-PR concurrency cancels stale
+runs as defense in depth.
 
-Its first job has read-only pull-request access. It verifies the event's exact
-head before and after paginated changed-file enumeration, requires the observed
-file count, rejects current or previous names for the privileged workflow, and
-then revalidates the head immediately before and after running the pinned
-metadata action with read authority. Per-PR concurrency cancels stale runs as
-defense in depth. The separate write-capable job contains exactly one action —
-the pinned GitHub-org `actions/create-github-app-token` (v2.2.1), which signs a
-JWT and exchanges it for an installation token without executing any
-repository code. That token carries `administration: read` and nothing else:
-reading rulesets requires the `administration` permission, which the workflow
-`GITHUB_TOKEN` cannot hold (it is not a valid `GITHUB_TOKEN` scope; declaring
-it makes GitHub reject the workflow at validation), so the live-ruleset
-precondition authenticates with the minted token, reads the rulesets that
-apply to `main` via the branch-rules endpoint, and uses the token for nothing
-else. The job then revalidates that exact head immediately before asking
-GitHub to enable auto-merge with an atomic expected-head guard — a merge
-request that still uses the workflow `GITHUB_TOKEN` (contents +
-pull-requests write only).
-Thus a same-count H1/H2 race or mixed-path self-update fails closed rather than
-executing an H1 action ref with write authority, and a narrowed ruleset can
-never silently widen what native auto-merge waits on.
+The inspection job holds `contents: read` and `pull-requests: read`, and
+contains exactly one action — the pinned GitHub-org
+`actions/create-github-app-token` (v2.2.1), which signs a JWT and exchanges it
+for an installation token without executing any repository code. That token
+carries `administration: read` and nothing else: reading rulesets requires the
+`administration` permission, which the workflow `GITHUB_TOKEN` cannot hold (it
+is not a valid `GITHUB_TOKEN` scope; declaring it makes GitHub reject the
+workflow at validation). The job reads the rulesets that apply to `main` via
+the branch-rules endpoint, reports readiness, and uses the token for nothing
+else.
+
+There is no write job, no merge request, and no auto-merge enablement in this
+workflow: a narrowed ruleset can no longer silently widen what native
+auto-merge waits on, because nothing here enables native auto-merge at all.
+The publisher's App private key is stored only as a secret of the protected
+`bot-review-gate-publisher` environment — never as a repository Actions
+secret — and the publisher refuses to fall back to the shared workflow token.
 
 Lockfile and toolchain repair intentionally remain GasCity Repairer operations
 instead of a `pull_request_target` writer. This keeps untrusted dependency or

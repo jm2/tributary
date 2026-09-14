@@ -122,6 +122,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   death before the first App-authored publication, such as the token-mint step failing
   or the runner being lost — leaves the head's previous verdict standing, with the
   failed `Bot Review Gate Publisher` job as the re-run signal.
+- **Bot review gate staged activation and Dependabot read-only readiness** — The
+  `Bot Review Gate` publisher now ships inert behind the default-off, trusted
+  repository variable `BOT_REVIEW_GATE_ACTIVATION`. Until it is explicitly
+  `active`, the publishing job is skipped before it can request its protected
+  environment or mint an App token, so no App-authored verdict is published and
+  no merge authority is claimed; a required App-bound context that is absent
+  blocks the merge rather than being papered over, and any value other than
+  unset/`inactive`/`active` fails closed. The `Dependabot auto-merge` workflow
+  no longer enables native auto-merge at all — it is a strictly read-only
+  readiness diagnostic that reports whether the live `main` rulesets require the
+  full all-checks policy with `require-conversation-resolution`; unattended
+  enablement may return only through a separate reviewed change with live
+  freshness/rollout evidence. A read-only operator validator
+  (`scripts/preflight_bot_review_gate.sh`, prerequisites in
+  `.github/bot-review-gate-rollout.json`) reports missing prerequisites without
+  mutating settings; external activation remains the operator rollout on
+  tr-rcvys.
 
 ## [0.6.2] — 2026-09-01
 
