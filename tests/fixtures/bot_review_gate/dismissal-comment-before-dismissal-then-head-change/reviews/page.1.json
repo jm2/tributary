@@ -1,0 +1,56 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "headRefOid": "1111111111111111111111111111111111111111",
+        "reviews": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "cursor-cbd-page.1.json"
+          },
+          "nodes": [
+            {
+              "url": "u/cbd-dismissed",
+              "state": "DISMISSED",
+              "submittedAt": "2026-09-07T10:00:00Z",
+              "databaseId": 10,
+              "commit": {
+                "oid": "2222222222222222222222222222222222222222"
+              },
+              "author": {
+                "__typename": "Bot",
+                "login": "coderabbitai[bot]"
+              }
+            },
+            {
+              "url": "u/cbd-comment",
+              "state": "COMMENTED",
+              "submittedAt": "2026-09-07T11:00:00Z",
+              "databaseId": 11,
+              "commit": {
+                "oid": "2222222222222222222222222222222222222222"
+              },
+              "author": {
+                "__typename": "Bot",
+                "login": "coderabbitai[bot]"
+              }
+            },
+            {
+              "url": "u/dismissal-comment-before-dismissal-then-head-change-chatgpt-approval",
+              "state": "APPROVED",
+              "submittedAt": "2026-09-07T11:00:00Z",
+              "databaseId": 20,
+              "commit": {
+                "oid": "1111111111111111111111111111111111111111"
+              },
+              "author": {
+                "__typename": "Bot",
+                "login": "chatgpt-codex-connector[bot]"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

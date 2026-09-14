@@ -1,0 +1,105 @@
+name: Bot review gate
+
+# Refresh trigger for the trusted Bot Review Gate publisher.
+#
+# This workflow is deliberately an announcer, not the gate. GitHub runs the
+# revision of a `pull_request`-triggered workflow from the pull request's
+# merge ref, so any evaluation or publication logic placed here would execute
+# pull-request-controlled content: a pull request could replace this file
+# with a no-op that keeps the required `Bot Review Gate` check name and merge
+# with unresolved bot-review findings. The required `Bot Review Gate` context
+# is therefore published exclusively by the companion workflow
+# `.github/workflows/bot-review-gate-publisher.yml`, which GitHub always
+# executes from its default-branch revision via the `workflow_run` event.
+# This file contributes nothing but the refresh events:
+#   * pull_request synchronize re-announces at every new head;
+#   * pull_request edited re-announces when the pull request record changes
+#     without a push — retargeting to main above all, because a base-branch
+#     change alters which pull request the announced commit must be
+#     evaluated against and fires no other event;
+#   * pull_request review_requested re-announces when a re-review request
+#     is addressed to a reviewer, and review_request_removed re-announces
+#     when one is withdrawn: an outstanding re-review request invalidates
+#     the reviewer's earlier clean result at the head (the publisher's
+#     attempt-bound handshake), so the request and its withdrawal are both
+#     evidence-changing events. GitHub documents both activity types for
+#     the pull_request event, but does not guarantee that an Actions run
+#     fires when the requester or the requested reviewer is a bot or App —
+#     the common case for this gate's trusted reviewers — so these two
+#     types are best-effort coverage and the documented workflow_dispatch
+#     re-run below remains the guaranteed refresh path for a re-review
+#     request that fired no announcer run;
+#   * pull_request_review submitted/edited/dismissed re-announces when a
+#     conclusion is made, revised, or formally withdrawn;
+#   * pull_request_review_comment created re-announces when a thread is
+#     opened by a single review comment (no review submission).
+#
+# Resolving a review thread fires no Actions event at all
+# (`pull_request_review_thread` is a webhook event, not an Actions trigger),
+# and neither does reopening a resolved thread, so those two state changes
+# are refreshed by re-running this workflow or by dispatching it:
+#   gh workflow run bot-review-gate.yml --ref <head branch> -f pr_number=<n>
+# The merge-time enforcement for the reopened-thread gap is GitHub's native
+# require-conversation-resolution rule, which the rollout
+# (docs/dependency-updates.md) requires the live `main` ruleset to carry.
+#
+# Fail-closed posture: tampering with this announcer can only SUPPRESS the
+# refresh, and only from the default branch — a pull-request-side edit
+# rewrites this pull request's revision only, and the completion still
+# fires the default-branch publisher. A suppressed refresh does not
+# unreport an already-published verdict (the latest publication at the
+# head stands until any refresh event fires), which is why every
+# evidence-changing event above re-announces, and why the publisher
+# publishes a superseding verdict at the announced head on every
+# discovery-level refusal. Nor can a pull request forge a passing result:
+# the live `main` ruleset requires the context from the dedicated
+# gate-publisher App integration (see the publisher workflow), and
+# every check run a pull-request-controlled job can publish — this file's
+# own job included — is authored by the shared GitHub Actions integration,
+# which the ruleset does not match.
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, edited, review_requested, review_request_removed]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number whose evidence the publisher re-evaluates (dispatch on its head branch)
+        required: true
+        type: string
+
+# The announcer evaluates nothing and needs no token scopes.
+permissions: {}
+
+# Duplicate refresh bursts are serialized, never cancelled: a cancelled run
+# is terminal, and its check run would sit red at the live head forever (no
+# later event re-runs it), so any mechanical reader of head check runs would
+# see a failed `Bot Review Gate Trigger` on every multi-event burst. Queued
+# duplicates cost seconds (the job is a no-op) and the trusted publisher
+# collapses the burst with its own per-head concurrency.
+concurrency:
+  group: bot-review-gate-${{ github.repository }}-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  bot-review-gate:
+    # The check-run Actions creates for this job must never collide with the
+    # required `Bot Review Gate` context: that name belongs to the publisher.
+    name: Bot Review Gate Trigger
+    runs-on: ubuntu-latest
+    # `pull_request` already restricts to the configured base branches; the
+    # review-event triggers have no branch filter, so non-main pull requests
+    # are skipped here and the publisher resolves nothing for them.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.event.pull_request.base.ref == 'main'
+    steps:
+      # Announce only: every step the gate performs lives in the
+      # default-branch publisher, never in this pull-request-revision file.
+      - name: Announce the review event to the trusted publisher
+        shell: bash
+        run: |
+          echo "Review event announced; bot-review-gate-publisher.yml evaluates it."
