@@ -21,5 +21,6 @@ mod activation;
 mod evidence;
 mod fail_closed;
 mod harness;
+mod preflight;
 mod publication;
 mod substitution;
