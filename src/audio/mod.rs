@@ -23,6 +23,7 @@
 //! to the pattern used by [`LibraryEngine`](crate::local::engine::LibraryEngine).
 
 pub mod airplay_output;
+mod airplay_sender;
 pub mod cast_http_server;
 pub mod chromecast_output;
 mod gstreamer_media;
