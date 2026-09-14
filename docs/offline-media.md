@@ -51,7 +51,7 @@ the download/cache engine must satisfy.
 | Identity | Cache entries use the same `SourceId` + `TrackId` shape as live playback. The download engine adopts the live per-source `MediaKey`; it never invents a new identity kind. | New persisted media identifier kinds, new schema migrations for media identity, on-disk naming conventions beyond `task.md` and the credential-boundary section. The durable `SourceIncarnationId` of [restart authorization](#authenticated-resumable-download-jobs) is a registry-side durable field, not a media identifier kind; pre-existing saved sources receive one stable, persisted value at first load. |
 | Authority | Every cached media entry remains owned by its source. The source registry's exact-snapshot capability gates download admission, reconciliation, and retirement. A committed snapshot renders offline without a live registry round-trip; disconnect and refresh never gate playback of committed bytes. No offline bypass of the registry for admission. | Concurrent access contracts for the registry's offline catalogue; specific read-side materialisation policies. |
 | Download jobs | A bounded resumable job model keyed by exact `(SourceId, TrackId)` with a durable, `fsync`'d progress journal, entity validators (`If-Range`) on every range request, opaque server caps, deterministic cancellation, and structured redacted failures. Job state survives restart; it is never memory-only. Restart authorization is by durable source-incarnation identity (`SourceId` + `SourceIncarnationId`), never by the transient accepted-generation number, applied consistently to lease reacquisition, resumption, and publish-intent adoption. | Concrete worker pool scheduling, threading model, runtime selection, telemetry. |
-| Storage | Verify-then-publish: the temp file lives in the same directory (same filesystem) as its final cache path, integrity is verified on the temp file before any rename, and publish is an atomic rename — durability-ordered on Unix by a parent-directory `fsync` chain that re-derives and re-syncs the complete ancestor chain on every attempt, and on Windows by the documented `MOVEFILE_WRITE_THROUGH` barrier ([Atomic storage](#atomic-storage)). The final path is snapshot-scoped, so a refresh publishes a sibling instead of overwriting a predecessor's bytes; a journaled publish intent makes the rename-to-commit window crash-recoverable — adoption at startup completes the pending publication barrier, re-syncing the directory entry for the already-renamed file, before it may insert the row or clear the intent — and a durable delete intent — the publish intent itself, or the `fsync`'d terminal-verdict record that supersedes it on a post-rename terminal transition — is the delete owner for a file published without a row. Cross-filesystem publish is refused at admission, never emulated with copy+sync+delete. A `tracks` row may link to a cache path only when integrity passed, the per-track cap held before the rename, and the file is current. | Database migrations, schema, table layout, index choice, cache placement, encryption. |
+| Storage | Verify-then-publish: the temp file lives in the same directory (same filesystem) as its final cache path, integrity is verified on the temp file before any rename, and publish is an atomic rename — durability-ordered on Unix by a parent-directory `fsync` chain that re-derives and re-syncs the complete ancestor chain on every attempt, and on Windows by the documented `MOVEFILE_WRITE_THROUGH` barrier ([Atomic storage](#atomic-storage)). The final path is snapshot-scoped, so a refresh publishes a sibling instead of overwriting a predecessor's bytes; a journaled publish intent makes the rename-to-commit window crash-recoverable — adoption at startup completes the pending publication barrier, re-syncing the directory entry for the already-renamed file, and acquires an exact session commit authority atomically at the final admission before it may insert the row or clear the intent — and a durable delete intent — the publish intent itself, or the `fsync`'d terminal-verdict record that supersedes it on a post-rename terminal transition — is the delete owner for a file published without a row. Cross-filesystem publish is refused at admission, never emulated with copy+sync+delete. A `tracks` row may link to a cache path only when integrity passed, the per-track cap held before the rename, and the file is current. | Database migrations, schema, table layout, index choice, cache placement, encryption. |
 | Integrity | SHA-256 is computed over the bytes on disk and compared against an expected digest whose provenance is declared per backend (capability matrix below). A backend that advertises no digest is verified by independent double-fetch; the absence of any verification path is terminal, never a silent pass. Verification completes before publish. | Hashing algorithm extension, content-defined chunking, content-addressable stores. |
 | Capabilities | The remote source owns a default-deny `OfflineSnapshot` capability. Only the same set of backends that opt into live `ServerPlaylist`-style read authority may opt in. Radio-Browser, removable, external-file, and built-in local sources cannot. | Adapter-specific download strategies beyond HTTP(S) `Range` and Subsonic/Jellyfin/Plex/DAAP download endpoints. |
 | Credentials | Cached media may carry no credential, password, signed URL, or session cookie in metadata, file name, sidecar, log, or GTK-visible row. Bearer URLs are minted only by the existing exact-origin proxy and consumed through the same opaque revocable ticket used by live playback. | New credential storage paths, new vault tables, package or build-credential integration, distribution-time-key loading. |
@@ -173,8 +173,9 @@ file in memory.
 ### Committed snapshots play without a live authority
 
 The registry's accepted generation is consulted at exactly two points:
-download admission and reconciliation/retirement. It is never a playback
-precondition. A committed snapshot — one whose row was published after
+download admission — including the atomic admission that commits a
+crash-recovered publication — and reconciliation/retirement. It is never a
+playback precondition. A committed snapshot — one whose row was published after
 integrity verification — plays from local bytes while its source is
 disconnected, refreshing, mid-reauthentication, or retired pending cleanup.
 A disconnect or logout revokes in-flight leases only; it never unplays a
@@ -305,9 +306,43 @@ would let an implementation re-mint one on every load — breaking every
 resumed job's restart authorization — or declare the source replaced and
 retire its jobs. The contract therefore fixes a first-load rule: the
 migration that introduces the offline subsystem assigns each pre-existing
-saved source a durable `SourceIncarnationId` and persists it in the same
-saved-source record, exactly as a newly registered source would receive
-one. The assignment is idempotent and derivation-stable: the value is a
+saved source a durable `SourceIncarnationId` and persists it in that
+source's saved-source record through the versioned envelope defined
+below, exactly as a newly registered source would receive one.
+
+**The saved-source record moves to a version-2 envelope; the new field is
+versioned, not smuggled into v1.** `servers.json` is a strict format: the
+current `SavedServerEnvelope` accepts only `schema_version = 1`, and each
+`SavedServer` row uses `deny_unknown_fields` (`src/ui/server_dialogs.rs`).
+Writing a new field into a version-1 row would therefore produce a file
+that the loader's own v1 branch — and any older build — quarantines, so
+the offline subsystem raises the saved-source schema to version 2 instead.
+A v2 envelope carries `schema_version: 2` and a `servers` array of rows
+`{ type, name, url, source_id, source_incarnation }`, with
+`source_incarnation` required and `deny_unknown_fields` retained at both
+levels. The supported read versions are v1 and v2; the supported write
+version is v2. On first load of a v1 file the loader validates it exactly
+as today — canonical endpoint, valid persisted `source_id`, and the
+existing duplicate rules — then derives each row's deterministic
+incarnation and replaces the file with the v2 envelope through the same
+same-directory atomic write the loader already uses: a temp file in the
+parent directory, file `fsync`, `rename`, and a parent-directory `fsync`
+on Unix (`save_servers_to` in `src/ui/server_dialogs.rs`). The replacement
+is atomic and durable, so a crash before the rename leaves the readable v1
+file untouched and the next load retries; a failed write preserves the
+original v1 configuration and publishes no rows rather than partially
+upgrading. A retry or two concurrent loads both derive the same
+deterministic values, so the idempotent replacement converges on one file
+and never mints two incarnations for one row. Migration is idempotent
+across restarts: a v2 file is validated and used as-is, and re-loading it
+never re-mints an incarnation. Downgrade is explicitly unsupported and
+fail-closed: a pre-offline binary supports only v1 and quarantines an
+unknown-version envelope in place without rewriting or deleting it, so a
+downgrade makes saved sources unavailable but never silently drops an
+incarnation or destroys the v2 file, and re-upgrading recovers every
+source with its durable identity intact.
+
+The assignment is idempotent and derivation-stable: the value is a
 deterministic function of the row's durable identity fields (`source_id`,
 `type`, and `url`), so a retry, a crash before the durable write lands, or a
 concurrent load converges on a single value instead of racing to mint
@@ -618,17 +653,65 @@ the window and its single recovery resolution:
    source that has since withdrawn the capability or revoked the licence
    without writing a durable revocation record — fails the gate: the
    absence of a persisted revocation is never a substitute for current
-   authority. A job failing a definitive gate resolves as recorded-file
+   authority. That revalidation is asynchronous and runs outside any
+   lifecycle lock, exactly as a resumed job's does.
+
+   **The playable insert is one atomic admission event.** A point-in-time
+   revalidation taken before the publication barrier is not by itself an
+   authorization to insert: the source can be replaced, disconnected,
+   retired, or have its capability or licence revoked while recovery
+   performs the filesystem barrier, and the stale job must not become
+   playable underneath authority that is no longer current. Adoption
+   therefore separates the asynchronous work from the admission it
+   authorizes. It first completes the full platform publication barrier
+   unlocked — the Unix ancestor-chain re-derivation and `fsync` pass and
+   the snapshot-directory `fsync`, or the Windows rename-call barrier, per
+   step 5 and the file-state bullets below — and then, immediately before
+   the row insert, acquires an exact session commit authority atomically
+   under the lifecycle state lock. That acquisition rechecks the registry
+   incarnation, the exact `SourceId`, the exact adapter pointer, the
+   session epoch, and the active lease, and evaluates a synchronous,
+   non-reentrant predicate that reads the exact adapter's current
+   `offline_snapshot` capability and `OperationalLicence` under the same
+   lock; the predicate performs no filesystem, network, or registry work
+   and never re-enters the lifecycle. It is the same admission boundary
+   `architecture/source-lifecycle.md` states as "at the database boundary,
+   the registry verifies the same registry incarnation, source, adapter
+   pointer, epoch, capability, and active lease under the lifecycle mutex,
+   then acquires an opaque session-only permit retained through commit or
+   rollback", and the same one `src/source_lifecycle.rs` implements as
+   `acquire_session_commit_authority_if`. On success the permit is retained
+   across the idempotent row insert and the intent clear, so the commit is
+   admitted under authority that is exact at the commit boundary and cannot
+   be invalidated between validation and insert. No lifecycle lock is held
+   over the asynchronous revalidation or the publication barrier, so
+   filesystem and network work never run under the state lock.
+
+   **Both race orders are closed, and each resolves without a destructive
+   step.** (a) A replacement, disconnect, retirement, shutdown, or a
+   capability or licence revocation that wins *before* the authority is
+   acquired makes the acquisition return no authority: adoption creates no
+   row, runs no unlink, retains the pending intent as the durable owner,
+   and a later recovery pass retries — the non-destructive deferral
+   below. (b) A replacement, disconnect, retirement, or shutdown that
+   lands *after* the permit is acquired waits for the permit to drop and
+   cannot invalidate the commit; the idempotent insert and intent clear
+   complete under the authority the admission event selected, and any
+   later retirement of the committed row runs through its own retirement
+   protocol, never through this recovery's unlink. Staleness before
+   admission rejects; replacement after admission waits.
+
+   A job failing a definitive gate resolves as recorded-file
    cleanup — idempotent unlink of the published file, then the intent
    clear, with the terminal state standing. A job whose current authority
    cannot be established because the source is transiently unreachable or
    mid-reauthentication neither adopts nor destroys the publication: no
    row is created, no unlink runs, the pending intent remains the durable
    recovery/cleanup owner, and a later recovery pass retries once the
-   current accepted generation is establishable — the same fail-closed
-   retention the barrier arm below uses. That cleanup is reachable only
-   when no committed row was recognized and no verdict owns the file. For
-   an eligible job:
+   current accepted generation and the commit authority are
+   establishable — the same fail-closed retention the barrier arm below
+   uses. That cleanup is reachable only when no committed row was
+   recognized and no verdict owns the file. For an eligible job:
    - The file is present and its SHA-256 matches the journaled digest: the
      rename happened. Adoption must first complete and verify every pending
      platform publication barrier the crash interrupted — the outstanding
@@ -642,13 +725,16 @@ the window and its single recovery resolution:
      entry barrier completed inside the rename call, so adoption adds no
      undocumented flush and the named ancestor-entry residual remains
      bounded by the post-commit loss row. Only once every applicable
-     barrier holds does the engine complete step 6 — inserting the cache
-     row; the `(source_key, track_key, snapshot_key)` key makes the insert
+     barrier holds does adoption acquire the exact session commit authority
+     described above, and only with that authority retained does the engine
+     complete step 6 — inserting the cache row; the
+     `(source_key, track_key, snapshot_key)` key makes the insert
      idempotent — and clear the intent. If a required barrier cannot be
-     completed, adoption creates no row and clears no intent: the pending
-     intent remains the durable recovery/cleanup owner and a later recovery
-     pass retries, so a committed Unix row never references a path whose
-     rename entry is not durable.
+     completed, or the commit authority cannot be acquired, adoption
+     creates no row and clears no intent: the pending intent remains the
+     durable recovery/cleanup owner and a later recovery pass retries once
+     both are establishable, so a committed Unix row never references a
+     path whose rename entry is not durable.
    - The file is present and the digest does not match: the bytes are not
      the verified publication. The engine unlinks the file, clears the
      intent, and restarts the job from zero.
@@ -666,9 +752,17 @@ the window and its single recovery resolution:
    only by the engine's own recovery pass, is bounded by the same
    per-track cap as any committed snapshot — the cap is enforced before
    the rename, so this window can never hold an over-cap file — and its
-   lifetime ends at the
-   post-rename terminal transition or the first recovery pass, whichever
-   comes first.
+   lifetime is bounded by its durable owner rather than by a pass count.
+   The file ends when a pass recognizes its committed row and clears the
+   intent, when a verdict-owning cleanup completes the unlink and clears
+   the intent, when adoption acquires its commit authority and completes
+   the insert, or when the pre-rename file-absent resolution clears the
+   intent. A pass that cannot establish current authority, acquire the
+   commit authority, or complete the platform barrier makes no destructive
+   change and leaves that same durable owner in place, so a durably owned,
+   non-playable file may survive more than one recovery pass; every pass
+   leaves it owned and non-playable, and no pass ever strands it without a
+   durable owner.
 5. **The crash-point matrix.** Every kill point in the publish window has
    exactly one durable observable state and one recovery resolution. The
    matrix is normative: an implementation may not introduce a resolution
@@ -680,11 +774,11 @@ the window and its single recovery resolution:
    | --- | --- | --- | --- |
    | Ancestors created (step 1 or an earlier attempt), process crash before the step-5 ancestor-durability pass | No commit; temp present; final absent; ancestor directories may exist but their entry durability is unproven; no intent, or a pending one. | Ordinary journal recovery resumes or restarts per the journal; on reaching step 5 it re-derives the complete ancestor chain from the recorded final path and re-runs the top-down, idempotent pass before the rename, never trusting the crashed process's creation set. | The pass is path-derived and idempotent, so a resumed process completes it without the creator's memory. |
    | Power loss before or during the step-5 ancestor-durability pass, before the rename | No commit; final absent; the temp or some created ancestors may or may not have survived; a pending intent may be present. | File-absent resolution for any pending intent; on the next attempt the complete chain pass runs from the top before the rename. | Nothing was published; re-syncing the chain is unconditional and cannot double-publish. |
-   | Power loss after the rename, before the snapshot-directory `fsync` and the commit | Intent present; the published name may or may not have survived, because the rename's own entry was not yet synced; the ancestor chain is already durable from the pass. | Final present with the intent's digest → the adoption path first completes the interrupted publication barrier — on Unix re-deriving the recorded final path's complete ancestor chain and `fsync`-ing the snapshot directory that holds the already-renamed file, without repeating the rename — and only then inserts the row and clears the intent; if that barrier fails, no row is created and the intent stays as the durable owner. Final absent → clear the intent and resume or restart per the journal. | Ancestors are durable before the rename, so only the rename's own entry is at stake, and either arm resolves without an orphan beyond one pass; no committed Unix row exists until that entry is durable. |
-   | Process crash after the rename, before the snapshot-directory `fsync` and the commit | Intent present; the published name resolves in the still-running kernel and matches the intent's digest; the rename's own entry is not yet durable; the ancestor chain is durable from the pass; job `Committing`. | Adoption first completes the pending publication barrier — on Unix re-derives the recorded final path's complete ancestor chain and `fsync`s the snapshot directory holding the already-renamed file, never repeating the rename — then inserts the row and clears the intent; if the barrier fails, no row is created and the intent remains the durable owner. Because the barrier precedes the row insert, the recovery's own commit is durable and a subsequent power loss cannot lose the name. | The step-5 ordering is completed by recovery: a committed Unix row never exists before its publish-directory entry is durable. |
+   | Power loss after the rename, before the snapshot-directory `fsync` and the commit | Intent present; the published name may or may not have survived, because the rename's own entry was not yet synced; the ancestor chain is already durable from the pass. | Final present with the intent's digest → the adoption path first completes the interrupted publication barrier — on Unix re-deriving the recorded final path's complete ancestor chain and `fsync`-ing the snapshot directory that holds the already-renamed file, without repeating the rename — then acquires the exact session commit authority and, with it held, inserts the row and clears the intent; if the barrier or the authority acquisition fails, no row is created and the intent stays as the durable owner, retried on a later pass. Final absent → clear the intent and resume or restart per the journal. | Ancestors are durable before the rename, so only the rename's own entry is at stake; a barrier- or authority-blocked arm leaves the pending intent as the durable owner and may need more than one pass, and no committed Unix row exists until that entry is durable. |
+   | Process crash after the rename, before the snapshot-directory `fsync` and the commit | Intent present; the published name resolves in the still-running kernel and matches the intent's digest; the rename's own entry is not yet durable; the ancestor chain is durable from the pass; job `Committing`. | Adoption first completes the pending publication barrier — on Unix re-derives the recorded final path's complete ancestor chain and `fsync`s the snapshot directory holding the already-renamed file, never repeating the rename — then acquires the exact session commit authority and, with it held, inserts the row and clears the intent; if the barrier or the authority acquisition fails, no row is created and the intent remains the durable owner, retried on a later pass. Because the barrier precedes the row insert, the recovery's own commit is durable and a subsequent power loss cannot lose the name. | The step-5 ordering is completed by recovery under a retained commit authority: a committed Unix row never exists before its publish-directory entry is durable. |
    | Verify passed, publish-intent record not yet durable | No intent; temp present; final absent; job pre-`Committing`. | Ordinary journal recovery; the job proceeds from its journaled state. | Nothing was published; no recovery protocol engages. |
    | Intent `fsync`'d, before the rename | Intent present; temp present; final absent; job `Committing`. | File absent → clear the intent; resume or restart per the journal. | No publish without a commit; temp resume intact. |
-   | Rename applied, before the step-6 commit | Intent present; final present with the intent's digest; temp gone; job `Committing`; no verdict record. | Adoption path: digest match → complete the pending publication barrier first (on Unix re-derive the recorded final path's chain and `fsync` the snapshot directory of the already-renamed file; never repeat the rename), then the idempotent row insert completes step 6 and the intent is cleared; a barrier failure creates no row and retains the intent. | A row exists only after a verified rename and a completed durable publish barrier; no orphan beyond one pass. |
+   | Rename applied, before the step-6 commit | Intent present; final present with the intent's digest; temp gone; job `Committing`; no verdict record. | Adoption path: digest match → complete the pending publication barrier first (on Unix re-derive the recorded final path's chain and `fsync` the snapshot directory of the already-renamed file; never repeat the rename), then acquire the exact session commit authority; with it held the idempotent row insert completes step 6 and the intent is cleared; a barrier or authority failure creates no row and retains the intent, retried on a later pass. | A row exists only after a verified rename and a completed durable publish barrier under a retained commit authority; an authority- or barrier-blocked file stays durably owned and non-playable, not an orphan. |
    | Rename applied, then a newly created ancestor entry lost for want of durability | Intent present; final absent (the published name did not survive); job `Committing`. | File-absent resolution: clear the intent; the job continues per the journal — resume or restart from zero; missing ancestor directories are rebuilt under the ordinary creation rules. | On Unix, step 5's chain-durability ordering confines this row below the commit. On Windows the same crash before the commit resolves through this row; the same loss after the commit resolves through the post-commit loss row below. |
    | Row committed (Windows), then power loss loses a newly created ancestor entry or the published name | Intent cleared at the commit; row present; the recorded path does not resolve. | Post-commit loss path: the row is never served — lookup and the startup reconciliation pass mark it non-playable and recoverable, a fresh download job may republish a new snapshot, and the never-a-silent-pass rule applies. The predecessor snapshot, if any, is untouched. | Windows documents no normal-user ancestor-entry durability barrier; detection and repair, not an undocumented flush, bound this case. Unix excludes it by the step-5 `fsync` chain. |
    | Crash during the step-6 commit (row inserted, intent not yet cleared) | Intent present; row present; final present. | Row-recognition path: the exact committed row — identity, recorded path, and recorded digest all matching the intent — stands; preserve its bytes, clear the intent. The insert an adoption would re-run is an idempotent no-op. | Completion is idempotent; a committed row is never re-adjudicated by adoption gates. |
@@ -700,7 +794,20 @@ Restart recovery and the staged delete of
 [Eviction](#cancellation-quota-and-eviction) are the two crash-recovery
 protocols of the cache engine; together they ensure no playable row is
 ever served without its bytes, and no engine-owned file is ever stranded
-without a row beyond one recovery pass. The publish-window rows of the
+without a durable owner. Every engine-owned file is either backed by a
+row or held by a durable owner — a pending publish intent, a
+terminal-verdict record with its delete intent, or a delete tombstone —
+and a recovery pass either resolves that owner or leaves it standing
+unchanged. A pass blocked on current authority, on the commit-authority
+admission, or on a platform barrier is a non-destructive deferral, so a
+durably owned, non-playable file may survive more than one pass until its
+owner can resolve. The retry makes progress when a later pass can establish
+the current authority, complete the barrier, and acquire the commit
+authority (resolving by adoption), or when it can definitively establish a
+terminal gate or a durable verdict (resolving by cleanup); between such
+passes the file simply remains durably owned and non-playable. Ownership
+ends only when a resolution above clears the intent or the staged delete
+commits. The publish-window rows of the
 crash-point matrix are absolute on every platform: Unix re-derives and
 chains directory `fsync`s from every ancestor entry through the rename to
 the commit on every attempt — including a post-rename adoption, which
@@ -977,7 +1084,7 @@ This contract fixes the following failure cases:
 | Power loss before or during the step-5 ancestor-durability pass | Nothing was published; on the next attempt the complete chain pass re-runs from the top before the rename. |
 | Radio-Browser adapter receives an offline request | `Err(Denied)` from the capability; no network work. |
 | Local file is requested for offline | `None` from the capability; no offline layer is created; the file is already local. |
-| Crash between the publish rename and the row commit | Startup recovery resolves the journaled publish intent: adopt (complete the commit) only for a publication-eligible job, otherwise unlink. Never a playable row without verified bytes, never a stranded orphan beyond one recovery pass. |
+| Crash between the publish rename and the row commit | Startup recovery resolves the journaled publish intent: adopt (complete the commit) only for a publication-eligible job whose exact session commit authority is acquired atomically after the publication barrier, otherwise unlink. Never a playable row without verified bytes and never a file without a durable owner; a pass blocked on current authority, the commit-authority admission, or a platform barrier makes no destructive change and leaves the durable owner in place, so a durably owned, non-playable file may survive until a later pass resolves it. |
 | Committed row (Windows) loses its recorded path to a post-commit power loss | Never served: lookup and the startup reconciliation pass mark the row non-playable and recoverable, and a fresh download job may republish a new snapshot. Not a half-promotion — the bytes were verified before the commit; the platform lacks a documented ancestor-entry durability barrier (see [Atomic storage](#atomic-storage)). |
 | Row committed (Windows), publish intent still pending, and the recorded path unresolvable | Recognition stands the row on its durable evidence and clears the intent; the unresolvable path routes the row through the post-commit loss reconciliation — never served, marked non-playable and recoverable — never through the publish-intent recovery's unlink. |
 | Failure, cancellation, supersession, or a commit error lands after the publish rename | Post-rename terminal rule, verdict-first: the terminal verdict and its delete intent are journalled and `fsync`'d before any destructive step; the published file is then unlinked through the validated cache-unlink path; the intent is cleared last. A crash before the unlink leaves the verdict record in place as the durable delete owner; startup recovery consults it, never adopts the job as playable, and finishes the cleanup. |
@@ -1011,20 +1118,32 @@ are deliberately left for the implementation record. The migration:
    startup (no terminal verdict, `Committing`, a matching durable source
    incarnation, no durable revocation, and a current-authority revalidation
    of capability, licence, and validator against the source's accepted
-   generation) and is idempotently adopted, which completes that same step.
-   The verified rename (step 5) publishes the bytes only; it creates no row.
+   generation), completes the platform publication barrier, acquires an
+   exact session commit authority atomically at the final admission, and is
+   idempotently adopted while that authority is retained, which completes
+   that same step. The verified rename (step 5) publishes the bytes only;
+   it creates no row.
 4. Is reversible in the same way as migration 13: any error restores the
    complete predecessor schema and data so the upgrade remains retryable.
 5. Backfills a durable `SourceIncarnationId` for every pre-existing saved
    source that lacks one, under the first-load rule of
    [restart authorization](#authenticated-resumable-download-jobs): the
    value is assigned once, derived stably from the row's durable identity,
-   and persisted durably in the same saved-source record, so the first
-   restart after the upgrade preserves each source's incarnation and a
-   resumed job still rebinds. The backfill is idempotent and re-mints
-   nothing for a source that already holds an incarnation.
+   and persisted durably as that row's `source_incarnation` field through
+   the atomic v1→v2 saved-source envelope replacement described there —
+   never by adding a field to the strict v1 row — so the first restart
+   after the upgrade preserves each source's incarnation and a resumed job
+   still rebinds. The backfill is idempotent and re-mints nothing for a
+   source that already holds an incarnation; a failed replacement
+   preserves the original v1 configuration and publishes no rows. This
+   file-format step is the saved-source half of the migration and is
+   independent of the application schema version below.
 
-A successful migration raises the application schema version by exactly one.
+A successful migration raises the application schema version by exactly
+one, and the saved-source `servers.json` envelope moves to version 2 as
+described under [restart
+authorization](#authenticated-resumable-download-jobs); the two version
+numbers are distinct and each is idempotent on retry.
 
 ## Validation strategy
 
@@ -1035,8 +1154,8 @@ Each slice lands with its own focused regression suite. The slices are:
 | Identity | Same `SourceId` + `TrackId` semantics as live; no second identity kind minted. Derived cache keys: fixed hex charset and width, no separators or traversal, byte-exact identifier input. |
 | Capability | Default-deny behaviour for adapters that opt out; Subsonic/Jellyfin/Plex/DAAP opt in. |
 | Resumable job | Bounded, `If-Range`-validated range requests; `200`/`412` restarts from zero; journal survives crash (offset truncation, last-segment digest re-check); segment bytes durable before journal progress, with a short-file or digest-mismatch recovery restarting from zero without trusting the offset; no-validator jobs restart only. |
-| Restart authorization | Lease reacquisition, resumption, and publish-intent adoption all rebind by durable `SourceId` + `SourceIncarnationId`, never by a transient generation number, and both resumption and adoption revalidate current authority — capability, licence, and validator against the source's accepted generation — rather than trusting a durable identity and the absence of a persisted revocation. A valid restart on the same durable incarnation with a changed transient generation authorizes and resumes; a replaced incarnation, even one whose transient generation recycles the job's recorded `capability_epoch`, does not authorize and terminates; a backend-side revocation that left no durable record refuses adoption; an unestablishable current generation defers non-destructively. Pre-existing saved sources receive one stable, persisted incarnation at first load and keep it across restart (no re-mint per load, no spurious replacement). No lease handle or credential is persisted. |
-| Atomic storage | Same-directory temp reservation (missing ancestors created at reservation); verify-before-publish ordering; same-filesystem rename; cross-filesystem publish refused. Unix validation lane: the complete ancestor chain is re-derived from the recorded final path and re-synced top-down, idempotently, before the rename on every attempt — including after a crash that happened before the previous process ran the pass — and the rename-to-commit chain is ordered behind it. Windows validation lane: the documented `FlushFileBuffers` + `MOVEFILE_WRITE_THROUGH` barrier on the published file, and missing-path recovery — never served, marked non-playable and recoverable, a fresh job may republish — including the combined pending-intent + committed-row + unresolvable-path case. Both lanes: publish-intent recovery across every kill point of the crash-point matrix, including the crash-before-directory-sync and power-loss rows, the verdict-first post-rename terminal transition, its adoption gates (including the current-authority revalidation of capability, licence, and validator against the source's accepted generation), and committed-row recognition with a revocation or incarnation replacement landing after the commit, before recovery. |
+| Restart authorization | Lease reacquisition, resumption, and publish-intent adoption all rebind by durable `SourceId` + `SourceIncarnationId`, never by a transient generation number, and both resumption and adoption revalidate current authority — capability, licence, and validator against the source's accepted generation — rather than trusting a durable identity and the absence of a persisted revocation. A valid restart on the same durable incarnation with a changed transient generation authorizes and resumes; a replaced incarnation, even one whose transient generation recycles the job's recorded `capability_epoch`, does not authorize and terminates; a backend-side revocation that left no durable record refuses adoption; an unestablishable current generation defers non-destructively. An adoption's playable insert acquires an exact session commit authority atomically after the platform publication barrier and retains it across the idempotent insert; staleness before admission rejects non-destructively, and replacement or shutdown after admission waits. Pre-existing saved sources receive one stable, persisted incarnation at first load and keep it across restart (no re-mint per load, no spurious replacement), and the saved-source format migrates from v1 to the v2 envelope by an atomic durable replacement that is idempotent across retry and concurrent load, preserves the original v1 file and publishes no rows on failure, re-loads a v2 file without re-minting, and lets a strict v1 loader quarantine an unknown-version envelope in place without data loss. No lease handle or credential is persisted. |
+| Atomic storage | Same-directory temp reservation (missing ancestors created at reservation); verify-before-publish ordering; same-filesystem rename; cross-filesystem publish refused. Unix validation lane: the complete ancestor chain is re-derived from the recorded final path and re-synced top-down, idempotently, before the rename on every attempt — including after a crash that happened before the previous process ran the pass — and the rename-to-commit chain is ordered behind it. Windows validation lane: the documented `FlushFileBuffers` + `MOVEFILE_WRITE_THROUGH` barrier on the published file, and missing-path recovery — never served, marked non-playable and recoverable, a fresh job may republish — including the combined pending-intent + committed-row + unresolvable-path case. Both lanes: publish-intent recovery across every kill point of the crash-point matrix, including the crash-before-directory-sync and power-loss rows, the verdict-first post-rename terminal transition, its adoption gates (including the current-authority revalidation of capability, licence, and validator against the source's accepted generation), the atomic commit-authority acquisition at the final admission after the publication barrier, and committed-row recognition with a revocation or incarnation replacement landing after the commit, before recovery. A pass blocked on current authority, the commit-authority admission, or a platform barrier defers non-destructively and leaves the durable owner in place, so an authority-blocked, durably owned file may survive multiple passes and is never resolved by destructive cleanup. |
 | Digest provenance | Advertised digest compared exactly; double-fetch fallback equality; no-tier backends fail `IntegrityUnverifiable` before publish. |
 | Credential boundary | No credential in metadata, file name, sidecar, log, or GTK row. Isolation scope per `task-remediation-2026-07.md` P1.6; redaction mechanics per P1.4. |
 | Redirect policy | Per `task-remediation-2026-07.md` P1.4 matrix; HTTPS-only, no `Referer`, no HTTPS→HTTP downgrade. |
@@ -1076,8 +1195,9 @@ does not have to invent them mid-slice.
 Until an offline-capable source opts in for the first time, none of the
 offline machinery is exercised at runtime. The migration itself is
 unconditional — it creates the two offline tables, backfills saved-source
-incarnations, and raises the schema version whether or not any source ever
-opts in — so byte-level identity
+incarnations through the v1→v2 `servers.json` envelope, and raises the
+application schema version and the saved-source envelope version whether
+or not any source ever opts in — so byte-level identity
 with a pre-migration database is explicitly **not** a guarantee, and no
 migration test may promise one. The compatibility guarantee is
 behavioural: a database whose offline tables are empty behaves exactly
