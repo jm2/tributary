@@ -166,6 +166,20 @@ impl GstreamerRaopSender {
         rust_i18n::t!("errors.playback.airplay_raopsink_missing", locale = locale).into_owned()
     }
 
+    /// The `gst::parse::launch` description for the RAOP pipeline.
+    ///
+    /// `avenc_alac` is the encoder: it emits the 352-sample ALAC framing RAOP
+    /// receivers expect (design §2.4), so the description is asserted in a
+    /// unit test rather than only at runtime.
+    fn pipeline_description(host: &str, port: u16, uri: &str) -> String {
+        format!(
+            "uridecodebin name=decoder uri=\"{}\" ! audioconvert ! avenc_alac ! raopsink name=raop host={} port={}",
+            uri.replace('"', "\\\""),
+            host,
+            port,
+        )
+    }
+
     /// Build a pipeline using GStreamer's `raopsink`. The caller has
     /// already verified via [`Self::probe`] that the element is registered.
     fn build_pipeline(
@@ -174,12 +188,7 @@ impl GstreamerRaopSender {
         uri: &str,
         volume: f64,
     ) -> Result<gst::Pipeline, String> {
-        let pipeline_str = format!(
-            "uridecodebin name=decoder uri=\"{}\" ! audioconvert ! avenc_alac ! raopsink name=raop host={} port={}",
-            uri.replace('"', "\\\""),
-            host,
-            port,
-        );
+        let pipeline_str = Self::pipeline_description(host, port, uri);
 
         let element = gst::parse::launch(&pipeline_str)
             .map_err(|_| "Failed to build RAOP pipeline".to_string())?;
@@ -399,9 +408,8 @@ fn position_sample_event(
     if state != gst::State::Playing {
         return None;
     }
-    position_ms.map(|position_ms| {
-        PlayerEvent::position(generation, position_ms, duration_ms.unwrap_or(0))
-    })
+    position_ms
+        .map(|position_ms| PlayerEvent::position(generation, position_ms, duration_ms.unwrap_or(0)))
 }
 
 /// AirPlay audio output — streams to a RAOP receiver.
@@ -822,20 +830,13 @@ mod tests {
     fn airplay_position_samples_are_playing_only_and_keep_the_load_generation() {
         let generation = PlayerEventGeneration::from_raw(73);
 
-        assert!(position_sample_event(
-            generation,
-            gst::State::Paused,
-            Some(1_500),
-            Some(9_000),
-        )
-        .is_none());
-        assert!(position_sample_event(
-            generation,
-            gst::State::Playing,
-            None,
-            Some(9_000),
-        )
-        .is_none());
+        assert!(
+            position_sample_event(generation, gst::State::Paused, Some(1_500), Some(9_000),)
+                .is_none()
+        );
+        assert!(
+            position_sample_event(generation, gst::State::Playing, None, Some(9_000),).is_none()
+        );
 
         assert!(matches!(
             position_sample_event(
@@ -865,11 +866,89 @@ mod tests {
     /// supported package is misrepresented as providing the element.
     #[test]
     fn a_missing_raopsink_is_refused_with_honest_guidance() {
-        assert!(GstreamerRaopSender::raopsink_available() || true);
-
         let error = SenderError::Dependency(GstreamerRaopSender::raopsink_missing_message("en"));
+        assert!(matches!(error, SenderError::Dependency(_)));
         assert!(error.message().contains("raopsink"), "{}", error.message());
-        assert!(!error.message().contains("gst-plugins-bad"), "{}", error.message());
+        assert!(
+            !error.message().contains("gst-plugins-bad"),
+            "{}",
+            error.message()
+        );
+    }
+
+    /// The GStreamer adapter's description must select the ALAC encoder, whose
+    /// 352-sample framing RAOP receivers expect (design §2.4, §9.7). This is a
+    /// string-level regression because a mis-framed stream only manifests as
+    /// device-specific glitches.
+    #[test]
+    fn the_gstreamer_pipeline_requests_alac_framing_and_raopsink() {
+        let description = GstreamerRaopSender::pipeline_description(
+            "192.0.2.10",
+            7000,
+            "http://127.0.0.1:1234/audio",
+        );
+        assert!(description.contains("avenc_alac"), "{description}");
+        assert!(description.contains("raopsink"), "{description}");
+        assert!(description.contains("host=192.0.2.10"), "{description}");
+        assert!(description.contains("port=7000"), "{description}");
+    }
+
+    /// A sender whose probe cannot pass refuses the load with its own
+    /// `SenderError` guidance — design §9.1/§9.2's adapter-injection stub.
+    struct FailingSender(SenderError);
+
+    impl AirplaySender for FailingSender {
+        fn name(&self) -> &'static str {
+            "test-failing"
+        }
+
+        fn probe(&self) -> Result<(), SenderError> {
+            Err(self.0.clone())
+        }
+
+        fn open_session(&self, _ctx: &SenderOpenContext<'_>) -> OpenOutcome {
+            OpenOutcome::Failed(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn a_failing_probe_refuses_the_load_without_opening_a_session() {
+        let (tx, rx) = async_channel::unbounded();
+        let mut output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
+        output.sender = Box::new(FailingSender(SenderError::Dependency(
+            "sender unavailable".to_string(),
+        )));
+        let generation = PlayerEventGeneration::from_raw(21);
+        output.set_event_generation(generation);
+
+        output.load_uri("https://music.test/stream");
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PlayerEvent::StateChanged {
+                generation: event_generation,
+                state: PlayerState::Buffering,
+            }) if event_generation == generation
+        ));
+        match rx.try_recv() {
+            Ok(PlayerEvent::Error {
+                generation: event_generation,
+                message,
+            }) => {
+                assert_eq!(event_generation, generation);
+                assert_eq!(message, "sender unavailable");
+            }
+            event => panic!("expected sender-probe error, got {event:?}"),
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PlayerEvent::StateChanged {
+                generation: event_generation,
+                state: PlayerState::Stopped,
+            }) if event_generation == generation
+        ));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(output.state(), PlayerState::Stopped);
     }
 
     /// The guidance must be real in every catalog — present, mentioning the

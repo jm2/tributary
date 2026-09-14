@@ -654,6 +654,13 @@ pub fn encode_airplay_row_identity(host_port: &str, device_id: Option<&str>) -> 
     }
 }
 
+/// The `host:port` endpoint portion of a discovered AirPlay row's identity,
+/// dropping any retained device identifier.
+pub(super) fn airplay_row_endpoint(raw: &str) -> &str {
+    raw.split_once(AIRPLAY_ROW_ID_SEPARATOR)
+        .map_or(raw, |(endpoint, _)| endpoint)
+}
+
 /// Decode an AirPlay row widget name into its `(host:port, device_id)` parts.
 fn decode_airplay_row_identity(raw: &str) -> (String, Option<String>) {
     match raw.split_once(AIRPLAY_ROW_ID_SEPARATOR) {

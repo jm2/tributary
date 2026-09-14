@@ -1072,8 +1072,7 @@ mod tests {
         strip_airplay_mac_prefix, strip_avahi_display_suffix, strip_avahi_name_suffix,
         usable_chromecast_control_address, validate_jellyfin_discovery_address, DiscoveredServer,
         DiscoveryEvent, MdnsPublication, MdnsPublications, PublishedOrigin, ServiceInstanceKey,
-        CHROMECAST_SERVICE, MAX_MDNS_INSTANCES_PER_ORIGIN, MAX_MDNS_PUBLICATIONS,
-        SUBSONIC_SERVICE,
+        CHROMECAST_SERVICE, MAX_MDNS_INSTANCES_PER_ORIGIN, MAX_MDNS_PUBLICATIONS, SUBSONIC_SERVICE,
     };
 
     fn resolved_event(

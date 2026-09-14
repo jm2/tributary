@@ -358,8 +358,7 @@ mod tests {
 
     #[test]
     fn recovery_completion_returns_immediately_when_resolved() {
-        let completion =
-            RecoveryCompletion::resolved(RecoveryOutcome::Restored);
+        let completion = RecoveryCompletion::resolved(RecoveryOutcome::Restored);
         assert_eq!(completion.wait(), RecoveryOutcome::Restored);
     }
 

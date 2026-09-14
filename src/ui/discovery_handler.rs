@@ -282,23 +282,39 @@ fn handle_airplay_found(output_list: &gtk::ListBox, server: &crate::discovery::D
     let airplay_url = &server.url;
     let airplay_name = server.name.clone();
 
-    // Dedup: check if this AirPlay device is already in outputs.
-    if is_device_in_output_list(output_list, &airplay_name) {
+    // A receiver without a parseable `host:port` endpoint cannot be addressed
+    // and must not be presented as playable.
+    let Ok(parsed) = url::Url::parse(airplay_url) else {
+        tracing::warn!(url = %airplay_url, "Ignoring AirPlay discovery without a parseable endpoint");
+        return;
+    };
+    let host = parsed.host_str().unwrap_or("").to_string();
+    if host.is_empty() {
+        tracing::warn!(url = %airplay_url, "Ignoring AirPlay discovery without a host");
+        return;
+    }
+    let port = parsed.port().unwrap_or(7000);
+    let endpoint = format!("{host}:{port}");
+
+    // Dedup by retained identity, not display name: two receivers can share a
+    // display name, and each must stay independently selectable so a later
+    // sender can address the exact one the user picked (design §10 step 3).
+    let identity =
+        super::output_switch::encode_airplay_row_identity(&endpoint, server.device_id.as_deref());
+    if is_airplay_identity_in_output_list(output_list, &identity) {
         return;
     }
 
     info!(
         name = %airplay_name,
         url = %airplay_url,
+        device_id = ?server.device_id,
         "AirPlay receiver discovered — adding to output selector"
     );
     let row = header_bar::build_output_row(&airplay_name, "network-wireless-symbolic", false);
-    // Store the host:port on the row so the output selector can use it.
-    if let Ok(parsed) = url::Url::parse(airplay_url) {
-        let host = parsed.host_str().unwrap_or("").to_string();
-        let port = parsed.port().unwrap_or(7000);
-        row.set_widget_name(&format!("{host}:{port}"));
-    }
+    // Store the endpoint and retained identifier on the row so the output
+    // selector can address the exact receiver.
+    row.set_widget_name(&identity);
     output_list.append(&row);
     propagate_widget_name(output_list);
 }
@@ -368,36 +384,34 @@ fn handle_chromecast_lost(output_list: &gtk::ListBox, url: &str) {
 }
 
 /// Remove a lost AirPlay device from the output selector.
+///
+/// Removal matches the lost endpoint, not the AirPlay icon: a single receiver
+/// going away must not unregister every other discovered receiver, and two
+/// receivers that share a display name must be removed independently.
 fn handle_airplay_lost(output_list: &gtk::ListBox, url: &str) {
     info!(url = %url, "AirPlay receiver lost — removing from output selector");
 
+    let Ok(parsed) = url::Url::parse(url) else {
+        tracing::warn!(url = %url, "Ignoring AirPlay loss without a parseable endpoint");
+        return;
+    };
+    let host = parsed.host_str().unwrap_or("").to_string();
+    if host.is_empty() {
+        tracing::warn!(url = %url, "Ignoring AirPlay loss without a host");
+        return;
+    }
+    let endpoint = format!("{host}:{}", parsed.port().unwrap_or(7000));
+
     let mut child = output_list.first_child();
-    let mut row_idx = 0i32;
     while let Some(c) = child {
         let next = c.next_sibling();
-        // Skip index 0 ("My Computer") — never remove it.
-        if row_idx > 0 {
-            if let Some(row_box) = c
-                .first_child()
-                .and_then(|inner| inner.downcast::<gtk::Box>().ok())
-            {
-                // Check the icon — AirPlay rows use "network-wireless-symbolic".
-                if let Some(icon) = row_box
-                    .first_child()
-                    .and_then(|i| i.downcast::<gtk::Image>().ok())
-                {
-                    if icon
-                        .icon_name()
-                        .is_some_and(|n| n == "network-wireless-symbolic")
-                    {
-                        if let Some(list_row) = c.downcast_ref::<gtk::ListBoxRow>() {
-                            output_list.remove(list_row);
-                        }
-                    }
-                }
+        if let Some(list_row) = c.downcast_ref::<gtk::ListBoxRow>() {
+            // The row widget name is `<endpoint>` or `<endpoint>|<device_id>`.
+            let row_name = list_row.widget_name();
+            if super::output_switch::airplay_row_endpoint(&row_name) == endpoint {
+                output_list.remove(list_row);
             }
         }
-        row_idx += 1;
         child = next;
     }
 }
@@ -451,6 +465,24 @@ fn is_device_in_output_list(output_list: &gtk::ListBox, name: &str) -> bool {
                 if label.text() == name {
                     return true;
                 }
+            }
+        }
+        child = c.next_sibling();
+    }
+    false
+}
+
+/// Check whether a discovered AirPlay row with the given encoded identity
+/// already exists in the output list.
+///
+/// Identity — endpoint plus retained device identifier — is the dedup key so
+/// that two receivers sharing a display name are both retained.
+fn is_airplay_identity_in_output_list(output_list: &gtk::ListBox, identity: &str) -> bool {
+    let mut child = output_list.first_child();
+    while let Some(c) = child {
+        if let Some(list_row) = c.downcast_ref::<gtk::ListBoxRow>() {
+            if list_row.widget_name() == identity {
+                return true;
             }
         }
         child = c.next_sibling();
