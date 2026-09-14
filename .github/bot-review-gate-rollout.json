@@ -13,9 +13,9 @@
   "environment": {
     "name": "bot-review-gate-publisher",
     "purpose": "Scopes the gate-publisher App private key to trusted default-branch deployment only.",
-    "deployment_policy": "protected branches only (main), no required reviewers",
-    "protected_branches": true,
-    "custom_branch_policies": false
+    "deployment_policy": "custom branch policies naming exactly the main branch (type branch; no tags, no other branches, no wildcards); no required reviewers, no wait timer",
+    "protected_branches": false,
+    "custom_branch_policies": true
   },
   "apps": [
     {
@@ -69,7 +69,7 @@
   ],
   "require_conversation_resolution": true,
   "rollout_steps": [
-    "Create the tributary-bot-review-gate-publisher GitHub App with only checks:write, install it, create the bot-review-gate-publisher environment restricted to protected branches (main) with no required reviewers, and store its credentials exclusively as that environment's secrets.",
+    "Create the tributary-bot-review-gate-publisher GitHub App with only checks:write, install it, create the bot-review-gate-publisher environment with custom deployment branch policies naming exactly the main branch (type branch; no tags, no other branches, no wildcards) and no required reviewers or wait timer, and store its credentials exclusively as that environment's secrets.",
     "Set the repository variable BOT_REVIEW_GATE_APP_ID to the gate-publisher App's numeric id.",
     "Create the tributary-ruleset-reader GitHub App with only administration:read and store its credentials as Dependabot secrets RULESET_READER_APP_ID and RULESET_READER_APP_PRIVATE_KEY.",
     "Run scripts/preflight_bot_review_gate.sh; expect a staged-inactive, consistent result while activation is off.",

@@ -359,8 +359,11 @@ not re-enable non-Dependabot auto-merge.
      on this repository, with its credentials stored **exclusively** as secrets
      of the protected environment `bot-review-gate-publisher` (names
      `BOT_REVIEW_GATE_APP_ID` and `BOT_REVIEW_GATE_PRIVATE_KEY`); the
-     environment is locked to a protected-branch deployment policy restricted
-     to `main`, with no required reviewers. The environment's branch policy is
+     environment is locked to **custom deployment branch policies naming
+     exactly the `main` branch** (type `branch`; no tags, no other branches, no
+     wildcards), with no required reviewers and no wait timer. The exact-main
+     deployment branch policy — not the `protected_branches` flag, which
+     authorizes *every* protected branch rather than an exact allowlist — is
      what makes the credentials reachable exactly where they are trusted —
      `workflow_run` completions from default-branch content — and nowhere else.
      Never store them as repository-level Actions secrets: every

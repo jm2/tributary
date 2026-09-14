@@ -164,7 +164,7 @@ name: Bot review gate publisher
 # protected environment (see the job block): pull-request-controlled
 # workflows — which receive repository secrets on same-repository pull
 # requests — can neither read environment-scoped secrets nor pass the
-# environment's main-only branch policy. The publishing job is additionally
+# environment's exact-main custom deployment branch policy. The publishing job is additionally
 # gated behind the default-off repository activation flag, so merely
 # provisioning credentials does not activate App-authored publication.
 #
