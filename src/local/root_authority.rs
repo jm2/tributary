@@ -3293,6 +3293,150 @@ fn with_bind_capture_interpose(interpose: Box<BindCaptureInterpose>, run: impl F
 #[cfg(all(test, unix))]
 static BIND_CAPTURE_INTERPOSE_SERIAL: Mutex<()> = Mutex::new(());
 
+/// Test-only seam: run the registered tombstone-creation interposition, if
+/// any.
+///
+/// `create_reversal_tombstone_coupled` creates the tombstone `O_EXCL` and
+/// then derives its identity from the creation descriptor. A concurrent
+/// writer replacing the just-created NAME in that window must not have its
+/// object adopted as the tombstone identity (and later deleted by the
+/// coupled release); a regression test registers a closure here that
+/// performs the replacement deterministically between the creation and the
+/// identity capture. Never compiled outside `cargo test`.
+#[cfg(all(test, unix))]
+fn run_tombstone_creation_interpose(parent: &File, tombstone_leaf: &OsStr) {
+    if let Some(interpose) = TOMBSTONE_CREATION_INTERPOSE.lock().unwrap().as_ref() {
+        interpose(parent, tombstone_leaf);
+    }
+}
+
+#[cfg(all(test, unix))]
+type TombstoneCreationInterpose = dyn Fn(&File, &OsStr) + Send + Sync;
+
+#[cfg(all(test, unix))]
+static TOMBSTONE_CREATION_INTERPOSE: Mutex<Option<Box<TombstoneCreationInterpose>>> =
+    Mutex::new(None);
+
+/// Serialize tests that use the tombstone-creation interposition seam.
+#[cfg(all(test, unix))]
+fn with_tombstone_creation_interpose(
+    interpose: Box<TombstoneCreationInterpose>,
+    run: impl FnOnce(),
+) {
+    let _serial = TOMBSTONE_CREATION_INTERPOSE_SERIAL.lock().unwrap();
+    *TOMBSTONE_CREATION_INTERPOSE.lock().unwrap() = Some(interpose);
+    run();
+    *TOMBSTONE_CREATION_INTERPOSE.lock().unwrap() = None;
+}
+
+#[cfg(all(test, unix))]
+static TOMBSTONE_CREATION_INTERPOSE_SERIAL: Mutex<()> = Mutex::new(());
+
+/// Test-only seam: run the registered parked-object removal interposition,
+/// if any.
+///
+/// `remove_leaf_coupled` pins the captured parked object and then removes it
+/// through an atomic exchange/quarantine. A concurrent writer replacing the
+/// parked NAME between the identity capture and the removal must not have
+/// its object deleted; a regression test registers a closure here that
+/// performs the replacement deterministically in that window. Never
+/// compiled outside `cargo test`.
+#[cfg(all(test, unix))]
+fn run_parked_removal_interpose(parent: &File, parked_leaf: &OsStr) {
+    if let Some(interpose) = PARKED_REMOVAL_INTERPOSE.lock().unwrap().as_ref() {
+        interpose(parent, parked_leaf);
+    }
+}
+
+#[cfg(all(test, unix))]
+type ParkedRemovalInterpose = dyn Fn(&File, &OsStr) + Send + Sync;
+
+#[cfg(all(test, unix))]
+static PARKED_REMOVAL_INTERPOSE: Mutex<Option<Box<ParkedRemovalInterpose>>> = Mutex::new(None);
+
+/// Serialize tests that use the parked-object removal interposition seam.
+#[cfg(all(test, unix))]
+fn with_parked_removal_interpose(interpose: Box<ParkedRemovalInterpose>, run: impl FnOnce()) {
+    let _serial = PARKED_REMOVAL_INTERPOSE_SERIAL.lock().unwrap();
+    *PARKED_REMOVAL_INTERPOSE.lock().unwrap() = Some(interpose);
+    run();
+    *PARKED_REMOVAL_INTERPOSE.lock().unwrap() = None;
+}
+
+#[cfg(all(test, unix))]
+static PARKED_REMOVAL_INTERPOSE_SERIAL: Mutex<()> = Mutex::new(());
+
+/// Test-only seam: run the registered post-removal interposition, if any.
+///
+/// `drop_redundant_staged_link_coupled` drops the redundant staged link and
+/// then moves the retained original back under the recorded backup name. A
+/// regression that forces the move to fail hooks here, after the staged link
+/// is gone, to remove the backup NAME (forcing the exchange to report
+/// `ENOENT`) before the no-replace fallback runs. Never compiled outside
+/// `cargo test`.
+#[cfg(all(test, unix))]
+fn run_post_removal_interpose(parent: &File, backup_leaf: &OsStr) {
+    if let Some(interpose) = POST_REMOVAL_INTERPOSE.lock().unwrap().as_ref() {
+        interpose(parent, backup_leaf);
+    }
+}
+
+#[cfg(all(test, unix))]
+type PostRemovalInterpose = dyn Fn(&File, &OsStr) + Send + Sync;
+
+#[cfg(all(test, unix))]
+static POST_REMOVAL_INTERPOSE: Mutex<Option<Box<PostRemovalInterpose>>> = Mutex::new(None);
+
+/// Serialize tests that use the post-removal interposition seam.
+#[cfg(all(test, unix))]
+fn with_post_removal_interpose(interpose: Box<PostRemovalInterpose>, run: impl FnOnce()) {
+    let _serial = POST_REMOVAL_INTERPOSE_SERIAL.lock().unwrap();
+    *POST_REMOVAL_INTERPOSE.lock().unwrap() = Some(interpose);
+    run();
+    *POST_REMOVAL_INTERPOSE.lock().unwrap() = None;
+}
+
+#[cfg(all(test, unix))]
+static POST_REMOVAL_INTERPOSE_SERIAL: Mutex<()> = Mutex::new(());
+
+/// Test-only seam: run the registered no-replace-fallback interposition, if
+/// any.
+///
+/// When the post-removal exchange reports the backup NAME absent,
+/// `drop_redundant_staged_link_coupled` falls back to a no-replace rename of
+/// the quarantined original onto the backup name. A regression that forces
+/// that fallback to fail (a writer recreating the name in the window) hooks
+/// here, after the `ENOENT` was observed and before the fallback runs. Never
+/// compiled outside `cargo test`.
+#[cfg(all(test, unix))]
+fn run_no_replace_fallback_interpose(parent: &File, backup_leaf: &OsStr) {
+    if let Some(interpose) = NO_REPLACE_FALLBACK_INTERPOSE.lock().unwrap().as_ref() {
+        interpose(parent, backup_leaf);
+    }
+}
+
+#[cfg(all(test, unix))]
+type NoReplaceFallbackInterpose = dyn Fn(&File, &OsStr) + Send + Sync;
+
+#[cfg(all(test, unix))]
+static NO_REPLACE_FALLBACK_INTERPOSE: Mutex<Option<Box<NoReplaceFallbackInterpose>>> =
+    Mutex::new(None);
+
+/// Serialize tests that use the no-replace-fallback interposition seam.
+#[cfg(all(test, unix))]
+fn with_no_replace_fallback_interpose(
+    interpose: Box<NoReplaceFallbackInterpose>,
+    run: impl FnOnce(),
+) {
+    let _serial = NO_REPLACE_FALLBACK_INTERPOSE_SERIAL.lock().unwrap();
+    *NO_REPLACE_FALLBACK_INTERPOSE.lock().unwrap() = Some(interpose);
+    run();
+    *NO_REPLACE_FALLBACK_INTERPOSE.lock().unwrap() = None;
+}
+
+#[cfg(all(test, unix))]
+static NO_REPLACE_FALLBACK_INTERPOSE_SERIAL: Mutex<()> = Mutex::new(());
+
 /// Test-only seam: run the registered pre-exchange interposition, if any.
 ///
 /// The Unix Overwrite replace captures the bound backup object, then performs
@@ -3861,8 +4005,16 @@ enum QuarantinedLeafKind {
 /// name is created `O_EXCL` so it can never collide with a concurrent
 /// writer's file, and no other process ever learns it: after the quarantine
 /// exchange, the verify-then-remove on the tombstone name is race-free.
+///
+/// The `O_EXCL` descriptor is RETURNED, never dropped: it names exactly the
+/// object this call created, so a caller that needs the tombstone's identity
+/// derives it from `fstat` on the descriptor instead of re-opening the
+/// mutable name. Re-opening the name leaves a window in which a concurrent
+/// writer can rename the freshly created entry away and install its own
+/// object, which would then be adopted as this call's tombstone identity and
+/// deleted by a later coupled removal.
 #[cfg(unix)]
-fn create_reversal_tombstone(parent: &File) -> io::Result<OsString> {
+fn create_reversal_tombstone(parent: &File) -> io::Result<(OsString, File)> {
     use rustix::fs::{Mode, OFlags};
 
     for _ in 0..8 {
@@ -3875,10 +4027,7 @@ fn create_reversal_tombstone(parent: &File) -> io::Result<OsString> {
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::from_bits_truncate(0o600),
         ) {
-            Ok(descriptor) => {
-                drop(File::from(descriptor));
-                return Ok(name);
-            }
+            Ok(descriptor) => return Ok((name, File::from(descriptor))),
             Err(rustix::io::Errno::EXIST) => {}
             Err(error) => return Err(io::Error::from(error)),
         }
@@ -4114,7 +4263,9 @@ fn quarantine_and_remove_leaf_unix(
     };
 
     // Phase 2: quarantine by atomic exchange against a private tombstone.
-    let tombstone = create_reversal_tombstone(parent)?;
+    // The `O_EXCL` descriptor is retained for the duration of the exchange so
+    // the placeholder object can never be adopted by a name re-open.
+    let (tombstone, _tombstone_placeholder) = create_reversal_tombstone(parent)?;
     let release_tombstone_file =
         |parent: &File| -> io::Result<()> { exchange_leaf_names(parent, leaf, &tombstone) };
     match rustix::fs::renameat_with(
@@ -4289,43 +4440,51 @@ fn release_parked_reversal_leaf(
     }
 }
 
-/// Create a private reversal tombstone and retain a no-follow handle on it,
-/// returning the name, the handle, and the tombstone object's identity.
+/// Create a private reversal tombstone and retain the `O_EXCL` descriptor
+/// that created it, returning the name, the handle, and the tombstone
+/// object's identity.
 ///
 /// The handle keeps the object re-statable by identity — never by a later
 /// name lookup — so a cleanup can prove it is consuming exactly the
 /// tombstone this call created even after a concurrent writer renames the
-/// private name. The identity comes from the retained handle when the
-/// platform offers one (falling back to a name capture otherwise), and is
-/// `None` when the object could not be captured at all. Callers must treat
-/// a `None` identity as unverifiable: never remove the name it points at.
+/// private name. Both the handle and the identity come from the SAME
+/// descriptor the `O_EXCL` creation returned: there is no name re-open
+/// between the creation and the identity capture, so a writer that swaps the
+/// just-created name can never be adopted as the tombstone (and then
+/// deleted by `release_tombstone_coupled`). The identity is `None` only when
+/// the descriptor cannot be `fstat`ed. Callers must treat a `None` identity
+/// as unverifiable: never remove the name it points at.
 #[cfg(unix)]
 fn create_reversal_tombstone_coupled(
     parent: &File,
 ) -> io::Result<(OsString, Option<File>, Option<LeafIdentity>)> {
-    let name = create_reversal_tombstone(parent)?;
-    let handle = retained_leaf_handle(parent, &name);
-    let identity = handle
-        .as_ref()
-        .and_then(retained_handle_identity)
-        .or_else(|| leaf_identity_at(parent, &name).ok().flatten());
-    Ok((name, handle, identity))
+    let (name, descriptor) = create_reversal_tombstone(parent)?;
+    // Test-only seam: a regression interposes a replacement of the
+    // just-created tombstone NAME between the `O_EXCL` creation and the
+    // identity capture. The identity must still name the object the
+    // descriptor created, never the writer's replacement.
+    #[cfg(test)]
+    run_tombstone_creation_interpose(parent, &name);
+    let identity = retained_handle_identity(&descriptor);
+    Ok((name, Some(descriptor), identity))
 }
 
 /// Remove the object currently named `leaf` without racing a concurrent
 /// writer that re-points the name.
 ///
 /// The occupant is captured with an atomic rename under a fresh, private
-/// `.tributary-reversal-*` name and only then verified and removed, exactly
-/// the discipline [`release_parked_reversal_leaf`] applies to a tombstone it
-/// already owns. When `expected` is supplied, only an object identical to it
-/// (device and index — the rename legitimately updates the change instant)
-/// is removed; any other occupant is renamed back to `leaf` with no-replace
-/// semantics and reported preserved (`Ok(false)`), so a writer's replacement
-/// is never destroyed. When `expected` is `None` there is nothing to verify,
-/// so the atomically captured occupant is removed — the historical path-only
-/// semantics, now bound to the object captured at the rename instant rather
-/// than whatever the public name holds at unlink time.
+/// `.tributary-reversal-*` name, pinned with a retained no-follow handle
+/// opened immediately after the rename, and only then verified and removed
+/// by [`remove_captured_leaf_coupled`] — never by a bare pathname
+/// `unlinkat` after a separate name lookup. When `expected` is supplied,
+/// only an object identical to it (device and index — the rename
+/// legitimately updates the change instant) is removed; any other occupant
+/// is renamed back to `leaf` with no-replace semantics and reported
+/// preserved (`Ok(false)`), so a writer's replacement is never destroyed.
+/// When `expected` is `None` there is nothing to verify, so the atomically
+/// captured occupant is removed — the historical path-only semantics, now
+/// bound to the object captured at the rename instant rather than whatever
+/// the public name holds at unlink time.
 #[cfg(unix)]
 fn remove_leaf_coupled(
     parent: &File,
@@ -4334,7 +4493,7 @@ fn remove_leaf_coupled(
 ) -> io::Result<bool> {
     use rustix::fs::{renameat, renameat_with, unlinkat, AtFlags, RenameFlags};
 
-    let parked_name = create_reversal_tombstone(parent)?;
+    let (parked_name, _parked_placeholder) = create_reversal_tombstone(parent)?;
     if let Err(error) = renameat(parent, leaf, parent, &parked_name) {
         // Nothing was captured; discard the placeholder this call created.
         let _ = unlinkat(parent, &parked_name, AtFlags::empty());
@@ -4345,8 +4504,17 @@ fn remove_leaf_coupled(
     }
     // The public name is now vacant and the captured occupant is parked at a
     // private name a concurrent writer cannot reach without racing the
-    // unpredictable name itself.
-    let parked = leaf_identity_at(parent, &parked_name).ok().flatten();
+    // unpredictable name itself. Pin that exact object with a retained
+    // no-follow handle — opened immediately after the atomic capture — and
+    // derive its identity from the handle, never a separate later name
+    // lookup. The deletion is then coupled to the pinned object: a writer
+    // that swaps the parked name between this capture and the removal is
+    // itself captured and preserved, never deleted.
+    let parked_handle = retained_leaf_handle(parent, &parked_name);
+    let parked = parked_handle
+        .as_ref()
+        .and_then(retained_handle_identity)
+        .or_else(|| leaf_identity_at(parent, &parked_name).ok().flatten());
     let verified = match expected {
         Some(expected) => parked
             .as_ref()
@@ -4354,9 +4522,12 @@ fn remove_leaf_coupled(
         None => true,
     };
     if verified {
-        return unlinkat(parent, &parked_name, AtFlags::empty())
-            .map(|()| true)
-            .map_err(io::Error::from);
+        // Test-only seam: a regression interposes a replacement of the
+        // parked name between the identity capture above and the coupled
+        // removal below; the replacement must survive.
+        #[cfg(test)]
+        run_parked_removal_interpose(parent, &parked_name);
+        return remove_captured_leaf_coupled(parent, &parked_name, parked.as_ref());
     }
     // A writer's object was captured: put it back exactly where it was, with
     // no-replace semantics so a fresh concurrent creation at the public name
@@ -4373,6 +4544,102 @@ fn remove_leaf_coupled(
         )),
         Err(error) => Err(io::Error::from(error)),
     }
+}
+
+/// Remove the object a prior atomic capture parked at `captured_name`,
+/// coupling the deletion itself to `captured_identity`.
+///
+/// The parked object is re-quarantined under a fresh, unguessable private
+/// name by an atomic NO-REPLACE rename, so the object the subsequent verify
+/// sees is exactly the object that occupied `captured_name` at the rename
+/// instant — not whatever a concurrent writer may have swapped onto the name
+/// afterwards (a writer that already occupies a candidate name is never
+/// clobbered: the rename reports `EXIST` and another candidate is tried).
+/// Only an object that matches `captured_identity` (device and index) is
+/// unlinked; anything else is moved back untouched and reported preserved
+/// (`Ok(false)`). A `None` captured identity degrades to the historical
+/// path-only semantics: the atomically captured object is removed.
+///
+/// This is what makes the coupling survive the gap between verification and
+/// the unlink: the earlier helper verified the parked name and then called
+/// `unlinkat` on that same mutable name, so a writer racing a replacement in
+/// between had its object destroyed. Here the object is re-quarantined by an
+/// atomic rename immediately before the unlink and re-verified against the
+/// pinned identity, so the unlink target is the object the atomic rename
+/// captured rather than whatever a writer later put on the original name.
+/// No placeholder object is created, so no private litter can remain.
+#[cfg(unix)]
+fn remove_captured_leaf_coupled(
+    parent: &File,
+    captured_name: &OsStr,
+    captured_identity: Option<&LeafIdentity>,
+) -> io::Result<bool> {
+    use rustix::fs::{unlinkat, AtFlags};
+
+    let Some(quarantine_name) = quarantine_captured_leaf(parent, captured_name)? else {
+        return Ok(false);
+    };
+    // `quarantine_name` names exactly the object `captured_name` held at the
+    // atomic rename instant; `captured_name` is now vacant. Verify the
+    // captured object against the pinned identity immediately before the
+    // unlink.
+    let captured = leaf_identity_at(parent, &quarantine_name).ok().flatten();
+    let coupled = match captured_identity {
+        Some(expected) => captured
+            .as_ref()
+            .is_some_and(|candidate| candidate.same_object(expected)),
+        None => true,
+    };
+    if coupled {
+        return unlinkat(parent, &quarantine_name, AtFlags::empty())
+            .map(|()| true)
+            .map_err(io::Error::from);
+    }
+    // A foreign object was captured: move it back onto its original name
+    // untouched (no-replace, so a fresh concurrent creation is never
+    // overwritten) and report it preserved. The atomic rename captured the
+    // foreign object, so it is never unlinked.
+    rename_no_replace_within_parent(
+        parent,
+        &quarantine_name,
+        Path::new(""),
+        captured_name,
+        Path::new(""),
+    )
+    .map(|()| false)
+}
+
+/// Atomically move the object at `captured_name` to a fresh, unguessable
+/// private `.tributary-reversal-*.tmp` name with NO-REPLACE semantics.
+///
+/// The rename is atomic, so the destination names exactly what the source
+/// held at the rename instant; the destination is required to be absent, so
+/// a writer that already occupies a candidate name is never clobbered and a
+/// fresh candidate is tried instead. `Ok(None)` reports the source was
+/// already absent.
+#[cfg(unix)]
+fn quarantine_captured_leaf(parent: &File, captured_name: &OsStr) -> io::Result<Option<OsString>> {
+    for _ in 0..8 {
+        let mut name = OsString::from(".tributary-reversal-");
+        name.push(Uuid::new_v4().to_string());
+        name.push(".tmp");
+        match rename_no_replace_within_parent(
+            parent,
+            captured_name,
+            Path::new(""),
+            &name,
+            Path::new(""),
+        ) {
+            Ok(()) => return Ok(Some(name)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a private quarantine name for the captured object",
+    ))
 }
 
 /// Best-effort release of a private reversal tombstone this call created,
@@ -5563,6 +5830,7 @@ fn verify_atomic_swap(
                     Ok(ReversalOutcome::RefusedForeignLeaf) => Err(displaced_occupant_failure(
                         published_leaf,
                         Some(retained_identity),
+                        None,
                         io::Error::other(
                             "the bound backup was replaced after the capture and the \
                              displaced occupant could not be restored",
@@ -5572,6 +5840,7 @@ fn verify_atomic_swap(
                     Err(error) => Err(displaced_occupant_failure(
                         published_leaf,
                         Some(retained_identity),
+                        None,
                         error,
                         None,
                     )),
@@ -5580,12 +5849,35 @@ fn verify_atomic_swap(
                 // transfer's bytes ARE published and the backup/original are
                 // still live, so carry the marker rather than a bare I/O
                 // error the Drop path would clean up destructively (H1).
-                Err(error) => Err(displaced_occupant_failure(
-                    published_leaf,
-                    Some(retained_identity),
-                    error,
-                    None,
-                )),
+                // When the post-removal move stranded the retained original
+                // under a private quarantine name, carry that actual location
+                // and its settled identity so the caller records where
+                // rollback can find it.
+                Err(error) => {
+                    let stranded = error
+                        .get_ref()
+                        .and_then(|payload| payload.downcast_ref::<StrandedDisplacedOriginal>());
+                    let (stranded_leaf, backup_identity) = match stranded {
+                        Some(stranded) => (
+                            // Only a location that is NOT the recorded backup
+                            // name needs recording; a recovery that returned
+                            // the original to the backup name keeps the
+                            // caller's recorded path, but still supplies the
+                            // settled identity the exact backup gate needs.
+                            (stranded.location_leaf.as_os_str() != backup_leaf)
+                                .then(|| stranded.location_leaf.clone()),
+                            stranded.identity,
+                        ),
+                        None => (None, retained_identity),
+                    };
+                    Err(displaced_occupant_failure(
+                        published_leaf,
+                        Some(backup_identity),
+                        stranded_leaf,
+                        error,
+                        None,
+                    ))
+                }
             }
         }
         Ok(_) => {
@@ -5611,6 +5903,7 @@ fn verify_atomic_swap(
                 Ok(ReversalOutcome::RefusedForeignLeaf) => Err(displaced_occupant_failure(
                     published_leaf,
                     Some(retained_identity),
+                    None,
                     io::Error::other(
                         "the interposed occupant could not be restored to the destination \
                          without clobbering a concurrent writer's entry",
@@ -5620,6 +5913,7 @@ fn verify_atomic_swap(
                 Err(error) => Err(displaced_occupant_failure(
                     published_leaf,
                     Some(retained_identity),
+                    None,
                     error,
                     None,
                 )),
@@ -5647,12 +5941,14 @@ fn verify_atomic_swap(
             Ok(ReversalOutcome::RefusedForeignLeaf) => Err(displaced_occupant_failure(
                 published_leaf,
                 Some(retained_identity),
+                None,
                 verification,
                 None,
             )),
             Err(restore) => Err(displaced_occupant_failure(
                 published_leaf,
                 Some(retained_identity),
+                None,
                 verification,
                 Some(restore),
             )),
@@ -5767,6 +6063,11 @@ fn drop_redundant_staged_link_coupled(
     // the discoverable staged name between the coupling check and the
     // removal is captured and preserved, never deleted (H4).
     remove_leaf_coupled(parent, from_leaf, Some(retained_identity))?;
+    // Test-only seam: a regression removes the backup NAME here, after the
+    // staged link is gone, so the post-removal exchange below reports
+    // `ENOENT` and takes the no-replace fallback.
+    #[cfg(test)]
+    run_post_removal_interpose(parent, backup_leaf);
     // Move the original back under the public backup name. The exchange
     // always lands the quarantined object (the original) at the backup name
     // and parks whatever now bears the backup name at the private name.
@@ -5782,16 +6083,48 @@ fn drop_redundant_staged_link_coupled(
         // writer removed the parked tombstone): take the now-free name with
         // a no-replace move so a concurrent creation is never clobbered.
         Err(rustix::io::Errno::NOENT) => {
-            rename_no_replace_within_parent(
+            // Test-only seam: a regression recreates the backup NAME here,
+            // after the `ENOENT` and before the fallback, forcing the
+            // no-replace move to fail closed.
+            #[cfg(test)]
+            run_no_replace_fallback_interpose(parent, backup_leaf);
+            if let Err(cause) = rename_no_replace_within_parent(
                 parent,
                 &quarantine,
                 Path::new(""),
                 backup_leaf,
                 backup_absolute,
-            )?;
+            ) {
+                // The staged link is already dropped, so the retained
+                // original's LAST link is the private quarantine name. A
+                // plain error here would record the backup path, which no
+                // longer names the original: return the original to the
+                // recorded backup name if we can, and carry its actual
+                // location and settled identity when we cannot.
+                return Err(stranded_original_error(
+                    parent,
+                    &quarantine,
+                    backup_leaf,
+                    tombstone_identity.as_ref(),
+                    retained_identity,
+                    cause,
+                ));
+            }
             return Ok(true);
         }
-        Err(error) => return Err(io::Error::from(error)),
+        Err(error) => {
+            // Same post-removal failure: the original is stranded at the
+            // private quarantine name unless it can be returned to the
+            // recorded backup name.
+            return Err(stranded_original_error(
+                parent,
+                &quarantine,
+                backup_leaf,
+                tombstone_identity.as_ref(),
+                retained_identity,
+                io::Error::from(error),
+            ));
+        }
     }
     // Consume the private parking name only when it still holds the empty
     // tombstone this call created; a foreign object a writer raced into the
@@ -5800,6 +6133,94 @@ fn drop_redundant_staged_link_coupled(
     // check-then-unlink on the private name (H5).
     release_tombstone_coupled(parent, &quarantine, tombstone_identity.as_ref());
     Ok(true)
+}
+
+/// A post-removal failure in [`drop_redundant_staged_link_coupled`] left the
+/// retained original's last transfer-controlled link at `location_leaf`.
+///
+/// The identity is captured AFTER every rename the machine performed, so a
+/// rollback's change-instant-exact backup gate matches the object where it
+/// actually sits. `location_leaf` is the recorded backup name when the
+/// original was recovered there, or the private quarantine name when it
+/// could not be moved back — in which case the caller must record
+/// `location_leaf` as the replaced-original path instead of the backup path,
+/// which no longer names the original.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct StrandedDisplacedOriginal {
+    /// Leaf name that actually holds the retained original.
+    pub(crate) location_leaf: OsString,
+    /// Settled identity of the retained original at `location_leaf`.
+    pub(crate) identity: LeafIdentity,
+    /// The post-removal failure that stranded the original.
+    cause: io::Error,
+}
+
+#[cfg(unix)]
+impl fmt::Display for StrandedDisplacedOriginal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "the retained original is preserved at the private name {} ({})",
+            self.location_leaf.to_string_lossy(),
+            self.cause
+        )
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for StrandedDisplacedOriginal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+/// Build the failure for a post-removal move that could not return the
+/// retained original to the recorded backup name.
+///
+/// The staged link is already gone, so the original's last link is the
+/// private `quarantine` name. First try to return it to the recorded backup
+/// name: drop this call's own empty placeholder there (never a writer's
+/// object, which a coupled removal preserves), then move the original with
+/// no-replace semantics so a writer's fresh creation is never clobbered.
+/// Whether or not that succeeds, capture the original's actual location and
+/// settled identity and carry them in the error so the caller records where
+/// rollback can find the original instead of a backup path that no longer
+/// names it.
+#[cfg(unix)]
+fn stranded_original_error(
+    parent: &File,
+    quarantine: &OsStr,
+    backup_leaf: &OsStr,
+    placeholder_identity: Option<&LeafIdentity>,
+    fallback_identity: &LeafIdentity,
+    cause: io::Error,
+) -> io::Error {
+    // Release the empty placeholder this call parked at the backup name. A
+    // foreign object a writer swapped in is preserved (the coupled removal
+    // reports `Ok(false)` and unlinks nothing).
+    let _ = remove_leaf_coupled(parent, backup_leaf, placeholder_identity);
+    let recovered = rename_no_replace_within_parent(
+        parent,
+        quarantine,
+        Path::new(""),
+        backup_leaf,
+        Path::new(""),
+    )
+    .is_ok();
+    let location_leaf = if recovered { backup_leaf } else { quarantine };
+    let identity = leaf_identity_at(parent, location_leaf)
+        .ok()
+        .flatten()
+        .unwrap_or(*fallback_identity);
+    io::Error::new(
+        cause.kind(),
+        StrandedDisplacedOriginal {
+            location_leaf: location_leaf.to_os_string(),
+            identity,
+            cause,
+        },
+    )
 }
 
 /// Restore the object the atomic exchange left at the private staged leaf to
@@ -5840,7 +6261,9 @@ fn restore_displaced_occupant(
 /// whose post-swap verification could not restore the destination: the
 /// transfer's bytes ARE published at the destination, the bind-time backup
 /// is retained for restoration, and the displaced object survives at the
-/// private staged leaf — which the caller must shield from cleanup.
+/// private staged leaf — or, when a post-removal failure stranded the
+/// retained original under a private quarantine name, at
+/// `stranded_original_leaf` — which the caller must shield from cleanup.
 /// Surfaced through an [`io::Error`] payload so it travels every `?` on the
 /// publish path; the write authority's commit maps it to a
 /// verified-publication failure carrying the outcome.
@@ -5851,8 +6274,15 @@ pub(crate) struct DisplacedOccupantFailure {
     pub(crate) published_leaf: Option<LeafIdentity>,
     /// Bind-time identity of the replaced occupant the retained backup
     /// holds, so the caller can couple the backup's later restoration and
-    /// disposal to the exact object it names.
+    /// disposal to the exact object it names. When `stranded_original_leaf`
+    /// is set this is the settled identity at that actual location.
     pub(crate) backup_leaf: Option<LeafIdentity>,
+    /// The private name that actually holds the retained original when a
+    /// post-removal failure could not return it to the recorded backup
+    /// name. The caller must record this leaf as the replaced-original path
+    /// so rollback can find the original; `None` means the original still
+    /// sits at the recorded backup name.
+    pub(crate) stranded_original_leaf: Option<OsString>,
 }
 
 #[cfg(unix)]
@@ -5861,6 +6291,7 @@ impl fmt::Debug for DisplacedOccupantFailure {
         formatter
             .debug_struct("DisplacedOccupantFailure")
             .field("published_leaf_captured", &self.published_leaf.is_some())
+            .field("stranded_original", &self.stranded_original_leaf.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -5868,12 +6299,21 @@ impl fmt::Debug for DisplacedOccupantFailure {
 #[cfg(unix)]
 impl fmt::Display for DisplacedOccupantFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "the atomic exchange published the staged bytes but the displaced occupant \
-             could not be restored to the destination; the bind-time backup is retained \
-             and the displaced object is preserved at the private staged leaf"
-        )
+        match &self.stranded_original_leaf {
+            Some(leaf) => write!(
+                formatter,
+                "the atomic exchange published the staged bytes but the displaced occupant \
+                 could not be restored to the destination; the bind-time backup is retained \
+                 and the retained original is preserved at the private name {}",
+                leaf.to_string_lossy()
+            ),
+            None => write!(
+                formatter,
+                "the atomic exchange published the staged bytes but the displaced occupant \
+                 could not be restored to the destination; the bind-time backup is retained \
+                 and the displaced object is preserved at the private staged leaf"
+            ),
+        }
     }
 }
 
@@ -5882,11 +6322,14 @@ impl std::error::Error for DisplacedOccupantFailure {}
 
 /// Build the marker-carrying error for a displaced occupant the publish
 /// machinery could not restore. `cause` is the primary failure; `detail`
-/// is a secondary failure woven into the message.
+/// is a secondary failure woven into the message. `stranded_original_leaf`
+/// names the actual location of the retained original when a post-removal
+/// failure moved it off the recorded backup name.
 #[cfg(unix)]
 fn displaced_occupant_failure(
     published_leaf: Option<LeafIdentity>,
     backup_leaf: Option<LeafIdentity>,
+    stranded_original_leaf: Option<OsString>,
     cause: io::Error,
     detail: Option<io::Error>,
 ) -> io::Error {
@@ -5894,6 +6337,7 @@ fn displaced_occupant_failure(
         payload: DisplacedOccupantFailure {
             published_leaf,
             backup_leaf,
+            stranded_original_leaf,
         },
         cause,
         detail,
@@ -9603,6 +10047,229 @@ mod tests {
                 }
                 other => panic!("expected a verified degraded proof, got {other:?}"),
             }
+        }
+    }
+
+    /// Interposition regressions for the residuals the coupled removal
+    /// helpers still carried: a writer's replacement of the just-created
+    /// tombstone name, of the parked name between the identity capture and
+    /// the removal, and the post-removal failure that strands the retained
+    /// original under an unrecorded quarantine name.
+    #[cfg(unix)]
+    mod reversal_coupling_residuals {
+        use super::*;
+
+        fn open_parent_dir(path: &Path) -> File {
+            let opened = rustix::fs::openat(
+                rustix::fs::CWD,
+                path,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .expect("open parent directory handle");
+            File::from(opened)
+        }
+
+        fn directory_contains_bytes(directory: &Path, expected: &[u8]) -> bool {
+            fs::read_dir(directory)
+                .expect("list the directory")
+                .filter_map(|entry| entry.ok())
+                .any(|entry| fs::read(entry.path()).is_ok_and(|bytes| bytes == expected))
+        }
+
+        /// A writer that replaces the just-created tombstone NAME between the
+        /// `O_EXCL` creation and the identity capture must not have its object
+        /// adopted as the tombstone identity, and must never be deleted by the
+        /// coupled release. With the identity taken from the re-opened name it
+        /// would match the writer's object and `release_tombstone_coupled`
+        /// would unlink it.
+        #[test]
+        fn raced_tombstone_replacement_is_not_deleted_by_release() {
+            let directory = TestDirectory::new("tombstone-raced");
+            let parent = open_parent_dir(directory.path());
+            let moved = directory.path().join("moved-tombstone.tmp");
+            let moved_for_closure = moved.clone();
+            let watched = directory.path().to_path_buf();
+
+            with_tombstone_creation_interpose(
+                Box::new(move |parent, tombstone_leaf| {
+                    if !handle_is_directory(parent, &watched) {
+                        return;
+                    }
+                    let name = watched.join(tombstone_leaf);
+                    fs::rename(&name, &moved_for_closure)
+                        .expect("move the just-created tombstone aside");
+                    fs::write(&name, b"foreign tombstone")
+                        .expect("install the writer's object at the tombstone name");
+                }),
+                || {
+                    let (name, _handle, identity) = create_reversal_tombstone_coupled(&parent)
+                        .expect("create the coupled tombstone");
+                    release_tombstone_coupled(&parent, &name, identity.as_ref());
+
+                    assert_eq!(
+                        fs::read(directory.path().join(&name)).expect("read the tombstone name"),
+                        b"foreign tombstone",
+                        "a writer's replacement of the tombstone name must never be deleted"
+                    );
+                    assert_eq!(
+                        fs::read(&moved).expect("read the moved tombstone"),
+                        b"",
+                        "the object the O_EXCL creation made must survive where it was moved"
+                    );
+                },
+            );
+        }
+
+        /// A writer that replaces the parked NAME between the identity
+        /// capture and the removal must have its object preserved, not
+        /// deleted: the removal is coupled to the captured object through an
+        /// atomic exchange/quarantine, so the writer's object is exchanged
+        /// back untouched.
+        #[test]
+        fn raced_parked_replacement_between_capture_and_removal_survives() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let directory = TestDirectory::new("parked-raced-removal");
+            fs::write(directory.path().join("victim.flac"), b"victim bytes")
+                .expect("write the victim leaf");
+            let parent = open_parent_dir(directory.path());
+            let expected = leaf_identity_at(&parent, OsStr::new("victim.flac"))
+                .expect("stat victim")
+                .expect("victim exists");
+            let moved = directory.path().join("moved-captured");
+            let moved_for_closure = moved.clone();
+            let watched = directory.path().to_path_buf();
+            let once = AtomicBool::new(false);
+
+            with_parked_removal_interpose(
+                Box::new(move |parent, parked_leaf| {
+                    if !handle_is_directory(parent, &watched) || once.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    let parked = watched.join(parked_leaf);
+                    fs::rename(&parked, &moved_for_closure)
+                        .expect("move the captured original aside");
+                    fs::write(&parked, b"foreign parked")
+                        .expect("install the writer's object at the parked name");
+                }),
+                || {
+                    let removed =
+                        remove_leaf_coupled(&parent, OsStr::new("victim.flac"), Some(&expected))
+                            .expect("a foreign replacement must be preserved, not fail");
+                    assert!(!removed, "a foreign replacement must be reported preserved");
+                },
+            );
+
+            assert!(
+                directory_contains_bytes(directory.path(), b"foreign parked"),
+                "the writer's replacement of the parked name must survive the removal"
+            );
+            assert_eq!(
+                fs::read(&moved).expect("read the moved captured original"),
+                b"victim bytes",
+                "the captured original must survive wherever the writer moved it"
+            );
+        }
+
+        /// A post-removal failure that cannot return the retained original to
+        /// the recorded backup name must carry the original's ACTUAL location
+        /// and settled identity, so the caller records where rollback can find
+        /// it instead of a backup path that no longer names anything.
+        #[test]
+        fn post_removal_failure_records_the_actual_quarantine_location() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let directory = TestDirectory::new("stranded-original");
+            let from_leaf = OsStr::new("from.flac");
+            let backup_leaf = OsStr::new(".tributary-backup-stranded");
+            let from_path = directory.path().join(from_leaf);
+            let backup_path = directory.path().join(backup_leaf);
+            fs::write(&from_path, b"original bytes").expect("write the displaced original");
+            fs::hard_link(&from_path, &backup_path).expect("bind the backup to the original");
+            let parent = open_parent_dir(directory.path());
+            let retained_identity = leaf_identity_at(&parent, from_leaf)
+                .expect("stat the original")
+                .expect("the original exists");
+
+            // Remove the backup NAME after the staged link is gone, forcing
+            // the post-removal exchange to report `ENOENT` and take the
+            // no-replace fallback; then recreate the name so the fallback
+            // fails closed. The original is left at the private quarantine.
+            let watched = directory.path().to_path_buf();
+            let once = AtomicBool::new(false);
+            let once_for_fallback = AtomicBool::new(false);
+            let backup_name = backup_leaf.to_os_string();
+
+            with_post_removal_interpose(
+                Box::new(move |parent, removed_backup| {
+                    if !handle_is_directory(parent, &watched)
+                        || removed_backup != backup_name.as_os_str()
+                        || once.swap(true, Ordering::SeqCst)
+                    {
+                        return;
+                    }
+                    fs::remove_file(watched.join(removed_backup))
+                        .expect("remove the backup name before the post-removal exchange");
+                }),
+                || {
+                    let watched_fallback = directory.path().to_path_buf();
+                    let backup_name_fallback = backup_leaf.to_os_string();
+                    with_no_replace_fallback_interpose(
+                        Box::new(move |parent, backup| {
+                            if !handle_is_directory(parent, &watched_fallback)
+                                || backup != backup_name_fallback.as_os_str()
+                                || once_for_fallback.swap(true, Ordering::SeqCst)
+                            {
+                                return;
+                            }
+                            fs::write(watched_fallback.join(backup), b"foreign backup")
+                                .expect("recreate the backup name inside the fallback window");
+                        }),
+                        || {
+                            let error = drop_redundant_staged_link_coupled(
+                                &parent,
+                                from_leaf,
+                                backup_leaf,
+                                &backup_path,
+                                &retained_identity,
+                            )
+                            .expect_err("a failing post-removal move must surface an error");
+
+                            let stranded = error
+                                .get_ref()
+                                .and_then(|payload| {
+                                    payload.downcast_ref::<StrandedDisplacedOriginal>()
+                                })
+                                .expect("the failure must carry the original's actual location");
+                            assert_ne!(
+                                stranded.location_leaf.as_os_str(),
+                                backup_leaf,
+                                "the original is not at the backup name; its actual location must be recorded"
+                            );
+                            assert!(
+                                stranded.identity.same_object(&retained_identity),
+                                "the recorded identity must name the retained original"
+                            );
+                            assert_eq!(
+                                fs::read(directory.path().join(&stranded.location_leaf))
+                                    .expect("read the original at its recorded location"),
+                                b"original bytes",
+                                "the original must be recoverable from the recorded location"
+                            );
+                            assert_eq!(
+                                fs::read(directory.path().join(backup_leaf))
+                                    .expect("read the backup name"),
+                                b"foreign backup",
+                                "the writer's recreation of the backup name must survive"
+                            );
+                        },
+                    );
+                },
+            );
         }
     }
 
