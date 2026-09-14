@@ -4317,6 +4317,40 @@ mod tests {
         .expect("post-mutation catalogue refresh settles");
     }
 
+    /// Wait until a source's post-mutation pending identities are fully
+    /// consumed.
+    ///
+    /// Settlement-confirmed consumption runs in the accepting generation's
+    /// `on_acceptance` hook, which the lifecycle runs only after it releases
+    /// its state lock and removes the lane. A
+    /// [`wait_for_post_mutation_refresh_settled`] that observes the lane gone
+    /// can therefore still race that hook: the two take different locks, so
+    /// "settled" does not yet imply "consumed". A test that asserts a later
+    /// save re-reads only its own identity must first wait for the accepted
+    /// generation's hook to drain the batch it observed published; otherwise
+    /// the later save clones the not-yet-consumed union and re-reads the
+    /// identities the accepted generation already published. This barrier
+    /// keys on the same mutex the hook consumes under, so observing the
+    /// drained map happens-after the hook's consumption.
+    async fn wait_for_mutation_refresh_pending_drained(
+        registry: &SourceRegistry,
+        source_id: SourceId,
+    ) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let drained = lock(&registry.inner.mutation_refresh_pending)
+                    .get(&source_id)
+                    .is_none_or(|pending| pending.is_empty());
+                if drained {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an accepted generation consumed its pending post-mutation identities");
+    }
+
     #[tokio::test]
     async fn post_mutation_refresh_refusal_is_never_a_lane_failure() {
         let registry = registry();
@@ -4749,6 +4783,12 @@ mod tests {
 
         // Consumption is settlement-confirmed: the successor's acceptance
         // emptied the batch, so a later save re-reads only its own identity.
+        // The successor's settlement and its consumption are observed through
+        // different locks (the lane removal above, the pending map in the
+        // acceptance hook), so wait for the hook to drain the batch before
+        // saving again — otherwise this save clones and re-reads the
+        // identities the successor already published.
+        wait_for_mutation_refresh_pending_drained(&registry, source_id).await;
         let third_generation =
             registry.refresh_catalogue_after_mutation(&[(source_id, third_track.clone())])[0];
         probe.wait_for_post_mutation_calls(3).await;
@@ -4886,7 +4926,11 @@ mod tests {
 
         // The clean single-save path still empties the batch on acceptance:
         // the third save's settlement consumed its batch, so a later clean
-        // save re-reads only its own identity.
+        // save re-reads only its own identity. As above, the lane removal and
+        // the acceptance hook's consumption are observed through different
+        // locks, so wait for the accepted generation to drain the pending map
+        // before the next save.
+        wait_for_mutation_refresh_pending_drained(&registry, source_id).await;
         let fourth_generation =
             registry.refresh_catalogue_after_mutation(&[(source_id, fourth_track.clone())])[0];
         probe.wait_for_post_mutation_calls(4).await;
