@@ -409,9 +409,9 @@ pub async fn resolve_track(
             // still queued or running (2026-09-14 review finding).
             let _probe_permit = probe_permit;
             #[cfg(test)]
-            let _park = probe_park::enter_if_watched(&probe_track_id);
+            let probe_park_guard = probe_park::enter_if_watched(&probe_track_id);
             #[cfg(test)]
-            if let Some(park) = _park.as_ref() {
+            if let Some(park) = probe_park_guard.as_ref() {
                 park.wait_for_release();
             }
             let authority = Arc::new(RootAuthorityLease::acquire(
@@ -992,6 +992,34 @@ mod tests {
         }
     }
 
+    /// Spawn `attempt_count` real `resolve_track` calls for `track`, returning
+    /// their handles so the caller can simulate recycled rows by aborting them.
+    fn spawn_resolution_attempts(
+        db: &Arc<DatabaseConnection>,
+        roots: &[String],
+        track: &str,
+        attempt_count: usize,
+    ) -> Vec<tokio::task::JoinHandle<Result<ResolvedLocalMedia, LocalMediaResolutionError>>> {
+        (0..attempt_count)
+            .map(|_| {
+                let db = Arc::clone(db);
+                let roots = roots.to_vec();
+                let track = track.to_string();
+                tokio::spawn(async move { resolve_track(&db, &track, &roots).await })
+            })
+            .collect()
+    }
+
+    /// Wait until the watched probe count reaches `target`, panicking with
+    /// `message` if it does not within the two-second budget.
+    async fn wait_for_probe_count(target: usize, message: &'static str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while probe_park::in_flight() != target {
+            assert!(tokio::time::Instant::now() < deadline, "{message}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     #[tokio::test]
     async fn recycled_rows_cannot_grow_the_authority_probe_backlog_past_the_bound() {
         let db = database().await;
@@ -1003,10 +1031,7 @@ mod tests {
         // `probe_park` is process-global, so watch a private id: sibling
         // tests run in parallel and resolve their own tracks.
         const TRACK: &str = "bounded-probe-track";
-        model(TRACK, &path)
-            .insert(&db)
-            .await
-            .expect("insert track");
+        model(TRACK, &path).insert(&db).await.expect("insert track");
 
         let db = Arc::new(db);
         probe_park::watch(TRACK);
@@ -1014,26 +1039,16 @@ mod tests {
 
         // Submit several times the permitted concurrency, then let the
         // resolutions reach the point where their blocking probes run.
-        let attempt_count = MAX_CONCURRENT_AUTHORITY_PROBES * 3;
-        let mut attempts = Vec::with_capacity(attempt_count);
-        for _ in 0..attempt_count {
-            let db = Arc::clone(&db);
-            let roots = roots.clone();
-            attempts.push(tokio::spawn(async move {
-                resolve_track(&db, TRACK, &roots).await
-            }));
-        }
+        let attempts =
+            spawn_resolution_attempts(&db, &roots, TRACK, MAX_CONCURRENT_AUTHORITY_PROBES * 3);
 
         // The gate is the only thing that can keep the rest of the probes
         // out; wait until every permit is held by a parked probe.
-        let bound_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while probe_park::in_flight() < MAX_CONCURRENT_AUTHORITY_PROBES {
-            assert!(
-                tokio::time::Instant::now() < bound_deadline,
-                "fewer than {MAX_CONCURRENT_AUTHORITY_PROBES} probes entered the gate"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_for_probe_count(
+            MAX_CONCURRENT_AUTHORITY_PROBES,
+            "fewer than the bound of probes entered the gate",
+        )
+        .await;
         assert_eq!(
             probe_park::peak(),
             MAX_CONCURRENT_AUTHORITY_PROBES,
@@ -1055,14 +1070,7 @@ mod tests {
         );
 
         probe_park::release();
-        let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while probe_park::in_flight() != 0 {
-            assert!(
-                tokio::time::Instant::now() < drain_deadline,
-                "parked probes did not finish after release"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_for_probe_count(0, "parked probes did not finish after release").await;
         assert_eq!(
             probe_park::peak(),
             MAX_CONCURRENT_AUTHORITY_PROBES,
