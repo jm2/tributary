@@ -1457,42 +1457,51 @@ fn dependabot_automerge_inspection_and_metadata_stay_read_only_and_head_bound() 
 }
 
 #[test]
-// These assertions jointly prove one privileged boundary and should fail as a
-// unit if an action, permission, concurrency rule, or exact-head guard regresses.
+// These assertions jointly prove the staged read-only boundary and should fail
+// as a unit if an action, write permission, concurrency rule, or exact-head
+// guard regresses. The readiness job inspects and reports; it can never enable
+// native auto-merge.
 // #lizard forgives
-fn dependabot_automerge_writer_is_action_free_concurrent_and_exact_head_guarded() {
+fn dependabot_automerge_readiness_is_read_only_action_free_and_exact_head_guarded() {
     let workflow = dependabot_automerge_workflow();
-    let writer = &workflow["jobs"]["dependabot-automerge"];
-    assert_eq!(writer["needs"].as_str(), Some("inspect_changed_files"));
-    assert_eq!(writer["permissions"]["contents"].as_str(), Some("write"));
+    let readiness = &workflow["jobs"]["dependabot-readiness"];
+    assert_eq!(readiness["needs"].as_str(), Some("inspect_changed_files"));
+    assert_eq!(readiness["permissions"]["contents"].as_str(), Some("read"));
     assert_eq!(
-        writer["permissions"]["pull-requests"].as_str(),
-        Some("write")
+        readiness["permissions"]["pull-requests"].as_str(),
+        Some("read")
     );
     assert!(
-        writer["if"]
+        readiness["permissions"].as_mapping().is_some_and(|permissions| {
+            permissions
+                .values()
+                .all(|value| value.as_str() == Some("read"))
+        }),
+        "the readiness inspection must hold only read scopes"
+    );
+    assert!(
+        readiness["if"]
             .as_str()
             .is_some_and(|condition| condition.contains(
                 "needs.inspect_changed_files.outputs.privileged_workflow_unchanged == 'true'"
             )),
-        "the write job must depend on an affirmative read-only inspection result"
+        "the readiness job must depend on an affirmative read-only inspection result"
     );
-    let writer_steps = writer["steps"]
+    let readiness_steps = readiness["steps"]
         .as_sequence()
-        .expect("write job steps must be a sequence");
-    // Exactly one action may appear in the write job: the pinned GitHub-org
+        .expect("readiness job steps must be a sequence");
+    // Exactly one action may appear in the readiness job: the pinned GitHub-org
     // app-token minter. It executes no repository code — it only signs a JWT
     // and exchanges it for an installation token — and checkout remains
-    // forbidden; anything else reintroduces an unreviewed execution context
-    // into the only job that can enable auto-merge.
-    let used_steps: Vec<&serde_yaml::Value> = writer_steps
+    // forbidden; anything else reintroduces an unreviewed execution context.
+    let used_steps: Vec<&serde_yaml::Value> = readiness_steps
         .iter()
         .filter(|step| step.get("uses").is_some())
         .collect();
     assert_eq!(
         used_steps.len(),
         1,
-        "the write-capable job must contain exactly one action: the pinned ruleset-reader token minter"
+        "the readiness job must contain exactly one action: the pinned ruleset-reader token minter"
     );
     assert!(
         used_steps.first().is_some_and(|step| step["uses"].as_str()
@@ -1500,9 +1509,9 @@ fn dependabot_automerge_writer_is_action_free_concurrent_and_exact_head_guarded(
         "the token minter must be the GitHub-org action pinned to its full commit SHA"
     );
     assert_eq!(
-        writer_steps.len(),
-        3,
-        "the write-capable job must contain only the token mint, the live-ruleset precondition, and the guarded merge command"
+        readiness_steps.len(),
+        2,
+        "the readiness job must contain only the token mint and the inline readiness report"
     );
     assert_eq!(
         workflow["concurrency"]["cancel-in-progress"].as_bool(),
@@ -1528,7 +1537,6 @@ fn dependabot_automerge_writer_is_action_free_concurrent_and_exact_head_guarded(
             && DEPENDABOT_AUTOMERGE.contains("pre_metadata_head")
             && DEPENDABOT_AUTOMERGE.contains("metadata_head")
             && DEPENDABOT_AUTOMERGE.contains("observed_head")
-            && DEPENDABOT_AUTOMERGE.contains("--match-head-commit")
             && DEPENDABOT_AUTOMERGE.contains(".previous_filename")
             && DEPENDABOT_AUTOMERGE.contains("observed_changed_files")
             && DEPENDABOT_AUTOMERGE.contains(
@@ -1554,6 +1562,15 @@ fn dependabot_automerge_writer_is_action_free_concurrent_and_exact_head_guarded(
                 "!contains(needs.inspect_changed_files.outputs.dependency_names, 'dependabot/fetch-metadata')"
             ),
         "Dependabot automation must be pinned, checkout-free, exact-head API-preflighted, narrowly admitted, race-contained, mixed-path self-update-safe, and refuse toolchain auto-merge"
+    );
+    // The staged boundary: no write path may survive anywhere in the workflow.
+    assert!(
+        !DEPENDABOT_AUTOMERGE.contains("gh pr merge")
+            && !DEPENDABOT_AUTOMERGE.contains("--match-head-commit")
+            && !DEPENDABOT_AUTOMERGE.contains("--auto")
+            && !DEPENDABOT_AUTOMERGE.contains("contents: write")
+            && !DEPENDABOT_AUTOMERGE.contains("pull-requests: write"),
+        "the staged implementation must contain no auto-merge write path at all"
     );
 }
 
@@ -2185,40 +2202,47 @@ fn bot_review_gate_substitution_waiver_is_scoped_and_audited() {
     );
 }
 
-// The auto-merge writer must hold exactly contents + pull-requests on the
-// workflow GITHUB_TOKEN: `administration` is not a valid GITHUB_TOKEN scope
-// and declaring it makes GitHub reject the whole workflow at validation.
-fn assert_writer_permissions_are_valid_github_token_scopes(workflow: &serde_yaml::Value) {
-    let writer = &workflow["jobs"]["dependabot-automerge"];
-    let writer_permissions = writer["permissions"]
+// The staged readiness job must hold only read scopes on the workflow
+// GITHUB_TOKEN: `administration` is not a valid GITHUB_TOKEN scope and
+// declaring it makes GitHub reject the whole workflow at validation, and any
+// write scope would contradict the read-only staged boundary.
+fn assert_readiness_permissions_are_read_only_valid_scopes(workflow: &serde_yaml::Value) {
+    let readiness = &workflow["jobs"]["dependabot-readiness"];
+    let permissions = readiness["permissions"]
         .as_mapping()
-        .expect("writer permissions must be a mapping");
+        .expect("readiness permissions must be a mapping");
     assert_eq!(
-        writer_permissions.len(),
+        permissions.len(),
         2,
-        "the writer must hold exactly contents and pull-requests on the workflow GITHUB_TOKEN"
+        "the readiness job must hold exactly contents and pull-requests on the workflow GITHUB_TOKEN"
     );
-    assert_eq!(writer["permissions"]["contents"].as_str(), Some("write"));
+    assert_eq!(readiness["permissions"]["contents"].as_str(), Some("read"));
     assert_eq!(
-        writer["permissions"]["pull-requests"].as_str(),
-        Some("write")
+        readiness["permissions"]["pull-requests"].as_str(),
+        Some("read")
     );
     assert!(
-        writer["permissions"].get("administration").is_none(),
+        permissions
+            .values()
+            .all(|value| value.as_str() == Some("read")),
+        "the staged readiness job must hold only read scopes"
+    );
+    assert!(
+        readiness["permissions"].get("administration").is_none(),
         "administration is not a GITHUB_TOKEN scope and must never be declared"
     );
 }
 
 // The ruleset read must authenticate with a single-purpose minted GitHub App
-// installation token (administration: read only), and the ruleset
-// precondition must be the writer's next step, ahead of any merge request.
+// installation token (administration: read only), and the readiness report
+// must be the mint's next step; there is no merge request anywhere after it.
 fn assert_ruleset_read_uses_the_minted_app_token(workflow: &serde_yaml::Value) {
-    let writer = &workflow["jobs"]["dependabot-automerge"];
-    let writer_steps = writer["steps"]
+    let readiness = &workflow["jobs"]["dependabot-readiness"];
+    let readiness_steps = readiness["steps"]
         .as_sequence()
-        .expect("write job steps must be a sequence");
+        .expect("readiness job steps must be a sequence");
     assert!(
-        writer_steps
+        readiness_steps
             .first()
             .is_some_and(|step| step["name"].as_str()
                 == Some("Mint a read-only ruleset-reader token")
@@ -2231,16 +2255,16 @@ fn assert_ruleset_read_uses_the_minted_app_token(workflow: &serde_yaml::Value) {
                     == Some("${{ secrets.RULESET_READER_APP_PRIVATE_KEY }}")),
         "the ruleset read must authenticate with a minted installation token restricted to administration: read"
     );
-    let precondition = writer_steps.get(1).expect("precondition step must exist");
+    let report = readiness_steps.get(1).expect("readiness step must exist");
     assert_eq!(
-        precondition["env"]["GH_TOKEN"].as_str(),
+        report["env"]["GH_TOKEN"].as_str(),
         Some("${{ steps.ruleset_reader.outputs.token }}"),
-        "the ruleset precondition must use the minted read-only token, not the workflow GITHUB_TOKEN"
+        "the readiness report must use the minted read-only token, not the workflow GITHUB_TOKEN"
     );
     assert_eq!(
-        precondition["name"].as_str(),
-        Some("Require the live ruleset to enforce the full policy gate"),
-        "the ruleset precondition must run before any merge request"
+        report["name"].as_str(),
+        Some("Report live-ruleset readiness for the full policy gate"),
+        "the readiness diagnostic must be the step after the token mint"
     );
 }
 
@@ -2301,16 +2325,16 @@ fn assert_precondition_enforces_the_full_policy() {
         "the precondition must refuse auto-merge unless the live ruleset enforces require-conversation-resolution"
     );
     assert!(
-        DEPENDABOT_AUTOMERGE.contains("Refusing to enable auto-merge")
-            && DEPENDABOT_AUTOMERGE.contains("refusing auto-merge"),
-        "every query failure or coverage gap must keep routine auto-merge off"
+        DEPENDABOT_AUTOMERGE.contains("Refusing to report readiness")
+            && DEPENDABOT_AUTOMERGE.contains("readiness inspection fails closed"),
+        "every query failure or coverage gap must fail the readiness diagnostic closed"
     );
 }
 
 #[test]
-fn dependabot_automerge_waits_for_the_live_full_policy_ruleset() {
+fn dependabot_readiness_reports_the_live_full_policy_ruleset() {
     let workflow = dependabot_automerge_workflow();
-    assert_writer_permissions_are_valid_github_token_scopes(&workflow);
+    assert_readiness_permissions_are_read_only_valid_scopes(&workflow);
     assert_ruleset_read_uses_the_minted_app_token(&workflow);
     assert_precondition_enforces_the_full_policy();
 }
