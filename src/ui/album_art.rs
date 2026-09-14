@@ -115,6 +115,11 @@ impl RequestLiveness {
 #[derive(Clone)]
 pub struct ScopedArtFetch {
     valid: Arc<AtomicBool>,
+    /// Wakeup for work parked on [`ScopedArtFetch::wait_revoked`]. The
+    /// built-in local album-pane resolution awaits this so a rebind can
+    /// cancel a pending `resolve_track` probe instead of running it to
+    /// completion for a row the user has already scrolled past.
+    revoked: Arc<tokio::sync::Notify>,
 }
 
 impl Default for ScopedArtFetch {
@@ -127,19 +132,39 @@ impl ScopedArtFetch {
     pub fn new() -> Self {
         Self {
             valid: Arc::new(AtomicBool::new(true)),
+            revoked: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     /// Stop the fetch this token was minted for. Idempotent and safe to
     /// call from any thread; every future [`ScopedArtFetch::is_live`]
-    /// observation on this token returns `false`.
+    /// observation on this token returns `false`, and every
+    /// [`ScopedArtFetch::wait_revoked`] waiter is woken.
     pub fn revoke(&self) {
         self.valid.store(false, Ordering::Relaxed);
+        self.revoked.notify_waiters();
     }
 
     /// `true` while the fetch may still run, reply, and paint.
     pub fn is_live(&self) -> bool {
         self.valid.load(Ordering::Relaxed)
+    }
+
+    /// Wait until this token is revoked, returning immediately if it
+    /// already is.
+    ///
+    /// Interest is registered before the liveness re-check, so a
+    /// concurrent `revoke` between the check and the await still wakes
+    /// this waiter — `Notified::enable` is what closes that lost-wakeup
+    /// race for `notify_waiters` (which stores no permit).
+    pub async fn wait_revoked(&self) {
+        let notified = self.revoked.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.is_live() {
+            return;
+        }
+        notified.await;
     }
 }
 
