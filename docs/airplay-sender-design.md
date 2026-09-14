@@ -2,6 +2,33 @@
 
 Status: design record, no implementation in this bead.
 
+Revision 18 (2026-09-14, corrective pass). This revision answers the
+fresh exact-head Codex review at the `4238d88` head (thread
+`PRRT_kwDOR1IXks6iAkRf`) with one contract fix to §4.1/§4.3/§9,
+docs-only: in-flight cancellation registrations are **keyed per
+ticket/generation**, not a single per-proxy slot. Revision 17
+guaranteed immediate replacement activation — a replacement load B may
+begin `open_session` after superseding load A while A's cancellation
+cleanup is still running — but the cancellation-registration contract
+still installed into one per-proxy slot and §4.1/§4.3 said "at most one
+handle is installed per proxy at a time". Those cannot both hold: one
+slot cannot also register B, and replacing it would let A's guard later
+deregister B, while refusing B would leave Stop or a subsequent
+replacement unable to abort B's blocked operation. Registrations are
+now keyed by the registering load's ticket identity (equivalently its
+per-load generation): `register_in_flight_cancel` installs this load's
+`OpenCancel` under its own key, teardown (Stop, the proxy's `Drop`,
+replacement preparation) cancels the handle registered for *the ticket
+it is superseding* in the same state-locked step that custodies that
+ticket — so each load's cancellation is reached independently and a
+superseded load A's still-installed registration is never cancelled in
+place of B's — and the RAII guard's `Drop` removes only its own keyed
+entry, never a concurrent load's. Concurrent registrations therefore
+coexist exactly as keyed recovery custody does. The §4.1/§4.3 contract
+and acceptance item 12 (new trace F: A's cleanup overlapping B's
+registration and B's cancellation) state the keyed invariant. It
+changes the design record only.
+
 Revision 17 (2026-09-14, corrective pass). This revision answers the
 fresh exact-head Codex review at the `d0c71f4` head (review `5193475063`,
 threads `PRRT_kwDOR1IXks6h-bFc` and `PRRT_kwDOR1IXks6h-bFg`) with two
@@ -897,13 +924,21 @@ impl MediaTicketCustody {
 
     /// Register this call's `OpenCancel` with the proxy for the
     /// duration of one `open_session` call, returning an RAII guard
-    /// that deregisters when the call returns. Registration is what
-    /// lets explicit teardown and replacement preparation reach the
-    /// in-flight open: they cancel the registered handle in the same
-    /// state-locked step that custodies the still-active ticket, so
-    /// the blocked operation is aborted rather than awaited, and a
-    /// stale open cannot remain blocked, keep mutating, or return
-    /// `Opened`. **Registration runs under the proxy's state lock and
+    /// that deregisters when the call returns. Registrations are
+    /// **keyed by the registering load's ticket identity** — the same
+    /// pointer-identity key its custody entry uses; a per-load
+    /// generation is an equivalent key — never a single per-proxy
+    /// slot. A replacement load B therefore installs its own keyed
+    /// registration while a superseded load A's guard is still
+    /// installed, so teardown reaches each load's blocked operation
+    /// independently and A's `Drop` cannot deregister B. Registration
+    /// is what lets explicit teardown and replacement preparation
+    /// reach the in-flight open: they cancel the handle registered for
+    /// *the ticket they are superseding* in the same state-locked step
+    /// that custodies that still-active ticket, so the blocked
+    /// operation is aborted rather than awaited, and a stale open
+    /// cannot remain blocked, keep mutating, or return `Opened`.
+    /// **Registration runs under the proxy's state lock and
     /// is superseded-checked, not merely lock-safe.** In that same
     /// locked step it observes whether this load's lease is already
     /// custodied — or its preparation generation already superseded —
@@ -929,8 +964,12 @@ impl MediaTicketCustody {
     /// cancellable from the teardown thread, that registration and
     /// deregistration run under the proxy's state lock, that
     /// registration atomically observes a prior supersession before
-    /// installing anything, and that no registered handle is left
-    /// installed once `open_session` returns.
+    /// installing anything, that each registration is keyed and its
+    /// guard's `Drop` removes only its own entry — never a concurrent
+    /// load's — and that no registered handle is left installed once
+    /// `open_session` returns. The concrete key (ticket pointer
+    /// identity or register-time generation) is the implementation
+    /// record's choice.
     fn register_in_flight_cancel(&self, cancel: &OpenCancel) -> InFlightCancelRegistration;
 }
 
@@ -956,9 +995,14 @@ impl MediaTicketCustody {
 /// an open can distinguish "registration succeeded, proceed" from
 /// "this load was superseded before it could register" and never
 /// confuse the two. Registration begins before the call blocks and
-/// ends when it returns (the guard's `Drop`), so at most one handle is
-/// installed per proxy at a time and a cancelled open cannot outlive
-/// its own registration.
+/// ends when it returns (the guard's `Drop`). Each registration is
+/// **keyed by the registering load's ticket identity** (§4.1), so
+/// concurrent loads' registrations coexist: a guard's `Drop`
+/// removes only its own keyed entry and never deregisters another
+/// load's handle, and teardown cancels only the entry keyed by the
+/// ticket it supersedes. A cancelled open therefore cannot outlive
+/// its own registration — its own guard still removes that entry —
+/// and cannot have another load's registration removed under it.
 struct InFlightCancelRegistration { /* the implementation record's primitive */ }
 
 /// Stable, machine-distinguishable seam failures. The load path's
@@ -1069,16 +1113,19 @@ enum SenderError {
 /// The load path sets the flag when the load is dropped or its
 /// generation is superseded: exactly the conditions the event
 /// contract already keys on. For an open that is *in flight*, the
-/// proxy registers this handle in its state
-/// (`MediaTicketCustody::register_in_flight_cancel`, §4.1) and the
-/// state-locked teardown step — Stop, the proxy's `Drop`, or
-/// replacement preparation — cancels it in the same critical section
-/// that moves the still-active ticket into recovery custody, so the
+/// proxy registers this handle in its state under the load's ticket
+/// key (`MediaTicketCustody::register_in_flight_cancel`, §4.1) and
+/// the state-locked teardown step — Stop, the proxy's `Drop`, or
+/// replacement preparation — cancels the handle registered for the
+/// ticket it is superseding in the same critical section
+/// that moves that still-active ticket into recovery custody, so the
 /// flag is set synchronously with supersession rather than only
-/// compared after the fact. That registration is itself
-/// superseded-checked: it runs under the same state lock and observes
-/// a lease already custodied before the handle was installed, in
-/// which case it installs nothing and the open yields its `Cancelled`
+/// compared after the fact. Registrations are keyed, so each
+/// in-flight load's handle is cancellable independently and a
+/// concurrent load's registration is untouched. That registration is
+/// itself superseded-checked: it runs under the same state lock and
+/// observes a lease already custodied before the handle was installed,
+/// in which case it installs nothing and the open yields its `Cancelled`
 /// outcome without negotiating (§4.1). This is deliberately not
 /// `PlayerEventGeneration` itself — a generation
 /// (`src/audio/mod.rs:85-87`) is a `Copy` value the caller compares
@@ -1273,10 +1320,11 @@ trait AirplaySender: Send + Sync {
     ///   finds the lease already custodied and removes nothing; if
     ///   replacement preparation runs first, in one state-locked step
     ///   it moves the still-active lease into that ticket's keyed
-    ///   custody entry and cancels the proxy-registered in-flight
-    ///   `OpenCancel` handle
-    ///   (cancelling that handle — not bumping the preparation
-    ///   generation — is the signal an in-flight open actually
+    ///   custody entry and cancels the in-flight `OpenCancel` handle
+    ///   registered for **that ticket** (registrations are keyed by
+    ///   ticket identity, §4.1, so a concurrent load's registration is
+    ///   left untouched; cancelling that keyed handle — not bumping the
+    ///   preparation generation — is the signal an in-flight open actually
     ///   observes, `:868-877`), and the open then observes the
     ///   cancellation with the lease already custodied. Supersession
     ///   therefore does not force `Cancelled`: a
@@ -1300,8 +1348,10 @@ trait AirplaySender: Send + Sync {
     ///   must not take and unconditionally revoke it either. In one
     ///   atomic step under the state lock they (a) move that in-flight
     ///   active ticket into its keyed custody entry and (b) cancel the
-    ///   in-flight open's registered `OpenCancel` handle — cancelling
-    ///   that handle, not a generation comparison, is how supersession
+    ///   `OpenCancel` handle registered for that ticket — registrations
+    ///   are keyed by ticket identity (§4.1), so a concurrent load's
+    ///   registration is untouched — and cancelling that keyed handle,
+    ///   not a generation comparison, is how supersession
     ///   reaches a blocked call — exactly as
     ///   `prepare_with_server_start` now does, so the open observes
     ///   cancellation with the lease already custodied and its recovery
@@ -1758,8 +1808,14 @@ Tributary talks to an OwnTone instance as a transmission service:
   active lease for an in-flight open whose canceled outcome has not
   reached its terminal quiesced state, teardown must move that active
   ticket into custody and, in the same state-locked critical section,
-  cancel the proxy's registered in-flight open handle — cancelling
-  that handle, not bumping the preparation generation, is the signal
+  cancel the in-flight open handle **registered for that ticket** —
+  registration is keyed by the registering load's ticket identity and
+  concurrent registrations coexist (§4.1), so teardown cancels exactly
+  the handle belonging to the load it is superseding and a superseded
+  load A's still-installed registration is never cancelled in place of
+  B's, while B's own registration remains independently cancellable
+  even before A's cleanup guard has dropped; cancelling that keyed
+  handle, not bumping the preparation generation, is the signal
   an in-flight open actually observes (§4.1) — exactly as the
   replacement path does — rather than take and revoke it. If the open
   has not yet registered (it is between the lease becoming active and
@@ -2363,7 +2419,11 @@ record for the selected path must add, at minimum:
     ticket identity (§4.1), not a single slot: every concurrently
     custodied ticket keeps its own entry, so no trace relies on a
     shared slot and a second superseded ticket can neither overwrite or
-    leak the first entry nor be released early. Every scenario asserts
+    leak the first entry nor be released early. In-flight cancellation
+    registrations are **likewise keyed by ticket identity** (§4.1), so
+    each load's `OpenCancel` is cancelled by teardown independently and
+    a registration guard's `Drop` deregisters only its own entry, never
+    a concurrent load's. Every scenario asserts
     the open's own loopback route is **not** revoked early:
     replacement preparation must preserve the superseded lease —
     moving it into that ticket's keyed custody entry rather than taking
@@ -2459,6 +2519,28 @@ record for the selected path must add, at minimum:
       the trace the single-slot contract could not represent: with one
       slot, either A would be overwritten/leaked or B revoked before
       quiescence.
+    - **F. Concurrent registration during a superseded load's
+      cleanup.** *Initial state:* load A registered its in-flight
+      `OpenCancel` and is negotiating; replacement load B supersedes A —
+      in one state-locked step A's still-active lease moves into A's
+      keyed custody entry and A's registered handle is cancelled — and B
+      becomes active; before A's `open_session` call returns, so A's
+      registration guard has not yet dropped, B registers its own
+      in-flight `OpenCancel`. *Trigger:* teardown while both
+      registrations are installed — Stop, or a second replacement C
+      superseding B. *Outcome and assertion:* B's registration installs
+      under **B's own** ticket key even though A's guard is still
+      installed, and the two registrations coexist. Teardown cancels
+      exactly B's keyed handle and leaves A's registration untouched,
+      and when A's call finally returns its guard's `Drop` removes only
+      A's keyed entry and never deregisters B's handle. The test asserts
+      A's cancellation reached A independently, B's cancellation reached
+      B independently, and neither guard's `Drop` removed the other
+      load's registration. This is the trace the single-slot
+      registration contract could not represent: with one slot, B's
+      registration would either overwrite A's — so A's guard would later
+      deregister B — or be refused, leaving Stop unable to abort B's
+      blocked operation.
 13. **Persistent-restoration-failure acceptance:** a restoration step
     fails while a `RecoveryPending` recovery is serialized. The test
     asserts the incomplete-takeover record is retained for the
