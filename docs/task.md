@@ -28,8 +28,8 @@ remains in [task-remediation-2026-07.md](task-remediation-2026-07.md).
 - Update this index, roadmap, and issue state in the implementing PR. Keep literal counters
   synchronized, count release/operator evidence separately, and never interpret counts as effort.
 
-Current status: **16/57 (28.1%)** implementation records complete: the retained baseline is
-**16/39**, with **0/11** new corrective and **0/7** engineering records complete. The earlier
+Current status: **17/57 (29.8%)** implementation records complete: the retained baseline is
+**17/39**, with **0/11** new corrective and **0/7** engineering records complete. The earlier
 15/39 headline was an arithmetic error. This expansion closes no feature record. The archived
 remediation remains **223/226 (98.7%)** after its documented exclusions; its three open environment
 validations are surfaced below. Eight feature issues and eleven filed bugs are open at this audit
@@ -401,8 +401,11 @@ full acceptance is binding; the checklist below indexes it. No new record has a 
   pairing, encrypted control, audio/timing, licensing, key provenance, packaging, and real-device
   tests.
 
-  In flight; #170 / `tr-vp9`, draft. Design acceptance includes protocol evidence,
-  licensing/key provenance, process/native packaging and representative device prerequisites.
+  In flight; #170 / `tr-vp9`, draft. The investigation document is
+  [`airplay-sender-design.md`](airplay-sender-design.md); implementation is deliberately deferred
+  to a subsequent bead once a maintainer accepts the seam refactor and policy review outlined
+  there. Design acceptance includes protocol evidence, licensing/key provenance, process/native
+  packaging and representative device prerequisites.
 
 - [ ] **P2.4-D** — Implement the selected maintained AirPlay sender path without presenting
   unsupported discovered receivers as playable; keep simultaneous multi-room sync out of scope
@@ -636,3 +639,7 @@ contains earlier PR delivery evidence and historical release counts.
   exposed Gas City dependencies/holds and release evidence. Preserved all 39 original record states.
   Corrected the old count to 16/39; eleven corrective and seven engineering additions yield
   16/57 (28.1%). This documentation update closes no feature acceptance.
+- **2026-09-12:** recounted the mechanical checklist: 17 of 57 top-level records are complete
+  (the retained baseline is 17/39), so the current-status counter now reads 17/57 (29.8%). The
+  completed P3.4-D record was already `- [x]`; no record state changed here. This documentation
+  update closes no feature acceptance.
