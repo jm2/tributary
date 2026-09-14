@@ -683,7 +683,7 @@ pub fn attach_runtime(state: &BrowserState, rt_handle: tokio::runtime::Handle) {
 
 /// Lightweight snapshot of track fields for filtering (avoids borrowing GObjects).
 #[derive(Clone)]
-struct TrackSnapshot {
+pub struct TrackSnapshot {
     #[allow(dead_code)] // Used by window.rs search filter via TrackObject, not directly here
     title: String,
     genre: String,
@@ -709,7 +709,7 @@ struct TrackSnapshot {
 }
 
 impl TrackSnapshot {
-    fn from_object(t: &TrackObject) -> Self {
+    pub fn from_object(t: &TrackObject) -> Self {
         Self {
             title: t.title(),
             genre: t.genre(),
@@ -1158,7 +1158,7 @@ fn populate_artists(
     }
 }
 
-fn populate_albums(
+pub fn populate_albums(
     store: &gio::ListStore,
     tracks: &[TrackSnapshot],
     genre_filter: &Option<String>,
