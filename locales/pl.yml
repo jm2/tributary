@@ -309,6 +309,7 @@ errors:
     audio_output_failed: "Wystąpił błąd wyjścia dźwięku"
     playback_failed: "Odtwarzanie dźwięku nie powiodło się"
     airplay_raopsink_missing: "Odtwarzanie AirPlay 1 jest niedostępne: ta kompilacja nie zawiera zgodnego nadajnika GStreamer raopsink"
+    airplay_owntone_unavailable: "AirPlay przez nadajnik OwnTone jest niedostępne: %{reason}"
     mpd_exclusive_control_required: "Dodaj ponownie to wyjście MPD, potwierdź wyłączną kontrolę nad partycją, a następnie wybierz je ponownie przed odtwarzaniem"
 
 # ── About dialog ───────────────────────────────────────────────────
