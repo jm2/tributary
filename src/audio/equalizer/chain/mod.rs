@@ -109,20 +109,27 @@ fn drop_limiter_from_bin(bin: &gst::Bin, clipper: &gst::Element) {
 }
 
 /// Test-only deterministic fault injection for the limiter-removal
-/// surgery. The variants model the two failure shapes the production
-/// code path must survive: the direct relink is refused once, or both
-/// the direct relink and the limiter-path restoration are refused. Each
-/// fault is consumed when it fires, so a subsequent call retries against
-/// the real graph — exactly the retry the caller's recorded-state
-/// discipline depends on.
+/// surgery. The variants model the failure shapes the production code
+/// path must survive: the direct relink is refused once; the direct
+/// relink and the limiter-path restoration are both refused; or every
+/// link the surgery can make — including the final forced direct
+/// link — is refused, leaving the `equalizer-10bands` src pad with no
+/// peer. Each fault is consumed when it fires, so a subsequent call
+/// retries against the real graph — exactly the retry the caller's
+/// recorded-state discipline depends on.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimiterRemoveFault {
     /// The direct `eq → post-convert` relink is refused; the
     /// limiter-path restoration then succeeds.
-    DirectRelink,
-    /// Both the direct relink and the limiter-path restoration fail.
+    DirectRelinkBlocked,
+    /// Both the direct relink and the limiter-path restoration fail;
+    /// the final forced direct link then succeeds.
     DirectRelinkAndRestore,
+    /// The direct relink, the limiter-path restoration, and the final
+    /// forced direct link all fail, leaving the `equalizer-10bands` src
+    /// pad unlinked.
+    EveryLinkBlocked,
 }
 
 // ── Installed chain ─────────────────────────────────────────────────────
@@ -140,6 +147,12 @@ pub struct EqChain {
     post_convert: gst::Element,
     /// `rglimiter` stage (`clipper`), present iff clip protection is on.
     clipper: Option<gst::Element>,
+    /// Set when a limiter edit and its rollback could not validate a
+    /// linked topology: the `equalizer-10bands` src pad has no peer and
+    /// the blocking probe was left installed. Once wedged, no further
+    /// topology edit is attempted; the pipeline is retired by the
+    /// eq-bin-originated bus error seam instead of resumed.
+    wedged: bool,
     /// Test-only armed surgery fault; production builds never carry it.
     #[cfg(test)]
     remove_fault: Option<LimiterRemoveFault>,
@@ -174,6 +187,7 @@ impl EqChain {
                 .iter()
                 .find(|element| element.name() == "clipper")
                 .cloned(),
+            wedged: false,
             #[cfg(test)]
             remove_fault: None,
         };
@@ -287,20 +301,34 @@ impl EqChain {
     /// or, as a fallback after a failed dynamic re-link, the pause/relink
     /// seam. Returns `false` when the surgery failed and the chain degraded
     /// to the no-limiter layout (recoverable per the contract).
+    ///
+    /// A wedged chain (an earlier edit and rollback left the
+    /// `equalizer-10bands` src pad unlinked) refuses every further edit: no
+    /// topology change can validate a linked graph, and the contract retires
+    /// the wedged pipeline instead of resuming it, so reporting a successful
+    /// toggle here would be untruthful.
     pub fn set_clip_protection(&mut self, soft: ClipProtection) -> bool {
+        if self.wedged {
+            return false;
+        }
         let graph = self.limiter_graph();
         // Precompute the test-fault decisions in the order the surgery
         // consumes them: the direct relink is always attempted, the
-        // restoration only after the direct relink is refused.
-        let direct_blocked = self.fault_blocks_direct_relink();
-        let restore_blocked = self.fault_blocks_restore();
-        edit_limiter_topology(
+        // restoration only after the direct relink is refused, and the
+        // forced direct link only after the restoration is refused.
+        let (direct_blocked, restore_blocked, forced_blocked) = self.take_limiter_fault_decisions();
+        let outcome = edit_limiter_topology(
             &graph,
             soft,
             &mut self.clipper,
             direct_blocked,
             restore_blocked,
-        )
+            forced_blocked,
+        );
+        if outcome == LimiterEditOutcome::Unlinked {
+            self.wedged = true;
+        }
+        outcome == LimiterEditOutcome::Installed
     }
 
     /// The element handles one in-bin limiter edit rewires. Cheap clones of
@@ -327,41 +355,73 @@ impl EqChain {
     /// returns `GST_PAD_PROBE_REMOVE` only over a validated topology: the
     /// new layout on success, or the pre-edit layout the surgery restores
     /// on a failed re-link, so blocked flow resumes across a valid chain.
+    /// When even the rollback cannot re-link the `equalizer-10bands` src
+    /// pad, the callback keeps the probe installed, posts the explicit
+    /// error diagnostic, and lets the ordinary eq-bin-originated bus seam
+    /// retire the wedged pipeline — it never resumes flow across an
+    /// unlinked pad (contract: *Live-reconfiguration boundary*).
+    ///
     /// A pipeline that never reports the pad idle within the bounded
     /// window is left untouched and the caller falls back to the
     /// pause/relink seam.
     ///
     /// Returns `Some(true)` when the requested toggle is installed,
     /// `Some(false)` when the dynamic re-link failed and the pre-edit
-    /// layout was restored (the caller retries via the pause/relink
-    /// seam), and `None` when the probe could not engage or no EQ src pad
-    /// exists.
+    /// layout was restored or the graph was left wedged (the caller retries
+    /// via the pause/relink seam, which refuses a wedged chain), and `None`
+    /// when the probe could not engage or no EQ src pad exists.
     pub fn swap_clip_protection_under_block_probe(&mut self, soft: ClipProtection) -> Option<bool> {
+        if self.wedged {
+            return Some(false);
+        }
         let eq_src = self.eq.static_pad("src")?;
         let graph = self.limiter_graph();
         // The probe callback runs on the streaming thread, so it cannot
         // borrow the chain: the owned `rglimiter` handle is threaded
-        // through a shared slot and the result is reported over a channel.
+        // through a shared slot and the outcome is reported over a channel.
+        // The test-fault decisions are resolved before the closure is built
+        // and captured by value, so the callback never touches the chain.
+        let (direct_blocked, restore_blocked, forced_blocked) = self.take_limiter_fault_decisions();
         let slot = Arc::new(Mutex::new(self.clipper.take()));
-        let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<LimiterEditOutcome>(1);
         let signal = Mutex::new(tx);
         let slot_cb = Arc::clone(&slot);
         let probe_id = eq_src.add_probe(
             gst::PadProbeType::BLOCK_DOWNSTREAM | gst::PadProbeType::IDLE,
             move |_pad, _info| {
-                let installed = {
+                let outcome = {
                     let mut current = slot_cb
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    edit_limiter_topology(&graph, soft, &mut current, false, false)
+                    edit_limiter_topology(
+                        &graph,
+                        soft,
+                        &mut current,
+                        direct_blocked,
+                        restore_blocked,
+                        forced_blocked,
+                    )
                 };
                 if let Ok(tx) = signal.lock() {
-                    let _ = tx.try_send(installed);
+                    let _ = tx.try_send(outcome);
                 }
-                // Uninstall the probe only now, over the validated
-                // topology, so blocked data flow resumes across a valid
-                // chain (and the caller learns the outcome).
-                gst::PadProbeReturn::Remove
+                if outcome == LimiterEditOutcome::Unlinked {
+                    // No linked topology exists. Keep the probe installed so
+                    // no buffer is ever pushed across the unlinked pad, post
+                    // the contract's explicit error diagnostic (the
+                    // eq-bin-originated bus seam retires the wedged
+                    // pipeline), and report the unmet toggle to the caller.
+                    post_wedged_topology_error(&graph);
+                    // `PadProbeReturn::Ok` leaves the probe installed:
+                    // the EQ src pad stays blocked, so no buffer crosses
+                    // the unlinked pad.
+                    gst::PadProbeReturn::Ok
+                } else {
+                    // Uninstall the probe only now, over the validated
+                    // topology, so blocked data flow resumes across a valid
+                    // chain (and the caller learns the outcome).
+                    gst::PadProbeReturn::Remove
+                }
             },
         );
         // A pad that reports idle synchronously runs the callback before
@@ -369,10 +429,15 @@ impl EqChain {
         // arrives over the channel. A missing outcome means the probe
         // could not engage (or the pad never went idle), so the graph is
         // left untouched for the caller's pause/relink fallback.
-        let installed = rx.recv_timeout(LIMITER_PROBE_ENGAGE_TIMEOUT).ok();
+        let outcome = rx.recv_timeout(LIMITER_PROBE_ENGAGE_TIMEOUT).ok();
+        let wedged = outcome == Some(LimiterEditOutcome::Unlinked);
         if let Some(probe_id) = probe_id {
-            // Harmless when the callback already uninstalled itself.
-            eq_src.remove_probe(probe_id);
+            // Harmless when the callback already uninstalled itself over a
+            // validated topology. A wedged callback returned `Keep`, so the
+            // probe must stay installed and is deliberately not removed.
+            if !wedged {
+                eq_src.remove_probe(probe_id);
+            }
         }
         // Adopt the handle the callback left in the slot (or the original
         // handle when the callback never ran).
@@ -381,12 +446,17 @@ impl EqChain {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         self.clipper = retained;
-        installed
+        if wedged {
+            self.wedged = true;
+        }
+        outcome.map(|outcome| outcome == LimiterEditOutcome::Installed)
     }
 
-    /// Test-only: whether the armed fault refuses the direct relink.
-    /// Fires once (the fault is consumed), so a later call retries the
-    /// real graph. Always `false` in production builds.
+    /// Test-only: resolve and consume the armed surgery fault into the
+    /// three link decisions the removal surgery takes, in the order it
+    /// consumes them — direct relink, limiter-path restoration, and the
+    /// final forced direct link. Consumed once, so a later call retries the
+    /// real graph. Always `(false, false, false)` in production builds.
     // The production body never reads the (test-only) fault field, so the
     // receiver is genuinely unused there; allow the pedantic lints rather
     // than split the method across cfg signatures.
@@ -394,44 +464,19 @@ impl EqChain {
         not(test),
         allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)
     )]
-    fn fault_blocks_direct_relink(&mut self) -> bool {
+    fn take_limiter_fault_decisions(&mut self) -> (bool, bool, bool) {
         #[cfg(test)]
         {
-            match self.remove_fault {
-                Some(LimiterRemoveFault::DirectRelink) => {
-                    self.remove_fault = None;
-                    true
-                }
-                // Consumed by the restoration step below.
-                Some(LimiterRemoveFault::DirectRelinkAndRestore) => true,
-                None => false,
+            match self.remove_fault.take() {
+                Some(LimiterRemoveFault::DirectRelinkBlocked) => (true, false, false),
+                Some(LimiterRemoveFault::DirectRelinkAndRestore) => (true, true, false),
+                Some(LimiterRemoveFault::EveryLinkBlocked) => (true, true, true),
+                None => (false, false, false),
             }
         }
         #[cfg(not(test))]
         {
-            false
-        }
-    }
-
-    /// Test-only: whether the armed fault refuses the limiter-path
-    /// restoration. Fires once. Always `false` in production builds.
-    #[cfg_attr(
-        not(test),
-        allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)
-    )]
-    fn fault_blocks_restore(&mut self) -> bool {
-        #[cfg(test)]
-        {
-            if self.remove_fault == Some(LimiterRemoveFault::DirectRelinkAndRestore) {
-                self.remove_fault = None;
-                true
-            } else {
-                false
-            }
-        }
-        #[cfg(not(test))]
-        {
-            false
+            (false, false, false)
         }
     }
 
@@ -447,6 +492,15 @@ impl EqChain {
     pub fn clip_protection_installed(&self) -> bool {
         self.clipper.is_some()
     }
+
+    /// True when a limiter edit and its rollback could not validate a linked
+    /// topology. A wedged chain refuses further edits; the blocking probe
+    /// stays installed and the ordinary eq-bin-originated bus seam retires
+    /// the wedged pipeline.
+    #[allow(dead_code)] // inspection helper; exercised by the contract tests
+    pub fn topology_wedged(&self) -> bool {
+        self.wedged
+    }
 }
 
 // ── Limiter surgery ─────────────────────────────────────────────────────
@@ -461,21 +515,67 @@ struct LimiterGraph {
     post_convert: gst::Element,
 }
 
+/// The validated state of the `equalizer-10bands` src pad after one limiter
+/// topology edit. This is what the blocking-probe callback needs to decide
+/// whether it may uninstall itself (contract: the callback never uninstalls
+/// the probe while the `equalizer-10bands` src pad has no linked downstream
+/// peer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LimiterEditOutcome {
+    /// The requested toggle is installed and the graph is linked.
+    Installed,
+    /// The requested toggle could not be installed, but the pre-edit layout
+    /// was restored and the graph is linked; the caller retries on the
+    /// pause/relink seam.
+    Restored,
+    /// The edit and its rollback both failed: the `equalizer-10bands` src
+    /// pad has no linked downstream peer. The probe must stay installed and
+    /// the wedged pipeline retired by the ordinary teardown seam.
+    Unlinked,
+}
+
+/// Whether the `equalizer-10bands` src pad currently has a linked downstream
+/// peer. The pad is the single boundary every limiter edit rewires, so this
+/// is the ground truth for the contract's "never uninstall the probe while
+/// the EQ src pad has no linked peer" rule.
+fn eq_src_has_linked_peer(graph: &LimiterGraph) -> bool {
+    graph
+        .eq
+        .static_pad("src")
+        .map(|src| src.peer().is_some())
+        .unwrap_or(false)
+}
+
+/// Post the contract's explicit error diagnostic for a wedged limiter edit:
+/// the message is sourced from the bin, so the ordinary
+/// eq-bin-originated bus seam retires the wedged pipeline. The blocking probe
+/// stays installed, so no buffer is ever pushed across the unlinked pad and
+/// this path cannot produce `GST_FLOW_NOT_LINKED`.
+fn post_wedged_topology_error(graph: &LimiterGraph) {
+    gst::element_error!(
+        graph.bin,
+        gst::CoreError::Failed,
+        ("equalizer limiter edit left the equalizer-10bands src pad unlinked; \
+          retiring the wedged pipeline with the blocking probe still installed")
+    );
+}
+
 /// Apply one limiter topology edit to `clipper`, the chain's owned
 /// `rglimiter` handle (`None` when clip protection is off). The handle is
 /// left matching the routed graph, so `clip_protection_installed` stays
-/// truthful. Returns whether the requested toggle is installed.
+/// truthful. Returns the validated topology the edit left behind.
 ///
-/// `direct_blocked`/`restore_blocked` are the test-only fault decisions for
-/// the removal surgery; production callers pass `false`.
+/// `direct_blocked`/`restore_blocked`/`forced_blocked` are the test-only
+/// fault decisions for the removal surgery; production callers pass `false`.
 fn edit_limiter_topology(
     graph: &LimiterGraph,
     soft: ClipProtection,
     clipper: &mut Option<gst::Element>,
     direct_blocked: bool,
     restore_blocked: bool,
-) -> bool {
-    match (soft, clipper.take()) {
+    forced_blocked: bool,
+) -> LimiterEditOutcome {
+    let requested_installed = match (soft, clipper.take()) {
         (ClipProtection::Soft, None) => match insert_limiter(graph) {
             Ok(installed) => {
                 *clipper = Some(installed);
@@ -484,8 +584,13 @@ fn edit_limiter_topology(
             Err(()) => false,
         },
         (ClipProtection::Off, Some(installed)) => {
-            let (landed, retained) =
-                remove_limiter(graph, installed, direct_blocked, restore_blocked);
+            let (landed, retained) = remove_limiter(
+                graph,
+                installed,
+                direct_blocked,
+                restore_blocked,
+                forced_blocked,
+            );
             *clipper = retained;
             landed
         }
@@ -497,6 +602,16 @@ fn edit_limiter_topology(
             *clipper = Some(installed);
             true
         }
+    };
+    // The peer check overrides the surgery's own success flag: an edit (or a
+    // no-op) that leaves the EQ src pad unlinked is never a resumable
+    // topology, even if the requested toggle nominally landed.
+    if !eq_src_has_linked_peer(graph) {
+        LimiterEditOutcome::Unlinked
+    } else if requested_installed {
+        LimiterEditOutcome::Installed
+    } else {
+        LimiterEditOutcome::Restored
     }
 }
 
@@ -557,12 +672,15 @@ fn insert_limiter(graph: &LimiterGraph) -> Result<gst::Element, ()> {
 /// `eq` source: the partial links are torn down, the limiter leaves the bin,
 /// and the direct path is forced. The handle is cleared (no limiter remains
 /// installed) and the first tuple member reports whether the requested
-/// removal landed.
+/// removal landed. If that final forced direct link also fails, the first
+/// member is `false`, the handle is `None`, and the caller observes the
+/// unlinked `eq` src pad and leaves the probe installed.
 fn remove_limiter(
     graph: &LimiterGraph,
     clipper: gst::Element,
     direct_blocked: bool,
     restore_blocked: bool,
+    forced_blocked: bool,
 ) -> (bool, Option<gst::Element>) {
     graph.eq.unlink(&clipper);
     clipper.unlink(&graph.post_convert);
@@ -583,11 +701,13 @@ fn remove_limiter(
     // Restoration itself failed: do not resume an unlinked graph. Tear down
     // any partial restoration link, remove the limiter, and force the direct
     // path so the chain keeps a working route. The handle is cleared because
-    // no limiter remains in the bin.
+    // no limiter remains in the bin; a failed forced link leaves the `eq`
+    // src pad unlinked for the caller's probe-installed wedge path.
     graph.eq.unlink(&clipper);
     clipper.unlink(&graph.post_convert);
     drop_limiter_from_bin(&graph.bin, &clipper);
-    (graph.eq.link(&graph.post_convert).is_ok(), None)
+    let forced_linked = !forced_blocked && graph.eq.link(&graph.post_convert).is_ok();
+    (forced_linked, None)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

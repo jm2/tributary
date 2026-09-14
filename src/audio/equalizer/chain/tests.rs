@@ -191,6 +191,16 @@ fn dynamic_limiter_swap_rewires_the_graph_under_the_blocking_probe() {
     assert!(!chain.clip_protection_installed());
     assert!(chain.bin.by_name("clipper").is_none());
     assert_links_eq_directly_to_post_convert(&chain.bin);
+
+    // Every validated edit removed its probe again: no blocking probe is
+    // left installed and the chain is not wedged (contract: the probe is
+    // uninstalled only over a validated topology).
+    let eq_src = chain.eq.static_pad("src").expect("eq src pad");
+    assert!(
+        !eq_src.is_blocked(),
+        "a validated dynamic edit must uninstall its blocking probe"
+    );
+    assert!(!chain.topology_wedged());
 }
 
 /// Regression (contract acceptance 6, live-pipeline half): dynamic
@@ -248,7 +258,7 @@ fn failed_limiter_removal_keeps_the_handle_and_a_routed_graph() {
     assert!(chain.clip_protection_installed());
 
     // Refuse the direct relink once at the real surgery boundary.
-    chain.inject_limiter_remove_fault(LimiterRemoveFault::DirectRelink);
+    chain.inject_limiter_remove_fault(LimiterRemoveFault::DirectRelinkBlocked);
     assert!(
         !chain.set_clip_protection(ClipProtection::Off),
         "a failed removal must report that Off was not installed"
@@ -305,6 +315,105 @@ fn doubly_failed_limiter_removal_leaves_no_unlinked_graph() {
     assert_links_eq_through_clipper(&chain.bin);
     assert!(chain.set_clip_protection(ClipProtection::Off));
     assert_links_eq_directly_to_post_convert(&chain.bin);
+}
+
+/// Regression (review finding H, PR #220): when the limiter surgery and
+/// its rollback cannot validate a linked topology, the blocking-probe
+/// callback must keep the probe installed — the `equalizer-10bands` src
+/// pad stays blocked so no buffer is ever pushed across the unlinked pad
+/// (no `GST_FLOW_NOT_LINKED`) — and the chain must report itself wedged so
+/// the caller's pause/relink fallback cannot fabricate a successful toggle
+/// over the unlinked graph. The wedged pipeline is retired by the ordinary
+/// eq-bin-originated bus seam, never resumed.
+#[test]
+fn unlinked_rollback_keeps_the_blocking_probe_installed_and_wedges_the_chain() {
+    if !bin_requires_plugins() {
+        return;
+    }
+    let mut chain = EqChain::build(&EqSettings {
+        enabled: true,
+        clip_protection: ClipProtection::Soft,
+        ..EqSettings::default()
+    })
+    .expect("eq-bin builds");
+    assert!(chain.clip_protection_installed());
+    let eq_src = chain.eq.static_pad("src").expect("eq src pad");
+    assert!(
+        !eq_src.is_blocked(),
+        "no probe is installed before the edit"
+    );
+
+    // Refuse the direct relink, the limiter-path restoration, and the final
+    // forced direct link: every rollback the surgery can attempt fails, so
+    // the eq src pad is left with no linked peer.
+    chain.inject_limiter_remove_fault(LimiterRemoveFault::EveryLinkBlocked);
+    assert_eq!(
+        chain.swap_clip_protection_under_block_probe(ClipProtection::Off),
+        Some(false),
+        "a wedged rollback must report the requested toggle as unmet"
+    );
+
+    // The probe stayed installed (the pad is still blocked), the graph is
+    // unlinked, and the chain records the wedge.
+    assert!(
+        eq_src.is_blocked(),
+        "the callback must keep the blocking probe installed when no linked topology exists"
+    );
+    assert!(
+        eq_src.peer().is_none(),
+        "the failed edit and rollback must leave the eq src pad unlinked"
+    );
+    assert!(!chain.clip_protection_installed());
+    assert!(chain.topology_wedged());
+
+    // A wedged chain refuses every further topology edit: the pause/relink
+    // fallback cannot report a successful toggle over the still-unlinked
+    // graph, and it must not disturb the installed probe.
+    assert!(
+        !chain.set_clip_protection(ClipProtection::Off),
+        "a wedged chain must not fabricate a successful toggle"
+    );
+    assert!(chain.topology_wedged());
+    assert!(eq_src.is_blocked());
+    assert!(eq_src.peer().is_none());
+}
+
+/// Regression (review finding H, PR #220): a wedge must post the explicit
+/// error diagnostic the contract requires, sourced from inside `eq-bin`,
+/// so the ordinary eq-bin-originated bus seam retires the wedged pipeline
+/// instead of resuming it.
+#[test]
+fn unlinked_rollback_posts_an_eq_bin_originated_error_on_the_bus() {
+    if !bin_requires_plugins() {
+        return;
+    }
+    let pipeline = gst::Pipeline::new();
+    let mut chain = EqChain::build(&EqSettings {
+        enabled: true,
+        clip_protection: ClipProtection::Soft,
+        ..EqSettings::default()
+    })
+    .expect("eq-bin builds");
+    pipeline.add(&chain.bin).expect("bin added to a pipeline");
+    let bus = pipeline.bus().expect("pipeline bus");
+
+    chain.inject_limiter_remove_fault(LimiterRemoveFault::EveryLinkBlocked);
+    assert_eq!(
+        chain.swap_clip_protection_under_block_probe(ClipProtection::Off),
+        Some(false)
+    );
+
+    let message = bus
+        .timed_pop_filtered(gst::ClockTime::from_seconds(5), &[gst::MessageType::Error])
+        .expect("the wedge must post an error diagnostic on the bus");
+    let source = message.src().expect("an error message has a source");
+    assert_eq!(
+        source.name().as_str(),
+        "eq-bin",
+        "the diagnostic must originate inside eq-bin so the retirement seam fires"
+    );
+    assert!(chain.topology_wedged());
+    let _ = pipeline.set_state(gst::State::Null);
 }
 
 #[test]
