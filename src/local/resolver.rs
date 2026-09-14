@@ -416,17 +416,75 @@ pub async fn resolve_track_with_class(
         return Err(LocalMediaResolutionError::InvalidTrackId);
     }
 
-    let model = track::Entity::find_by_id(track_id.to_string())
+    let model = load_track(db, track_id).await?;
+    let AuthorizedRoot {
+        expected,
+        root,
+        marker,
+    } = select_authorized_root(db, &model.file_path, configured_roots).await?;
+    let path = PathBuf::from(&model.file_path);
+    let acquired = acquire_authority_probe(class, track_id, &root, &path, &marker).await?;
+
+    // The blocking handle acquisition is intentionally outside SQLite. Re-read
+    // both bindings afterward so a concurrent reconciliation/root demotion
+    // cannot publish authority acquired for an obsolete database snapshot.
+    verify_unchanged(db, track_id, &model.file_path, &expected).await?;
+
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_owned);
+
+    Ok(ResolvedLocalMedia {
+        inner: Arc::new(ResolvedLocalMediaInner {
+            authority: RetainedFileAuthority::Local {
+                authority: acquired.0,
+                file: acquired.1,
+                path,
+            },
+            extension,
+            seek_consumers: Mutex::new(()),
+        }),
+        lease: None,
+    })
+}
+
+/// The configured root that currently owns a track, captured together with the
+/// exact authority identity a probe must revalidate.
+struct AuthorizedRoot {
+    expected: ExpectedRootAuthorityState,
+    root: PathBuf,
+    marker: String,
+}
+
+/// Load the exact track row or report it as missing.
+async fn load_track(
+    db: &DatabaseConnection,
+    track_id: &str,
+) -> Result<track::Model, LocalMediaResolutionError> {
+    track::Entity::find_by_id(track_id.to_string())
         .one(db)
         .await
         .map_err(|source| LocalMediaResolutionError::Database { source })?
-        .ok_or(LocalMediaResolutionError::Missing)?;
+        .ok_or(LocalMediaResolutionError::Missing)
+}
 
+/// Select the authoritative configured root containing `file_path`.
+///
+/// Fails closed when no configured root contains the path, when the owning
+/// root is not currently authoritative, or when its identity marker is
+/// absent. The returned [`ExpectedRootAuthorityState`] captures the row so a
+/// later re-read can detect a concurrent demotion.
+async fn select_authorized_root(
+    db: &DatabaseConnection,
+    file_path: &str,
+    configured_roots: &[String],
+) -> Result<AuthorizedRoot, LocalMediaResolutionError> {
     let states = library_root::Entity::find()
         .all(db)
         .await
         .map_err(|source| LocalMediaResolutionError::Database { source })?;
-    let path = PathBuf::from(&model.file_path);
+    let path = PathBuf::from(file_path);
     let Some((state, root)) = configured_root_states(&states, configured_roots)
         .into_iter()
         .find(|(_, root)| path.starts_with(root))
@@ -436,22 +494,38 @@ pub async fn resolve_track_with_class(
     if !state.identity_confirmed || !state.is_available || !state.last_scan_complete {
         return Err(LocalMediaResolutionError::RootUnavailable);
     }
-    let expected_marker = state
+    let marker = state
         .device_id
         .clone()
         .ok_or(LocalMediaResolutionError::RootUnavailable)?;
-    let expected_root_state = ExpectedRootAuthorityState::from_model(state);
-    // Bound the probe before submitting it. A cancelled caller must not be
-    // able to free gate capacity while its detached blocking closure still
-    // runs, so the permit is moved into the closure below. The existing
-    // five-second budget covers both waiting for capacity and running the
-    // probe: a saturated gate can delay a resolution but never stretch it
-    // past `FILE_PROBE_TIMEOUT`, and a callback whose row was recycled while
-    // it queued is dropped before it ever submits a blocking probe.
-    //
-    // Speculative (album-pane) and playback-critical callers acquire from
-    // independent gates, so a panes-only saturation cannot delay a playback
-    // resolution here (2026-09-14 N5 review finding).
+    Ok(AuthorizedRoot {
+        expected: ExpectedRootAuthorityState::from_model(state),
+        root,
+        marker,
+    })
+}
+
+/// Acquire retained filesystem authority for `path` under `root`.
+///
+/// Bound the probe before submitting it. A cancelled caller must not be able
+/// to free gate capacity while its detached blocking closure still runs, so
+/// the permit is moved into the closure below. The existing five-second budget
+/// covers both waiting for capacity and running the probe: a saturated gate
+/// can delay a resolution but never stretch it past `FILE_PROBE_TIMEOUT`, and
+/// a callback whose row was recycled while it queued is dropped before it ever
+/// submits a blocking probe.
+///
+/// Speculative (album-pane) and playback-critical callers acquire from
+/// independent gates, so a panes-only saturation cannot delay a playback
+/// resolution here (2026-09-14 N5 review finding).
+#[cfg_attr(not(test), allow(unused_variables))]
+async fn acquire_authority_probe(
+    class: ProbeClass,
+    track_id: &str,
+    root: &std::path::Path,
+    path: &std::path::Path,
+    marker: &str,
+) -> Result<(Arc<RootAuthorityLease>, BoundFile), LocalMediaResolutionError> {
     let deadline = tokio::time::Instant::now() + FILE_PROBE_TIMEOUT;
     let probe_permit = tokio::time::timeout_at(deadline, probe_gate(class).acquire())
         .await
@@ -459,11 +533,12 @@ pub async fn resolve_track_with_class(
         .map_err(|_| LocalMediaResolutionError::AuthorityUnavailable {
             source: std::io::Error::other("local authority probe gate unavailable"),
         })?;
-    let authority_path = path.clone();
-    let authority_root = root.clone();
+    let authority_path = path.to_path_buf();
+    let authority_root = root.to_path_buf();
+    let expected_marker = marker.to_owned();
     #[cfg(test)]
     let probe_track_id = track_id.to_string();
-    let acquired = tokio::time::timeout_at(
+    tokio::time::timeout_at(
         deadline,
         tokio::task::spawn_blocking(move || {
             // Hold the gate permit for the entire blocking closure so an
@@ -489,42 +564,34 @@ pub async fn resolve_track_with_class(
     .map_err(|source| LocalMediaResolutionError::AuthorityUnavailable {
         source: std::io::Error::other(format!("local authority task failed: {source}")),
     })?
-    .map_err(|source| LocalMediaResolutionError::AuthorityUnavailable { source })?;
+    .map_err(|source| LocalMediaResolutionError::AuthorityUnavailable { source })
+}
 
-    // The blocking handle acquisition is intentionally outside SQLite. Re-read
-    // both bindings afterward so a concurrent reconciliation/root demotion
-    // cannot publish authority acquired for an obsolete database snapshot.
+/// Re-read the track and owning root after the blocking probe.
+///
+/// The blocking handle acquisition is intentionally outside SQLite. Re-reading
+/// both bindings afterward ensures a concurrent reconciliation/root demotion
+/// cannot publish authority acquired for an obsolete database snapshot.
+async fn verify_unchanged(
+    db: &DatabaseConnection,
+    track_id: &str,
+    file_path: &str,
+    expected: &ExpectedRootAuthorityState,
+) -> Result<(), LocalMediaResolutionError> {
     let current_model = track::Entity::find_by_id(track_id.to_string())
         .one(db)
         .await
         .map_err(|source| LocalMediaResolutionError::Database { source })?
         .ok_or(LocalMediaResolutionError::Missing)?;
-    let current_state = library_root::Entity::find_by_id(expected_root_state.path.clone())
+    let current_state = library_root::Entity::find_by_id(expected.path.clone())
         .one(db)
         .await
         .map_err(|source| LocalMediaResolutionError::Database { source })?
         .ok_or(LocalMediaResolutionError::ChangedDuringResolution)?;
-    if current_model.file_path != model.file_path || !expected_root_state.matches(&current_state) {
+    if current_model.file_path != file_path || !expected.matches(&current_state) {
         return Err(LocalMediaResolutionError::ChangedDuringResolution);
     }
-
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_owned);
-
-    Ok(ResolvedLocalMedia {
-        inner: Arc::new(ResolvedLocalMediaInner {
-            authority: RetainedFileAuthority::Local {
-                authority: acquired.0,
-                file: acquired.1,
-                path,
-            },
-            extension,
-            seek_consumers: Mutex::new(()),
-        }),
-        lease: None,
-    })
+    Ok(())
 }
 
 /// Test-only instrumentation for the retained-authority probe gates.
