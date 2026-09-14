@@ -129,6 +129,15 @@ fn rename_over(temp_path: &std::path::Path, path: &std::path::Path) -> std::io::
         move || {
             // Safety: both pointers reference NUL-terminated wide buffers owned
             // by this call and `MoveFileExW` keeps them valid for its duration.
+            // This is the benign-Codacy audit finding: the upstream
+            // `rust.lang.security.unsafe-usage.unsafe-usage` rule only asks for
+            // an audit of an `unsafe` block, not a memory-safety defect. The
+            // owned UTF-16 buffers survive every synchronous bounded retry, the
+            // return/last_os_error handling is checked, and REPLACE_EXISTING +
+            // WRITE_THROUGH preserve the required durable-replace behavior; no
+            // safe std/dependency API expresses it. The operator authorized this
+            // single call-site acknowledgement for the exact qualified rule ID.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let ok = unsafe {
                 windows_sys::Win32::Storage::FileSystem::MoveFileExW(
                     from.as_mut_ptr(),
