@@ -57,7 +57,10 @@ struct PanelOutput {
 }
 
 impl PanelOutput {
-    fn panel(supported: bool, settings: EqSettings) -> (SharedAudioOutput, Rc<RefCell<PanelState>>) {
+    fn panel(
+        supported: bool,
+        settings: EqSettings,
+    ) -> (SharedAudioOutput, Rc<RefCell<PanelState>>) {
         let state = Rc::new(RefCell::new(PanelState {
             settings,
             refuse_enable: false,
