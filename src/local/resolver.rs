@@ -85,6 +85,25 @@ fn probe_gate(class: ProbeClass) -> &'static tokio::sync::Semaphore {
     }
 }
 
+/// Acquire one retained-authority probe permit for an adapter that performs
+/// its own blocking mounted probe (retained removable media).
+///
+/// Mirrors [`acquire_authority_probe`]'s discipline: the caller must move the
+/// returned permit into the blocking closure so aborting the async caller
+/// cannot release capacity while the probe still runs, and speculative
+/// album-pane work draws on a different gate than playback so a saturated
+/// pane lane cannot delay a playback resolution. `None` means the gate could
+/// not be acquired within [`FILE_PROBE_TIMEOUT`]; the caller fails closed.
+pub async fn acquire_retained_probe_permit(
+    class: ProbeClass,
+) -> Option<tokio::sync::SemaphorePermit<'static>> {
+    let deadline = tokio::time::Instant::now() + FILE_PROBE_TIMEOUT;
+    tokio::time::timeout_at(deadline, probe_gate(class).acquire())
+        .await
+        .ok()?
+        .ok()
+}
+
 /// A closed, path-free local resolution failure safe for application logs.
 #[derive(Debug, Error)]
 pub enum LocalMediaResolutionError {

@@ -18,7 +18,7 @@ use crate::architecture::SourceId;
 use crate::ui::album_art;
 use crate::ui::objects::AlbumArtCandidate;
 
-pub(super) enum ResolvedArtKind {
+pub enum ResolvedArtKind {
     NoArtwork,
     /// A retained exact-file capability resolved through the source
     /// registry — the pane's authority-correct local extraction input.
@@ -95,7 +95,7 @@ fn pane_track_id(candidate: &AlbumArtCandidate) -> Option<crate::architecture::T
     }
 }
 
-pub(super) async fn resolve_kind(
+pub async fn resolve_kind(
     source_registry: Option<crate::source_registry::SourceRegistry>,
     source_id: Option<SourceId>,
     source_epoch: Option<u64>,
@@ -113,11 +113,15 @@ pub(super) async fn resolve_kind(
                 source_id.expect("registry authority requires a source id"),
                 source_epoch.expect("registry authority requires a session epoch"),
             );
-            // Retained local-media authority first: a row whose playable
-            // locator is a file:// URI keeps its authority through the
-            // album pane — no remote resolver is consulted first, no
-            // opaque credentials are minted, and no pathname is reopened.
-            if candidate.uri.starts_with("file://") {
+            // Retained local-media authority first, chosen by the live
+            // adapter's authoritative capability — NOT by the row's raw
+            // locator: production registry rows are pathless (their URI
+            // is empty), yet a mounted removable album still resolves to a
+            // retained file beneath its mount authority. The capability
+            // check is cheap and synchronous, so it mints no stream
+            // credential and reopens no pathname merely to discover the
+            // source kind (2026-09-14 review finding).
+            if registry.retains_file_streams(id, epoch) {
                 if let Some(resolved) =
                     resolve_retained_file_art(registry, &id, epoch, candidate).await
                 {
@@ -304,9 +308,15 @@ where
     }
 }
 
-/// Resolve one identity-carrying `file://` row through the retained
+/// Resolve one retained-file-capable registry row through the retained
 /// local-media authority: an exact retained file capability is resolved
 /// and the artwork extracted through it — never a reopened pathname.
+///
+/// The resolution is classed [`StreamResolutionClass::Speculative`] because
+/// the album pane resolves artwork for every bound row: an adapter whose
+/// resolution performs a blocking mounted probe (retained removable media)
+/// must draw on the pane-bounded speculative gate and must never delay a
+/// playback resolution (2026-09-14 review finding).
 ///
 /// Returns `None` when resolution should fall through to the remote
 /// artwork resolver: the authority reported the stream as remote, or the
@@ -323,7 +333,15 @@ async fn resolve_retained_file_art(
         // pathname open.
         return Some(ResolvedArtKind::NoArtwork);
     };
-    match registry.resolve_stream(*id, epoch, track_id).await {
+    match registry
+        .resolve_stream_classified(
+            *id,
+            epoch,
+            track_id,
+            crate::source_registry::StreamResolutionClass::Speculative,
+        )
+        .await
+    {
         Ok(crate::source_registry::ResolvedSourceStream::File(media)) => {
             Some(ResolvedArtKind::ResolvedFile { media })
         }
