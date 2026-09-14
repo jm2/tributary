@@ -508,7 +508,7 @@ fn stage_placeholder_fetch(
 mod tests {
     use super::*;
     use crate::architecture::SourceId;
-    use resolver::{classify_pane_authority, PaneAuthority};
+    use resolver::{classify_pane_authority, resolve_kind, PaneAuthority, ResolvedArtKind};
 
     /// A `file://` row that carries a complete registry identity
     /// (source id + session epoch + attached registry) must resolve
@@ -669,6 +669,239 @@ mod tests {
         assert_eq!(controller.placeholder_icon(), "audio-x-generic-symbolic");
         let controller2 = AlbumArtController::new("image-missing-symbolic");
         assert_eq!(controller2.placeholder_icon(), "image-missing-symbolic");
+    }
+
+    // ---------------------------------------------------------------------
+    // Production projection through the real removable adapter
+    //
+    // Registry-backed album rows are pathless: `arch_remote_track_to_object`
+    // constructs every adopted-session row with an empty URI, and
+    // `populate_albums` copies that into the `AlbumArtCandidate`. The pane
+    // resolver must therefore choose the retained-file route from the live
+    // adapter's authoritative capability, not the row's raw locator
+    // (2026-09-14 review finding).
+    // ---------------------------------------------------------------------
+
+    use crate::source_lifecycle::SourceProvenance;
+    use crate::source_registry::SourceRegistry;
+    use std::time::Duration;
+
+    /// Copy the deterministic FLAC fixture, tag it, and embed one cover
+    /// picture so a retained-file extraction has real artwork to find.
+    fn tagged_flac_with_embedded_art(path: &std::path::Path, art: &[u8]) {
+        use lofty::config::WriteOptions;
+        use lofty::file::{FileType, TaggedFileExt};
+        use lofty::picture::{MimeType, Picture, PictureType};
+        use lofty::probe::Probe;
+        use lofty::tag::{Accessor, Tag, TagExt};
+        use std::io::BufReader;
+
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            ),
+            path,
+        )
+        .expect("copy deterministic FLAC fixture");
+        let fixture_file = std::fs::File::open(path).expect("open FLAC fixture");
+        let mut tagged = Probe::with_file_type(BufReader::new(fixture_file), FileType::Flac)
+            .read()
+            .expect("read FLAC fixture through handle");
+        if tagged.primary_tag_mut().is_none() {
+            let tag_type = tagged.primary_tag_type();
+            tagged.insert_tag(Tag::new(tag_type));
+        }
+        let tag = tagged.primary_tag_mut().expect("FLAC primary tag");
+        tag.set_title("Removable Album".to_string());
+        tag.set_artist("Removable Artist".to_string());
+        tag.set_album("Removable Album".to_string());
+        tag.push_picture(
+            Picture::unchecked(art.to_vec())
+                .pic_type(PictureType::CoverFront)
+                .mime_type(MimeType::Png)
+                .build(),
+        );
+        tag.save_to_path(path, WriteOptions::default())
+            .expect("write FLAC tags and embedded art");
+    }
+
+    /// Adopt one real removable mount into a fresh registry and return the
+    /// live session epoch plus the accepted catalogue track.
+    async fn adopted_removable(
+        mount_root: &std::path::Path,
+        source_id: SourceId,
+    ) -> (SourceRegistry, u64, crate::architecture::models::Track) {
+        let registry = SourceRegistry::new(tokio::runtime::Handle::current());
+        registry
+            .claim_provenance(source_id, SourceProvenance::Removable)
+            .expect("claim removable source");
+        registry
+            .connect_removable(source_id, mount_root.to_path_buf(), |_| {})
+            .expect("removable connection admitted");
+        let epoch = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(catalogue) = registry
+                    .snapshot(source_id)
+                    .and_then(|snapshot| snapshot.catalogue)
+                {
+                    return catalogue.session_epoch;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("removable catalogue accepted");
+        let track = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .and_then(|catalogue| catalogue.value.tracks().first().cloned())
+            .expect("accepted removable track");
+        (registry, epoch, track)
+    }
+
+    /// Build the album-pane candidate exactly as the production browser
+    /// does: `arch_remote_track_to_object` (pathless row) -> `TrackSnapshot`
+    /// -> `populate_albums`.
+    fn pane_candidate_for(
+        track: &crate::architecture::models::Track,
+        source_id: SourceId,
+        epoch: u64,
+    ) -> AlbumArtCandidate {
+        let object = crate::ui::window::arch_remote_track_to_object(track, source_id, epoch, 1);
+        assert_eq!(object.uri(), "", "the production projection is pathless");
+        let snapshots = vec![crate::ui::browser::TrackSnapshot::from_object(&object)];
+        let store = gtk::gio::ListStore::new::<BrowserItem>();
+        crate::ui::browser::populate_albums(&store, &snapshots, &None, &None, false);
+        (0..store.n_items())
+            .filter_map(|index| store.item(index))
+            .filter_map(|item| item.downcast::<BrowserItem>().ok())
+            .find_map(|item| item.artwork_candidate())
+            .expect("album row must carry an artwork candidate")
+    }
+
+    /// The P2 regression (2026-09-14 review finding): a mounted removable
+    /// album reaches the pane as a production registry row with an empty
+    /// URI. Its retained-file capability must route it to the retained
+    /// file extractor and the embedded art must come back through the
+    /// exact retained capability — never through a raw path.
+    #[tokio::test]
+    async fn pathless_removable_album_row_resolves_retained_embedded_art() {
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let art = b"retained-removable-cover-art";
+        tagged_flac_with_embedded_art(&mount.path().join("cover.flac"), art);
+        let source_id =
+            SourceId::removable("pane:test:retained-art").expect("removable source identity");
+        let (registry, epoch, track) = adopted_removable(mount.path(), source_id).await;
+
+        let candidate = pane_candidate_for(&track, source_id, epoch);
+        assert_eq!(candidate.uri, "", "production registry rows are pathless");
+        assert_eq!(candidate.source_id, Some(source_id));
+        assert_eq!(candidate.source_session_epoch, Some(epoch));
+
+        let liveness = album_art::ScopedArtFetch::new();
+        let resolved = resolve_kind(
+            Some(registry.clone()),
+            Some(source_id),
+            Some(epoch),
+            Vec::new(),
+            Some(tokio::runtime::Handle::current()),
+            &candidate,
+            &liveness,
+        )
+        .await;
+        let ResolvedArtKind::ResolvedFile { media } = resolved else {
+            panic!("a pathless removable row must reach retained-file artwork");
+        };
+        assert_eq!(
+            album_art::extract_resolved_file_album_art_bytes(&media).as_deref(),
+            Some(art.as_slice()),
+            "embedded art must extract through the retained file capability"
+        );
+
+        drop(media);
+        registry.shutdown().wait().await;
+    }
+
+    /// A superseded session epoch must leave the placeholder: the live
+    /// adapter no longer carries retained-file authority for that epoch,
+    /// and no raw locator may be reopened to compensate.
+    #[tokio::test]
+    async fn superseded_removable_epoch_stays_on_the_placeholder() {
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        tagged_flac_with_embedded_art(&mount.path().join("cover.flac"), b"art");
+        let source_id =
+            SourceId::removable("pane:test:superseded").expect("removable source identity");
+        let (registry, epoch, track) = adopted_removable(mount.path(), source_id).await;
+
+        let candidate = pane_candidate_for(&track, source_id, epoch);
+        let liveness = album_art::ScopedArtFetch::new();
+        let resolved = resolve_kind(
+            Some(registry.clone()),
+            Some(source_id),
+            Some(epoch + 1),
+            Vec::new(),
+            Some(tokio::runtime::Handle::current()),
+            &candidate,
+            &liveness,
+        )
+        .await;
+        assert!(
+            matches!(resolved, ResolvedArtKind::NoArtwork),
+            "a superseded epoch must not resolve artwork"
+        );
+
+        registry.shutdown().wait().await;
+    }
+
+    /// A retained-file-capable adapter that refuses the exact track (a
+    /// well-formed identity the scan never accepted) must fall through to
+    /// the remote resolver's authoritative no-artwork rather than reopening
+    /// a raw path. This also covers the remote `Ok(None)` contract: the
+    /// removable adapter inherits the default no-artwork resolver.
+    #[tokio::test]
+    async fn refused_retained_authority_stays_on_the_placeholder() {
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        tagged_flac_with_embedded_art(&mount.path().join("cover.flac"), b"art");
+        let source_id =
+            SourceId::removable("pane:test:refused").expect("removable source identity");
+        let (registry, epoch, _track) = adopted_removable(mount.path(), source_id).await;
+
+        // A file that appeared after the accepted scan is a well-formed but
+        // unaccepted removable identity: the adapter advertises retained-file
+        // capability yet refuses this exact track at resolution.
+        let unseen = mount.path().join("appeared-later.flac");
+        tagged_flac_with_embedded_art(&unseen, b"art");
+        let unaccepted = crate::architecture::TrackId::removable_relative(mount.path(), &unseen)
+            .expect("well-formed relative identity");
+        let candidate = AlbumArtCandidate {
+            track_id: unaccepted.as_str().to_string(),
+            uri: String::new(),
+            cover_art_url: String::new(),
+            source_id: Some(source_id),
+            source_session_epoch: Some(epoch),
+        };
+
+        let liveness = album_art::ScopedArtFetch::new();
+        let resolved = resolve_kind(
+            Some(registry.clone()),
+            Some(source_id),
+            Some(epoch),
+            Vec::new(),
+            Some(tokio::runtime::Handle::current()),
+            &candidate,
+            &liveness,
+        )
+        .await;
+        match resolved {
+            ResolvedArtKind::NoArtwork => {}
+            ResolvedArtKind::DirectFile { .. } => {
+                panic!("a refused retained row must not reopen a raw path")
+            }
+            _ => panic!("refused retained authority must leave the placeholder"),
+        }
+
+        registry.shutdown().wait().await;
     }
 }
 

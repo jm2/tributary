@@ -796,7 +796,7 @@ fn extract_direct_file_album_art_bytes(path: &std::path::Path) -> Option<Vec<u8>
     extract_album_art_bytes(&mut file, extension)
 }
 
-fn extract_resolved_file_album_art_bytes(
+pub fn extract_resolved_file_album_art_bytes(
     media: &crate::local::resolver::ResolvedLocalMedia,
 ) -> Option<Vec<u8>> {
     let extension = media.extension().map(str::to_owned);

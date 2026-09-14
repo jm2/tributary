@@ -4723,7 +4723,7 @@ pub fn arch_track_to_object(t: &crate::architecture::models::Track) -> TrackObje
 }
 
 /// Convert a remote track into a pathless row bound to one adopted session.
-fn arch_remote_track_to_object(
+pub fn arch_remote_track_to_object(
     track: &crate::architecture::models::Track,
     source_id: crate::architecture::SourceId,
     session_epoch: u64,

@@ -23,7 +23,7 @@ use crate::source_lifecycle::{
 };
 use crate::source_registry::{
     CatalogueFuture, ManagedSourceAdapter, MutationTargetFuture, PlaybackAttributionCapability,
-    PlaybackAttributionProfile, StreamFuture,
+    PlaybackAttributionProfile, RetainedFileStreamCapability, StreamFuture, StreamResolutionClass,
 };
 
 const MAX_TAG_TEXT_BYTES: usize = 64 * 1024;
@@ -213,6 +213,13 @@ impl ManagedSourceAdapter for RemovableMediaAdapter {
         PlaybackAttributionCapability::Removable
     }
 
+    /// Retained removable media resolves every accepted identity to a file
+    /// beneath its live mount authority, so the album pane may route a
+    /// pathless removable row to the retained-file artwork extractor.
+    fn retained_file_stream_capability(&self) -> RetainedFileStreamCapability {
+        RetainedFileStreamCapability::Supported
+    }
+
     fn playback_attribution_profile(
         &self,
         track_id: &TrackId,
@@ -230,6 +237,26 @@ impl ManagedSourceAdapter for RemovableMediaAdapter {
     }
 
     fn resolve_stream(self: Arc<Self>, track_id: TrackId) -> StreamFuture {
+        // Direct adapter callers (including the registry's playback-class
+        // `resolve_stream`) default to the playback lane.
+        self.resolve_stream_classified(track_id, StreamResolutionClass::Playback)
+    }
+
+    /// Resolve one accepted removable identity and bound the blocking mounted
+    /// probe against the consumer's class.
+    ///
+    /// The album pane now reaches this route for pathless removable rows, so
+    /// speculative pane probes must not saturate the shared blocking pool or
+    /// delay playback. The class permit is acquired BEFORE the probe is
+    /// submitted and moved INTO the blocking closure, so an aborted
+    /// speculative caller cannot release capacity while the probe still runs
+    /// (2026-09-14 review finding). The exact-membership gate and both mount
+    /// validations stay inside the per-object operation.
+    fn resolve_stream_classified(
+        self: Arc<Self>,
+        track_id: TrackId,
+        class: StreamResolutionClass,
+    ) -> StreamFuture {
         Box::pin(async move {
             // Membership is checked before decoding or touching the mount. A
             // well-formed relative identity that appeared after the accepted
@@ -241,8 +268,15 @@ impl ManagedSourceAdapter for RemovableMediaAdapter {
                 .removable_relative_path()
                 .map_err(|_| resolution_failed())?;
             let extension = extension_hint(&relative_path);
+            let probe_permit =
+                crate::local::resolver::acquire_retained_probe_permit(probe_class_for(class))
+                    .await
+                    .ok_or_else(resolution_failed)?;
             let authority = Arc::clone(&self.authority);
             let task = self.runtime.spawn_blocking(move || {
+                // Hold the class permit for the entire blocking closure so a
+                // cancelled pane caller cannot release it early.
+                let _probe_permit = probe_permit;
                 authority.validate()?;
                 let media = ResolvedFileMedia::from_mounted_relative_path(
                     Arc::clone(&authority),
@@ -516,6 +550,19 @@ fn scan_failed() -> BackendError {
 
 fn resolution_failed() -> BackendError {
     BackendError::Internal(anyhow::anyhow!("removable media identity is unavailable"))
+}
+
+/// Map the album pane's stream-resolution class onto the retained-authority
+/// probe gate this adapter draws capacity from.
+///
+/// Speculative pane work and playback-critical resolution must not share one
+/// gate: a saturated album pane must never delay a playback resolution that
+/// is waiting on a blocking mounted probe (2026-09-14 review finding).
+fn probe_class_for(class: StreamResolutionClass) -> crate::local::resolver::ProbeClass {
+    match class {
+        StreamResolutionClass::Speculative => crate::local::resolver::ProbeClass::Speculative,
+        StreamResolutionClass::Playback => crate::local::resolver::ProbeClass::Playback,
+    }
 }
 
 #[cfg(test)]
