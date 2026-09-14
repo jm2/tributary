@@ -158,6 +158,41 @@ fn limiter_surgery_inserts_and_removes_inside_the_installed_bin() {
     assert_links_eq_directly_to_post_convert(&chain.bin);
 }
 
+/// Regression (review finding G, PR #220): the limiter insert/remove is
+/// delivered as the documented dynamic in-bin edit under a blocking pad
+/// probe on the `equalizer-10bands` src pad. The blocking probe pins the
+/// EQ output while the graph is rewired and is removed only over the
+/// validated topology, so the edit lands without pausing the pipeline.
+#[test]
+fn dynamic_limiter_swap_rewires_the_graph_under_the_blocking_probe() {
+    if !bin_requires_plugins() {
+        return;
+    }
+    let mut chain = EqChain::build(&EqSettings {
+        enabled: true,
+        ..EqSettings::default()
+    })
+    .expect("eq-bin builds");
+
+    // Off → Soft: dynamic insert.
+    assert_eq!(
+        chain.swap_clip_protection_under_block_probe(ClipProtection::Soft),
+        Some(true)
+    );
+    assert!(chain.clip_protection_installed());
+    assert_links_eq_through_clipper(&chain.bin);
+    assert!(chain.bin.by_name("clipper").is_some());
+
+    // Soft → Off: dynamic removal.
+    assert_eq!(
+        chain.swap_clip_protection_under_block_probe(ClipProtection::Off),
+        Some(true)
+    );
+    assert!(!chain.clip_protection_installed());
+    assert!(chain.bin.by_name("clipper").is_none());
+    assert_links_eq_directly_to_post_convert(&chain.bin);
+}
+
 /// Regression (contract acceptance 6, live-pipeline half): dynamic
 /// `rglimiter` insertion must state-sync the new element with its
 /// parent bin. A bin brought to `READY` completes that transition
