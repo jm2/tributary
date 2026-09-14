@@ -217,10 +217,13 @@ The rules:
    the temp file is flushed to the disk for the appended range first, and
    the sidecar record is `fsync`'d second — so the journal never runs
    ahead of the bytes it certifies. Each append is itself bounded by the
-   remaining quota allowance before any byte is written (see
+   remaining quota allowance, reserved atomically before any byte is read
+   or written (see
    [Cancellation, quota, and eviction](#cancellation-quota-and-eviction)),
    so the durable-before-journal ordering never certifies bytes beyond
-   the cap. A resumed job truncates the temp file
+   the cap and a response whose size exactly equals the cap is accepted
+   as end-of-stream rather than misreported as `QuotaExceeded`. A resumed
+   job truncates the temp file
    back to the journaled offset (discarding torn tail bytes
    from an interrupted write), re-verifies the last journaled segment
    digest, and re-requests the remainder with `Range` **and** `If-Range`
@@ -414,9 +417,10 @@ directory.
    obtain any verification path — unlinks the temp file and fails the job
    terminally (`IntegrityMismatch`, or `IntegrityUnverifiable` when no
    digest source exists at all). The verified size is also checked against
-   the per-track cap here, before any rename: an over-cap snapshot fails
-   `QuotaExceeded` and the temp is unlinked. No rename has occurred at
-   this point.
+   the per-track cap here, before any rename: a snapshot whose verified
+   size strictly exceeds the cap fails `QuotaExceeded` and the temp is
+   unlinked, while a size exactly equal to the cap passes. No rename has
+   occurred at this point.
 5. **Publish by atomic rename.** The engine first appends an `fsync`'d
    publish-intent record to the job's durable journal, naming the
    snapshot-scoped final cache path and the verified digest (see
@@ -569,8 +573,8 @@ Failure at any step:
 - Verify: `OfflineError::IntegrityMismatch` on digest mismatch;
   `OfflineError::IntegrityUnverifiable` when no provenance tier can supply
   an expected digest; `OfflineError::QuotaExceeded` when the verified size
-  exceeds the per-track cap. The temp file is unlinked; no cache row is
-  created; nothing was ever renamed.
+  strictly exceeds the per-track cap (equality passes). The temp file is
+  unlinked; no cache row is created; nothing was ever renamed.
 - Publish: `OfflineError::StorageUnavailable`. A failed rename leaves the
   temp in place for cleanup and the cache path untouched — nothing was
   published, so a terminal state clears the intent under the pre-rename
@@ -1076,22 +1080,40 @@ policy:
    - A response of unknown length is bounded before each append, not
      charged after it. Because a segment's bytes are made durable before
      the journal records that segment's progress (the resumption rule
-     above), the job computes the remaining allowance immediately before
-     reading and appending the next segment — the smaller of the track's
-     remaining cap and the free global quota — and bounds that segment to
-     the allowance, so the bytes it makes durable can never exceed the
-     cap. When the remaining allowance is zero, the job fails
-     `QuotaExceeded` before appending another byte. The journal record
-     written after a bounded append accounts exactly the bytes made
-     durable inside the allowance — adding them to the track's running
-     total and the global charged total — so accounting follows the
-     reservation instead of racing it, and an unknown-length download
-     cannot stream past the cap even when the response's next segment
-     would be larger than the remaining allowance.
+     above), the job atomically **reserves** the remaining allowance —
+     the smaller of the track's remaining cap and the free global
+     quota — against the engine's same-process quota accounting before it
+     reads or writes any byte, and bounds the segment to that reservation.
+     The reservation is charged to the global total at reservation time,
+     so two jobs appending concurrently can never both observe the same
+     free global quota: with 10 MiB free, the first reservation consumes
+     it and the second sees zero. After the bounded append, the journal
+     record accounts exactly the bytes made durable inside the
+     reservation — adding them to the track's running total — and any
+     unused remainder (a short read, a failed or cancelled append) is
+     released back to the global total before the job continues or
+     terminates, so a reservation never permanently charges bytes that
+     were not made durable. Cross-process quota enforcement remains out
+     of scope (see [Open scope deliberately
+     deferred](#open-scope-deliberately-deferred)); the reservation is
+     atomic within the single supervisor process that owns every offline
+     job, so the bytes a job makes durable can never exceed the cap.
+   - When the reservation is zero, the job does not fail blindly. A
+     bounded read that fills the reservation exactly need not report
+     end-of-stream — a close-delimited body may signal the boundary only
+     on the next read — so the job retains the bounded read's
+     end-of-stream signal or performs a non-durable one-byte probe, and
+     fails `QuotaExceeded` only once it has confirmed that additional
+     payload actually exists. A response whose size equals, not exceeds,
+     the cap is therefore treated as complete and proceeds to the
+     verified-size check, which passes at exact equality; the quota
+     failure is reserved for a stream that really does carry more bytes
+     than the cap allows.
    - Independently of any streaming estimate, the verified size on the
      temp file is checked against the cap before the rename (step 4/5). A
-     snapshot whose verified size exceeds the cap resolves like any quota
-     failure — the temp is cleaned per its state, no rename occurs, and no
+     snapshot whose verified size strictly exceeds the cap resolves like
+     any quota failure — the temp is cleaned per its state, no rename
+     occurs, and no
      published-but-uncommitted file is created. Checking only at step 6
      would permit an oversized published-but-uncommitted file inside the
      rename-to-commit window; the pre-rename check is what keeps that
@@ -1151,7 +1173,7 @@ This contract fixes the following failure cases:
 | Second transfer disagrees with the first (double-fetch) | `Failed(IntegrityMismatch)`. Temp file unlinked. |
 | `OperationalLicence = Denied` or `Revoked` at admission | Job refused before network work. |
 | Source retired mid-download | Job cancels; lease revokes; cache row not promoted. |
-| Quota exceeded before publish (declared total, pre-append allowance exhausted for unknown-length streaming, or verified size) | Job fails terminally with `QuotaExceeded`; temp cleaned, no rename, no row, and no published-but-uncommitted file. |
+| Quota exceeded before publish (declared total, an unknown-length response that still carries payload once the reserved allowance is exhausted, or verified size) | Job fails terminally with `QuotaExceeded`; temp cleaned, no rename, no row, and no published-but-uncommitted file. A response whose size exactly equals the cap is not a quota failure: the bounded read's end-of-stream signal, or a non-durable one-byte probe, shows no further payload, and the verified-size check passes at equality. |
 | Filesystem refuses temp reservation | `Failed(StorageUnavailable)`. |
 | User cancels a download | `Cancelled`. Temp unlinked. |
 | Two requests for the same `MediaKey` race | Newest waits for terminal state of predecessor; admission is one-at-a-time. |
@@ -1232,7 +1254,7 @@ Each slice lands with its own focused regression suite. The slices are:
 | --- | --- |
 | Identity | Same `SourceId` + `TrackId` semantics as live; no second identity kind minted. Derived cache keys: fixed hex charset and width, no separators or traversal, byte-exact identifier input. |
 | Capability | Default-deny behaviour for adapters that opt out; Subsonic/Jellyfin/Plex/DAAP opt in. |
-| Resumable job | Bounded, `If-Range`-validated range requests; `200`/`412` restarts from zero; journal survives crash (offset truncation, last-segment digest re-check); segment bytes durable before journal progress and bounded by the remaining quota allowance before each append so durable bytes never exceed the cap, with a short-file or digest-mismatch recovery restarting from zero without trusting the offset; no-validator jobs restart only. |
+| Resumable job | Bounded, `If-Range`-validated range requests; `200`/`412` restarts from zero; journal survives crash (offset truncation, last-segment digest re-check); segment bytes durable before journal progress and bounded by the remaining quota allowance, reserved atomically from the same-process global total before each append — so concurrent jobs cannot both spend the same free global quota and any unused reservation is released on a short or failed append — so durable bytes never exceed the cap; a bounded read that fills the reservation exactly is accepted as end-of-stream unless a non-durable probe finds further payload, so an exact-cap response is not misreported as `QuotaExceeded`; a short-file or digest-mismatch recovery restarts from zero without trusting the offset; no-validator jobs restart only. |
 | Restart authorization | Lease reacquisition, resumption, and publish-intent adoption all rebind by durable `SourceId` + `SourceIncarnationId`, never by a transient generation number, and both resumption and adoption revalidate current authority — capability, licence, and validator against the source's accepted generation — rather than trusting a durable identity and the absence of a persisted revocation. A valid restart on the same durable incarnation with a changed transient generation authorizes and resumes; a replaced incarnation, even one whose transient generation recycles the job's recorded `capability_epoch`, does not authorize and terminates; a backend-side revocation that left no durable record refuses adoption; an unestablishable current generation defers non-destructively. An adoption's playable insert acquires an exact session commit authority atomically after the platform publication barrier and retains it across the idempotent insert, and the ordinary step-6 commit uses that same authority boundary at the row insert; staleness before admission rejects non-destructively with no row and the pending intent retained, and replacement or shutdown after admission waits. Pre-existing saved sources receive one stable, persisted incarnation at first load and keep it across restart (no re-mint per load, no spurious replacement), and the saved-source format migrates from v1 to the v2 envelope by an atomic durable replacement — Unix temp-file `fsync`, same-directory `rename`, parent-directory `fsync`, with a `fsync` failure propagated rather than swallowed — that is idempotent across retry and concurrent load, preserves the original v1 file and publishes no rows on failure, re-loads a v2 file without re-minting, and lets a strict v1 loader quarantine an unknown-version envelope in place without data loss. No lease handle or credential is persisted. |
 | Atomic storage | Same-directory temp reservation (missing ancestors created at reservation); verify-before-publish ordering; same-filesystem rename; cross-filesystem publish refused. Unix validation lane: the complete ancestor chain is re-derived from the recorded final path and re-synced top-down, idempotently, before the rename on every attempt — including after a crash that happened before the previous process ran the pass — and the rename-to-commit chain is ordered behind it. Windows validation lane: the documented `FlushFileBuffers` + `MOVEFILE_WRITE_THROUGH` barrier on the published file, and missing-path recovery — never served, marked non-playable and recoverable, a fresh job may republish — including the combined pending-intent + committed-row + unresolvable-path case. Both lanes: publish-intent recovery across every kill point of the crash-point matrix, including the crash-before-directory-sync and power-loss rows, the verdict-first post-rename terminal transition, its adoption gates (including the current-authority revalidation of capability, licence, and validator against the source's accepted generation), the atomic commit-authority acquisition at the final admission after the publication barrier, and committed-row recognition with a revocation or incarnation replacement landing after the commit, before recovery. The ordinary step-6 commit acquires the same exact session commit authority immediately before the row insert and retains it through the idempotent insert and the intent clear, so a replacement, disconnect, retirement, shutdown, capability withdrawal, or licence revocation winning between admission and the commit refuses promotion — no row, no intent clear — instead of letting a stale job become playable. A pass blocked on current authority, the commit-authority admission, or a platform barrier defers non-destructively and leaves the durable owner in place, so an authority-blocked, durably owned file may survive multiple passes and is never resolved by destructive cleanup. |
 | Digest provenance | Advertised digest compared exactly; double-fetch fallback equality; no-tier backends fail `IntegrityUnverifiable` before publish. |
@@ -1241,7 +1263,7 @@ Each slice lands with its own focused regression suite. The slices are:
 | Licensing | Default-deny; revocation retires rows but preserves files. |
 | Reconciliation | Refresh creates a sibling with its own snapshot-scoped path; no in-place mutation; staged-delete unlink with idempotent recovery. |
 | Cancellation | Lifecycle supersession cancels in-flight jobs; a cancel landing in the rename-to-commit window follows the verdict-first post-rename terminal rule and is never adopted as playable. |
-| Quota and eviction | Quota accounting covers committed bytes, in-flight temps, published-but-uncommitted pending-intent files, and unknown-length responses reserved against the allowance before each append. The per-track cap is enforced at admission (declared total), by reserving the remaining allowance (the smaller of the track's remaining cap and the free global quota) before each append of an unknown-length response and bounding that append to it — so a durable segment can never be written past the cap — and on the verified size before the rename, so unknown-length data crossing the cap fails before any further byte is durable and no published-but-uncommitted file ever exceeds the cap. Eviction walks sources oldest-cache-first, newest-first within a source; staged tombstone-then-unlink; recovery completes interrupted deletes. |
+| Quota and eviction | Quota accounting covers committed bytes, in-flight temps, published-but-uncommitted pending-intent files, and unknown-length responses reserved against the allowance before each append. The per-track cap is enforced at admission (declared total), by atomically reserving the remaining allowance (the smaller of the track's remaining cap and the free global quota) from the same-process global total before each append of an unknown-length response and bounding that append to it — so two concurrent jobs cannot both reserve the same free global quota, an unused remainder is released on a short or failed append, and a durable segment can never be written past the cap — and on the verified size before the rename, so unknown-length data crossing the cap fails before any further byte is durable and no published-but-uncommitted file ever exceeds the cap. A bounded read that fills the reservation exactly is accepted as end-of-stream when no further payload exists (the retained end-of-stream signal, or a non-durable one-byte probe), so an exact-cap response passes the verified-size check instead of failing `QuotaExceeded`. Eviction walks sources oldest-cache-first, newest-first within a source; staged tombstone-then-unlink; recovery completes interrupted deletes. |
 | UI | Credential-free GTK rows; localised progress and failure. |
 
 The contract does not bless a single language binding or test framework; it
