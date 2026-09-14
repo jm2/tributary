@@ -24,10 +24,34 @@ pub use super::root_authority::{MountedMutationTarget, MountedRootAuthority};
 /// same outer budget for the point-in-time file probe.
 const FILE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Maximum number of retained-authority filesystem probes that may run at once.
+/// Maximum number of **speculative** retained-authority filesystem probes
+/// (album-pane artwork lookups) that may run at once.
 const MAX_CONCURRENT_AUTHORITY_PROBES: usize = 8;
 
-/// Bounds concurrent retained-authority filesystem probes.
+/// Reserved capacity for **playback-critical** retained-authority probes.
+///
+/// Playback resolution must never be starved by speculative pane work, so it
+/// draws on a gate of its own instead of sharing [`SPECULATIVE_PROBE_GATE`]
+/// (2026-09-14 N5 review finding).
+const RESERVED_PLAYBACK_PROBES: usize = 8;
+
+/// Which consumer is acquiring retained-authority probe capacity.
+///
+/// The two classes draw on independent gates so that a saturated album-pane
+/// lane cannot delay a playback resolution waiting for capacity
+/// (2026-09-14 N5 review finding).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeClass {
+    /// Speculative work (album-pane thumbnails). Bounded by
+    /// [`SPECULATIVE_PROBE_GATE`] so recycled rows cannot accumulate
+    /// blocking probes.
+    Speculative,
+    /// Playback-critical resolution from `play_current`. Draws on the
+    /// reserved [`PLAYBACK_PROBE_GATE`] so pane saturation cannot starve it.
+    Playback,
+}
+
+/// Bounds concurrent **speculative** retained-authority filesystem probes.
 ///
 /// [`resolve_track`] submits its pre-extraction probe with
 /// `tokio::task::spawn_blocking`. A blocking closure cannot be unwound once
@@ -38,9 +62,28 @@ const MAX_CONCURRENT_AUTHORITY_PROBES: usize = 8;
 /// (2026-09-14 review finding). The permit is acquired *before* the probe is
 /// submitted and moved INTO the blocking closure, so it is released only
 /// when the probe actually completes — never early on task abort — and at
-/// most [`MAX_CONCURRENT_AUTHORITY_PROBES`] probes can ever be in flight.
-static AUTHORITY_PROBE_GATE: tokio::sync::Semaphore =
+/// most [`MAX_CONCURRENT_AUTHORITY_PROBES`] speculative probes can ever be in
+/// flight.
+static SPECULATIVE_PROBE_GATE: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_CONCURRENT_AUTHORITY_PROBES);
+
+/// Reserved gate for playback-critical retained-authority probes.
+///
+/// Kept separate from [`SPECULATIVE_PROBE_GATE`] so that eight stuck
+/// album-pane probes can never consume the capacity a playback resolution
+/// needs (2026-09-14 N5 review finding). Playback is user-paced and
+/// superseded one track at a time, so this bound is a safety cap on
+/// blocking-pool growth rather than a scheduling choke point.
+static PLAYBACK_PROBE_GATE: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(RESERVED_PLAYBACK_PROBES);
+
+/// Select the retained-authority probe gate for `class`.
+fn probe_gate(class: ProbeClass) -> &'static tokio::sync::Semaphore {
+    match class {
+        ProbeClass::Speculative => &SPECULATIVE_PROBE_GATE,
+        ProbeClass::Playback => &PLAYBACK_PROBE_GATE,
+    }
+}
 
 /// A closed, path-free local resolution failure safe for application logs.
 #[derive(Debug, Error)]
@@ -354,6 +397,21 @@ pub async fn resolve_track(
     track_id: &str,
     configured_roots: &[String],
 ) -> Result<ResolvedLocalMedia, LocalMediaResolutionError> {
+    resolve_track_with_class(ProbeClass::Speculative, db, track_id, configured_roots).await
+}
+
+/// Resolve one local track using an explicit [`ProbeClass`].
+///
+/// [`resolve_track`] is the speculative convenience wrapper used by
+/// album-pane artwork. Playback-critical callers pass
+/// [`ProbeClass::Playback`] so their probe capacity is reserved and cannot be
+/// starved by pane work (2026-09-14 N5 review finding).
+pub async fn resolve_track_with_class(
+    class: ProbeClass,
+    db: &DatabaseConnection,
+    track_id: &str,
+    configured_roots: &[String],
+) -> Result<ResolvedLocalMedia, LocalMediaResolutionError> {
     if track_id.is_empty() {
         return Err(LocalMediaResolutionError::InvalidTrackId);
     }
@@ -390,8 +448,12 @@ pub async fn resolve_track(
     // probe: a saturated gate can delay a resolution but never stretch it
     // past `FILE_PROBE_TIMEOUT`, and a callback whose row was recycled while
     // it queued is dropped before it ever submits a blocking probe.
+    //
+    // Speculative (album-pane) and playback-critical callers acquire from
+    // independent gates, so a panes-only saturation cannot delay a playback
+    // resolution here (2026-09-14 N5 review finding).
     let deadline = tokio::time::Instant::now() + FILE_PROBE_TIMEOUT;
-    let probe_permit = tokio::time::timeout_at(deadline, AUTHORITY_PROBE_GATE.acquire())
+    let probe_permit = tokio::time::timeout_at(deadline, probe_gate(class).acquire())
         .await
         .map_err(|_| LocalMediaResolutionError::AuthorityCheckTimedOut)?
         .map_err(|_| LocalMediaResolutionError::AuthorityUnavailable {
@@ -465,7 +527,7 @@ pub async fn resolve_track(
     })
 }
 
-/// Test-only instrumentation for [`AUTHORITY_PROBE_GATE`].
+/// Test-only instrumentation for the retained-authority probe gates.
 ///
 /// Records how many watched probe closures are concurrently executing and
 /// parks them behind a condvar, so a regression can observe the bound
@@ -992,6 +1054,11 @@ mod tests {
         }
     }
 
+    /// Serializes tests that drive the process-global `probe_park`
+    /// instrumentation: only one watcher can be armed at a time, and sibling
+    /// tests run in parallel.
+    static PROBE_PARK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Spawn `attempt_count` real `resolve_track` calls for `track`, returning
     /// their handles so the caller can simulate recycled rows by aborting them.
     fn spawn_resolution_attempts(
@@ -1022,6 +1089,7 @@ mod tests {
 
     #[tokio::test]
     async fn recycled_rows_cannot_grow_the_authority_probe_backlog_past_the_bound() {
+        let _serial = PROBE_PARK_TEST_LOCK.lock().await;
         let db = database().await;
         let root = tempfile::tempdir().expect("library root");
         authorize_root(&db, root.path()).await;
@@ -1076,5 +1144,72 @@ mod tests {
             MAX_CONCURRENT_AUTHORITY_PROBES,
             "the backlog never exceeded the bound"
         );
+    }
+
+    /// The speculative pane lane and the playback lane must draw on separate
+    /// capacity: a fully saturated album-pane lane must not delay a playback
+    /// resolution for an unrelated healthy root (2026-09-14 N5 review
+    /// finding).
+    #[tokio::test]
+    async fn saturated_pane_probes_do_not_block_a_playback_resolution() {
+        let _serial = PROBE_PARK_TEST_LOCK.lock().await;
+        let db = database().await;
+        let root = tempfile::tempdir().expect("library root");
+        authorize_root(&db, root.path()).await;
+        let roots = configured(root.path());
+        let pane_path = root.path().join("pane.flac");
+        std::fs::write(&pane_path, b"pane").expect("write pane file");
+        let playback_path = root.path().join("playback.flac");
+        std::fs::write(&playback_path, b"playback").expect("write playback file");
+        // `probe_park` is process-global, so watch a private id; the playback
+        // track is deliberately a different id so its probe is not parked.
+        const PANE_TRACK: &str = "saturated-pane-track";
+        const PLAYBACK_TRACK: &str = "starving-playback-track";
+        model(PANE_TRACK, &pane_path)
+            .insert(&db)
+            .await
+            .expect("insert pane track");
+        model(PLAYBACK_TRACK, &playback_path)
+            .insert(&db)
+            .await
+            .expect("insert playback track");
+
+        let db = Arc::new(db);
+        probe_park::watch(PANE_TRACK);
+        let _park = ParkGuard;
+
+        // Saturate the speculative lane: every permit is held by a parked
+        // pane probe, each of which is detached from its async caller.
+        let pane_attempts =
+            spawn_resolution_attempts(&db, &roots, PANE_TRACK, MAX_CONCURRENT_AUTHORITY_PROBES);
+        wait_for_probe_count(
+            MAX_CONCURRENT_AUTHORITY_PROBES,
+            "the pane lane did not saturate",
+        )
+        .await;
+
+        // A playback resolution for a different healthy track must still
+        // reach the filesystem promptly rather than waiting out the probe
+        // budget for a permit held by pane work.
+        let playback = tokio::time::timeout(
+            Duration::from_secs(2),
+            resolve_track_with_class(ProbeClass::Playback, &db, PLAYBACK_TRACK, &roots),
+        )
+        .await
+        .expect("a playback resolution must not be starved by saturated pane probes");
+        assert!(
+            playback.is_ok(),
+            "playback resolution should succeed: {playback:?}"
+        );
+
+        probe_park::release();
+        for attempt in pane_attempts {
+            let resolved = attempt.await.expect("parked pane probe joined");
+            assert!(
+                resolved.is_ok(),
+                "saturated pane probe should succeed: {resolved:?}"
+            );
+        }
+        wait_for_probe_count(0, "parked pane probes did not finish after release").await;
     }
 }

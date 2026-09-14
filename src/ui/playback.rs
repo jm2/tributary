@@ -26,6 +26,7 @@ use crate::lastfm::playback_owner::{
     LastFmOutputIntent, LastFmPlaybackOccurrenceIdentity, LastFmPlaybackSource,
 };
 use crate::local::playback_history::PlaybackHistoryProgress;
+use crate::local::resolver::ProbeClass;
 use crate::source_registry::{
     PlaybackAttributionProfile, PlaybackSourceReference, RegularPlaylistCatalogueGuard,
     SourceRegistry,
@@ -2122,8 +2123,13 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         ctx.rt_handle.spawn(async move {
             let resolved = match crate::db::connection::init_db().await {
                 Ok(db) => {
-                    crate::local::resolver::resolve_track(&db, track_id.as_str(), &configured_roots)
-                        .await
+                    crate::local::resolver::resolve_track_with_class(
+                        ProbeClass::Playback,
+                        &db,
+                        track_id.as_str(),
+                        &configured_roots,
+                    )
+                    .await
                 }
                 Err(source) => {
                     Err(crate::local::resolver::LocalMediaResolutionError::Database { source })
