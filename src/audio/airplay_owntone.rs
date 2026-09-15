@@ -1288,6 +1288,16 @@ struct SessionInner {
     /// wait the moment the load is cancelled or replaced (review R4).
     cancel: OpenCancel,
     restored: AtomicBool,
+    /// The session's **terminal** flag. Set under [`Self::mutation_lock`] at
+    /// the start of [`Self::restore`], i.e. *before* the daemon is restored, so
+    /// the terminal transition and any concurrent control transmission are one
+    /// serialized decision. Once set, [`Self::transmit_mutation`] refuses every
+    /// later control RPC: a control that was queued or waiting for the
+    /// settlement boundary while the pump restored can no longer transmit a
+    /// `player/play`/`player/pause`/`volume` against the already-restored
+    /// output selection (review W1). It is never cleared — a restored session
+    /// is terminal and a fresh load builds a new [`SessionInner`].
+    terminal: AtomicBool,
     /// The session's **settlement boundary**. Every daemon-mutating RPC the
     /// live session transmits (control RPCs and the restoring `player/stop` +
     /// `outputs/set`) takes this lock, and [`Self::restore`] holds it across
@@ -1324,11 +1334,25 @@ impl SessionInner {
     /// [`Self::restore`] can never observe "nothing outstanding" while an
     /// effect is still in flight, and a failed or timed-out effect stays
     /// recorded until a confirmed quiescence settles it (review U1).
+    ///
+    /// **Terminal sessions refuse every control transmission (review W1).**
+    /// [`Self::restore`] sets [`Self::terminal`] under this same lock before it
+    /// restores the daemon, so a control that is queued or waiting for the
+    /// boundary while the terminal transition runs acquires the lock only
+    /// *after* the session is terminal and is refused here — it can never
+    /// transmit a late `player/play`/`pause`/`volume` against the restored
+    /// output selection. The refusal is fail-closed and does not touch the
+    /// outstanding count (nothing was transmitted).
     fn transmit_mutation<F>(&self, effect: F) -> Result<(), SenderError>
     where
         F: FnOnce() -> Result<(), SenderError>,
     {
         let _boundary = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if self.terminal.load(Ordering::SeqCst) {
+            return Err(unavailable(
+                "the AirPlay session is no longer accepting control",
+            ));
+        }
         self.unsettled.fetch_add(1, Ordering::SeqCst);
         match effect() {
             Ok(()) => {
@@ -1377,7 +1401,28 @@ impl SessionInner {
     /// live: it must quiesce first.
     fn restore(&self) -> Result<(), SenderError> {
         let _boundary = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        // Terminal transition, taken under the settlement boundary **before**
+        // any restoring RPC. This is what makes "this session is finished" and
+        // "a control may transmit" one ordered decision instead of a
+        // check-to-effect race: a control that is queued on `mutation_lock`
+        // while this runs observes `terminal` on acquire and is refused (review
+        // W1). Latch it even when restoration later fails — a failed teardown
+        // is still terminal for the session. `running` is cleared so the pump's
+        // loop and activation gate stop as well.
+        self.terminal.store(true, Ordering::SeqCst);
+        self.running.store(false, Ordering::SeqCst);
         if self.restored.load(Ordering::SeqCst) {
+            // Restoration already completed. A mutation whose outcome is still
+            // unproven — transmitted while the terminal transition was being
+            // taken, or left outstanding by a timed-out restoring RPC — must
+            // still be settled before ownership can be released: a bare
+            // `restored` check would short-circuit over it and drop the lock
+            // (review W1). Quiescence drops every in-flight request; if it
+            // cannot be established, fail closed and retain the lock.
+            if self.unsettled.load(Ordering::SeqCst) > 0 {
+                quiesce_daemon(&self.config)?;
+                self.unsettled.store(0, Ordering::SeqCst);
+            }
             return Ok(());
         }
         // A transmitted RPC that failed or timed out may still be outstanding.
@@ -2165,6 +2210,7 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
         gate: Arc::clone(&ctx.session_gate),
         cancel: ctx.cancel.clone(),
         restored: AtomicBool::new(false),
+        terminal: AtomicBool::new(false),
         mutation_lock: Mutex::new(()),
         unsettled: AtomicUsize::new(0),
         position: Mutex::new(SenderPosition::unknown(ctx.generation)),
@@ -3516,6 +3562,7 @@ mod tests {
             gate: Arc::new(SessionGate::new()),
             cancel: OpenCancel::new(),
             restored: AtomicBool::new(false),
+            terminal: AtomicBool::new(false),
             mutation_lock: Mutex::new(()),
             unsettled: AtomicUsize::new(0),
             position: Mutex::new(SenderPosition::unknown(PlayerEventGeneration::from_raw(1))),
@@ -3553,6 +3600,7 @@ mod tests {
             gate: Arc::new(SessionGate::new()),
             cancel: OpenCancel::new(),
             restored: AtomicBool::new(false),
+            terminal: AtomicBool::new(false),
             mutation_lock: Mutex::new(()),
             unsettled: AtomicUsize::new(0),
             position: Mutex::new(SenderPosition::unknown(PlayerEventGeneration::from_raw(1))),
@@ -3625,6 +3673,7 @@ mod tests {
             gate: Arc::new(SessionGate::new()),
             cancel: OpenCancel::new(),
             restored: AtomicBool::new(false),
+            terminal: AtomicBool::new(false),
             mutation_lock: Mutex::new(()),
             unsettled: AtomicUsize::new(0),
             position: Mutex::new(SenderPosition::unknown(PlayerEventGeneration::from_raw(1))),
@@ -3647,11 +3696,17 @@ mod tests {
             "http://127.0.0.1:{}",
             listener.local_addr().expect("addr").port()
         );
-        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
             for incoming in listener.incoming() {
                 let Ok(stream) = incoming else { continue };
-                let _ = accepted_tx.send(());
+                let Ok(reader_stream) = stream.try_clone() else {
+                    continue;
+                };
+                let mut reader = std::io::BufReader::new(reader_stream);
+                let mut request_line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut request_line);
+                let _ = accepted_tx.send(request_line.trim().to_string());
                 std::thread::spawn(move || {
                     // Hold the connection without responding: the play RPC
                     // blocks until its own client timeout.
@@ -3671,10 +3726,16 @@ mod tests {
         let play_inner = Arc::clone(&inner);
         let play = std::thread::spawn(move || play_inner.activate_and_play());
 
-        // Barrier: the play request has reached the stalling server.
-        accepted_rx
+        // Barrier: the actual `player/play` request has reached the stalling
+        // server — the Stop is measured against a genuine in-flight effect,
+        // not a cancelled-before-transmit shortcut.
+        let request = accepted_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the play request must reach the server");
+        assert!(
+            request.contains("/api/player/play"),
+            "the observed request must be the play RPC: {request:?}"
+        );
 
         let stopped = Instant::now();
         inner.gate.stop();
@@ -3691,6 +3752,13 @@ mod tests {
             "a Stop that wins during the play must suppress the accepted start"
         );
         assert!(!inner.activation_live());
+        // The stalled play transmitted before the Stop and never settled: it
+        // stays recorded as outstanding, so the session's own teardown must
+        // quiesce before it can release ownership.
+        assert!(
+            inner.unsettled_count() > 0,
+            "a transmitted-but-unsettled play must remain outstanding for teardown"
+        );
     }
 
     /// U3: a Stop that wins the shared boundary refuses the start effect before
@@ -3826,8 +3894,19 @@ mod tests {
         });
 
         // The owner is retrying spawns and the job stays queued (with its lock
-        // held); recover the spawn facility and let the same production retry
-        // path start a worker.
+        // held). A failed handoff is never reported as clean: while no live
+        // owner exists the job must remain queued and its resources unreleased.
+        wait_until(|| supervisor.pending_jobs() >= 1);
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "the job must not be released before a live owner exists"
+        );
+        assert!(
+            supervisor.pending_jobs() >= 1,
+            "the job must stay queued (with its lock held) while every spawn fails"
+        );
+        // Recover the spawn facility and let the same production retry path
+        // start a worker.
         std::thread::sleep(Duration::from_millis(50));
         supervisor.fail_next_spawns(0);
         wait_until(|| released.load(Ordering::SeqCst));
@@ -3862,5 +3941,373 @@ mod tests {
 
         wait_until(|| released_a.load(Ordering::SeqCst) && released_b.load(Ordering::SeqCst));
         wait_until(|| supervisor.pending_jobs() == 0);
+    }
+
+    /// W2: the **real** [`RetainedRecovery`] path, with a real advisory lock,
+    /// holds that lock while it cannot establish settlement. The supervisor
+    /// starts a live owner after an injected spawn failure, the job is
+    /// attempted against an unreachable daemon, and it stays queued — the lock
+    /// is never released on a failed attempt, so no false clean handoff is
+    /// reported.
+    #[cfg(unix)]
+    #[test]
+    fn a_retained_recovery_holds_its_real_advisory_lock_until_settlement() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let lock_path = directory.path().join("instance.lock");
+        let lock = open_lock(&lock_path).expect("open lock");
+        assert!(
+            rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).is_ok(),
+            "the retained recovery must hold the instance lock"
+        );
+        // A competing opener cannot take the same advisory lock while the
+        // retained job owns it.
+        let competing = open_lock(&lock_path).expect("open competing lock");
+        assert!(
+            rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err(),
+            "the advisory lock must be held by the retained recovery"
+        );
+
+        let config = owned_config(directory.path());
+        let client = Arc::new(OwnToneClient::new("http://127.0.0.1:1").expect("client"));
+        let job = RetainedRecovery {
+            client,
+            config,
+            recorded: TakeoverRecord {
+                enabled_outputs: vec![1],
+                selected_output: 0,
+            },
+            lock,
+            route: None,
+            retry_at: Instant::now(),
+        };
+
+        let supervisor = Arc::new(RecoverySupervisor::new());
+        // The first owner spawn fails; the production retry path must still
+        // prove a live owner before completing the handoff.
+        supervisor.fail_next_spawns(1);
+        let enqueue_supervisor = Arc::clone(&supervisor);
+        let handle = std::thread::spawn(move || enqueue_supervisor.register(job));
+        handle.join().expect("enqueue owner");
+
+        // The job is serviced by a live owner; its attempt against the
+        // unreachable daemon fails and it stays queued with the lock held.
+        wait_until(|| supervisor.worker_is_live());
+        wait_until(|| supervisor.pending_jobs() >= 1);
+        assert!(
+            rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err(),
+            "a failed settlement attempt must not release the advisory lock"
+        );
+    }
+
+    // ----- W1/W2: HTTP-faithful terminal-settlement regressions -----
+
+    /// A hermetic fake OwnTone daemon speaking the adapter's HTTP contract.
+    ///
+    /// It records the request line of every request it serves (so a
+    /// regression can assert the *actual* request/effect boundary rather than
+    /// a scheduling opportunity) and answers the adapter's endpoints
+    /// truthfully: `/api/config`, `/api/outputs`, `/api/player` return JSON and
+    /// the mutating `PUT`s return `200`. An optional single path can be
+    /// *parked*: the server records it and holds the response until the test
+    /// releases it, so a concurrent operation can be deterministically placed
+    /// behind an in-flight request (review W1, review W2).
+    #[cfg(target_os = "linux")]
+    struct FakeOwnToneServer {
+        api_base: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        park: Arc<ParkGate>,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ParkGate {
+        marker: String,
+        seen: Mutex<bool>,
+        released: Mutex<bool>,
+        cv: Condvar,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ParkGate {
+        fn new(marker: &str) -> Arc<Self> {
+            Arc::new(Self {
+                marker: marker.to_string(),
+                seen: Mutex::new(false),
+                released: Mutex::new(false),
+                cv: Condvar::new(),
+            })
+        }
+
+        /// Block until the parked request has reached the server.
+        fn wait_seen(&self) {
+            let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+            while !*seen {
+                seen = self.cv.wait(seen).unwrap_or_else(|p| p.into_inner());
+            }
+        }
+
+        /// Let the parked request complete.
+        fn release(&self) {
+            *self.released.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            self.cv.notify_all();
+        }
+
+        /// Called on the server's request thread: mark the request observed and
+        /// hold it until released.
+        fn hold(&self) {
+            *self.seen.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            self.cv.notify_all();
+            let mut released = self.released.lock().unwrap_or_else(|p| p.into_inner());
+            while !*released {
+                released = self.cv.wait(released).unwrap_or_else(|p| p.into_inner());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl FakeOwnToneServer {
+        /// A server that answers every request immediately.
+        fn start() -> Self {
+            Self::with_park("/__never_park__")
+        }
+
+        /// A server that parks the restoring `player/stop` request until
+        /// [`ParkGate::release`], so a concurrent operation can be placed
+        /// deterministically behind an in-flight restoration.
+        fn start_parking_stop() -> Self {
+            Self::with_park("/api/player/stop")
+        }
+
+        fn with_park(marker: &str) -> Self {
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
+            let port = listener.local_addr().expect("addr").port();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let park = ParkGate::new(marker);
+            let requests_worker = Arc::clone(&requests);
+            let park_worker = Arc::clone(&park);
+            std::thread::spawn(move || {
+                for incoming in listener.incoming() {
+                    let Ok(stream) = incoming else { continue };
+                    let requests = Arc::clone(&requests_worker);
+                    let park = Arc::clone(&park_worker);
+                    std::thread::spawn(move || serve_fake_own_tone(stream, &requests, &park));
+                }
+            });
+            Self {
+                api_base: format!("http://127.0.0.1:{port}"),
+                requests,
+                park,
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
+
+        fn requests_matching(&self, needle: &str) -> Vec<String> {
+            self.requests()
+                .into_iter()
+                .filter(|request| request.contains(needle))
+                .collect()
+        }
+    }
+
+    /// Serve one request on its own thread: record the request line, park the
+    /// designated path, then answer.
+    #[cfg(target_os = "linux")]
+    fn serve_fake_own_tone(
+        stream: std::net::TcpStream,
+        requests: &Mutex<Vec<String>>,
+        park: &ParkGate,
+    ) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let Ok(reader_stream) = stream.try_clone() else {
+            return;
+        };
+        let mut reader = BufReader::new(reader_stream);
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).is_err() {
+            return;
+        }
+        let trimmed = request_line.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        let mut content_length = 0usize;
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
+                break;
+            }
+            if let Some(value) = header
+                .to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(str::trim)
+                .map(str::to_string)
+            {
+                content_length = value.parse().unwrap_or(0);
+            }
+        }
+        if content_length > 0 {
+            let mut body = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body);
+        }
+        requests
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(trimmed.clone());
+        let path = trimmed
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .to_string();
+        if path == park.marker {
+            park.hold();
+        }
+        let body = fake_own_tone_body(&path);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut stream = stream;
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    /// The JSON the adapter expects from each read endpoint.
+    #[cfg(target_os = "linux")]
+    fn fake_own_tone_body(path: &str) -> &'static str {
+        match path {
+            "/api/config" => r#"{"version":"29.3"}"#,
+            "/api/outputs" => r#"{"outputs":[]}"#,
+            "/api/player" => r#"{"state":"stop"}"#,
+            _ => "{}",
+        }
+    }
+
+    /// W1: a control that is queued behind the terminal restoration can never
+    /// transmit. The restoration owns the settlement boundary and has set the
+    /// terminal flag (and sent its first restoring RPC) before the control is
+    /// even scheduled; when the control finally acquires the boundary it is
+    /// refused, so no late request reaches the daemon and no post-restoration
+    /// effect is left outstanding.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_control_parked_behind_terminal_restoration_transmits_nothing() {
+        let server = FakeOwnToneServer::start_parking_stop();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let inner = Arc::new(test_session_inner_at_base(
+            &server.api_base,
+            directory.path(),
+            async_channel::unbounded().0,
+        ));
+
+        let restore_inner = Arc::clone(&inner);
+        let restore = std::thread::spawn(move || restore_inner.restore());
+
+        // Barrier: the restoration has acquired the settlement boundary and is
+        // genuinely in flight at the daemon.
+        server.park.wait_seen();
+
+        // A control queued behind the terminal restoration. It can only acquire
+        // the boundary after the terminal transition, so `transmit_mutation`
+        // must refuse it.
+        let control_inner = Arc::clone(&inner);
+        let control = std::thread::spawn(move || {
+            control_inner.transmit_mutation(|| control_inner.client.set_volume(50))
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        server.park.release();
+
+        assert!(
+            restore.join().expect("restore thread").is_ok(),
+            "the terminal restoration must succeed"
+        );
+        assert!(
+            control.join().expect("control thread").is_err(),
+            "a control parked behind the terminal transition must be refused"
+        );
+        assert!(inner.terminal.load(Ordering::SeqCst));
+        assert!(inner.restored.load(Ordering::SeqCst));
+        assert!(
+            server.requests_matching("/api/player/volume").is_empty(),
+            "no late control request may reach the restored daemon: {:?}",
+            server.requests()
+        );
+    }
+
+    /// W1 (error path): once the decode-error restoration is terminal, a
+    /// `resume` the worker may still service transmits no `player/play` and
+    /// reports no `Playing` — the restored output selection is never re-driven.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_terminal_restoration_refuses_a_late_resume_and_sends_no_play() {
+        let server = FakeOwnToneServer::start();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = async_channel::unbounded();
+        let inner = test_session_inner_at_base(&server.api_base, directory.path(), tx);
+
+        // The decode-error terminal sequence: the pump has already restored.
+        assert!(inner.restore().is_ok());
+        assert!(inner.terminal.load(Ordering::SeqCst));
+
+        assert!(
+            !inner.activate_and_play(),
+            "a resume after terminal restoration must not activate"
+        );
+        assert!(!inner.activation_live());
+        assert!(
+            server.requests_matching("/api/player/play").is_empty(),
+            "no late player/play may reach the restored daemon: {:?}",
+            server.requests()
+        );
+
+        let mut saw_playing = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Playing,
+                    ..
+                }
+            ) {
+                saw_playing = true;
+            }
+        }
+        assert!(!saw_playing, "a late resume must never publish Playing");
+    }
+
+    /// W1: the close path's second restoration cannot short-circuit over an
+    /// outstanding mutation. After a successful terminal restoration, a
+    /// mutation whose outcome never settled must still force a quiescence
+    /// before ownership may be released; when that cannot be established the
+    /// restore fails closed and the count is retained.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_terminal_restore_does_not_release_over_an_outstanding_mutation() {
+        let server = FakeOwnToneServer::start();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let inner = test_session_inner_at_base(
+            &server.api_base,
+            directory.path(),
+            async_channel::unbounded().0,
+        );
+        assert!(inner.restore().is_ok());
+        assert!(inner.restored.load(Ordering::SeqCst));
+
+        // The outstanding mutation the terminal transition could not observe.
+        inner.mark_unsettled();
+        assert!(
+            inner.restore().is_err(),
+            "a second restore must not treat `restored` as proof that nothing is outstanding"
+        );
+        assert!(
+            inner.unsettled_count() > 0,
+            "the outstanding mutation must be retained until a confirmed quiescence"
+        );
     }
 }
