@@ -21,7 +21,7 @@
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use gst::prelude::*;
@@ -67,6 +67,10 @@ const CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
 const RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
 /// Poll interval between serialized-recovery restoration attempts.
 const RECOVERY_POLL: Duration = Duration::from_millis(200);
+/// Poll interval for the process-global retained-recovery supervisor (review
+/// T2). The supervisor keeps the advisory lock held and retries until
+/// settlement, so it never busy-spins.
+const RECOVERY_SUPERVISOR_POLL: Duration = Duration::from_millis(500);
 /// Bound on terminating the owned instance during quiescence (review R2).
 const QUIESCE_TERMINATE_DEADLINE: Duration = Duration::from_secs(5);
 /// Bound on confirming the owned instance is gone after `SIGKILL` before
@@ -1161,6 +1165,11 @@ struct SessionInner {
     /// wait the moment the load is cancelled or replaced (review R4).
     cancel: OpenCancel,
     restored: AtomicBool,
+    /// `true` while a transmitted control RPC may still be outstanding (it
+    /// failed or timed out after transmission). Such a request cannot be
+    /// retracted by releasing the OS lock, so the daemon must be quiesced
+    /// before ownership is released (review T1).
+    mutation_outstanding: AtomicBool,
     position: Mutex<SenderPosition>,
     state: Mutex<PlayerState>,
     pipeline: Mutex<Option<gst::Pipeline>>,
@@ -1172,6 +1181,13 @@ impl SessionInner {
         let _ = self
             .event_tx
             .try_send(PlayerEvent::state(self.generation, state));
+    }
+
+    /// Record that a transmitted control RPC may still be outstanding, so the
+    /// terminal teardown must quiesce the daemon before releasing ownership
+    /// (review T1).
+    fn mark_mutation_transmitted(&self) {
+        self.mutation_outstanding.store(true, Ordering::SeqCst);
     }
 
     /// Restore the daemon to the state recorded at takeover and remove the
@@ -1191,6 +1207,15 @@ impl SessionInner {
     fn restore(&self) -> Result<(), SenderError> {
         if self.restored.load(Ordering::SeqCst) {
             return Ok(());
+        }
+        // A transmitted control RPC that failed or timed out may still be
+        // outstanding. Quiescence (terminate/restart, dropping every in-flight
+        // request) is then mandatory before restoration can be trusted; if it
+        // cannot be established, retain custody rather than releasing (review
+        // T1).
+        if self.mutation_outstanding.load(Ordering::SeqCst) {
+            quiesce_daemon(&self.config)?;
+            self.mutation_outstanding.store(false, Ordering::SeqCst);
         }
         restore_daemon(&self.client, &self.config, &self.recorded)?;
         // Release this load's loopback route by identity only after the daemon
@@ -1257,7 +1282,14 @@ impl SessionInner {
     /// `false` when a cancellation already won the serialized boundary, in
     /// which case the caller must not transmit `player/play` (review S4).
     fn activate(&self) -> bool {
+        // Hold the acceptance/cancellation boundary across the decision and
+        // re-check the load's cancellation currency inside the same lock: a Stop
+        // that raced the worker's currentness check has already cancelled this
+        // token, so the play is refused before it is transmitted (review T3).
         let mut state = self.activation.lock().unwrap_or_else(|p| p.into_inner());
+        if self.cancel.is_cancelled() {
+            state.cancelled = true;
+        }
         activation_decide(&mut state, self.running.load(Ordering::SeqCst))
     }
 
@@ -1555,28 +1587,60 @@ impl SenderSession for OwnToneSession {
     fn set_volume(&mut self, level: f64) {
         let percent = (level.clamp(0.0, 1.0) * 100.0).round() as u8;
         if let Err(error) = self.inner.client.set_volume(percent) {
+            // A failed (or timed-out) PUT may still be applied server-side, so
+            // record it as outstanding for terminal settlement (review T1).
+            self.inner.mark_mutation_transmitted();
             debug!(reason = %error.message(), "OwnTone volume change failed");
         }
     }
 
     fn pause(&mut self) {
-        if self.inner.client.player_control("pause").is_ok() {
-            self.inner.publish_state(PlayerState::Paused);
+        match self.inner.client.player_control("pause") {
+            Ok(()) => self.inner.publish_state(PlayerState::Paused),
+            Err(error) => {
+                self.inner.mark_mutation_transmitted();
+                debug!(reason = %error.message(), "OwnTone pause failed");
+            }
         }
     }
 
-    fn resume(&mut self) {
+    fn resume(&mut self) -> bool {
         // The first accepted resume is the activation that releases the inert
         // decode pump; the pump never starts playback on its own (review R4).
         // Acceptance and cancellation share one serialized boundary: if a
         // Stop/replacement won it, activation is refused and no `player/play`
         // is transmitted, so a stale daemon play can never follow a cancelled
-        // load (review S4).
+        // load (review S4). The boundary also re-checks the load's cancellation
+        // currency inside the same lock, so a Stop that raced the pump's
+        // currentness check still refuses the play (review T3).
         if !self.inner.activate() {
-            return;
+            return false;
         }
-        if self.inner.client.player_control("play").is_ok() {
-            self.inner.publish_state(PlayerState::Playing);
+        // Re-check the cancellation currency immediately before transmitting:
+        // a Stop that won the boundary after acceptance must not leave a stale
+        // play behind (review T3). A play that is nevertheless transmitted races
+        // a teardown whose restoration `player/stop` compensates it.
+        if self.inner.cancel.is_cancelled() {
+            self.inner.cancel_activation();
+            return false;
+        }
+        match self.inner.client.player_control("play") {
+            Ok(()) => {
+                self.inner.publish_state(PlayerState::Playing);
+                true
+            }
+            Err(error) => {
+                // Propagate the failed initial play truthfully: never report
+                // `Playing`, and record the outstanding play so teardown
+                // settles it (review T3, review T1).
+                self.inner.mark_mutation_transmitted();
+                let _ = self.inner.event_tx.try_send(PlayerEvent::error(
+                    self.inner.generation,
+                    error.message().to_string(),
+                ));
+                self.inner.publish_state(PlayerState::Stopped);
+                false
+            }
         }
     }
 
@@ -1855,6 +1919,9 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
     // value until the user moves it again (review S7). A failed volume RPC is
     // surfaced and unwound, never swallowed.
     if let Err(error) = client.set_volume(volume_percent(ctx.volume)) {
+        // A failed (or timed-out) volume PUT may still be applied server-side,
+        // so this is not a clean unwind (review T1).
+        unsettled = true;
         return fail_outcome(client, config, recorded, lock, unsettled, error, &custody);
     }
     if ctx.cancel.is_cancelled() {
@@ -1894,6 +1961,7 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
         activation: Mutex::new(ActivationState::default()),
         cancel: ctx.cancel.clone(),
         restored: AtomicBool::new(false),
+        mutation_outstanding: AtomicBool::new(false),
         position: Mutex::new(SenderPosition::unknown(ctx.generation)),
         state: Mutex::new(PlayerState::Buffering),
         pipeline: Mutex::new(Some(pipeline.clone())),
@@ -2025,23 +2093,117 @@ fn cancel_outcome(
 /// is still outstanding — retrying compensation cannot retract it (review S3).
 /// After the first failure the daemon is therefore quiesced (terminated and
 /// restarted, dropping every in-flight request) before the next attempt, so a
-/// late restoring mutation cannot land after restoration.
+/// late restoring mutation cannot land after restoration. If quiescence itself
+/// cannot be established, a later successful compensation is **not** accepted
+/// as proof of settlement: the caller must retain ownership (review T1).
 fn settle_restore(
     client: &OwnToneClient,
     config: &OwnToneConfig,
     recorded: &TakeoverRecord,
     deadline: Instant,
 ) -> bool {
+    // A clean restoration first: the caller had nothing outstanding.
+    if restore_daemon(client, config, recorded).is_ok() {
+        return true;
+    }
     loop {
+        // The failed restoration step transmitted a `PUT` that may still be
+        // outstanding. Quiesce before compensating; if quiescence cannot be
+        // established, no later compensation is trustworthy.
+        if quiesce_daemon(config).is_err() {
+            return false;
+        }
         if restore_daemon(client, config, recorded).is_ok() {
             return true;
         }
-        // A failed restoration step may itself have transmitted a `PUT` that is
-        // still outstanding; retrying compensation cannot retract it, so
-        // quiesce the daemon before the next attempt (review S3).
-        let _ = quiesce_daemon(config);
         if Instant::now() >= deadline {
             return false;
+        }
+        std::thread::sleep(RECOVERY_POLL);
+    }
+}
+
+/// A recovery that could not establish quiescence inside the inline recovery
+/// deadline. Rather than leaking the advisory lock descriptor with no owner
+/// (review T2), the lock, the route and everything needed to retry are handed
+/// to a process-global supervisor with a reachable retry/release path.
+struct RetainedRecovery {
+    client: Arc<OwnToneClient>,
+    config: OwnToneConfig,
+    recorded: TakeoverRecord,
+    lock: std::fs::File,
+    route: Option<(Arc<GstreamerMediaProxy>, Arc<GstreamerMediaTicket>)>,
+}
+
+/// Process-global registry and worker for retained recoveries (review T2).
+/// Lazily started only when the inline recovery cannot establish quiescence, so
+/// the common path pays nothing. The supervisor keeps the advisory lock held
+/// and retries quiescence + restoration until they succeed, then releases the
+/// route by identity and drops the lock — a live recovery owner until proven
+/// settlement.
+struct RecoverySupervisor {
+    queue: Mutex<Vec<RetainedRecovery>>,
+    signal: Condvar,
+}
+
+impl RecoverySupervisor {
+    fn global() -> &'static Self {
+        static SUPERVISOR: OnceLock<RecoverySupervisor> = OnceLock::new();
+        SUPERVISOR.get_or_init(|| {
+            let supervisor = Self {
+                queue: Mutex::new(Vec::new()),
+                signal: Condvar::new(),
+            };
+            let _ = std::thread::Builder::new()
+                .name("airplay-owntone-supervisor".to_string())
+                .spawn(supervise_retained);
+            supervisor
+        })
+    }
+
+    fn register(&self, job: RetainedRecovery) {
+        let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
+        queue.push(job);
+        self.signal.notify_all();
+    }
+
+    /// Block until a job is queued, then take one.
+    fn take(&self) -> RetainedRecovery {
+        let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if let Some(job) = queue.pop() {
+                return job;
+            }
+            let (next, _) = self
+                .signal
+                .wait_timeout(queue, RECOVERY_SUPERVISOR_POLL)
+                .unwrap_or_else(|p| p.into_inner());
+            queue = next;
+        }
+    }
+}
+
+/// The supervisor thread: take retained recoveries and retry each until
+/// settlement.
+fn supervise_retained() {
+    loop {
+        let job = RecoverySupervisor::global().take();
+        supervise_job(job);
+    }
+}
+
+/// Retry one retained recovery until quiescence and restoration succeed, then
+/// release the route by identity and drop the lock. The owner stays live for as
+/// long as settlement requires (review T2).
+fn supervise_job(job: RetainedRecovery) {
+    loop {
+        if quiesce_daemon(&job.config).is_ok()
+            && restore_daemon(&job.client, &job.config, &job.recorded).is_ok()
+        {
+            if let Some((proxy, ticket)) = job.route.as_ref() {
+                proxy.take_and_release(ticket);
+            }
+            return;
         }
         std::thread::sleep(RECOVERY_POLL);
     }
@@ -2067,12 +2229,17 @@ fn spawn_serialized_recovery(
 ) -> RecoveryCompletion {
     let completion = RecoveryCompletion::default();
     let worker = completion.clone();
-    // The lock lives in a lease the spawned worker takes ownership of. On a
-    // spawn failure (or an unquiescible recovery) the lease is retained by
-    // leaking the descriptor, so the advisory lock stays held and no other
-    // opener adopts a daemon whose recovery never ran (review S3).
+    // The lock lives in a lease the spawned worker takes ownership of. If the
+    // inline worker cannot be started (or cannot establish quiescence), the
+    // lease, the route and the retry state are handed to the process-global
+    // supervisor rather than leaked with no owner (review T2).
     let lease = Arc::new(Mutex::new(Some(lock)));
     let worker_lease = Arc::clone(&lease);
+    // Fallback copies so a spawn failure can still register a live owner.
+    let fallback_client = Arc::clone(&client);
+    let fallback_config = config.clone();
+    let fallback_recorded = recorded.clone();
+    let fallback_route = route.clone();
     let spawned = std::thread::Builder::new()
         .name("airplay-owntone-recovery".to_string())
         .spawn(move || {
@@ -2083,34 +2250,47 @@ fn spawn_serialized_recovery(
                 .unwrap_or_else(|p| p.into_inner())
                 .take();
             let deadline = Instant::now() + RECOVERY_DEADLINE;
-            // Bounded quiescence precedes every restoration attempt: a
-            // transmitted mutating RPC cannot be retracted by releasing the OS
-            // lock, so terminate/restart the owned instance so no old-generation
-            // mutation can land after restoration (review R2).
-            let mut quiesced = quiesce_daemon(&config).is_ok();
+            // `settled` is true only after a successful quiescence with no
+            // subsequent failed restoration attempt: a restoration step that
+            // fails may itself have transmitted a `PUT` that is still
+            // outstanding (review T1).
+            let mut settled = quiesce_daemon(&config).is_ok();
             loop {
-                if quiesced && restore_daemon(&client, &config, &recorded).is_ok() {
-                    if let Some((proxy, ticket)) = route.as_ref() {
-                        proxy.take_and_release(ticket);
+                if settled {
+                    if restore_daemon(&client, &config, &recorded).is_ok() {
+                        if let Some((proxy, ticket)) = route.as_ref() {
+                            proxy.take_and_release(ticket);
+                        }
+                        worker.resolve(RecoveryOutcome::Restored);
+                        return;
                     }
-                    worker.resolve(RecoveryOutcome::Restored);
-                    return;
+                    // The attempt may have transmitted an outstanding `PUT`: it
+                    // is not settled until the instance is quiesced again.
+                    settled = false;
                 }
                 if Instant::now() >= deadline {
-                    if quiesced {
-                        // Quiescence was established, so no old-generation
-                        // mutation can survive; the record stays for the
-                        // supervisor and the route is released by the load path.
+                    if settled {
+                        // Quiescence was established with nothing outstanding
+                        // since, so no old-generation mutation can survive; the
+                        // record stays for the supervisor and the route is
+                        // released by the load path.
                         worker.resolve(RecoveryOutcome::RestorationFailed {
                             message: "restoration did not complete before the recovery deadline"
                                 .to_string(),
                         });
                     } else {
                         // Quiescence was never established: an outstanding
-                        // mutation may still land. Retain the lock and the route
-                        // rather than claiming a failed-but-released outcome.
+                        // mutation may still land. Hand the retained recovery to
+                        // the process-global supervisor, which keeps the lock and
+                        // the route and retries until settlement (review T2).
                         if let Some(lock) = lock_guard {
-                            std::mem::forget(lock);
+                            RecoverySupervisor::global().register(RetainedRecovery {
+                                client: Arc::clone(&client),
+                                config: config.clone(),
+                                recorded: recorded.clone(),
+                                lock,
+                                route: route.clone(),
+                            });
                         }
                         worker.resolve(RecoveryOutcome::Retained {
                             message: "quiescence was not established before the recovery deadline"
@@ -2120,17 +2300,22 @@ fn spawn_serialized_recovery(
                     return;
                 }
                 std::thread::sleep(RECOVERY_POLL);
-                quiesced = quiesce_daemon(&config).is_ok();
+                settled = quiesce_daemon(&config).is_ok();
             }
         });
     if spawned.is_err() {
-        // No executable recovery owner exists. Retain the lock (leak its
-        // descriptor so the flock stays held for the process) and the route for
-        // the supervisor, and report a terminal retained outcome rather than
-        // pretending the failed recovery released ownership (review S3).
+        // No inline recovery owner could start. Hand the retained recovery to
+        // the process-global supervisor rather than leaking the descriptor
+        // (review T2), and report the terminal retained outcome.
         let retained_lock = lease.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(lock) = retained_lock {
-            std::mem::forget(lock);
+            RecoverySupervisor::global().register(RetainedRecovery {
+                client: fallback_client,
+                config: fallback_config,
+                recorded: fallback_recorded,
+                lock,
+                route: fallback_route,
+            });
         }
         completion.resolve(RecoveryOutcome::Retained {
             message: "the serialized recovery could not be started".to_string(),
@@ -2840,11 +3025,62 @@ mod tests {
             activation: Mutex::new(ActivationState::default()),
             cancel: OpenCancel::new(),
             restored: AtomicBool::new(false),
+            mutation_outstanding: AtomicBool::new(false),
             position: Mutex::new(SenderPosition::unknown(PlayerEventGeneration::from_raw(1))),
             state: Mutex::new(PlayerState::Buffering),
             pipeline: Mutex::new(None),
         };
         assert!(inner.restore().is_err());
         assert!(!inner.restored.load(Ordering::SeqCst));
+    }
+
+    /// Build a `SessionInner` whose daemon endpoint is unreachable, for the
+    /// fail-closed terminal paths.
+    fn test_session_inner(state_dir: &Path) -> SessionInner {
+        SessionInner {
+            client: Arc::new(OwnToneClient::new("http://127.0.0.1:1").expect("client")),
+            config: owned_config(state_dir),
+            generation: PlayerEventGeneration::from_raw(1),
+            event_tx: async_channel::unbounded().0,
+            recorded: TakeoverRecord {
+                enabled_outputs: vec![1],
+                selected_output: 2,
+            },
+            media_proxy: Arc::new(GstreamerMediaProxy::new(None)),
+            media_ticket: None,
+            running: AtomicBool::new(true),
+            activation: Mutex::new(ActivationState::default()),
+            cancel: OpenCancel::new(),
+            restored: AtomicBool::new(false),
+            mutation_outstanding: AtomicBool::new(false),
+            position: Mutex::new(SenderPosition::unknown(PlayerEventGeneration::from_raw(1))),
+            state: Mutex::new(PlayerState::Buffering),
+            pipeline: Mutex::new(None),
+        }
+    }
+
+    /// T3: acceptance consults the load's cancellation currency inside the
+    /// serialized boundary, so a Stop that raced the worker's currentness check
+    /// refuses activation instead of transmitting a stale `player/play`.
+    #[test]
+    fn activation_refuses_once_the_load_is_cancelled() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let inner = test_session_inner(directory.path());
+        inner.cancel.cancel();
+        assert!(!inner.activate());
+        assert!(!inner.activation_live());
+    }
+
+    /// T1: a transmitted control that failed leaves the session unsettled, so
+    /// restoration must quiesce first; when the daemon cannot be quiesced the
+    /// restoration fails closed instead of releasing ownership.
+    #[test]
+    fn restore_fails_closed_while_a_mutation_is_outstanding() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let inner = test_session_inner(directory.path());
+        inner.mark_mutation_transmitted();
+        assert!(inner.restore().is_err());
+        assert!(!inner.restored.load(Ordering::SeqCst));
+        assert!(inner.mutation_outstanding.load(Ordering::SeqCst));
     }
 }

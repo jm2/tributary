@@ -102,8 +102,8 @@ impl SenderSession for GstreamerSenderSession {
         let _ = self.pipeline.set_state(gst::State::Paused);
     }
 
-    fn resume(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Playing);
+    fn resume(&mut self) -> bool {
+        self.pipeline.set_state(gst::State::Playing).is_ok()
     }
 
     fn flush(&mut self) {
@@ -782,8 +782,16 @@ fn run_session_worker(
                 return;
             }
             // `open_session` only prerolls; like every other output, a load
-            // must actually start playback.
-            session.resume();
+            // must actually start playback. Report the real outcome: a failed
+            // or cancelled start is not `Playing` (review T3).
+            if !session.resume() {
+                state_cache.store(PlayerState::Stopped as u8, Ordering::SeqCst);
+                let _ = ctx
+                    .event_tx
+                    .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
+                session.close();
+                return;
+            }
             state_cache.store(PlayerState::Playing as u8, Ordering::SeqCst);
             let _ = ctx
                 .event_tx
@@ -796,7 +804,9 @@ fn run_session_worker(
                 }
                 match commands.recv_timeout(Duration::from_millis(200)) {
                     Ok(SessionCommand::Pause) => session.pause(),
-                    Ok(SessionCommand::Resume) => session.resume(),
+                    Ok(SessionCommand::Resume) => {
+                        let _ = session.resume();
+                    }
                     Ok(SessionCommand::SetVolume(level)) => session.set_volume(level),
                     Ok(SessionCommand::Stop) => break,
                     Err(RecvTimeoutError::Timeout) => {}
