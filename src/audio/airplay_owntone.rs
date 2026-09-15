@@ -69,6 +69,11 @@ const RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
 const RECOVERY_POLL: Duration = Duration::from_millis(200);
 /// Bound on terminating the owned instance during quiescence (review R2).
 const QUIESCE_TERMINATE_DEADLINE: Duration = Duration::from_secs(5);
+/// Bound on confirming the owned instance is gone after `SIGKILL` before
+/// quiescence is declared failed (review S3). `SIGKILL` cannot be ignored, so
+/// a process still present after this bound is not dying and must not be
+/// mistaken for a quiesced instance.
+const QUIESCE_KILL_DEADLINE: Duration = Duration::from_secs(5);
 /// Bound on the owned instance coming back after quiescence (review R2).
 const QUIESCE_RESTART_DEADLINE: Duration = Duration::from_secs(15);
 
@@ -256,8 +261,32 @@ fn is_loopback_host(host: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ListenerProcess {
     pid: u32,
+    /// Kernel process start time, from `/proc/<pid>/stat` field 22. Paired
+    /// with the pid it is a stable identity: a recycled pid has a different
+    /// start time, so a signal can never reach a foreign successor of the
+    /// dedicated instance (review S2).
+    start_time: u64,
     exe: PathBuf,
     cmdline: String,
+}
+
+impl ListenerProcess {
+    /// The stable kernel identity a signal must re-verify immediately before
+    /// delivery (review S2).
+    fn identity(&self) -> ProcessIdentity {
+        ProcessIdentity {
+            pid: self.pid,
+            start_time: self.start_time,
+        }
+    }
+}
+
+/// A pid paired with the kernel start time that makes it stable across pid
+/// reuse (review S2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessIdentity {
+    pid: u32,
+    start_time: u64,
 }
 
 /// The local port of a JSON API base URL.
@@ -266,11 +295,48 @@ fn api_port(api_base: &str) -> Option<u16> {
     url.port_or_known_default()
 }
 
+/// The loopback host of a JSON API base URL.
+fn api_host(api_base: &str) -> Option<String> {
+    let url = url::Url::parse(api_base).ok()?;
+    url.host_str().map(str::to_string)
+}
+
+/// Acceptable `/proc/net/tcp{,6}` `HEXADDR` renderings for the configured
+/// loopback host. The kernel stores IPv4 addresses as a little-endian `u32`
+/// and IPv6 addresses as four little-endian `u32` words, so a plain
+/// big-endian hex rendering would not match. `localhost` accepts both
+/// loopback families. Port-only matching was the S2 defect: a listener on a
+/// *different* loopback address that happens to share the port was treated as
+/// the dedicated endpoint.
+fn expected_local_addrs(host: &str) -> Vec<String> {
+    fn ipv4(octets: [u8; 4]) -> String {
+        format!("{:08X}", u32::from_le_bytes(octets))
+    }
+    fn ipv6(segments: [u16; 8]) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for chunk in segments.chunks(2) {
+            let word = ((chunk[0] as u32) << 16) | chunk[1] as u32;
+            let _ = write!(out, "{:08X}", word.swap_bytes());
+        }
+        out
+    }
+    match host {
+        "127.0.0.1" => vec![ipv4([127, 0, 0, 1])],
+        "::1" | "[::1]" => vec![ipv6([0, 0, 0, 0, 0, 0, 0, 1])],
+        "localhost" => vec![ipv4([127, 0, 0, 1]), ipv6([0, 0, 0, 0, 0, 0, 0, 1])],
+        _ => Vec::new(),
+    }
+}
+
 /// Parse a `/proc/net/tcp` / `/proc/net/tcp6` table (identical layout) and
-/// return the socket inodes LISTENing on `port`. The local-address column is
-/// `HEXADDR:HEXPORT`, the state column is `0A` for `TCP_LISTEN`, and the inode
-/// is the tenth whitespace-separated column.
-fn listening_inodes(table: &str, port: u16) -> Vec<u64> {
+/// return the socket inodes LISTENing on `port` at one of `addrs`. The
+/// local-address column is `HEXADDR:HEXPORT`, the state column is `0A` for
+/// `TCP_LISTEN`, and the inode is the tenth whitespace-separated column. Both
+/// the bound address and the port must match the configured endpoint, so a
+/// listener sharing only the port is never confused with the dedicated
+/// instance (review S2).
+fn listening_inodes(table: &str, port: u16, addrs: &[String]) -> Vec<u64> {
     let mut inodes = Vec::new();
     for line in table.lines().skip(1) {
         // Columns: `sl local_address rem_address st ... inode`. The slot is
@@ -282,13 +348,13 @@ fn listening_inodes(table: &str, port: u16) -> Vec<u64> {
         if *state != "0A" {
             continue;
         }
-        let Some(port_hex) = local.rsplit(':').next() else {
+        let Some((addr, port_hex)) = local.rsplit_once(':') else {
             continue;
         };
         let Ok(local_port) = u16::from_str_radix(port_hex, 16) else {
             continue;
         };
-        if local_port != port {
+        if local_port != port || !addrs.iter().any(|expected| expected == addr) {
             continue;
         }
         if let Some(inode) = fields.get(9).and_then(|value| value.parse::<u64>().ok()) {
@@ -316,20 +382,44 @@ fn process_state(pid: u32) -> Option<char> {
     stat[close + 1..].split_whitespace().next()?.chars().next()
 }
 
-/// Read a process's executable path and command line out of band.
+/// The kernel start time (field 22 of `/proc/<pid>/stat`) that, paired with
+/// the pid, gives a stable process identity across pid reuse (review S2).
+fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Skip the parenthesised `comm`; the next fields are state, ppid, ...,
+    // starttime (field 22), which is the 20th field after `comm`.
+    let close = stat.rfind(')')?;
+    stat[close + 1..].split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Read a process's executable path, command line and stable start time out of
+/// band.
 fn read_process(pid: u32) -> Option<ListenerProcess> {
     let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
     let cmdline = render_cmdline(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?);
-    Some(ListenerProcess { pid, exe, cmdline })
+    let start_time = process_start_time(pid)?;
+    Some(ListenerProcess {
+        pid,
+        start_time,
+        exe,
+        cmdline,
+    })
 }
 
-/// The process currently LISTENing on the configured loopback API port.
+/// The process currently LISTENing on the configured loopback API endpoint —
+/// both the configured address and port must match (review S2).
 fn listener_process(api_base: &str) -> Option<ListenerProcess> {
     let port = api_port(api_base)?;
+    let addrs = api_host(api_base)
+        .map(|host| expected_local_addrs(&host))
+        .unwrap_or_default();
+    if addrs.is_empty() {
+        return None;
+    }
     let mut inodes = Vec::new();
     for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
         if let Ok(text) = std::fs::read_to_string(table) {
-            inodes.extend(listening_inodes(&text, port));
+            inodes.extend(listening_inodes(&text, port, &addrs));
         }
     }
     if inodes.is_empty() {
@@ -369,12 +459,24 @@ fn listener_process(api_base: &str) -> Option<ListenerProcess> {
     None
 }
 
-/// `true` when `cmdline` names the dedicated instance's state directory — the
-/// out-of-band configuration binding that distinguishes the owned daemon from
-/// a foreign listener that merely holds the same port (review R5).
+/// `true` when an argument in `cmdline` names the dedicated instance's state
+/// directory — the out-of-band configuration binding that distinguishes the
+/// owned daemon from a foreign listener that merely holds the same port
+/// (review R5, strengthened by S2).
+///
+/// Binding is **path-component exact**: an argument is accepted when it equals
+/// the state directory or has it as a leading path prefix (`/state/owntone.conf`
+/// under `/state`). A bare substring is rejected because a sibling directory
+/// such as `/run/tributary-other` would otherwise match `/run/tributary`, which
+/// is exactly the S2 collision.
 fn cmdline_binds_state_dir(cmdline: &str, state_dir: &Path) -> bool {
-    let needle = state_dir.to_string_lossy();
-    !needle.is_empty() && cmdline.contains(needle.as_ref())
+    if state_dir.as_os_str().is_empty() {
+        return false;
+    }
+    cmdline.split_whitespace().any(|arg| {
+        let arg = Path::new(arg);
+        arg == state_dir || arg.starts_with(state_dir)
+    })
 }
 
 /// Compare an executable path with the configured binary, resolving symlinks
@@ -415,15 +517,47 @@ fn verify_daemon_process(config: &OwnToneConfig) -> Result<(), SenderError> {
     Ok(())
 }
 
-/// Terminate `pid`, escalating to `SIGKILL` at the deadline, and wait until the
-/// process is gone or a zombie. Only ever called on a listener already
-/// verified as the owned instance.
-fn terminate_process(pid: u32, deadline: Duration) -> Result<(), SenderError> {
+/// Re-verify, immediately before signalling, that the exact process the
+/// listener was resolved from is still the dedicated Tributary-owned instance
+/// (review S2). The pid/start-time identity guards against pid reuse and the
+/// full ownership binding (binary + component-exact state directory) guards
+/// against a foreign same-binary successor adopting the endpoint.
+fn verify_signal_target(
+    process: &ListenerProcess,
+    config: &OwnToneConfig,
+) -> Result<(), SenderError> {
+    let Some(current) = read_process(process.pid) else {
+        return Err(unavailable("the dedicated daemon is no longer running"));
+    };
+    if current.identity() != process.identity() {
+        return Err(unavailable(
+            "the dedicated daemon process identity changed before it could be signalled",
+        ));
+    }
+    if !process_is_owned(&current, config) {
+        return Err(unavailable(
+            "the process bound to the configured endpoint is not the dedicated Tributary-owned instance",
+        ));
+    }
+    Ok(())
+}
+
+/// Signal `pid`, escalating to `SIGKILL` at `deadline`, and **confirm** the
+/// process is gone (or a zombie). A signal error is reported rather than
+/// ignored, and `SIGKILL` must be followed by observed exit: quiescence is
+/// only established once the old process is actually gone (review S3).
+fn signal_and_wait(pid: u32, deadline: Duration) -> Result<(), SenderError> {
+    use rustix::io::Errno;
     use rustix::process::{kill_process, Pid, Signal};
     let Some(signal_pid) = Pid::from_raw(pid as i32) else {
         return Err(unavailable("the dedicated daemon process id is invalid"));
     };
-    let _ = kill_process(signal_pid, Signal::TERM);
+    match kill_process(signal_pid, Signal::TERM) {
+        Ok(()) => {}
+        // Already gone: quiescence is satisfied.
+        Err(Errno::SRCH) => return Ok(()),
+        Err(_) => return Err(unavailable("the dedicated daemon could not be signalled")),
+    }
     let end = Instant::now() + deadline;
     loop {
         match process_state(pid) {
@@ -431,11 +565,40 @@ fn terminate_process(pid: u32, deadline: Duration) -> Result<(), SenderError> {
             Some(_) => {}
         }
         if Instant::now() >= end {
-            let _ = kill_process(signal_pid, Signal::KILL);
-            return Ok(());
+            break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    match kill_process(signal_pid, Signal::KILL) {
+        Ok(()) => {}
+        Err(Errno::SRCH) => return Ok(()),
+        Err(_) => return Err(unavailable("the dedicated daemon could not be terminated")),
+    }
+    let kill_end = Instant::now() + QUIESCE_KILL_DEADLINE;
+    loop {
+        match process_state(pid) {
+            None | Some('Z') => return Ok(()),
+            Some(_) => {}
+        }
+        if Instant::now() >= kill_end {
+            return Err(unavailable(
+                "the dedicated daemon did not terminate after SIGKILL",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Terminate the dedicated instance, re-verifying its full authority and
+/// stable identity immediately before signalling (review S2), and confirming
+/// exit after `SIGKILL` before declaring quiescence (review S3).
+fn terminate_process(
+    process: &ListenerProcess,
+    config: &OwnToneConfig,
+    deadline: Duration,
+) -> Result<(), SenderError> {
+    verify_signal_target(process, config)?;
+    signal_and_wait(process.pid, deadline)
 }
 
 /// Run the supervisor's restart command recorded by the installation (review
@@ -453,14 +616,20 @@ fn spawn_restart_command(command: &str) -> Result<(), SenderError> {
         .map_err(|_| unavailable("the dedicated daemon could not be restarted"))
 }
 
-/// Wait (bounded) until the configured endpoint is again served by the owned
-/// instance after quiescence.
-fn wait_for_owned_listener(config: &OwnToneConfig, deadline: Instant) -> Result<(), SenderError> {
+/// Wait (bounded) until the configured endpoint is again served by an owned
+/// instance after quiescence. The **same** still-live process that was just
+/// terminated never satisfies the wait: its stable identity is excluded, so a
+/// failed termination cannot be mistaken for a restart (review S3).
+fn wait_for_owned_listener(
+    config: &OwnToneConfig,
+    deadline: Instant,
+    previous: ProcessIdentity,
+) -> Result<(), SenderError> {
     loop {
-        if listener_process(&config.api_base)
-            .is_some_and(|process| process_is_owned(&process, config))
-        {
-            return Ok(());
+        if let Some(process) = listener_process(&config.api_base) {
+            if process_is_owned(&process, config) && process.identity() != previous {
+                return Ok(());
+            }
         }
         if Instant::now() >= deadline {
             return Err(unavailable(
@@ -483,16 +652,19 @@ fn quiesce_daemon(config: &OwnToneConfig) -> Result<(), SenderError> {
             "the dedicated daemon is not running to quiesce",
         ));
     };
-    if !same_binary(&process.exe, &config.binary) {
+    // Full authority, not just the binary: a same-binary shared instance that
+    // happens to hold the endpoint must never be terminated (review S2).
+    if !process_is_owned(&process, config) {
         return Err(unavailable(
-            "the process bound to the configured endpoint is not the dedicated owntone binary",
+            "the process bound to the configured endpoint is not the dedicated Tributary-owned instance",
         ));
     }
-    terminate_process(process.pid, QUIESCE_TERMINATE_DEADLINE)?;
+    let previous = process.identity();
+    terminate_process(&process, config, QUIESCE_TERMINATE_DEADLINE)?;
     if let Some(command) = config.restart_command() {
         spawn_restart_command(&command)?;
     }
-    wait_for_owned_listener(config, Instant::now() + QUIESCE_RESTART_DEADLINE)
+    wait_for_owned_listener(config, Instant::now() + QUIESCE_RESTART_DEADLINE, previous)
 }
 
 /// `true` when this package target has a documented OwnTone acquisition path.
@@ -822,6 +994,21 @@ fn open_pipe_write(
     }
 }
 
+/// The serialized activation/cancellation decision shared by the load path
+/// (which accepts a current load) and teardown (which cancels the load). A
+/// single mutex makes the two a defined boundary: an activation that loses the
+/// race to a cancellation is refused *before* it transmits `player/play`, and
+/// a cancellation that follows an accepted activation knows a play may have
+/// been transmitted and must be covered by restoration (review S4).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ActivationState {
+    /// The load path accepted this session; the decode pump may start.
+    accepted: bool,
+    /// Teardown cancelled this session; no activation may be accepted and no
+    /// pump may start.
+    cancelled: bool,
+}
+
 /// Per-session shared state, driven by the decode pump and read by the seam.
 struct SessionInner {
     client: Arc<OwnToneClient>,
@@ -835,11 +1022,11 @@ struct SessionInner {
     media_proxy: Arc<GstreamerMediaProxy>,
     media_ticket: Option<Arc<GstreamerMediaTicket>>,
     running: AtomicBool,
-    /// Set only when the load path accepts this session's activation. The
-    /// decode pump stays inert — no pipeline start, no PCM, no daemon play —
-    /// until then, so a cancelled or superseded load cannot start stale
-    /// playback (review R4).
-    activated: AtomicBool,
+    /// The serialized acceptance/cancellation boundary. The decode pump stays
+    /// inert — no pipeline start, no PCM, no daemon play — until acceptance,
+    /// and a cancellation that wins the boundary refuses a late acceptance
+    /// (review R4, review S4).
+    activation: Mutex<ActivationState>,
     /// The load's cancellation currency, so the pump can abort its activation
     /// wait the moment the load is cancelled or replaced (review R4).
     cancel: OpenCancel,
@@ -876,11 +1063,14 @@ impl SessionInner {
             return Ok(());
         }
         restore_daemon(&self.client, &self.config, &self.recorded)?;
-        // Revoke this load's loopback route by identity only after the daemon
+        // Release this load's loopback route by identity only after the daemon
         // has been restored: the route stays valid for every request the
-        // daemon might still be applying (§4.1, §4.3).
+        // daemon might still be applying (§4.1, §4.3). The identity-bound
+        // `take_and_release` is the single release primitive, so a ticket that
+        // was moved into recovery custody during a superseded open is also
+        // removed from custody here rather than stranded (review S5).
         if let Some(ticket) = self.media_ticket.as_ref() {
-            self.media_proxy.revoke_if_current(ticket);
+            self.media_proxy.take_and_release(ticket);
         }
         self.restored.store(true, Ordering::SeqCst);
         Ok(())
@@ -933,32 +1123,71 @@ impl SessionInner {
             .clone()
     }
 
-    /// Accept activation: release the decode pump to start playback. Called
-    /// only after the load path has confirmed the generation is still current
-    /// and the load is not cancelled (review R4).
-    fn activate(&self) {
-        self.activated.store(true, Ordering::SeqCst);
+    /// Accept activation: release the decode pump to start playback. Returns
+    /// `false` when a cancellation already won the serialized boundary, in
+    /// which case the caller must not transmit `player/play` (review S4).
+    fn activate(&self) -> bool {
+        let mut state = self.activation.lock().unwrap_or_else(|p| p.into_inner());
+        activation_decide(&mut state, self.running.load(Ordering::SeqCst))
     }
+
+    /// Cancel activation: after this returns, no activation can be accepted.
+    /// Idempotent and safe from any thread; paired with the same mutex the
+    /// acceptance uses so an in-flight `resume` and a concurrent teardown
+    /// observe a single ordering (review S4).
+    fn cancel_activation(&self) {
+        let mut state = self.activation.lock().unwrap_or_else(|p| p.into_inner());
+        state.cancelled = true;
+    }
+
+    /// The pump's final serialized check: `true` only while activation is
+    /// accepted and no cancellation has won. Taken under the same mutex as
+    /// acceptance and cancellation, so the pump's start decision cannot
+    /// interleave with a teardown that is cancelling it (review S4).
+    fn activation_live(&self) -> bool {
+        let state = self.activation.lock().unwrap_or_else(|p| p.into_inner());
+        state.accepted && !state.cancelled
+    }
+}
+
+/// Pure acceptance decision shared by [`SessionInner::activate`]: accept
+/// activation only while the session is running and no cancellation has won
+/// the serialized boundary (review S4). Split out so the boundary is
+/// deterministically unit-testable without a live session.
+fn activation_decide(state: &mut ActivationState, running: bool) -> bool {
+    if state.cancelled || !running {
+        return false;
+    }
+    state.accepted = true;
+    true
 }
 
 /// Pure activation gate, split from [`wait_for_activation`] so the pump's
 /// "inert until accepted" barrier is deterministically unit-testable without
-/// a GStreamer pipeline (review R4). Returns `true` only when the load
+/// a GStreamer pipeline (review R4, S4). Returns `true` only when the load
 /// accepted activation before the deadline and was neither cancelled nor torn
-/// down while waiting.
+/// down while waiting. The decision is read under the activation mutex, so the
+/// gate observes the same serialized boundary as [`SessionInner::activate`]
+/// and [`SessionInner::cancel_activation`].
 fn activation_gate(
+    activation: &Mutex<ActivationState>,
     running: &AtomicBool,
-    activated: &AtomicBool,
     cancel: &OpenCancel,
     deadline: Instant,
     poll: Duration,
 ) -> bool {
     loop {
+        {
+            let state = activation.lock().unwrap_or_else(|p| p.into_inner());
+            if state.cancelled {
+                return false;
+            }
+            if state.accepted {
+                return true;
+            }
+        }
         if cancel.is_cancelled() || !running.load(Ordering::SeqCst) {
             return false;
-        }
-        if activated.load(Ordering::SeqCst) {
-            return true;
         }
         if Instant::now() >= deadline {
             return false;
@@ -975,8 +1204,8 @@ fn activation_gate(
 /// event, or driving the daemon (review R4).
 fn wait_for_activation(inner: &SessionInner) -> bool {
     activation_gate(
+        &inner.activation,
         &inner.running,
-        &inner.activated,
         &inner.cancel,
         Instant::now() + OPEN_DEADLINE,
         FIFO_OPEN_POLL,
@@ -999,6 +1228,13 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
     // cancelled or superseded before activation returns here without touching
     // the pipeline or the daemon (review R4).
     if !wait_for_activation(&inner) {
+        return;
+    }
+    // Final serialized check before any pipeline start, PCM or daemon drive: a
+    // cancellation that won the boundary after the wait must still leave the
+    // pump inert, so an accepted-then-cancelled load never starts playback
+    // (review S4).
+    if !inner.activation_live() || inner.cancel.is_cancelled() {
         return;
     }
 
@@ -1202,9 +1438,13 @@ impl SenderSession for OwnToneSession {
     fn resume(&mut self) {
         // The first accepted resume is the activation that releases the inert
         // decode pump; the pump never starts playback on its own (review R4).
-        // The load path calls this only after confirming the generation is
-        // still current and the load was not cancelled.
-        self.inner.activate();
+        // Acceptance and cancellation share one serialized boundary: if a
+        // Stop/replacement won it, activation is refused and no `player/play`
+        // is transmitted, so a stale daemon play can never follow a cancelled
+        // load (review S4).
+        if !self.inner.activate() {
+            return;
+        }
         if self.inner.client.player_control("play").is_ok() {
             self.inner.publish_state(PlayerState::Playing);
         }
@@ -1228,6 +1468,10 @@ impl SenderSession for OwnToneSession {
 
     fn close(self: Box<Self>) {
         let this = *self;
+        // Win the serialized activation boundary before tearing down: a close
+        // that races an accepted activation must block any late `player/play`
+        // (review S4).
+        this.inner.cancel_activation();
         this.inner.running.store(false, Ordering::SeqCst);
         if let Some(pipeline) = this.inner.pipeline() {
             let _ = pipeline.set_state(gst::State::Null);
@@ -1241,21 +1485,21 @@ impl SenderSession for OwnToneSession {
             drop(this.lock);
             return;
         }
-        // A failed restoration is not a clean close: install the same
-        // serialized recovery a `RecoveryPending` open leaves behind, so the
-        // advisory lock and the loopback route are retained until recovery
-        // reaches a terminal disposition (review R3). This runs on the load
-        // worker, never on GTK.
+        // A failed restoration is not a clean close: move the route off the
+        // active lease into keyed custody *before* recovery starts, so a
+        // replacement preparation in the interval can never revoke it (review
+        // S5), then install the same serialized recovery a `RecoveryPending`
+        // open leaves behind. This runs on the load worker, never on GTK.
+        let ticket = this.inner.media_ticket.as_ref().map(Arc::clone);
+        if let Some(ticket) = ticket.as_ref() {
+            this.inner.media_proxy.move_to_recovery_custody(ticket);
+        }
         let Some(lock) = this.lock else {
             // No lock to hold; the durable takeover record still makes the
             // next opener refuse rather than adopt a half-taken-over daemon.
             return;
         };
-        let route = this
-            .inner
-            .media_ticket
-            .as_ref()
-            .map(|ticket| (Arc::clone(&this.inner.media_proxy), Arc::clone(ticket)));
+        let route = ticket.map(|ticket| (Arc::clone(&this.inner.media_proxy), ticket));
         let completion = spawn_serialized_recovery(
             Arc::clone(&this.inner.client),
             this.inner.config.clone(),
@@ -1374,6 +1618,10 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
         Ok(client) => Arc::new(client),
         Err(error) => return OpenOutcome::Failed(error),
     };
+    // The route hand-off a recovery-pending outcome carries: the seat moves
+    // this load's ticket into custody before constructing that outcome (review
+    // S5).
+    let custody = CustodyHandoff::from_ctx(ctx);
     if let Err(error) = config.verify_owned() {
         return OpenOutcome::Failed(error);
     }
@@ -1453,43 +1701,54 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
 
     let mut unsettled = false;
     if ctx.cancel.is_cancelled() {
-        return cancel_outcome(client, config, recorded, lock, unsettled);
+        return cancel_outcome(client, config, recorded, lock, unsettled, &custody);
     }
     if let Err(error) = client.set_outputs(&[selected]) {
         // A mutating RPC that returned an error may still have been applied
         // server-side, so this is not a clean unwind (review F3).
         unsettled = true;
-        return fail_outcome(client, config, recorded, lock, unsettled, error);
+        return fail_outcome(client, config, recorded, lock, unsettled, error, &custody);
     }
     if ctx.cancel.is_cancelled() {
-        return cancel_outcome(client, config, recorded, lock, unsettled);
+        return cancel_outcome(client, config, recorded, lock, unsettled, &custody);
     }
     if let Err(error) = client.clear_queue() {
         unsettled = true;
-        return fail_outcome(client, config, recorded, lock, unsettled, error);
+        return fail_outcome(client, config, recorded, lock, unsettled, error, &custody);
     }
     if ctx.cancel.is_cancelled() {
-        return cancel_outcome(client, config, recorded, lock, unsettled);
+        return cancel_outcome(client, config, recorded, lock, unsettled, &custody);
+    }
+
+    // Apply the user's current volume **before any activation**, so a switch
+    // to OwnTone starts at the slider's level instead of the daemon's prior
+    // value until the user moves it again (review S7). A failed volume RPC is
+    // surfaced and unwound, never swallowed.
+    if let Err(error) = client.set_volume(volume_percent(ctx.volume)) {
+        return fail_outcome(client, config, recorded, lock, unsettled, error, &custody);
+    }
+    if ctx.cancel.is_cancelled() {
+        return cancel_outcome(client, config, recorded, lock, unsettled, &custody);
     }
 
     let write_fd = match open_pipe_write(&config.pipe_path, deadline, &ctx.cancel) {
         Ok(fd) => fd,
         Err(CancelOrError::Cancelled) => {
-            return cancel_outcome(client, config, recorded, lock, unsettled);
+            return cancel_outcome(client, config, recorded, lock, unsettled, &custody);
         }
         Err(CancelOrError::Failed(error)) => {
-            return fail_outcome(client, config, recorded, lock, unsettled, error);
+            return fail_outcome(client, config, recorded, lock, unsettled, error, &custody);
         }
     };
     if ctx.cancel.is_cancelled() {
         drop(write_fd);
-        return cancel_outcome(client, config, recorded, lock, unsettled);
+        return cancel_outcome(client, config, recorded, lock, unsettled, &custody);
     }
 
     let pipeline = match build_pipeline(&ctx.prepared_uri, &write_fd) {
         Ok(pipeline) => pipeline,
         Err(error) => {
-            return fail_outcome(client, config, recorded, lock, unsettled, error);
+            return fail_outcome(client, config, recorded, lock, unsettled, error, &custody);
         }
     };
 
@@ -1502,7 +1761,7 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
         media_proxy: Arc::clone(&ctx.media_proxy),
         media_ticket: ctx.media_ticket.clone(),
         running: AtomicBool::new(true),
-        activated: AtomicBool::new(false),
+        activation: Mutex::new(ActivationState::default()),
         cancel: ctx.cancel.clone(),
         restored: AtomicBool::new(false),
         position: Mutex::new(SenderPosition::unknown(ctx.generation)),
@@ -1526,6 +1785,7 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
                 lock,
                 unsettled,
                 error,
+                &custody,
             ),
             Err(inner) => {
                 let _ = restore_daemon(&inner.client, &inner.config, &inner.recorded);
@@ -1541,10 +1801,52 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
     }))
 }
 
+/// The linear `[0.0, 1.0]` volume mapped to the daemon's integer percent, so
+/// the initial-volume application is a pure, testable computation (review S7).
+fn volume_percent(level: f64) -> u8 {
+    (level.clamp(0.0, 1.0) * 100.0).round() as u8
+}
+
+/// The route hand-off a recovery-pending outcome needs: the load's proxy and
+/// its own ticket. The seat moves the ticket into keyed custody **before** it
+/// constructs the outcome, so a replacement load's supersession revocation can
+/// never observe it on the active lease in the interval before the load path
+/// receives the outcome (review S5).
+struct CustodyHandoff {
+    proxy: Arc<GstreamerMediaProxy>,
+    ticket: Option<Arc<GstreamerMediaTicket>>,
+}
+
+impl CustodyHandoff {
+    fn from_ctx(ctx: &SenderOpenContext) -> Self {
+        Self {
+            proxy: Arc::clone(&ctx.media_proxy),
+            ticket: ctx.media_ticket.clone(),
+        }
+    }
+
+    /// Move this load's ticket off the active lease into recovery custody.
+    /// Idempotent.
+    fn move_to_custody(&self) {
+        if let Some(ticket) = self.ticket.as_ref() {
+            self.proxy.move_to_recovery_custody(ticket);
+        }
+    }
+
+    /// The route handle the serialized recovery releases at its terminal
+    /// disposition.
+    fn route(&self) -> Option<(Arc<GstreamerMediaProxy>, Arc<GstreamerMediaTicket>)> {
+        self.ticket
+            .as_ref()
+            .map(|ticket| (Arc::clone(&self.proxy), Arc::clone(ticket)))
+    }
+}
+
 /// Handle a failure after the first mutating RPC. A clean restoration inside
 /// the cleanup deadline returns the original failure; otherwise the record is
 /// preserved and recovery is serialized behind a `RecoveryPending` failure
 /// (review F3).
+#[allow(clippy::too_many_arguments)]
 fn fail_outcome(
     client: Arc<OwnToneClient>,
     config: OwnToneConfig,
@@ -1552,6 +1854,7 @@ fn fail_outcome(
     lock: std::fs::File,
     unsettled: bool,
     original: SenderError,
+    custody: &CustodyHandoff,
 ) -> OpenOutcome {
     if !unsettled {
         let deadline = Instant::now() + CLEANUP_DEADLINE;
@@ -1560,7 +1863,7 @@ fn fail_outcome(
             return OpenOutcome::Failed(original);
         }
     }
-    OpenOutcome::Failed(recovery_pending(client, config, recorded, lock))
+    OpenOutcome::Failed(recovery_pending(client, config, recorded, lock, custody))
 }
 
 /// Handle a cancellation after the first mutating RPC. A clean restoration
@@ -1572,6 +1875,7 @@ fn cancel_outcome(
     recorded: TakeoverRecord,
     lock: std::fs::File,
     unsettled: bool,
+    custody: &CustodyHandoff,
 ) -> OpenOutcome {
     if !unsettled {
         let deadline = Instant::now() + CLEANUP_DEADLINE;
@@ -1580,12 +1884,18 @@ fn cancel_outcome(
             return OpenOutcome::Cancelled;
         }
     }
-    OpenOutcome::Failed(recovery_pending(client, config, recorded, lock))
+    OpenOutcome::Failed(recovery_pending(client, config, recorded, lock, custody))
 }
 
 /// Attempt restoration until `deadline`. Used as the "settle" half of
 /// settle-or-restart: a mutating RPC that settled on its own is compensated by
 /// re-running restoration, after which ownership can be released cleanly.
+///
+/// A restoration attempt that itself fails may have transmitted a `PUT` that
+/// is still outstanding — retrying compensation cannot retract it (review S3).
+/// After the first failure the daemon is therefore quiesced (terminated and
+/// restarted, dropping every in-flight request) before the next attempt, so a
+/// late restoring mutation cannot land after restoration.
 fn settle_restore(
     client: &OwnToneClient,
     config: &OwnToneConfig,
@@ -1596,6 +1906,10 @@ fn settle_restore(
         if restore_daemon(client, config, recorded).is_ok() {
             return true;
         }
+        // A failed restoration step may itself have transmitted a `PUT` that is
+        // still outstanding; retrying compensation cannot retract it, so
+        // quiesce the daemon before the next attempt (review S3).
+        let _ = quiesce_daemon(config);
         if Instant::now() >= deadline {
             return false;
         }
@@ -1607,9 +1921,13 @@ fn settle_restore(
 /// the live-session teardown path (review F3, review R3). It holds the advisory
 /// lock until its terminal outcome, quiesces the dedicated daemon before any
 /// restoration attempt (review R2), retries restoration until the recovery
-/// deadline, and — when a route is supplied — revokes that route by identity
-/// only after a terminal disposition. The incomplete-takeover record is left in
-/// place for the supervisor on failure.
+/// deadline, and — when a route is supplied — releases that route by identity
+/// only after a terminal disposition.
+///
+/// Quiescence must be **confirmed** before either terminal outcome: a missing
+/// recovery owner, or a recovery that never established quiescence, retains the
+/// lock and the route for the supervisor rather than reporting a false clean
+/// failure (review S3).
 fn spawn_serialized_recovery(
     client: Arc<OwnToneClient>,
     config: OwnToneConfig,
@@ -1619,12 +1937,21 @@ fn spawn_serialized_recovery(
 ) -> RecoveryCompletion {
     let completion = RecoveryCompletion::default();
     let worker = completion.clone();
+    // The lock lives in a lease the spawned worker takes ownership of. On a
+    // spawn failure (or an unquiescible recovery) the lease is retained by
+    // leaking the descriptor, so the advisory lock stays held and no other
+    // opener adopts a daemon whose recovery never ran (review S3).
+    let lease = Arc::new(Mutex::new(Some(lock)));
+    let worker_lease = Arc::clone(&lease);
     let spawned = std::thread::Builder::new()
         .name("airplay-owntone-recovery".to_string())
         .spawn(move || {
             // Hold the advisory lock until recovery is terminal so ownership is
             // never released early.
-            let _lock_guard = lock;
+            let lock_guard = worker_lease
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
             let deadline = Instant::now() + RECOVERY_DEADLINE;
             // Bounded quiescence precedes every restoration attempt: a
             // transmitted mutating RPC cannot be retracted by releasing the OS
@@ -1634,16 +1961,32 @@ fn spawn_serialized_recovery(
             loop {
                 if quiesced && restore_daemon(&client, &config, &recorded).is_ok() {
                     if let Some((proxy, ticket)) = route.as_ref() {
-                        proxy.revoke_if_current(ticket);
+                        proxy.take_and_release(ticket);
                     }
                     worker.resolve(RecoveryOutcome::Restored);
                     return;
                 }
                 if Instant::now() >= deadline {
-                    worker.resolve(RecoveryOutcome::RestorationFailed {
-                        message: "restoration did not complete before the recovery deadline"
-                            .to_string(),
-                    });
+                    if quiesced {
+                        // Quiescence was established, so no old-generation
+                        // mutation can survive; the record stays for the
+                        // supervisor and the route is released by the load path.
+                        worker.resolve(RecoveryOutcome::RestorationFailed {
+                            message: "restoration did not complete before the recovery deadline"
+                                .to_string(),
+                        });
+                    } else {
+                        // Quiescence was never established: an outstanding
+                        // mutation may still land. Retain the lock and the route
+                        // rather than claiming a failed-but-released outcome.
+                        if let Some(lock) = lock_guard {
+                            std::mem::forget(lock);
+                        }
+                        worker.resolve(RecoveryOutcome::Retained {
+                            message: "quiescence was not established before the recovery deadline"
+                                .to_string(),
+                        });
+                    }
                     return;
                 }
                 std::thread::sleep(RECOVERY_POLL);
@@ -1651,10 +1994,15 @@ fn spawn_serialized_recovery(
             }
         });
     if spawned.is_err() {
-        // No recovery owner exists; report a terminal failure now rather than
-        // leaving a waiter pending. The record remains in place for the
-        // supervisor.
-        completion.resolve(RecoveryOutcome::RestorationFailed {
+        // No executable recovery owner exists. Retain the lock (leak its
+        // descriptor so the flock stays held for the process) and the route for
+        // the supervisor, and report a terminal retained outcome rather than
+        // pretending the failed recovery released ownership (review S3).
+        let retained_lock = lease.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(lock) = retained_lock {
+            std::mem::forget(lock);
+        }
+        completion.resolve(RecoveryOutcome::Retained {
             message: "the serialized recovery could not be started".to_string(),
         });
     }
@@ -1662,17 +2010,21 @@ fn spawn_serialized_recovery(
 }
 
 /// Build the non-clean recovery-pending failure and start the serialized
-/// recovery (review F3).
+/// recovery (review F3). The custody move happens here, before the outcome is
+/// constructed, so the route is off the active lease by the time the load path
+/// sees `RecoveryPending` (review S5).
 fn recovery_pending(
     client: Arc<OwnToneClient>,
     config: OwnToneConfig,
     recorded: TakeoverRecord,
     lock: std::fs::File,
+    custody: &CustodyHandoff,
 ) -> SenderError {
     let message = unavailable("recovery is pending for the dedicated daemon")
         .message()
         .to_string();
-    let completion = spawn_serialized_recovery(client, config, recorded, lock, None);
+    custody.move_to_custody();
+    let completion = spawn_serialized_recovery(client, config, recorded, lock, custody.route());
     SenderError::RecoveryPending {
         message,
         completion,
@@ -1835,33 +2187,36 @@ mod tests {
         assert!(!is_loopback_host("owntone.example"));
     }
 
-    /// R4: the decode pump's activation barrier is deterministic. It releases
-    /// only on an accepted activation; an already-cancelled, torn-down, or
-    /// never-activated load leaves the pump inert, so no pipeline start, no
-    /// PCM and no daemon play can follow a cancelled load.
+    /// R4/S4: the decode pump's activation barrier is deterministic and reads
+    /// the same serialized decision the load path's acceptance and teardown's
+    /// cancellation use. It releases only on an accepted activation; an
+    /// already-cancelled, torn-down, or never-activated load leaves the pump
+    /// inert, so no pipeline start, no PCM and no daemon play can follow a
+    /// cancelled load.
     #[test]
     fn activation_gate_releases_only_on_accepted_activation() {
         let future = Instant::now() + Duration::from_millis(50);
+        let open = || Mutex::new(ActivationState::default());
 
         // Never activated inside the bound: inert.
         let running = AtomicBool::new(true);
-        let activated = AtomicBool::new(false);
+        let activation = open();
         let cancel = OpenCancel::new();
         assert!(!activation_gate(
+            &activation,
             &running,
-            &activated,
             &cancel,
             Instant::now(),
             Duration::ZERO
         ));
 
-        // Cancelled before activation: inert even when a stale activation
-        // attempt races in.
-        cancel.cancel();
-        activated.store(true, Ordering::SeqCst);
+        // Cancelled before activation: inert even when a stale acceptance
+        // races in.
+        let activation = open();
+        activation.lock().unwrap().cancelled = true;
         assert!(!activation_gate(
+            &activation,
             &running,
-            &activated,
             &cancel,
             future,
             Duration::ZERO
@@ -1869,11 +2224,11 @@ mod tests {
 
         // Torn down before activation: inert.
         let running = AtomicBool::new(false);
-        let activated = AtomicBool::new(false);
+        let activation = open();
         let cancel = OpenCancel::new();
         assert!(!activation_gate(
+            &activation,
             &running,
-            &activated,
             &cancel,
             future,
             Duration::ZERO
@@ -1881,15 +2236,45 @@ mod tests {
 
         // Accepted activation: released.
         let running = AtomicBool::new(true);
-        let activated = AtomicBool::new(true);
+        let activation = open();
+        activation.lock().unwrap().accepted = true;
         let cancel = OpenCancel::new();
         assert!(activation_gate(
+            &activation,
             &running,
-            &activated,
             &cancel,
             future,
             Duration::ZERO
         ));
+    }
+
+    /// S4: acceptance and cancellation share one serialized decision. A
+    /// cancellation that wins refuses a late acceptance, and a torn-down
+    /// session refuses activation too.
+    #[test]
+    fn activation_and_cancellation_share_a_serialized_boundary() {
+        // Cancellation first: a late acceptance is refused.
+        let mut state = ActivationState {
+            accepted: false,
+            cancelled: true,
+        };
+        assert!(
+            !activation_decide(&mut state, true),
+            "a cancelled session must refuse a late activation"
+        );
+        assert!(!state.accepted);
+
+        // Torn down first: activation is refused.
+        let mut state = ActivationState::default();
+        assert!(!activation_decide(&mut state, false));
+        assert!(!state.accepted);
+
+        // Acceptance first: accepted, and cancellation then wins.
+        let mut state = ActivationState::default();
+        assert!(activation_decide(&mut state, true));
+        assert!(state.accepted && !state.cancelled);
+        state.cancelled = true;
+        assert!(!activation_decide(&mut state, true));
     }
 
     #[test]
@@ -2077,22 +2462,57 @@ mod tests {
         assert!(!daemon_completion_reached(""));
     }
 
-    /// R5: `/proc/net/tcp` is parsed to the socket inodes LISTENing on the
-    /// configured port — the kernel-side identity the JSON API cannot provide.
+    /// S7: the initial-volume application maps the UI level to the daemon's
+    /// integer percent (clamped), so a low/muted slider starts low/muted.
+    #[test]
+    fn volume_percent_maps_and_clamps_the_slider() {
+        assert_eq!(volume_percent(1.0), 100);
+        assert_eq!(volume_percent(0.5), 50);
+        assert_eq!(volume_percent(0.0), 0);
+        assert_eq!(volume_percent(-1.0), 0);
+        assert_eq!(volume_percent(2.0), 100);
+    }
+
+    /// R5/S2: `/proc/net/tcp` is parsed to the socket inodes LISTENing on the
+    /// configured **address and** port — the kernel-side identity the JSON API
+    /// cannot provide. A listener sharing only the port (a different loopback
+    /// address) is not the dedicated endpoint.
     #[test]
     fn listening_inodes_parses_the_proc_net_tcp_table() {
         let table = "\
   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
    0: 0100007F:0DA5 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000000 100 0 0 10 0\n\
    1: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 99 1 0000000000000000 100 0 0 10 0\n\
-   2: 0100007F:0DA5 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  1000        0 555 1 0000000000000000 100 0 0 10 0\n";
-        assert_eq!(listening_inodes(table, 0x0DA5), vec![12345]);
-        assert_eq!(listening_inodes(table, 0x1F90), vec![99]);
+   2: 0100007F:0DA5 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  1000        0 555 1 0000000000000000 100 0 0 10 0\n\
+   3: 0B00007F:0DA5 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 777 1 0000000000000000 100 0 0 10 0\n";
+        let loopback = vec!["0100007F".to_string()];
+        assert_eq!(listening_inodes(table, 0x0DA5, &loopback), vec![12345]);
+        assert_eq!(listening_inodes(table, 0x1F90, &loopback), vec![99]);
         // A non-LISTEN row is not an owner.
-        assert!(listening_inodes(table, 0x0DA5)
+        assert!(listening_inodes(table, 0x0DA5, &loopback)
             .iter()
             .all(|inode| *inode != 555));
-        assert!(listening_inodes(table, 4242).is_empty());
+        // The same port on a different bound address is not this endpoint.
+        assert!(listening_inodes(table, 0x0DA5, &loopback)
+            .iter()
+            .all(|inode| *inode != 777));
+        assert!(listening_inodes(table, 4242, &loopback).is_empty());
+    }
+
+    /// S2: the configured loopback host maps to the kernel's little-endian
+    /// address rendering, so the endpoint binding is address- and port-exact.
+    #[test]
+    fn expected_local_addrs_use_the_kernel_byte_order() {
+        assert_eq!(
+            expected_local_addrs("127.0.0.1"),
+            vec!["0100007F".to_string()]
+        );
+        assert_eq!(
+            expected_local_addrs("::1"),
+            vec!["00000000000000000000000001000000".to_string()]
+        );
+        assert_eq!(expected_local_addrs("localhost").len(), 2);
+        assert!(expected_local_addrs("192.168.1.10").is_empty());
     }
 
     /// R5: the listener bound to a port is resolved to its owning process out
@@ -2113,6 +2533,9 @@ mod tests {
         assert!(listener_process(&format!("http://127.0.0.1:{free_port}")).is_none());
     }
 
+    /// S2: the command-line binding is path-component exact, not a substring.
+    /// A sibling state directory that merely has the configured one as a
+    /// string prefix must not match.
     #[test]
     fn cmdline_binding_requires_the_exact_state_directory() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -2124,6 +2547,12 @@ mod tests {
             state_dir
         ));
         assert!(!cmdline_binds_state_dir("", state_dir));
+
+        // A sibling directory sharing the name as a bare string prefix is not
+        // the configured one (the S2 substring collision).
+        let sibling = format!("{}-other", state_dir.display());
+        let cmdline = format!("/usr/bin/owntone -c {sibling}/owntone.conf");
+        assert!(!cmdline_binds_state_dir(&cmdline, state_dir));
     }
 
     /// R5: a matching ownership record is not enough — a foreign process bound
@@ -2144,19 +2573,50 @@ mod tests {
         assert!(verify_daemon_process(&config).is_err());
     }
 
-    /// R2: quiescence terminates the owned process (escalating to `SIGKILL`).
+    /// R2/S3: quiescence terminates the owned process (escalating to
+    /// `SIGKILL`) and **confirms** exit before returning.
     #[test]
-    fn terminate_process_stops_a_child_process() {
+    fn signal_and_wait_stops_a_child_process() {
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .expect("spawn sleep");
         let pid = child.id();
-        assert!(terminate_process(pid, Duration::from_secs(5)).is_ok());
+        assert!(signal_and_wait(pid, Duration::from_secs(5)).is_ok());
         // The child is gone or a zombie awaiting our reap — never still
         // running.
         assert!(matches!(process_state(pid), None | Some('Z')));
         let _ = child.wait();
+    }
+
+    /// S3: a pid that no longer exists is already quiesced (ESRCH), not an
+    /// error that could mask a live process.
+    #[test]
+    fn signal_and_wait_treats_a_gone_process_as_quiesced() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(signal_and_wait(pid, Duration::from_secs(1)).is_ok());
+    }
+
+    /// S3: the recovery outcome retains custody rather than reporting a clean
+    /// failure when quiescence was never established.
+    #[test]
+    fn retained_recovery_outcome_is_terminal_and_distinct() {
+        let completion = RecoveryCompletion::default();
+        completion.resolve(RecoveryOutcome::Retained {
+            message: "quiescence was not established".to_string(),
+        });
+        assert_eq!(
+            completion.wait(),
+            RecoveryOutcome::Retained {
+                message: "quiescence was not established".to_string()
+            }
+        );
     }
 
     /// R3: `restore` reports its outcome instead of silently swallowing a
@@ -2179,7 +2639,7 @@ mod tests {
             media_proxy: Arc::new(GstreamerMediaProxy::new(None)),
             media_ticket: None,
             running: AtomicBool::new(true),
-            activated: AtomicBool::new(false),
+            activation: Mutex::new(ActivationState::default()),
             cancel: OpenCancel::new(),
             restored: AtomicBool::new(false),
             position: Mutex::new(SenderPosition::unknown(PlayerEventGeneration::from_raw(1))),

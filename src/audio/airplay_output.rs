@@ -54,8 +54,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::airplay_sender::{
-    AirplaySender, OpenCancel, OpenOutcome, SenderError, SenderOpenContext, SenderPosition,
-    SenderSession, SenderTarget, SenderWriteOutcome,
+    AirplaySender, OpenCancel, OpenOutcome, RecoveryOutcome, SenderError, SenderOpenContext,
+    SenderPosition, SenderSession, SenderTarget, SenderWriteOutcome,
 };
 use super::gstreamer_media::{GstreamerMediaProxy, GstreamerMediaTicket, PreparedGstreamerMedia};
 use super::output::{AudioOutput, OutputType};
@@ -588,6 +588,11 @@ impl AirPlayOutput {
     /// Start a load on its own worker thread. The availability gate and media
     /// preparation have already run on the caller, so this only marshals the
     /// owned context and spawns the worker.
+    ///
+    /// A worker-spawn failure is not swallowed: the prepared route is released
+    /// and a `Stopped` failure is reported, so a spawn failure can never leave
+    /// a minted loopback route alive or the output stuck `Buffering` (review
+    /// S6).
     fn start_session_worker(
         &self,
         generation: PlayerEventGeneration,
@@ -598,7 +603,8 @@ impl AirPlayOutput {
 
         let open_id = self.load_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let cancel = OpenCancel::new();
-        let media_ticket = prepared.ticket();
+        // Retain a handle for the failure path; the context owns its own clone.
+        let failure_ticket = prepared.ticket();
         let state_cache = Arc::new(AtomicU8::new(PlayerState::Buffering as u8));
         let position_cache = Arc::new(Mutex::new(SenderPosition::unknown(generation)));
         let (commands, command_rx) = mpsc::channel();
@@ -609,7 +615,7 @@ impl AirPlayOutput {
             event_tx: self.event_tx.clone(),
             generation,
             media_proxy: Arc::clone(&self.media_proxy),
-            media_ticket,
+            media_ticket: prepared.ticket(),
             volume: self.volume,
             cancel: cancel.clone(),
             open_id,
@@ -618,7 +624,7 @@ impl AirPlayOutput {
         let event_generation = Arc::clone(&self.event_generation);
         let worker_state = Arc::clone(&state_cache);
         let worker_position = Arc::clone(&position_cache);
-        let handle = std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("airplay-load".to_string())
             .spawn(move || {
                 run_session_worker(
@@ -629,13 +635,20 @@ impl AirPlayOutput {
                     worker_position,
                     event_generation,
                 );
-            })
-            .ok();
+            });
+
+        let Ok(handle) = spawned else {
+            if let Some(ticket) = failure_ticket.as_ref() {
+                self.media_proxy.take_and_release(ticket);
+            }
+            self.report_load_failure(generation, "AirPlay session worker could not be started");
+            return;
+        };
 
         *self.controller_guard() = Some(LoadController {
             cancel,
             commands: Some(commands),
-            handle,
+            handle: Some(handle),
             state: state_cache,
             position: position_cache,
         });
@@ -653,17 +666,18 @@ impl AirPlayOutput {
             .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
     }
 
-    /// Run the availability gate and media preparation for one load. A probe
-    /// or preparation failure is reported synchronously; a successful gate
-    /// starts the worker and returns immediately, so the caller never blocks
-    /// on negotiation (review F2).
-    fn begin_load(
-        &self,
-        generation: PlayerEventGeneration,
-        prepared: Result<PreparedGstreamerMedia, String>,
-    ) -> bool {
+    /// Run the availability gate and media preparation for one load, in that
+    /// order (review S6). The gate runs **before** any per-track media work, so
+    /// an unavailable sender can never mint a loopback route or open local
+    /// media. `prepare` is only invoked once the probe succeeds; a successful
+    /// gate starts the worker and returns immediately, so the caller never
+    /// blocks on negotiation (review F2).
+    fn begin_load<F>(&self, generation: PlayerEventGeneration, prepare: F) -> bool
+    where
+        F: FnOnce() -> Result<PreparedGstreamerMedia, String>,
+    {
         match self.sender.probe() {
-            Ok(()) => match prepared {
+            Ok(()) => match prepare() {
                 Ok(prepared) => self.start_session_worker(generation, prepared),
                 Err(message) => self.report_load_failure(generation, &message),
             },
@@ -803,7 +817,9 @@ fn run_session_worker(
             if let SenderError::RecoveryPending { completion, .. } = &error {
                 // Recovery is still outstanding: keep the route in keyed
                 // custody and release it only at the terminal recovery
-                // outcome (review F3). Never release on receipt.
+                // outcome (review F3). The seat already moved it to custody as
+                // part of producing this outcome (review S5); this idempotent
+                // call backstops a ticket that reached custody another way.
                 if let Some(ticket) = ctx.media_ticket.as_ref() {
                     proxy.move_to_recovery_custody(ticket);
                 }
@@ -815,8 +831,13 @@ fn run_session_worker(
                         .event_tx
                         .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
                 }
-                let _ = completion.wait();
-                release_ticket(&proxy, &ctx);
+                match completion.wait() {
+                    // Quiescence was never established, so the recovery retains
+                    // the lock and the route custody for the supervisor. Do not
+                    // release the route (review S3).
+                    RecoveryOutcome::Retained { .. } => {}
+                    _ => release_ticket(&proxy, &ctx),
+                }
             } else {
                 // Restoration completed inside the seam; release on receipt.
                 release_ticket(&proxy, &ctx);
@@ -868,11 +889,13 @@ impl AudioOutput for AirPlayOutput {
             .event_tx
             .try_send(PlayerEvent::state(generation, PlayerState::Buffering));
 
-        let prepared = self
-            .media_proxy
-            .prepare(uri)
-            .map_err(|_| "AirPlay media preparation failed".to_string());
-        self.begin_load(generation, prepared)
+        // The probe runs before this closure: an unavailable sender never
+        // reaches media preparation (review S6).
+        self.begin_load(generation, || {
+            self.media_proxy
+                .prepare(uri)
+                .map_err(|_| "AirPlay media preparation failed".to_string())
+        })
     }
 
     fn load_resolved(&self, request: ResolvedHttpRequest) -> bool {
@@ -881,11 +904,11 @@ impl AudioOutput for AirPlayOutput {
         let _ = self
             .event_tx
             .try_send(PlayerEvent::state(generation, PlayerState::Buffering));
-        let prepared = self
-            .media_proxy
-            .prepare_resolved(request)
-            .map_err(|_| "AirPlay media preparation failed".to_string());
-        self.begin_load(generation, prepared)
+        self.begin_load(generation, || {
+            self.media_proxy
+                .prepare_resolved(request)
+                .map_err(|_| "AirPlay media preparation failed".to_string())
+        })
     }
 
     fn load_local(&self, media: ResolvedLocalMedia) -> bool {
@@ -894,11 +917,11 @@ impl AudioOutput for AirPlayOutput {
         let _ = self
             .event_tx
             .try_send(PlayerEvent::state(generation, PlayerState::Buffering));
-        let prepared = self
-            .media_proxy
-            .prepare_local(media)
-            .map_err(|_| "AirPlay media preparation failed".to_string());
-        self.begin_load(generation, prepared)
+        self.begin_load(generation, || {
+            self.media_proxy
+                .prepare_local(media)
+                .map_err(|_| "AirPlay media preparation failed".to_string())
+        })
     }
 
     fn set_event_generation(&self, generation: PlayerEventGeneration) {
@@ -1164,6 +1187,47 @@ mod tests {
         assert_eq!(output.state(), PlayerState::Stopped);
     }
 
+    /// S6: the availability gate runs **before** media preparation. A failing
+    /// sender must never reach preparation, so a valid runtime and a protected
+    /// request cannot mint a loopback route for a session that will not open.
+    #[test]
+    fn a_failing_probe_never_prepares_or_mints_a_route() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (tx, _rx) = async_channel::unbounded();
+        let mut output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0)
+            .with_runtime(runtime.handle().clone());
+        output.sender = Arc::new(FailingSender(SenderError::Dependency(
+            "sender unavailable".to_string(),
+        )));
+        let generation = PlayerEventGeneration::from_raw(88);
+        output.set_event_generation(generation);
+
+        // A protected URI that would mint a ticket if preparation ran.
+        let protected = "https://music.test/stream?api_key=must-not-mint";
+        let mut preparation_ran = false;
+        output.begin_load(generation, || {
+            preparation_ran = true;
+            output
+                .media_proxy
+                .prepare(protected)
+                .map_err(|_| "AirPlay media preparation failed".to_string())
+        });
+
+        assert!(
+            !preparation_ran,
+            "preparation must not run when the probe fails (S6)"
+        );
+        assert!(
+            !output.media_proxy.has_active_lease(),
+            "an unavailable sender must not mint a loopback route (S6)"
+        );
+        assert!(!output.media_proxy.has_custody_entries());
+    }
+
     /// The guidance must be real in every catalog — present, mentioning the
     /// exact technical identifier, and not silently falling back to English.
     #[test]
@@ -1227,6 +1291,12 @@ mod tests {
     /// freeze the load path. The blocking handshake lives on the load worker;
     /// `load_uri` and a following `stop` both return promptly against a
     /// stalled endpoint.
+    ///
+    /// Unix-only: the fixture builds the dedicated-instance adapter, which
+    /// owns a FIFO, an advisory `flock` and a `/proc`-verified process
+    /// binding. On other targets the unsupported shim is compiled instead and
+    /// this test would not link (review S1).
+    #[cfg(unix)]
     #[test]
     fn a_stalled_owntone_endpoint_does_not_block_load_or_stop() {
         use std::net::TcpListener;
@@ -1269,6 +1339,21 @@ mod tests {
             "stop blocked on the stalled OwnTone endpoint: {:?}",
             stopped.elapsed()
         );
+    }
+
+    /// S1: on a target with no documented OwnTone acquisition path, the
+    /// unsupported shim is compiled instead of the Unix adapter. Selection is
+    /// still recognized and the sender still refuses explicitly, so a load can
+    /// never be misreported as an OwnTone session — and the Unix-only stalled
+    /// endpoint regression above is never compiled here.
+    #[cfg(not(unix))]
+    #[test]
+    fn an_unsupported_platform_owntone_sender_refuses_the_load() {
+        let sender = crate::audio::airplay_owntone::OwnToneSender::from_env();
+        let error = sender
+            .probe()
+            .expect_err("the unsupported shim must refuse every load");
+        assert!(error.message().contains("OwnTone"), "{}", error.message());
     }
 
     /// A cancelled open is never reported as a user-facing failure.

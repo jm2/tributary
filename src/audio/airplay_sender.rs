@@ -93,6 +93,12 @@ pub(super) enum RecoveryOutcome {
     /// Restoration did not complete; the record was retained for the
     /// supervisor. Terminal, and explicitly not a success.
     RestorationFailed { message: String },
+    /// Quiescence was never established (or no recovery owner could be
+    /// started), so no terminal restoration ran and an outstanding mutation
+    /// may still land. The advisory lock and the route custody are retained
+    /// for the supervisor; the caller must **not** release its ticket.
+    /// Terminal, and explicitly not a success.
+    Retained { message: String },
 }
 
 /// Completion handle for a serialized recovery that a
