@@ -67,6 +67,10 @@ const CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
 const RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
 /// Poll interval between serialized-recovery restoration attempts.
 const RECOVERY_POLL: Duration = Duration::from_millis(200);
+/// Bound on terminating the owned instance during quiescence (review R2).
+const QUIESCE_TERMINATE_DEADLINE: Duration = Duration::from_secs(5);
+/// Bound on the owned instance coming back after quiescence (review R2).
+const QUIESCE_RESTART_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Token value inside the dedicated instance's ownership record. The record
 /// (see [`OwnershipRecord`]) is written by the installation/service record and
@@ -162,17 +166,11 @@ impl OwnToneConfig {
         self.state_dir.join(".tributary-takeover.json")
     }
 
-    /// Confirm out of band that the answering daemon is the dedicated
-    /// Tributary-owned instance, before any state is read (§4.3, §8). The JSON
-    /// API exposes no instance identity, so the ownership record in the
-    /// instance's own state directory — the same trust domain as the lock file
-    /// — is what distinguishes it from a shared instance that merely looks
-    /// healthy. The record must bind the *configured* endpoint, pipe, state
-    /// directory and binary: a valid token paired with a foreign API endpoint
-    /// is refused here, before any receiver state is read or mutated (review
-    /// F5). A constant marker string cannot make that distinction, because it
-    /// never ties the answering endpoint to the owned instance.
-    fn verify_owned(&self) -> Result<(), SenderError> {
+    /// Read and validate the on-disk ownership record only: the token must be
+    /// ours and the record must bind the *configured* endpoint, pipe, state
+    /// directory and binary (review F5). This is the local, non-blocking half
+    /// of the ownership gate, safe to run synchronously on the GTK caller.
+    fn verify_owned_record(&self) -> Result<(), SenderError> {
         let body = std::fs::read_to_string(self.owner_marker())
             .map_err(|_| unavailable("the dedicated-instance ownership record is missing"))?;
         let record: OwnershipRecord = serde_json::from_str(&body)
@@ -193,6 +191,35 @@ impl OwnToneConfig {
         }
         Ok(())
     }
+
+    /// The supervisor restart command the installation record supplied, if
+    /// any (review R2).
+    fn restart_command(&self) -> Option<String> {
+        let body = std::fs::read_to_string(self.owner_marker()).ok()?;
+        let record: OwnershipRecord = serde_json::from_str(&body).ok()?;
+        record.restart_command
+    }
+
+    /// Confirm out of band that the answering daemon is the dedicated
+    /// Tributary-owned instance, before any state is read (§4.3, §8). The JSON
+    /// API exposes no instance identity, so the ownership record in the
+    /// instance's own state directory — the same trust domain as the lock file
+    /// — is what distinguishes it from a shared instance that merely looks
+    /// healthy. The record must bind the *configured* endpoint, pipe, state
+    /// directory and binary: a valid token paired with a foreign API endpoint
+    /// is refused here, before any receiver state is read or mutated (review
+    /// F5). A constant marker string cannot make that distinction, because it
+    /// never ties the answering endpoint to the owned instance.
+    ///
+    /// A matching record is still not proof that the *answering process* is
+    /// ours: an old record stays valid if the dedicated daemon stops and a
+    /// shared instance binds the same port. The kernel's view of the listener
+    /// closes that gap (review R5), so this runs on the load worker — the
+    /// `/proc` walk is filesystem I/O, not GTK work.
+    fn verify_owned(&self) -> Result<(), SenderError> {
+        self.verify_owned_record()?;
+        verify_daemon_process(self)
+    }
 }
 
 /// The out-of-band ownership record an installation writes into the dedicated
@@ -206,10 +233,261 @@ struct OwnershipRecord {
     pipe_path: String,
     state_dir: String,
     binary: String,
+    /// Optional supervisor restart command. The installation/service record
+    /// writes the documented per-user service's restart invocation here; the
+    /// adapter executes it after terminating the owned instance during bounded
+    /// quiescence (review R2). Absent means the environment is expected to
+    /// bring the instance back on its own and the adapter waits for it.
+    #[serde(default)]
+    restart_command: Option<String>,
 }
 
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+}
+
+// ---------------------------------------------------------------------------
+// Out-of-band process identity and bounded quiescence (review R2, R5)
+// ---------------------------------------------------------------------------
+
+/// A process bound to the dedicated instance's loopback API port, resolved
+/// through the kernel rather than the JSON API — which exposes no instance
+/// identity at all (design §4.3, review R5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListenerProcess {
+    pid: u32,
+    exe: PathBuf,
+    cmdline: String,
+}
+
+/// The local port of a JSON API base URL.
+fn api_port(api_base: &str) -> Option<u16> {
+    let url = url::Url::parse(api_base).ok()?;
+    url.port_or_known_default()
+}
+
+/// Parse a `/proc/net/tcp` / `/proc/net/tcp6` table (identical layout) and
+/// return the socket inodes LISTENing on `port`. The local-address column is
+/// `HEXADDR:HEXPORT`, the state column is `0A` for `TCP_LISTEN`, and the inode
+/// is the tenth whitespace-separated column.
+fn listening_inodes(table: &str, port: u16) -> Vec<u64> {
+    let mut inodes = Vec::new();
+    for line in table.lines().skip(1) {
+        // Columns: `sl local_address rem_address st ... inode`. The slot is
+        // `0:`, so `nth(1)` is `HEXADDR:HEXPORT`, `nth(3)` is the state and
+        // `nth(9)` is the inode.
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(local) = fields.get(1) else { continue };
+        let Some(state) = fields.get(3) else { continue };
+        if *state != "0A" {
+            continue;
+        }
+        let Some(port_hex) = local.rsplit(':').next() else {
+            continue;
+        };
+        let Ok(local_port) = u16::from_str_radix(port_hex, 16) else {
+            continue;
+        };
+        if local_port != port {
+            continue;
+        }
+        if let Some(inode) = fields.get(9).and_then(|value| value.parse::<u64>().ok()) {
+            inodes.push(inode);
+        }
+    }
+    inodes
+}
+
+/// `/proc/<pid>/cmdline` is NUL-separated; render it for substring binding.
+fn render_cmdline(raw: &[u8]) -> String {
+    raw.split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The `stat` state letter of a live process (`Z` for a zombie), or `None`
+/// when it no longer exists.
+fn process_state(pid: u32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Skip the parenthesised `comm` (it can contain spaces and ')').
+    let close = stat.rfind(')')?;
+    stat[close + 1..].split_whitespace().next()?.chars().next()
+}
+
+/// Read a process's executable path and command line out of band.
+fn read_process(pid: u32) -> Option<ListenerProcess> {
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let cmdline = render_cmdline(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?);
+    Some(ListenerProcess { pid, exe, cmdline })
+}
+
+/// The process currently LISTENing on the configured loopback API port.
+fn listener_process(api_base: &str) -> Option<ListenerProcess> {
+    let port = api_port(api_base)?;
+    let mut inodes = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(text) = std::fs::read_to_string(table) {
+            inodes.extend(listening_inodes(&text, port));
+        }
+    }
+    if inodes.is_empty() {
+        return None;
+    }
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            let target = target.to_string_lossy();
+            let Some(inode) = target
+                .strip_prefix("socket:[")
+                .and_then(|rest| rest.strip_suffix(']'))
+            else {
+                continue;
+            };
+            if inodes.iter().any(|candidate| candidate.to_string() == inode) {
+                return read_process(pid);
+            }
+        }
+    }
+    None
+}
+
+/// `true` when `cmdline` names the dedicated instance's state directory — the
+/// out-of-band configuration binding that distinguishes the owned daemon from
+/// a foreign listener that merely holds the same port (review R5).
+fn cmdline_binds_state_dir(cmdline: &str, state_dir: &Path) -> bool {
+    let needle = state_dir.to_string_lossy();
+    !needle.is_empty() && cmdline.contains(needle.as_ref())
+}
+
+/// Compare an executable path with the configured binary, resolving symlinks
+/// so a `/bin`-vs-`/usr/bin` split is not a false mismatch.
+fn same_binary(actual: &Path, configured: &Path) -> bool {
+    let actual = std::fs::canonicalize(actual).unwrap_or_else(|_| actual.to_path_buf());
+    let configured = std::fs::canonicalize(configured).unwrap_or_else(|_| configured.to_path_buf());
+    actual == configured
+}
+
+/// `true` when `process` is the configured dedicated binary *and* its command
+/// line binds the configured state directory (review R5).
+fn process_is_owned(process: &ListenerProcess, config: &OwnToneConfig) -> bool {
+    same_binary(&process.exe, &config.binary)
+        && cmdline_binds_state_dir(&process.cmdline, &config.state_dir)
+}
+
+/// Confirm the process answering on the configured endpoint is the dedicated
+/// Tributary-owned daemon. A matching ownership record alone is insufficient:
+/// an old record stays valid if the dedicated daemon stops and a shared
+/// instance binds the same port (review R5).
+fn verify_daemon_process(config: &OwnToneConfig) -> Result<(), SenderError> {
+    let Some(process) = listener_process(&config.api_base) else {
+        return Err(unavailable(
+            "no process is bound to the configured dedicated-instance endpoint",
+        ));
+    };
+    if !same_binary(&process.exe, &config.binary) {
+        return Err(unavailable(
+            "the process bound to the configured endpoint is not the dedicated owntone binary",
+        ));
+    }
+    if !cmdline_binds_state_dir(&process.cmdline, &config.state_dir) {
+        return Err(unavailable(
+            "the process bound to the configured endpoint is not the dedicated Tributary-owned instance",
+        ));
+    }
+    Ok(())
+}
+
+/// Terminate `pid`, escalating to `SIGKILL` at the deadline, and wait until the
+/// process is gone or a zombie. Only ever called on a listener already
+/// verified as the owned instance.
+fn terminate_process(pid: u32, deadline: Duration) -> Result<(), SenderError> {
+    use rustix::process::{kill_process, Pid, Signal};
+    let Some(signal_pid) = Pid::from_raw(pid as i32) else {
+        return Err(unavailable("the dedicated daemon process id is invalid"));
+    };
+    let _ = kill_process(signal_pid, Signal::TERM);
+    let end = Instant::now() + deadline;
+    loop {
+        match process_state(pid) {
+            None | Some('Z') => return Ok(()),
+            Some(_) => {}
+        }
+        if Instant::now() >= end {
+            let _ = kill_process(signal_pid, Signal::KILL);
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Run the supervisor's restart command recorded by the installation (review
+/// R2). Detached: the daemon outlives this process.
+fn spawn_restart_command(command: &str) -> Result<(), SenderError> {
+    use std::process::{Command, Stdio};
+    Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| unavailable("the dedicated daemon could not be restarted"))
+}
+
+/// Wait (bounded) until the configured endpoint is again served by the owned
+/// instance after quiescence.
+fn wait_for_owned_listener(config: &OwnToneConfig, deadline: Instant) -> Result<(), SenderError> {
+    loop {
+        if listener_process(&config.api_base)
+            .is_some_and(|process| process_is_owned(&process, config))
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(unavailable(
+                "the dedicated daemon did not come back after quiescence",
+            ));
+        }
+        std::thread::sleep(RECOVERY_POLL);
+    }
+}
+
+/// Bounded server-side quiescence before any compensation or terminal delivery
+/// (review R2). An unsettled mutating RPC cannot be retracted by releasing the
+/// OS lock: the daemon may still apply a late `outputs/set`, `queue/add`, or
+/// `player/play`. Terminating and restarting the dedicated instance drops every
+/// connection and cancels any in-flight request, after which restoration runs
+/// against a daemon that cannot replay an old generation's mutation.
+fn quiesce_daemon(config: &OwnToneConfig) -> Result<(), SenderError> {
+    let Some(process) = listener_process(&config.api_base) else {
+        return Err(unavailable("the dedicated daemon is not running to quiesce"));
+    };
+    if !same_binary(&process.exe, &config.binary) {
+        return Err(unavailable(
+            "the process bound to the configured endpoint is not the dedicated owntone binary",
+        ));
+    }
+    terminate_process(process.pid, QUIESCE_TERMINATE_DEADLINE)?;
+    if let Some(command) = config.restart_command() {
+        spawn_restart_command(&command)?;
+    }
+    wait_for_owned_listener(config, Instant::now() + QUIESCE_RESTART_DEADLINE)
 }
 
 /// `true` when this package target has a documented OwnTone acquisition path.
@@ -541,7 +819,7 @@ fn open_pipe_write(
 
 /// Per-session shared state, driven by the decode pump and read by the seam.
 struct SessionInner {
-    client: OwnToneClient,
+    client: Arc<OwnToneClient>,
     config: OwnToneConfig,
     generation: PlayerEventGeneration,
     event_tx: async_channel::Sender<PlayerEvent>,
@@ -583,13 +861,16 @@ impl SessionInner {
     /// it must not release exclusive ownership while the daemon may still be
     /// half-taken-over. The route is revoked only after restoration has
     /// actually completed.
-    fn restore(&self) {
+    ///
+    /// Returns the restoration outcome so callers cannot mistake a failed
+    /// restore for a clean teardown: `Ok(())` once the record is cleared and
+    /// the route revoked by identity, `Err` when the record and route are
+    /// retained for serialized recovery (review R3).
+    fn restore(&self) -> Result<(), SenderError> {
         if self.restored.load(Ordering::SeqCst) {
-            return;
+            return Ok(());
         }
-        if restore_daemon(&self.client, &self.config, &self.recorded).is_err() {
-            return;
-        }
+        restore_daemon(&self.client, &self.config, &self.recorded)?;
         // Revoke this load's loopback route by identity only after the daemon
         // has been restored: the route stays valid for every request the
         // daemon might still be applying (§4.1, §4.3).
@@ -597,6 +878,7 @@ impl SessionInner {
             self.media_proxy.revoke_if_current(ticket);
         }
         self.restored.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -774,7 +1056,10 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
                         "AirPlay playback failed".to_string(),
                     ));
                     inner.publish_state(PlayerState::Stopped);
-                    inner.restore();
+                    // A failed restore is not a clean teardown; the session
+                    // close path installs serialized recovery and retains the
+                    // record (review R3).
+                    let _ = inner.restore();
                     break;
                 }
                 _ => {}
@@ -850,7 +1135,7 @@ fn natural_completion(inner: &SessionInner, pipeline: &gst::Pipeline) {
                     "AirPlay completion could not be confirmed".to_string(),
                 ));
                 inner.publish_state(PlayerState::Stopped);
-                inner.restore();
+                let _ = inner.restore();
                 return;
             }
         }
@@ -860,12 +1145,21 @@ fn natural_completion(inner: &SessionInner, pipeline: &gst::Pipeline) {
                 "AirPlay completion timed out".to_string(),
             ));
             inner.publish_state(PlayerState::Stopped);
-            inner.restore();
+            let _ = inner.restore();
             return;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    inner.restore();
+    // Do not publish completion after a failed restore: the daemon may still be
+    // half-taken-over, and a clean `TrackEnded` would misreport it (review R3).
+    if inner.restore().is_err() {
+        let _ = inner.event_tx.try_send(PlayerEvent::error(
+            inner.generation,
+            "AirPlay restoration failed".to_string(),
+        ));
+        inner.publish_state(PlayerState::Stopped);
+        return;
+    }
     inner.publish_state(PlayerState::Stopped);
     let _ = inner
         .event_tx
@@ -929,10 +1223,36 @@ impl SenderSession for OwnToneSession {
         if let Some(handle) = this.pump {
             let _ = handle.join();
         }
-        this.inner.restore();
-        // Dropping the lock file releases the advisory lock only after
-        // restoration has completed (§4.3).
-        drop(this.lock);
+        if this.inner.restore().is_ok() {
+            // Dropping the lock file releases the advisory lock only after
+            // restoration has completed (§4.3).
+            drop(this.lock);
+            return;
+        }
+        // A failed restoration is not a clean close: install the same
+        // serialized recovery a `RecoveryPending` open leaves behind, so the
+        // advisory lock and the loopback route are retained until recovery
+        // reaches a terminal disposition (review R3). This runs on the load
+        // worker, never on GTK.
+        let Some(lock) = this.lock else {
+            // No lock to hold; the durable takeover record still makes the
+            // next opener refuse rather than adopt a half-taken-over daemon.
+            return;
+        };
+        let route = this.inner.media_ticket.as_ref().map(|ticket| {
+            (
+                Arc::clone(&this.inner.media_proxy),
+                Arc::clone(ticket),
+            )
+        });
+        let completion = spawn_serialized_recovery(
+            Arc::clone(&this.inner.client),
+            this.inner.config.clone(),
+            this.inner.recorded.clone(),
+            lock,
+            route,
+        );
+        let _ = completion.wait();
     }
 }
 
@@ -994,7 +1314,10 @@ impl AirplaySender for OwnToneSender {
             .config
             .as_ref()
             .ok_or_else(|| unavailable("not configured"))?;
-        config.verify_owned()?;
+        // Record-only here: the kernel-verified process binding (review R5)
+        // walks `/proc`, so it stays on the worker with the rest of the
+        // non-local gate.
+        config.verify_owned_record()?;
         if !config.binary.is_file() {
             return Err(unavailable("the owntone binary was not found"));
         }
@@ -1037,7 +1360,7 @@ fn check_daemon_health(client: &OwnToneClient) -> Result<(), SenderError> {
 fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
     let deadline = Instant::now() + OPEN_DEADLINE;
     let client = match OwnToneClient::new(&config.api_base) {
-        Ok(client) => client,
+        Ok(client) => Arc::new(client),
         Err(error) => return OpenOutcome::Failed(error),
     };
     if let Err(error) = config.verify_owned() {
@@ -1212,7 +1535,7 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
 /// preserved and recovery is serialized behind a `RecoveryPending` failure
 /// (review F3).
 fn fail_outcome(
-    client: OwnToneClient,
+    client: Arc<OwnToneClient>,
     config: OwnToneConfig,
     recorded: TakeoverRecord,
     lock: std::fs::File,
@@ -1233,7 +1556,7 @@ fn fail_outcome(
 /// returns `Cancelled` silently; an unsettled mutation or failed restoration
 /// returns the non-clean `RecoveryPending` failure (review F2, review F3).
 fn cancel_outcome(
-    client: OwnToneClient,
+    client: Arc<OwnToneClient>,
     config: OwnToneConfig,
     recorded: TakeoverRecord,
     lock: std::fs::File,
@@ -1269,22 +1592,22 @@ fn settle_restore(
     }
 }
 
-/// Build the non-clean recovery-pending failure and start the serialized
-/// recovery that keeps retrying restoration — and leaves the incomplete-
-/// takeover record for the supervisor — until the recovery deadline. The
-/// recovery owns the advisory lock until its terminal outcome, so no next
-/// opener can interleave with an unsettled request (review F3).
-fn recovery_pending(
-    client: OwnToneClient,
+/// Start the serialized recovery shared by the `RecoveryPending` open path and
+/// the live-session teardown path (review F3, review R3). It holds the advisory
+/// lock until its terminal outcome, quiesces the dedicated daemon before any
+/// restoration attempt (review R2), retries restoration until the recovery
+/// deadline, and — when a route is supplied — revokes that route by identity
+/// only after a terminal disposition. The incomplete-takeover record is left in
+/// place for the supervisor on failure.
+fn spawn_serialized_recovery(
+    client: Arc<OwnToneClient>,
     config: OwnToneConfig,
     recorded: TakeoverRecord,
     lock: std::fs::File,
-) -> SenderError {
+    route: Option<(Arc<GstreamerMediaProxy>, Arc<GstreamerMediaTicket>)>,
+) -> RecoveryCompletion {
     let completion = RecoveryCompletion::default();
     let worker = completion.clone();
-    let message = unavailable("recovery is pending for the dedicated daemon")
-        .message()
-        .to_string();
     let spawned = std::thread::Builder::new()
         .name("airplay-owntone-recovery".to_string())
         .spawn(move || {
@@ -1292,8 +1615,16 @@ fn recovery_pending(
             // never released early.
             let _lock_guard = lock;
             let deadline = Instant::now() + RECOVERY_DEADLINE;
+            // Bounded quiescence precedes every restoration attempt: a
+            // transmitted mutating RPC cannot be retracted by releasing the OS
+            // lock, so terminate/restart the owned instance so no old-generation
+            // mutation can land after restoration (review R2).
+            let mut quiesced = quiesce_daemon(&config).is_ok();
             loop {
-                if restore_daemon(&client, &config, &recorded).is_ok() {
+                if quiesced && restore_daemon(&client, &config, &recorded).is_ok() {
+                    if let Some((proxy, ticket)) = route.as_ref() {
+                        proxy.revoke_if_current(ticket);
+                    }
                     worker.resolve(RecoveryOutcome::Restored);
                     return;
                 }
@@ -1305,6 +1636,7 @@ fn recovery_pending(
                     return;
                 }
                 std::thread::sleep(RECOVERY_POLL);
+                quiesced = quiesce_daemon(&config).is_ok();
             }
         });
     if spawned.is_err() {
@@ -1315,6 +1647,21 @@ fn recovery_pending(
             message: "the serialized recovery could not be started".to_string(),
         });
     }
+    completion
+}
+
+/// Build the non-clean recovery-pending failure and start the serialized
+/// recovery (review F3).
+fn recovery_pending(
+    client: Arc<OwnToneClient>,
+    config: OwnToneConfig,
+    recorded: TakeoverRecord,
+    lock: std::fs::File,
+) -> SenderError {
+    let message = unavailable("recovery is pending for the dedicated daemon")
+        .message()
+        .to_string();
+    let completion = spawn_serialized_recovery(client, config, recorded, lock, None);
     SenderError::RecoveryPending {
         message,
         completion,
@@ -1377,6 +1724,7 @@ pub(super) fn test_owned_sender(api_base: &str, state_dir: &Path, binary: &Path)
         pipe_path: config.pipe_path.to_string_lossy().into_owned(),
         state_dir: config.state_dir.to_string_lossy().into_owned(),
         binary: config.binary.to_string_lossy().into_owned(),
+        restart_command: None,
     };
     std::fs::write(
         config.owner_marker(),
@@ -1636,6 +1984,7 @@ mod tests {
             pipe_path: config.pipe_path.to_string_lossy().into_owned(),
             state_dir: config.state_dir.to_string_lossy().into_owned(),
             binary: config.binary.to_string_lossy().into_owned(),
+            restart_command: None,
         };
         std::fs::write(
             config.owner_marker(),
@@ -1652,35 +2001,35 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let config = owned_config(directory.path());
         write_owner_record(&config);
-        assert!(config.verify_owned().is_ok());
+        assert!(config.verify_owned_record().is_ok());
 
         let foreign_endpoint = OwnToneConfig {
             api_base: "http://127.0.0.1:9999".to_string(),
             ..config.clone()
         };
-        assert!(foreign_endpoint.verify_owned().is_err());
+        assert!(foreign_endpoint.verify_owned_record().is_err());
 
         let foreign_pipe = OwnToneConfig {
             pipe_path: directory.path().join("other.pcm"),
             ..config.clone()
         };
-        assert!(foreign_pipe.verify_owned().is_err());
+        assert!(foreign_pipe.verify_owned_record().is_err());
 
         let foreign_binary = OwnToneConfig {
             binary: PathBuf::from("/usr/bin/not-owntone"),
             ..config.clone()
         };
-        assert!(foreign_binary.verify_owned().is_err());
+        assert!(foreign_binary.verify_owned_record().is_err());
     }
 
     #[test]
     fn ownership_record_rejects_a_foreign_token_and_a_missing_record() {
         let directory = tempfile::tempdir().expect("tempdir");
         let config = owned_config(directory.path());
-        assert!(config.verify_owned().is_err());
+        assert!(config.verify_owned_record().is_err());
 
         std::fs::write(config.owner_marker(), "not a tributary token").expect("write marker");
-        assert!(config.verify_owned().is_err());
+        assert!(config.verify_owned_record().is_err());
     }
 
     /// F3: a failed restoration leaves the incomplete-takeover record in place
@@ -1705,5 +2054,113 @@ mod tests {
             config.takeover_record().exists(),
             "a failed restore must not clear the takeover record"
         );
+    }
+
+    /// R5: `/proc/net/tcp` is parsed to the socket inodes LISTENing on the
+    /// configured port — the kernel-side identity the JSON API cannot provide.
+    #[test]
+    fn listening_inodes_parses_the_proc_net_tcp_table() {
+        let table = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:0DA5 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0000000000000000 100 0 0 10 0\n\
+   1: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 99 1 0000000000000000 100 0 0 10 0\n\
+   2: 0100007F:0DA5 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  1000        0 555 1 0000000000000000 100 0 0 10 0\n";
+        assert_eq!(listening_inodes(table, 0x0DA5), vec![12345]);
+        assert_eq!(listening_inodes(table, 0x1F90), vec![99]);
+        // A non-LISTEN row is not an owner.
+        assert!(listening_inodes(table, 0x0DA5).iter().all(|inode| *inode != 555));
+        assert!(listening_inodes(table, 4242).is_empty());
+    }
+
+    /// R5: the listener bound to a port is resolved to its owning process out
+    /// of band. The test binds its own loopback listener, so the owner must be
+    /// this test process.
+    #[test]
+    fn listener_process_resolves_the_process_bound_to_a_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("addr").port();
+        let process = listener_process(&format!("http://127.0.0.1:{port}"))
+            .expect("a listener must resolve to its owner");
+        assert_eq!(process.pid, std::process::id());
+        assert!(!process.exe.as_os_str().is_empty());
+        // A port nobody holds resolves to no process.
+        let released = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let free_port = released.local_addr().expect("addr").port();
+        drop(released);
+        assert!(listener_process(&format!("http://127.0.0.1:{free_port}")).is_none());
+    }
+
+    #[test]
+    fn cmdline_binding_requires_the_exact_state_directory() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state_dir = directory.path();
+        let cmdline = format!("/usr/bin/owntone -c {}/owntone.conf", state_dir.display());
+        assert!(cmdline_binds_state_dir(&cmdline, state_dir));
+        assert!(!cmdline_binds_state_dir("/usr/bin/owntone -c /etc/owntone.conf", state_dir));
+        assert!(!cmdline_binds_state_dir("", state_dir));
+    }
+
+    /// R5: a matching ownership record is not enough — a foreign process bound
+    /// to the configured endpoint is refused.
+    #[test]
+    fn verify_daemon_process_refuses_a_foreign_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("addr").port();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let binary = directory.path().join("owntone");
+        std::fs::write(&binary, b"#!/bin/true\n").expect("write dummy binary");
+        let config = OwnToneConfig {
+            api_base: format!("http://127.0.0.1:{port}"),
+            pipe_path: directory.path().join("airplay.pcm"),
+            state_dir: directory.path().to_path_buf(),
+            binary,
+        };
+        assert!(verify_daemon_process(&config).is_err());
+    }
+
+    /// R2: quiescence terminates the owned process (escalating to `SIGKILL`).
+    #[test]
+    fn terminate_process_stops_a_child_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        assert!(terminate_process(pid, Duration::from_secs(5)).is_ok());
+        // The child is gone or a zombie awaiting our reap — never still
+        // running.
+        assert!(matches!(process_state(pid), None | Some('Z')));
+        let _ = child.wait();
+    }
+
+    /// R3: `restore` reports its outcome instead of silently swallowing a
+    /// failed restoration, so callers can install serialized recovery.
+    #[test]
+    fn restore_reports_a_failed_restoration() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = owned_config(directory.path());
+        let recorded = TakeoverRecord {
+            enabled_outputs: vec![1],
+            selected_output: 2,
+        };
+        let client = Arc::new(OwnToneClient::new("http://127.0.0.1:1").expect("client"));
+        let inner = SessionInner {
+            client,
+            config,
+            generation: PlayerEventGeneration::from_raw(1),
+            event_tx: async_channel::unbounded().0,
+            recorded,
+            media_proxy: Arc::new(GstreamerMediaProxy::new(None)),
+            media_ticket: None,
+            running: AtomicBool::new(true),
+            activated: AtomicBool::new(false),
+            cancel: OpenCancel::new(),
+            restored: AtomicBool::new(false),
+            position: Mutex::new(SenderPosition::unknown(PlayerEventGeneration::from_raw(1))),
+            state: Mutex::new(PlayerState::Buffering),
+            pipeline: Mutex::new(None),
+        };
+        assert!(inner.restore().is_err());
+        assert!(!inner.restored.load(Ordering::SeqCst));
     }
 }

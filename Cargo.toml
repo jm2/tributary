@@ -136,7 +136,7 @@ zbus-secret-service-keyring-store = { version = "1", default-features = false, f
 
 # Stable filesystem IDs for removable/network library-root safety.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 embed-resource = "3.0"
