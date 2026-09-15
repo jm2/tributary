@@ -1387,10 +1387,17 @@ mod tests {
         let probe = TcpListener::bind("127.0.0.1:0").expect("reserve port");
         let port = probe.local_addr().expect("addr").port();
         drop(probe);
+        // The production boundary this fixture asserts: the load's own request
+        // must reach the daemon (and be observed there) before Stop is
+        // measured. Without this barrier the test could pass merely because
+        // cancellation prevented the worker from issuing `/api/config` at all
+        // (review V3).
+        let observed = directory.path().join("observed.txt");
         let mut child = std::process::Command::new(&binary)
             .arg("-c")
             .arg(&config)
             .env("TRIBUTARY_FAKE_LISTEN", format!("127.0.0.1:{port}"))
+            .env("TRIBUTARY_FAKE_OBSERVED", &observed)
             .spawn()
             .expect("spawn fake daemon");
         // Wait for the fake daemon to bind before the load verifies ownership.
@@ -1421,6 +1428,22 @@ mod tests {
             started.elapsed()
         );
 
+        // Barrier: wait until the daemon has read the blocking handshake
+        // request, proving the load worker genuinely reached `/api/config` and
+        // is stalled there (not merely cancelled before it started).
+        let barrier_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let text = std::fs::read_to_string(&observed).unwrap_or_default();
+            if text.contains("/api/config") {
+                break;
+            }
+            assert!(
+                Instant::now() < barrier_deadline,
+                "the load never reached /api/config (observed: {text:?})"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
         let stopped = Instant::now();
         output.stop();
         assert!(
@@ -1434,22 +1457,50 @@ mod tests {
     }
 
     /// The fake OwnTone daemon source compiled by the stalled-endpoint fixture.
-    /// It binds the loopback endpoint named in `TRIBUTARY_FAKE_LISTEN`, accepts
-    /// every connection and holds it without ever writing a response, so a
-    /// blocking `/api/config` handshake stalls until its client timeout.
+    /// It binds the loopback endpoint named in `TRIBUTARY_FAKE_LISTEN`, reads
+    /// each accepted request line, appends it to the path named in
+    /// `TRIBUTARY_FAKE_OBSERVED` (so the test can prove the exact request
+    /// reached the server), then holds the connection without ever writing a
+    /// response — a blocking `/api/config` handshake stalls until its client
+    /// timeout.
     #[cfg(target_os = "linux")]
     const FAKE_DAEMON_SOURCE: &str = r#"
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::time::Duration;
+
 fn main() {
     let addr = std::env::var("TRIBUTARY_FAKE_LISTEN").expect("listen address");
+    let observed = std::env::var("TRIBUTARY_FAKE_OBSERVED").ok();
     let listener = TcpListener::bind(&addr).expect("bind");
-    let mut held = Vec::new();
-    loop {
-        if let Ok((stream, _)) = listener.accept() {
-            held.push(stream);
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    for incoming in listener.incoming() {
+        let observed = observed.clone();
+        let Ok(stream) = incoming else { continue };
+        std::thread::spawn(move || {
+            let Ok(reader_stream) = stream.try_clone() else { return };
+            let mut reader = BufReader::new(reader_stream);
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line);
+            let trimmed = request_line.trim();
+            if !trimmed.is_empty() {
+                if let Some(path) = observed.as_ref() {
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                    {
+                        let _ = writeln!(file, "{trimmed}");
+                        let _ = file.flush();
+                    }
+                }
+            }
+            // Hold the connection open without ever responding, so the client's
+            // blocking handshake stalls until its own timeout.
+            let _held = stream;
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        });
     }
 }
 "#;
