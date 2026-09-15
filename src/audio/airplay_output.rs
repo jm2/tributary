@@ -1745,6 +1745,123 @@ fn main() {
         );
     }
 
+    /// X2: a session orphaned by a superseding generation releases its route
+    /// through the real `run_session_worker` stale-open path, not merely at the
+    /// session level. The route must be released by identity (lease gone,
+    /// custody empty, route shut down) with no start published.
+    struct StaleSession {
+        proxy: Arc<GstreamerMediaProxy>,
+        ticket: Option<Arc<GstreamerMediaTicket>>,
+    }
+
+    impl SenderSession for StaleSession {
+        fn write_pcm(&mut self, samples: &[u8]) -> SenderWriteOutcome {
+            SenderWriteOutcome::Accepted(samples.len())
+        }
+        fn set_volume(&mut self, _level: f64) {}
+        fn pause(&mut self) {}
+        fn resume(&mut self) -> bool {
+            true
+        }
+        fn confirm_started(&self, _publish: &mut dyn FnMut(PlayerState)) -> bool {
+            false
+        }
+        fn flush(&mut self) {}
+        fn observe(&self) -> SenderPosition {
+            SenderPosition::unknown(PlayerEventGeneration::from_raw(0))
+        }
+        fn state(&self) -> PlayerState {
+            PlayerState::Stopped
+        }
+        fn close(self: Box<Self>) {
+            if let Some(ticket) = self.ticket.as_ref() {
+                self.proxy.take_and_release(ticket);
+            }
+        }
+    }
+
+    struct StaleSender {
+        proxy: Arc<GstreamerMediaProxy>,
+    }
+
+    impl AirplaySender for StaleSender {
+        fn name(&self) -> &'static str {
+            "stale"
+        }
+        fn probe(&self) -> Result<(), SenderError> {
+            Ok(())
+        }
+        fn open_session(&self, ctx: &SenderOpenContext) -> OpenOutcome {
+            OpenOutcome::Opened(Box::new(StaleSession {
+                proxy: Arc::clone(&self.proxy),
+                ticket: ctx.media_ticket.clone(),
+            }))
+        }
+    }
+
+    #[test]
+    fn a_stale_opened_session_releases_its_route_through_the_worker() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let request = ResolvedHttpRequest::new(
+            url::Url::parse("https://music.test/stream.flac").expect("url"),
+        )
+        .expect("resolved request");
+        let prepared = proxy.prepare_resolved(request).expect("prepared media");
+        let ticket = prepared.ticket().expect("protected media ticket");
+        assert!(proxy.has_active_lease());
+        assert_eq!(ticket.route_count(), 1);
+
+        let generation = PlayerEventGeneration::from_raw(9);
+        let cancel = OpenCancel::new();
+        let registration = proxy.register_in_flight_cancel(91, prepared.generation(), &cancel);
+        let (tx, _rx) = async_channel::unbounded();
+        // The generation moved on before the worker ran, so the open is stale.
+        let event_generation = Arc::new(AtomicU64::new(generation.as_raw() + 1));
+        let ctx = SenderOpenContext {
+            target: SenderTarget::new("Test", "127.0.0.1", 7000, None),
+            prepared_uri: prepared.uri().to_string(),
+            event_tx: tx,
+            generation,
+            media_proxy: Arc::clone(&proxy),
+            media_ticket: prepared.ticket(),
+            volume: 1.0,
+            cancel: cancel.clone(),
+            session_gate: Arc::new(SessionGate::new()),
+            open_id: 91,
+        };
+        let sender = Arc::new(StaleSender {
+            proxy: Arc::clone(&proxy),
+        });
+        let state_cache = Arc::new(AtomicU8::new(PlayerState::Buffering as u8));
+        let position_cache = Arc::new(Mutex::new(SenderPosition::unknown(generation)));
+        let (_commands, command_rx) = mpsc::channel();
+
+        run_session_worker(
+            sender,
+            ctx,
+            registration,
+            command_rx,
+            state_cache,
+            position_cache,
+            event_generation,
+        );
+
+        assert!(
+            !proxy.has_active_lease() && !proxy.has_custody_entries(),
+            "a stale opened session must release its route by identity"
+        );
+        assert_eq!(
+            ticket.route_count(),
+            0,
+            "the released route must be shut down"
+        );
+    }
+
     /// A cancelled open is never reported as a user-facing failure.
     #[test]
     fn a_cancelled_open_publishes_no_error() {
