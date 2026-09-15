@@ -842,17 +842,20 @@ fn run_session_worker(
                 session.close();
                 return;
             }
-            // Publish the accepted start through the session, so the coarse
-            // `Playing` is serialized with the session's own terminal
-            // transition (review X1). A session that has already gone terminal
-            // returns `None` and publishes nothing: no `Playing` may follow a
-            // terminal `Stopped`/`TrackEnded`.
-            if let Some(started) = session.confirm_started() {
-                state_cache.store(started as u8, Ordering::SeqCst);
-                let _ = ctx
-                    .event_tx
-                    .try_send(PlayerEvent::state(generation, started));
-            }
+            // Run the worker's own cache/event publication *through* the
+            // session, so it is serialized with the session's terminal
+            // transition (review X1, review Y1). Publishing from here after
+            // `confirm_started` returned was the caller-side gap: the returned
+            // value outlived the session's boundary and a concurrent terminal
+            // restoration could publish `Stopped`/`TrackEnded` first. The
+            // closure runs under that boundary and is skipped entirely once the
+            // session is terminal, so no `Playing` can follow a terminal
+            // `Stopped`/`TrackEnded`.
+            let mut publish_started = |state: PlayerState| {
+                state_cache.store(state as u8, Ordering::SeqCst);
+                let _ = ctx.event_tx.try_send(PlayerEvent::state(generation, state));
+            };
+            session.confirm_started(&mut publish_started);
             loop {
                 state_cache.store(session.state() as u8, Ordering::SeqCst);
                 *position_cache.lock().unwrap_or_else(|p| p.into_inner()) = session.observe();
@@ -1075,6 +1078,7 @@ impl AudioOutput for AirPlayOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn test_airplay_output_name() {
@@ -1560,6 +1564,185 @@ fn main() {
             .probe()
             .expect_err("the unsupported shim must refuse every load");
         assert!(error.message().contains("OwnTone"), "{}", error.message());
+    }
+
+    /// Y1 regression double: a session whose `confirm_started` runs the
+    /// caller's publication only while it is live. It models the OwnTone
+    /// contract without a daemon, so the worker's routing can be driven
+    /// directly.
+    struct BoundarySession {
+        live: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
+        generation: PlayerEventGeneration,
+    }
+
+    impl SenderSession for BoundarySession {
+        fn write_pcm(&mut self, samples: &[u8]) -> SenderWriteOutcome {
+            SenderWriteOutcome::Accepted(samples.len())
+        }
+        fn set_volume(&mut self, _level: f64) {}
+        fn pause(&mut self) {}
+        fn resume(&mut self) -> bool {
+            true
+        }
+        fn confirm_started(&self, publish: &mut dyn FnMut(PlayerState)) -> bool {
+            if !self.live.load(Ordering::SeqCst) {
+                return false;
+            }
+            publish(PlayerState::Playing);
+            true
+        }
+        fn flush(&mut self) {}
+        fn observe(&self) -> SenderPosition {
+            SenderPosition::unknown(self.generation)
+        }
+        fn state(&self) -> PlayerState {
+            PlayerState::Playing
+        }
+        fn close(self: Box<Self>) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct BoundarySender {
+        live: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl AirplaySender for BoundarySender {
+        fn name(&self) -> &'static str {
+            "boundary"
+        }
+        fn probe(&self) -> Result<(), SenderError> {
+            Ok(())
+        }
+        fn open_session(&self, ctx: &SenderOpenContext) -> OpenOutcome {
+            OpenOutcome::Opened(Box::new(BoundarySession {
+                live: Arc::clone(&self.live),
+                closed: Arc::clone(&self.closed),
+                generation: ctx.generation,
+            }))
+        }
+    }
+
+    /// Drive the real `run_session_worker` for one `BoundarySession` and return
+    /// the events it published, its final state cache, and whether the session
+    /// was closed. A `Stop` command ends the control loop deterministically.
+    fn drive_boundary_worker(
+        live: bool,
+    ) -> (Vec<PlayerEvent>, PlayerState, bool, PlayerEventGeneration) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let request = ResolvedHttpRequest::new(
+            url::Url::parse("https://music.test/stream.flac").expect("url"),
+        )
+        .expect("resolved request");
+        let prepared = proxy.prepare_resolved(request).expect("prepared media");
+        let generation = PlayerEventGeneration::from_raw(5);
+        let cancel = OpenCancel::new();
+        let registration = proxy.register_in_flight_cancel(77, prepared.generation(), &cancel);
+        let (tx, rx) = async_channel::unbounded();
+
+        let ctx = SenderOpenContext {
+            target: SenderTarget::new("Test", "127.0.0.1", 7000, None),
+            prepared_uri: prepared.uri().to_string(),
+            event_tx: tx,
+            generation,
+            media_proxy: Arc::clone(&proxy),
+            media_ticket: prepared.ticket(),
+            volume: 1.0,
+            cancel: cancel.clone(),
+            session_gate: Arc::new(SessionGate::new()),
+            open_id: 77,
+        };
+        let sender = Arc::new(BoundarySender {
+            live: Arc::new(AtomicBool::new(live)),
+            closed: Arc::new(AtomicBool::new(false)),
+        });
+        let closed = Arc::clone(&sender.closed);
+        let state_cache = Arc::new(AtomicU8::new(PlayerState::Buffering as u8));
+        let position_cache = Arc::new(Mutex::new(SenderPosition::unknown(generation)));
+        let event_generation = Arc::new(AtomicU64::new(generation.as_raw()));
+        let (commands, command_rx) = mpsc::channel();
+
+        let worker_state = Arc::clone(&state_cache);
+        let handle = std::thread::spawn(move || {
+            run_session_worker(
+                sender,
+                ctx,
+                registration,
+                command_rx,
+                worker_state,
+                position_cache,
+                event_generation,
+            );
+        });
+
+        // Let the worker's start path run (or be skipped), then snapshot the
+        // cache while the worker is still live; the `Stop` teardown overwrites
+        // it with `Stopped` afterwards.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state_cache.load(Ordering::SeqCst) == PlayerState::Buffering as u8
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let cache = state_from_u8(state_cache.load(Ordering::SeqCst));
+        commands.send(SessionCommand::Stop).expect("stop");
+        handle.join().expect("worker");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        (events, cache, closed.load(Ordering::SeqCst), generation)
+    }
+
+    /// Y1: the worker's coarse start publication is routed *through* the session
+    /// (`confirm_started`) under its terminal-ordering boundary, not published
+    /// by the worker after the call returns. A live session's publication
+    /// reaches the event channel and the output cache; a session that has
+    /// already gone terminal publishes nothing, yet the worker still owns
+    /// teardown.
+    #[test]
+    fn run_session_worker_publishes_the_start_through_the_session_boundary() {
+        let (events, cache, closed, generation) = drive_boundary_worker(true);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    generation: g,
+                    state: PlayerState::Playing,
+                } if *g == generation
+            )),
+            "the session's own boundary publication must reach the worker's channel: {events:?}"
+        );
+        assert_eq!(
+            cache,
+            PlayerState::Playing,
+            "the worker cache must reflect the accepted start"
+        );
+        assert!(closed, "the worker owns session teardown");
+
+        let (terminal_events, _, terminal_closed, _) = drive_boundary_worker(false);
+        assert!(
+            !terminal_events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Playing | PlayerState::Paused,
+                    ..
+                }
+            )),
+            "a terminal session must publish no Playing/Paused through the worker: {terminal_events:?}"
+        );
+        assert!(
+            terminal_closed,
+            "the worker must tear down a terminal session too"
+        );
     }
 
     /// A cancelled open is never reported as a user-facing failure.
