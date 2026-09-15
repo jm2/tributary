@@ -358,7 +358,10 @@ fn listener_process(api_base: &str) -> Option<ListenerProcess> {
             else {
                 continue;
             };
-            if inodes.iter().any(|candidate| candidate.to_string() == inode) {
+            if inodes
+                .iter()
+                .any(|candidate| candidate.to_string() == inode)
+            {
                 return read_process(pid);
             }
         }
@@ -476,7 +479,9 @@ fn wait_for_owned_listener(config: &OwnToneConfig, deadline: Instant) -> Result<
 /// against a daemon that cannot replay an old generation's mutation.
 fn quiesce_daemon(config: &OwnToneConfig) -> Result<(), SenderError> {
     let Some(process) = listener_process(&config.api_base) else {
-        return Err(unavailable("the dedicated daemon is not running to quiesce"));
+        return Err(unavailable(
+            "the dedicated daemon is not running to quiesce",
+        ));
     };
     if !same_binary(&process.exe, &config.binary) {
         return Err(unavailable(
@@ -1112,6 +1117,13 @@ fn sample_position(inner: &SessionInner) {
     *inner.state.lock().unwrap_or_else(|p| p.into_inner()) = state;
 }
 
+/// The daemon must report `stop` for a finite item to count as completed:
+/// `pause` is a user-visible state, not a finished item (review F4). Kept as a
+/// predicate so the pause-is-not-completion regression is unit-testable.
+fn daemon_completion_reached(state: &str) -> bool {
+    state == "stop"
+}
+
 /// Natural EOS: close the write end so the daemon sees end-of-input, wait
 /// (bounded) for daemon-confirmed completion, restore, then publish exactly one
 /// generation-scoped `TrackEnded` (§4.3, §9 item 10). A drain deadline miss or
@@ -1127,7 +1139,7 @@ fn natural_completion(inner: &SessionInner, pipeline: &gst::Pipeline) {
     let deadline = Instant::now() + DRAIN_DEADLINE;
     loop {
         match inner.client.player_state() {
-            Ok(state) if state == "stop" => break,
+            Ok(state) if daemon_completion_reached(&state) => break,
             Ok(_) => {}
             Err(_) => {
                 let _ = inner.event_tx.try_send(PlayerEvent::error(
@@ -1239,12 +1251,11 @@ impl SenderSession for OwnToneSession {
             // next opener refuse rather than adopt a half-taken-over daemon.
             return;
         };
-        let route = this.inner.media_ticket.as_ref().map(|ticket| {
-            (
-                Arc::clone(&this.inner.media_proxy),
-                Arc::clone(ticket),
-            )
-        });
+        let route = this
+            .inner
+            .media_ticket
+            .as_ref()
+            .map(|ticket| (Arc::clone(&this.inner.media_proxy), Arc::clone(ticket)));
         let completion = spawn_serialized_recovery(
             Arc::clone(&this.inner.client),
             this.inner.config.clone(),
@@ -2056,6 +2067,16 @@ mod tests {
         );
     }
 
+    /// F4: a paused item is not a completed item; only `stop` completes, so a
+    /// paused track is never reported as `TrackEnded`.
+    #[test]
+    fn completion_requires_stop_and_never_accepts_pause() {
+        assert!(daemon_completion_reached("stop"));
+        assert!(!daemon_completion_reached("pause"));
+        assert!(!daemon_completion_reached("play"));
+        assert!(!daemon_completion_reached(""));
+    }
+
     /// R5: `/proc/net/tcp` is parsed to the socket inodes LISTENing on the
     /// configured port — the kernel-side identity the JSON API cannot provide.
     #[test]
@@ -2068,7 +2089,9 @@ mod tests {
         assert_eq!(listening_inodes(table, 0x0DA5), vec![12345]);
         assert_eq!(listening_inodes(table, 0x1F90), vec![99]);
         // A non-LISTEN row is not an owner.
-        assert!(listening_inodes(table, 0x0DA5).iter().all(|inode| *inode != 555));
+        assert!(listening_inodes(table, 0x0DA5)
+            .iter()
+            .all(|inode| *inode != 555));
         assert!(listening_inodes(table, 4242).is_empty());
     }
 
@@ -2096,7 +2119,10 @@ mod tests {
         let state_dir = directory.path();
         let cmdline = format!("/usr/bin/owntone -c {}/owntone.conf", state_dir.display());
         assert!(cmdline_binds_state_dir(&cmdline, state_dir));
-        assert!(!cmdline_binds_state_dir("/usr/bin/owntone -c /etc/owntone.conf", state_dir));
+        assert!(!cmdline_binds_state_dir(
+            "/usr/bin/owntone -c /etc/owntone.conf",
+            state_dir
+        ));
         assert!(!cmdline_binds_state_dir("", state_dir));
     }
 
