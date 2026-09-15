@@ -552,6 +552,14 @@ struct SessionInner {
     media_proxy: Arc<GstreamerMediaProxy>,
     media_ticket: Option<Arc<GstreamerMediaTicket>>,
     running: AtomicBool,
+    /// Set only when the load path accepts this session's activation. The
+    /// decode pump stays inert — no pipeline start, no PCM, no daemon play —
+    /// until then, so a cancelled or superseded load cannot start stale
+    /// playback (review R4).
+    activated: AtomicBool,
+    /// The load's cancellation currency, so the pump can abort its activation
+    /// wait the moment the load is cancelled or replaced (review R4).
+    cancel: OpenCancel,
     restored: AtomicBool,
     position: Mutex<SenderPosition>,
     state: Mutex<PlayerState>,
@@ -637,6 +645,55 @@ impl SessionInner {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
+
+    /// Accept activation: release the decode pump to start playback. Called
+    /// only after the load path has confirmed the generation is still current
+    /// and the load is not cancelled (review R4).
+    fn activate(&self) {
+        self.activated.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Pure activation gate, split from [`wait_for_activation`] so the pump's
+/// "inert until accepted" barrier is deterministically unit-testable without
+/// a GStreamer pipeline (review R4). Returns `true` only when the load
+/// accepted activation before the deadline and was neither cancelled nor torn
+/// down while waiting.
+fn activation_gate(
+    running: &AtomicBool,
+    activated: &AtomicBool,
+    cancel: &OpenCancel,
+    deadline: Instant,
+    poll: Duration,
+) -> bool {
+    loop {
+        if cancel.is_cancelled() || !running.load(Ordering::SeqCst) {
+            return false;
+        }
+        if activated.load(Ordering::SeqCst) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        if !poll.is_zero() {
+            std::thread::sleep(poll);
+        }
+    }
+}
+
+/// Wait (bounded) for the load path to accept activation. A load that is
+/// cancelled, torn down, or never accepted inside the bound leaves the pump
+/// inert: it returns `false` without starting the pipeline, publishing a start
+/// event, or driving the daemon (review R4).
+fn wait_for_activation(inner: &SessionInner) -> bool {
+    activation_gate(
+        &inner.running,
+        &inner.activated,
+        &inner.cancel,
+        Instant::now() + OPEN_DEADLINE,
+        FIFO_OPEN_POLL,
+    )
 }
 
 /// The pump's three exits must not be conflated (§4.3): backpressure is the
@@ -649,6 +706,15 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
     // wait, the daemon's FIFO reader would never observe EOF and a finite track
     // would fall into the drain-deadline failure path instead of `TrackEnded`.
     let mut write_fd = Some(write_fd);
+
+    // The pump is spawned inside `open`, before the load path has accepted the
+    // session, so it must stay inert until that acceptance arrives. A load
+    // cancelled or superseded before activation returns here without touching
+    // the pipeline or the daemon (review R4).
+    if !wait_for_activation(&inner) {
+        return;
+    }
+
     let Some(bus) = pipeline.bus() else {
         inner.publish_state(PlayerState::Stopped);
         let _ = inner.event_tx.try_send(PlayerEvent::error(
@@ -828,6 +894,11 @@ impl SenderSession for OwnToneSession {
     }
 
     fn resume(&mut self) {
+        // The first accepted resume is the activation that releases the inert
+        // decode pump; the pump never starts playback on its own (review R4).
+        // The load path calls this only after confirming the generation is
+        // still current and the load was not cancelled.
+        self.inner.activate();
         if self.inner.client.player_control("play").is_ok() {
             self.inner.publish_state(PlayerState::Playing);
         }
@@ -898,6 +969,21 @@ impl AirplaySender for OwnToneSender {
         "owntone"
     }
 
+    /// Non-blocking availability gate (review R1).
+    ///
+    /// `probe` runs synchronously on the GTK caller, so it must never touch
+    /// the network: the daemon reachability/version check is network I/O with
+    /// a documented timeout, and running it here froze the UI until the
+    /// dedicated daemon answered (or the timeout expired) before the load
+    /// worker even started. The blocking daemon handshake moves to
+    /// [`open`], which the load path already runs on its own worker
+    /// thread — off GTK — before any receiver state is read or mutated.
+    ///
+    /// What remains here is the local, fail-closed configuration check: the
+    /// platform path, the ownership record, the binary and the pipe. A missing
+    /// or foreign dedicated instance is still refused before any per-track
+    /// media work, and the refusal is identical whether it is observed here
+    /// or by the worker's first health step.
     fn probe(&self) -> Result<(), SenderError> {
         if !platform_available() {
             return Err(unavailable(
@@ -912,11 +998,6 @@ impl AirplaySender for OwnToneSender {
         if !config.binary.is_file() {
             return Err(unavailable("the owntone binary was not found"));
         }
-        let client = OwnToneClient::new(&config.api_base)?;
-        let (major, _minor) = client.version()?;
-        if major < OWNTONE_MIN_MAJOR {
-            return Err(unavailable("the dedicated daemon is older than 29.x"));
-        }
         ensure_pipe(&config.pipe_path)?;
         Ok(())
     }
@@ -930,6 +1011,19 @@ impl AirplaySender for OwnToneSender {
         };
         open(config, ctx)
     }
+}
+
+/// Confirm the dedicated daemon answers and is new enough. This is the
+/// blocking half of the old availability gate, deliberately executed on the
+/// load worker's [`open`] rather than in the synchronous, GTK-thread `probe`
+/// (review R1). It is the first daemon RPC the worker performs and it never
+/// reads or mutates receiver state.
+fn check_daemon_health(client: &OwnToneClient) -> Result<(), SenderError> {
+    let (major, _minor) = client.version()?;
+    if major < OWNTONE_MIN_MAJOR {
+        return Err(unavailable("the dedicated daemon is older than 29.x"));
+    }
+    Ok(())
 }
 
 /// Acquire exclusivity, map the receiver, record the pre-takeover state, take
@@ -947,6 +1041,17 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
         Err(error) => return OpenOutcome::Failed(error),
     };
     if let Err(error) = config.verify_owned() {
+        return OpenOutcome::Failed(error);
+    }
+    if ctx.cancel.is_cancelled() {
+        return OpenOutcome::Cancelled;
+    }
+
+    // The blocking daemon handshake runs here, on the load worker, never on
+    // the GTK caller (review R1). Reachability and version are the network I/O
+    // the synchronous `probe` must not perform; running them before the lock
+    // and before any receiver state read preserves the fail-closed ordering.
+    if let Err(error) = check_daemon_health(&client) {
         return OpenOutcome::Failed(error);
     }
     if ctx.cancel.is_cancelled() {
@@ -1063,6 +1168,8 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
         media_proxy: Arc::clone(&ctx.media_proxy),
         media_ticket: ctx.media_ticket.clone(),
         running: AtomicBool::new(true),
+        activated: AtomicBool::new(false),
+        cancel: ctx.cancel.clone(),
         restored: AtomicBool::new(false),
         position: Mutex::new(SenderPosition::unknown(ctx.generation)),
         state: Mutex::new(PlayerState::Buffering),
@@ -1253,6 +1360,35 @@ fn open_lock(path: &Path) -> Result<std::fs::File, SenderError> {
         .map_err(|_| unavailable("the instance lock file could not be opened"))
 }
 
+/// Build a fully-owned [`OwnToneSender`] for controller-path regressions: a
+/// temp state directory carrying a matching ownership record, a created FIFO
+/// and a real (dummy) binary file, pointed at `api_base`.
+#[cfg(test)]
+pub(super) fn test_owned_sender(api_base: &str, state_dir: &Path, binary: &Path) -> OwnToneSender {
+    let config = OwnToneConfig {
+        api_base: api_base.trim_end_matches('/').to_string(),
+        pipe_path: state_dir.join("airplay.pcm"),
+        state_dir: state_dir.to_path_buf(),
+        binary: binary.to_path_buf(),
+    };
+    let record = OwnershipRecord {
+        token: OWNER_TOKEN.to_string(),
+        api_base: config.api_base.clone(),
+        pipe_path: config.pipe_path.to_string_lossy().into_owned(),
+        state_dir: config.state_dir.to_string_lossy().into_owned(),
+        binary: config.binary.to_string_lossy().into_owned(),
+    };
+    std::fs::write(
+        config.owner_marker(),
+        serde_json::to_vec(&record).expect("serialize record"),
+    )
+    .expect("write record");
+    ensure_pipe(&config.pipe_path).expect("create pipe");
+    OwnToneSender {
+        config: Some(config),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1338,6 +1474,63 @@ mod tests {
         assert!(is_loopback_host("::1"));
         assert!(!is_loopback_host("192.168.1.10"));
         assert!(!is_loopback_host("owntone.example"));
+    }
+
+    /// R4: the decode pump's activation barrier is deterministic. It releases
+    /// only on an accepted activation; an already-cancelled, torn-down, or
+    /// never-activated load leaves the pump inert, so no pipeline start, no
+    /// PCM and no daemon play can follow a cancelled load.
+    #[test]
+    fn activation_gate_releases_only_on_accepted_activation() {
+        let future = Instant::now() + Duration::from_millis(50);
+
+        // Never activated inside the bound: inert.
+        let running = AtomicBool::new(true);
+        let activated = AtomicBool::new(false);
+        let cancel = OpenCancel::new();
+        assert!(!activation_gate(
+            &running,
+            &activated,
+            &cancel,
+            Instant::now(),
+            Duration::ZERO
+        ));
+
+        // Cancelled before activation: inert even when a stale activation
+        // attempt races in.
+        cancel.cancel();
+        activated.store(true, Ordering::SeqCst);
+        assert!(!activation_gate(
+            &running,
+            &activated,
+            &cancel,
+            future,
+            Duration::ZERO
+        ));
+
+        // Torn down before activation: inert.
+        let running = AtomicBool::new(false);
+        let activated = AtomicBool::new(false);
+        let cancel = OpenCancel::new();
+        assert!(!activation_gate(
+            &running,
+            &activated,
+            &cancel,
+            future,
+            Duration::ZERO
+        ));
+
+        // Accepted activation: released.
+        let running = AtomicBool::new(true);
+        let activated = AtomicBool::new(true);
+        let cancel = OpenCancel::new();
+        assert!(activation_gate(
+            &running,
+            &activated,
+            &cancel,
+            future,
+            Duration::ZERO
+        ));
     }
 
     #[test]

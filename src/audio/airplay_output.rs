@@ -1222,6 +1222,55 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// R1: the availability gate runs on the GTK caller, so a dedicated
+    /// daemon that accepts the connection and then never answers must not
+    /// freeze the load path. The blocking handshake lives on the load worker;
+    /// `load_uri` and a following `stop` both return promptly against a
+    /// stalled endpoint.
+    #[test]
+    fn a_stalled_owntone_endpoint_does_not_block_load_or_stop() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled endpoint");
+        let addr = listener.local_addr().expect("local addr");
+        let api_base = format!("http://{addr}");
+        // Accept the connection and hold it open without ever answering: any
+        // blocking probe on this endpoint would sit until its timeout.
+        std::thread::spawn(move || {
+            if listener.accept().is_ok() {
+                std::thread::sleep(Duration::from_secs(10));
+            }
+        });
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let binary = directory.path().join("owntone");
+        std::fs::write(&binary, b"#!/bin/true\n").expect("dummy binary");
+        let sender =
+            crate::audio::airplay_owntone::test_owned_sender(&api_base, directory.path(), &binary);
+
+        let (tx, _rx) = async_channel::unbounded();
+        let mut output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
+        output.sender = Arc::new(sender);
+        let generation = PlayerEventGeneration::from_raw(64);
+        output.set_event_generation(generation);
+
+        let started = Instant::now();
+        output.load_uri("http://127.0.0.1:1/media");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "load blocked on the stalled OwnTone endpoint: {:?}",
+            started.elapsed()
+        );
+
+        let stopped = Instant::now();
+        output.stop();
+        assert!(
+            stopped.elapsed() < Duration::from_millis(500),
+            "stop blocked on the stalled OwnTone endpoint: {:?}",
+            stopped.elapsed()
+        );
+    }
+
     /// A cancelled open is never reported as a user-facing failure.
     #[test]
     fn a_cancelled_open_publishes_no_error() {
