@@ -33,7 +33,8 @@ use tracing::{debug, error, info, warn};
 
 use super::airplay_sender::{
     AirplaySender, OpenCancel, OpenOutcome, RecoveryCompletion, RecoveryOutcome, SenderError,
-    SenderOpenContext, SenderPosition, SenderSession, SenderWriteOutcome, SessionGate,
+    SenderOpenContext, SenderPosition, SenderSession, SenderTarget, SenderWriteOutcome,
+    SessionGate,
 };
 use super::gstreamer_media::{GstreamerMediaProxy, GstreamerMediaTicket};
 use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
@@ -4918,6 +4919,87 @@ mod tests {
         );
     }
 
+    /// X2/W2: a **failed start** leaves the production pump inert. The play RPC
+    /// is refused, the pump's activation gate stays closed, and the real decode
+    /// pipeline is never started: the FIFO reader observes EOF with zero bytes
+    /// and no `Playing`/`TrackEnded` is ever published.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_start_leaves_the_pump_inert_and_writes_no_pcm() {
+        use std::io::Read;
+
+        gst::init().expect("GStreamer init");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let pipe_path = directory.path().join("airplay.pcm");
+        ensure_pipe(&pipe_path).expect("create fifo");
+
+        let (tx, rx) = async_channel::unbounded();
+        let inner = Arc::new(test_session_inner_with_events(directory.path(), tx));
+        assert!(
+            !inner.activate_and_play(),
+            "an unreachable daemon must refuse the start"
+        );
+        assert!(!inner.activation_live());
+
+        let reader_path = pipe_path.clone();
+        let reader = std::thread::spawn(move || {
+            let mut fifo = std::fs::OpenOptions::new()
+                .read(true)
+                .open(&reader_path)
+                .expect("open fifo reader");
+            let mut total = 0usize;
+            let mut buffer = [0u8; 4096];
+            loop {
+                match fifo.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => total += read,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            total
+        });
+
+        let write_fd = open_pipe_write(
+            &pipe_path,
+            Instant::now() + Duration::from_secs(5),
+            &inner.cancel,
+        )
+        .unwrap_or_else(|_| panic!("open fifo write end"));
+        let pipeline = gst::parse::launch(&format!(
+            "audiotestsrc num-buffers=8 ! audioconvert ! audio/x-raw,format=S16LE,rate=44100,channels=2 ! fdsink fd={}",
+            write_fd.as_raw_fd(),
+        ))
+        .expect("build pipeline")
+        .downcast::<gst::Pipeline>()
+        .expect("pipeline");
+
+        run_pump(Arc::clone(&inner), pipeline, write_fd);
+
+        let written = reader.join().expect("reader");
+        assert_eq!(written, 0, "a refused start must write no PCM into the FIFO");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Playing,
+                    ..
+                }
+            )),
+            "a refused start must not publish Playing: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::TrackEnded { .. })),
+            "an inert pump must not complete: {events:?}"
+        );
+    }
+
     /// X2/W2: the **production** [`run_pump`] path drives a real decode
     /// pipeline into a real FIFO; the daemon observes the writer's EOF and
     /// reports completion, and exactly one `TrackEnded` is published after
@@ -5457,5 +5539,278 @@ fn serve(stream: std::net::TcpStream) {
         wait_until(|| {
             rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_ok()
         });
+    }
+
+    // ----- X2/Y2: full open() production-path ordering -----
+
+    /// Hermetic fake OwnTone daemon for the full `open()` fixture: it satisfies
+    /// the ownership binding, reports one output matching device id 255, answers
+    /// the control endpoints, and records every request line to the file named
+    /// by `TRIBUTARY_FAKE_REQUESTS`, so the adapter's real request ordering is
+    /// observable.
+    #[cfg(target_os = "linux")]
+    const RECORDING_DAEMON_SOURCE: &str = r##"
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+
+fn main() {
+    let addr = std::env::var("TRIBUTARY_FAKE_LISTEN").expect("listen address");
+    let listener = TcpListener::bind(&addr).expect("bind");
+    for incoming in listener.incoming() {
+        let Ok(stream) = incoming else { continue };
+        std::thread::spawn(move || serve(stream));
+    }
+}
+
+fn serve(stream: std::net::TcpStream) {
+    let Ok(reader_stream) = stream.try_clone() else { return };
+    let mut reader = BufReader::new(reader_stream);
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).is_err() { return; }
+    let trimmed = request_line.trim().to_string();
+    if trimmed.is_empty() { return; }
+    if let Ok(record) = std::env::var("TRIBUTARY_FAKE_REQUESTS") {
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(record) {
+            let _ = writeln!(file, "{trimmed}");
+            let _ = file.flush();
+        }
+    }
+    let mut content_length = 0usize;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).is_err() || header.trim().is_empty() { break; }
+        if let Some(value) = header
+            .to_ascii_lowercase()
+            .strip_prefix("content-length:")
+            .map(str::trim)
+        {
+            content_length = value.parse().unwrap_or(0);
+        }
+    }
+    if content_length > 0 {
+        let mut body = vec![0u8; content_length];
+        let _ = reader.read_exact(&mut body);
+    }
+    let path = trimmed.split_whitespace().nth(1).unwrap_or_default().to_string();
+    let body = match path.as_str() {
+        "/api/config" => r#"{"version":"29.3"}"#.to_string(),
+        "/api/outputs" => r#"{"outputs":[{"id":"11189196","name":"Test","selected":true}]}"#.to_string(),
+        "/api/player" => r#"{"state":"stop"}"#.to_string(),
+        _ => "{}".to_string(),
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(), body
+    );
+    let mut stream = stream;
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+"##;
+
+    /// A real, owned, request-recording fake daemon for the full `open()` path.
+    #[cfg(target_os = "linux")]
+    struct RecordingOwnedDaemon {
+        _directory: tempfile::TempDir,
+        config: OwnToneConfig,
+        requests: PathBuf,
+        child: Option<std::process::Child>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for RecordingOwnedDaemon {
+        fn drop(&mut self) {
+            if let Some(process) = listener_process(&self.config.api_base) {
+                let _ = terminate_process(&process, &self.config, Duration::from_secs(5));
+            }
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl RecordingOwnedDaemon {
+        fn start() -> Self {
+            use std::net::TcpListener;
+            let directory = tempfile::tempdir().expect("tempdir");
+            let state_dir = directory.path().join("state");
+            std::fs::create_dir_all(&state_dir).expect("state dir");
+            let pipe = state_dir.join("airplay.pcm");
+            let config_path = state_dir.join(OWNTONE_CONFIG_FILE);
+            std::fs::write(
+                &config_path,
+                format!("pipe_path = \"{}\"\n", pipe.display()),
+            )
+            .expect("write config");
+
+            let source = directory.path().join("fake_recording.rs");
+            std::fs::write(&source, RECORDING_DAEMON_SOURCE).expect("write source");
+            let binary = directory.path().join("fake_owntone");
+            let compiled = std::process::Command::new("rustc")
+                .arg("-O")
+                .arg(&source)
+                .arg("-o")
+                .arg(&binary)
+                .status()
+                .expect("invoke rustc");
+            assert!(compiled.success(), "the recording daemon must compile");
+
+            let probe = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+            let port = probe.local_addr().expect("addr").port();
+            drop(probe);
+
+            let api_base = format!("http://127.0.0.1:{port}");
+            let requests = state_dir.join("requests.txt");
+            let config = OwnToneConfig {
+                api_base: api_base.clone(),
+                pipe_path: pipe.clone(),
+                state_dir: state_dir.clone(),
+                binary: binary.clone(),
+            };
+            let restart = format!(
+                "TRIBUTARY_FAKE_LISTEN=127.0.0.1:{port} TRIBUTARY_FAKE_REQUESTS={} {} -c {}",
+                requests.display(),
+                binary.display(),
+                config_path.display()
+            );
+            let record = OwnershipRecord {
+                token: OWNER_TOKEN.to_string(),
+                api_base,
+                pipe_path: pipe.to_string_lossy().into_owned(),
+                state_dir: state_dir.to_string_lossy().into_owned(),
+                binary: binary.to_string_lossy().into_owned(),
+                restart_command: Some(restart),
+            };
+            std::fs::write(
+                config.owner_marker(),
+                serde_json::to_vec(&record).expect("serialize record"),
+            )
+            .expect("write ownership record");
+
+            let child = std::process::Command::new(&binary)
+                .arg("-c")
+                .arg(&config_path)
+                .env("TRIBUTARY_FAKE_LISTEN", format!("127.0.0.1:{port}"))
+                .env("TRIBUTARY_FAKE_REQUESTS", &requests)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn recording daemon");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(Instant::now() < deadline, "the recording daemon never listened");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Self {
+                _directory: directory,
+                config,
+                requests,
+                child: Some(child),
+            }
+        }
+
+        fn recorded(&self) -> String {
+            std::fs::read_to_string(&self.requests).unwrap_or_default()
+        }
+    }
+
+    /// Y2: the initial volume is applied **before any activation** through the
+    /// real `open()`, so a switch to OwnTone starts at the slider's level and
+    /// the daemon never sees a `player/play` before the `player/volume` PUT.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_initial_volume_is_applied_before_the_first_play_through_open() {
+        use std::io::Read;
+
+        gst::init().expect("GStreamer init");
+        let daemon = RecordingOwnedDaemon::start();
+        // `open()` assumes the availability gate created the FIFO; the direct
+        // call must set it up the way `probe` would.
+        ensure_pipe(&daemon.config.pipe_path).expect("create fifo");
+
+        // A reader must hold the FIFO open for `open_pipe_write` to succeed.
+        let pipe_path = daemon.config.pipe_path.clone();
+        let reader = std::thread::spawn(move || {
+            let mut fifo = std::fs::OpenOptions::new()
+                .read(true)
+                .open(&pipe_path)
+                .expect("open fifo reader");
+            let mut buffer = [0u8; 4096];
+            loop {
+                match fifo.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let (tx, _rx) = async_channel::unbounded();
+        let generation = PlayerEventGeneration::from_raw(3);
+        let cancel = OpenCancel::new();
+        let ctx = SenderOpenContext {
+            target: SenderTarget::new("Test", "127.0.0.1", 7000, Some("aabbcc".to_string())),
+            prepared_uri: "file:///nonexistent/dummy.wav".to_string(),
+            event_tx: tx,
+            generation,
+            media_proxy: Arc::clone(&proxy),
+            media_ticket: None,
+            volume: 0.42,
+            cancel: cancel.clone(),
+            session_gate: Arc::new(SessionGate::new()),
+            open_id: 1,
+        };
+
+        let outcome = open(daemon.config.clone(), &ctx);
+        let session = match outcome {
+            OpenOutcome::Opened(session) => session,
+            OpenOutcome::Failed(error) => {
+                panic!("open() failed against the recording daemon: {}", error.message())
+            }
+            OpenOutcome::Cancelled => panic!("open() was cancelled unexpectedly"),
+        };
+
+        let recorded = daemon.recorded();
+        assert!(
+            recorded.contains("/api/player/volume"),
+            "open() must apply the initial volume: {recorded:?}"
+        );
+        assert!(
+            !recorded.contains("/api/player/play"),
+            "no play may precede the initial volume: {recorded:?}"
+        );
+
+        let mut session = session;
+        assert!(session.resume(), "the accepted start must transmit");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !daemon.recorded().contains("/api/player/play") {
+            assert!(
+                Instant::now() < deadline,
+                "the play must reach the daemon: {:?}",
+                daemon.recorded()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let recorded = daemon.recorded();
+        let volume_at = recorded
+            .find("/api/player/volume")
+            .expect("volume request recorded");
+        let play_at = recorded.find("/api/player/play").expect("play request recorded");
+        assert!(
+            volume_at < play_at,
+            "the initial volume must precede the first play: {recorded:?}"
+        );
+
+        session.close();
+        reader.join().expect("reader");
     }
 }
