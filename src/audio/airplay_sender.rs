@@ -365,6 +365,20 @@ pub(super) trait SenderSession: Send {
     /// instead of publishing `Playing` unconditionally (review T3).
     fn resume(&mut self) -> bool;
 
+    /// Confirm the start that [`Self::resume`] just accepted and publish its
+    /// playback state atomically with the session's own terminal transition
+    /// (review X1). Returns the state the worker should cache — `Some` when a
+    /// start state may be published, `None` once the session has gone terminal
+    /// and nothing may follow the terminal `Stopped`/`TrackEnded`.
+    ///
+    /// The default returns `Some(PlayerState::Playing)` without publishing, so
+    /// the worker caches and publishes it; that is correct for sessions with no
+    /// internal terminal transition. A session that owns an internal terminal
+    /// transition implements this so the publication is serialized with it.
+    fn confirm_started(&self) -> Option<PlayerState> {
+        Some(PlayerState::Playing)
+    }
+
     /// Flush buffered audio without tearing down the receiver session.
     fn flush(&mut self);
 

@@ -842,10 +842,17 @@ fn run_session_worker(
                 session.close();
                 return;
             }
-            state_cache.store(PlayerState::Playing as u8, Ordering::SeqCst);
-            let _ = ctx
-                .event_tx
-                .try_send(PlayerEvent::state(generation, PlayerState::Playing));
+            // Publish the accepted start through the session, so the coarse
+            // `Playing` is serialized with the session's own terminal
+            // transition (review X1). A session that has already gone terminal
+            // returns `None` and publishes nothing: no `Playing` may follow a
+            // terminal `Stopped`/`TrackEnded`.
+            if let Some(started) = session.confirm_started() {
+                state_cache.store(started as u8, Ordering::SeqCst);
+                let _ = ctx
+                    .event_tx
+                    .try_send(PlayerEvent::state(generation, started));
+            }
             loop {
                 state_cache.store(session.state() as u8, Ordering::SeqCst);
                 *position_cache.lock().unwrap_or_else(|p| p.into_inner()) = session.observe();
