@@ -27,24 +27,69 @@ const MEDIA_PREPARATION_FAILED: &str = "protected media preparation failed";
 /// Deliberately not `Debug`: the direct variant is credential-free by
 /// classification, while the protected variant owns the proxy that retains
 /// the original authenticated URL.
-pub(super) enum PreparedGstreamerMedia {
+///
+/// The media carries the **preparation generation** it was minted under. An
+/// in-flight registration is accepted only while the proxy still owns that
+/// generation, so a superseded prepared load can never overwrite a newer
+/// load's authorization — the generation is the scheduling watermark, not a
+/// slot that supersession clears (review T4, review U4).
+pub(super) struct PreparedGstreamerMedia {
+    kind: PreparedMediaKind,
+    generation: Arc<PreparationGeneration>,
+}
+
+enum PreparedMediaKind {
     Direct(String),
     Protected(Arc<GstreamerMediaTicket>),
 }
 
 impl PreparedGstreamerMedia {
+    fn direct(uri: String, generation: Arc<PreparationGeneration>) -> Self {
+        Self {
+            kind: PreparedMediaKind::Direct(uri),
+            generation,
+        }
+    }
+
+    fn protected(
+        ticket: Arc<GstreamerMediaTicket>,
+        generation: Arc<PreparationGeneration>,
+    ) -> Self {
+        Self {
+            kind: PreparedMediaKind::Protected(ticket),
+            generation,
+        }
+    }
+
     pub(super) fn uri(&self) -> &str {
-        match self {
-            Self::Direct(uri) => uri,
-            Self::Protected(ticket) => ticket.uri(),
+        match &self.kind {
+            PreparedMediaKind::Direct(uri) => uri,
+            PreparedMediaKind::Protected(ticket) => ticket.uri(),
         }
     }
 
     pub(super) fn ticket(&self) -> Option<Arc<GstreamerMediaTicket>> {
-        match self {
-            Self::Direct(_) => None,
-            Self::Protected(ticket) => Some(Arc::clone(ticket)),
+        match &self.kind {
+            PreparedMediaKind::Direct(_) => None,
+            PreparedMediaKind::Protected(ticket) => Some(Arc::clone(ticket)),
         }
+    }
+
+    /// The preparation generation this media was minted under. An in-flight
+    /// registration binds to it, so a load whose preparation was superseded
+    /// registers nothing (review T4, review U4).
+    pub(super) fn generation(&self) -> &Arc<PreparationGeneration> {
+        &self.generation
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_direct(&self) -> bool {
+        matches!(self.kind, PreparedMediaKind::Direct(_))
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_protected(&self) -> bool {
+        matches!(self.kind, PreparedMediaKind::Protected(_))
     }
 }
 
@@ -91,7 +136,7 @@ struct ProxyState {
     generation: Arc<PreparationGeneration>,
 }
 
-struct PreparationGeneration;
+pub(super) struct PreparationGeneration;
 
 /// Stateful last-mile resolver shared by local and AirPlay outputs.
 pub(super) struct GstreamerMediaProxy {
@@ -217,7 +262,7 @@ impl GstreamerMediaProxy {
             ticket.revoke();
             return Err(MEDIA_PREPARATION_FAILED);
         }
-        Ok(PreparedGstreamerMedia::Protected(ticket))
+        Ok(PreparedGstreamerMedia::protected(ticket, generation))
     }
 
     fn prepare_resolved_with_server_start<F>(
@@ -260,7 +305,7 @@ impl GstreamerMediaProxy {
             ticket.revoke();
             return Err(MEDIA_PREPARATION_FAILED);
         }
-        Ok(PreparedGstreamerMedia::Protected(ticket))
+        Ok(PreparedGstreamerMedia::protected(ticket, generation))
     }
 
     fn prepare_with_server_start<F>(
@@ -295,7 +340,10 @@ impl GstreamerMediaProxy {
         match classification {
             MediaUriSecurity::Direct => {
                 if self.is_current_generation(&generation) {
-                    Ok(PreparedGstreamerMedia::Direct(raw_uri.to_string()))
+                    Ok(PreparedGstreamerMedia::direct(
+                        raw_uri.to_string(),
+                        generation,
+                    ))
                 } else {
                     Err(MEDIA_PREPARATION_FAILED)
                 }
@@ -315,7 +363,7 @@ impl GstreamerMediaProxy {
                     ticket.revoke();
                     return Err(MEDIA_PREPARATION_FAILED);
                 }
-                Ok(PreparedGstreamerMedia::Protected(ticket))
+                Ok(PreparedGstreamerMedia::protected(ticket, generation))
             }
         }
     }
@@ -370,37 +418,33 @@ impl GstreamerMediaProxy {
         }
     }
 
-    /// Authorize `open_id` to negotiate. Called before the in-flight open
-    /// registers; any later supersession clears it.
-    ///
-    /// Only the newest scheduled load may authorize: the proxy tracks loads in
-    /// scheduling order, so a stale worker whose authorization was superseded
-    /// must not overwrite a newer load's identity (review T4). `retire_active_locked`
-    /// clears the slot on every replacement, so a fresh load always installs.
-    pub(super) fn begin_open(&self, open_id: u64) {
-        let mut state = self.lock_state();
-        if state.current_open.is_none_or(|current| open_id >= current) {
-            state.current_open = Some(open_id);
-        }
-    }
-
     /// Register `cancel` for the duration of one `open_session`, keyed by
-    /// `open_id`. Superseded-checked: if the load was already superseded before
-    /// it could register (Stop, the proxy's `Drop`, or a replacement
-    /// preparation won the prepare-to-open race), installs nothing and reports
-    /// it, so the open yields `Cancelled` without negotiating (review F2).
+    /// `open_id`, **bound to the preparation generation** the media was minted
+    /// under (review T4, review U4).
+    ///
+    /// Superseded-checked on identity, not on a slot that supersession clears:
+    /// the load is accepted only while the proxy still owns `generation`. A
+    /// delayed worker whose preparation was already superseded (a replacement
+    /// preparation, a Stop, or the proxy's `Drop`) therefore installs nothing
+    /// and reports it, so the open yields `Cancelled` without negotiating.
+    ///
+    /// The registration must be taken **before scheduling the worker**, so a
+    /// replacement preparation that runs after this sees the load counted
+    /// in-flight and preserves its route in custody instead of revoking it.
     pub(super) fn register_in_flight_cancel(
         self: &Arc<Self>,
         open_id: u64,
+        generation: &Arc<PreparationGeneration>,
         cancel: &OpenCancel,
     ) -> InFlightCancelRegistration {
         let installed = {
             let mut state = self.lock_state();
-            if state.current_open == Some(open_id) {
+            if !Arc::ptr_eq(&state.generation, generation) {
+                false
+            } else {
+                state.current_open = Some(open_id);
                 state.inflight.insert(open_id, cancel.clone());
                 true
-            } else {
-                false
             }
         };
         InFlightCancelRegistration {
@@ -789,7 +833,7 @@ mod tests {
         let request = ResolvedHttpRequest::new(endpoint.clone()).expect("resolved request");
 
         let prepared = proxy.prepare_resolved(request).expect("typed media ticket");
-        assert!(matches!(&prepared, PreparedGstreamerMedia::Protected(_)));
+        assert!(prepared.is_protected());
         assert!(prepared.ticket().is_some());
         assert_ne!(prepared.uri(), endpoint.as_str());
         assert!(!prepared.uri().contains("music.test"));
@@ -920,8 +964,8 @@ mod tests {
         let inflight = prepared.ticket().expect("local media ticket");
 
         let cancel = OpenCancel::new();
-        proxy.begin_open(7);
-        let registration = proxy.register_in_flight_cancel(7, &cancel);
+        let generation = Arc::clone(prepared.generation());
+        let registration = proxy.register_in_flight_cancel(7, &generation, &cancel);
         assert!(!registration.is_superseded());
 
         // Replacement preparation lands while the open is registered: the
@@ -942,50 +986,76 @@ mod tests {
         drop(replacement);
     }
 
+    /// U4: registration is bound to the prepared generation, so a load whose
+    /// preparation was superseded before it registered installs nothing and
+    /// cannot negotiate on a revoked prepared route.
     #[test]
     fn a_superseded_registration_installs_nothing() {
         let runtime = runtime();
         let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let (_root, media) = authorized_local_media();
+        let older = proxy
+            .prepare_local_with_server_start(media, |handle| {
+                Ok(CastHttpServer::detached_for_test(
+                    handle,
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 46_150)),
+                ))
+            })
+            .expect("prepare older local media");
+        let generation = Arc::clone(older.generation());
         let cancel = OpenCancel::new();
-        proxy.begin_open(11);
-        // A replacement preparation supersedes load 11 before it registers.
-        proxy
-            .prepare(media_uri_for_supersession())
-            .expect("prepare");
-        let registration = proxy.register_in_flight_cancel(11, &cancel);
+        // A replacement preparation supersedes the older load before it
+        // registers.
+        let request = ResolvedHttpRequest::new(
+            Url::parse("https://music.test/clean/track.flac").expect("endpoint"),
+        )
+        .expect("resolved request");
+        let _replacement = proxy.prepare_resolved(request).expect("replacement ticket");
+        let registration = proxy.register_in_flight_cancel(11, &generation, &cancel);
         assert!(registration.is_superseded());
         assert!(!cancel.is_cancelled());
     }
 
-    /// T4: authorization is scheduling-ordered. A stale worker whose
-    /// authorization lost the prepare-to-open race must not overwrite the newer
-    /// load's `current_open`, which would let it register and negotiate.
+    /// U4: registration is identity-bound to the preparation generation, not a
+    /// slot that supersession clears. A delayed worker for a superseded
+    /// preparation cannot install itself over a newer load's authorization.
     #[test]
-    fn a_stale_begin_open_cannot_overwrite_a_newer_authorization() {
-        let proxy = Arc::new(GstreamerMediaProxy::new(None));
-        proxy.begin_open(9);
-        // The stale worker runs begin_open late with a smaller id.
-        proxy.begin_open(4);
+    fn a_stale_registration_cannot_overwrite_a_newer_authorization() {
+        let runtime = runtime();
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let (_root, media) = authorized_local_media();
+        let older = proxy
+            .prepare_local_with_server_start(media, |handle| {
+                Ok(CastHttpServer::detached_for_test(
+                    handle,
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 46_160)),
+                ))
+            })
+            .expect("prepare older local media");
+        let older_generation = Arc::clone(older.generation());
 
-        let newer_cancel = OpenCancel::new();
-        assert!(
-            !proxy
-                .register_in_flight_cancel(9, &newer_cancel)
-                .is_superseded(),
-            "the newer load must keep its authorization"
-        );
+        let request = ResolvedHttpRequest::new(
+            Url::parse("https://music.test/clean/track.flac").expect("endpoint"),
+        )
+        .expect("resolved request");
+        let newer = proxy.prepare_resolved(request).expect("newer ticket");
+        let newer_generation = Arc::clone(newer.generation());
+
         let stale_cancel = OpenCancel::new();
         assert!(
             proxy
-                .register_in_flight_cancel(4, &stale_cancel)
+                .register_in_flight_cancel(4, &older_generation, &stale_cancel)
                 .is_superseded(),
             "the stale load must not be authorized"
         );
+        let newer_cancel = OpenCancel::new();
+        assert!(
+            !proxy
+                .register_in_flight_cancel(9, &newer_generation, &newer_cancel)
+                .is_superseded(),
+            "the newer load must keep its authorization"
+        );
         assert!(!stale_cancel.is_cancelled());
-    }
-
-    fn media_uri_for_supersession() -> &'static str {
-        "https://music.test/clean/track.flac"
     }
 
     #[test]
@@ -1017,7 +1087,7 @@ mod tests {
         let newer = proxy
             .prepare("https://radio.test/live.mp3")
             .expect("newer direct load");
-        assert!(matches!(newer, PreparedGstreamerMedia::Direct(_)));
+        assert!(newer.is_direct());
         release_startup_tx.send(()).expect("finish startup");
         assert_eq!(
             older.join().expect("typed preparation thread").err(),

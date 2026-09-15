@@ -219,6 +219,62 @@ impl OpenCancel {
     }
 }
 
+/// A shared Stop/start boundary for one live session (review U3).
+///
+/// The load path (which owns the controller) and the session both hold the
+/// same gate. A start effect is authorized and transmitted under the gate's
+/// mutex, and a Stop takes that same mutex, so a start can never be authorized
+/// *after* a Stop: the two form one serialized decision instead of a
+/// check-to-effect race. A start that already transmitted before the Stop is
+/// recorded as playing and is torn down (and, for a daemon adapter, restored)
+/// by the session's own teardown.
+pub(super) struct SessionGate {
+    state: Mutex<SessionGateState>,
+}
+
+#[derive(Default)]
+struct SessionGateState {
+    stopped: bool,
+    playing: bool,
+}
+
+impl SessionGate {
+    pub(super) fn new() -> Self {
+        Self {
+            state: Mutex::new(SessionGateState::default()),
+        }
+    }
+
+    /// Authorize and perform one start effect under the boundary. `effect`
+    /// returns whether the effect actually started. Returns `false` — and does
+    /// not run the effect — once a Stop has won the boundary.
+    pub(super) fn start<F>(&self, effect: F) -> bool
+    where
+        F: FnOnce() -> bool,
+    {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.stopped {
+            return false;
+        }
+        state.playing = effect();
+        state.playing
+    }
+
+    /// Stop: after this returns, no start is authorized and any recorded start
+    /// is marked stopped. The session's teardown settles any transmitted
+    /// effect (a daemon `player/stop` restoration, or a pipeline `Null`).
+    pub(super) fn stop(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.stopped = true;
+        state.playing = false;
+    }
+
+    /// `true` once a Stop has won the boundary.
+    pub(super) fn is_stopped(&self) -> bool {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).stopped
+    }
+}
+
 /// One live AirPlay session, already negotiated with the receiver.
 ///
 /// Implementations own their transport; Tributary only pushes audio and
@@ -323,6 +379,10 @@ pub(super) struct SenderOpenContext {
     pub(super) media_ticket: Option<Arc<super::gstreamer_media::GstreamerMediaTicket>>,
     pub(super) volume: f64,
     pub(super) cancel: OpenCancel,
+    /// The load path's Stop/start boundary for this session (review U3). A
+    /// session authorizes its playback start through this gate so a Stop taken
+    /// by the load path serializes with the start effect instead of racing it.
+    pub(super) session_gate: Arc<SessionGate>,
     /// Stable per-load identity used to key in-flight cancellation
     /// registration in the media proxy.
     pub(super) open_id: u64,

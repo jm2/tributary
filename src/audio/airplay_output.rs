@@ -55,9 +55,11 @@ use std::time::{Duration, Instant};
 
 use super::airplay_sender::{
     AirplaySender, OpenCancel, OpenOutcome, RecoveryOutcome, SenderError, SenderOpenContext,
-    SenderPosition, SenderSession, SenderTarget, SenderWriteOutcome,
+    SenderPosition, SenderSession, SenderTarget, SenderWriteOutcome, SessionGate,
 };
-use super::gstreamer_media::{GstreamerMediaProxy, GstreamerMediaTicket, PreparedGstreamerMedia};
+use super::gstreamer_media::{
+    GstreamerMediaProxy, GstreamerMediaTicket, InFlightCancelRegistration, PreparedGstreamerMedia,
+};
 use super::output::{AudioOutput, OutputType};
 use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
 
@@ -83,6 +85,10 @@ struct GstreamerSenderSession {
     _bus_watch: gst::bus::BusWatchGuard,
     generation: PlayerEventGeneration,
     media_proxy: Arc<GstreamerMediaProxy>,
+    /// Shared Stop/start boundary with the load path (review U3): a Stop taken
+    /// by [`AirPlayOutput::close_session`] serializes with `resume` so a start
+    /// can never be authorized after a Stop.
+    gate: Arc<SessionGate>,
 }
 
 impl SenderSession for GstreamerSenderSession {
@@ -103,7 +109,13 @@ impl SenderSession for GstreamerSenderSession {
     }
 
     fn resume(&mut self) -> bool {
-        self.pipeline.set_state(gst::State::Playing).is_ok()
+        // Authorize and perform the pipeline start under the shared Stop/start
+        // boundary: a Stop taken by the load path either wins first (refusing
+        // the start) or loses and is followed by the session's own `Null`
+        // teardown, which settles the already-started pipeline (review U3).
+        let pipeline = self.pipeline.clone();
+        self.gate
+            .start(move || pipeline.set_state(gst::State::Playing).is_ok())
     }
 
     fn flush(&mut self) {
@@ -137,8 +149,11 @@ impl SenderSession for GstreamerSenderSession {
     fn close(self: Box<Self>) {
         // Stop the pipeline before invalidating its loopback route. Doing this
         // in the opposite order can turn an intentional close into a transient
-        // fetch error while GStreamer is still winding down.
+        // fetch error while GStreamer is still winding down. The shared
+        // boundary is stopped first so no concurrent `resume` can restart the
+        // pipeline after this teardown (review U3).
         let this = *self;
+        this.gate.stop();
         let _ = this.pipeline.set_state(gst::State::Null);
         if let Some(ticket) = this.media_ticket.as_ref() {
             // Identity-bound terminal release: a superseded session's ticket may
@@ -279,6 +294,7 @@ impl AirplaySender for GstreamerRaopSender {
             _bus_watch: bus_watch,
             generation: ctx.generation,
             media_proxy: Arc::clone(&ctx.media_proxy),
+            gate: Arc::clone(&ctx.session_gate),
         }))
     }
 }
@@ -453,6 +469,9 @@ enum SessionCommand {
 struct LoadController {
     /// Cancellation currency for this load's open and its worker loop.
     cancel: OpenCancel,
+    /// The load's shared Stop/start boundary. `close_session` stops it so no
+    /// concurrent start effect can be authorized after teardown (review U3).
+    gate: Arc<SessionGate>,
     /// Command channel into the worker. `None` once the controller is closed.
     commands: Option<std::sync::mpsc::Sender<SessionCommand>>,
     /// Detached on close so the UI thread never joins a blocking teardown.
@@ -610,8 +629,27 @@ impl AirPlayOutput {
 
         let open_id = self.load_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let cancel = OpenCancel::new();
+        // The shared Stop/start boundary for this load (review U3).
+        let gate = Arc::new(SessionGate::new());
         // Retain a handle for the failure path; the context owns its own clone.
         let failure_ticket = prepared.ticket();
+        // Register the in-flight cancellation — bound to this preparation's
+        // generation — **before scheduling the worker** (review U4). A
+        // replacement preparation that runs after this sees the load counted
+        // in-flight and preserves its route in custody instead of revoking it,
+        // and a load whose preparation was already superseded registers nothing.
+        let registration =
+            self.media_proxy
+                .register_in_flight_cancel(open_id, prepared.generation(), &cancel);
+        if registration.is_superseded() {
+            // Lost the prepare-to-open race before scheduling: no negotiation
+            // and no events. Release the route on the caller.
+            if let Some(ticket) = failure_ticket.as_ref() {
+                self.media_proxy.take_and_release(ticket);
+            }
+            debug!("AirPlay: load superseded before its worker was scheduled");
+            return;
+        }
         let state_cache = Arc::new(AtomicU8::new(PlayerState::Buffering as u8));
         let position_cache = Arc::new(Mutex::new(SenderPosition::unknown(generation)));
         let (commands, command_rx) = mpsc::channel();
@@ -625,6 +663,7 @@ impl AirPlayOutput {
             media_ticket: prepared.ticket(),
             volume: self.volume,
             cancel: cancel.clone(),
+            session_gate: Arc::clone(&gate),
             open_id,
         };
         let sender = Arc::clone(&self.sender);
@@ -637,6 +676,7 @@ impl AirPlayOutput {
                 run_session_worker(
                     sender,
                     ctx,
+                    registration,
                     command_rx,
                     worker_state,
                     worker_position,
@@ -654,6 +694,7 @@ impl AirPlayOutput {
 
         *self.controller_guard() = Some(LoadController {
             cancel,
+            gate,
             commands: Some(commands),
             handle: Some(handle),
             state: state_cache,
@@ -699,6 +740,10 @@ impl AirPlayOutput {
     fn close_session(&self) {
         let controller = self.controller_guard().take();
         if let Some(mut controller) = controller {
+            // Stop the shared boundary before cancelling: a start effect that
+            // races this teardown is either refused before it runs or already
+            // transmitted, and the session's own close settles it (review U3).
+            controller.gate.stop();
             controller.cancel.cancel();
             if let Some(commands) = controller.commands.take() {
                 let _ = commands.send(SessionCommand::Stop);
@@ -752,35 +797,31 @@ impl AirPlayOutput {
     }
 }
 
-/// Worker for one load: registers its cancellation under the load key, runs
-/// the blocking `open_session` off the UI thread, then owns the live session
-/// and services control commands. Publishes coarse state/position into caches
-/// the UI reads without touching the session (review F2).
+/// Worker for one load: its in-flight cancellation registration was taken by
+/// the load path **before** this worker was scheduled (review U4), so the
+/// worker only runs the blocking `open_session` off the UI thread, then owns
+/// the live session and services control commands. Publishes coarse
+/// state/position into caches the UI reads without touching the session
+/// (review F2).
 fn run_session_worker(
     sender: Arc<dyn AirplaySender>,
     ctx: SenderOpenContext,
+    registration: InFlightCancelRegistration,
     commands: std::sync::mpsc::Receiver<SessionCommand>,
     state_cache: Arc<AtomicU8>,
     position_cache: Arc<Mutex<SenderPosition>>,
     event_generation: Arc<AtomicU64>,
 ) {
     let proxy = Arc::clone(&ctx.media_proxy);
-    proxy.begin_open(ctx.open_id);
-    let registration = proxy.register_in_flight_cancel(ctx.open_id, &ctx.cancel);
-    if registration.is_superseded() {
-        // Lost the prepare-to-open race: no negotiation and no events. The
-        // load path releases the ticket.
-        release_ticket(&proxy, &ctx);
-        return;
-    }
-
-    let generation = ctx.generation;
-    let outcome = sender.open_session(&ctx);
     // The registration intentionally outlives the open: while the session is
     // live it keeps the load counted as in-flight in the proxy, so a replacement
     // preparation preserves the live route in recovery custody instead of
     // revoking it before the session's own close can release it (review T4). It
     // drops when this worker returns, after the session's terminal release.
+    let _registration = registration;
+
+    let generation = ctx.generation;
+    let outcome = sender.open_session(&ctx);
     match outcome {
         OpenOutcome::Opened(mut session) => {
             let still_current = event_generation.load(Ordering::SeqCst) == generation.as_raw()
