@@ -2378,10 +2378,10 @@ impl RecoveryJob for RetainedRecovery {
     }
 }
 
-/// Jobs the supervisor may attempt at the same moment, and the backoff between
-/// spawn attempts while a live owner is being proven (review U2).
-const SUPERVISOR_SPAWN_ATTEMPTS: usize = 3;
+/// Backoff between supervisor-worker spawn attempts while a live owner is
+/// being proven, and its cap (review U2, review V2).
 const SUPERVISOR_SPAWN_BACKOFF: Duration = Duration::from_millis(10);
+const SUPERVISOR_SPAWN_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 struct SupervisorQueue {
     jobs: Vec<Box<dyn RecoveryJob>>,
@@ -2452,13 +2452,25 @@ impl RecoverySupervisor {
         }
         self.signal.notify_all();
         // Prove a live owner before completing the handoff. A spawn that keeps
-        // failing leaves the job queued with its lock held rather than
-        // pretending it is serviced (review U2).
-        for _ in 0..SUPERVISOR_SPAWN_ATTEMPTS {
-            if self.ensure_worker() {
-                return;
-            }
-            std::thread::sleep(SUPERVISOR_SPAWN_BACKOFF);
+        // failing is retried **on this recovery thread** until a worker exists,
+        // so a temporary spawn failure can never strand the retained lock and
+        // route with no owner — the retry path does not depend on a future,
+        // unrelated registration (review V2). The job stays queued (with its
+        // lock held) for the whole retry, so no false clean handoff is
+        // reported. This runs on a dedicated recovery/load worker, never on the
+        // UI Stop path.
+        self.ensure_worker_until_live();
+    }
+
+    /// Retry worker creation with bounded backoff until a worker is live. This
+    /// is the autonomous retry owner that review V2 requires: it keeps going
+    /// after the inline attempt budget is exhausted, so a recovered spawn
+    /// facility picks up the queued job without another registration.
+    fn ensure_worker_until_live(self: &Arc<Self>) {
+        let mut backoff = SUPERVISOR_SPAWN_BACKOFF;
+        while !self.ensure_worker() {
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(SUPERVISOR_SPAWN_BACKOFF_MAX);
         }
     }
 
@@ -3590,6 +3602,97 @@ mod tests {
         assert!(!inner.restored.load(Ordering::SeqCst));
     }
 
+    /// A `SessionInner` pointed at an arbitrary API base, for fixtures that
+    /// need a live (or stalling) endpoint rather than the unreachable default.
+    fn test_session_inner_at_base(
+        api_base: &str,
+        state_dir: &Path,
+        event_tx: async_channel::Sender<PlayerEvent>,
+    ) -> SessionInner {
+        SessionInner {
+            client: Arc::new(OwnToneClient::new(api_base).expect("client")),
+            config: owned_config(state_dir),
+            generation: PlayerEventGeneration::from_raw(1),
+            event_tx,
+            recorded: TakeoverRecord {
+                enabled_outputs: vec![1],
+                selected_output: 2,
+            },
+            media_proxy: Arc::new(GstreamerMediaProxy::new(None)),
+            media_ticket: None,
+            running: AtomicBool::new(true),
+            activation: Mutex::new(ActivationState::default()),
+            gate: Arc::new(SessionGate::new()),
+            cancel: OpenCancel::new(),
+            restored: AtomicBool::new(false),
+            mutation_lock: Mutex::new(()),
+            unsettled: AtomicUsize::new(0),
+            position: Mutex::new(SenderPosition::unknown(PlayerEventGeneration::from_raw(1))),
+            state: Mutex::new(PlayerState::Buffering),
+            pipeline: Mutex::new(None),
+        }
+    }
+
+    /// V1: a Stop must return promptly even while a `player/play` RPC is
+    /// genuinely stalled at the server. This is a production-path barrier: the
+    /// stalling loopback endpoint signals the test when the play request has
+    /// reached it, so the Stop is measured against a real in-flight effect
+    /// (not a cancelled-before-transmit shortcut).
+    #[test]
+    fn a_stop_returns_promptly_while_the_own_tone_play_is_stalled() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalling endpoint");
+        let api_base = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("addr").port()
+        );
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(stream) = incoming else { continue };
+                let _ = accepted_tx.send(());
+                std::thread::spawn(move || {
+                    // Hold the connection without responding: the play RPC
+                    // blocks until its own client timeout.
+                    let _held = stream;
+                    std::thread::sleep(Duration::from_secs(30));
+                });
+            }
+        });
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let inner = Arc::new(test_session_inner_at_base(
+            &api_base,
+            directory.path(),
+            async_channel::unbounded().0,
+        ));
+
+        let play_inner = Arc::clone(&inner);
+        let play = std::thread::spawn(move || play_inner.activate_and_play());
+
+        // Barrier: the play request has reached the stalling server.
+        accepted_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the play request must reach the server");
+
+        let stopped = Instant::now();
+        inner.gate.stop();
+        assert!(
+            stopped.elapsed() < Duration::from_millis(500),
+            "Stop blocked behind a stalled player/play RPC: {:?}",
+            stopped.elapsed()
+        );
+
+        // The transmitted play is suppressed once the request times out; the
+        // session's own teardown settles the receiver state.
+        assert!(
+            !play.join().expect("play thread"),
+            "a Stop that wins during the play must suppress the accepted start"
+        );
+        assert!(!inner.activation_live());
+    }
+
     /// U3: a Stop that wins the shared boundary refuses the start effect before
     /// it is transmitted — the session publishes at most a truthful `Stopped`
     /// (never `Playing`) and no error event, because no play RPC ever ran.
@@ -3700,34 +3803,40 @@ mod tests {
         }
     }
 
-    /// U2: a supervisor whose worker cannot be started proves no live owner,
-    /// keeps the job (and its resources) queued, and services it once worker
-    /// creation succeeds — never reporting a false clean handoff.
+    /// V2: after the spawn budget is exhausted the production path keeps an
+    /// executable retry owner on its own. Once the spawn facility recovers, the
+    /// queued job is serviced and its resources are released — with no manual
+    /// retry-helper call and no second job registration.
     #[test]
-    fn supervisor_preserves_a_job_when_its_worker_cannot_start() {
+    fn supervisor_retains_a_retry_owner_until_the_spawn_facility_recovers() {
         let supervisor = Arc::new(RecoverySupervisor::new());
-        // Every spawn attempt inside `enqueue` fails, so no owner is proven.
-        supervisor.fail_next_spawns(SUPERVISOR_SPAWN_ATTEMPTS);
+        // Far more failures than any fixed inline budget: enough to prove the
+        // production path retries past them rather than only trying a few times.
+        supervisor.fail_next_spawns(usize::MAX / 2);
         let released = Arc::new(AtomicBool::new(false));
-        supervisor.enqueue(Box::new(TestRecoveryJob {
-            attempts: AtomicUsize::new(0),
-            succeed_on: 1,
-            released: Arc::clone(&released),
-            retry_at: Instant::now(),
-        }));
+        let enqueue_supervisor = Arc::clone(&supervisor);
+        let enqueue_released = Arc::clone(&released);
+        let handle = std::thread::spawn(move || {
+            enqueue_supervisor.enqueue(Box::new(TestRecoveryJob {
+                attempts: AtomicUsize::new(0),
+                succeed_on: 1,
+                released: enqueue_released,
+                retry_at: Instant::now(),
+            }));
+        });
 
-        assert!(
-            !supervisor.worker_is_live(),
-            "no owner may be reported live"
-        );
-        assert_eq!(supervisor.pending_jobs(), 1, "the job must be preserved");
-        assert!(!released.load(Ordering::SeqCst));
-
-        // Retrying creation picks up the queued job and settles it.
+        // The owner is retrying spawns and the job stays queued (with its lock
+        // held); recover the spawn facility and let the same production retry
+        // path start a worker.
+        std::thread::sleep(Duration::from_millis(50));
         supervisor.fail_next_spawns(0);
-        supervisor.ensure_worker_if_pending();
         wait_until(|| released.load(Ordering::SeqCst));
         wait_until(|| supervisor.pending_jobs() == 0);
+        assert!(
+            supervisor.worker_is_live(),
+            "the recovered spawn must leave a live owner, not a static queue"
+        );
+        handle.join().expect("enqueue owner");
     }
 
     /// U2: two independent retained recoveries are both serviced. A job that is

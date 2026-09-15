@@ -38,6 +38,8 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+#[cfg(test)]
+use std::time::{Duration, Instant};
 
 use super::{PlayerEventGeneration, PlayerState};
 
@@ -219,22 +221,41 @@ impl OpenCancel {
     }
 }
 
-/// A shared Stop/start boundary for one live session (review U3).
+/// A shared Stop/start boundary for one live session (review U3, review V1).
 ///
 /// The load path (which owns the controller) and the session both hold the
-/// same gate. A start effect is authorized and transmitted under the gate's
-/// mutex, and a Stop takes that same mutex, so a start can never be authorized
-/// *after* a Stop: the two form one serialized decision instead of a
-/// check-to-effect race. A start that already transmitted before the Stop is
-/// recorded as playing and is torn down (and, for a daemon adapter, restored)
-/// by the session's own teardown.
+/// same gate, but the gate separates two concerns that review U3 had coupled:
+///
+/// 1. **Authorization** — "may a start effect run, and is it the one a Stop
+///    must settle?" This is a single serialized decision under the gate's
+///    mutex. A Stop and an authorization cannot interleave, so a start is
+///    either authorized *before* a Stop (and then settled by the session's own
+///    worker teardown) or refused *after* it. There is no check-to-effect
+///    window.
+/// 2. **Execution** — the effect itself (a blocking daemon RPC, or a pipeline
+///    state change). This runs **outside** the mutex, on the worker that owns
+///    it, so a concurrent Stop never blocks behind network work (review V1).
+///
+/// A Stop only records cancellation and returns; it never waits for an
+/// in-flight effect. Settlement of an effect that transmitted before the Stop
+/// is owned by the worker that ran it (its session teardown), not by the UI
+/// Stop path.
 pub(super) struct SessionGate {
     state: Mutex<SessionGateState>,
+    /// Woken when an authorized start effect drains, so a worker (or a test)
+    /// can observe settlement without polling. The UI Stop path never waits
+    /// on this.
+    drained: Condvar,
 }
 
 #[derive(Default)]
 struct SessionGateState {
     stopped: bool,
+    /// Authorized start effects that are currently running their effect. A
+    /// Stop does not wait for these; the worker that owns them settles them.
+    in_flight: usize,
+    /// A start effect ran and obtained a playing result. Retained so a
+    /// transmitted-but-cancelled start is still knowable.
     playing: bool,
 }
 
@@ -242,36 +263,81 @@ impl SessionGate {
     pub(super) fn new() -> Self {
         Self {
             state: Mutex::new(SessionGateState::default()),
+            drained: Condvar::new(),
         }
     }
 
-    /// Authorize and perform one start effect under the boundary. `effect`
-    /// returns whether the effect actually started. Returns `false` — and does
-    /// not run the effect — once a Stop has won the boundary.
+    /// Authorize and perform one start effect. The decision (check that no
+    /// Stop has won, and reserve an in-flight slot) is one serialized step
+    /// under the mutex; the effect then runs **outside** the mutex so a
+    /// concurrent [`Self::stop`] returns promptly. Returns `false` — and does
+    /// not run the effect — once a Stop has won the boundary, and also returns
+    /// `false` when a Stop wins *after* authorization (the effect may have
+    /// transmitted, but it is not reported as a live start; the worker's
+    /// teardown settles it).
     pub(super) fn start<F>(&self, effect: F) -> bool
     where
         F: FnOnce() -> bool,
     {
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if state.stopped {
-            return false;
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.stopped {
+                return false;
+            }
+            state.in_flight += 1;
         }
-        state.playing = effect();
-        state.playing
+        // The effect runs without the state lock: Stop must never block behind
+        // it (review V1).
+        let started = effect();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.in_flight -= 1;
+        if started {
+            state.playing = true;
+        }
+        let stopped = state.stopped;
+        self.drained.notify_all();
+        // A Stop that landed while the effect was in flight suppresses the
+        // accepted result; the effect has already been (or is being)
+        // transmitted, and the session's worker teardown compensates it
+        // (review V1). Authorization-before-Stop still settles.
+        started && !stopped
     }
 
-    /// Stop: after this returns, no start is authorized and any recorded start
-    /// is marked stopped. The session's teardown settles any transmitted
-    /// effect (a daemon `player/stop` restoration, or a pipeline `Null`).
+    /// Record cancellation and return promptly. Any start effect already
+    /// authorized may still be transmitting; the worker that owns it settles
+    /// it, so this never waits on network work (review V1).
     pub(super) fn stop(&self) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.stopped = true;
-        state.playing = false;
+        // Wake any test/worker bounded wait promptly.
+        self.drained.notify_all();
     }
 
     /// `true` once a Stop has won the boundary.
     pub(super) fn is_stopped(&self) -> bool {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).stopped
+    }
+
+    /// Bounded wait until every authorized start effect has drained. A test
+    /// aid: the UI Stop path must never wait on this, and the worker that owns
+    /// an effect settles it on its own thread before its teardown completes
+    /// (review V1).
+    #[cfg(test)]
+    pub(super) fn wait_effects_drained(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        while state.in_flight != 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, _) = self
+                .drained
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(|p| p.into_inner());
+            state = next;
+        }
+        true
     }
 }
 
@@ -521,5 +587,62 @@ mod tests {
             !ran_after_stop.load(Ordering::SeqCst),
             "the start effect must not run after a Stop"
         );
+    }
+
+    /// V1: a Stop must not block behind an in-flight start effect. The effect
+    /// is parked while a Stop is taken on another thread; the Stop returns
+    /// promptly and the effect's result is suppressed (the worker settles it).
+    #[test]
+    fn session_gate_stop_does_not_block_behind_an_in_flight_start() {
+        let gate = Arc::new(SessionGate::new());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let start_gate = Arc::clone(&gate);
+        let handle = std::thread::spawn(move || {
+            start_gate.start(move || {
+                let _ = entered_tx.send(());
+                // Block "in the effect" until the test releases it.
+                let _ = release_rx.recv();
+                true
+            })
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the start effect must begin");
+
+        // The Stop must return promptly even though the effect is still parked.
+        let stop_gate = Arc::clone(&gate);
+        let (stop_done_tx, stop_done_rx) = std::sync::mpsc::channel::<()>();
+        let stop_thread = std::thread::spawn(move || {
+            stop_gate.stop();
+            let _ = stop_done_tx.send(());
+        });
+        stop_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Stop must not block behind an in-flight start effect");
+        stop_thread.join().expect("stop thread");
+
+        // Release the effect; the start is suppressed because a Stop won while
+        // it was in flight, and the effect is now drained.
+        release_tx.send(()).expect("release the effect");
+        assert!(
+            !handle.join().expect("start thread"),
+            "a Stop that lands during the effect suppresses the accepted start"
+        );
+        assert!(gate.wait_effects_drained(Duration::from_secs(5)));
+    }
+
+    /// V1: after a Stop, no new start is authorized, and a start authorized
+    /// before the Stop still reports a drained (settled) effect boundary.
+    #[test]
+    fn session_gate_records_an_authorized_effect_until_settled() {
+        let gate = SessionGate::new();
+        assert!(gate.start(|| true));
+        assert!(gate.wait_effects_drained(Duration::from_secs(1)));
+        gate.stop();
+        assert!(!gate.start(|| true));
+        assert!(gate.is_stopped());
     }
 }
