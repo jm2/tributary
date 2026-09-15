@@ -493,4 +493,33 @@ mod tests {
         assert_eq!(target.host, "192.168.1.2");
         assert_eq!(target.port, 7000);
     }
+
+    /// U3: the shared Stop/start boundary is one serialized decision. A start
+    /// runs its effect only while no Stop has won; a Stop that wins first
+    /// refuses the effect outright.
+    #[test]
+    fn session_gate_serializes_stop_and_start() {
+        let gate = SessionGate::new();
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_clone = Arc::clone(&ran);
+        assert!(gate.start(move || {
+            ran_clone.store(true, Ordering::SeqCst);
+            true
+        }));
+        assert!(ran.load(Ordering::SeqCst));
+
+        gate.stop();
+        assert!(gate.is_stopped());
+        let ran_after_stop = Arc::new(AtomicBool::new(false));
+        let ran_after_stop_clone = Arc::clone(&ran_after_stop);
+        assert!(!gate.start(move || {
+            ran_after_stop_clone.store(true, Ordering::SeqCst);
+            true
+        }));
+        assert!(
+            !ran_after_stop.load(Ordering::SeqCst),
+            "the start effect must not run after a Stop"
+        );
+    }
 }
