@@ -35,7 +35,21 @@ mod airplay_sender;
 // The OwnTone process adapter (design §4.3, §5.4, §6, §10 step 2): the
 // selected maintained AirPlay sender path. Selected only by explicit
 // configuration and fail-closed everywhere else.
+//
+// The adapter's real implementation is Unix-only: it owns a FIFO, an `flock`
+// and a blocking JSON-API client built on `rustix`/`std::os::unix`, and
+// `rustix` is declared only under `cfg(unix)` in Cargo.toml. Declaring the
+// module unconditionally made every non-Unix target fail to compile (review
+// F1). On `not(unix)` a fail-closed shim of the same shape is compiled
+// instead, so an explicit `TRIBUTARY_AIRPLAY_SENDER=owntone` still refuses
+// with localized guidance and never silently falls back to another sender
+// (design §4.4, §9 platform scope).
 #[allow(dead_code)]
+#[cfg(unix)]
+mod airplay_owntone;
+#[allow(dead_code)]
+#[cfg(not(unix))]
+#[path = "airplay_owntone_unsupported.rs"]
 mod airplay_owntone;
 pub mod cast_http_server;
 pub mod chromecast_output;

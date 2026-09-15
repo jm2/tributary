@@ -32,8 +32,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use super::airplay_sender::{
-    AirplaySender, OpenOutcome, SenderError, SenderOpenContext, SenderPosition, SenderSession,
-    SenderWriteOutcome,
+    AirplaySender, OpenCancel, OpenOutcome, RecoveryCompletion, RecoveryOutcome, SenderError,
+    SenderOpenContext, SenderPosition, SenderSession, SenderWriteOutcome,
 };
 use super::gstreamer_media::{GstreamerMediaProxy, GstreamerMediaTicket};
 use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
@@ -57,8 +57,21 @@ const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 const FIFO_OPEN_POLL: Duration = Duration::from_millis(50);
 const POSITION_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Marker content proving the state directory belongs to a Tributary-owned
-/// dedicated instance. Written by the installation/service record.
+/// Bound on the synchronous cleanup that runs when an open fails or is
+/// cancelled: restoration must complete inside it, or the failure becomes the
+/// non-clean `RecoveryPending` state (review F3).
+const CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
+/// Bound on the serialized recovery behind a `RecoveryPending` open. It caps
+/// the whole recovery — settle-or-restart quiescence plus any restoration
+/// attempt — so the `RecoveryCompletion` handle is always terminal.
+const RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
+/// Poll interval between serialized-recovery restoration attempts.
+const RECOVERY_POLL: Duration = Duration::from_millis(200);
+
+/// Token value inside the dedicated instance's ownership record. The record
+/// (see [`OwnershipRecord`]) is written by the installation/service record and
+/// binds this token to the configured endpoint, pipe, state directory and
+/// binary.
 const OWNER_TOKEN: &str = "tributary-airplay-owntone-v1";
 
 /// The localized, actionable message every refusal is built from.
@@ -151,19 +164,48 @@ impl OwnToneConfig {
 
     /// Confirm out of band that the answering daemon is the dedicated
     /// Tributary-owned instance, before any state is read (§4.3, §8). The JSON
-    /// API exposes no instance identity, so the ownership marker in the
-    /// instance's own state directory is what distinguishes it from a shared
-    /// instance that merely looks healthy.
+    /// API exposes no instance identity, so the ownership record in the
+    /// instance's own state directory — the same trust domain as the lock file
+    /// — is what distinguishes it from a shared instance that merely looks
+    /// healthy. The record must bind the *configured* endpoint, pipe, state
+    /// directory and binary: a valid token paired with a foreign API endpoint
+    /// is refused here, before any receiver state is read or mutated (review
+    /// F5). A constant marker string cannot make that distinction, because it
+    /// never ties the answering endpoint to the owned instance.
     fn verify_owned(&self) -> Result<(), SenderError> {
-        let marker = std::fs::read_to_string(self.owner_marker())
-            .map_err(|_| unavailable("the dedicated-instance ownership marker is missing"))?;
-        if marker.trim() != OWNER_TOKEN {
+        let body = std::fs::read_to_string(self.owner_marker())
+            .map_err(|_| unavailable("the dedicated-instance ownership record is missing"))?;
+        let record: OwnershipRecord = serde_json::from_str(&body)
+            .map_err(|_| unavailable("the dedicated-instance ownership record is malformed"))?;
+        if record.token != OWNER_TOKEN {
             return Err(unavailable(
                 "the configured state directory is not a Tributary-owned instance",
             ));
         }
+        let matches = record.api_base == self.api_base
+            && record.pipe_path == self.pipe_path.to_string_lossy()
+            && record.state_dir == self.state_dir.to_string_lossy()
+            && record.binary == self.binary.to_string_lossy();
+        if !matches {
+            return Err(unavailable(
+                "the configured endpoint, pipe, state directory or binary does not match the dedicated Tributary-owned instance",
+            ));
+        }
         Ok(())
     }
+}
+
+/// The out-of-band ownership record an installation writes into the dedicated
+/// instance's state directory. It binds the token to the exact endpoint, pipe,
+/// state directory and binary the adapter is configured with, so a valid token
+/// cannot authorize a foreign API endpoint (review F5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct OwnershipRecord {
+    token: String,
+    api_base: String,
+    pipe_path: String,
+    state_dir: String,
+    binary: String,
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -441,33 +483,58 @@ fn ensure_pipe(path: &Path) -> Result<(), SenderError> {
     }
 }
 
+/// Distinguishes a cancellation observed while waiting from a real failure, so
+/// the FIFO wait can be aborted ("cancellation must be silent").
+enum CancelOrError {
+    Cancelled,
+    Failed(SenderError),
+}
+
 /// Open the pipe write end, waiting (bounded) for the daemon's reader.
 ///
 /// The write end is opened non-blocking first — `ENXIO` means the daemon has
 /// not opened the read end yet — then switched to blocking mode so a full pipe
 /// produces natural backpressure in the streaming thread instead of an error.
-fn open_pipe_write(path: &Path, deadline: Instant) -> Result<OwnedFd, SenderError> {
+/// The wait is raced against `cancel`, so a Stop or replacement aborts it
+/// rather than leaving the open blocked on a daemon that never opens the pipe
+/// (review F2).
+fn open_pipe_write(
+    path: &Path,
+    deadline: Instant,
+    cancel: &OpenCancel,
+) -> Result<OwnedFd, CancelOrError> {
     loop {
+        if cancel.is_cancelled() {
+            return Err(CancelOrError::Cancelled);
+        }
         match rustix::fs::open(
             path,
             OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
         ) {
             Ok(fd) => {
-                let mut flags = rustix::fs::fcntl_getfl(&fd)
-                    .map_err(|_| unavailable("the pipe write end could not be configured"))?;
+                let mut flags = rustix::fs::fcntl_getfl(&fd).map_err(|_| {
+                    CancelOrError::Failed(unavailable("the pipe write end could not be configured"))
+                })?;
                 flags.remove(OFlags::NONBLOCK);
-                rustix::fs::fcntl_setfl(&fd, flags)
-                    .map_err(|_| unavailable("the pipe write end could not be configured"))?;
+                rustix::fs::fcntl_setfl(&fd, flags).map_err(|_| {
+                    CancelOrError::Failed(unavailable("the pipe write end could not be configured"))
+                })?;
                 return Ok(fd);
             }
             Err(rustix::io::Errno::NXIO) => {
                 if Instant::now() >= deadline {
-                    return Err(unavailable("the dedicated daemon is not reading the pipe"));
+                    return Err(CancelOrError::Failed(unavailable(
+                        "the dedicated daemon is not reading the pipe",
+                    )));
                 }
                 std::thread::sleep(FIFO_OPEN_POLL);
             }
-            Err(_) => return Err(unavailable("the pipe write end could not be opened")),
+            Err(_) => {
+                return Err(CancelOrError::Failed(unavailable(
+                    "the pipe write end could not be opened",
+                )))
+            }
         }
     }
 }
@@ -500,21 +567,20 @@ impl SessionInner {
     }
 
     /// Restore the daemon to the state recorded at takeover and remove the
-    /// incomplete-takeover record. Idempotent: the first terminal restore wins.
+    /// incomplete-takeover record. Idempotent on success.
+    ///
+    /// On any failed restoration step the record is **left in place** and the
+    /// loopback route is **not** revoked (review F3): a failed mutation unwind
+    /// must not erase the evidence a later holder or the supervisor needs, and
+    /// it must not release exclusive ownership while the daemon may still be
+    /// half-taken-over. The route is revoked only after restoration has
+    /// actually completed.
     fn restore(&self) {
-        if self.restored.swap(true, Ordering::SeqCst) {
+        if self.restored.load(Ordering::SeqCst) {
             return;
         }
-        if let Err(error) = self.client.player_control("stop") {
-            warn!(reason = %error.message(), "OwnTone restore: player stop failed");
-        }
-        if let Err(error) = self.client.set_outputs(&self.recorded.enabled_outputs) {
-            warn!(reason = %error.message(), "OwnTone restore: enabled-output set failed");
-        }
-        if let Err(error) = std::fs::remove_file(self.config.takeover_record()) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                warn!("OwnTone restore: takeover record removal failed");
-            }
+        if restore_daemon(&self.client, &self.config, &self.recorded).is_err() {
+            return;
         }
         // Revoke this load's loopback route by identity only after the daemon
         // has been restored: the route stays valid for every request the
@@ -522,7 +588,38 @@ impl SessionInner {
         if let Some(ticket) = self.media_ticket.as_ref() {
             self.media_proxy.revoke_if_current(ticket);
         }
+        self.restored.store(true, Ordering::SeqCst);
     }
+}
+
+/// Restore the dedicated daemon to the state recorded before takeover and
+/// remove the incomplete-takeover record. Shared by the live-session restore
+/// path and the serialized recovery that a `RecoveryPending` open leaves
+/// behind. Returns `Err` and leaves the record in place on any failed step.
+fn restore_daemon(
+    client: &OwnToneClient,
+    config: &OwnToneConfig,
+    recorded: &TakeoverRecord,
+) -> Result<(), SenderError> {
+    let mut first_error: Option<SenderError> = None;
+    if let Err(error) = client.player_control("stop") {
+        warn!(reason = %error.message(), "OwnTone restore: player stop failed");
+        first_error.get_or_insert(error);
+    }
+    if let Err(error) = client.set_outputs(&recorded.enabled_outputs) {
+        warn!(reason = %error.message(), "OwnTone restore: enabled-output set failed");
+        first_error.get_or_insert(error);
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    if let Err(error) = std::fs::remove_file(config.takeover_record()) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!("OwnTone restore: takeover record removal failed");
+            return Err(unavailable("the takeover record could not be cleared"));
+        }
+    }
+    Ok(())
 }
 
 /// One live OwnTone session. The decode pump owns the prepared URI; pushed PCM
@@ -547,6 +644,11 @@ impl SessionInner {
 /// natural end-of-stream is the decoder's own EOS — never inferred from a
 /// write result.
 fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd) {
+    // The write end is owned here so the natural-EOS path can close it *before*
+    // waiting for daemon completion (review F4). If it stayed open across the
+    // wait, the daemon's FIFO reader would never observe EOF and a finite track
+    // would fall into the drain-deadline failure path instead of `TrackEnded`.
+    let mut write_fd = Some(write_fd);
     let Some(bus) = pipeline.bus() else {
         inner.publish_state(PlayerState::Stopped);
         let _ = inner.event_tx.try_send(PlayerEvent::error(
@@ -588,6 +690,10 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
         ) {
             match message.view() {
                 gst::MessageView::Eos(..) => {
+                    // Drain and close the actual write end *before* waiting for
+                    // the daemon: the reader must see EOF to finish naturally
+                    // (review F4). `drop` on the owned descriptor is the close.
+                    drop(write_fd.take());
                     natural_completion(&inner, &pipeline);
                     break;
                 }
@@ -618,7 +724,7 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
     // Stop the pipeline before releasing the write end so an intentional close
     // never surfaces as a transient fetch error (§4.4, `close_session`).
     let _ = pipeline.set_state(gst::State::Null);
-    drop(write_fd);
+    drop(write_fd.take());
 }
 
 /// Publish the current daemon position into the observation cache. Position is
@@ -655,16 +761,22 @@ fn sample_position(inner: &SessionInner) {
     *inner.state.lock().unwrap_or_else(|p| p.into_inner()) = state;
 }
 
-/// Natural EOS: drain, close the write end so the daemon sees end-of-input,
-/// wait (bounded) for daemon-confirmed completion, restore, then publish
-/// exactly one generation-scoped `TrackEnded` (§4.3, §9 item 10). A drain
-/// deadline miss or transport loss is terminal failure, never completion.
+/// Natural EOS: close the write end so the daemon sees end-of-input, wait
+/// (bounded) for daemon-confirmed completion, restore, then publish exactly one
+/// generation-scoped `TrackEnded` (§4.3, §9 item 10). A drain deadline miss or
+/// transport loss is terminal failure, never completion.
+///
+/// The caller has already closed the pipe write end via the owned descriptor it
+/// passed in; this function only waits. Completion requires the daemon to
+/// report `stop` — `pause` is a user-visible state, not a finished item, and
+/// treating any state other than `play` as success reported a paused track as
+/// completed (review F4).
 fn natural_completion(inner: &SessionInner, pipeline: &gst::Pipeline) {
     pipeline.set_state(gst::State::Null).ok();
     let deadline = Instant::now() + DRAIN_DEADLINE;
     loop {
         match inner.client.player_state() {
-            Ok(state) if state != "play" => break,
+            Ok(state) if state == "stop" => break,
             Ok(_) => {}
             Err(_) => {
                 let _ = inner.event_tx.try_send(PlayerEvent::error(
@@ -809,51 +921,85 @@ impl AirplaySender for OwnToneSender {
         Ok(())
     }
 
-    fn open_session(&self, ctx: &SenderOpenContext<'_>) -> OpenOutcome {
+    fn open_session(&self, ctx: &SenderOpenContext) -> OpenOutcome {
         if ctx.cancel.is_cancelled() {
             return OpenOutcome::Cancelled;
         }
         let Some(config) = self.config.clone() else {
             return OpenOutcome::Failed(unavailable("not configured"));
         };
-        match open(config, ctx) {
-            Ok(session) => OpenOutcome::Opened(Box::new(session)),
-            Err(error) => OpenOutcome::Failed(error),
-        }
+        open(config, ctx)
     }
 }
 
 /// Acquire exclusivity, map the receiver, record the pre-takeover state, take
 /// the daemon over, and start the decode pump (§4.3).
-fn open(config: OwnToneConfig, ctx: &SenderOpenContext<'_>) -> Result<OwnToneSession, SenderError> {
+///
+/// Every blocking step is bounded and cancellation is observed between steps;
+/// a cancellation or failure after the first mutating RPC unwinds through
+/// [`fail_outcome`]/[`cancel_outcome`], which preserve the incomplete-takeover
+/// record and serialize recovery when restoration cannot be completed (review
+/// F2, review F3).
+fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
     let deadline = Instant::now() + OPEN_DEADLINE;
-    let client = OwnToneClient::new(&config.api_base)?;
-    config.verify_owned()?;
+    let client = match OwnToneClient::new(&config.api_base) {
+        Ok(client) => client,
+        Err(error) => return OpenOutcome::Failed(error),
+    };
+    if let Err(error) = config.verify_owned() {
+        return OpenOutcome::Failed(error);
+    }
+    if ctx.cancel.is_cancelled() {
+        return OpenOutcome::Cancelled;
+    }
 
     // Exclusivity is locked before the first state read.
-    let lock = open_lock(&config.lock_path())?;
-    rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|_| {
-        unavailable("another Tributary session is already using the dedicated daemon")
-    })?;
+    let lock = match open_lock(&config.lock_path()) {
+        Ok(lock) => lock,
+        Err(error) => return OpenOutcome::Failed(error),
+    };
+    if rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).is_err() {
+        return OpenOutcome::Failed(unavailable(
+            "another Tributary session is already using the dedicated daemon",
+        ));
+    }
 
     // A record left by a crashed holder means the daemon may be half-taken
     // over. Refuse and let the supervisor (or the next opener) recover rather
     // than adopting it silently (§4.3).
     if config.takeover_record().exists() {
-        return Err(unavailable(
+        return OpenOutcome::Failed(unavailable(
             "a previous takeover is incomplete and must be recovered first",
         ));
     }
-
-    let outputs = client.outputs()?;
-    let selected = map_receiver_to_output(&outputs, ctx.target.device_id.as_deref())
-        .map_err(|failure| unavailable(&failure.to_string()))?;
-
-    // Never preempt audible playback on the dedicated instance.
-    if client.player_state()? == "play" {
-        return Err(unavailable("the dedicated daemon is already playing"));
+    if ctx.cancel.is_cancelled() {
+        return OpenOutcome::Cancelled;
     }
 
+    // Read phase: nothing has been mutated, so a failure or cancellation here
+    // has no takeover to unwind.
+    let outputs = match client.outputs() {
+        Ok(outputs) => outputs,
+        Err(error) => return OpenOutcome::Failed(error),
+    };
+    let selected = match map_receiver_to_output(&outputs, ctx.target.device_id.as_deref()) {
+        Ok(selected) => selected,
+        Err(failure) => return OpenOutcome::Failed(unavailable(&failure.to_string())),
+    };
+
+    // Never preempt audible playback on the dedicated instance.
+    match client.player_state() {
+        Ok(state) if state == "play" => {
+            return OpenOutcome::Failed(unavailable("the dedicated daemon is already playing"));
+        }
+        Ok(_) => {}
+        Err(error) => return OpenOutcome::Failed(error),
+    }
+    if ctx.cancel.is_cancelled() {
+        return OpenOutcome::Cancelled;
+    }
+
+    // Mutation phase: every failure or cancellation from here unwinds.
     let recorded = TakeoverRecord {
         enabled_outputs: outputs
             .iter()
@@ -862,33 +1008,49 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext<'_>) -> Result<OwnToneSes
             .collect(),
         selected_output: selected,
     };
-    recorded.write(&config.takeover_record())?;
+    if let Err(error) = recorded.write(&config.takeover_record()) {
+        return OpenOutcome::Failed(error);
+    }
 
+    let mut unsettled = false;
+    if ctx.cancel.is_cancelled() {
+        return cancel_outcome(client, config, recorded, lock, unsettled);
+    }
     if let Err(error) = client.set_outputs(&[selected]) {
-        let _ = std::fs::remove_file(config.takeover_record());
-        return Err(error);
+        // A mutating RPC that returned an error may still have been applied
+        // server-side, so this is not a clean unwind (review F3).
+        unsettled = true;
+        return fail_outcome(client, config, recorded, lock, unsettled, error);
+    }
+    if ctx.cancel.is_cancelled() {
+        return cancel_outcome(client, config, recorded, lock, unsettled);
     }
     if let Err(error) = client.clear_queue() {
-        let _ = client.set_outputs(&recorded.enabled_outputs);
-        let _ = std::fs::remove_file(config.takeover_record());
-        return Err(error);
+        unsettled = true;
+        return fail_outcome(client, config, recorded, lock, unsettled, error);
+    }
+    if ctx.cancel.is_cancelled() {
+        return cancel_outcome(client, config, recorded, lock, unsettled);
     }
 
-    let write_fd = match open_pipe_write(&config.pipe_path, deadline) {
+    let write_fd = match open_pipe_write(&config.pipe_path, deadline, &ctx.cancel) {
         Ok(fd) => fd,
-        Err(error) => {
-            let _ = client.set_outputs(&recorded.enabled_outputs);
-            let _ = std::fs::remove_file(config.takeover_record());
-            return Err(error);
+        Err(CancelOrError::Cancelled) => {
+            return cancel_outcome(client, config, recorded, lock, unsettled);
+        }
+        Err(CancelOrError::Failed(error)) => {
+            return fail_outcome(client, config, recorded, lock, unsettled, error);
         }
     };
+    if ctx.cancel.is_cancelled() {
+        drop(write_fd);
+        return cancel_outcome(client, config, recorded, lock, unsettled);
+    }
 
-    let pipeline = match build_pipeline(ctx.prepared_uri, &write_fd) {
+    let pipeline = match build_pipeline(&ctx.prepared_uri, &write_fd) {
         Ok(pipeline) => pipeline,
         Err(error) => {
-            let _ = client.set_outputs(&recorded.enabled_outputs);
-            let _ = std::fs::remove_file(config.takeover_record());
-            return Err(error);
+            return fail_outcome(client, config, recorded, lock, unsettled, error);
         }
     };
 
@@ -898,7 +1060,7 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext<'_>) -> Result<OwnToneSes
         generation: ctx.generation,
         event_tx: ctx.event_tx.clone(),
         recorded,
-        media_proxy: Arc::clone(ctx.media_proxy),
+        media_proxy: Arc::clone(&ctx.media_proxy),
         media_ticket: ctx.media_ticket.clone(),
         running: AtomicBool::new(true),
         restored: AtomicBool::new(false),
@@ -910,14 +1072,146 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext<'_>) -> Result<OwnToneSes
     let pump_inner = Arc::clone(&inner);
     let pump = std::thread::Builder::new()
         .name("airplay-owntone-pump".to_string())
-        .spawn(move || run_pump(pump_inner, pipeline, write_fd))
-        .map_err(|_| unavailable("the decode pump could not be started"))?;
+        .spawn(move || run_pump(pump_inner, pipeline, write_fd));
+    let Ok(pump) = pump else {
+        // Worker-spawn failure *after* takeover: reclaim the session state and
+        // unwind, so a half-taken-over daemon is never leaked (review F3).
+        let error = unavailable("the decode pump could not be started");
+        return match Arc::try_unwrap(inner) {
+            Ok(session) => fail_outcome(
+                session.client,
+                session.config,
+                session.recorded,
+                lock,
+                unsettled,
+                error,
+            ),
+            Err(inner) => {
+                let _ = restore_daemon(&inner.client, &inner.config, &inner.recorded);
+                OpenOutcome::Failed(error)
+            }
+        };
+    };
 
-    Ok(OwnToneSession {
+    OpenOutcome::Opened(Box::new(OwnToneSession {
         inner,
         pump: Some(pump),
         lock: Some(lock),
-    })
+    }))
+}
+
+/// Handle a failure after the first mutating RPC. A clean restoration inside
+/// the cleanup deadline returns the original failure; otherwise the record is
+/// preserved and recovery is serialized behind a `RecoveryPending` failure
+/// (review F3).
+fn fail_outcome(
+    client: OwnToneClient,
+    config: OwnToneConfig,
+    recorded: TakeoverRecord,
+    lock: std::fs::File,
+    unsettled: bool,
+    original: SenderError,
+) -> OpenOutcome {
+    if !unsettled {
+        let deadline = Instant::now() + CLEANUP_DEADLINE;
+        if settle_restore(&client, &config, &recorded, deadline) {
+            drop(lock);
+            return OpenOutcome::Failed(original);
+        }
+    }
+    OpenOutcome::Failed(recovery_pending(client, config, recorded, lock))
+}
+
+/// Handle a cancellation after the first mutating RPC. A clean restoration
+/// returns `Cancelled` silently; an unsettled mutation or failed restoration
+/// returns the non-clean `RecoveryPending` failure (review F2, review F3).
+fn cancel_outcome(
+    client: OwnToneClient,
+    config: OwnToneConfig,
+    recorded: TakeoverRecord,
+    lock: std::fs::File,
+    unsettled: bool,
+) -> OpenOutcome {
+    if !unsettled {
+        let deadline = Instant::now() + CLEANUP_DEADLINE;
+        if settle_restore(&client, &config, &recorded, deadline) {
+            drop(lock);
+            return OpenOutcome::Cancelled;
+        }
+    }
+    OpenOutcome::Failed(recovery_pending(client, config, recorded, lock))
+}
+
+/// Attempt restoration until `deadline`. Used as the "settle" half of
+/// settle-or-restart: a mutating RPC that settled on its own is compensated by
+/// re-running restoration, after which ownership can be released cleanly.
+fn settle_restore(
+    client: &OwnToneClient,
+    config: &OwnToneConfig,
+    recorded: &TakeoverRecord,
+    deadline: Instant,
+) -> bool {
+    loop {
+        if restore_daemon(client, config, recorded).is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(RECOVERY_POLL);
+    }
+}
+
+/// Build the non-clean recovery-pending failure and start the serialized
+/// recovery that keeps retrying restoration — and leaves the incomplete-
+/// takeover record for the supervisor — until the recovery deadline. The
+/// recovery owns the advisory lock until its terminal outcome, so no next
+/// opener can interleave with an unsettled request (review F3).
+fn recovery_pending(
+    client: OwnToneClient,
+    config: OwnToneConfig,
+    recorded: TakeoverRecord,
+    lock: std::fs::File,
+) -> SenderError {
+    let completion = RecoveryCompletion::default();
+    let worker = completion.clone();
+    let message = unavailable("recovery is pending for the dedicated daemon")
+        .message()
+        .to_string();
+    let spawned = std::thread::Builder::new()
+        .name("airplay-owntone-recovery".to_string())
+        .spawn(move || {
+            // Hold the advisory lock until recovery is terminal so ownership is
+            // never released early.
+            let _lock_guard = lock;
+            let deadline = Instant::now() + RECOVERY_DEADLINE;
+            loop {
+                if restore_daemon(&client, &config, &recorded).is_ok() {
+                    worker.resolve(RecoveryOutcome::Restored);
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    worker.resolve(RecoveryOutcome::RestorationFailed {
+                        message: "restoration did not complete before the recovery deadline"
+                            .to_string(),
+                    });
+                    return;
+                }
+                std::thread::sleep(RECOVERY_POLL);
+            }
+        });
+    if spawned.is_err() {
+        // No recovery owner exists; report a terminal failure now rather than
+        // leaving a waiter pending. The record remains in place for the
+        // supervisor.
+        completion.resolve(RecoveryOutcome::RestorationFailed {
+            message: "the serialized recovery could not be started".to_string(),
+        });
+    }
+    SenderError::RecoveryPending {
+        message,
+        completion,
+    }
 }
 
 /// Build the headless decode pipeline that writes s16le 44100 Hz stereo PCM
@@ -1131,5 +1425,92 @@ mod tests {
         let file = directory.path().join("regular");
         std::fs::write(&file, b"not a fifo").expect("write");
         assert!(ensure_pipe(&file).is_err());
+    }
+
+    fn owned_config(dir: &Path) -> OwnToneConfig {
+        OwnToneConfig {
+            api_base: "http://127.0.0.1:3689".to_string(),
+            pipe_path: dir.join("airplay.pcm"),
+            state_dir: dir.to_path_buf(),
+            binary: PathBuf::from("/usr/bin/owntone"),
+        }
+    }
+
+    fn write_owner_record(config: &OwnToneConfig) {
+        let record = OwnershipRecord {
+            token: OWNER_TOKEN.to_string(),
+            api_base: config.api_base.clone(),
+            pipe_path: config.pipe_path.to_string_lossy().into_owned(),
+            state_dir: config.state_dir.to_string_lossy().into_owned(),
+            binary: config.binary.to_string_lossy().into_owned(),
+        };
+        std::fs::write(
+            config.owner_marker(),
+            serde_json::to_vec(&record).expect("serialize record"),
+        )
+        .expect("write record");
+    }
+
+    /// F5: the ownership record binds the token to the configured endpoint,
+    /// pipe, state directory and binary. A valid marker paired with a foreign
+    /// API endpoint is refused before any state read or mutation.
+    #[test]
+    fn ownership_record_binds_endpoint_pipe_state_and_binary() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = owned_config(directory.path());
+        write_owner_record(&config);
+        assert!(config.verify_owned().is_ok());
+
+        let foreign_endpoint = OwnToneConfig {
+            api_base: "http://127.0.0.1:9999".to_string(),
+            ..config.clone()
+        };
+        assert!(foreign_endpoint.verify_owned().is_err());
+
+        let foreign_pipe = OwnToneConfig {
+            pipe_path: directory.path().join("other.pcm"),
+            ..config.clone()
+        };
+        assert!(foreign_pipe.verify_owned().is_err());
+
+        let foreign_binary = OwnToneConfig {
+            binary: PathBuf::from("/usr/bin/not-owntone"),
+            ..config.clone()
+        };
+        assert!(foreign_binary.verify_owned().is_err());
+    }
+
+    #[test]
+    fn ownership_record_rejects_a_foreign_token_and_a_missing_record() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = owned_config(directory.path());
+        assert!(config.verify_owned().is_err());
+
+        std::fs::write(config.owner_marker(), "not a tributary token").expect("write marker");
+        assert!(config.verify_owned().is_err());
+    }
+
+    /// F3: a failed restoration leaves the incomplete-takeover record in place
+    /// so the supervisor can retry; it is never erased by an unwind that did
+    /// not actually complete.
+    #[test]
+    fn failed_restoration_preserves_the_takeover_record() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = owned_config(directory.path());
+        let recorded = TakeoverRecord {
+            enabled_outputs: vec![1],
+            selected_output: 2,
+        };
+        recorded
+            .write(&config.takeover_record())
+            .expect("write takeover record");
+
+        // An unreachable daemon makes every restoration step fail.
+        let client = OwnToneClient::new("http://127.0.0.1:1").expect("client");
+        assert!(restore_daemon(&client, &config, &recorded).is_err());
+        assert!(
+            config.takeover_record().exists(),
+            "a failed restore must not clear the takeover record"
+        );
     }
 }
