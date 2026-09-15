@@ -288,7 +288,11 @@ struct ListenerProcess {
     /// dedicated instance (review S2).
     start_time: u64,
     exe: PathBuf,
-    cmdline: String,
+    /// The process's NUL-separated argument vector. Kept as discrete arguments
+    /// (not a whitespace-joined string) so the effective configuration option
+    /// and its value can be parsed without an argument boundary being forged
+    /// with a space (review U5).
+    argv: Vec<String>,
 }
 
 impl ListenerProcess {
@@ -385,13 +389,13 @@ fn listening_inodes(table: &str, port: u16, addrs: &[String]) -> Vec<u64> {
     inodes
 }
 
-/// `/proc/<pid>/cmdline` is NUL-separated; render it for substring binding.
-fn render_cmdline(raw: &[u8]) -> String {
+/// `/proc/<pid>/cmdline` is NUL-separated; split it into discrete arguments so
+/// binding compares whole arguments, never substrings (review U5).
+fn parse_argv(raw: &[u8]) -> Vec<String> {
     raw.split(|byte| *byte == 0)
         .filter(|part| !part.is_empty())
         .map(|part| String::from_utf8_lossy(part).into_owned())
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect()
 }
 
 /// The fail-closed kernel observation of a process (review T5). A `/proc`
@@ -440,13 +444,13 @@ fn process_start_time(pid: u32) -> Option<u64> {
 /// band.
 fn read_process(pid: u32) -> Option<ListenerProcess> {
     let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    let cmdline = render_cmdline(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?);
+    let argv = parse_argv(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?);
     let start_time = process_start_time(pid)?;
     Some(ListenerProcess {
         pid,
         start_time,
         exe,
-        cmdline,
+        argv,
     })
 }
 
@@ -503,72 +507,121 @@ fn listener_process(api_base: &str) -> Option<ListenerProcess> {
     None
 }
 
-/// `true` when an argument in `cmdline` names the dedicated instance's state
-/// directory — the out-of-band configuration binding that distinguishes the
-/// owned daemon from a foreign listener that merely holds the same port
-/// The configuration file the dedicated instance is launched with inside its
-/// state directory. The ownership record binds `state_dir`, so the launch must
-/// name exactly this file (or the directory itself); any other configuration
-/// file beneath the state directory is a foreign instance (review T5).
+/// The dedicated instance's launch configuration file name inside its state
+/// directory (review T5, review U5).
 const OWNTONE_CONFIG_FILE: &str = "owntone.conf";
 
-/// Lexically normalize `path` — resolving `.` and `..` components — without
-/// touching the filesystem, so a traversal such as `state/../foreign.conf`
-/// cannot masquerade as a descendant of the state directory (review T5).
-fn normalize_path(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
-            Component::RootDir => out.push(Component::RootDir.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                // `pop` on a lone root returns false; keep the root rather
-                // than dropping it, so an absolute path stays absolute.
-                let _ = out.pop();
+/// The config directives that bind OwnTone's named-pipe input to a path. The
+/// dedicated instance must read the same FIFO the adapter writes, so the
+/// effective configuration is read and its pipe path compared to
+/// [`OwnToneConfig::pipe_path`] (review U5).
+const OWNTONE_PIPE_KEYS: &[&str] = &["pipe_path"];
+
+/// The effective configuration file named by a process's launch arguments.
+///
+/// OwnTone takes its configuration through an explicit option (`-c <file>`,
+/// `--config <file>`, `--config=<file>`, or attached `-c<file>`). That value is
+/// the instance's **effective** configuration; a bare path argument that
+/// happens to name the state directory or the config file is not (review U5).
+/// Ambiguity — no option, more than one, or an empty value — fails closed by
+/// returning `None`.
+fn effective_config_argument(argv: &[String]) -> Option<PathBuf> {
+    let mut found: Option<PathBuf> = None;
+    let mut index = 0;
+    while index < argv.len() {
+        let arg = argv[index].as_str();
+        let value = if arg == "-c" || arg == "--config" {
+            index += 1;
+            argv.get(index).cloned()
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            Some(value.to_string())
+        } else if let Some(value) = arg.strip_prefix("-c") {
+            (!value.is_empty()).then(|| value.to_string())
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            if value.is_empty() || found.is_some() {
+                return None;
             }
-            Component::Normal(part) => out.push(part),
+            found = Some(PathBuf::from(value));
         }
+        index += 1;
     }
-    out
+    found
 }
 
-/// `true` when an argument in `cmdline` names the dedicated instance's launch
-/// configuration — the out-of-band binding that distinguishes the owned daemon
-/// from a foreign listener that merely holds the same port (review R5,
-/// strengthened by S2 and T5).
-///
-/// Binding is **path-component exact and traversal-safe**: every candidate is
-/// lexically normalized before comparison, so an argument that lexically names
-/// the state directory but escapes it through `..` (`/state/../foreign.conf`)
-/// is refused, and a configuration file beneath the state directory that is
-/// not the canonical `owntone.conf` is refused. A bare substring is rejected
-/// because a sibling directory such as `/run/tributary-other` would otherwise
-/// match `/run/tributary` (the S2 collision).
-fn cmdline_binds_state_dir(cmdline: &str, state_dir: &Path) -> bool {
-    if state_dir.as_os_str().is_empty() {
+/// Read the launched configuration and require it to bind OwnTone's pipe input
+/// to `pipe_path`. The effective configuration is the instance's own trust
+/// domain, so the FIFO the adapter writes is authoritative only when the daemon
+/// is configured to read exactly that FIFO (review U5).
+fn config_binds_pipe(config_path: &Path, pipe_path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(config_path) else {
         return false;
-    }
-    let normalized_state = normalize_path(state_dir);
-    let expected_config = normalized_state.join(OWNTONE_CONFIG_FILE);
-    let mut bound = false;
-    for arg in cmdline.split_whitespace() {
-        let raw = Path::new(arg);
-        let normalized = normalize_path(raw);
-        if normalized == normalized_state || normalized == expected_config {
-            bound = true;
-        } else if normalized.starts_with(&normalized_state) {
-            // A path beneath the state directory that is not the canonical
-            // launch configuration is a foreign file, not this instance.
-            return false;
-        } else if raw.starts_with(state_dir) {
-            // Lexically referenced the state directory but normalized outside
-            // it through `..`: a traversal to a foreign configuration.
-            return false;
+    };
+    let expected = std::fs::canonicalize(pipe_path).unwrap_or_else(|_| pipe_path.to_path_buf());
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if !OWNTONE_PIPE_KEYS
+            .iter()
+            .any(|candidate| key.trim().eq_ignore_ascii_case(candidate))
+        {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if value.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(value);
+        let candidate =
+            std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+        if candidate == expected {
+            return true;
         }
     }
-    bound
+    false
+}
+
+/// `true` when the process's launch binds the dedicated instance: its effective
+/// configuration option names the canonical launch file inside the configured
+/// state directory, that file is a regular (non-symlink) file, and it binds
+/// OwnTone's pipe input to the adapter's configured FIFO (review R5, S2, T5,
+/// U5).
+///
+/// The check is **effective and canonical**: only the argument of the
+/// configuration option counts, both the configuration file and the state
+/// directory are resolved through symlinks, and a symlinked launch file or a
+/// `..` traversal out of the state directory is refused. A foreign daemon that
+/// merely holds the same port and mentions the state directory cannot pass.
+fn cmdline_binds_instance(argv: &[String], state_dir: &Path, pipe_path: &Path) -> bool {
+    if state_dir.as_os_str().is_empty() || pipe_path.as_os_str().is_empty() {
+        return false;
+    }
+    let Some(config) = effective_config_argument(argv) else {
+        return false;
+    };
+    // Resolve symlinks: a lexically-correct name that resolves outside the
+    // state directory is a foreign configuration (review U5).
+    let Ok(canonical_state) = std::fs::canonicalize(state_dir) else {
+        return false;
+    };
+    let Ok(canonical_config) = std::fs::canonicalize(&config) else {
+        return false;
+    };
+    let expected_config = canonical_state.join(OWNTONE_CONFIG_FILE);
+    if canonical_config != expected_config {
+        return false;
+    }
+    // The expected name must itself be the regular file, not a symlink to a
+    // foreign configuration (review U5).
+    match std::fs::symlink_metadata(&expected_config) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        _ => return false,
+    }
+    config_binds_pipe(&canonical_config, pipe_path)
 }
 
 /// Compare an executable path with the configured binary, resolving symlinks
@@ -583,7 +636,7 @@ fn same_binary(actual: &Path, configured: &Path) -> bool {
 /// line binds the configured state directory (review R5).
 fn process_is_owned(process: &ListenerProcess, config: &OwnToneConfig) -> bool {
     same_binary(&process.exe, &config.binary)
-        && cmdline_binds_state_dir(&process.cmdline, &config.state_dir)
+        && cmdline_binds_instance(&process.argv, &config.state_dir, &config.pipe_path)
 }
 
 /// Confirm the process answering on the configured endpoint is the dedicated
@@ -601,7 +654,7 @@ fn verify_daemon_process(config: &OwnToneConfig) -> Result<(), SenderError> {
             "the process bound to the configured endpoint is not the dedicated owntone binary",
         ));
     }
-    if !cmdline_binds_state_dir(&process.cmdline, &config.state_dir) {
+    if !cmdline_binds_instance(&process.argv, &config.state_dir, &config.pipe_path) {
         return Err(unavailable(
             "the process bound to the configured endpoint is not the dedicated Tributary-owned instance",
         ));
@@ -656,26 +709,96 @@ fn identity_still_ours(identity: ProcessIdentity) -> Result<bool, SenderError> {
     }
 }
 
+/// A stable delivery handle for the exact process the listener was resolved
+/// from (review U5). On Linux this is a `pidfd`: signals sent through it are
+/// delivered to that process and can never reach a recycled pid, so there is no
+/// check-to-signal window at all. On other Unix targets the numeric pid is
+/// re-bound to the observed start time immediately before each delivery.
+struct SignalHandle {
+    identity: ProcessIdentity,
+    #[cfg(target_os = "linux")]
+    pidfd: OwnedFd,
+}
+
+impl SignalHandle {
+    /// Open a stable handle for `identity`, proving it still names the observed
+    /// process. `Ok(None)` when the process is already gone.
+    fn open(identity: ProcessIdentity) -> Result<Option<Self>, SenderError> {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::process::{pidfd_open, Pid, PidfdFlags};
+            let Some(pid) = Pid::from_raw(identity.pid as i32) else {
+                return Err(unavailable("the dedicated daemon process id is invalid"));
+            };
+            match pidfd_open(pid, PidfdFlags::empty()) {
+                Ok(pidfd) => {
+                    // Prove the handle names the observed process, not a
+                    // successor that reused the pid in the interval.
+                    if process_start_time(identity.pid) != Some(identity.start_time) {
+                        return Err(unavailable(
+                            "the dedicated daemon process identity changed before it could be signalled",
+                        ));
+                    }
+                    Ok(Some(Self { identity, pidfd }))
+                }
+                Err(rustix::io::Errno::SRCH) => Ok(None),
+                Err(_) => Err(unavailable(
+                    "a stable handle to the dedicated daemon could not be opened",
+                )),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            match identity_still_ours(identity)? {
+                false => Ok(None),
+                true => Ok(Some(Self { identity })),
+            }
+        }
+    }
+
+    /// Deliver `signal` through the handle. `Ok(false)` when the process is
+    /// already gone (quiescence satisfied).
+    fn send(&self, signal: rustix::process::Signal) -> Result<bool, SenderError> {
+        #[cfg(target_os = "linux")]
+        {
+            match rustix::process::pidfd_send_signal(&self.pidfd, signal) {
+                Ok(()) => Ok(true),
+                Err(rustix::io::Errno::SRCH) => Ok(false),
+                Err(_) => Err(unavailable("the dedicated daemon could not be signalled")),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            use rustix::process::{kill_process, Pid};
+            if !identity_still_ours(self.identity)? {
+                return Ok(false);
+            }
+            let Some(pid) = Pid::from_raw(self.identity.pid as i32) else {
+                return Err(unavailable("the dedicated daemon process id is invalid"));
+            };
+            match kill_process(pid, signal) {
+                Ok(()) => Ok(true),
+                Err(rustix::io::Errno::SRCH) => Ok(false),
+                Err(_) => Err(unavailable("the dedicated daemon could not be signalled")),
+            }
+        }
+    }
+}
+
 /// Signal the process named by the stable `identity`, escalating to `SIGKILL`
-/// at `deadline`, and **confirm** the process is gone (or a zombie). Every
-/// signal is bound to the pid/start-time identity immediately before delivery —
-/// including the later `SIGKILL` — so a pid reaped and reused during the wait is
-/// never signalled as the old instance (review S2, review T5). A `/proc` read
-/// that cannot prove absence is an error, not quiescence.
+/// at `deadline`, and **confirm** the process is gone (or a zombie). Delivery
+/// goes through a stable handle — a Linux `pidfd` on Linux — so a pid reaped
+/// and reused during the wait is never signalled as the old instance (review
+/// S2, review U5). A `/proc` read that cannot prove absence is an error, not
+/// quiescence.
 fn signal_and_wait(identity: ProcessIdentity, deadline: Duration) -> Result<(), SenderError> {
-    use rustix::io::Errno;
-    use rustix::process::{kill_process, Pid, Signal};
-    let Some(signal_pid) = Pid::from_raw(identity.pid as i32) else {
-        return Err(unavailable("the dedicated daemon process id is invalid"));
-    };
-    if !identity_still_ours(identity)? {
+    use rustix::process::Signal;
+    let Some(handle) = SignalHandle::open(identity)? else {
         // Already gone: quiescence is satisfied.
         return Ok(());
-    }
-    match kill_process(signal_pid, Signal::TERM) {
-        Ok(()) => {}
-        Err(Errno::SRCH) => return Ok(()),
-        Err(_) => return Err(unavailable("the dedicated daemon could not be signalled")),
+    };
+    if !handle.send(Signal::TERM)? {
+        return Ok(());
     }
     let end = Instant::now() + deadline;
     loop {
@@ -693,15 +816,10 @@ fn signal_and_wait(identity: ProcessIdentity, deadline: Duration) -> Result<(), 
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    // Re-bind the identity before escalating: refuse to `SIGKILL` a recycled
-    // pid (review T5).
-    if !identity_still_ours(identity)? {
+    // Escalate through the same stable handle: it still names the original
+    // process even if the pid was recycled during the wait (review U5).
+    if !handle.send(Signal::KILL)? {
         return Ok(());
-    }
-    match kill_process(signal_pid, Signal::KILL) {
-        Ok(()) => {}
-        Err(Errno::SRCH) => return Ok(()),
-        Err(_) => return Err(unavailable("the dedicated daemon could not be terminated")),
     }
     let kill_end = Instant::now() + QUIESCE_KILL_DEADLINE;
     loop {
@@ -2309,7 +2427,7 @@ impl RecoverySupervisor {
 
     fn instance() -> Arc<Self> {
         static SUPERVISOR: OnceLock<Arc<RecoverySupervisor>> = OnceLock::new();
-        Arc::clone(SUPERVISOR.get_or_init(|| Arc::new(RecoverySupervisor::new())))
+        Arc::clone(SUPERVISOR.get_or_init(|| Arc::new(Self::new())))
     }
 
     /// The process-global supervisor, with a live worker ensured whenever work
@@ -3118,46 +3236,140 @@ mod tests {
         assert!(listener_process(&format!("http://127.0.0.1:{free_port}")).is_none());
     }
 
-    /// S2: the command-line binding is path-component exact, not a substring.
-    /// A sibling state directory that merely has the configured one as a
-    /// string prefix must not match.
+    /// U5: the launch binding is the **effective** configuration option — the
+    /// value of `-c`/`--config` — resolved through symlinks, restricted to the
+    /// canonical state-directory `owntone.conf`, and required to bind the
+    /// adapter's FIFO. A bare path argument, a foreign or non-canonical config,
+    /// a symlinked name, ambiguity, and a config that names another pipe are
+    /// all refused.
     #[test]
-    fn cmdline_binding_requires_the_exact_state_directory() {
+    fn cmdline_binding_requires_the_effective_configuration_and_pipe() {
+        fn argv(args: &[&str]) -> Vec<String> {
+            args.iter().map(|value| value.to_string()).collect()
+        }
+
         let directory = tempfile::tempdir().expect("tempdir");
         let state_dir = directory.path();
-        let cmdline = format!("/usr/bin/owntone -c {}/owntone.conf", state_dir.display());
-        assert!(cmdline_binds_state_dir(&cmdline, state_dir));
-        assert!(!cmdline_binds_state_dir(
-            "/usr/bin/owntone -c /etc/owntone.conf",
-            state_dir
-        ));
-        assert!(!cmdline_binds_state_dir("", state_dir));
+        let pipe = state_dir.join("airplay.pcm");
+        std::fs::write(&pipe, b"fifo").expect("write pipe placeholder");
+        let config = state_dir.join(OWNTONE_CONFIG_FILE);
+        std::fs::write(&config, format!("pipe_path = \"{}\"\n", pipe.display()))
+            .expect("write config");
+        std::fs::create_dir_all(state_dir.join("sub")).expect("sub dir");
 
+        // The effective option names the canonical file and binds the FIFO.
+        assert!(cmdline_binds_instance(
+            &argv(&["/usr/bin/owntone", "-c", &config.to_string_lossy()]),
+            state_dir,
+            &pipe
+        ));
+        assert!(cmdline_binds_instance(
+            &argv(&[
+                "/usr/bin/owntone",
+                &format!("--config={}", config.display())
+            ]),
+            state_dir,
+            &pipe
+        ));
+        // A `..` that stays inside the state directory still binds exactly.
+        assert!(cmdline_binds_instance(
+            &argv(&[
+                "/usr/bin/owntone",
+                "-c",
+                &format!("{}/sub/../owntone.conf", state_dir.display()),
+            ]),
+            state_dir,
+            &pipe
+        ));
+
+        // A bare path argument is not an effective configuration.
+        assert!(!cmdline_binds_instance(
+            &argv(&[
+                "/usr/bin/owntone",
+                &state_dir.to_string_lossy(),
+                &config.to_string_lossy(),
+            ]),
+            state_dir,
+            &pipe
+        ));
+        assert!(!cmdline_binds_instance(
+            &argv(&["/usr/bin/owntone"]),
+            state_dir,
+            &pipe
+        ));
+
+        // A foreign configuration is refused.
+        assert!(!cmdline_binds_instance(
+            &argv(&["/usr/bin/owntone", "-c", "/etc/owntone.conf"]),
+            state_dir,
+            &pipe
+        ));
         // A sibling directory sharing the name as a bare string prefix is not
         // the configured one (the S2 substring collision).
-        let sibling = format!("{}-other", state_dir.display());
-        let cmdline = format!("/usr/bin/owntone -c {sibling}/owntone.conf");
-        assert!(!cmdline_binds_state_dir(&cmdline, state_dir));
+        let sibling = format!("{}-other/owntone.conf", state_dir.display());
+        assert!(!cmdline_binds_instance(
+            &argv(&["/usr/bin/owntone", "-c", &sibling]),
+            state_dir,
+            &pipe
+        ));
+        // A `..` traversal out of the state directory is refused.
+        let traversal = format!("{}/../foreign.conf", state_dir.display());
+        assert!(!cmdline_binds_instance(
+            &argv(&["/usr/bin/owntone", "-c", &traversal]),
+            state_dir,
+            &pipe
+        ));
+        // A non-canonical configuration beneath the state directory is refused.
+        let unrelated = state_dir.join("other.conf");
+        std::fs::write(&unrelated, "pipe_path = \"/tmp/nope\"\n").expect("write unrelated");
+        assert!(!cmdline_binds_instance(
+            &argv(&["/usr/bin/owntone", "-c", &unrelated.to_string_lossy()]),
+            state_dir,
+            &pipe
+        ));
+        // More than one effective configuration is ambiguous and refused.
+        assert!(!cmdline_binds_instance(
+            &argv(&[
+                "/usr/bin/owntone",
+                "-c",
+                &config.to_string_lossy(),
+                "--config",
+                &config.to_string_lossy(),
+            ]),
+            state_dir,
+            &pipe
+        ));
 
-        // T5: a `..` traversal that lexically names the state directory but
-        // resolves to a foreign file is refused.
-        let traversal = format!(
-            "/usr/bin/owntone -c {}/../foreign.conf",
-            state_dir.display()
-        );
-        assert!(!cmdline_binds_state_dir(&traversal, state_dir));
+        // A symlinked launch file is refused even when it resolves elsewhere.
+        let foreign = directory.path().join("foreign.conf");
+        std::fs::write(&foreign, format!("pipe_path = \"{}\"\n", pipe.display()))
+            .expect("foreign config");
+        let symlinked_dir = tempfile::tempdir().expect("tempdir");
+        let symlink_state = symlinked_dir.path().join("state");
+        std::fs::create_dir_all(&symlink_state).expect("state dir");
+        let symlink_config = symlink_state.join(OWNTONE_CONFIG_FILE);
+        std::os::unix::fs::symlink(&foreign, &symlink_config).expect("symlink config");
+        assert!(!cmdline_binds_instance(
+            &argv(&["/usr/bin/owntone", "-c", &symlink_config.to_string_lossy()]),
+            &symlink_state,
+            &pipe
+        ));
 
-        // T5: a configuration beneath the state directory that is not the
-        // canonical `owntone.conf` is a foreign instance and is refused.
-        let unrelated = format!("/usr/bin/owntone -c {}/other.conf", state_dir.display());
-        assert!(!cmdline_binds_state_dir(&unrelated, state_dir));
-
-        // A `..` that stays inside the state directory still binds exactly.
-        let inner = format!(
-            "/usr/bin/owntone -c {}/sub/../owntone.conf",
-            state_dir.display()
-        );
-        assert!(cmdline_binds_state_dir(&inner, state_dir));
+        // A configuration that binds a different FIFO is refused.
+        let other_dir = tempfile::tempdir().expect("tempdir");
+        let other_pipe = other_dir.path().join("other.pcm");
+        std::fs::write(&other_pipe, b"other").expect("other pipe");
+        let other_config = other_dir.path().join(OWNTONE_CONFIG_FILE);
+        std::fs::write(
+            &other_config,
+            format!("pipe_path = \"{}\"\n", other_pipe.display()),
+        )
+        .expect("other config");
+        assert!(!cmdline_binds_instance(
+            &argv(&["/usr/bin/owntone", "-c", &other_config.to_string_lossy()]),
+            other_dir.path(),
+            &pipe
+        ));
     }
 
     /// R5: a matching ownership record is not enough — a foreign process bound
@@ -3305,11 +3517,19 @@ mod tests {
     /// Build a `SessionInner` whose daemon endpoint is unreachable, for the
     /// fail-closed terminal paths.
     fn test_session_inner(state_dir: &Path) -> SessionInner {
+        test_session_inner_with_events(state_dir, async_channel::unbounded().0)
+    }
+
+    /// As [`test_session_inner`], with an event channel the regression observes.
+    fn test_session_inner_with_events(
+        state_dir: &Path,
+        event_tx: async_channel::Sender<PlayerEvent>,
+    ) -> SessionInner {
         SessionInner {
             client: Arc::new(OwnToneClient::new("http://127.0.0.1:1").expect("client")),
             config: owned_config(state_dir),
             generation: PlayerEventGeneration::from_raw(1),
-            event_tx: async_channel::unbounded().0,
+            event_tx,
             recorded: TakeoverRecord {
                 enabled_outputs: vec![1],
                 selected_output: 2,
@@ -3352,5 +3572,186 @@ mod tests {
         assert!(inner.restore().is_err());
         assert!(!inner.restored.load(Ordering::SeqCst));
         assert!(inner.unsettled_count() > 0);
+    }
+
+    /// U1: a failed restoration registers uncertainty and keeps it. A second
+    /// restore (the close path re-invokes one after joining the pump) must not
+    /// be able to clear the marker and release ownership without a confirmed
+    /// quiescence: it stays failed closed with the count raised.
+    #[test]
+    fn a_failed_restoration_keeps_its_uncertainty_across_a_second_restore() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let inner = test_session_inner(directory.path());
+        assert!(inner.restore().is_err());
+        assert!(inner.unsettled_count() > 0);
+        assert!(!inner.restored.load(Ordering::SeqCst));
+        assert!(inner.restore().is_err());
+        assert!(inner.unsettled_count() > 0);
+        assert!(!inner.restored.load(Ordering::SeqCst));
+    }
+
+    /// U3: a Stop that wins the shared boundary refuses the start effect before
+    /// it is transmitted — the session publishes at most a truthful `Stopped`
+    /// (never `Playing`) and no error event, because no play RPC ever ran.
+    #[test]
+    fn a_stop_before_start_refuses_the_effect() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = async_channel::unbounded();
+        let inner = test_session_inner_with_events(directory.path(), tx);
+        inner.gate.stop();
+        assert!(!inner.activate_and_play(), "a stopped load must not start");
+        assert!(!inner.activation_live());
+        match rx.try_recv() {
+            Ok(PlayerEvent::StateChanged {
+                state: PlayerState::Stopped,
+                ..
+            }) => {}
+            other => panic!("expected only a Stopped state, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no further events (no error, no Playing) may follow a refused start"
+        );
+    }
+
+    /// U1: a control RPC that fails after transmission is counted as
+    /// outstanding **before** it is transmitted and retained on failure — a
+    /// later restoration must quiesce before it can settle.
+    #[test]
+    fn a_failed_control_is_retained_as_outstanding() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let inner = test_session_inner(directory.path());
+        assert!(inner
+            .transmit_mutation(|| inner.client.set_volume(50))
+            .is_err());
+        assert!(inner.unsettled_count() > 0);
+    }
+
+    /// U3: a failed initial play never publishes `Playing`; it surfaces the
+    /// error, keeps the pump inert, and records the transmitted play as
+    /// outstanding for settlement.
+    #[test]
+    fn a_failed_initial_play_publishes_no_playing() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = async_channel::unbounded();
+        let inner = test_session_inner_with_events(directory.path(), tx);
+        assert!(
+            !inner.activate_and_play(),
+            "a failed play is not activation"
+        );
+        assert!(!inner.activation_live());
+        assert!(inner.unsettled_count() > 0);
+
+        let mut saw_error = false;
+        let mut saw_playing = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                PlayerEvent::Error { .. } => saw_error = true,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Playing,
+                    ..
+                } => saw_playing = true,
+                _ => {}
+            }
+        }
+        assert!(saw_error, "the failed play must be surfaced");
+        assert!(
+            !saw_playing,
+            "a failed play must never be reported as Playing"
+        );
+    }
+
+    // ----- U2: retained-recovery supervisor liveness, retry and fairness -----
+
+    /// The supervisor's regression seam: a job that settles after
+    /// `succeed_on` attempts and records that its resources were released.
+    struct TestRecoveryJob {
+        attempts: AtomicUsize,
+        succeed_on: usize,
+        released: Arc<AtomicBool>,
+        retry_at: Instant,
+    }
+
+    impl RecoveryJob for TestRecoveryJob {
+        fn retry_at(&self) -> Instant {
+            self.retry_at
+        }
+
+        fn set_retry_at(&mut self, at: Instant) {
+            self.retry_at = at;
+        }
+
+        fn attempt(&self) -> bool {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt >= self.succeed_on {
+                self.released.store(true, Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    fn wait_until(mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !predicate() {
+            assert!(Instant::now() < deadline, "timed out waiting for condition");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// U2: a supervisor whose worker cannot be started proves no live owner,
+    /// keeps the job (and its resources) queued, and services it once worker
+    /// creation succeeds — never reporting a false clean handoff.
+    #[test]
+    fn supervisor_preserves_a_job_when_its_worker_cannot_start() {
+        let supervisor = Arc::new(RecoverySupervisor::new());
+        // Every spawn attempt inside `enqueue` fails, so no owner is proven.
+        supervisor.fail_next_spawns(SUPERVISOR_SPAWN_ATTEMPTS);
+        let released = Arc::new(AtomicBool::new(false));
+        supervisor.enqueue(Box::new(TestRecoveryJob {
+            attempts: AtomicUsize::new(0),
+            succeed_on: 1,
+            released: Arc::clone(&released),
+            retry_at: Instant::now(),
+        }));
+
+        assert!(
+            !supervisor.worker_is_live(),
+            "no owner may be reported live"
+        );
+        assert_eq!(supervisor.pending_jobs(), 1, "the job must be preserved");
+        assert!(!released.load(Ordering::SeqCst));
+
+        // Retrying creation picks up the queued job and settles it.
+        supervisor.fail_next_spawns(0);
+        supervisor.ensure_worker_if_pending();
+        wait_until(|| released.load(Ordering::SeqCst));
+        wait_until(|| supervisor.pending_jobs() == 0);
+    }
+
+    /// U2: two independent retained recoveries are both serviced. A job that is
+    /// not yet settleable must not starve the other, and both must eventually
+    /// reach release.
+    #[test]
+    fn supervisor_services_two_independent_jobs_fairly() {
+        let supervisor = Arc::new(RecoverySupervisor::new());
+        let released_a = Arc::new(AtomicBool::new(false));
+        let released_b = Arc::new(AtomicBool::new(false));
+        supervisor.enqueue(Box::new(TestRecoveryJob {
+            attempts: AtomicUsize::new(0),
+            succeed_on: 2,
+            released: Arc::clone(&released_a),
+            retry_at: Instant::now(),
+        }));
+        supervisor.enqueue(Box::new(TestRecoveryJob {
+            attempts: AtomicUsize::new(0),
+            succeed_on: 2,
+            released: Arc::clone(&released_b),
+            retry_at: Instant::now(),
+        }));
+
+        wait_until(|| released_a.load(Ordering::SeqCst) && released_b.load(Ordering::SeqCst));
+        wait_until(|| supervisor.pending_jobs() == 0);
     }
 }

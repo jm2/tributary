@@ -1346,37 +1346,66 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// R1: the availability gate runs on the GTK caller, so a dedicated
+    /// R1/U6: the availability gate runs on the GTK caller, so a dedicated
     /// daemon that accepts the connection and then never answers must not
-    /// freeze the load path. The blocking handshake lives on the load worker;
-    /// `load_uri` and a following `stop` both return promptly against a
-    /// stalled endpoint.
+    /// freeze the load path.
     ///
-    /// Unix-only: the fixture builds the dedicated-instance adapter, which
-    /// owns a FIFO, an advisory `flock` and a `/proc`-verified process
-    /// binding. On other targets the unsupported shim is compiled instead and
-    /// this test would not link (review S1).
-    #[cfg(unix)]
+    /// This is a **production-path** fixture: it compiles a hermetic fake
+    /// daemon whose executable and `-c <state>/owntone.conf` launch bind it as
+    /// the owned instance (the canonical config names the adapter's FIFO), so
+    /// `verify_owned` passes and the load genuinely reaches the `/api/config`
+    /// handshake before the endpoint stalls. `load_uri` and `stop` must both
+    /// return promptly because the blocking handshake runs on the load worker.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_stalled_owntone_endpoint_does_not_block_load_or_stop() {
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled endpoint");
-        let addr = listener.local_addr().expect("local addr");
-        let api_base = format!("http://{addr}");
-        // Accept the connection and hold it open without ever answering: any
-        // blocking probe on this endpoint would sit until its timeout.
-        std::thread::spawn(move || {
-            if listener.accept().is_ok() {
-                std::thread::sleep(Duration::from_secs(10));
-            }
-        });
+        use std::net::{TcpListener, TcpStream};
 
         let directory = tempfile::tempdir().expect("tempdir");
-        let binary = directory.path().join("owntone");
-        std::fs::write(&binary, b"#!/bin/true\n").expect("dummy binary");
+        let state_dir = directory.path().join("state");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        let pipe = state_dir.join("airplay.pcm");
+        let config = state_dir.join("owntone.conf");
+        std::fs::write(&config, format!("pipe_path = \"{}\"\n", pipe.display()))
+            .expect("write config");
+
+        // Compile the hermetic fake daemon: it binds the endpoint and never
+        // answers, and its argv binds the canonical config so it is genuinely
+        // the owned process the adapter verifies.
+        let source = directory.path().join("fake_owntone.rs");
+        std::fs::write(&source, FAKE_DAEMON_SOURCE).expect("write daemon source");
+        let binary = directory.path().join("fake_owntone");
+        let compiled = std::process::Command::new("rustc")
+            .arg("-O")
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .status()
+            .expect("invoke rustc");
+        assert!(compiled.success(), "the fake daemon must compile");
+
+        let probe = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let mut child = std::process::Command::new(&binary)
+            .arg("-c")
+            .arg(&config)
+            .env("TRIBUTARY_FAKE_LISTEN", format!("127.0.0.1:{port}"))
+            .spawn()
+            .expect("spawn fake daemon");
+        // Wait for the fake daemon to bind before the load verifies ownership.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "the fake daemon did not start listening"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let api_base = format!("http://127.0.0.1:{port}");
         let sender =
-            crate::audio::airplay_owntone::test_owned_sender(&api_base, directory.path(), &binary);
+            crate::audio::airplay_owntone::test_owned_sender(&api_base, &state_dir, &binary);
 
         let (tx, _rx) = async_channel::unbounded();
         let mut output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
@@ -1397,6 +1426,65 @@ mod tests {
         assert!(
             stopped.elapsed() < Duration::from_millis(500),
             "stop blocked on the stalled OwnTone endpoint: {:?}",
+            stopped.elapsed()
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The fake OwnTone daemon source compiled by the stalled-endpoint fixture.
+    /// It binds the loopback endpoint named in `TRIBUTARY_FAKE_LISTEN`, accepts
+    /// every connection and holds it without ever writing a response, so a
+    /// blocking `/api/config` handshake stalls until its client timeout.
+    #[cfg(target_os = "linux")]
+    const FAKE_DAEMON_SOURCE: &str = r#"
+use std::net::TcpListener;
+use std::time::Duration;
+fn main() {
+    let addr = std::env::var("TRIBUTARY_FAKE_LISTEN").expect("listen address");
+    let listener = TcpListener::bind(&addr).expect("bind");
+    let mut held = Vec::new();
+    loop {
+        if let Ok((stream, _)) = listener.accept() {
+            held.push(stream);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+"#;
+
+    /// R1: off Linux the kernel process binding is unsupported, so the load
+    /// fails closed before any network handshake — and it must still never
+    /// block the caller. Unix-only: the dedicated-instance adapter owns a FIFO,
+    /// an advisory `flock` and a `/proc`-verified process binding.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn a_stalled_owntone_endpoint_does_not_block_load_or_stop() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let binary = directory.path().join("owntone");
+        std::fs::write(&binary, b"#!/bin/true\n").expect("dummy binary");
+        let api_base = "http://127.0.0.1:1";
+        let sender =
+            crate::audio::airplay_owntone::test_owned_sender(api_base, directory.path(), &binary);
+
+        let (tx, _rx) = async_channel::unbounded();
+        let mut output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
+        output.sender = Arc::new(sender);
+        output.set_event_generation(PlayerEventGeneration::from_raw(64));
+
+        let started = Instant::now();
+        output.load_uri("http://127.0.0.1:1/media");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "load blocked on the unsupported OwnTone endpoint: {:?}",
+            started.elapsed()
+        );
+        let stopped = Instant::now();
+        output.stop();
+        assert!(
+            stopped.elapsed() < Duration::from_millis(500),
+            "stop blocked on the unsupported OwnTone endpoint: {:?}",
             stopped.elapsed()
         );
     }
