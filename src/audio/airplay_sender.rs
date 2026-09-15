@@ -295,19 +295,27 @@ impl SenderTarget {
 /// app-owned media ticket is threaded through here. `prepared_uri` is the
 /// credential-safe loopback URL the proxy minted; the original authenticated
 /// URL never reaches the sender.
-pub(super) struct SenderOpenContext<'a> {
-    pub(super) target: &'a SenderTarget,
-    pub(super) prepared_uri: &'a str,
-    pub(super) event_tx: &'a async_channel::Sender<super::PlayerEvent>,
+///
+/// The context is **owned** (no borrows) so the load path can move it onto the
+/// per-load worker that performs the blocking negotiation off the UI thread
+/// without blocking GTK (review F2). `open_id` is the load's stable identity
+/// for keyed in-flight cancellation registration.
+pub(super) struct SenderOpenContext {
+    pub(super) target: SenderTarget,
+    pub(super) prepared_uri: String,
+    pub(super) event_tx: async_channel::Sender<super::PlayerEvent>,
     pub(super) generation: PlayerEventGeneration,
-    pub(super) media_proxy: &'a Arc<super::gstreamer_media::GstreamerMediaProxy>,
+    pub(super) media_proxy: Arc<super::gstreamer_media::GstreamerMediaProxy>,
     /// The app-owned loopback media ticket for this load, when the media was
     /// protected. The opened session adopts it so EOS/error/close revoke it
     /// by identity; a non-opened outcome leaves it to the load path to
     /// release.
     pub(super) media_ticket: Option<Arc<super::gstreamer_media::GstreamerMediaTicket>>,
     pub(super) volume: f64,
-    pub(super) cancel: &'a OpenCancel,
+    pub(super) cancel: OpenCancel,
+    /// Stable per-load identity used to key in-flight cancellation
+    /// registration in the media proxy.
+    pub(super) open_id: u64,
 }
 
 /// A selectable transmission path. One immutable instance per
@@ -331,7 +339,7 @@ pub(super) trait AirplaySender: Send + Sync {
     /// that performs blocking negotiation must observe it (racing each
     /// blocking step against it) and return [`OpenOutcome::Cancelled`] after
     /// its restoration path completes.
-    fn open_session(&self, ctx: &SenderOpenContext<'_>) -> OpenOutcome;
+    fn open_session(&self, ctx: &SenderOpenContext) -> OpenOutcome;
 }
 
 #[cfg(test)]

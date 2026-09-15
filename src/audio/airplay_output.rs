@@ -48,7 +48,8 @@
 //!   unavailable unless a compatible third-party element is already present.
 //! - **Seeking is not supported** for live RAOP streams.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -223,7 +224,7 @@ impl AirplaySender for GstreamerRaopSender {
         }
     }
 
-    fn open_session(&self, ctx: &SenderOpenContext<'_>) -> OpenOutcome {
+    fn open_session(&self, ctx: &SenderOpenContext) -> OpenOutcome {
         // Cancellation is checked before any transport work; this adapter
         // transmits no mutating remote call, so a cancelled open has nothing
         // to unwind beyond the resources it has not yet created.
@@ -234,7 +235,7 @@ impl AirplaySender for GstreamerRaopSender {
         let pipeline = match Self::build_pipeline(
             &ctx.target.host,
             ctx.target.port,
-            ctx.prepared_uri,
+            &ctx.prepared_uri,
             ctx.volume,
         ) {
             Ok(pipeline) => pipeline,
@@ -243,9 +244,9 @@ impl AirplaySender for GstreamerRaopSender {
 
         let bus_watch = match attach_bus_watch(
             &pipeline,
-            ctx.event_tx,
+            &ctx.event_tx,
             ctx.generation,
-            ctx.media_proxy,
+            &ctx.media_proxy,
             ctx.media_ticket.clone(),
         ) {
             Ok(watch) => watch,
@@ -254,7 +255,7 @@ impl AirplaySender for GstreamerRaopSender {
                 return OpenOutcome::Failed(SenderError::Receiver(message));
             }
         };
-        start_position_timer(&pipeline, ctx.event_tx, ctx.generation);
+        start_position_timer(&pipeline, &ctx.event_tx, ctx.generation);
 
         if pipeline.set_state(gst::State::Paused).is_err() {
             let _ = pipeline.set_state(gst::State::Null);
@@ -273,7 +274,7 @@ impl AirplaySender for GstreamerRaopSender {
             media_ticket: ctx.media_ticket.clone(),
             _bus_watch: bus_watch,
             generation: ctx.generation,
-            media_proxy: Arc::clone(ctx.media_proxy),
+            media_proxy: Arc::clone(&ctx.media_proxy),
         }))
     }
 }
@@ -377,7 +378,10 @@ fn start_position_timer(
     let pipeline_weak = pipeline.downgrade();
     let tx = event_tx.clone();
 
-    glib::timeout_add_local(Duration::from_millis(500), move || {
+    // `timeout_add` (not `timeout_add_local`) attaches to the default main
+    // context from any thread, so the timer still fires on the GTK main loop
+    // now that the session is opened on its own worker thread (review F2).
+    glib::timeout_add(Duration::from_millis(500), move || {
         let Some(pipeline) = pipeline_weak.upgrade() else {
             return glib::ControlFlow::Break;
         };
@@ -418,11 +422,47 @@ fn position_sample_event(
 /// the OwnTone process adapter is used only when
 /// `TRIBUTARY_AIRPLAY_SENDER=owntone`, and the GStreamer `raopsink` adapter
 /// remains the default. Both are independently probe-gated at load time.
-fn select_sender() -> Box<dyn AirplaySender> {
+fn select_sender() -> Arc<dyn AirplaySender> {
     if super::airplay_owntone::OwnToneSender::selected() {
-        Box::new(super::airplay_owntone::OwnToneSender::from_env())
+        Arc::new(super::airplay_owntone::OwnToneSender::from_env())
     } else {
-        Box::new(GstreamerRaopSender)
+        Arc::new(GstreamerRaopSender)
+    }
+}
+
+/// One command delivered to a load's worker thread. Sending is non-blocking on
+/// the UI thread; the blocking daemon RPC or teardown runs on the worker
+/// (review F2).
+#[derive(Debug, Clone, Copy)]
+enum SessionCommand {
+    Pause,
+    Resume,
+    SetVolume(f64),
+    Stop,
+}
+
+/// Owns the worker thread for one load, plus the caches the UI reads without
+/// touching the session (which lives on the worker).
+struct LoadController {
+    /// Cancellation currency for this load's open and its worker loop.
+    cancel: OpenCancel,
+    /// Command channel into the worker. `None` once the controller is closed.
+    commands: Option<std::sync::mpsc::Sender<SessionCommand>>,
+    /// Detached on close so the UI thread never joins a blocking teardown.
+    handle: Option<std::thread::JoinHandle<()>>,
+    /// Coarse state published by the worker.
+    state: Arc<AtomicU8>,
+    /// Latest position snapshot published by the worker.
+    position: Arc<Mutex<SenderPosition>>,
+}
+
+/// Map the worker's cached state byte back to [`PlayerState`].
+fn state_from_u8(raw: u8) -> PlayerState {
+    match raw {
+        value if value == PlayerState::Buffering as u8 => PlayerState::Buffering,
+        value if value == PlayerState::Playing as u8 => PlayerState::Playing,
+        value if value == PlayerState::Paused as u8 => PlayerState::Paused,
+        _ => PlayerState::Stopped,
     }
 }
 
@@ -441,17 +481,24 @@ pub struct AirPlayOutput {
     device_id: Option<String>,
     /// Event sender for relaying state changes to the GTK main thread.
     event_tx: async_channel::Sender<PlayerEvent>,
-    event_generation: AtomicU64,
+    /// Current load generation, shared with the worker so a stale open cannot
+    /// start playback after its generation was superseded.
+    event_generation: Arc<AtomicU64>,
     /// Cached volume level (0.0–1.0).
     volume: f64,
     /// App-owned exact-origin fetch boundary for authenticated media. The
     /// GStreamer pipelines receive only its opaque loopback ticket.
     media_proxy: Arc<GstreamerMediaProxy>,
     /// The transmission path selected for this output.
-    sender: Box<dyn AirplaySender>,
-    /// Active session, if any.  `Mutex` (not `RefCell`) because the
-    /// bus watch may run on a worker thread.
-    session: Arc<Mutex<Option<Box<dyn SenderSession>>>>,
+    sender: Arc<dyn AirplaySender>,
+    /// Monotonic per-load identity used to key in-flight cancellation
+    /// registration in the media proxy.
+    load_seq: AtomicU64,
+    /// The active load's controller, if any. The controller owns the worker
+    /// thread that performs the (potentially blocking) open and controls, so
+    /// neither the GTK thread nor a bus callback blocks on a daemon RPC
+    /// (review F2).
+    controller: Mutex<Option<LoadController>>,
 }
 
 impl AirPlayOutput {
@@ -478,14 +525,15 @@ impl AirPlayOutput {
             port,
             device_id: None,
             event_tx,
-            event_generation: AtomicU64::new(0),
+            event_generation: Arc::new(AtomicU64::new(0)),
             // Seed from the current slider value so switching to this device
             // doesn't reset the effective volume to maximum (0 dB) on the
             // first track load.
             volume: initial_volume.clamp(0.0, 1.0),
             media_proxy: Arc::new(GstreamerMediaProxy::new(None)),
             sender: select_sender(),
-            session: Arc::new(Mutex::new(None)),
+            load_seq: AtomicU64::new(0),
+            controller: Mutex::new(None),
         }
     }
 
@@ -503,17 +551,15 @@ impl AirPlayOutput {
         self
     }
 
-    /// Lock the session, recovering transparently from poisoning.
+    /// Lock the controller, recovering transparently from poisoning.
     ///
     /// A poisoned `Mutex` here means a previous holder panicked. The bus
-    /// watch runs on the GLib main loop, so a panic in any of its
-    /// branches (or in `close_session`) would otherwise propagate as an
-    /// app-wide crash on the next lock — even though we don't actually
-    /// rely on any invariant the panicking thread might have left
-    /// half-built. `into_inner()` returns the underlying value either
-    /// way, which is the behaviour we want.
-    fn session_lock(&self) -> std::sync::MutexGuard<'_, Option<Box<dyn SenderSession>>> {
-        self.session.lock().unwrap_or_else(|p| p.into_inner())
+    /// watch runs on the GLib main loop, so a panic in any of its branches
+    /// would otherwise propagate as an app-wide crash on the next lock — even
+    /// though we don't actually rely on any invariant the panicking thread
+    /// might have left half-built.
+    fn controller_guard(&self) -> std::sync::MutexGuard<'_, Option<LoadController>> {
+        self.controller.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     fn event_generation(&self) -> PlayerEventGeneration {
@@ -539,56 +585,139 @@ impl AirPlayOutput {
         }
     }
 
-    fn open_session(&self, prepared: PreparedGstreamerMedia) -> OpenOutcome {
-        // Tear down any previous session before starting a new one.
+    /// Start a load on its own worker thread. The availability gate and media
+    /// preparation have already run on the caller, so this only marshals the
+    /// owned context and spawns the worker.
+    fn start_session_worker(
+        &self,
+        generation: PlayerEventGeneration,
+        prepared: PreparedGstreamerMedia,
+    ) {
+        // Tear down any previous load before starting a new one.
         self.close_session();
 
-        let target = self.target();
-        let generation = self.event_generation();
+        let open_id = self.load_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let cancel = OpenCancel::new();
         let media_ticket = prepared.ticket();
-        let ctx = SenderOpenContext {
-            target: &target,
-            prepared_uri: prepared.uri(),
-            event_tx: &self.event_tx,
-            generation,
-            media_proxy: &self.media_proxy,
-            media_ticket: media_ticket.clone(),
-            volume: self.volume,
-            cancel: &cancel,
-        };
-        let outcome = self.sender.open_session(&ctx);
+        let state_cache = Arc::new(AtomicU8::new(PlayerState::Buffering as u8));
+        let position_cache = Arc::new(Mutex::new(SenderPosition::unknown(generation)));
+        let (commands, command_rx) = mpsc::channel();
 
-        // An opened session adopts the ticket and revokes it by identity on
-        // EOS/error/close. Every non-opened outcome leaves the route live, so
-        // the load path releases its own ticket here (the single release
-        // point for this seam record).
-        if !matches!(outcome, OpenOutcome::Opened(_)) {
-            if let Some(ticket) = media_ticket.as_ref() {
-                self.media_proxy.revoke_if_current(ticket);
-            }
-        }
-        outcome
+        let ctx = SenderOpenContext {
+            target: self.target(),
+            prepared_uri: prepared.uri().to_string(),
+            event_tx: self.event_tx.clone(),
+            generation,
+            media_proxy: Arc::clone(&self.media_proxy),
+            media_ticket,
+            volume: self.volume,
+            cancel: cancel.clone(),
+            open_id,
+        };
+        let sender = Arc::clone(&self.sender);
+        let event_generation = Arc::clone(&self.event_generation);
+        let worker_state = Arc::clone(&state_cache);
+        let worker_position = Arc::clone(&position_cache);
+        let handle = std::thread::Builder::new()
+            .name("airplay-load".to_string())
+            .spawn(move || {
+                run_session_worker(
+                    sender,
+                    ctx,
+                    command_rx,
+                    worker_state,
+                    worker_position,
+                    event_generation,
+                );
+            })
+            .ok();
+
+        *self.controller_guard() = Some(LoadController {
+            cancel,
+            commands: Some(commands),
+            handle,
+            state: state_cache,
+            position: position_cache,
+        });
     }
 
+    /// Report a synchronous load failure (probe or media preparation) on the
+    /// caller's thread.
+    fn report_load_failure(&self, generation: PlayerEventGeneration, message: &str) {
+        error!(error = %message, "AirPlay: failed to open session");
+        let _ = self
+            .event_tx
+            .try_send(PlayerEvent::error(generation, message));
+        let _ = self
+            .event_tx
+            .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
+    }
+
+    /// Run the availability gate and media preparation for one load. A probe
+    /// or preparation failure is reported synchronously; a successful gate
+    /// starts the worker and returns immediately, so the caller never blocks
+    /// on negotiation (review F2).
+    fn begin_load(
+        &self,
+        generation: PlayerEventGeneration,
+        prepared: Result<PreparedGstreamerMedia, String>,
+    ) -> bool {
+        match self.sender.probe() {
+            Ok(()) => match prepared {
+                Ok(prepared) => self.start_session_worker(generation, prepared),
+                Err(message) => self.report_load_failure(generation, &message),
+            },
+            Err(error) => self.report_load_failure(generation, error.message()),
+        }
+        true
+    }
+
+    /// Tear down the active load without blocking the caller: signal the
+    /// worker, then detach it so teardown (a blocking daemon RPC or a pump
+    /// join) runs on the worker, not the UI thread (review F2).
+    fn close_session(&self) {
+        let controller = self.controller_guard().take();
+        if let Some(mut controller) = controller {
+            controller.cancel.cancel();
+            if let Some(commands) = controller.commands.take() {
+                let _ = commands.send(SessionCommand::Stop);
+            }
+            // Dropping the handle detaches the worker; it owns session teardown.
+            drop(controller.handle.take());
+            controller
+                .state
+                .store(PlayerState::Stopped as u8, Ordering::SeqCst);
+        }
+    }
+
+    /// Apply a state transition through the worker, if any.
+    fn set_session_state(&self, target: PlayerState) -> bool {
+        let command = match target {
+            PlayerState::Playing => SessionCommand::Resume,
+            PlayerState::Paused => SessionCommand::Pause,
+            PlayerState::Buffering => return true,
+            PlayerState::Stopped => {
+                self.close_session();
+                return true;
+            }
+        };
+        let guard = self.controller_guard();
+        let Some(controller) = guard.as_ref() else {
+            debug!(?target, "AirPlay: no active session for state change");
+            return false;
+        };
+        controller
+            .commands
+            .as_ref()
+            .is_some_and(|commands| commands.send(command).is_ok())
+    }
+
+    /// Test-only direct outcome handling for the synchronous failure and
+    /// cancellation paths; the live path goes through [`Self::start_session_worker`].
+    #[cfg(test)]
     fn finish_load(&self, generation: PlayerEventGeneration, outcome: OpenOutcome) {
         match outcome {
-            OpenOutcome::Opened(session) => {
-                *self.session_lock() = Some(session);
-                if !self.set_session_state(PlayerState::Playing) {
-                    // `open_session` only prerolls the pipeline to Paused;
-                    // like every other output, a load must actually start
-                    // playback.
-                    self.close_session();
-                    let _ = self.event_tx.try_send(PlayerEvent::error(
-                        generation,
-                        "AirPlay playback failed to start",
-                    ));
-                    let _ = self
-                        .event_tx
-                        .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
-                }
-            }
+            OpenOutcome::Opened(_) => {}
             OpenOutcome::Cancelled => {
                 // A cancelled load is not a user-facing failure: no error
                 // event and no `Stopped` for a generation the caller already
@@ -596,55 +725,118 @@ impl AirPlayOutput {
                 debug!("AirPlay: load cancelled before the session opened");
             }
             OpenOutcome::Failed(error) => {
-                error!(error = %error.message(), "AirPlay: failed to open session");
-                let _ = self
-                    .event_tx
-                    .try_send(PlayerEvent::error(generation, error.message()));
-                let _ = self
-                    .event_tx
-                    .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
+                self.report_load_failure(generation, error.message());
             }
         }
     }
+}
 
-    /// Run the availability gate and media preparation for one load, then
-    /// open the session.
-    fn begin_load(&self, prepared: Result<PreparedGstreamerMedia, String>) -> OpenOutcome {
-        match self.sender.probe() {
-            Ok(()) => match prepared {
-                Ok(prepared) => self.open_session(prepared),
-                Err(message) => OpenOutcome::Failed(SenderError::Receiver(message)),
-            },
-            Err(error) => OpenOutcome::Failed(error),
-        }
+/// Worker for one load: registers its cancellation under the load key, runs
+/// the blocking `open_session` off the UI thread, then owns the live session
+/// and services control commands. Publishes coarse state/position into caches
+/// the UI reads without touching the session (review F2).
+fn run_session_worker(
+    sender: Arc<dyn AirplaySender>,
+    ctx: SenderOpenContext,
+    commands: std::sync::mpsc::Receiver<SessionCommand>,
+    state_cache: Arc<AtomicU8>,
+    position_cache: Arc<Mutex<SenderPosition>>,
+    event_generation: Arc<AtomicU64>,
+) {
+    let proxy = Arc::clone(&ctx.media_proxy);
+    proxy.begin_open(ctx.open_id);
+    let registration = proxy.register_in_flight_cancel(ctx.open_id, &ctx.cancel);
+    if registration.is_superseded() {
+        // Lost the prepare-to-open race: no negotiation and no events. The
+        // load path releases the ticket.
+        release_ticket(&proxy, &ctx);
+        return;
     }
 
-    /// Tear down the active session.
-    fn close_session(&self) {
-        let session = self.session_lock().take();
-        if let Some(session) = session {
+    let generation = ctx.generation;
+    let outcome = sender.open_session(&ctx);
+    // Registration covers only the open call itself; it must not outlive it.
+    drop(registration);
+
+    match outcome {
+        OpenOutcome::Opened(mut session) => {
+            let still_current = event_generation.load(Ordering::SeqCst) == generation.as_raw()
+                && !ctx.cancel.is_cancelled();
+            if !still_current {
+                // A stale open must not start playback.
+                session.close();
+                return;
+            }
+            // `open_session` only prerolls; like every other output, a load
+            // must actually start playback.
+            session.resume();
+            state_cache.store(PlayerState::Playing as u8, Ordering::SeqCst);
+            let _ = ctx
+                .event_tx
+                .try_send(PlayerEvent::state(generation, PlayerState::Playing));
+            loop {
+                state_cache.store(session.state() as u8, Ordering::SeqCst);
+                *position_cache.lock().unwrap_or_else(|p| p.into_inner()) = session.observe();
+                if ctx.cancel.is_cancelled() {
+                    break;
+                }
+                match commands.recv_timeout(Duration::from_millis(200)) {
+                    Ok(SessionCommand::Pause) => session.pause(),
+                    Ok(SessionCommand::Resume) => session.resume(),
+                    Ok(SessionCommand::SetVolume(level)) => session.set_volume(level),
+                    Ok(SessionCommand::Stop) => break,
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            // The worker owns teardown, so the close's blocking restore/join
+            // never runs on the UI thread.
             session.close();
+            state_cache.store(PlayerState::Stopped as u8, Ordering::SeqCst);
+        }
+        OpenOutcome::Cancelled => {
+            // Silent and fully unwound: release this load's ticket on receipt.
+            release_ticket(&proxy, &ctx);
+        }
+        OpenOutcome::Failed(error) => {
+            state_cache.store(PlayerState::Stopped as u8, Ordering::SeqCst);
+            if let SenderError::RecoveryPending { completion, .. } = &error {
+                // Recovery is still outstanding: keep the route in keyed
+                // custody and release it only at the terminal recovery
+                // outcome (review F3). Never release on receipt.
+                if let Some(ticket) = ctx.media_ticket.as_ref() {
+                    proxy.move_to_recovery_custody(ticket);
+                }
+                if event_generation.load(Ordering::SeqCst) == generation.as_raw() {
+                    let _ = ctx
+                        .event_tx
+                        .try_send(PlayerEvent::error(generation, error.message()));
+                    let _ = ctx
+                        .event_tx
+                        .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
+                }
+                let _ = completion.wait();
+                release_ticket(&proxy, &ctx);
+            } else {
+                // Restoration completed inside the seam; release on receipt.
+                release_ticket(&proxy, &ctx);
+                if event_generation.load(Ordering::SeqCst) == generation.as_raw() {
+                    let _ = ctx
+                        .event_tx
+                        .try_send(PlayerEvent::error(generation, error.message()));
+                    let _ = ctx
+                        .event_tx
+                        .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
+                }
+            }
         }
     }
+}
 
-    /// Apply a state transition to the active session, if any.
-    fn set_session_state(&self, target: PlayerState) -> bool {
-        if target == PlayerState::Stopped {
-            self.close_session();
-            return true;
-        }
-        let mut guard = self.session_lock();
-        let Some(session) = guard.as_mut() else {
-            debug!(?target, "AirPlay: no active session for state change");
-            return false;
-        };
-        match target {
-            PlayerState::Playing => session.resume(),
-            PlayerState::Paused => session.pause(),
-            PlayerState::Buffering => {}
-            PlayerState::Stopped => unreachable!("handled above"),
-        }
-        true
+/// Release this load's media ticket, if it had one.
+fn release_ticket(proxy: &Arc<GstreamerMediaProxy>, ctx: &SenderOpenContext) {
+    if let Some(ticket) = ctx.media_ticket.as_ref() {
+        proxy.take_and_release(ticket);
     }
 }
 
@@ -680,8 +872,7 @@ impl AudioOutput for AirPlayOutput {
             .media_proxy
             .prepare(uri)
             .map_err(|_| "AirPlay media preparation failed".to_string());
-        self.finish_load(generation, self.begin_load(prepared));
-        true
+        self.begin_load(generation, prepared)
     }
 
     fn load_resolved(&self, request: ResolvedHttpRequest) -> bool {
@@ -694,8 +885,7 @@ impl AudioOutput for AirPlayOutput {
             .media_proxy
             .prepare_resolved(request)
             .map_err(|_| "AirPlay media preparation failed".to_string());
-        self.finish_load(generation, self.begin_load(prepared));
-        true
+        self.begin_load(generation, prepared)
     }
 
     fn load_local(&self, media: ResolvedLocalMedia) -> bool {
@@ -708,8 +898,7 @@ impl AudioOutput for AirPlayOutput {
             .media_proxy
             .prepare_local(media)
             .map_err(|_| "AirPlay media preparation failed".to_string());
-        self.finish_load(generation, self.begin_load(prepared));
-        true
+        self.begin_load(generation, prepared)
     }
 
     fn set_event_generation(&self, generation: PlayerEventGeneration) {
@@ -738,11 +927,14 @@ impl AudioOutput for AirPlayOutput {
 
     fn toggle_play_pause(&self) {
         let target = {
-            let guard = self.session_lock();
-            guard.as_ref().map(|session| match session.state() {
-                PlayerState::Playing => PlayerState::Paused,
-                PlayerState::Paused | PlayerState::Stopped => PlayerState::Playing,
-                PlayerState::Buffering => PlayerState::Playing,
+            let guard = self.controller_guard();
+            guard.as_ref().map(|controller| {
+                match state_from_u8(controller.state.load(Ordering::SeqCst)) {
+                    PlayerState::Playing => PlayerState::Paused,
+                    PlayerState::Paused | PlayerState::Stopped | PlayerState::Buffering => {
+                        PlayerState::Playing
+                    }
+                }
             })
         };
         if let Some(state) = target {
@@ -757,9 +949,11 @@ impl AudioOutput for AirPlayOutput {
 
     fn set_volume(&mut self, level: f64) {
         self.volume = level.clamp(0.0, 1.0);
-        let mut guard = self.session_lock();
-        if let Some(session) = guard.as_mut() {
-            session.set_volume(self.volume);
+        let guard = self.controller_guard();
+        if let Some(controller) = guard.as_ref() {
+            if let Some(commands) = controller.commands.as_ref() {
+                let _ = commands.send(SessionCommand::SetVolume(self.volume));
+            }
         }
     }
 
@@ -768,18 +962,23 @@ impl AudioOutput for AirPlayOutput {
     }
 
     fn state(&self) -> PlayerState {
-        let guard = self.session_lock();
-        guard
-            .as_ref()
-            .map_or(PlayerState::Stopped, |session| session.state())
+        let guard = self.controller_guard();
+        guard.as_ref().map_or(PlayerState::Stopped, |controller| {
+            state_from_u8(controller.state.load(Ordering::SeqCst))
+        })
     }
 
     fn position_ms(&self) -> Option<u64> {
         // A live RAOP stream owns its position internally; this must not
         // claim progress for a stopped session.
-        let guard = self.session_lock();
-        let session = guard.as_ref()?;
-        session.observe().position_ms
+        let guard = self.controller_guard();
+        let controller = guard.as_ref()?;
+        let position = controller
+            .position
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .position_ms;
+        position
     }
 }
 
@@ -920,7 +1119,7 @@ mod tests {
             Err(self.0.clone())
         }
 
-        fn open_session(&self, _ctx: &SenderOpenContext<'_>) -> OpenOutcome {
+        fn open_session(&self, _ctx: &SenderOpenContext) -> OpenOutcome {
             OpenOutcome::Failed(self.0.clone())
         }
     }
@@ -929,7 +1128,7 @@ mod tests {
     fn a_failing_probe_refuses_the_load_without_opening_a_session() {
         let (tx, rx) = async_channel::unbounded();
         let mut output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
-        output.sender = Box::new(FailingSender(SenderError::Dependency(
+        output.sender = Arc::new(FailingSender(SenderError::Dependency(
             "sender unavailable".to_string(),
         )));
         let generation = PlayerEventGeneration::from_raw(21);
