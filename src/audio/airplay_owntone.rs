@@ -4918,6 +4918,189 @@ mod tests {
         );
     }
 
+    /// X2/W2: the **production** [`run_pump`] path drives a real decode
+    /// pipeline into a real FIFO; the daemon observes the writer's EOF and
+    /// reports completion, and exactly one `TrackEnded` is published after
+    /// `Stopped`, with the daemon restored and the cached state terminal. The
+    /// earlier fixtures called [`natural_completion`] directly with a pipeline
+    /// already gone; this drives the real pump, the real pipe write end and the
+    /// daemon drain.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_pump_publishes_completion_after_a_real_fifo_drain() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        gst::init().expect("GStreamer init");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state_dir = directory.path();
+        let pipe_path = state_dir.join("airplay.pcm");
+        ensure_pipe(&pipe_path).expect("create fifo");
+
+        // A daemon that reports `play` until the FIFO reader observes EOF, then
+        // `stop` — the production completion contract.
+        let drained = Arc::new(AtomicBool::new(false));
+        let server_drained = Arc::clone(&drained);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let api_base = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("addr").port()
+        );
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(stream) = incoming else { continue };
+                let drained = Arc::clone(&server_drained);
+                std::thread::spawn(move || {
+                    use std::io::{BufRead, BufReader, Write};
+                    let Ok(reader_stream) = stream.try_clone() else {
+                        return;
+                    };
+                    let mut reader = BufReader::new(reader_stream);
+                    let mut request = String::new();
+                    let _ = reader.read_line(&mut request);
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut header = String::new();
+                        if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
+                            break;
+                        }
+                        if let Some(value) = header
+                            .to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(str::trim)
+                        {
+                            content_length = value.parse().unwrap_or(0);
+                        }
+                    }
+                    if content_length > 0 {
+                        let mut body = vec![0u8; content_length];
+                        let _ = reader.read_exact(&mut body);
+                    }
+                    let path = request
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    let body = match path.as_str() {
+                        "/api/config" => r#"{"version":"29.3"}"#.to_string(),
+                        "/api/outputs" => r#"{"outputs":[]}"#.to_string(),
+                        "/api/player" => {
+                            let state = if drained.load(Ordering::SeqCst) {
+                                "stop"
+                            } else {
+                                "play"
+                            };
+                            format!(r#"{{"state":"{state}"}}"#)
+                        }
+                        _ => "{}".to_string(),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let mut stream = stream;
+                    let _ = stream.write_all(response.as_bytes());
+                });
+            }
+        });
+
+        // The FIFO reader observes the drained writer and only then flips the
+        // daemon's completion state — a real drain barrier, not a sleep.
+        let reader_path = pipe_path.clone();
+        let reader_drained = Arc::clone(&drained);
+        let reader = std::thread::spawn(move || {
+            let mut fifo = std::fs::OpenOptions::new()
+                .read(true)
+                .open(&reader_path)
+                .expect("open fifo reader");
+            let mut total = 0usize;
+            let mut buffer = [0u8; 4096];
+            loop {
+                match fifo.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => total += read,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            reader_drained.store(true, Ordering::SeqCst);
+            total
+        });
+
+        let (tx, rx) = async_channel::unbounded();
+        let inner = Arc::new(test_session_inner_at_base(&api_base, state_dir, tx));
+        assert!(inner.activate_and_play(), "the accepted start must transmit");
+
+        let write_fd = open_pipe_write(
+            &pipe_path,
+            Instant::now() + Duration::from_secs(5),
+            &inner.cancel,
+        )
+        .unwrap_or_else(|_| panic!("open fifo write end"));
+        let pipeline = gst::parse::launch(&format!(
+            "audiotestsrc num-buffers=8 ! audioconvert ! audio/x-raw,format=S16LE,rate=44100,channels=2 ! fdsink fd={}",
+            write_fd.as_raw_fd(),
+        ))
+        .expect("build pipeline")
+        .downcast::<gst::Pipeline>()
+        .expect("pipeline");
+        *inner.pipeline.lock().unwrap_or_else(|p| p.into_inner()) = Some(pipeline.clone());
+
+        let pump_inner = Arc::clone(&inner);
+        let pump = std::thread::spawn(move || run_pump(pump_inner, pipeline, write_fd));
+
+        let written = reader.join().expect("reader");
+        pump.join().expect("pump");
+
+        assert!(
+            written > 0,
+            "the pipeline must have written PCM into the FIFO before EOF"
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
+                .count(),
+            1,
+            "exactly one TrackEnded: {events:?}"
+        );
+        let stopped_at = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    PlayerEvent::StateChanged {
+                        state: PlayerState::Stopped,
+                        ..
+                    }
+                )
+            })
+            .unwrap_or_else(|| panic!("Stopped must be published: {events:?}"));
+        let ended_at = events
+            .iter()
+            .position(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
+            .expect("TrackEnded");
+        assert!(
+            stopped_at < ended_at,
+            "Stopped must precede TrackEnded: {events:?}"
+        );
+        assert!(
+            inner.restored.load(Ordering::SeqCst),
+            "completion must restore the daemon"
+        );
+        assert_eq!(
+            *inner.state.lock().unwrap_or_else(|p| p.into_inner()),
+            PlayerState::Stopped,
+            "the terminal state must be the final cached state"
+        );
+    }
+
     /// W2: the real [`OwnToneSession::close`] owns teardown. A play in flight
     /// when the close begins is settled by the close's own restoration, and both
     /// the session's media route and the advisory instance lock are released
