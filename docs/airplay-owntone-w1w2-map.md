@@ -161,15 +161,82 @@ UI Stop remains non-blocking: no wait was added to the Stop path.
   asserts the terminal retained outcome and that the process-global supervisor
   settles it and releases the lock.
 
+## Y1 (P2) — the worker start publication must be inside the terminal boundary
+
+**Review.** `.gc/operations/reviews/refinery-20260915-b739bd7-tr-t3a/corrective-instructions.md`
+at rejected head `b739bd7efbc1edbef133c057f84709b3332f1282`, base
+`754fc6d8e6c7e7b99b1fe8844b73482f833d668d`.
+
+**Defect.** `confirm_started` returned `Option<PlayerState>`. OwnTone's
+implementation published `Playing` under `mutation_lock` and returned
+`Some(Playing)`, after which `run_session_worker` stored its own cache and sent
+another `Playing` event **outside** the lock. A concurrent `natural_completion`
+could latch terminal, restore, and publish `Stopped`/`TrackEnded` in that
+window, leaving a current-generation `Playing` after the terminal event.
+`natural_completion`'s error/deadline paths also published `Stopped` *before*
+`restore` latched terminal, opening the same gap to a queued control.
+
+**Fix (`src/audio/airplay_sender.rs`, `src/audio/airplay_output.rs`,
+`src/audio/airplay_owntone.rs`).**
+
+- `SenderSession::confirm_started` now takes the caller's publication as a
+  `&mut dyn FnMut(PlayerState)` and runs it at most once while the session's
+  terminal-ordering boundary is held. `run_session_worker` passes its cache
+  write + state-event send as that closure; a terminal session runs nothing.
+- `SessionInner::publish_under_boundary` is the OwnTone implementation (holds
+  `mutation_lock`, suppresses on the terminal latch). `activate_and_play` still
+  publishes the accepted start through the same boundary.
+- `SessionInner::publish_terminal` latches `terminal` and publishes `Stopped`
+  as one serialized decision. Every terminal pump path uses it: no bus, failed
+  pipeline start, decode error, completion transport loss, drain-deadline miss,
+  and failed restore. The successful completion path publishes through the same
+  latch after `restore`.
+
+**Regressions.**
+
+- `the_worker_start_publication_respects_the_terminal_transition` (caller
+  publication runs/skips under the boundary).
+- `the_worker_start_publication_is_atomic_with_the_terminal_transition`
+  (publication parked inside the boundary vs. the real `natural_completion`).
+- `run_session_worker_publishes_the_start_through_the_session_boundary` drives
+  the real worker with a fake session for both the live and terminal cases.
+
+## Y2 (P2) — production-path fixtures completed this leg
+
+- **Real FIFO EOF/drain.** `the_pump_publishes_completion_after_a_real_fifo_drain`
+  drives `run_pump` (not `natural_completion` in isolation) with a real decode
+  pipeline writing into a real FIFO; the reader observes the writer's EOF and
+  only then flips the daemon to `stop`. Asserts PCM written, exactly one
+  `TrackEnded` after `Stopped`, daemon restored, cached state terminal.
+- **Failed start / no PCM.** `a_failed_start_leaves_the_pump_inert_and_writes_no_pcm`
+  drives the real pump with a refused start: the pipeline never starts, the FIFO
+  reader sees zero bytes, and no `Playing`/`TrackEnded` is published.
+- **Initial volume before first play, through `open()`.** A hermetic *owned*
+  fake daemon (real subprocess, `-c <state>/owntone.conf` argv binding,
+  ownership record, request recording) lets
+  `the_initial_volume_is_applied_before_the_first_play_through_open` drive the
+  real `open()`: the `player/volume` PUT is recorded strictly before the first
+  `player/play`, and no play appears before `open()` returns. This also
+  exercises `verify_owned`/configuration binding (U5 authority path).
+- **Stale `Opened` exact custody/route evidence.**
+  `a_stale_opened_session_releases_its_route_through_the_worker` drives the real
+  `run_session_worker` with a superseded-generation `OpenOutcome::Opened`; the
+  route is released by identity (lease gone, custody empty, route count 0).
+
 ## Remaining gaps (recorded honestly, not claimed)
 
-- Initial-volume daemon-call ordering through `open()` (needs the load path's
-  FIFO reader, which the hermetic fake daemon does not yet provide).
-- Deterministic GStreamer pipeline start/Stop barrier and a real
-  no-`Playing`/no-PCM failed-start assertion for the GStreamer adapter.
-- Stale-`Opened` exact custody/route-count evidence through
-  `AirPlayOutput`/`run_session_worker` (the session-level custody contract is
-  covered).
+- The GStreamer `raopsink` adapter's own deterministic start/Stop barrier and
+  its failed-start/no-PCM assertion cannot run in this environment: `raopsink`
+  is not registered by any currently supported GStreamer package (the same
+  constraint the adapter fails closed on), so `GstreamerRaopSender::open_session`
+  cannot construct a `GstreamerSenderSession` here. The shared `SessionGate`
+  refusal path is covered by the seam unit tests; the OwnTone decode pipeline
+  (also GStreamer) is covered end-to-end above.
+- A live session whose `close` fails restoration and is replaced mid-custody is
+  not yet driven through `AirPlayOutput` end-to-end; the session-level custody
+  and serialized-recovery contracts are covered
+  (`a_session_close_settles_a_stalled_play_and_releases_route_and_lock`,
+  `a_retained_recovery_releases_lock_and_custodied_route_on_settlement`).
 
 ## Validation
 

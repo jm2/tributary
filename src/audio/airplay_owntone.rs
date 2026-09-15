@@ -33,8 +33,7 @@ use tracing::{debug, error, info, warn};
 
 use super::airplay_sender::{
     AirplaySender, OpenCancel, OpenOutcome, RecoveryCompletion, RecoveryOutcome, SenderError,
-    SenderOpenContext, SenderPosition, SenderSession, SenderTarget, SenderWriteOutcome,
-    SessionGate,
+    SenderOpenContext, SenderPosition, SenderSession, SenderWriteOutcome, SessionGate,
 };
 use super::gstreamer_media::{GstreamerMediaProxy, GstreamerMediaTicket};
 use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
@@ -4707,10 +4706,9 @@ mod tests {
         let publisher_inner = Arc::clone(&inner);
         let publisher = std::thread::spawn(move || {
             session.confirm_started(&mut |state| {
-                let _ = publisher_inner.event_tx.try_send(PlayerEvent::state(
-                    publisher_inner.generation,
-                    state,
-                ));
+                let _ = publisher_inner
+                    .event_tx
+                    .try_send(PlayerEvent::state(publisher_inner.generation, state));
                 let _ = entered_tx.send(());
                 // Park inside the boundary until the test releases us, so the
                 // terminal path is placed deterministically behind this
@@ -4977,7 +4975,10 @@ mod tests {
         run_pump(Arc::clone(&inner), pipeline, write_fd);
 
         let written = reader.join().expect("reader");
-        assert_eq!(written, 0, "a refused start must write no PCM into the FIFO");
+        assert_eq!(
+            written, 0,
+            "a refused start must write no PCM into the FIFO"
+        );
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
@@ -5112,7 +5113,10 @@ mod tests {
 
         let (tx, rx) = async_channel::unbounded();
         let inner = Arc::new(test_session_inner_at_base(&api_base, state_dir, tx));
-        assert!(inner.activate_and_play(), "the accepted start must transmit");
+        assert!(
+            inner.activate_and_play(),
+            "the accepted start must transmit"
+        );
 
         let write_fd = open_pipe_write(
             &pipe_path,
@@ -5699,7 +5703,10 @@ fn serve(stream: std::net::TcpStream) {
                 .expect("spawn recording daemon");
             let deadline = Instant::now() + Duration::from_secs(5);
             while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-                assert!(Instant::now() < deadline, "the recording daemon never listened");
+                assert!(
+                    Instant::now() < deadline,
+                    "the recording daemon never listened"
+                );
                 std::thread::sleep(Duration::from_millis(20));
             }
             Self {
@@ -5757,7 +5764,12 @@ fn serve(stream: std::net::TcpStream) {
         let generation = PlayerEventGeneration::from_raw(3);
         let cancel = OpenCancel::new();
         let ctx = SenderOpenContext {
-            target: SenderTarget::new("Test", "127.0.0.1", 7000, Some("aabbcc".to_string())),
+            target: crate::audio::airplay_sender::SenderTarget::new(
+                "Test",
+                "127.0.0.1",
+                7000,
+                Some("aabbcc".to_string()),
+            ),
             prepared_uri: "file:///nonexistent/dummy.wav".to_string(),
             event_tx: tx,
             generation,
@@ -5773,7 +5785,10 @@ fn serve(stream: std::net::TcpStream) {
         let session = match outcome {
             OpenOutcome::Opened(session) => session,
             OpenOutcome::Failed(error) => {
-                panic!("open() failed against the recording daemon: {}", error.message())
+                panic!(
+                    "open() failed against the recording daemon: {}",
+                    error.message()
+                )
             }
             OpenOutcome::Cancelled => panic!("open() was cancelled unexpectedly"),
         };
@@ -5804,7 +5819,9 @@ fn serve(stream: std::net::TcpStream) {
         let volume_at = recorded
             .find("/api/player/volume")
             .expect("volume request recorded");
-        let play_at = recorded.find("/api/player/play").expect("play request recorded");
+        let play_at = recorded
+            .find("/api/player/play")
+            .expect("play request recorded");
         assert!(
             volume_at < play_at,
             "the initial volume must precede the first play: {recorded:?}"
