@@ -153,6 +153,16 @@ impl OwnToneConfig {
         let url = url::Url::parse(&self.api_base)
             .map_err(|_| unavailable("the configured API URL is invalid"))?;
         let host = url.host_str().unwrap_or_default();
+        if is_loopback_host(host) && !is_literal_loopback_host(host) {
+            // "localhost" resolves to *both* loopback families, so the process
+            // the kernel match finds and the address the HTTP client actually
+            // dials can be different listeners (review T5). Require the literal
+            // address the client will use, so the observed family is the
+            // endpoint's family by construction.
+            return Err(unavailable(
+                "the JSON API loopback host must be a literal address (127.0.0.1 or ::1), not an ambiguous name",
+            ));
+        }
         if !is_loopback_host(host) {
             return Err(unavailable("the JSON API must be bound to loopback"));
         }
@@ -249,6 +259,13 @@ struct OwnershipRecord {
 
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+}
+
+/// A loopback host that names exactly one address family, so the `/proc`
+/// listener match and the HTTP client dial the same endpoint (review T5). The
+/// name `localhost` is deliberately excluded: it is ambiguous.
+fn is_literal_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "::1" | "[::1]")
 }
 
 // ---------------------------------------------------------------------------
@@ -373,13 +390,36 @@ fn render_cmdline(raw: &[u8]) -> String {
         .join(" ")
 }
 
-/// The `stat` state letter of a live process (`Z` for a zombie), or `None`
-/// when it no longer exists.
-fn process_state(pid: u32) -> Option<char> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // Skip the parenthesised `comm` (it can contain spaces and ')').
-    let close = stat.rfind(')')?;
-    stat[close + 1..].split_whitespace().next()?.chars().next()
+/// The fail-closed kernel observation of a process (review T5). A `/proc`
+/// read that fails for any reason other than "the pid does not exist" is
+/// **unobserved**, never silently collapsed into absence: an unreadable or
+/// inaccessible state table must not be reported as a quiesced process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessObservation {
+    /// The process exists; the payload is its `stat` state letter (`Z` for a
+    /// zombie, which is terminal for our purposes).
+    Live(char),
+    /// The kernel reports no such process (`/proc/<pid>/stat` is absent).
+    Gone,
+    /// The state could not be read or parsed, so absence is not proven.
+    Unobserved,
+}
+
+/// Observe a process's kernel state without conflating absence with a failed
+/// read (review T5).
+fn observe_process(pid: u32) -> ProcessObservation {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => match stat
+            .rfind(')')
+            .and_then(|close| stat[close + 1..].split_whitespace().next())
+            .and_then(|field| field.chars().next())
+        {
+            Some(state) => ProcessObservation::Live(state),
+            None => ProcessObservation::Unobserved,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProcessObservation::Gone,
+        Err(_) => ProcessObservation::Unobserved,
+    }
 }
 
 /// The kernel start time (field 22 of `/proc/<pid>/stat`) that, paired with
@@ -462,21 +502,69 @@ fn listener_process(api_base: &str) -> Option<ListenerProcess> {
 /// `true` when an argument in `cmdline` names the dedicated instance's state
 /// directory — the out-of-band configuration binding that distinguishes the
 /// owned daemon from a foreign listener that merely holds the same port
-/// (review R5, strengthened by S2).
+/// The configuration file the dedicated instance is launched with inside its
+/// state directory. The ownership record binds `state_dir`, so the launch must
+/// name exactly this file (or the directory itself); any other configuration
+/// file beneath the state directory is a foreign instance (review T5).
+const OWNTONE_CONFIG_FILE: &str = "owntone.conf";
+
+/// Lexically normalize `path` — resolving `.` and `..` components — without
+/// touching the filesystem, so a traversal such as `state/../foreign.conf`
+/// cannot masquerade as a descendant of the state directory (review T5).
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(Component::RootDir.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // `pop` on a lone root returns false; keep the root rather
+                // than dropping it, so an absolute path stays absolute.
+                let _ = out.pop();
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
+/// `true` when an argument in `cmdline` names the dedicated instance's launch
+/// configuration — the out-of-band binding that distinguishes the owned daemon
+/// from a foreign listener that merely holds the same port (review R5,
+/// strengthened by S2 and T5).
 ///
-/// Binding is **path-component exact**: an argument is accepted when it equals
-/// the state directory or has it as a leading path prefix (`/state/owntone.conf`
-/// under `/state`). A bare substring is rejected because a sibling directory
-/// such as `/run/tributary-other` would otherwise match `/run/tributary`, which
-/// is exactly the S2 collision.
+/// Binding is **path-component exact and traversal-safe**: every candidate is
+/// lexically normalized before comparison, so an argument that lexically names
+/// the state directory but escapes it through `..` (`/state/../foreign.conf`)
+/// is refused, and a configuration file beneath the state directory that is
+/// not the canonical `owntone.conf` is refused. A bare substring is rejected
+/// because a sibling directory such as `/run/tributary-other` would otherwise
+/// match `/run/tributary` (the S2 collision).
 fn cmdline_binds_state_dir(cmdline: &str, state_dir: &Path) -> bool {
     if state_dir.as_os_str().is_empty() {
         return false;
     }
-    cmdline.split_whitespace().any(|arg| {
-        let arg = Path::new(arg);
-        arg == state_dir || arg.starts_with(state_dir)
-    })
+    let normalized_state = normalize_path(state_dir);
+    let expected_config = normalized_state.join(OWNTONE_CONFIG_FILE);
+    let mut bound = false;
+    for arg in cmdline.split_whitespace() {
+        let raw = Path::new(arg);
+        let normalized = normalize_path(raw);
+        if normalized == normalized_state || normalized == expected_config {
+            bound = true;
+        } else if normalized.starts_with(&normalized_state) {
+            // A path beneath the state directory that is not the canonical
+            // launch configuration is a foreign file, not this instance.
+            return false;
+        } else if raw.starts_with(state_dir) {
+            // Lexically referenced the state directory but normalized outside
+            // it through `..`: a traversal to a foreign configuration.
+            return false;
+        }
+    }
+    bound
 }
 
 /// Compare an executable path with the configured binary, resolving symlinks
@@ -542,32 +630,69 @@ fn verify_signal_target(
     Ok(())
 }
 
-/// Signal `pid`, escalating to `SIGKILL` at `deadline`, and **confirm** the
-/// process is gone (or a zombie). A signal error is reported rather than
-/// ignored, and `SIGKILL` must be followed by observed exit: quiescence is
-/// only established once the old process is actually gone (review S3).
-fn signal_and_wait(pid: u32, deadline: Duration) -> Result<(), SenderError> {
+/// Re-verify `identity` immediately before a signal (review T5). `Ok(true)`
+/// when the same live process is still present, `Ok(false)` when it is gone
+/// (already quiesced), and `Err` when it was replaced (pid reuse) or could not
+/// be observed — never a silent success.
+fn identity_still_ours(identity: ProcessIdentity) -> Result<bool, SenderError> {
+    match observe_process(identity.pid) {
+        ProcessObservation::Gone => Ok(false),
+        ProcessObservation::Unobserved => Err(unavailable(
+            "the dedicated daemon process state could not be observed",
+        )),
+        ProcessObservation::Live(_) => {
+            if process_start_time(identity.pid) == Some(identity.start_time) {
+                Ok(true)
+            } else {
+                Err(unavailable(
+                    "the dedicated daemon process identity changed before it could be signalled",
+                ))
+            }
+        }
+    }
+}
+
+/// Signal the process named by the stable `identity`, escalating to `SIGKILL`
+/// at `deadline`, and **confirm** the process is gone (or a zombie). Every
+/// signal is bound to the pid/start-time identity immediately before delivery —
+/// including the later `SIGKILL` — so a pid reaped and reused during the wait is
+/// never signalled as the old instance (review S2, review T5). A `/proc` read
+/// that cannot prove absence is an error, not quiescence.
+fn signal_and_wait(identity: ProcessIdentity, deadline: Duration) -> Result<(), SenderError> {
     use rustix::io::Errno;
     use rustix::process::{kill_process, Pid, Signal};
-    let Some(signal_pid) = Pid::from_raw(pid as i32) else {
+    let Some(signal_pid) = Pid::from_raw(identity.pid as i32) else {
         return Err(unavailable("the dedicated daemon process id is invalid"));
     };
+    if !identity_still_ours(identity)? {
+        // Already gone: quiescence is satisfied.
+        return Ok(());
+    }
     match kill_process(signal_pid, Signal::TERM) {
         Ok(()) => {}
-        // Already gone: quiescence is satisfied.
         Err(Errno::SRCH) => return Ok(()),
         Err(_) => return Err(unavailable("the dedicated daemon could not be signalled")),
     }
     let end = Instant::now() + deadline;
     loop {
-        match process_state(pid) {
-            None | Some('Z') => return Ok(()),
-            Some(_) => {}
+        match observe_process(identity.pid) {
+            ProcessObservation::Gone | ProcessObservation::Live('Z') => return Ok(()),
+            ProcessObservation::Live(_) => {}
+            ProcessObservation::Unobserved => {
+                return Err(unavailable(
+                    "the dedicated daemon process state could not be observed",
+                ));
+            }
         }
         if Instant::now() >= end {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+    // Re-bind the identity before escalating: refuse to `SIGKILL` a recycled
+    // pid (review T5).
+    if !identity_still_ours(identity)? {
+        return Ok(());
     }
     match kill_process(signal_pid, Signal::KILL) {
         Ok(()) => {}
@@ -576,9 +701,14 @@ fn signal_and_wait(pid: u32, deadline: Duration) -> Result<(), SenderError> {
     }
     let kill_end = Instant::now() + QUIESCE_KILL_DEADLINE;
     loop {
-        match process_state(pid) {
-            None | Some('Z') => return Ok(()),
-            Some(_) => {}
+        match observe_process(identity.pid) {
+            ProcessObservation::Gone | ProcessObservation::Live('Z') => return Ok(()),
+            ProcessObservation::Live(_) => {}
+            ProcessObservation::Unobserved => {
+                return Err(unavailable(
+                    "the dedicated daemon process state could not be observed",
+                ));
+            }
         }
         if Instant::now() >= kill_end {
             return Err(unavailable(
@@ -598,7 +728,7 @@ fn terminate_process(
     deadline: Duration,
 ) -> Result<(), SenderError> {
     verify_signal_target(process, config)?;
-    signal_and_wait(process.pid, deadline)
+    signal_and_wait(process.identity(), deadline)
 }
 
 /// Run the supervisor's restart command recorded by the installation (review
@@ -2337,8 +2467,11 @@ mod tests {
             binary: PathBuf::from("/usr/bin/owntone"),
         };
         assert!(config("http://127.0.0.1:3689").verify_loopback().is_ok());
-        assert!(config("http://localhost:3689").verify_loopback().is_ok());
         assert!(config("http://[::1]:3689").verify_loopback().is_ok());
+        // T5: an ambiguous name resolves to both loopback families, so the
+        // process the kernel matches and the endpoint HTTP dials can differ.
+        // It is refused; only a literal address is accepted.
+        assert!(config("http://localhost:3689").verify_loopback().is_err());
         assert!(config("http://192.168.1.10:3689")
             .verify_loopback()
             .is_err());
@@ -2517,7 +2650,8 @@ mod tests {
 
     /// R5: the listener bound to a port is resolved to its owning process out
     /// of band. The test binds its own loopback listener, so the owner must be
-    /// this test process.
+    /// this test process. Linux-only: resolution reads `/proc` (review T6).
+    #[cfg(target_os = "linux")]
     #[test]
     fn listener_process_resolves_the_process_bound_to_a_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
@@ -2553,10 +2687,32 @@ mod tests {
         let sibling = format!("{}-other", state_dir.display());
         let cmdline = format!("/usr/bin/owntone -c {sibling}/owntone.conf");
         assert!(!cmdline_binds_state_dir(&cmdline, state_dir));
+
+        // T5: a `..` traversal that lexically names the state directory but
+        // resolves to a foreign file is refused.
+        let traversal = format!(
+            "/usr/bin/owntone -c {}/../foreign.conf",
+            state_dir.display()
+        );
+        assert!(!cmdline_binds_state_dir(&traversal, state_dir));
+
+        // T5: a configuration beneath the state directory that is not the
+        // canonical `owntone.conf` is a foreign instance and is refused.
+        let unrelated = format!("/usr/bin/owntone -c {}/other.conf", state_dir.display());
+        assert!(!cmdline_binds_state_dir(&unrelated, state_dir));
+
+        // A `..` that stays inside the state directory still binds exactly.
+        let inner = format!(
+            "/usr/bin/owntone -c {}/sub/../owntone.conf",
+            state_dir.display()
+        );
+        assert!(cmdline_binds_state_dir(&inner, state_dir));
     }
 
     /// R5: a matching ownership record is not enough — a foreign process bound
-    /// to the configured endpoint is refused.
+    /// to the configured endpoint is refused. Linux-only: resolution reads
+    /// `/proc` (review T6).
+    #[cfg(target_os = "linux")]
     #[test]
     fn verify_daemon_process_refuses_a_foreign_listener() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
@@ -2573,8 +2729,24 @@ mod tests {
         assert!(verify_daemon_process(&config).is_err());
     }
 
-    /// R2/S3: quiescence terminates the owned process (escalating to
-    /// `SIGKILL`) and **confirms** exit before returning.
+    /// T6: on platforms without a Linux `/proc`, the kernel-side process
+    /// binding is explicitly unsupported and fails closed — it never silently
+    /// accepts a listener as the owned instance.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn process_resolution_is_unsupported_off_linux() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let port = listener.local_addr().expect("addr").port();
+        assert!(
+            listener_process(&format!("http://127.0.0.1:{port}")).is_none(),
+            "no /proc enumeration exists off Linux, so no listener may resolve"
+        );
+    }
+
+    /// R2/S3/T5: quiescence terminates the owned process (escalating to
+    /// `SIGKILL`) and **confirms** exit before returning. Linux-only: the
+    /// observation primitive reads `/proc` (review T6).
+    #[cfg(target_os = "linux")]
     #[test]
     fn signal_and_wait_stops_a_child_process() {
         let mut child = std::process::Command::new("sleep")
@@ -2582,15 +2754,20 @@ mod tests {
             .spawn()
             .expect("spawn sleep");
         let pid = child.id();
-        assert!(signal_and_wait(pid, Duration::from_secs(5)).is_ok());
+        let identity = read_process(pid).expect("read child").identity();
+        assert!(signal_and_wait(identity, Duration::from_secs(5)).is_ok());
         // The child is gone or a zombie awaiting our reap — never still
         // running.
-        assert!(matches!(process_state(pid), None | Some('Z')));
+        assert!(matches!(
+            observe_process(pid),
+            ProcessObservation::Gone | ProcessObservation::Live('Z')
+        ));
         let _ = child.wait();
     }
 
-    /// S3: a pid that no longer exists is already quiesced (ESRCH), not an
-    /// error that could mask a live process.
+    /// S3/T5: a pid that no longer exists is already quiesced (ESRCH), not an
+    /// error that could mask a live process. Linux-only (review T6).
+    #[cfg(target_os = "linux")]
     #[test]
     fn signal_and_wait_treats_a_gone_process_as_quiesced() {
         let mut child = std::process::Command::new("sleep")
@@ -2598,9 +2775,30 @@ mod tests {
             .spawn()
             .expect("spawn sleep");
         let pid = child.id();
+        let identity = read_process(pid).expect("read child").identity();
         let _ = child.kill();
         let _ = child.wait();
-        assert!(signal_and_wait(pid, Duration::from_secs(1)).is_ok());
+        assert!(signal_and_wait(identity, Duration::from_secs(1)).is_ok());
+    }
+
+    /// T5: a replaced identity (a pid whose start time no longer matches) is
+    /// refused rather than signalled.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn signal_and_wait_refuses_a_replaced_identity() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        // A forged start time that cannot belong to the live child.
+        let forged = ProcessIdentity {
+            pid,
+            start_time: u64::MAX,
+        };
+        assert!(identity_still_ours(forged).is_err());
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// S3: the recovery outcome retains custody rather than reporting a clean
