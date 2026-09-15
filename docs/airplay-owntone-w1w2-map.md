@@ -223,28 +223,98 @@ window, leaving a current-generation `Playing` after the terminal event.
   `run_session_worker` with a superseded-generation `OpenOutcome::Opened`; the
   route is released by identity (lease gone, custody empty, route count 0).
 
+## Z1/Z2 (P2) — corrective fixtures
+
+**Review.** `.gc/operations/reviews/refinery-20260915-0ac3fcc-tr-t3a/corrective-instructions.md`
+at rejected head `0ac3fcc87f608cc05abd055f7d07becae565ce1c`, base
+`754fc6d8e6c7e7b99b1fe8844b73482f833d668d`.
+
+### Z1a — controller-level failed-live-close replacement
+
+The prior fixture (`StaleSender`/`StaleSession`) invoked `run_session_worker`
+with an already-stale generation and released the ticket from a test double; it
+never drove `AirPlayOutput`'s controller/replacement path with a **live** real
+OwnTone session whose `close` fails restoration.
+
+**Fixture (`a_failed_live_close_is_replaced_without_losing_the_recovery_route`).**
+A hermetic, Tributary-owned fake OwnTone daemon (`controller_regression`) fails
+its restoring `PUT`s while a control file exists; a test `AirplaySender`
+builds one real `OwnToneSession` (with a real advisory lock) per open. The
+production controller (`ControllerHarness`, backed by the real
+`AirPlayOutput::begin_load`/`close_session`) runs:
+
+1. a live load with a real protected-media ticket/route;
+2. a `stop` whose worker close fails restoration — the close hands the route to
+   **real recovery custody** and the regression captures the retained
+   `RetainedRecovery` at that boundary (keyed by `api_base`, so no other
+   recovery can steal it);
+3. a replacement load through the same controller while recovery is
+   outstanding.
+
+Asserted: UI `stop` returns promptly (never blocks on the failing restoration);
+the old exact ticket survives in custody (`is_custodied`, route count 1) and its
+advisory lock stays held; the replacement route installs and is usable
+(`has_active_lease`, route count 1); after settlement (clearing the fail file and
+running one real `RecoveryJob::attempt`) only the old route is shut down and only
+the old lock is released — the replacement route and lock are untouched.
+
+### Z1b — GStreamer adapter start/Stop, failed-start and route cleanup
+
+The GStreamer session is now constructible around an **injected pipeline**
+(`GstreamerSenderSession::for_test_session` /
+`for_test_with_start_effect`), retaining the real `resume`/`close`/state paths;
+the injected `fakesink name=raop` carries a buffer probe so consumption is
+observable without the unavailable production `raopsink`.
+
+- `a_gstreamer_session_start_consumes_buffers_and_close_releases_the_route` —
+  the authorized start runs the injected pipeline, whose sink observably consumes
+  buffers; `close` releases the protected route by identity.
+- `a_stop_before_start_refuses_the_gstreamer_start_and_consumes_no_buffers` — a
+  Stop taken before any start refuses the effect (no start after Stop), consumes
+  no buffers and publishes no `Playing`.
+- `a_failed_gstreamer_state_transition_consumes_no_buffers_and_publishes_no_playing`
+  — an injected start effect that runs and fails reports no start; the pipeline
+  never plays and no `Playing` is published.
+
+No PCM after refusal, no start after Stop, and identity-bound route cleanup are
+all asserted. The real registry probe (`GstreamerRaopSender::probe`) remains
+fail-closed and untouched.
+
+### Z2 — deterministic worker/terminal race
+
+`the_worker_start_publication_is_atomic_with_the_terminal_transition` previously
+invoked `confirm_started` directly and slept 150 ms as arrival evidence, and it
+inspected the session state rather than the worker's own cache.
+
+The rewritten fixture drives the **real `run_session_worker`** (via the new
+test-only `spawn_test_session_worker`) with a real `OwnToneSession`. A
+`#[cfg(test)] SessionProbe` on `SessionInner` (a) parks the worker's own
+cache/event publication inside the settlement boundary *before* its effects run
+and (b) signals when the terminal `restore` reaches that boundary. The test
+asserts the worker cache is still `Buffering` while parked, waits for the
+terminal contender's explicit boundary arrival (no sleep), releases the
+publication, and asserts `Playing` precedes exactly one `TrackEnded`, no
+`Playing`/`Paused` follows it, and the real worker cache is terminal after
+settlement. All prior behavioral assertions are preserved.
+
 ## Remaining gaps (recorded honestly, not claimed)
 
-- The GStreamer `raopsink` adapter's own deterministic start/Stop barrier and
-  its failed-start/no-PCM assertion cannot run in this environment: `raopsink`
-  is not registered by any currently supported GStreamer package (the same
-  constraint the adapter fails closed on), so `GstreamerRaopSender::open_session`
-  cannot construct a `GstreamerSenderSession` here. The shared `SessionGate`
-  refusal path is covered by the seam unit tests; the OwnTone decode pipeline
-  (also GStreamer) is covered end-to-end above.
 - A live session whose `close` fails restoration and is replaced mid-custody is
-  not yet driven through `AirPlayOutput` end-to-end; the session-level custody
-  and serialized-recovery contracts are covered
-  (`a_session_close_settles_a_stalled_play_and_releases_route_and_lock`,
-  `a_retained_recovery_releases_lock_and_custodied_route_on_settlement`).
+  now driven through `AirPlayOutput` end-to-end (Z1a above).
+- The GStreamer adapter's start/Stop, failed-start and route-cleanup paths are
+  now covered with an injected pipeline (Z1b above); the shared `SessionGate`
+  refusal path and the OwnTone decode pipeline (also GStreamer) remain covered by
+  the regressions above.
 
 ## Validation
 
-Run in this worktree against the pushed branch (all exit 0):
+Run in this worktree (all exit 0):
 
 - `cargo check --all-targets --locked`
 - `cargo fmt --check`
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo clippy --release -- -D warnings`
 - `cargo build --release`
-- `cargo test --all-targets`
+- `cargo test --all-targets` — 1953 unit + 30 packaging, 0 failed
+- `cargo test --bin tributary audio::airplay` — 89 passed, 0 failed (includes
+  the Z1a/Z1b/Z2 fixtures above)

@@ -1261,6 +1261,87 @@ struct ActivationState {
     cancelled: bool,
 }
 
+/// Test-only instrumentation for the terminal/publication ordering regressions
+/// (review Z1/Z2). It adds no ordering of its own: it can only *observe* that a
+/// terminal `restore` is about to contend on the settlement boundary, and park
+/// a publication that already holds that boundary *before* its effects run, so
+/// a regression can place the terminal contender deterministically behind it
+/// instead of sleeping and hoping.
+#[cfg(test)]
+#[derive(Default)]
+struct SessionProbe {
+    /// Signalled, once, by a `restore` immediately before it contends on
+    /// `mutation_lock`.
+    restore_attempt: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// The publication holding the settlement boundary.
+    publication_hold: Mutex<PublicationHold>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PublicationHold {
+    /// Signalled, once, once the publication has acquired the boundary and is
+    /// about to run the caller's effects.
+    entered: Option<std::sync::mpsc::Sender<()>>,
+    /// Parked on before the caller's effects run; the test releases it.
+    release: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+impl SessionInner {
+    /// Arm the terminal-contender arrival probe: the next `restore` signals just
+    /// before it attempts the settlement boundary.
+    fn arm_restore_attempt_probe(&self, tx: std::sync::mpsc::Sender<()>) {
+        *self
+            .probe
+            .restore_attempt
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(tx);
+    }
+
+    /// Arm the publication probe: the next `publish_under_boundary` signals that
+    /// it holds the boundary and then parks before running the caller's effects.
+    fn arm_publication_probe(
+        &self,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        let mut hold = self
+            .probe
+            .publication_hold
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        hold.entered = Some(entered);
+        hold.release = Some(release);
+    }
+
+    fn note_restore_attempt(&self) {
+        let attempt = self
+            .probe
+            .restore_attempt
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(tx) = attempt {
+            let _ = tx.send(());
+        }
+    }
+
+    fn note_publication_entered(&self) {
+        let mut hold = self
+            .probe
+            .publication_hold
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(tx) = hold.entered.take() {
+            let _ = tx.send(());
+        }
+        if let Some(release) = hold.release.take() {
+            let _ = release.recv();
+        }
+    }
+}
+
 /// Per-session shared state, driven by the decode pump and read by the seam.
 struct SessionInner {
     client: Arc<OwnToneClient>,
@@ -1318,6 +1399,10 @@ struct SessionInner {
     position: Mutex<SenderPosition>,
     state: Mutex<PlayerState>,
     pipeline: Mutex<Option<gst::Pipeline>>,
+    /// Test-only ordering instrumentation (review Z1/Z2). Compiled out of
+    /// production builds.
+    #[cfg(test)]
+    probe: SessionProbe,
 }
 
 impl SessionInner {
@@ -1433,6 +1518,11 @@ impl SessionInner {
         if self.terminal.load(Ordering::SeqCst) {
             return false;
         }
+        // Test-only: signal that this publication holds the boundary and, when
+        // armed, park before running the caller's effects so a terminal
+        // contender can be placed deterministically behind it (review Z2).
+        #[cfg(test)]
+        self.note_publication_entered();
         publish(PlayerState::Playing);
         true
     }
@@ -1491,6 +1581,11 @@ impl SessionInner {
     /// and release the lock while an earlier timed-out restoration is still
     /// live: it must quiesce first.
     fn restore(&self) -> Result<(), SenderError> {
+        // Test-only: signal that this terminal transition has reached the
+        // settlement boundary (before it contends on the lock), so a regression
+        // can synchronize on real arrival instead of a sleep (review Z2).
+        #[cfg(test)]
+        self.note_restore_attempt();
         let _boundary = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
         // Terminal transition, taken under the settlement boundary **before**
         // any restoring RPC. This is what makes "this session is finished" and
@@ -2346,6 +2441,8 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
         position: Mutex::new(SenderPosition::unknown(ctx.generation)),
         state: Mutex::new(PlayerState::Buffering),
         pipeline: Mutex::new(Some(pipeline.clone())),
+        #[cfg(test)]
+        probe: SessionProbe::default(),
     });
 
     let pump_inner = Arc::clone(&inner);
@@ -2815,6 +2912,53 @@ fn take_injected_recovery_spawn_failure() -> bool {
         .is_ok()
 }
 
+/// Test-only: the endpoint whose next serialized recovery should be captured
+/// instead of started inline. Keyed by `api_base` so a concurrent recovery for
+/// another fixture can never steal the capture, and vice versa (review Z1).
+#[cfg(test)]
+static CAPTURE_RETAINED_API_BASE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Test-only: the captured retained recovery.
+#[cfg(test)]
+static CAPTURED_RETAINED_RECOVERY: Mutex<Option<RetainedRecovery>> = Mutex::new(None);
+
+/// Test-only: capture the next serialized recovery for `api_base` instead of
+/// starting it inline, so a controller-level regression owns the retained
+/// lock/route and drives settlement at a chosen boundary.
+#[cfg(test)]
+fn arm_retained_recovery_capture(api_base: &str) {
+    CAPTURED_RETAINED_RECOVERY
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    *CAPTURE_RETAINED_API_BASE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(api_base.to_string());
+}
+
+/// Test-only: consume the capture arm if it targets this endpoint.
+#[cfg(test)]
+fn take_retained_recovery_capture_for(api_base: &str) -> bool {
+    let mut slot = CAPTURE_RETAINED_API_BASE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if slot.as_deref() == Some(api_base) {
+        *slot = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// Test-only: take the captured retained recovery, if the recovery already ran.
+#[cfg(test)]
+fn take_captured_retained_recovery() -> Option<RetainedRecovery> {
+    CAPTURED_RETAINED_RECOVERY
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+}
+
 fn spawn_serialized_recovery(
     client: Arc<OwnToneClient>,
     config: OwnToneConfig,
@@ -2836,6 +2980,28 @@ fn spawn_serialized_recovery(
     let fallback_recorded = recorded.clone();
     let fallback_route = route.clone();
     let builder = std::thread::Builder::new().name("airplay-owntone-recovery".to_string());
+    // Test-only: hand the retained recovery to the regression instead of
+    // starting an inline owner, so settlement is driven at a chosen boundary.
+    #[cfg(test)]
+    if take_retained_recovery_capture_for(&config.api_base) {
+        let retained_lock = lease.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(lock) = retained_lock {
+            *CAPTURED_RETAINED_RECOVERY
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(RetainedRecovery {
+                client: Arc::clone(&client),
+                config: config.clone(),
+                recorded: recorded.clone(),
+                lock,
+                route: route.clone(),
+                retry_at: Instant::now(),
+            });
+        }
+        completion.resolve(RecoveryOutcome::Retained {
+            message: "test-controlled retained recovery".to_string(),
+        });
+        return completion;
+    }
     let worker_body = move || {
         // Hold the advisory lock until recovery is terminal so ownership is
         // never released early.
@@ -3732,6 +3898,8 @@ mod tests {
             position: Mutex::new(SenderPosition::unknown(PlayerEventGeneration::from_raw(1))),
             state: Mutex::new(PlayerState::Buffering),
             pipeline: Mutex::new(None),
+            #[cfg(test)]
+            probe: SessionProbe::default(),
         };
         assert!(inner.restore().is_err());
         assert!(!inner.restored.load(Ordering::SeqCst));
@@ -3770,6 +3938,8 @@ mod tests {
             position: Mutex::new(SenderPosition::unknown(PlayerEventGeneration::from_raw(1))),
             state: Mutex::new(PlayerState::Buffering),
             pipeline: Mutex::new(None),
+            #[cfg(test)]
+            probe: SessionProbe::default(),
         }
     }
 
@@ -3843,6 +4013,8 @@ mod tests {
             position: Mutex::new(SenderPosition::unknown(PlayerEventGeneration::from_raw(1))),
             state: Mutex::new(PlayerState::Buffering),
             pipeline: Mutex::new(None),
+            #[cfg(test)]
+            probe: SessionProbe::default(),
         }
     }
 
@@ -4674,72 +4846,156 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// Y1: the worker's start publication is **atomic** with the terminal
-    /// transition. The caller's publication is parked *while holding the
-    /// settlement boundary* — exactly where `run_session_worker` now runs it —
-    /// and the real [`natural_completion`] terminal path is started
-    /// concurrently. The terminal path can only acquire the boundary after the
-    /// publication drains, so the order is `Playing` → `Stopped` →
-    /// `TrackEnded` and the final cached state is terminal. Under the rejected
-    /// design the caller published *after* the boundary was released, which the
-    /// terminal path could beat.
+    /// A test sender that hands the real [`run_session_worker`] a single
+    /// prepared session, so the worker's own cache/event publication can be
+    /// interposed while it drives a real `OwnToneSession` boundary (review Z2).
+    struct FixedSessionSender {
+        session: Mutex<Option<Box<dyn SenderSession>>>,
+    }
+
+    impl AirplaySender for FixedSessionSender {
+        fn name(&self) -> &'static str {
+            "test-fixed-session"
+        }
+
+        fn probe(&self) -> Result<(), SenderError> {
+            Ok(())
+        }
+
+        fn open_session(&self, _ctx: &SenderOpenContext) -> OpenOutcome {
+            let session = self
+                .session
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            match session {
+                Some(session) => OpenOutcome::Opened(session),
+                None => OpenOutcome::Failed(unavailable("no prepared test session")),
+            }
+        }
+    }
+
+    /// Y1/Z2: the worker's start publication is **atomic** with the terminal
+    /// transition, driven through the **real** `run_session_worker` and a real
+    /// `OwnToneSession`. The worker's own cache/event publication is parked
+    /// while it holds the settlement boundary, the terminal contender's arrival
+    /// at that boundary is observed explicitly (no sleep as arrival evidence),
+    /// and only then is the publication released. The terminal path acquires the
+    /// boundary after the publication drains, so `Playing` precedes the single
+    /// `TrackEnded` and the terminal state is final. The worker's own cache is
+    /// asserted terminal after settlement — the state the UI reads.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_worker_start_publication_is_atomic_with_the_terminal_transition() {
+        use crate::architecture::media::ResolvedHttpRequest;
+        use crate::audio::airplay_output::{spawn_test_session_worker, TestSessionWorker};
+        use crate::audio::airplay_sender::SenderTarget;
+        use std::sync::atomic::{AtomicU64, AtomicU8};
+
         gst::init().expect("GStreamer init");
         let server = FakeOwnToneServer::start();
         let directory = tempfile::tempdir().expect("tempdir");
         let (tx, rx) = async_channel::unbounded();
-        let inner = Arc::new(test_session_inner_at_base(
-            &server.api_base,
-            directory.path(),
-            tx,
-        ));
-        let session = OwnToneSession {
-            inner: Arc::clone(&inner),
-            pump: None,
-            lock: None,
-        };
 
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let request = ResolvedHttpRequest::new(
+            url::Url::parse("https://music.test/stream.flac").expect("url"),
+        )
+        .expect("resolved request");
+        let prepared = proxy.prepare_resolved(request).expect("prepared media");
+
+        let generation = PlayerEventGeneration::from_raw(41);
+        let inner = Arc::new({
+            let mut inner =
+                test_session_inner_at_base(&server.api_base, directory.path(), tx.clone());
+            inner.generation = generation;
+            inner.media_proxy = Arc::clone(&proxy);
+            inner.media_ticket = prepared.ticket();
+            inner
+        });
+
+        // Park the worker's own publication inside the boundary, and observe the
+        // terminal contender's arrival at it explicitly.
         let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let publisher_inner = Arc::clone(&inner);
-        let publisher = std::thread::spawn(move || {
-            session.confirm_started(&mut |state| {
-                let _ = publisher_inner
-                    .event_tx
-                    .try_send(PlayerEvent::state(publisher_inner.generation, state));
-                let _ = entered_tx.send(());
-                // Park inside the boundary until the test releases us, so the
-                // terminal path is placed deterministically behind this
-                // publication.
-                let _ = release_rx.recv();
-            })
+        inner.arm_publication_probe(entered_tx, release_rx);
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel::<()>();
+        inner.arm_restore_attempt_probe(attempt_tx);
+
+        let cancel = OpenCancel::new();
+        let registration = proxy.register_in_flight_cancel(41, prepared.generation(), &cancel);
+        let ctx = SenderOpenContext {
+            target: SenderTarget::new("Test", "127.0.0.1", 7000, None),
+            prepared_uri: prepared.uri().to_string(),
+            event_tx: tx,
+            generation,
+            media_proxy: Arc::clone(&proxy),
+            media_ticket: prepared.ticket(),
+            volume: 1.0,
+            cancel: cancel.clone(),
+            session_gate: Arc::new(SessionGate::new()),
+            open_id: 41,
+        };
+        let sender = Arc::new(FixedSessionSender {
+            session: Mutex::new(Some(Box::new(OwnToneSession {
+                inner: Arc::clone(&inner),
+                pump: None,
+                lock: None,
+            }))),
         });
 
+        let state_cache = Arc::new(AtomicU8::new(PlayerState::Buffering as u8));
+        let position_cache = Arc::new(Mutex::new(SenderPosition::unknown(generation)));
+        let event_generation = Arc::new(AtomicU64::new(generation.as_raw()));
+        let mut worker: TestSessionWorker = spawn_test_session_worker(
+            sender,
+            ctx,
+            registration,
+            Arc::clone(&state_cache),
+            Arc::clone(&position_cache),
+            event_generation,
+        );
+
+        // The worker has entered its own publication and is parked inside the
+        // boundary *before* its cache/event effects run.
         entered_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("the worker publication must be entered");
+            .expect("the worker publication must enter the boundary");
+        assert_eq!(
+            state_cache.load(Ordering::SeqCst),
+            PlayerState::Buffering as u8,
+            "the publication must be parked before it writes the worker cache"
+        );
 
+        // The real terminal path runs concurrently. Its arrival at the
+        // settlement boundary is observed explicitly, so the assertion below is
+        // not vacuous (no sleep-as-arrival-evidence).
         let completion_inner = Arc::clone(&inner);
         let completion = std::thread::spawn(move || {
-            let pipeline = gst::Pipeline::new();
-            natural_completion(&completion_inner, &pipeline);
+            natural_completion(&completion_inner, &gst::Pipeline::new());
         });
-        // The terminal path must be blocked on the boundary the publication
-        // holds.
-        std::thread::sleep(Duration::from_millis(150));
+        attempt_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the terminal contender must reach the settlement boundary");
         assert!(
             !inner.terminal.load(Ordering::SeqCst),
-            "the terminal transition must not run while the publication holds the boundary"
+            "the terminal transition must not latch while the worker publication holds the boundary"
         );
-        release_tx.send(()).expect("release the publication");
+        release_tx.send(()).expect("release the worker publication");
 
-        assert!(
-            publisher.join().expect("publisher"),
-            "a live session must run the publication"
+        completion.join().expect("completion thread");
+        worker.stop_and_join();
+
+        assert_eq!(
+            worker.cached_state(),
+            PlayerState::Stopped,
+            "the worker's own cache must be terminal after settlement"
         );
-        completion.join().expect("completion");
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -4756,7 +5012,7 @@ mod tests {
                     }
                 )
             })
-            .unwrap_or_else(|| panic!("the publication must be observed: {events:?}"));
+            .unwrap_or_else(|| panic!("the worker publication must be observed: {events:?}"));
         let terminal_at = events
             .iter()
             .position(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
@@ -4764,6 +5020,14 @@ mod tests {
         assert!(
             playing_at < terminal_at,
             "Playing must precede the terminal event: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
+                .count(),
+            1,
+            "exactly one TrackEnded must be published: {events:?}"
         );
         assert!(
             !events.iter().skip(terminal_at).any(|event| matches!(
@@ -4774,11 +5038,6 @@ mod tests {
                 }
             )),
             "no Playing/Paused may follow the terminal TrackEnded: {events:?}"
-        );
-        assert_eq!(
-            *inner.state.lock().unwrap_or_else(|p| p.into_inner()),
-            PlayerState::Stopped,
-            "the terminal transition must be the final cached state"
         );
     }
 
@@ -5829,5 +6088,491 @@ fn serve(stream: std::net::TcpStream) {
 
         session.close();
         reader.join().expect("reader");
+    }
+
+    /// Z1: a live session whose close fails restoration must be replaced
+    /// through the **real controller** without losing either route. The close
+    /// hands the old route to real recovery custody; the old exact ticket
+    /// survives only while recovery owns it; a replacement load through the
+    /// same controller installs a usable route; and settlement releases only the
+    /// old route and the old advisory lock. UI Stop never blocks on the failing
+    /// restoration.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_live_close_is_replaced_without_losing_the_recovery_route() {
+        use super::controller_regression::ControllerReplacementFixture;
+        use crate::architecture::media::ResolvedHttpRequest;
+        use crate::audio::airplay_output::ControllerHarness;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let fixture = ControllerReplacementFixture::start();
+        let (tx, _rx) = async_channel::unbounded();
+        let harness = ControllerHarness::new(runtime.handle().clone(), fixture.sender(), tx);
+
+        // --- Live load #1, with a real protected-media route. ---
+        let old_generation = PlayerEventGeneration::from_raw(1);
+        harness.set_generation(old_generation);
+        let old_prepared = harness.prepare(
+            ResolvedHttpRequest::new(
+                url::Url::parse("https://music.test/stream-a.flac").expect("url"),
+            )
+            .expect("resolved request"),
+        );
+        let old_ticket = old_prepared.ticket().expect("old protected ticket");
+        harness.load(old_generation, old_prepared);
+        wait_until(|| harness.state() == PlayerState::Playing);
+        let proxy = harness.proxy();
+        assert!(proxy.has_active_lease());
+        assert_eq!(old_ticket.route_count(), 1);
+
+        // --- UI Stop must not block on the failing restoration; the retained
+        // recovery is handed to the regression at its boundary. ---
+        fixture.arm_capture();
+        let stopped = Instant::now();
+        harness.stop();
+        assert!(
+            stopped.elapsed() < Duration::from_millis(500),
+            "UI Stop must not block on the failing restoration: {:?}",
+            stopped.elapsed()
+        );
+
+        wait_until(|| proxy.is_custodied(&old_ticket));
+        assert_eq!(
+            old_ticket.route_count(),
+            1,
+            "the old route must survive while recovery owns it"
+        );
+        let recovery = wait_for_captured_recovery();
+        let old_locks = fixture.lock_paths();
+        assert_eq!(old_locks.len(), 1, "the live session held one real lock");
+        assert!(
+            flock_is_held(&old_locks[0]),
+            "the retained recovery must hold the old advisory lock"
+        );
+
+        // --- Replacement load #2 while the retained recovery is outstanding. ---
+        let new_generation = PlayerEventGeneration::from_raw(2);
+        harness.set_generation(new_generation);
+        let new_prepared = harness.prepare(
+            ResolvedHttpRequest::new(
+                url::Url::parse("https://music.test/stream-b.flac").expect("url"),
+            )
+            .expect("resolved request"),
+        );
+        let new_ticket = new_prepared.ticket().expect("new protected ticket");
+        harness.load(new_generation, new_prepared);
+        wait_until(|| harness.state() == PlayerState::Playing);
+        assert!(
+            proxy.has_active_lease(),
+            "the replacement route must be the active lease"
+        );
+        assert_eq!(
+            new_ticket.route_count(),
+            1,
+            "the replacement route must be usable"
+        );
+        assert!(!proxy.is_custodied(&new_ticket));
+        assert!(
+            proxy.is_custodied(&old_ticket),
+            "the old route stays in recovery custody"
+        );
+        assert_eq!(old_ticket.route_count(), 1);
+
+        // --- Settlement releases only the old route and the old lock. ---
+        fixture.allow_settlement();
+        assert!(
+            recovery.attempt(),
+            "the retained recovery must settle once restoration can succeed"
+        );
+        drop(recovery);
+        wait_until(|| !proxy.has_custody_entries());
+        assert_eq!(
+            old_ticket.route_count(),
+            0,
+            "settlement must shut down the old route"
+        );
+        assert!(
+            flock_is_acquirable(&old_locks[0]),
+            "settlement must release the old advisory lock"
+        );
+        assert!(
+            proxy.has_active_lease(),
+            "the replacement route must remain usable"
+        );
+        assert_eq!(
+            new_ticket.route_count(),
+            1,
+            "settlement must not touch the replacement route"
+        );
+
+        harness.stop();
+        wait_until(|| !proxy.has_active_lease());
+    }
+
+    /// Poll for the retained recovery the failing close handed off.
+    fn wait_for_captured_recovery() -> super::controller_regression::CapturedRetainedRecovery {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(recovery) =
+                super::controller_regression::ControllerReplacementFixture::take_captured()
+            {
+                return recovery;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the failing close never handed off its retained recovery"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn flock_is_held(path: &Path) -> bool {
+        let file = open_lock(path).expect("open competing lock");
+        rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive).is_err()
+    }
+
+    fn flock_is_acquirable(path: &Path) -> bool {
+        let file = open_lock(path).expect("open competing lock");
+        rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive).is_ok()
+    }
+}
+
+/// Test-only support for the controller-level failed-live-close/replacement
+/// regression (review Z1). It owns a hermetic, Tributary-owned fake OwnTone
+/// daemon whose restoring RPCs fail while a control file exists, a real
+/// [`AirplaySender`] that builds one real [`OwnToneSession`] per open (with a
+/// real advisory lock), and the hand-off of the retained recovery to the test
+/// so settlement is driven at a chosen boundary.
+#[cfg(test)]
+pub(super) mod controller_regression {
+    use super::*;
+
+    /// A hermetic fake daemon that answers the adapter's HTTP contract, but
+    /// returns `500` for the restoring `player/stop` and `outputs/set` while the
+    /// path named by `TRIBUTARY_FAKE_FAIL_RESTORE` exists. Launched with
+    /// `-c <state>/owntone.conf`, it satisfies the adapter's ownership binding so
+    /// `quiesce_daemon` can genuinely terminate and restart it.
+    const RESTORE_SWITCH_DAEMON_SOURCE: &str = r##"
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+
+fn main() {
+    let addr = std::env::var("TRIBUTARY_FAKE_LISTEN").expect("listen address");
+    let fail = std::env::var("TRIBUTARY_FAKE_FAIL_RESTORE").ok();
+    let listener = TcpListener::bind(&addr).expect("bind");
+    for incoming in listener.incoming() {
+        let Ok(stream) = incoming else { continue };
+        let fail = fail.clone();
+        std::thread::spawn(move || serve(stream, fail));
+    }
+}
+
+fn serve(stream: std::net::TcpStream, fail: Option<String>) {
+    let Ok(reader_stream) = stream.try_clone() else { return };
+    let mut reader = BufReader::new(reader_stream);
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).is_err() { return; }
+    let trimmed = request_line.trim().to_string();
+    if trimmed.is_empty() { return; }
+    let mut content_length = 0usize;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).is_err() || header.trim().is_empty() { break; }
+        if let Some(value) = header
+            .to_ascii_lowercase()
+            .strip_prefix("content-length:")
+            .map(str::trim)
+        {
+            content_length = value.parse().unwrap_or(0);
+        }
+    }
+    if content_length > 0 {
+        let mut body = vec![0u8; content_length];
+        let _ = reader.read_exact(&mut body);
+    }
+    let path = trimmed.split_whitespace().nth(1).unwrap_or_default().to_string();
+    let failing = fail
+        .as_deref()
+        .is_some_and(|file| std::path::Path::new(file).exists())
+        && matches!(path.as_str(), "/api/player/stop" | "/api/outputs/set");
+    let (status, body) = if failing {
+        ("500 Internal Server Error", "{\"error\":\"restoration refused\"}".to_string())
+    } else {
+        let body = match path.as_str() {
+            "/api/config" => r#"{"version":"29.3"}"#.to_string(),
+            "/api/outputs" => r#"{"outputs":[]}"#.to_string(),
+            "/api/player" => r#"{"state":"stop"}"#.to_string(),
+            _ => "{}".to_string(),
+        };
+        ("200 OK", body)
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let mut stream = stream;
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+"##;
+
+    /// Owns the fake daemon and the config that binds it for the duration of the
+    /// regression. `Drop` stops whichever instance currently holds the endpoint
+    /// (the recovery may have restarted it) and reaps the initial child.
+    pub(super) struct ControllerReplacementFixture {
+        api_base: String,
+        state_dir: PathBuf,
+        binary: PathBuf,
+        fail_restore: PathBuf,
+        lock_paths: Arc<Mutex<Vec<PathBuf>>>,
+        child: Option<std::process::Child>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl Drop for ControllerReplacementFixture {
+        fn drop(&mut self) {
+            let config = OwnToneConfig {
+                api_base: self.api_base.clone(),
+                pipe_path: self.state_dir.join("airplay.pcm"),
+                state_dir: self.state_dir.clone(),
+                binary: self.binary.clone(),
+            };
+            if let Some(process) = listener_process(&self.api_base) {
+                let _ = terminate_process(&process, &config, Duration::from_secs(5));
+            }
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.wait();
+            }
+        }
+    }
+
+    impl ControllerReplacementFixture {
+        /// Compile and start the daemon, bind it as the owned instance (record +
+        /// restart command carrying the failing-restoration control file), and
+        /// leave restoration failing until [`Self::allow_settlement`].
+        pub(super) fn start() -> Self {
+            use std::net::TcpListener;
+
+            let directory = tempfile::tempdir().expect("tempdir");
+            let state_dir = directory.path().join("state");
+            std::fs::create_dir_all(&state_dir).expect("state dir");
+            let pipe = state_dir.join("airplay.pcm");
+            let config_path = state_dir.join(OWNTONE_CONFIG_FILE);
+            std::fs::write(
+                &config_path,
+                format!("pipe_path = \"{}\"\n", pipe.display()),
+            )
+            .expect("write config");
+
+            let source = directory.path().join("fake_restore_switch.rs");
+            std::fs::write(&source, RESTORE_SWITCH_DAEMON_SOURCE).expect("write source");
+            let binary = directory.path().join("fake_owntone");
+            let compiled = std::process::Command::new("rustc")
+                .arg("-O")
+                .arg(&source)
+                .arg("-o")
+                .arg(&binary)
+                .status()
+                .expect("invoke rustc");
+            assert!(compiled.success(), "the restore-switch daemon must compile");
+
+            let probe = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+            let port = probe.local_addr().expect("addr").port();
+            drop(probe);
+            let api_base = format!("http://127.0.0.1:{port}");
+
+            let fail_restore = state_dir.join("fail-restore");
+            // Present from the start: the live close's restoration must fail so
+            // the route is retained for recovery.
+            std::fs::write(&fail_restore, b"fail").expect("write fail flag");
+
+            let config = OwnToneConfig {
+                api_base: api_base.clone(),
+                pipe_path: pipe.clone(),
+                state_dir: state_dir.clone(),
+                binary: binary.clone(),
+            };
+            let restart = format!(
+                "TRIBUTARY_FAKE_LISTEN=127.0.0.1:{port} TRIBUTARY_FAKE_FAIL_RESTORE={} {} -c {}",
+                fail_restore.display(),
+                binary.display(),
+                config_path.display()
+            );
+            let record = OwnershipRecord {
+                token: OWNER_TOKEN.to_string(),
+                api_base: api_base.clone(),
+                pipe_path: pipe.to_string_lossy().into_owned(),
+                state_dir: state_dir.to_string_lossy().into_owned(),
+                binary: binary.to_string_lossy().into_owned(),
+                restart_command: Some(restart),
+            };
+            std::fs::write(
+                config.owner_marker(),
+                serde_json::to_vec(&record).expect("serialize record"),
+            )
+            .expect("write ownership record");
+
+            let child = std::process::Command::new(&binary)
+                .arg("-c")
+                .arg(&config_path)
+                .env("TRIBUTARY_FAKE_LISTEN", format!("127.0.0.1:{port}"))
+                .env("TRIBUTARY_FAKE_FAIL_RESTORE", &fail_restore)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn restore-switch daemon");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the restore-switch daemon never listened"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            Self {
+                api_base,
+                state_dir,
+                binary,
+                fail_restore,
+                lock_paths: Arc::new(Mutex::new(Vec::new())),
+                child: Some(child),
+                _directory: directory,
+            }
+        }
+
+        /// A real sender that builds one real `OwnToneSession` per open, each
+        /// holding a real advisory lock recorded for the regression.
+        pub(super) fn sender(&self) -> Arc<dyn AirplaySender> {
+            let config = OwnToneConfig {
+                api_base: self.api_base.clone(),
+                pipe_path: self.state_dir.join("airplay.pcm"),
+                state_dir: self.state_dir.clone(),
+                binary: self.binary.clone(),
+            };
+            Arc::new(ControllerSessionSender {
+                config,
+                state_dir: self.state_dir.clone(),
+                lock_paths: Arc::clone(&self.lock_paths),
+            })
+        }
+
+        /// Let restoration succeed from now on (the settlement boundary).
+        pub(super) fn allow_settlement(&self) {
+            match std::fs::remove_file(&self.fail_restore) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("could not clear the fail-restore flag: {error}"),
+            }
+        }
+
+        /// The advisory lock files handed out so far, in open order.
+        pub(super) fn lock_paths(&self) -> Vec<PathBuf> {
+            self.lock_paths
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
+
+        /// Capture the next serialized recovery instead of letting it run inline.
+        pub(super) fn arm_capture(&self) {
+            arm_retained_recovery_capture(&self.api_base);
+        }
+
+        /// Take the captured retained recovery, if the failing close has run.
+        pub(super) fn take_captured() -> Option<CapturedRetainedRecovery> {
+            take_captured_retained_recovery().map(|job| CapturedRetainedRecovery { job })
+        }
+    }
+
+    /// A real sender that builds real sessions bound to the fixture daemon.
+    struct ControllerSessionSender {
+        config: OwnToneConfig,
+        state_dir: PathBuf,
+        lock_paths: Arc<Mutex<Vec<PathBuf>>>,
+    }
+
+    impl AirplaySender for ControllerSessionSender {
+        fn name(&self) -> &'static str {
+            "test-controller-session"
+        }
+
+        fn probe(&self) -> Result<(), SenderError> {
+            Ok(())
+        }
+
+        fn open_session(&self, ctx: &SenderOpenContext) -> OpenOutcome {
+            let client = match OwnToneClient::new(&self.config.api_base) {
+                Ok(client) => Arc::new(client),
+                Err(error) => return OpenOutcome::Failed(error),
+            };
+            let index = self
+                .lock_paths
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len()
+                + 1;
+            let lock_path = self.state_dir.join(format!("session-{index}.lock"));
+            let lock = match open_lock(&lock_path) {
+                Ok(lock) => lock,
+                Err(error) => return OpenOutcome::Failed(error),
+            };
+            if rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).is_err() {
+                return OpenOutcome::Failed(unavailable("the test session lock is contested"));
+            }
+            self.lock_paths
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(lock_path);
+
+            let inner = SessionInner {
+                client,
+                config: self.config.clone(),
+                generation: ctx.generation,
+                event_tx: ctx.event_tx.clone(),
+                recorded: TakeoverRecord {
+                    enabled_outputs: vec![1],
+                    selected_output: 0,
+                },
+                media_proxy: Arc::clone(&ctx.media_proxy),
+                media_ticket: ctx.media_ticket.clone(),
+                running: AtomicBool::new(true),
+                activation: Mutex::new(ActivationState::default()),
+                gate: Arc::clone(&ctx.session_gate),
+                cancel: ctx.cancel.clone(),
+                restored: AtomicBool::new(false),
+                terminal: AtomicBool::new(false),
+                mutation_lock: Mutex::new(()),
+                unsettled: AtomicUsize::new(0),
+                position: Mutex::new(SenderPosition::unknown(ctx.generation)),
+                state: Mutex::new(PlayerState::Buffering),
+                pipeline: Mutex::new(None),
+                probe: SessionProbe::default(),
+            };
+            OpenOutcome::Opened(Box::new(OwnToneSession {
+                inner: Arc::new(inner),
+                pump: None,
+                lock: Some(lock),
+            }))
+        }
+    }
+
+    /// The real retained recovery the controller's failing close handed off,
+    /// driven by the regression at its chosen settlement boundary.
+    pub(super) struct CapturedRetainedRecovery {
+        job: RetainedRecovery,
+    }
+
+    impl CapturedRetainedRecovery {
+        /// One real settlement attempt: quiesce the owned daemon, restore it,
+        /// and release the retained route by identity on success.
+        pub(super) fn attempt(&self) -> bool {
+            self.job.attempt()
+        }
     }
 }

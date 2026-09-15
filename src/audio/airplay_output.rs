@@ -89,6 +89,59 @@ struct GstreamerSenderSession {
     /// by [`AirPlayOutput::close_session`] serializes with `resume` so a start
     /// can never be authorized after a Stop.
     gate: Arc<SessionGate>,
+    /// Test-only override for the start effect, so a regression can drive a
+    /// deterministic failed state transition through the real session without a
+    /// transmitter. Compiled out of production builds.
+    #[cfg(test)]
+    start_effect: Option<Box<dyn Fn() -> bool + Send>>,
+}
+
+impl GstreamerSenderSession {
+    fn new(
+        pipeline: gst::Pipeline,
+        ctx: &SenderOpenContext,
+        bus_watch: gst::bus::BusWatchGuard,
+    ) -> Self {
+        Self {
+            pipeline,
+            media_ticket: ctx.media_ticket.clone(),
+            _bus_watch: bus_watch,
+            generation: ctx.generation,
+            media_proxy: Arc::clone(&ctx.media_proxy),
+            gate: Arc::clone(&ctx.session_gate),
+            #[cfg(test)]
+            start_effect: None,
+        }
+    }
+
+    /// Test-only constructor: attach the real bus watch and build the session
+    /// around an injected pipeline, retaining the actual `resume`/`close` and
+    /// state paths (review Z1).
+    #[cfg(test)]
+    fn for_test_session(pipeline: gst::Pipeline, ctx: &SenderOpenContext) -> Result<Self, String> {
+        let bus_watch = attach_bus_watch(
+            &pipeline,
+            &ctx.event_tx,
+            ctx.generation,
+            &ctx.media_proxy,
+            ctx.media_ticket.clone(),
+        )?;
+        Ok(Self::new(pipeline, ctx, bus_watch))
+    }
+
+    /// Test-only constructor with an injected start effect, so a regression can
+    /// drive a genuinely failed state transition (the effect runs and reports
+    /// failure) through the real `resume`.
+    #[cfg(test)]
+    fn for_test_with_start_effect(
+        pipeline: gst::Pipeline,
+        ctx: &SenderOpenContext,
+        start_effect: Box<dyn Fn() -> bool + Send>,
+    ) -> Result<Self, String> {
+        let mut session = Self::for_test_session(pipeline, ctx)?;
+        session.start_effect = Some(start_effect);
+        Ok(session)
+    }
 }
 
 impl SenderSession for GstreamerSenderSession {
@@ -114,6 +167,10 @@ impl SenderSession for GstreamerSenderSession {
         // the start) or loses and is followed by the session's own `Null`
         // teardown, which settles the already-started pipeline (review U3).
         let pipeline = self.pipeline.clone();
+        #[cfg(test)]
+        if let Some(effect) = self.start_effect.take() {
+            return self.gate.start(effect);
+        }
         self.gate
             .start(move || pipeline.set_state(gst::State::Playing).is_ok())
     }
@@ -288,14 +345,9 @@ impl AirplaySender for GstreamerRaopSender {
             "AirPlay: session opened via raopsink"
         );
 
-        OpenOutcome::Opened(Box::new(GstreamerSenderSession {
-            pipeline,
-            media_ticket: ctx.media_ticket.clone(),
-            _bus_watch: bus_watch,
-            generation: ctx.generation,
-            media_proxy: Arc::clone(&ctx.media_proxy),
-            gate: Arc::clone(&ctx.session_gate),
-        }))
+        OpenOutcome::Opened(Box::new(GstreamerSenderSession::new(
+            pipeline, ctx, bus_watch,
+        )))
     }
 }
 
@@ -928,6 +980,127 @@ fn run_session_worker(
 fn release_ticket(proxy: &Arc<GstreamerMediaProxy>, ctx: &SenderOpenContext) {
     if let Some(ticket) = ctx.media_ticket.as_ref() {
         proxy.take_and_release(ticket);
+    }
+}
+
+/// Test-only harness that drives the real [`run_session_worker`] for a
+/// caller-supplied sender/session, so a regression can exercise the production
+/// worker path (its own cache/event publication, command loop and teardown)
+/// rather than a session in isolation (review Z2).
+#[cfg(test)]
+pub(super) struct TestSessionWorker {
+    state_cache: Arc<AtomicU8>,
+    commands: Option<std::sync::mpsc::Sender<SessionCommand>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl TestSessionWorker {
+    /// The worker's own coarse state cache, exactly as the UI reads it.
+    pub(super) fn cached_state(&self) -> PlayerState {
+        state_from_u8(self.state_cache.load(Ordering::SeqCst))
+    }
+
+    /// Deliver a `Stop` and join the worker, releasing its teardown.
+    pub(super) fn stop_and_join(&mut self) {
+        if let Some(commands) = self.commands.take() {
+            let _ = commands.send(SessionCommand::Stop);
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Spawn the real [`run_session_worker`] on its own thread for a test-supplied
+/// sender and context. The returned harness exposes the worker's own caches and
+/// a deterministic stop/join.
+#[cfg(test)]
+pub(super) fn spawn_test_session_worker(
+    sender: Arc<dyn AirplaySender>,
+    ctx: SenderOpenContext,
+    registration: InFlightCancelRegistration,
+    state_cache: Arc<AtomicU8>,
+    position_cache: Arc<Mutex<SenderPosition>>,
+    event_generation: Arc<AtomicU64>,
+) -> TestSessionWorker {
+    let (commands, command_rx) = mpsc::channel();
+    let worker_state = Arc::clone(&state_cache);
+    let worker_position = Arc::clone(&position_cache);
+    let handle = std::thread::Builder::new()
+        .name("airplay-test-load".to_string())
+        .spawn(move || {
+            run_session_worker(
+                sender,
+                ctx,
+                registration,
+                command_rx,
+                worker_state,
+                worker_position,
+                event_generation,
+            );
+        })
+        .expect("spawn test session worker");
+    TestSessionWorker {
+        state_cache,
+        commands: Some(commands),
+        handle: Some(handle),
+    }
+}
+
+/// Test-only controller harness around a real [`AirPlayOutput`]: it exposes the
+/// exact `begin_load`/`stop`/cache/route surface the production controller uses,
+/// so a cross-module regression can drive the controller/replacement path
+/// without reaching into private fields.
+#[cfg(test)]
+pub(super) struct ControllerHarness {
+    output: AirPlayOutput,
+}
+
+#[cfg(test)]
+impl ControllerHarness {
+    pub(super) fn new(
+        runtime: tokio::runtime::Handle,
+        sender: Arc<dyn AirplaySender>,
+        event_tx: async_channel::Sender<PlayerEvent>,
+    ) -> Self {
+        let mut output =
+            AirPlayOutput::new("Test", "127.0.0.1", 7000, event_tx, 1.0).with_runtime(runtime);
+        output.sender = sender;
+        Self { output }
+    }
+
+    /// Mint a protected route through the output's own media proxy.
+    pub(super) fn prepare(&self, request: ResolvedHttpRequest) -> PreparedGstreamerMedia {
+        self.output
+            .media_proxy
+            .prepare_resolved(request)
+            .expect("prepare protected media")
+    }
+
+    /// Start a load on the production controller with already-prepared media.
+    pub(super) fn load(&self, generation: PlayerEventGeneration, prepared: PreparedGstreamerMedia) {
+        assert!(
+            self.output.begin_load(generation, || Ok(prepared)),
+            "the controller must accept the load"
+        );
+    }
+
+    pub(super) fn set_generation(&self, generation: PlayerEventGeneration) {
+        self.output.set_event_generation(generation);
+    }
+
+    pub(super) fn proxy(&self) -> Arc<GstreamerMediaProxy> {
+        Arc::clone(&self.output.media_proxy)
+    }
+
+    pub(super) fn state(&self) -> PlayerState {
+        self.output.state()
+    }
+
+    /// The production non-blocking Stop path (signals and detaches the worker).
+    pub(super) fn stop(&self) {
+        self.output.stop();
     }
 }
 
@@ -1932,5 +2105,279 @@ fn main() {
             }) if event_generation == generation
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    // ----- Z1: GStreamer adapter start/Stop, failed-start and route cleanup -----
+
+    /// The count of buffers the injected pipeline's sink has consumed, signalled
+    /// on a condvar so a regression waits on the real effect rather than a
+    /// sleep.
+    type BufferCounter = Arc<(Mutex<usize>, std::sync::Condvar)>;
+
+    /// Build the injected RAOP-shaped pipeline around a `fakesink` named
+    /// `raop` (the element name [`GstreamerSenderSession`] looks up), with a
+    /// buffer probe on its sink pad so consumption is observable.
+    fn test_pipeline_with_buffer_counter() -> (gst::Pipeline, BufferCounter) {
+        let pipeline = gst::parse::launch(
+            "audiotestsrc ! audioconvert ! audio/x-raw,format=S16LE,rate=44100,channels=2 ! fakesink name=raop sync=false",
+        )
+        .expect("parse test pipeline")
+        .downcast::<gst::Pipeline>()
+        .expect("test pipeline");
+        let sink = pipeline.by_name("raop").expect("test sink");
+        let counter: BufferCounter = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
+        let probe_counter = Arc::clone(&counter);
+        sink.static_pad("sink").expect("test sink pad").add_probe(
+            gst::PadProbeType::BUFFER,
+            move |_, _| {
+                let (lock, cvar) = &*probe_counter;
+                *lock.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                cvar.notify_all();
+                gst::PadProbeReturn::Ok
+            },
+        );
+        (pipeline, counter)
+    }
+
+    fn buffer_count(counter: &BufferCounter) -> usize {
+        *counter.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn wait_for_buffers(counter: &BufferCounter, minimum: usize) {
+        let (lock, cvar) = &**counter;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut count = lock.lock().unwrap_or_else(|p| p.into_inner());
+        while *count < minimum {
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "the pipeline consumed no buffers (count={})",
+                *count
+            );
+            let (next, _) = cvar
+                .wait_timeout(count, deadline - now)
+                .unwrap_or_else(|p| p.into_inner());
+            count = next;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_session_ctx(
+        proxy: &Arc<GstreamerMediaProxy>,
+        ticket: Option<Arc<GstreamerMediaTicket>>,
+        event_tx: async_channel::Sender<PlayerEvent>,
+        gate: Arc<SessionGate>,
+        generation: PlayerEventGeneration,
+    ) -> SenderOpenContext {
+        SenderOpenContext {
+            target: SenderTarget::new("Test", "127.0.0.1", 7000, None),
+            prepared_uri: "http://127.0.0.1:1/media".to_string(),
+            event_tx,
+            generation,
+            media_proxy: Arc::clone(proxy),
+            media_ticket: ticket,
+            volume: 1.0,
+            cancel: OpenCancel::new(),
+            session_gate: gate,
+            open_id: 1,
+        }
+    }
+
+    /// Z1: the real [`GstreamerSenderSession`] start/Stop interposition. A
+    /// `resume` is authorized and starts the injected pipeline, whose sink
+    /// observably consumes buffers; a `Stop` taken through the session's shared
+    /// gate then refuses a later start, and `close` releases the protected
+    /// route by identity. This drives the production session's own
+    /// `resume`/`close` paths rather than the seam in isolation.
+    #[test]
+    fn a_gstreamer_session_start_consumes_buffers_and_close_releases_the_route() {
+        gst::init().expect("GStreamer init");
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let request = ResolvedHttpRequest::new(
+            url::Url::parse("https://music.test/stream.flac").expect("url"),
+        )
+        .expect("resolved request");
+        let prepared = proxy.prepare_resolved(request).expect("prepared media");
+        let ticket = prepared.ticket().expect("protected media ticket");
+        assert!(proxy.has_active_lease());
+        assert_eq!(ticket.route_count(), 1);
+
+        let (tx, _rx) = async_channel::unbounded();
+        let gate = Arc::new(SessionGate::new());
+        let generation = PlayerEventGeneration::from_raw(11);
+        let ctx = test_session_ctx(
+            &proxy,
+            Some(Arc::clone(&ticket)),
+            tx,
+            Arc::clone(&gate),
+            generation,
+        );
+
+        let (pipeline, counter) = test_pipeline_with_buffer_counter();
+        let session = GstreamerSenderSession::for_test_session(pipeline, &ctx).expect("session");
+        let mut session = Box::new(session);
+
+        assert!(
+            session.resume(),
+            "the authorized start must run the injected pipeline"
+        );
+        wait_for_buffers(&counter, 1);
+        assert!(
+            buffer_count(&counter) >= 1,
+            "the started pipeline must consume buffers"
+        );
+
+        // The production close takes the shared Stop boundary and tears the
+        // pipeline down, releasing the protected route by identity.
+        session.close();
+        assert!(
+            !proxy.has_active_lease() && !proxy.has_custody_entries(),
+            "close must release the session's route by identity"
+        );
+        assert_eq!(
+            ticket.route_count(),
+            0,
+            "the closed session's route must be shut down"
+        );
+    }
+
+    /// Z1: a Stop taken before any start refuses the start effect. The real
+    /// session's `resume` reports no start, the injected pipeline never plays
+    /// (no buffers consumed, cached state stopped) and nothing is published.
+    #[test]
+    fn a_stop_before_start_refuses_the_gstreamer_start_and_consumes_no_buffers() {
+        gst::init().expect("GStreamer init");
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let request = ResolvedHttpRequest::new(
+            url::Url::parse("https://music.test/stream.flac").expect("url"),
+        )
+        .expect("resolved request");
+        let prepared = proxy.prepare_resolved(request).expect("prepared media");
+        let ticket = prepared.ticket().expect("protected media ticket");
+
+        let (tx, rx) = async_channel::unbounded();
+        let gate = Arc::new(SessionGate::new());
+        let generation = PlayerEventGeneration::from_raw(13);
+        let ctx = test_session_ctx(
+            &proxy,
+            Some(Arc::clone(&ticket)),
+            tx,
+            Arc::clone(&gate),
+            generation,
+        );
+
+        let (pipeline, counter) = test_pipeline_with_buffer_counter();
+        let session = GstreamerSenderSession::for_test_session(pipeline, &ctx).expect("session");
+        let mut session = Box::new(session);
+
+        // The Stop wins the boundary before any start is authorized.
+        gate.stop();
+        assert!(
+            !session.resume(),
+            "a start after Stop must be refused (no start after Stop)"
+        );
+        assert_ne!(
+            session.state(),
+            PlayerState::Playing,
+            "the pipeline must never report playing after a refused start"
+        );
+        assert_eq!(
+            buffer_count(&counter),
+            0,
+            "no PCM may be consumed after a refused start"
+        );
+        assert!(
+            !rx_has_playing(&rx),
+            "a refused start must not publish Playing"
+        );
+
+        session.close();
+        assert!(
+            !proxy.has_active_lease() && !proxy.has_custody_entries(),
+            "close must release the session's route by identity"
+        );
+        assert_eq!(ticket.route_count(), 0);
+    }
+
+    /// Z1: a failed state transition. The injected start effect runs and reports
+    /// failure, so `resume` reports no start; the injected pipeline never plays
+    /// (no buffers consumed) and no `Playing` is published — the observable
+    /// "no PCM after refusal" contract.
+    #[test]
+    fn a_failed_gstreamer_state_transition_consumes_no_buffers_and_publishes_no_playing() {
+        gst::init().expect("GStreamer init");
+
+        let (tx, rx) = async_channel::unbounded();
+        let proxy = Arc::new(GstreamerMediaProxy::new(None));
+        let gate = Arc::new(SessionGate::new());
+        let generation = PlayerEventGeneration::from_raw(12);
+        let ctx = test_session_ctx(&proxy, None, tx, Arc::clone(&gate), generation);
+
+        let (pipeline, counter) = test_pipeline_with_buffer_counter();
+        let effect_ran = Arc::new(AtomicBool::new(false));
+        let ran = Arc::clone(&effect_ran);
+        let session = GstreamerSenderSession::for_test_with_start_effect(
+            pipeline,
+            &ctx,
+            Box::new(move || {
+                ran.store(true, Ordering::SeqCst);
+                false
+            }),
+        )
+        .expect("session");
+        let mut session = Box::new(session);
+
+        assert!(
+            !session.resume(),
+            "a failed state transition must not report a start"
+        );
+        assert!(
+            effect_ran.load(Ordering::SeqCst),
+            "the start effect must actually have run and failed"
+        );
+        assert_eq!(
+            session.state(),
+            PlayerState::Stopped,
+            "a failed transition leaves the pipeline stopped"
+        );
+        assert_eq!(
+            buffer_count(&counter),
+            0,
+            "no PCM may be consumed after a failed start"
+        );
+        assert!(
+            !rx_has_playing(&rx),
+            "a failed start must not publish Playing"
+        );
+
+        session.close();
+    }
+
+    fn rx_has_playing(rx: &async_channel::Receiver<PlayerEvent>) -> bool {
+        let mut saw_playing = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Playing,
+                    ..
+                }
+            ) {
+                saw_playing = true;
+            }
+        }
+        saw_playing
     }
 }
