@@ -237,7 +237,11 @@ pub(super) trait SenderSession: Send {
 
     fn pause(&mut self);
 
-    fn resume(&mut self);
+    /// Resume playback. Returns `true` when the session actually started
+    /// playing and `false` when it could not (a cancelled acceptance boundary
+    /// or a failed start RPC). The worker reports the outcome truthfully
+    /// instead of publishing `Playing` unconditionally (review T3).
+    fn resume(&mut self) -> bool;
 
     /// Flush buffered audio without tearing down the receiver session.
     fn flush(&mut self);
