@@ -440,6 +440,12 @@ impl GstreamerMediaProxy {
         if let Some(taken) = taken {
             taken.revoke();
             drop(taken);
+        } else {
+            // Not in any proxy structure — already superseded or stale. Still
+            // revoke this ticket's own route so the loopback server is shut
+            // down; dropping the caller's handle then releases the server
+            // (review S5).
+            ticket.revoke();
         }
     }
 
@@ -449,6 +455,18 @@ impl GstreamerMediaProxy {
         self.lock_state()
             .custody
             .contains_key(&(Arc::as_ptr(ticket) as usize))
+    }
+
+    /// `true` while any ticket holds the active lease.
+    #[cfg(test)]
+    pub(super) fn has_active_lease(&self) -> bool {
+        self.lock_state().active.is_some()
+    }
+
+    /// `true` while any ticket is held in recovery custody.
+    #[cfg(test)]
+    pub(super) fn has_custody_entries(&self) -> bool {
+        !self.lock_state().custody.is_empty()
     }
 
     /// Retire the superseded active lease at the start of a new preparation or
@@ -823,12 +841,55 @@ mod tests {
         // replacement load's supersession cannot invalidate it (review F3).
         proxy.move_to_recovery_custody(&ticket);
         assert!(proxy.is_custodied(&ticket));
+        assert!(!proxy.has_active_lease());
         assert_eq!(ticket.server.registered_route_count(), 1);
 
-        // Release is identity-bound and shuts the route down.
+        // Release is identity-bound and shuts the route down; the S5 terminal
+        // cleanup empties custody as well as the active lease.
         proxy.take_and_release(&ticket);
         assert!(!proxy.is_custodied(&ticket));
+        assert!(!proxy.has_custody_entries());
+        assert!(!proxy.has_active_lease());
         assert_eq!(ticket.server.registered_route_count(), 0);
+    }
+
+    /// S5: `take_and_release` is the single identity-bound release. A stale
+    /// ticket that is in neither the active lease nor custody revokes only its
+    /// own route and never clears a newer load's active lease.
+    #[test]
+    fn take_and_release_is_identity_bound_for_a_stale_ticket() {
+        let runtime = runtime();
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let (_root, media) = authorized_local_media();
+        let first = proxy
+            .prepare_local_with_server_start(media, |handle| {
+                Ok(CastHttpServer::detached_for_test(
+                    handle,
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 46_200)),
+                ))
+            })
+            .expect("prepare first local media");
+        let stale = first.ticket().expect("first ticket");
+
+        let request = ResolvedHttpRequest::new(
+            Url::parse("https://music.test/clean/track.flac").expect("endpoint"),
+        )
+        .expect("resolved request");
+        let second = proxy.prepare_resolved(request).expect("second ticket");
+        let active = second.ticket().expect("second ticket");
+
+        // The first ticket was retired by the replacement, so it is stale.
+        assert!(!proxy.is_custodied(&stale));
+        assert_eq!(stale.server.registered_route_count(), 0);
+
+        // Releasing the stale ticket must not touch the newer active lease.
+        proxy.take_and_release(&stale);
+        assert!(proxy.has_active_lease());
+        assert_eq!(active.server.registered_route_count(), 1);
+
+        proxy.take_and_release(&active);
+        assert!(!proxy.has_active_lease());
+        assert_eq!(active.server.registered_route_count(), 0);
     }
 
     #[test]
