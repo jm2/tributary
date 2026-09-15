@@ -111,6 +111,14 @@ impl GstreamerMediaTicket {
     pub(super) fn revoke(&self) {
         self.server.revoke_playback_routes();
     }
+
+    /// Test-only: the number of live playback routes this ticket's loopback
+    /// server currently has registered, so a terminal-release regression can
+    /// assert the route was actually revoked (not merely unreferenced).
+    #[cfg(test)]
+    pub(super) fn route_count(&self) -> usize {
+        self.server.registered_route_count()
+    }
 }
 
 struct ProxyState {

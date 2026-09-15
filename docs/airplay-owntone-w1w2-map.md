@@ -89,23 +89,87 @@ line).**
   owner is still proven and that the failed settlement attempt does **not**
   release the advisory lock (a competing opener still cannot take it).
 
+## X1 (P2) — terminal restoration still raced successful control publication
+
+**Review.** `.gc/operations/reviews/refinery-20260915-d83fa9f-tr-t3a/corrective-instructions.md`
+at rejected head `d83fa9f94445c72ff428086ccd4405d3374f366e`, base
+`754fc6d8e6c7e7b99b1fe8844b73482f833d668d`.
+
+**Defect.** `restore` latched `terminal` under `mutation_lock`, but the
+*successful control state publication* happened **after** `transmit_mutation`
+released that lock. A concurrent EOS/error terminal restoration could therefore
+latch terminal, restore the daemon, and publish `Stopped`/`TrackEnded` *between*
+a control's RPC settlement and its `Playing`/`Paused` publication, leaving a
+terminal current-generation session reporting `Playing`/`Paused`. The worker also
+published an unconditional coarse `Playing` after a successful `resume`, outside
+any boundary.
+
+**Fix (`src/audio/airplay_owntone.rs`, `src/audio/airplay_output.rs`,
+`src/audio/airplay_sender.rs`).**
+
+- `SessionInner::transmit_under_boundary` / `transmit_mutation_publishing` hold
+  `mutation_lock` across **both** the RPC transmission and the control-state
+  publication. `restore` can only latch `terminal` while holding the same lock,
+  so a control either publishes before the terminal transition begins or
+  observes the latch and publishes nothing. This is the deterministic barrier
+  the review required; a bare check before an out-of-lock publish would leave a
+  fresh check-to-effect race.
+- `activate_and_play` publishes `Playing` through that boundary; its refusal
+  path no longer emits a late `Stopped` once terminal.
+- `pause` publishes `Paused` through that boundary.
+- `run_pump`'s start publication goes through `publish_start_if_live`, which is
+  suppressed once terminal.
+- `SenderSession` gains `confirm_started`; `run_session_worker` routes its coarse
+  `Playing` through the session (`OwnToneSession` implements it via
+  `publish_start_if_live`) so the worker boundary respects terminal ordering.
+
+**Regressions.**
+
+- `a_start_publication_after_the_terminal_transition_publishes_nothing` —
+  before/after the terminal latch under the boundary.
+- `a_pause_after_the_terminal_transition_publishes_no_paused`.
+- `the_worker_start_publication_respects_the_terminal_transition`.
+- `a_start_publication_cannot_follow_a_concurrent_terminal_restoration` — a
+  parked accepted `player/play` races the real `natural_completion`; asserts the
+  final cached state is `Stopped`, exactly one `TrackEnded`, and no
+  `Playing`/`Paused` follows it.
+
+UI Stop remains non-blocking: no wait was added to the Stop path.
+
+## X2 (P2) — W2 production-path regressions completed
+
+- **Real `OwnToneSession::close` teardown.**
+  `a_session_close_settles_a_stalled_play_and_releases_route_and_lock` drives
+  the production `close` (not `gate.stop` directly) against a real loopback
+  daemon with a real media route and advisory lock, and asserts the route is
+  released by identity (route count → 0, custody empty) and the lock is released
+  **after** settlement.
+- **Real FIFO/EOS completion path.**
+  `natural_completion_publishes_exactly_one_track_ended` (exactly one
+  `TrackEnded`, after `Stopped`), `natural_completion_failure_is_terminal_and_never_track_ended`,
+  and `natural_completion_deadline_miss_is_terminal_and_never_track_ended`
+  (real drain deadline; a deadline miss is a timeout error, never a completion).
+- **Real `RetainedRecovery` success/release with exact custody.**
+  `a_retained_recovery_releases_lock_and_custodied_route_on_settlement` uses a
+  hermetic fake **owned** daemon (real process, real `-c <state>/owntone.conf`
+  argv binding and ownership record) so `quiesce_daemon` genuinely terminates
+  and restarts it; the custodied route is shut down by identity and the
+  advisory lock is released only on settlement.
+- **Inline `spawn_serialized_recovery` spawn-failure injection.**
+  `fail_next_recovery_spawns` forces the inline thread spawn to fail;
+  `an_injected_inline_recovery_spawn_failure_hands_off_to_the_supervisor`
+  asserts the terminal retained outcome and that the process-global supervisor
+  settles it and releases the lock.
+
 ## Remaining gaps (recorded honestly, not claimed)
 
-The following V1–V3/W2 fixtures still lack a production-path harness and are
-**not** claimed as resolved by this leg:
-
-1. A **full-session** replacement/close fixture that drives
-   `AirPlayOutput::stop`/replacement through `run_session_worker` and a real
-   `OwnToneSession::close` (route/custody release observed end to end). The
-   terminal-settlement contract itself is covered at the `SessionInner`
-   boundary with a real HTTP daemon above.
-2. Real FIFO EOF/drain/deadline/exactly-once `TrackEnded` regressions and
-   initial-volume daemon-call ordering.
-3. Deterministic GStreamer pipeline start/Stop barrier and a real
-   no-`Playing`/no-PCM failed-start assertion.
-4. Inline `airplay-owntone-recovery` thread-spawn-failure injection through
-   `spawn_serialized_recovery` itself (only the supervisor-worker spawn is
-   injectable today); `RetainedRecovery` retention is exercised directly.
+- Initial-volume daemon-call ordering through `open()` (needs the load path's
+  FIFO reader, which the hermetic fake daemon does not yet provide).
+- Deterministic GStreamer pipeline start/Stop barrier and a real
+  no-`Playing`/no-PCM failed-start assertion for the GStreamer adapter.
+- Stale-`Opened` exact custody/route-count evidence through
+  `AirPlayOutput`/`run_session_worker` (the session-level custody contract is
+  covered).
 
 ## Validation
 

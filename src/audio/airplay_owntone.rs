@@ -1347,6 +1347,43 @@ impl SessionInner {
     where
         F: FnOnce() -> Result<(), SenderError>,
     {
+        self.transmit_under_boundary(effect, None)
+    }
+
+    /// Transmit one daemon-mutating RPC and, on a confirmed success, publish the
+    /// control state it produces **inside the same settlement boundary** (review
+    /// X1). Holding [`Self::mutation_lock`] across both the transmission and the
+    /// publication is the deterministic barrier the review requires: a control
+    /// that succeeds publishes its `Playing`/`Paused` before it releases the
+    /// lock, and [`Self::restore`] can latch `terminal` only while holding that
+    /// same lock. No successful control publication can therefore trail a
+    /// terminal `Stopped`/`TrackEnded`, and a control that observes a latched
+    /// terminal transition publishes nothing. Publishing *after* releasing the
+    /// lock (a bare `terminal` check) would leave a fresh check-to-effect race
+    /// between the RPC settling and the state becoming visible.
+    fn transmit_mutation_publishing<F>(
+        &self,
+        effect: F,
+        on_success: PlayerState,
+    ) -> Result<(), SenderError>
+    where
+        F: FnOnce() -> Result<(), SenderError>,
+    {
+        self.transmit_under_boundary(effect, Some(on_success))
+    }
+
+    /// Shared body of [`Self::transmit_mutation`] and
+    /// [`Self::transmit_mutation_publishing`]: raise the outstanding count
+    /// **before** transmission, lower it only on confirmed success, and publish
+    /// an optional control state before the boundary is released.
+    fn transmit_under_boundary<F>(
+        &self,
+        effect: F,
+        on_success: Option<PlayerState>,
+    ) -> Result<(), SenderError>
+    where
+        F: FnOnce() -> Result<(), SenderError>,
+    {
         let _boundary = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
         if self.terminal.load(Ordering::SeqCst) {
             return Err(unavailable(
@@ -1357,10 +1394,31 @@ impl SessionInner {
         match effect() {
             Ok(()) => {
                 self.unsettled.fetch_sub(1, Ordering::SeqCst);
+                if let Some(state) = on_success {
+                    // Still unterminated: `restore` latches `terminal` only
+                    // under this same lock, so it cannot have interleaved
+                    // between the transmission and here (review X1).
+                    self.publish_state(state);
+                }
                 Ok(())
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Publish the start state for a successful [`Self::activate_and_play`]
+    /// under the settlement boundary, so a terminal transition can never
+    /// interleave between the accepted start and its `Playing` publication
+    /// (review X1). Returns `None` — publishing nothing — once the session is
+    /// terminal, because no `Playing` may follow a terminal
+    /// `Stopped`/`TrackEnded`.
+    fn publish_start_if_live(&self) -> Option<PlayerState> {
+        let _boundary = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if self.terminal.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.publish_state(PlayerState::Playing);
+        Some(PlayerState::Playing)
     }
 
     /// Register uncertainty around an effect whose transmission is not routed
@@ -1539,7 +1597,13 @@ impl SessionInner {
         // the RPC as outstanding until it settles, so a concurrent restore
         // cannot release ownership while it is in flight (review U1).
         let played = self.gate.start(|| {
-            match self.transmit_mutation(|| self.client.player_control("play")) {
+            // Transmit the accepted start and publish `Playing` in one bounded
+            // critical section, so a terminal transition cannot land between
+            // the successful play and its state publication (review X1).
+            match self.transmit_mutation_publishing(
+                || self.client.player_control("play"),
+                PlayerState::Playing,
+            ) {
                 Ok(()) => true,
                 Err(error) => {
                     let _ = self.event_tx.try_send(PlayerEvent::error(
@@ -1551,7 +1615,6 @@ impl SessionInner {
             }
         });
         if played {
-            self.publish_state(PlayerState::Playing);
             return true;
         }
         // Either a failed play or a Stop that won the boundary: refuse
@@ -1559,7 +1622,13 @@ impl SessionInner {
         // (review U3).
         state.accepted = false;
         state.cancelled = true;
-        self.publish_state(PlayerState::Stopped);
+        // A session that already went terminal published its own terminal
+        // state; a late `Stopped` must not follow `Stopped`/`TrackEnded`
+        // (review X1). A non-terminal refusal still reports the truthful
+        // `Stopped` (review U3).
+        if !self.terminal.load(Ordering::SeqCst) {
+            self.publish_state(PlayerState::Stopped);
+        }
         false
     }
 
@@ -1690,7 +1759,10 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
         let _ = pipeline.set_state(gst::State::Null);
         return;
     }
-    inner.publish_state(PlayerState::Playing);
+    // Publish under the settlement boundary and suppress it once the session is
+    // terminal: a decode start must not report `Playing` after a terminal
+    // `Stopped`/`TrackEnded` (review X1).
+    let _ = inner.publish_start_if_live();
 
     let mut last_position = Instant::now();
     let duration_ms = pipeline
@@ -1869,11 +1941,14 @@ impl SenderSession for OwnToneSession {
     }
 
     fn pause(&mut self) {
-        match self
-            .inner
-            .transmit_mutation(|| self.inner.client.player_control("pause"))
-        {
-            Ok(()) => self.inner.publish_state(PlayerState::Paused),
+        // A successful pause publishes `Paused` inside the settlement boundary,
+        // so a terminal `Stopped`/`TrackEnded` can never be followed by a late
+        // `Paused` (review X1).
+        match self.inner.transmit_mutation_publishing(
+            || self.inner.client.player_control("pause"),
+            PlayerState::Paused,
+        ) {
+            Ok(()) => {}
             Err(error) => {
                 debug!(reason = %error.message(), "OwnTone pause failed");
             }
@@ -1889,6 +1964,14 @@ impl SenderSession for OwnToneSession {
         // restoration `player/stop` — never a stale play after a cancelled load
         // (review S4, review T3, review U3).
         self.inner.activate_and_play()
+    }
+
+    fn confirm_started(&self) -> Option<PlayerState> {
+        // The worker's coarse `Playing` after a successful `resume` must respect
+        // the terminal ordering exactly like the session's own publication: it
+        // is emitted under the settlement boundary and suppressed once the
+        // session is terminal (review X1).
+        self.inner.publish_start_if_live()
     }
 
     fn flush(&mut self) {
@@ -2660,6 +2743,31 @@ impl Drop for WorkerAlive {
 /// recovery owner, or a recovery that never established quiescence, retains the
 /// lock and the route for the supervisor rather than reporting a false clean
 /// failure (review S3).
+#[cfg(test)]
+static INJECTED_RECOVERY_SPAWN_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+/// Test-only: force the next `count` inline serialized-recovery thread spawns to
+/// fail, so the fallback that hands the retained lock and route to the
+/// process-global supervisor is exercised deterministically (review X2).
+#[cfg(test)]
+fn fail_next_recovery_spawns(count: usize) {
+    INJECTED_RECOVERY_SPAWN_FAILURES.store(count, Ordering::SeqCst);
+}
+
+/// Test-only: consume one injected inline spawn failure, if any.
+#[cfg(test)]
+fn take_injected_recovery_spawn_failure() -> bool {
+    INJECTED_RECOVERY_SPAWN_FAILURES
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            if remaining > 0 {
+                Some(remaining - 1)
+            } else {
+                None
+            }
+        })
+        .is_ok()
+}
+
 fn spawn_serialized_recovery(
     client: Arc<OwnToneClient>,
     config: OwnToneConfig,
@@ -2680,70 +2788,79 @@ fn spawn_serialized_recovery(
     let fallback_config = config.clone();
     let fallback_recorded = recorded.clone();
     let fallback_route = route.clone();
-    let spawned = std::thread::Builder::new()
-        .name("airplay-owntone-recovery".to_string())
-        .spawn(move || {
-            // Hold the advisory lock until recovery is terminal so ownership is
-            // never released early.
-            let lock_guard = worker_lease
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take();
-            let deadline = Instant::now() + RECOVERY_DEADLINE;
-            // `settled` is true only after a successful quiescence with no
-            // subsequent failed restoration attempt: a restoration step that
-            // fails may itself have transmitted a `PUT` that is still
-            // outstanding (review T1).
-            let mut settled = quiesce_daemon(&config).is_ok();
-            loop {
-                if settled {
-                    if restore_daemon(&client, &config, &recorded).is_ok() {
-                        if let Some((proxy, ticket)) = route.as_ref() {
-                            proxy.take_and_release(ticket);
-                        }
-                        worker.resolve(RecoveryOutcome::Restored);
-                        return;
+    let builder = std::thread::Builder::new().name("airplay-owntone-recovery".to_string());
+    let worker_body = move || {
+        // Hold the advisory lock until recovery is terminal so ownership is
+        // never released early.
+        let lock_guard = worker_lease
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        let deadline = Instant::now() + RECOVERY_DEADLINE;
+        // `settled` is true only after a successful quiescence with no
+        // subsequent failed restoration attempt: a restoration step that
+        // fails may itself have transmitted a `PUT` that is still
+        // outstanding (review T1).
+        let mut settled = quiesce_daemon(&config).is_ok();
+        loop {
+            if settled {
+                if restore_daemon(&client, &config, &recorded).is_ok() {
+                    if let Some((proxy, ticket)) = route.as_ref() {
+                        proxy.take_and_release(ticket);
                     }
-                    // The attempt may have transmitted an outstanding `PUT`: it
-                    // is not settled until the instance is quiesced again.
-                    settled = false;
-                }
-                if Instant::now() >= deadline {
-                    if settled {
-                        // Quiescence was established with nothing outstanding
-                        // since, so no old-generation mutation can survive; the
-                        // record stays for the supervisor and the route is
-                        // released by the load path.
-                        worker.resolve(RecoveryOutcome::RestorationFailed {
-                            message: "restoration did not complete before the recovery deadline"
-                                .to_string(),
-                        });
-                    } else {
-                        // Quiescence was never established: an outstanding
-                        // mutation may still land. Hand the retained recovery to
-                        // the process-global supervisor, which keeps the lock and
-                        // the route and retries until settlement (review T2).
-                        if let Some(lock) = lock_guard {
-                            RecoverySupervisor::global().register(RetainedRecovery {
-                                client: Arc::clone(&client),
-                                config: config.clone(),
-                                recorded: recorded.clone(),
-                                lock,
-                                route: route.clone(),
-                                retry_at: Instant::now(),
-                            });
-                        }
-                        worker.resolve(RecoveryOutcome::Retained {
-                            message: "quiescence was not established before the recovery deadline"
-                                .to_string(),
-                        });
-                    }
+                    worker.resolve(RecoveryOutcome::Restored);
                     return;
                 }
-                std::thread::sleep(RECOVERY_POLL);
-                settled = quiesce_daemon(&config).is_ok();
+                // The attempt may have transmitted an outstanding `PUT`: it
+                // is not settled until the instance is quiesced again.
+                settled = false;
             }
-        });
+            if Instant::now() >= deadline {
+                if settled {
+                    // Quiescence was established with nothing outstanding
+                    // since, so no old-generation mutation can survive; the
+                    // record stays for the supervisor and the route is
+                    // released by the load path.
+                    worker.resolve(RecoveryOutcome::RestorationFailed {
+                        message: "restoration did not complete before the recovery deadline"
+                            .to_string(),
+                    });
+                } else {
+                    // Quiescence was never established: an outstanding
+                    // mutation may still land. Hand the retained recovery to
+                    // the process-global supervisor, which keeps the lock and
+                    // the route and retries until settlement (review T2).
+                    if let Some(lock) = lock_guard {
+                        RecoverySupervisor::global().register(RetainedRecovery {
+                            client: Arc::clone(&client),
+                            config: config.clone(),
+                            recorded: recorded.clone(),
+                            lock,
+                            route: route.clone(),
+                            retry_at: Instant::now(),
+                        });
+                    }
+                    worker.resolve(RecoveryOutcome::Retained {
+                        message: "quiescence was not established before the recovery deadline"
+                            .to_string(),
+                    });
+                }
+                return;
+            }
+            std::thread::sleep(RECOVERY_POLL);
+            settled = quiesce_daemon(&config).is_ok();
+        }
+    };
+    #[cfg(test)]
+    let spawned = if take_injected_recovery_spawn_failure() {
+        Err(std::io::Error::other(
+            "injected serialized-recovery spawn failure",
+        ))
+    } else {
+        builder.spawn(worker_body)
+    };
+    #[cfg(not(test))]
+    let spawned = builder.spawn(worker_body);
     if spawned.is_err() {
         // No inline recovery owner could start. Hand the retained recovery to
         // the process-global supervisor rather than leaking the descriptor
@@ -4065,19 +4182,33 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     impl FakeOwnToneServer {
-        /// A server that answers every request immediately.
+        /// A server that answers every request immediately and reports a
+        /// finished item (`stop`) for `/api/player`.
         fn start() -> Self {
-            Self::with_park("/__never_park__")
+            Self::with_park_and_state("/__never_park__", "stop")
+        }
+
+        /// A server whose `/api/player` never reports completion, so
+        /// [`natural_completion`] runs to its drain deadline.
+        fn start_playing_forever() -> Self {
+            Self::with_park_and_state("/__never_park__", "play")
         }
 
         /// A server that parks the restoring `player/stop` request until
         /// [`ParkGate::release`], so a concurrent operation can be placed
         /// deterministically behind an in-flight restoration.
         fn start_parking_stop() -> Self {
-            Self::with_park("/api/player/stop")
+            Self::with_park_and_state("/api/player/stop", "stop")
         }
 
-        fn with_park(marker: &str) -> Self {
+        /// A server that parks the `player/play` request until
+        /// [`ParkGate::release`], so a terminal restoration can be placed
+        /// deterministically behind an in-flight accepted start (review X1).
+        fn start_parking_play() -> Self {
+            Self::with_park_and_state("/api/player/play", "stop")
+        }
+
+        fn with_park_and_state(marker: &str, player_state: &str) -> Self {
             use std::net::TcpListener;
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
             let port = listener.local_addr().expect("addr").port();
@@ -4085,12 +4216,17 @@ mod tests {
             let park = ParkGate::new(marker);
             let requests_worker = Arc::clone(&requests);
             let park_worker = Arc::clone(&park);
+            let state = Arc::new(player_state.to_string());
+            let state_worker = Arc::clone(&state);
             std::thread::spawn(move || {
                 for incoming in listener.incoming() {
                     let Ok(stream) = incoming else { continue };
                     let requests = Arc::clone(&requests_worker);
                     let park = Arc::clone(&park_worker);
-                    std::thread::spawn(move || serve_fake_own_tone(stream, &requests, &park));
+                    let state = Arc::clone(&state_worker);
+                    std::thread::spawn(move || {
+                        serve_fake_own_tone(stream, &requests, &park, &state);
+                    });
                 }
             });
             Self {
@@ -4122,6 +4258,7 @@ mod tests {
         stream: std::net::TcpStream,
         requests: &Mutex<Vec<String>>,
         park: &ParkGate,
+        player_state: &str,
     ) {
         use std::io::{BufRead, BufReader, Read, Write};
         let Ok(reader_stream) = stream.try_clone() else {
@@ -4167,7 +4304,7 @@ mod tests {
         if path == park.marker {
             park.hold();
         }
-        let body = fake_own_tone_body(&path);
+        let body = fake_own_tone_body(&path, player_state);
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
@@ -4180,12 +4317,12 @@ mod tests {
 
     /// The JSON the adapter expects from each read endpoint.
     #[cfg(target_os = "linux")]
-    fn fake_own_tone_body(path: &str) -> &'static str {
+    fn fake_own_tone_body(path: &str, player_state: &str) -> String {
         match path {
-            "/api/config" => r#"{"version":"29.3"}"#,
-            "/api/outputs" => r#"{"outputs":[]}"#,
-            "/api/player" => r#"{"state":"stop"}"#,
-            _ => "{}",
+            "/api/config" => r#"{"version":"29.3"}"#.to_string(),
+            "/api/outputs" => r#"{"outputs":[]}"#.to_string(),
+            "/api/player" => format!(r#"{{"state":"{player_state}"}}"#),
+            _ => "{}".to_string(),
         }
     }
 
@@ -4309,5 +4446,667 @@ mod tests {
             inner.unsettled_count() > 0,
             "the outstanding mutation must be retained until a confirmed quiescence"
         );
+    }
+
+    // ----- X1: control/start publication is serialized with the terminal transition -----
+
+    /// X1: the start-state publication is taken under the settlement boundary.
+    /// Before the terminal transition it is live and publishes `Playing`; after
+    /// the transition it publishes nothing, because no `Playing` may follow the
+    /// terminal state. A bare `terminal` check outside the boundary would leave
+    /// a fresh check-to-effect race between the check and the publication.
+    #[test]
+    fn a_start_publication_after_the_terminal_transition_publishes_nothing() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = async_channel::unbounded();
+        let inner = test_session_inner_with_events(directory.path(), tx);
+
+        assert_eq!(inner.publish_start_if_live(), Some(PlayerState::Playing));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PlayerEvent::StateChanged {
+                state: PlayerState::Playing,
+                ..
+            })
+        ));
+
+        // The terminal transition latches even though the unreachable daemon
+        // makes restoration fail.
+        assert!(inner.restore().is_err());
+        assert!(inner.terminal.load(Ordering::SeqCst));
+
+        assert_eq!(inner.publish_start_if_live(), None);
+        assert!(
+            rx.try_recv().is_err(),
+            "no start state may follow the terminal transition"
+        );
+    }
+
+    /// X1: a `pause` the control loop may still service after the terminal
+    /// transition transmits nothing and publishes no `Paused`; the terminal
+    /// state is the final word.
+    #[test]
+    fn a_pause_after_the_terminal_transition_publishes_no_paused() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = async_channel::unbounded();
+        let inner = Arc::new(test_session_inner_with_events(directory.path(), tx));
+        assert!(inner.restore().is_err());
+        assert!(inner.terminal.load(Ordering::SeqCst));
+
+        let mut session = OwnToneSession {
+            inner,
+            pump: None,
+            lock: None,
+        };
+        session.pause();
+        assert!(
+            rx.try_recv().is_err(),
+            "a terminal session must not publish Paused"
+        );
+        assert_ne!(
+            *session
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+            PlayerState::Paused
+        );
+    }
+
+    /// X1: an accepted start and a concurrent terminal restoration cannot be
+    /// reordered. The play RPC is parked at the daemon while the control holds
+    /// the settlement boundary; the real [`natural_completion`] terminal path
+    /// runs concurrently and must acquire the boundary only after the control
+    /// publishes `Playing`. The final cached state is terminal and no
+    /// `Playing`/`Paused` may follow the single `TrackEnded`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_start_publication_cannot_follow_a_concurrent_terminal_restoration() {
+        gst::init().expect("GStreamer init");
+        let server = FakeOwnToneServer::start_parking_play();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = async_channel::unbounded();
+        let inner = Arc::new(test_session_inner_at_base(
+            &server.api_base,
+            directory.path(),
+            tx,
+        ));
+
+        let play_inner = Arc::clone(&inner);
+        let play = std::thread::spawn(move || play_inner.activate_and_play());
+        // Barrier: the accepted start genuinely reached the daemon and holds the
+        // settlement boundary while parked.
+        server.park.wait_seen();
+
+        let completion_inner = Arc::clone(&inner);
+        let pipeline = gst::Pipeline::new();
+        let completion =
+            std::thread::spawn(move || natural_completion(&completion_inner, &pipeline));
+        // Let the terminal path block on the settlement boundary the parked
+        // start holds.
+        std::thread::sleep(Duration::from_millis(100));
+        server.park.release();
+
+        assert!(
+            play.join().expect("play thread"),
+            "the accepted start must report a live play"
+        );
+        completion.join().expect("completion thread");
+
+        assert_eq!(
+            *inner.state.lock().unwrap_or_else(|p| p.into_inner()),
+            PlayerState::Stopped,
+            "the terminal transition must be the final cached state"
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let terminal_at = events
+            .iter()
+            .position(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
+            .unwrap_or_else(|| panic!("one TrackEnded must be published: {events:?}"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
+                .count(),
+            1,
+            "exactly one TrackEnded must be published: {events:?}"
+        );
+        assert!(
+            !events.iter().skip(terminal_at).any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Playing | PlayerState::Paused,
+                    ..
+                }
+            )),
+            "no Playing/Paused may follow the terminal TrackEnded: {events:?}"
+        );
+    }
+
+    /// X1: the worker's coarse start publication goes through the session
+    /// (`confirm_started`), so a session that has already gone terminal returns
+    /// `None` and the worker publishes nothing after the terminal state.
+    #[test]
+    fn the_worker_start_publication_respects_the_terminal_transition() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = async_channel::unbounded();
+        let inner = Arc::new(test_session_inner_with_events(directory.path(), tx));
+        let session = OwnToneSession {
+            inner: Arc::clone(&inner),
+            pump: None,
+            lock: None,
+        };
+
+        // Live session: the worker's confirmation publishes the start state.
+        assert_eq!(session.confirm_started(), Some(PlayerState::Playing));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PlayerEvent::StateChanged {
+                state: PlayerState::Playing,
+                ..
+            })
+        ));
+
+        // Terminal session: the worker confirmation publishes nothing.
+        assert!(inner.restore().is_err());
+        assert_eq!(session.confirm_started(), None);
+        assert!(rx.try_recv().is_err());
+    }
+
+    // ----- X2: natural-completion terminal-path regressions -----
+
+    /// W2: a finite item whose daemon reports `stop` publishes exactly one
+    /// generation-scoped `TrackEnded` **after** `Stopped`, restores the daemon,
+    /// and leaves the cached state terminal. A duplicate completion advances the
+    /// queue twice; a missing one never advances it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn natural_completion_publishes_exactly_one_track_ended() {
+        gst::init().expect("GStreamer init");
+        let server = FakeOwnToneServer::start();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = async_channel::unbounded();
+        let inner = test_session_inner_at_base(&server.api_base, directory.path(), tx);
+        let pipeline = gst::Pipeline::new();
+
+        natural_completion(&inner, &pipeline);
+
+        assert!(
+            inner.restored.load(Ordering::SeqCst),
+            "a completed item restores the daemon"
+        );
+        assert_eq!(
+            *inner.state.lock().unwrap_or_else(|p| p.into_inner()),
+            PlayerState::Stopped
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
+                .count(),
+            1,
+            "exactly one TrackEnded: {events:?}"
+        );
+        let stopped_at = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    PlayerEvent::StateChanged {
+                        state: PlayerState::Stopped,
+                        ..
+                    }
+                )
+            })
+            .unwrap_or_else(|| panic!("Stopped must be published: {events:?}"));
+        let ended_at = events
+            .iter()
+            .position(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
+            .expect("TrackEnded");
+        assert!(
+            stopped_at < ended_at,
+            "the terminal Stopped must precede TrackEnded: {events:?}"
+        );
+    }
+
+    /// W2: a transport loss while waiting for completion is a terminal failure
+    /// that restores and publishes no `TrackEnded` — completion is never
+    /// inferred from a failed observation.
+    #[test]
+    fn natural_completion_failure_is_terminal_and_never_track_ended() {
+        gst::init().expect("GStreamer init");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = async_channel::unbounded();
+        let inner = test_session_inner_at_base("http://127.0.0.1:1", directory.path(), tx);
+        let pipeline = gst::Pipeline::new();
+
+        natural_completion(&inner, &pipeline);
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::Error { .. })),
+            "a failed completion must surface an error: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::TrackEnded { .. })),
+            "transport loss is terminal failure, never completion: {events:?}"
+        );
+        assert_eq!(
+            *inner.state.lock().unwrap_or_else(|p| p.into_inner()),
+            PlayerState::Stopped
+        );
+    }
+
+    /// W2: a daemon that never reports completion is a bounded drain-deadline
+    /// miss — a terminal failure, never a false `TrackEnded`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn natural_completion_deadline_miss_is_terminal_and_never_track_ended() {
+        gst::init().expect("GStreamer init");
+        let server = FakeOwnToneServer::start_playing_forever();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = async_channel::unbounded();
+        let inner = test_session_inner_at_base(&server.api_base, directory.path(), tx);
+        let pipeline = gst::Pipeline::new();
+
+        let started = Instant::now();
+        natural_completion(&inner, &pipeline);
+        assert!(
+            started.elapsed() >= DRAIN_DEADLINE,
+            "the drain must be bounded by the deadline, waited {:?}",
+            started.elapsed()
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::Error { message, .. } if message.contains("timed out")
+            )),
+            "a deadline miss must surface as a timeout error: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::TrackEnded { .. })),
+            "a deadline miss is not a completion: {events:?}"
+        );
+    }
+
+    /// W2: the real [`OwnToneSession::close`] owns teardown. A play in flight
+    /// when the close begins is settled by the close's own restoration, and both
+    /// the session's media route and the advisory instance lock are released
+    /// only after that settlement. This drives the production close path rather
+    /// than calling the gate directly.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_session_close_settles_a_stalled_play_and_releases_route_and_lock() {
+        use crate::architecture::media::ResolvedHttpRequest;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let server = FakeOwnToneServer::start_parking_play();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let request = ResolvedHttpRequest::new(
+            url::Url::parse("https://music.test/stream.flac").expect("endpoint"),
+        )
+        .expect("resolved request");
+        let prepared = proxy.prepare_resolved(request).expect("prepared media");
+        let ticket = prepared.ticket().expect("protected media ticket");
+        assert!(proxy.has_active_lease());
+        assert_eq!(ticket.route_count(), 1);
+
+        let lock_path = directory.path().join("instance.lock");
+        let lock = open_lock(&lock_path).expect("open lock");
+        assert!(rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).is_ok());
+        let competing = open_lock(&lock_path).expect("open competing lock");
+        assert!(
+            rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err(),
+            "the live session must hold the advisory instance lock"
+        );
+
+        let inner = Arc::new({
+            let mut inner = test_session_inner_at_base(
+                &server.api_base,
+                directory.path(),
+                async_channel::unbounded().0,
+            );
+            inner.media_proxy = Arc::clone(&proxy);
+            inner.media_ticket = Some(Arc::clone(&ticket));
+            inner
+        });
+
+        let session = OwnToneSession {
+            inner: Arc::clone(&inner),
+            pump: None,
+            lock: Some(lock),
+        };
+
+        // A play is accepted and transmitted; the daemon parks it, so the close
+        // must wait on the settlement boundary and settle the in-flight effect.
+        let play_inner = Arc::clone(&inner);
+        let play = std::thread::spawn(move || play_inner.activate_and_play());
+        server.park.wait_seen();
+
+        let closer = std::thread::spawn(move || {
+            let boxed: Box<dyn SenderSession> = Box::new(session);
+            boxed.close();
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        server.park.release();
+
+        let _ = play.join().expect("play thread");
+        closer.join().expect("close thread");
+
+        assert!(
+            !proxy.has_active_lease() && !proxy.has_custody_entries(),
+            "close must release the media route by identity"
+        );
+        assert_eq!(
+            ticket.route_count(),
+            0,
+            "the released route must be shut down"
+        );
+        assert!(
+            rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_ok(),
+            "close must release the advisory lock after settlement"
+        );
+    }
+
+    // ----- X2: hermetic fake owned daemon + retained-recovery settlement -----
+
+    /// Source for a hermetic fake OwnTone daemon that satisfies the adapter's
+    /// full ownership binding: it binds the loopback endpoint and answers the
+    /// HTTP contract. Because it is a real process launched with
+    /// `-c <state>/owntone.conf`, `process_is_owned` accepts it and
+    /// `quiesce_daemon` can genuinely terminate and restart it.
+    #[cfg(target_os = "linux")]
+    const FAKE_OWNED_DAEMON_SOURCE: &str = r##"
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+
+fn main() {
+    let addr = std::env::var("TRIBUTARY_FAKE_LISTEN").expect("listen address");
+    let listener = TcpListener::bind(&addr).expect("bind");
+    for incoming in listener.incoming() {
+        let Ok(stream) = incoming else { continue };
+        std::thread::spawn(move || serve(stream));
+    }
+}
+
+fn serve(stream: std::net::TcpStream) {
+    let Ok(reader_stream) = stream.try_clone() else { return };
+    let mut reader = BufReader::new(reader_stream);
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).is_err() { return; }
+    let trimmed = request_line.trim().to_string();
+    if trimmed.is_empty() { return; }
+    let mut content_length = 0usize;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).is_err() || header.trim().is_empty() { break; }
+        if let Some(value) = header
+            .to_ascii_lowercase()
+            .strip_prefix("content-length:")
+            .map(str::trim)
+        {
+            content_length = value.parse().unwrap_or(0);
+        }
+    }
+    if content_length > 0 {
+        let mut body = vec![0u8; content_length];
+        let _ = reader.read_exact(&mut body);
+    }
+    let path = trimmed.split_whitespace().nth(1).unwrap_or_default().to_string();
+    let body = match path.as_str() {
+        "/api/config" => r#"{"version":"29.3"}"#.to_string(),
+        "/api/outputs" => r#"{"outputs":[]}"#.to_string(),
+        "/api/player" => r#"{"state":"stop"}"#.to_string(),
+        _ => "{}".to_string(),
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(), body
+    );
+    let mut stream = stream;
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+"##;
+
+    /// A real, owned, restartable fake daemon plus the configuration that binds
+    /// it. Kept alive for the duration of the test; `Drop` stops whichever
+    /// instance currently holds the endpoint and reaps the initial child.
+    #[cfg(target_os = "linux")]
+    struct FakeOwnedDaemon {
+        _directory: tempfile::TempDir,
+        config: OwnToneConfig,
+        child: Option<std::process::Child>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for FakeOwnedDaemon {
+        fn drop(&mut self) {
+            if let Some(process) = listener_process(&self.config.api_base) {
+                let _ = terminate_process(&process, &self.config, Duration::from_secs(5));
+            }
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl FakeOwnedDaemon {
+        fn start() -> Self {
+            use std::net::TcpListener;
+            let directory = tempfile::tempdir().expect("tempdir");
+            let state_dir = directory.path().join("state");
+            std::fs::create_dir_all(&state_dir).expect("state dir");
+            let pipe = state_dir.join("airplay.pcm");
+            let config_path = state_dir.join(OWNTONE_CONFIG_FILE);
+            std::fs::write(
+                &config_path,
+                format!("pipe_path = \"{}\"\n", pipe.display()),
+            )
+            .expect("write config");
+
+            let source = directory.path().join("fake_owned.rs");
+            std::fs::write(&source, FAKE_OWNED_DAEMON_SOURCE).expect("write source");
+            let binary = directory.path().join("fake_owntone");
+            let compiled = std::process::Command::new("rustc")
+                .arg("-O")
+                .arg(&source)
+                .arg("-o")
+                .arg(&binary)
+                .status()
+                .expect("invoke rustc");
+            assert!(compiled.success(), "the fake owned daemon must compile");
+
+            let probe = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+            let port = probe.local_addr().expect("addr").port();
+            drop(probe);
+
+            let api_base = format!("http://127.0.0.1:{port}");
+            let config = OwnToneConfig {
+                api_base: api_base.clone(),
+                pipe_path: pipe.clone(),
+                state_dir: state_dir.clone(),
+                binary: binary.clone(),
+            };
+            let restart = format!(
+                "TRIBUTARY_FAKE_LISTEN=127.0.0.1:{port} {} -c {}",
+                binary.display(),
+                config_path.display()
+            );
+            let record = OwnershipRecord {
+                token: OWNER_TOKEN.to_string(),
+                api_base,
+                pipe_path: pipe.to_string_lossy().into_owned(),
+                state_dir: state_dir.to_string_lossy().into_owned(),
+                binary: binary.to_string_lossy().into_owned(),
+                restart_command: Some(restart),
+            };
+            std::fs::write(
+                config.owner_marker(),
+                serde_json::to_vec(&record).expect("serialize record"),
+            )
+            .expect("write ownership record");
+
+            let child = launch_fake_owned(&binary, &config_path, port);
+            Self {
+                _directory: directory,
+                config,
+                child: Some(child),
+            }
+        }
+    }
+
+    /// Launch the fake owned daemon bound to `port`, wait until it is listening,
+    /// and return the child so it can be reaped on drop.
+    #[cfg(target_os = "linux")]
+    fn launch_fake_owned(binary: &Path, config_path: &Path, port: u16) -> std::process::Child {
+        let child = std::process::Command::new(binary)
+            .arg("-c")
+            .arg(config_path)
+            .env("TRIBUTARY_FAKE_LISTEN", format!("127.0.0.1:{port}"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn fake owned daemon");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "the fake daemon never listened");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        child
+    }
+
+    /// A real custodied media route for the retained-recovery fixtures.
+    #[cfg(target_os = "linux")]
+    fn custodied_route() -> (Arc<GstreamerMediaProxy>, Arc<GstreamerMediaTicket>) {
+        use crate::architecture::media::ResolvedHttpRequest;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let request = ResolvedHttpRequest::new(
+            url::Url::parse("https://music.test/stream.flac").expect("endpoint"),
+        )
+        .expect("resolved request");
+        let prepared = proxy.prepare_resolved(request).expect("prepared media");
+        let ticket = prepared.ticket().expect("protected ticket");
+        proxy.move_to_recovery_custody(&ticket);
+        (proxy, ticket)
+    }
+
+    /// X2: the **real** [`RetainedRecovery`] settles against a real owned daemon.
+    /// Quiescence terminates and restarts the instance, restoration succeeds,
+    /// and only then are the custodied route (by identity) and the advisory
+    /// lock released. This is the success path the previous leg never
+    /// exercised.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_retained_recovery_releases_lock_and_custodied_route_on_settlement() {
+        let daemon = FakeOwnedDaemon::start();
+        let (proxy, ticket) = custodied_route();
+        assert!(proxy.is_custodied(&ticket));
+        assert_eq!(ticket.route_count(), 1);
+
+        let lock_path = daemon.config.state_dir.join("instance.lock");
+        let lock = open_lock(&lock_path).expect("open lock");
+        assert!(rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).is_ok());
+        let competing = open_lock(&lock_path).expect("competing lock");
+        assert!(
+            rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err(),
+            "the retained recovery must hold the advisory lock"
+        );
+
+        let job = RetainedRecovery {
+            client: Arc::new(OwnToneClient::new(&daemon.config.api_base).expect("client")),
+            config: daemon.config.clone(),
+            recorded: TakeoverRecord {
+                enabled_outputs: vec![1],
+                selected_output: 0,
+            },
+            lock,
+            route: Some((Arc::clone(&proxy), Arc::clone(&ticket))),
+            retry_at: Instant::now(),
+        };
+        let supervisor = Arc::new(RecoverySupervisor::new());
+        supervisor.register(job);
+
+        wait_until(|| !proxy.is_custodied(&ticket) && !proxy.has_custody_entries());
+        assert_eq!(
+            ticket.route_count(),
+            0,
+            "the custodied route must be shut down"
+        );
+        wait_until(|| {
+            rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_ok()
+        });
+    }
+
+    /// X2: an **injected inline** `spawn_serialized_recovery` thread-spawn
+    /// failure is not leaked. The lock is handed to the process-global
+    /// supervisor, which starts a live owner, settles against the real daemon
+    /// and releases the lock; the completion reports the terminal retained
+    /// outcome.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_injected_inline_recovery_spawn_failure_hands_off_to_the_supervisor() {
+        let daemon = FakeOwnedDaemon::start();
+        let lock_path = daemon.config.state_dir.join("instance.lock");
+        let lock = open_lock(&lock_path).expect("open lock");
+        assert!(rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).is_ok());
+        let competing = open_lock(&lock_path).expect("competing lock");
+        assert!(rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err());
+
+        fail_next_recovery_spawns(1);
+        let completion = spawn_serialized_recovery(
+            Arc::new(OwnToneClient::new(&daemon.config.api_base).expect("client")),
+            daemon.config.clone(),
+            TakeoverRecord {
+                enabled_outputs: vec![1],
+                selected_output: 0,
+            },
+            lock,
+            None,
+        );
+        assert!(
+            matches!(completion.wait(), RecoveryOutcome::Retained { .. }),
+            "an inline spawn failure reports the terminal retained outcome"
+        );
+
+        // The fallback registered a live owner with the process-global
+        // supervisor, which settles and releases the lock.
+        wait_until(|| {
+            rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_ok()
+        });
     }
 }
