@@ -341,7 +341,11 @@ impl GstreamerMediaProxy {
     ///
     /// The identity check is the stale-callback guard. A superseded callback
     /// still owns a dedicated server and is free to revoke that server
-    /// directly, but it must not clear the proxy's newer active lease.
+    /// directly, but it must not clear the proxy's newer active lease. Unlike
+    /// [`Self::take_and_release`] this does **not** remove a recovery-custody
+    /// entry, so it is reserved for paths that never move a ticket into custody;
+    /// the GStreamer session's terminal paths use the identity-bound release
+    /// (review T4).
     pub(super) fn revoke_if_current(&self, ticket: &Arc<GstreamerMediaTicket>) {
         let active = {
             let mut state = self.lock_state();
@@ -368,8 +372,16 @@ impl GstreamerMediaProxy {
 
     /// Authorize `open_id` to negotiate. Called before the in-flight open
     /// registers; any later supersession clears it.
+    ///
+    /// Only the newest scheduled load may authorize: the proxy tracks loads in
+    /// scheduling order, so a stale worker whose authorization was superseded
+    /// must not overwrite a newer load's identity (review T4). `retire_active_locked`
+    /// clears the slot on every replacement, so a fresh load always installs.
     pub(super) fn begin_open(&self, open_id: u64) {
-        self.lock_state().current_open = Some(open_id);
+        let mut state = self.lock_state();
+        if state.current_open.is_none_or(|current| open_id >= current) {
+            state.current_open = Some(open_id);
+        }
     }
 
     /// Register `cancel` for the duration of one `open_session`, keyed by
@@ -943,6 +955,33 @@ mod tests {
         let registration = proxy.register_in_flight_cancel(11, &cancel);
         assert!(registration.is_superseded());
         assert!(!cancel.is_cancelled());
+    }
+
+    /// T4: authorization is scheduling-ordered. A stale worker whose
+    /// authorization lost the prepare-to-open race must not overwrite the newer
+    /// load's `current_open`, which would let it register and negotiate.
+    #[test]
+    fn a_stale_begin_open_cannot_overwrite_a_newer_authorization() {
+        let proxy = Arc::new(GstreamerMediaProxy::new(None));
+        proxy.begin_open(9);
+        // The stale worker runs begin_open late with a smaller id.
+        proxy.begin_open(4);
+
+        let newer_cancel = OpenCancel::new();
+        assert!(
+            !proxy
+                .register_in_flight_cancel(9, &newer_cancel)
+                .is_superseded(),
+            "the newer load must keep its authorization"
+        );
+        let stale_cancel = OpenCancel::new();
+        assert!(
+            proxy
+                .register_in_flight_cancel(4, &stale_cancel)
+                .is_superseded(),
+            "the stale load must not be authorized"
+        );
+        assert!(!stale_cancel.is_cancelled());
     }
 
     fn media_uri_for_supersession() -> &'static str {

@@ -141,7 +141,11 @@ impl SenderSession for GstreamerSenderSession {
         let this = *self;
         let _ = this.pipeline.set_state(gst::State::Null);
         if let Some(ticket) = this.media_ticket.as_ref() {
-            this.media_proxy.revoke_if_current(ticket);
+            // Identity-bound terminal release: a superseded session's ticket may
+            // have been moved into recovery custody by a replacement, so this
+            // must remove that custody entry as well as the active lease and
+            // revoke the route (review T4).
+            this.media_proxy.take_and_release(ticket);
         }
     }
 }
@@ -313,13 +317,16 @@ fn attach_bus_watch(
         match msg.view() {
             MessageView::Eos(..) => {
                 if let Some(ticket) = media_ticket.as_ref() {
-                    media_proxy.revoke_if_current(ticket);
+                    // Identity-bound release removes a recovery-custody entry a
+                    // replacement may have created, so a superseded server is
+                    // never leaked (review T4).
+                    media_proxy.take_and_release(ticket);
                 }
                 let _ = tx.try_send(PlayerEvent::ended(generation));
             }
             MessageView::Error(pipeline_error) => {
                 if let Some(ticket) = media_ticket.as_ref() {
-                    media_proxy.revoke_if_current(ticket);
+                    media_proxy.take_and_release(ticket);
                 }
                 // GStreamer error/debug strings can embed the authenticated
                 // source URI. Keep only closed categories and numeric
@@ -769,9 +776,11 @@ fn run_session_worker(
 
     let generation = ctx.generation;
     let outcome = sender.open_session(&ctx);
-    // Registration covers only the open call itself; it must not outlive it.
-    drop(registration);
-
+    // The registration intentionally outlives the open: while the session is
+    // live it keeps the load counted as in-flight in the proxy, so a replacement
+    // preparation preserves the live route in recovery custody instead of
+    // revoking it before the session's own close can release it (review T4). It
+    // drops when this worker returns, after the session's terminal release.
     match outcome {
         OpenOutcome::Opened(mut session) => {
             let still_current = event_generation.load(Ordering::SeqCst) == generation.as_raw()
