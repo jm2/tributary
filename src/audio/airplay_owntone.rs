@@ -1421,6 +1421,39 @@ impl SessionInner {
         Some(PlayerState::Playing)
     }
 
+    /// Run a caller-supplied publication (the worker's own cache/event write)
+    /// under the settlement boundary, suppressing it once the session is
+    /// terminal (review Y1). This is what makes the *caller's* publication
+    /// atomic with the terminal transition instead of a check-then-effect race
+    /// the caller could lose after the boundary was released: [`Self::restore`]
+    /// latches `terminal` under this same lock, so a publication either runs
+    /// before the latch or observes it and reports `false`.
+    fn publish_under_boundary(&self, publish: &mut dyn FnMut(PlayerState)) -> bool {
+        let _boundary = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if self.terminal.load(Ordering::SeqCst) {
+            return false;
+        }
+        publish(PlayerState::Playing);
+        true
+    }
+
+    /// Latch the terminal transition **and** publish the terminal `Stopped` as
+    /// one serialized decision (review Y1). A terminal failure that published
+    /// `Stopped` before `restore` latched `terminal` left a gap in which a
+    /// control queued on the settlement boundary could transmit successfully
+    /// and publish `Playing`/`Paused` *after* the terminal `Stopped`. Taking
+    /// the boundary for the latch and the publication together closes it: a
+    /// control acquires the boundary either before the latch (and publishes
+    /// before the `Stopped`) or after it (and is refused by
+    /// `transmit_mutation`). Idempotent with [`Self::restore`], which latches
+    /// the same flag under the same lock.
+    fn publish_terminal(&self) {
+        let _boundary = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.terminal.store(true, Ordering::SeqCst);
+        self.running.store(false, Ordering::SeqCst);
+        self.publish_state(PlayerState::Stopped);
+    }
+
     /// Register uncertainty around an effect whose transmission is not routed
     /// through [`Self::transmit_mutation`] — the restoring RPCs — so a failed
     /// restoration is never forgotten (review U1).
@@ -1740,7 +1773,10 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
     }
 
     let Some(bus) = pipeline.bus() else {
-        inner.publish_state(PlayerState::Stopped);
+        // A pump that cannot run is terminal for the session: latch terminal
+        // and publish `Stopped` together, so no control can publish after it
+        // (review Y1).
+        inner.publish_terminal();
         let _ = inner.event_tx.try_send(PlayerEvent::error(
             inner.generation,
             unavailable("the decode pipeline has no bus")
@@ -1755,7 +1791,7 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
             inner.generation,
             "OwnTone decode pipeline failed to start".to_string(),
         ));
-        inner.publish_state(PlayerState::Stopped);
+        inner.publish_terminal();
         let _ = pipeline.set_state(gst::State::Null);
         return;
     }
@@ -1800,7 +1836,8 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
                         inner.generation,
                         "AirPlay playback failed".to_string(),
                     ));
-                    inner.publish_state(PlayerState::Stopped);
+                    // Terminal failure: latch and publish together (review Y1).
+                    inner.publish_terminal();
                     // A failed restore is not a clean teardown; the session
                     // close path installs serialized recovery and retains the
                     // record (review R3).
@@ -1886,7 +1923,10 @@ fn natural_completion(inner: &SessionInner, pipeline: &gst::Pipeline) {
                     inner.generation,
                     "AirPlay completion could not be confirmed".to_string(),
                 ));
-                inner.publish_state(PlayerState::Stopped);
+                // Latch terminal and publish `Stopped` together, so no control
+                // can successfully publish after this terminal state (review
+                // Y1).
+                inner.publish_terminal();
                 let _ = inner.restore();
                 return;
             }
@@ -1896,7 +1936,9 @@ fn natural_completion(inner: &SessionInner, pipeline: &gst::Pipeline) {
                 inner.generation,
                 "AirPlay completion timed out".to_string(),
             ));
-            inner.publish_state(PlayerState::Stopped);
+            // Latched with the publication: no control may follow it (review
+            // Y1).
+            inner.publish_terminal();
             let _ = inner.restore();
             return;
         }
@@ -1909,10 +1951,13 @@ fn natural_completion(inner: &SessionInner, pipeline: &gst::Pipeline) {
             inner.generation,
             "AirPlay restoration failed".to_string(),
         ));
-        inner.publish_state(PlayerState::Stopped);
+        inner.publish_terminal();
         return;
     }
-    inner.publish_state(PlayerState::Stopped);
+    // `restore` already latched terminal under the boundary; publish the
+    // terminal `Stopped` through the same latch so the ordering holds even if
+    // a later restore path re-enters (review Y1).
+    inner.publish_terminal();
     let _ = inner
         .event_tx
         .try_send(PlayerEvent::ended(inner.generation));
@@ -1966,12 +2011,14 @@ impl SenderSession for OwnToneSession {
         self.inner.activate_and_play()
     }
 
-    fn confirm_started(&self) -> Option<PlayerState> {
+    fn confirm_started(&self, publish: &mut dyn FnMut(PlayerState)) -> bool {
         // The worker's coarse `Playing` after a successful `resume` must respect
-        // the terminal ordering exactly like the session's own publication: it
-        // is emitted under the settlement boundary and suppressed once the
-        // session is terminal (review X1).
-        self.inner.publish_start_if_live()
+        // the terminal ordering exactly like the session's own publication.
+        // `activate_and_play` already published the accepted start through the
+        // settlement boundary, so the worker's own cache/event write is run
+        // here, under the same boundary, instead of after this method returned
+        // — the caller-side gap review Y1 rejected (review X1, review Y1).
+        self.inner.publish_under_boundary(publish)
     }
 
     fn flush(&mut self) {
@@ -4587,22 +4634,30 @@ mod tests {
         );
     }
 
-    /// X1: the worker's coarse start publication goes through the session
-    /// (`confirm_started`), so a session that has already gone terminal returns
-    /// `None` and the worker publishes nothing after the terminal state.
+    /// Y1: the worker's coarse start publication is run *through* the session
+    /// (`confirm_started`), under the session's terminal-ordering boundary. A
+    /// live session runs the caller's publication; a session that has already
+    /// gone terminal runs nothing, so no `Playing` may follow the terminal
+    /// state. The previous enum-returning contract let the caller publish
+    /// *after* the boundary was released — the gap this exercises.
     #[test]
     fn the_worker_start_publication_respects_the_terminal_transition() {
         let directory = tempfile::tempdir().expect("tempdir");
         let (tx, rx) = async_channel::unbounded();
-        let inner = Arc::new(test_session_inner_with_events(directory.path(), tx));
+        let inner = Arc::new(test_session_inner_with_events(directory.path(), tx.clone()));
         let session = OwnToneSession {
             inner: Arc::clone(&inner),
             pump: None,
             lock: None,
         };
 
-        // Live session: the worker's confirmation publishes the start state.
-        assert_eq!(session.confirm_started(), Some(PlayerState::Playing));
+        // Live session: the caller's publication runs and is observed.
+        let mut live = None;
+        assert!(session.confirm_started(&mut |state| {
+            live = Some(state);
+            let _ = tx.try_send(PlayerEvent::state(inner.generation, state));
+        }));
+        assert_eq!(live, Some(PlayerState::Playing));
         assert!(matches!(
             rx.try_recv(),
             Ok(PlayerEvent::StateChanged {
@@ -4611,10 +4666,121 @@ mod tests {
             })
         ));
 
-        // Terminal session: the worker confirmation publishes nothing.
+        // Terminal session: the caller's publication must not run at all.
         assert!(inner.restore().is_err());
-        assert_eq!(session.confirm_started(), None);
+        let mut terminal = None;
+        assert!(!session.confirm_started(&mut |state| terminal = Some(state)));
+        assert_eq!(terminal, None);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// Y1: the worker's start publication is **atomic** with the terminal
+    /// transition. The caller's publication is parked *while holding the
+    /// settlement boundary* — exactly where `run_session_worker` now runs it —
+    /// and the real [`natural_completion`] terminal path is started
+    /// concurrently. The terminal path can only acquire the boundary after the
+    /// publication drains, so the order is `Playing` → `Stopped` →
+    /// `TrackEnded` and the final cached state is terminal. Under the rejected
+    /// design the caller published *after* the boundary was released, which the
+    /// terminal path could beat.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_worker_start_publication_is_atomic_with_the_terminal_transition() {
+        gst::init().expect("GStreamer init");
+        let server = FakeOwnToneServer::start();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = async_channel::unbounded();
+        let inner = Arc::new(test_session_inner_at_base(
+            &server.api_base,
+            directory.path(),
+            tx,
+        ));
+        let session = OwnToneSession {
+            inner: Arc::clone(&inner),
+            pump: None,
+            lock: None,
+        };
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let publisher_inner = Arc::clone(&inner);
+        let publisher = std::thread::spawn(move || {
+            session.confirm_started(&mut |state| {
+                let _ = publisher_inner.event_tx.try_send(PlayerEvent::state(
+                    publisher_inner.generation,
+                    state,
+                ));
+                let _ = entered_tx.send(());
+                // Park inside the boundary until the test releases us, so the
+                // terminal path is placed deterministically behind this
+                // publication.
+                let _ = release_rx.recv();
+            })
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker publication must be entered");
+
+        let completion_inner = Arc::clone(&inner);
+        let completion = std::thread::spawn(move || {
+            let pipeline = gst::Pipeline::new();
+            natural_completion(&completion_inner, &pipeline);
+        });
+        // The terminal path must be blocked on the boundary the publication
+        // holds.
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !inner.terminal.load(Ordering::SeqCst),
+            "the terminal transition must not run while the publication holds the boundary"
+        );
+        release_tx.send(()).expect("release the publication");
+
+        assert!(
+            publisher.join().expect("publisher"),
+            "a live session must run the publication"
+        );
+        completion.join().expect("completion");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let playing_at = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    PlayerEvent::StateChanged {
+                        state: PlayerState::Playing,
+                        ..
+                    }
+                )
+            })
+            .unwrap_or_else(|| panic!("the publication must be observed: {events:?}"));
+        let terminal_at = events
+            .iter()
+            .position(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
+            .unwrap_or_else(|| panic!("one TrackEnded must be published: {events:?}"));
+        assert!(
+            playing_at < terminal_at,
+            "Playing must precede the terminal event: {events:?}"
+        );
+        assert!(
+            !events.iter().skip(terminal_at).any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Playing | PlayerState::Paused,
+                    ..
+                }
+            )),
+            "no Playing/Paused may follow the terminal TrackEnded: {events:?}"
+        );
+        assert_eq!(
+            *inner.state.lock().unwrap_or_else(|p| p.into_inner()),
+            PlayerState::Stopped,
+            "the terminal transition must be the final cached state"
+        );
     }
 
     // ----- X2: natural-completion terminal-path regressions -----

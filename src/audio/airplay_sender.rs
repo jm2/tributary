@@ -365,18 +365,30 @@ pub(super) trait SenderSession: Send {
     /// instead of publishing `Playing` unconditionally (review T3).
     fn resume(&mut self) -> bool;
 
-    /// Confirm the start that [`Self::resume`] just accepted and publish its
-    /// playback state atomically with the session's own terminal transition
-    /// (review X1). Returns the state the worker should cache — `Some` when a
-    /// start state may be published, `None` once the session has gone terminal
-    /// and nothing may follow the terminal `Stopped`/`TrackEnded`.
+    /// Confirm the start that [`Self::resume`] just accepted, running the
+    /// worker's own cache-and-event publication through the session so it is
+    /// **atomic with the session's terminal transition** (review X1, review
+    /// Y1).
     ///
-    /// The default returns `Some(PlayerState::Playing)` without publishing, so
-    /// the worker caches and publishes it; that is correct for sessions with no
-    /// internal terminal transition. A session that owns an internal terminal
-    /// transition implements this so the publication is serialized with it.
-    fn confirm_started(&self) -> Option<PlayerState> {
-        Some(PlayerState::Playing)
+    /// `publish` is invoked at most once and only while the session is still
+    /// live, with the session's terminal-ordering boundary held across the
+    /// call. The worker passes a closure that writes its coarse state cache and
+    /// emits the generation-scoped state event; running it here means that
+    /// publication can never trail a terminal `Stopped`/`TrackEnded`. Returns
+    /// `false` — invoking nothing — once the session has gone terminal.
+    ///
+    /// Returning an enum was not enough: a value returned after the boundary
+    /// was released still let the caller publish *later*, which is exactly the
+    /// caller-side gap review Y1 rejected.
+    ///
+    /// The default invokes `publish(PlayerState::Playing)`, which is correct
+    /// for a session with no internal terminal transition (its terminal
+    /// transition is the worker's own teardown). A session that owns an
+    /// internal terminal transition implements this to hold its boundary across
+    /// the call.
+    fn confirm_started(&self, publish: &mut dyn FnMut(PlayerState)) -> bool {
+        publish(PlayerState::Playing);
+        true
     }
 
     /// Flush buffered audio without tearing down the receiver session.
