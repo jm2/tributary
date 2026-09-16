@@ -1050,13 +1050,16 @@ impl OwnToneClient {
             .ok_or_else(|| unavailable("the dedicated daemon reported no output list"))?;
         let mut outputs = Vec::with_capacity(array.len());
         for entry in array {
-            let Some(id) = entry
+            let id = entry
                 .get("id")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<u64>().ok())
-            else {
-                continue;
-            };
+                .ok_or_else(|| unavailable("the dedicated daemon reported an invalid output id"))?;
+            if outputs.iter().any(|output: &OwnToneOutput| output.id == id) {
+                return Err(unavailable(
+                    "the dedicated daemon reported duplicate output ids",
+                ));
+            }
             let name = entry
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -1065,7 +1068,9 @@ impl OwnToneClient {
             let selected = entry
                 .get("selected")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+                .ok_or_else(|| {
+                    unavailable("the dedicated daemon reported invalid output selection")
+                })?;
             outputs.push(OwnToneOutput { id, name, selected });
         }
         Ok(outputs)
@@ -1084,23 +1089,24 @@ impl OwnToneClient {
         self.put("/api/queue/clear")
     }
 
+    /// Validate the authority-bearing state for both takeover and drain polling.
+    fn decode_player_state(value: &serde_json::Value) -> Result<String, SenderError> {
+        match value.get("state").and_then(|v| v.as_str()) {
+            Some(state @ ("play" | "pause" | "stop")) => Ok(state.to_string()),
+            _ => Err(unavailable(
+                "the dedicated daemon reported an invalid player state",
+            )),
+        }
+    }
+
     /// The daemon's coarse player state (`play`, `pause`, `stop`).
     fn player_state(&self) -> Result<String, SenderError> {
-        let value = self.get_json("/api/player")?;
-        Ok(value
-            .get("state")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string())
+        Self::decode_player_state(&self.get_json("/api/player")?)
     }
 
     fn player_progress(&self) -> Result<(String, Option<u64>), SenderError> {
         let value = self.get_json("/api/player")?;
-        let state = value
-            .get("state")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
+        let state = Self::decode_player_state(&value)?;
         let progress = value.get("item_progress_ms").and_then(|v| v.as_u64());
         Ok((state, progress))
     }
@@ -6278,9 +6284,15 @@ fn serve(stream: std::net::TcpStream) {
         }
     }
     let mut state = STATE.lock().unwrap();
-    let dynamic = format!(r#"{{"state":"{}","pcm_bytes":{}}}"#, if state.playing { "play" } else if state.paused { "pause" } else { "stop" }, state.bytes);
+    let dynamic = format!(r#"{{"state":"{}","pcm_bytes":{},"queued":{}}}"#, if state.playing { "play" } else if state.paused { "pause" } else { "stop" }, state.bytes, state.queued);
     let outputs = format!(r#"{{"outputs":[{{"id":"11189196","name":"Test","selected":{}}},{{"id":"42","name":"Prior","selected":{}}}]}}"#, state.selected, !state.selected);
+    let overridden = match (method, path) {
+        ("GET", "/api/player") => std::fs::read_to_string(pipe.with_extension("player-response")).ok(),
+        ("GET", "/api/outputs") => std::fs::read_to_string(pipe.with_extension("outputs-response")).ok(),
+        _ => None,
+    };
     let (status, body) = match (method, path) {
+        ("GET", _) if overridden.is_some() => ("200 OK", overridden.as_deref().unwrap()),
         ("GET", "/api/config") => ("200 OK", r#"{"version":"29.3"}"#),
         ("GET", "/api/outputs") => ("200 OK", outputs.as_str()),
         ("GET", "/api/player") => ("200 OK", dynamic.as_str()),
@@ -6431,6 +6443,210 @@ fn serve(stream: std::net::TcpStream) {
 
         fn recorded(&self) -> String {
             std::fs::read_to_string(&self.requests).unwrap_or_default()
+        }
+    }
+
+    /// AK1: malformed observations must fail before any takeover effect.
+    #[cfg(target_os = "linux")]
+    fn exercise_takeover_observation(response: &str, outputs: bool, accepted: bool) {
+        use crate::audio::airplay_output::ControllerHarness;
+        use crate::local::resolver::ResolvedLocalMedia;
+
+        gst::init().unwrap();
+        let daemon = RecordingOwnedDaemon::start();
+        let client = OwnToneClient::new(&daemon.config.api_base).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        let controller = ControllerHarness::new(
+            runtime.handle().clone(),
+            Arc::new(OwnToneSender {
+                config: Some(daemon.config.clone()),
+            }),
+            tx,
+        )
+        .with_device_id("aabbcc");
+        let root = tempfile::tempdir().unwrap();
+        let marker = format!("marker:v1:{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            root.path().join(".tributary-root-id"),
+            format!("{marker}\n"),
+        )
+        .unwrap();
+        let path = root.path().join("observation.wav");
+        write_startup_wav(&path, 30);
+        let proxy = controller.proxy();
+        let prepare = || {
+            proxy
+                .prepare_local(
+                    ResolvedLocalMedia::from_authorized_path_for_test(root.path(), &marker, &path)
+                        .unwrap(),
+                )
+                .unwrap()
+        };
+        let baseline_outputs = client.outputs().unwrap();
+        let baseline_player = client.get_json("/api/player").unwrap();
+        let override_path = daemon.config.pipe_path.with_extension(if outputs {
+            "outputs-response"
+        } else {
+            "player-response"
+        });
+        std::fs::write(&override_path, response).unwrap();
+        if !outputs && !accepted && response != r#"{"state":"play"}"# {
+            assert!(client.player_state().is_err());
+            assert!(
+                client.player_progress().is_err(),
+                "drain must reject malformed state too"
+            );
+        }
+        let prepared = prepare();
+        let ticket = prepared.ticket().unwrap();
+        let generation = PlayerEventGeneration::from_raw(41);
+        controller.set_generation(generation);
+        let started = Instant::now();
+        controller.load(generation, prepared);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        if accepted {
+            // Remove the read override once open has accepted it, so actual PCM
+            // autostart can be observed normally by the production activation.
+            wait_until(|| daemon.recorded().contains("PUT /api/outputs/set "));
+            std::fs::remove_file(&override_path).unwrap();
+            wait_until(|| controller.state() == PlayerState::Playing);
+            controller.stop();
+        }
+        wait_until(|| ticket.route_count() == 0);
+        let competing = open_lock(&daemon.config.lock_path()).unwrap();
+        wait_until(|| {
+            rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_ok()
+        });
+        assert!(!daemon.config.takeover_record().exists());
+        assert!(!proxy.is_custodied(&ticket));
+        assert!(!proxy.has_custody_entries());
+        if !accepted {
+            let mut events = Vec::new();
+            wait_until(|| {
+                events.extend(std::iter::from_fn(|| rx.try_recv().ok()));
+                events.iter().any(|event| {
+                    matches!(
+                        event,
+                        PlayerEvent::StateChanged {
+                            state: PlayerState::Stopped,
+                            ..
+                        }
+                    )
+                })
+            });
+            assert!(
+                events.iter().all(|event| event.generation() == generation),
+                "{events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, PlayerEvent::Error { .. }))
+                    .count(),
+                1,
+                "{events:?}"
+            );
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    PlayerEvent::TrackEnded { .. }
+                        | PlayerEvent::StateChanged {
+                            state: PlayerState::Playing,
+                            ..
+                        }
+                )),
+                "{events:?}"
+            );
+            assert_eq!(controller.state(), PlayerState::Stopped);
+            assert!(
+                !daemon
+                    .recorded()
+                    .lines()
+                    .any(|line| line.starts_with("PUT ")
+                        || line.starts_with("POST ")
+                        || line.starts_with("DELETE ")),
+                "{}",
+                daemon.recorded()
+            );
+            std::fs::remove_file(&override_path).unwrap();
+            assert_eq!(
+                client.get_json("/api/player").unwrap(),
+                baseline_player,
+                "queue and player unchanged"
+            );
+        }
+        let restored = client.outputs().unwrap();
+        assert_eq!(restored.len(), baseline_outputs.len());
+        for (actual, prior) in restored.iter().zip(&baseline_outputs) {
+            assert_eq!((actual.id, actual.selected), (prior.id, prior.selected));
+        }
+        drop(competing);
+        // A failure must release the prepared route and lock without a UI Stop,
+        // and leave this same controller/daemon usable for the next generation.
+        while rx.try_recv().is_ok() {}
+        let next = prepare();
+        let next_ticket = next.ticket().unwrap();
+        controller.set_generation(generation.next());
+        controller.load(generation.next(), next);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        assert_eq!(next_ticket.route_count(), 1);
+        controller.stop();
+        wait_until(|| next_ticket.route_count() == 0);
+        wait_until(|| !daemon.config.takeover_record().exists());
+        let restored = client.outputs().unwrap();
+        assert_eq!(restored.len(), baseline_outputs.len());
+        for (actual, prior) in restored.iter().zip(&baseline_outputs) {
+            assert_eq!((actual.id, actual.selected), (prior.id, prior.selected));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn takeover_observation_rejects_malformed_player_states() {
+        for response in [
+            r#"{}"#,
+            r#"{"state":null}"#,
+            r#"{"state":17}"#,
+            r#"{"state":"unexpected"}"#,
+        ] {
+            exercise_takeover_observation(response, false, false);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn takeover_observation_rejects_incomplete_output_snapshots() {
+        for second in [
+            serde_json::json!({"selected": true}),
+            serde_json::json!({"id": "invalid", "selected": true}),
+            serde_json::json!({"id": null, "selected": true}),
+            serde_json::json!({"id": 42, "selected": true}),
+            serde_json::json!({"id": "42"}),
+            serde_json::json!({"id": "42", "selected": "true"}),
+            serde_json::json!({"id": "42", "selected": null}),
+            serde_json::json!({"id": "11189196", "selected": true}),
+        ] {
+            let response = serde_json::json!({"outputs": [
+                {"id": "11189196", "name": "Target", "selected": false}, second
+            ]});
+            exercise_takeover_observation(&response.to_string(), true, false);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn takeover_observation_preserves_recognized_state_policy() {
+        for state in ["stop", "pause", "play"] {
+            exercise_takeover_observation(
+                &format!(r#"{{"state":"{state}"}}"#),
+                false,
+                state != "play",
+            );
         }
     }
 
