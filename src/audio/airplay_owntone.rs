@@ -1449,6 +1449,21 @@ impl SessionInner {
     where
         F: FnOnce() -> Result<(), SenderError>,
     {
+        #[cfg(test)]
+        if self
+            .config
+            .pipe_path
+            .with_extension("park-terminal")
+            .exists()
+        {
+            std::fs::write(
+                self.config
+                    .pipe_path
+                    .with_extension("terminal-control-waiting"),
+                "",
+            )
+            .unwrap();
+        }
         let _boundary = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
         if self.terminal.load(Ordering::SeqCst) {
             return Err(unavailable(
@@ -2075,6 +2090,30 @@ fn natural_completion(inner: &SessionInner, pipeline: &gst::Pipeline) {
     // restoration retains custody for close()'s serialized recovery.
     let restored = inner.restore();
     let failure = failure.or_else(|| restored.err().map(|_| "AirPlay restoration failed"));
+    // Deterministically expose the restore-to-publication gap to real-pump
+    // controller regressions; this adds no production synchronization.
+    #[cfg(test)]
+    if inner
+        .config
+        .pipe_path
+        .with_extension("park-terminal")
+        .exists()
+    {
+        std::fs::write(inner.config.pipe_path.with_extension("terminal-ready"), "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !inner
+            .config
+            .pipe_path
+            .with_extension("terminal-release")
+            .exists()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "terminal publication was not released"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     // Lock order matches control publication: settlement boundary then gate.
     // Stop either wins first and suppresses every completion/error event, or
     // follows this entire bounded publication. No check-to-send race (AE1).
@@ -2180,15 +2219,41 @@ impl SenderSession for OwnToneSession {
         // Win the shared Stop/start boundary and the serialized activation
         // boundary before tearing down: a close that races an accepted
         // activation must block any late `player/play` (review S4, review U3).
-        this.inner.gate.stop();
+        // A refused control may have observed restore's terminal latch before
+        // the pump publishes its outcome. Worker cleanup must join that pump
+        // before closing its event gate (AJ1). Explicit Stop/replacement already
+        // stop the shared gate and cancel the token on the controller path, so
+        // they still suppress publication immediately. Genuine live failures
+        // still stop decoding and settle here on the worker.
+        if !this.inner.terminal.load(Ordering::SeqCst) {
+            this.inner.gate.stop();
+        }
         this.inner.cancel_activation();
         this.inner.running.store(false, Ordering::SeqCst);
         if let Some(pipeline) = this.inner.pipeline() {
             let _ = pipeline.set_state(gst::State::Null);
         }
+        #[cfg(test)]
+        if this
+            .inner
+            .config
+            .pipe_path
+            .with_extension("park-terminal")
+            .exists()
+        {
+            std::fs::write(
+                this.inner
+                    .config
+                    .pipe_path
+                    .with_extension("terminal-close-joining"),
+                "",
+            )
+            .unwrap();
+        }
         if let Some(handle) = this.pump {
             let _ = handle.join();
         }
+        this.inner.gate.stop();
         if this.inner.restore().is_ok() {
             // Dropping the lock file releases the advisory lock only after
             // restoration has completed (§4.3).
@@ -7060,6 +7125,24 @@ fn serve(stream: std::net::TcpStream) {
     /// Stop, replacement, controller drop, or UI handling of terminal events.
     #[cfg(target_os = "linux")]
     fn exercise_pump_settlement(decode_error: bool, restore_fault: Option<bool>) {
+        exercise_pump_settlement_with_control(decode_error, restore_fault, None);
+    }
+
+    #[derive(Clone, Copy)]
+    #[cfg(target_os = "linux")]
+    enum TerminalControl {
+        Volume,
+        Pause,
+        Resume,
+        StopAfterVolume,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exercise_pump_settlement_with_control(
+        decode_error: bool,
+        restore_fault: Option<bool>,
+        terminal_control: Option<TerminalControl>,
+    ) {
         use crate::audio::airplay_output::ControllerHarness;
         use crate::local::resolver::ResolvedLocalMedia;
 
@@ -7075,7 +7158,7 @@ fn serve(stream: std::net::TcpStream) {
             .build()
             .unwrap();
         let (tx, rx) = async_channel::unbounded();
-        let controller = ControllerHarness::new(
+        let mut controller = ControllerHarness::new(
             runtime.handle().clone(),
             Arc::new(OwnToneSender {
                 config: Some(daemon.config.clone()),
@@ -7092,11 +7175,12 @@ fn serve(stream: std::net::TcpStream) {
         .unwrap();
         let path = root.path().join("pump.wav");
         write_startup_wav(&path, if decode_error { 30 } else { 1 });
+        let proxy = controller.proxy();
         let prepare = || {
             let media =
                 ResolvedLocalMedia::from_authorized_path_for_test(root.path(), &marker, &path)
                     .unwrap();
-            controller.proxy().prepare_local(media).unwrap()
+            proxy.prepare_local(media).unwrap()
         };
         let prepared = prepare();
         let ticket = prepared.ticket().unwrap();
@@ -7131,10 +7215,17 @@ fn serve(stream: std::net::TcpStream) {
         assert!(daemon.config.takeover_record().exists());
         assert!(client.outputs().unwrap()[0].selected);
         while rx.try_recv().is_ok() {}
-        if let Some(timeout) = restore_fault {
+        if terminal_control.is_some() {
+            std::fs::write(pipe.with_extension("park-terminal"), "").unwrap();
+        }
+        if restore_fault.is_some() || terminal_control.is_some() {
             std::fs::write(
                 pipe.with_extension("park-restore"),
-                if timeout { "timeout" } else { "fail" },
+                match restore_fault {
+                    Some(true) => "timeout",
+                    Some(false) => "fail",
+                    None => "success",
+                },
             )
             .unwrap();
         }
@@ -7144,7 +7235,7 @@ fn serve(stream: std::net::TcpStream) {
         } else {
             std::fs::write(pipe.with_extension("drain-release"), "stop").unwrap();
         }
-        if let Some(timeout) = restore_fault {
+        if restore_fault.is_some() || terminal_control.is_some() {
             wait_until(|| pipe.with_extension("restore-seen").exists());
             assert_eq!(ticket.route_count(), 1, "restoring mutation retains media");
             assert!(daemon.config.takeover_record().exists());
@@ -7152,11 +7243,45 @@ fn serve(stream: std::net::TcpStream) {
                 rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err()
             );
             assert!(client.outputs().unwrap()[0].selected);
-            if !timeout {
+            if let Some(control) = terminal_control {
+                let started = Instant::now();
+                match control {
+                    TerminalControl::Volume | TerminalControl::StopAfterVolume => {
+                        controller.set_volume(0.37);
+                    }
+                    TerminalControl::Pause => controller.pause(),
+                    TerminalControl::Resume => controller.play(),
+                }
+                assert!(started.elapsed() < Duration::from_millis(500));
+                // Pause/volume block on restore's mutation boundary. Resume
+                // observes running=false and is refused without an RPC.
+                if !matches!(control, TerminalControl::Resume) {
+                    wait_until(|| pipe.with_extension("terminal-control-waiting").exists());
+                }
+            }
+            if restore_fault != Some(true) {
                 std::fs::write(pipe.with_extension("restore-release"), "").unwrap();
             }
             // Timeout is never released: only automatic worker quiescence can
             // kill that request and make releasing the instance lock safe.
+        }
+        if let Some(control) = terminal_control {
+            wait_until(|| pipe.with_extension("terminal-ready").exists());
+            wait_until(|| pipe.with_extension("terminal-close-joining").exists());
+            assert!(rx.try_recv().is_err(), "publication remains parked");
+            assert!(
+                rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err()
+            );
+            let requests = daemon.recorded();
+            assert!(!requests.contains("PUT /api/player/pause"));
+            assert!(!requests.contains("PUT /api/player/play"));
+            assert!(!requests.contains("volume=37"));
+            if matches!(control, TerminalControl::StopAfterVolume) {
+                let started = Instant::now();
+                controller.stop();
+                assert!(started.elapsed() < Duration::from_millis(500));
+            }
+            std::fs::write(pipe.with_extension("terminal-release"), "").unwrap();
         }
         wait_until(|| ticket.route_count() == 0);
         wait_until(|| {
@@ -7190,12 +7315,13 @@ fn serve(stream: std::net::TcpStream) {
             "direct-source UI does not send Stop"
         );
         assert!(playback.accepts_event_generation(generation));
+        let stopped = matches!(terminal_control, Some(TerminalControl::StopAfterVolume));
         let failed = decode_error || restore_fault.is_some();
         assert_eq!(
             events
                 .iter()
                 .any(|event| matches!(event, PlayerEvent::Error { .. })),
-            failed,
+            failed && !stopped,
             "{events:?}"
         );
         assert_eq!(
@@ -7203,7 +7329,7 @@ fn serve(stream: std::net::TcpStream) {
                 .iter()
                 .filter(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
                 .count(),
-            usize::from(!failed),
+            usize::from(!failed && !stopped),
             "{events:?}"
         );
         assert!(
@@ -7238,7 +7364,7 @@ fn serve(stream: std::net::TcpStream) {
         );
         assert!(rx.try_recv().is_err());
         drop(competing);
-        for suffix in ["park-drain", "drain-started"] {
+        for suffix in ["park-drain", "drain-started", "park-terminal"] {
             let _ = std::fs::remove_file(pipe.with_extension(suffix));
         }
         write_startup_wav(&path, 30);
@@ -7290,6 +7416,52 @@ fn serve(stream: std::net::TcpStream) {
     #[test]
     fn pump_finite_eos_timed_out_restore_settles_without_stop() {
         exercise_pump_settlement(false, Some(true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pump_terminal_control_volume_completion() {
+        exercise_pump_settlement_with_control(false, None, Some(TerminalControl::Volume));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pump_terminal_control_pause_completion() {
+        exercise_pump_settlement_with_control(false, None, Some(TerminalControl::Pause));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pump_terminal_control_resume_completion() {
+        exercise_pump_settlement_with_control(false, None, Some(TerminalControl::Resume));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pump_terminal_control_volume_restore_failure() {
+        exercise_pump_settlement_with_control(false, Some(false), Some(TerminalControl::Volume));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pump_terminal_control_pause_restore_failure() {
+        exercise_pump_settlement_with_control(false, Some(false), Some(TerminalControl::Pause));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pump_terminal_control_volume_stop_first() {
+        exercise_pump_settlement_with_control(false, None, Some(TerminalControl::StopAfterVolume));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pump_terminal_control_volume_failed_restore_stop_first() {
+        exercise_pump_settlement_with_control(
+            false,
+            Some(false),
+            Some(TerminalControl::StopAfterVolume),
+        );
     }
 
     /// AG1: events are observed without any UI-generated Stop, matching direct
