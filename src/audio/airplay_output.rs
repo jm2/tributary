@@ -1545,10 +1545,15 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let state_dir = directory.path().join("state");
         std::fs::create_dir_all(&state_dir).expect("state dir");
-        let pipe = state_dir.join("airplay.pcm");
         let config = state_dir.join("owntone.conf");
-        std::fs::write(&config, format!("pipe_path = \"{}\"\n", pipe.display()))
-            .expect("write config");
+        std::fs::write(
+            &config,
+            include_str!("../../tests/fixtures/owntone-29.3-library.conf").replace(
+                "@PIPE_DIRECTORY@",
+                state_dir.to_str().expect("UTF-8 state path"),
+            ),
+        )
+        .expect("write config");
 
         // Compile the hermetic fake daemon: it binds the endpoint and never
         // answers, and its argv binds the canonical config so it is genuinely

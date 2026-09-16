@@ -710,6 +710,29 @@ AirPlay-2-certified third-party speakers) advertise via `_airplay._tcp.local.` a
 detected, but remain filtered out until a path that can actually play to them ships. Both
 the OwnTone path and the eventual AirPlay 2 path need real-device validation.
 
+The dedicated OwnTone instance must use `<state_dir>/owntone.conf` via its explicit
+`-c`/`--config` launch option. Its input configuration uses OwnTone's library scanner:
+
+```conf
+library {
+    directories = { "/absolute/path/to/dedicated-input" }
+    pipe_autostart = true
+    pipe_sample_rate = 44100
+    pipe_bits_per_sample = 16
+}
+```
+
+Set `TRIBUTARY_OWNTONE_PIPE` to a direct child of that directory, such as
+`/absolute/path/to/dedicated-input/airplay.pcm`. Provision that directory and the
+FIFO for the dedicated daemon user. OwnTone has no `pipe_path` configuration key.
+The authority check accepts a conservative subset: one absolute scanned directory,
+a non-hidden `.pcm` FIFO without a symlink, enabled scanning and autostart, 44.1 kHz
+16-bit samples, and no nonempty ignore filters. Additional library options are limited
+to `name`, `port`, `password`, and `follow_symlinks`; includes, expansion, escapes,
+duplicate sections/options and titled sections are refused. Existing endpoint,
+process, ownership-record and exclusive-lock requirements still apply. This check
+establishes the configured scan path; it does not certify physical receiver playback.
+
 Sender-side AirPlay 2 support requires, at minimum:
 
 1. **A pairing/handshake step** to establish an authenticated session with the receiver before any audio is sent.

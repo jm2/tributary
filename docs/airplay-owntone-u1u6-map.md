@@ -13,7 +13,7 @@ Corrective commit on the canonical branch `polecat/tr-t3a` (base
 | Commit | Scope |
 | --- | --- |
 | `87ceb31d` | U1–U4 — settlement, live recovery, Stop/start boundary, prepared registration |
-| *(this leg)* | U5 — effective process/config/FIFO authority and stable signal delivery; U6 fixtures |
+| *(this leg)* | U5 — process/config/FIFO authority and stable signal delivery; U6 fixtures |
 
 ## U1 — failed live restoration left no outstanding-mutation marker
 
@@ -121,8 +121,11 @@ Corrective commit on the canonical branch `polecat/tr-t3a` (base
   - `cmdline_binds_instance` canonicalizes both the state directory and the
     effective config, requires the config to equal
     `<canonical state>/owntone.conf`, requires that name to be a **regular
-    file** (not a symlink), and then reads it and requires its `pipe_path`
-    directive to resolve to `OwnToneConfig.pipe_path` (`config_binds_pipe`).
+    file** (not a symlink), and then reads its `library` section and requires
+    the single scanned
+    `directories` entry to resolve to the configured FIFO parent, with enabled
+    scanning/autostart, compatible PCM settings and no ignore filters
+    (`config_binds_pipe`; corrected in AB1).
   - `SignalHandle`: on Linux signals are delivered through a **`pidfd`**
     (`pidfd_open` + `pidfd_send_signal`), which names the exact process and
     cannot reach a recycled pid — no check-to-signal window; the handle also
@@ -136,8 +139,10 @@ Corrective commit on the canonical branch `polecat/tr-t3a` (base
   `signal_and_wait_refuses_a_replaced_identity`,
   `signal_and_wait_treats_a_gone_process_as_quiesced`,
   `verify_daemon_process_refuses_a_foreign_listener`.
-- **Note:** `config_binds_pipe` reads the documented OwnTone `pipe_path`
-  directive. If the pinned 29.3 key differs, this is the one place to adjust.
+- **Correction (AB1):** OwnTone 29.3 has no `pipe_path` directive. The prior
+  claim was false. The gate now checks the supported `library.directories`
+  scanning contract; see [the AB1/AB2 map](airplay-owntone-ab1ab2-map.md)
+  for the supported subset, upstream schema validation and remaining limits.
 
 ## U6 — required behavioral evidence
 

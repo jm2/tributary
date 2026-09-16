@@ -511,11 +511,8 @@ fn listener_process(api_base: &str) -> Option<ListenerProcess> {
 /// directory (review T5, review U5).
 const OWNTONE_CONFIG_FILE: &str = "owntone.conf";
 
-/// The config directives that bind OwnTone's named-pipe input to a path. The
-/// dedicated instance must read the same FIFO the adapter writes, so the
-/// effective configuration is read and its pipe path compared to
-/// [`OwnToneConfig::pipe_path`] (review U5).
-const OWNTONE_PIPE_KEYS: &[&str] = &["pipe_path"];
+#[path = "airplay_owntone_config.rs"]
+mod dedicated_config;
 
 /// The effective configuration file named by a process's launch arguments.
 ///
@@ -556,33 +553,7 @@ fn effective_config_argument(argv: &[String]) -> Option<PathBuf> {
 /// domain, so the FIFO the adapter writes is authoritative only when the daemon
 /// is configured to read exactly that FIFO (review U5).
 fn config_binds_pipe(config_path: &Path, pipe_path: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(config_path) else {
-        return false;
-    };
-    let expected = std::fs::canonicalize(pipe_path).unwrap_or_else(|_| pipe_path.to_path_buf());
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or_default().trim();
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if !OWNTONE_PIPE_KEYS
-            .iter()
-            .any(|candidate| key.trim().eq_ignore_ascii_case(candidate))
-        {
-            continue;
-        }
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        if value.is_empty() {
-            continue;
-        }
-        let candidate = Path::new(value);
-        let candidate =
-            std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
-        if candidate == expected {
-            return true;
-        }
-    }
-    false
+    dedicated_config::binds_pipe(config_path, pipe_path)
 }
 
 /// `true` when the process's launch binds the dedicated instance: its effective
@@ -1139,10 +1110,10 @@ impl OwnToneClient {
     }
 
     fn set_volume(&self, percent: u8) -> Result<(), SenderError> {
-        self.put_json(
-            "/api/player/volume",
-            &serde_json::json!({ "volume": percent }),
-        )
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("volume", &percent.to_string())
+            .finish();
+        self.put(&format!("/api/player/volume?{query}"))
     }
 }
 
@@ -3663,8 +3634,7 @@ mod tests {
         let pipe = state_dir.join("airplay.pcm");
         std::fs::write(&pipe, b"fifo").expect("write pipe placeholder");
         let config = state_dir.join(OWNTONE_CONFIG_FILE);
-        std::fs::write(&config, format!("pipe_path = \"{}\"\n", pipe.display()))
-            .expect("write config");
+        std::fs::write(&config, dedicated_config::fixture(&pipe)).expect("write config");
         std::fs::create_dir_all(state_dir.join("sub")).expect("sub dir");
 
         // The effective option names the canonical file and binds the FIFO.
@@ -3731,7 +3701,11 @@ mod tests {
         ));
         // A non-canonical configuration beneath the state directory is refused.
         let unrelated = state_dir.join("other.conf");
-        std::fs::write(&unrelated, "pipe_path = \"/tmp/nope\"\n").expect("write unrelated");
+        std::fs::write(
+            &unrelated,
+            "library { directories = { \"/var/tmp/nope\" } }\n",
+        )
+        .expect("write unrelated");
         assert!(!cmdline_binds_instance(
             &argv(&["/usr/bin/owntone", "-c", &unrelated.to_string_lossy()]),
             state_dir,
@@ -3752,8 +3726,7 @@ mod tests {
 
         // A symlinked launch file is refused even when it resolves elsewhere.
         let foreign = directory.path().join("foreign.conf");
-        std::fs::write(&foreign, format!("pipe_path = \"{}\"\n", pipe.display()))
-            .expect("foreign config");
+        std::fs::write(&foreign, dedicated_config::fixture(&pipe)).expect("foreign config");
         let symlinked_dir = tempfile::tempdir().expect("tempdir");
         let symlink_state = symlinked_dir.path().join("state");
         std::fs::create_dir_all(&symlink_state).expect("state dir");
@@ -3770,11 +3743,8 @@ mod tests {
         let other_pipe = other_dir.path().join("other.pcm");
         std::fs::write(&other_pipe, b"other").expect("other pipe");
         let other_config = other_dir.path().join(OWNTONE_CONFIG_FILE);
-        std::fs::write(
-            &other_config,
-            format!("pipe_path = \"{}\"\n", other_pipe.display()),
-        )
-        .expect("other config");
+        std::fs::write(&other_config, dedicated_config::fixture(&other_pipe))
+            .expect("other config");
         assert!(!cmdline_binds_instance(
             &argv(&["/usr/bin/owntone", "-c", &other_config.to_string_lossy()]),
             other_dir.path(),
@@ -5667,11 +5637,7 @@ fn serve(stream: std::net::TcpStream) {
             std::fs::create_dir_all(&state_dir).expect("state dir");
             let pipe = state_dir.join("airplay.pcm");
             let config_path = state_dir.join(OWNTONE_CONFIG_FILE);
-            std::fs::write(
-                &config_path,
-                format!("pipe_path = \"{}\"\n", pipe.display()),
-            )
-            .expect("write config");
+            std::fs::write(&config_path, dedicated_config::fixture(&pipe)).expect("write config");
 
             let source = directory.path().join("fake_owned.rs");
             std::fs::write(&source, FAKE_OWNED_DAEMON_SOURCE).expect("write source");
@@ -5900,14 +5866,23 @@ fn serve(stream: std::net::TcpStream) {
         let _ = reader.read_exact(&mut body);
     }
     let path = trimmed.split_whitespace().nth(1).unwrap_or_default().to_string();
-    let body = match path.as_str() {
-        "/api/config" => r#"{"version":"29.3"}"#.to_string(),
-        "/api/outputs" => r#"{"outputs":[{"id":"11189196","name":"Test","selected":true}]}"#.to_string(),
-        "/api/player" => r#"{"state":"stop"}"#.to_string(),
-        _ => "{}".to_string(),
+    let method = trimmed.split_whitespace().next().unwrap_or_default();
+    let volume = path.strip_prefix("/api/player/volume?volume=")
+        .and_then(|v| v.parse::<u8>().ok()).filter(|v| *v <= 100);
+    let (status, body) = match (method, path.as_str()) {
+        ("GET", "/api/config") => ("200 OK", r#"{"version":"29.3"}"#),
+        ("GET", "/api/outputs") => ("200 OK", r#"{"outputs":[{"id":"11189196","name":"Test","selected":true}]}"#),
+        ("GET", "/api/player") => ("200 OK", r#"{"state":"stop"}"#),
+        ("PUT", _) if path.starts_with("/api/player/volume") => {
+            if volume.is_some() && content_length == 0 { ("204 No Content", "") }
+            else { ("400 Bad Request", "{}") }
+        }
+        ("PUT", "/api/outputs/set" | "/api/queue/clear" |
+            "/api/player/play" | "/api/player/pause" | "/api/player/stop") => ("204 No Content", ""),
+        _ => ("404 Not Found", "{}"),
     };
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(), body
     );
     let mut stream = stream;
@@ -5946,11 +5921,7 @@ fn serve(stream: std::net::TcpStream) {
             std::fs::create_dir_all(&state_dir).expect("state dir");
             let pipe = state_dir.join("airplay.pcm");
             let config_path = state_dir.join(OWNTONE_CONFIG_FILE);
-            std::fs::write(
-                &config_path,
-                format!("pipe_path = \"{}\"\n", pipe.display()),
-            )
-            .expect("write config");
+            std::fs::write(&config_path, dedicated_config::fixture(&pipe)).expect("write config");
 
             let source = directory.path().join("fake_recording.rs");
             std::fs::write(&source, RECORDING_DAEMON_SOURCE).expect("write source");
@@ -6099,7 +6070,7 @@ fn serve(stream: std::net::TcpStream) {
 
         let recorded = daemon.recorded();
         assert!(
-            recorded.contains("/api/player/volume"),
+            recorded.contains("PUT /api/player/volume?volume=42 HTTP/1.1"),
             "open() must apply the initial volume: {recorded:?}"
         );
         assert!(
@@ -6108,6 +6079,11 @@ fn serve(stream: std::net::TcpStream) {
         );
 
         let mut session = session;
+        session.set_volume(0.73);
+        assert!(daemon
+            .recorded()
+            .contains("PUT /api/player/volume?volume=73 HTTP/1.1"));
+
         assert!(session.resume(), "the accepted start must transmit");
         let deadline = Instant::now() + Duration::from_secs(5);
         while !daemon.recorded().contains("/api/player/play") {
@@ -6133,6 +6109,24 @@ fn serve(stream: std::net::TcpStream) {
 
         session.close();
         reader.join().expect("reader");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn volume_contract_rejects_body_only_and_propagates_http_failure() {
+        let daemon = RecordingOwnedDaemon::start();
+        let client = OwnToneClient::new(&daemon.config.api_base).expect("client");
+        assert!(client
+            .put_json("/api/player/volume", &serde_json::json!({"volume": 42}))
+            .is_err());
+        assert!(client.put("/api/player/volume?volume=invalid").is_err());
+        assert!(client.set_volume(101).is_err());
+        for percent in [0, 42, 73, 100] {
+            client.set_volume(percent).expect("supported query volume");
+            assert!(daemon
+                .recorded()
+                .contains(&format!("PUT /api/player/volume?volume={percent} HTTP/1.1")));
+        }
     }
 
     /// Z1: a live session whose close fails restoration hands its route to real
@@ -6512,11 +6506,7 @@ fn serve(stream: std::net::TcpStream, fail: Option<String>) {
             std::fs::create_dir_all(&state_dir).expect("state dir");
             let pipe = state_dir.join("airplay.pcm");
             let config_path = state_dir.join(OWNTONE_CONFIG_FILE);
-            std::fs::write(
-                &config_path,
-                format!("pipe_path = \"{}\"\n", pipe.display()),
-            )
-            .expect("write config");
+            std::fs::write(&config_path, dedicated_config::fixture(&pipe)).expect("write config");
 
             let source = directory.path().join("fake_restore_switch.rs");
             std::fs::write(&source, RESTORE_SWITCH_DAEMON_SOURCE).expect("write source");
