@@ -6609,7 +6609,7 @@ fn serve(stream: std::net::TcpStream) {
     #[test]
     fn takeover_observation_rejects_malformed_player_states() {
         for response in [
-            r#"{}"#,
+            "{}",
             r#"{"state":null}"#,
             r#"{"state":17}"#,
             r#"{"state":"unexpected"}"#,
