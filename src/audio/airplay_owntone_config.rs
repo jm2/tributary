@@ -125,7 +125,7 @@ fn parse(text: &str) -> Option<BTreeMap<String, Section>> {
                     }
                     Value::List(list)
                 }
-                _ => return None,
+                Token::Symbol(_) => return None,
             };
             if options.insert(key, value).is_some() {
                 return None;
@@ -282,7 +282,7 @@ mod tests {
             valid.replace(directory.path().to_str().unwrap(), "."),
             format!("{valid} {valid}"),
             format!("{valid} }}"),
-            valid.lines().map(|line| format!("# {line}\n")).collect(),
+            format!("# {}", valid.replace('\n', "\n# ")),
             format!("pipe_path = \"{}\"", pipe.display()),
         ] {
             assert!(!check(&invalid), "must reject {invalid}");
