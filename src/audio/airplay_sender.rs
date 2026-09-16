@@ -415,6 +415,14 @@ pub(super) trait SenderSession: Send {
     /// The current playback state for the output abstraction.
     fn state(&self) -> PlayerState;
 
+    /// Nonblocking terminal notification from an internally owned pump. This
+    /// is distinct from an observed Stopped state during startup or buffering.
+    /// True asks the command worker to close automatically, even without UI
+    /// commands. Adapters must finish terminal publication before returning true.
+    fn is_finished(&self) -> bool {
+        false
+    }
+
     /// Tear down the receiver session and local resources. Consumes `self` so
     /// a closed session is unrepresentable.
     fn close(self: Box<Self>);

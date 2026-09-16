@@ -893,7 +893,7 @@ fn run_session_worker(
             loop {
                 state_cache.store(session.state() as u8, Ordering::SeqCst);
                 *position_cache.lock().unwrap_or_else(|p| p.into_inner()) = session.observe();
-                if ctx.cancel.is_cancelled() {
+                if ctx.cancel.is_cancelled() || session.is_finished() {
                     break;
                 }
                 match commands.recv_timeout(Duration::from_millis(200)) {

@@ -1540,11 +1540,18 @@ impl SessionInner {
     /// before the `Stopped`) or after it (and is refused by
     /// `transmit_mutation`). Idempotent with [`Self::restore`], which latches
     /// the same flag under the same lock.
-    fn publish_terminal(&self) {
+    fn publish_terminal(&self, message: &str) {
         let _boundary = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
         self.terminal.store(true, Ordering::SeqCst);
         self.running.store(false, Ordering::SeqCst);
-        self.publish_state(PlayerState::Stopped);
+        self.gate.publish_if_live(|| {
+            if !self.cancel.is_cancelled() {
+                let _ = self
+                    .event_tx
+                    .try_send(PlayerEvent::error(self.generation, message.to_string()));
+                self.publish_state(PlayerState::Stopped);
+            }
+        });
     }
 
     /// Register uncertainty around an effect whose transmission is not routed
@@ -1912,13 +1919,7 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
         // and publish `Stopped` together, so no control can publish after it
         // (review Y1).
         let _ = pipeline.set_state(gst::State::Null);
-        inner.publish_terminal();
-        let _ = inner.event_tx.try_send(PlayerEvent::error(
-            inner.generation,
-            unavailable("the decode pipeline has no bus")
-                .message()
-                .to_string(),
-        ));
+        inner.publish_terminal("the decode pipeline has no bus");
         return;
     };
 
@@ -1959,12 +1960,8 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
                     // route so an intentional teardown is never mistaken for a
                     // transient fetch error (§4.4).
                     let _ = pipeline.set_state(gst::State::Null);
-                    let _ = inner.event_tx.try_send(PlayerEvent::error(
-                        inner.generation,
-                        "AirPlay playback failed".to_string(),
-                    ));
-                    // Terminal failure: latch and publish together (review Y1).
-                    inner.publish_terminal();
+                    // Terminal failure and publication share the Stop gate.
+                    inner.publish_terminal("AirPlay playback failed");
                     // A failed restore is not a clean teardown; the session
                     // close path installs serialized recovery and retains the
                     // record (review R3).
@@ -2168,6 +2165,14 @@ impl SenderSession for OwnToneSession {
 
     fn state(&self) -> PlayerState {
         *self.inner.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn is_finished(&self) -> bool {
+        // Waiting for the pump thread (rather than its early terminal latch)
+        // lets EOS/error publication finish before close stops the event gate.
+        // The worker polls at its bounded command interval and retains all
+        // resources until its existing close/restoration/recovery completes.
+        self.pump.as_ref().is_some_and(|pump| pump.is_finished())
     }
 
     fn close(self: Box<Self>) {
@@ -6087,8 +6092,14 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_millis(10));
             continue;
         }
+        if pipe().with_extension("break-pipe").exists() {
+            std::fs::remove_file(pipe().with_extension("break-pipe")).unwrap();
+            drop(FIFO.lock().unwrap().take());
+            std::fs::write(pipe().with_extension("pipe-broken"), "").unwrap();
+        }
         let mut buffer = [0; 4096];
-        if let Ok(n) = FIFO.lock().unwrap().as_mut().unwrap().read(&mut buffer) {
+        let read = FIFO.lock().unwrap().as_mut().map(|fifo| fifo.read(&mut buffer));
+        if let Some(Ok(n)) = read {
             if n > 0 {
                 if state.bytes == 0 {
                     let record = std::env::var("TRIBUTARY_FAKE_REQUESTS").unwrap();
@@ -6182,6 +6193,20 @@ fn serve(stream: std::net::TcpStream) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         if pipe.with_extension("fail-control").exists() {
+            let mut stream = stream;
+            let _ = stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            return;
+        }
+    }
+    // One-shot restoring mutation fault, consumed before restart so recovery
+    // can restore normally. A parked request really outlives the HTTP timeout.
+    if method == "PUT" && path == "/api/player/stop"
+        && std::fs::rename(pipe.with_extension("park-restore"), pipe.with_extension("restore-seen")).is_ok() {
+        let mode = std::fs::read_to_string(pipe.with_extension("restore-seen")).unwrap();
+        while !pipe.with_extension("restore-release").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if mode == "fail" {
             let mut stream = stream;
             let _ = stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
             return;
@@ -7029,6 +7054,242 @@ fn serve(stream: std::net::TcpStream) {
         assert!(events.iter().all(|event| event.generation() == generation
             || (replace && event.generation() == PlayerEventGeneration::from_raw(82))));
         assert!(!events.iter().any(|event| matches!(event, PlayerEvent::StateChanged { generation: g, state: PlayerState::Playing } if *g == generation)), "late Playing after cancellation: {events:?}");
+    }
+
+    /// AI1: the actual decoder/pump and command worker must settle without
+    /// Stop, replacement, controller drop, or UI handling of terminal events.
+    #[cfg(target_os = "linux")]
+    fn exercise_pump_settlement(decode_error: bool, restore_fault: Option<bool>) {
+        use crate::audio::airplay_output::ControllerHarness;
+        use crate::local::resolver::ResolvedLocalMedia;
+
+        gst::init().unwrap();
+        let daemon = RecordingOwnedDaemon::start();
+        let original_process = listener_process(&daemon.config.api_base)
+            .unwrap()
+            .identity();
+        let client = OwnToneClient::new(&daemon.config.api_base).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        let controller = ControllerHarness::new(
+            runtime.handle().clone(),
+            Arc::new(OwnToneSender {
+                config: Some(daemon.config.clone()),
+            }),
+            tx,
+        )
+        .with_device_id("aabbcc");
+        let root = tempfile::tempdir().unwrap();
+        let marker = format!("marker:v1:{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            root.path().join(".tributary-root-id"),
+            format!("{marker}\n"),
+        )
+        .unwrap();
+        let path = root.path().join("pump.wav");
+        write_startup_wav(&path, if decode_error { 30 } else { 1 });
+        let prepare = || {
+            let media =
+                ResolvedLocalMedia::from_authorized_path_for_test(root.path(), &marker, &path)
+                    .unwrap();
+            controller.proxy().prepare_local(media).unwrap()
+        };
+        let prepared = prepare();
+        let ticket = prepared.ticket().unwrap();
+        let mut playback = crate::ui::playback::PlaybackSession::default();
+        let direct = crate::ui::playback::QueueItem::direct_for_test(
+            "https://radio.invalid/live".into(),
+            "Radio".into(),
+            String::new(),
+            String::new(),
+        );
+        assert!(playback.replace_queue(vec![direct], 0));
+        let generation = playback.current_event_generation();
+        controller.set_generation(generation);
+        let pipe = &daemon.config.pipe_path;
+        // Park EOS before restoring so setup's own stop RPC cannot consume the
+        // fault. Decoder-error cases keep streaming until we close the reader.
+        if !decode_error {
+            std::fs::write(pipe.with_extension("park-drain"), "").unwrap();
+        }
+        let started = Instant::now();
+        controller.load(generation, prepared);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        if decode_error {
+            wait_until(|| controller.state() == PlayerState::Playing);
+        } else {
+            wait_until(|| pipe.with_extension("drain-seen").exists());
+        }
+        assert!(daemon.recorded().contains("PCM received"));
+        let competing = open_lock(&daemon.config.lock_path()).unwrap();
+        assert!(rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err());
+        assert_eq!(ticket.route_count(), 1);
+        assert!(daemon.config.takeover_record().exists());
+        assert!(client.outputs().unwrap()[0].selected);
+        while rx.try_recv().is_ok() {}
+        if let Some(timeout) = restore_fault {
+            std::fs::write(
+                pipe.with_extension("park-restore"),
+                if timeout { "timeout" } else { "fail" },
+            )
+            .unwrap();
+        }
+        if decode_error {
+            std::fs::write(pipe.with_extension("break-pipe"), "").unwrap();
+            wait_until(|| pipe.with_extension("pipe-broken").exists());
+        } else {
+            std::fs::write(pipe.with_extension("drain-release"), "stop").unwrap();
+        }
+        if let Some(timeout) = restore_fault {
+            wait_until(|| pipe.with_extension("restore-seen").exists());
+            assert_eq!(ticket.route_count(), 1, "restoring mutation retains media");
+            assert!(daemon.config.takeover_record().exists());
+            assert!(
+                rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err()
+            );
+            assert!(client.outputs().unwrap()[0].selected);
+            if !timeout {
+                std::fs::write(pipe.with_extension("restore-release"), "").unwrap();
+            }
+            // Timeout is never released: only automatic worker quiescence can
+            // kill that request and make releasing the instance lock safe.
+        }
+        wait_until(|| ticket.route_count() == 0);
+        wait_until(|| {
+            rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_ok()
+        });
+        wait_until(|| controller.state() == PlayerState::Stopped);
+        assert!(!daemon.config.takeover_record().exists());
+        assert!(!controller.proxy().is_custodied(&ticket));
+        assert!(!controller.proxy().has_custody_entries());
+        assert!(!client.outputs().unwrap()[0].selected);
+        assert!(client.outputs().unwrap()[1].selected);
+        assert_eq!(client.player_state().unwrap(), "stop");
+        let final_process = listener_process(&daemon.config.api_base)
+            .unwrap()
+            .identity();
+        if restore_fault.is_some() {
+            assert_ne!(
+                final_process, original_process,
+                "uncertain restore requires quiescence"
+            );
+        } else {
+            assert_eq!(
+                final_process, original_process,
+                "clean restore needs no restart"
+            );
+        }
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().all(|event| event.generation() == generation));
+        assert!(
+            !playback.mark_resolved_load_failed(generation),
+            "direct-source UI does not send Stop"
+        );
+        assert!(playback.accepts_event_generation(generation));
+        let failed = decode_error || restore_fault.is_some();
+        assert_eq!(
+            events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::Error { .. })),
+            failed,
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
+                .count(),
+            usize::from(!failed),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                }
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Playing | PlayerState::Paused,
+                    ..
+                }
+            )),
+            "{events:?}"
+        );
+        let before_controls = daemon.recorded();
+        controller.play();
+        controller.pause();
+        controller.play();
+        assert_eq!(controller.state(), PlayerState::Stopped);
+        assert_eq!(
+            daemon.recorded(),
+            before_controls,
+            "finished worker refuses late controls"
+        );
+        assert!(rx.try_recv().is_err());
+        drop(competing);
+        for suffix in ["park-drain", "drain-started"] {
+            let _ = std::fs::remove_file(pipe.with_extension(suffix));
+        }
+        write_startup_wav(&path, 30);
+        let prepared = prepare();
+        let next_ticket = prepared.ticket().unwrap();
+        controller.set_generation(generation.next());
+        controller.load(generation.next(), prepared);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        assert_eq!(next_ticket.route_count(), 1);
+        controller.pause();
+        wait_until(|| controller.state() == PlayerState::Paused);
+        controller.play();
+        wait_until(|| controller.state() == PlayerState::Playing);
+        controller.stop();
+        wait_until(|| next_ticket.route_count() == 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pump_decoder_error_settles_without_stop() {
+        exercise_pump_settlement(true, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pump_decoder_error_failed_restore_settles_without_stop() {
+        exercise_pump_settlement(true, Some(false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pump_decoder_error_timed_out_restore_settles_without_stop() {
+        exercise_pump_settlement(true, Some(true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pump_finite_eos_releases_lock_without_stop() {
+        exercise_pump_settlement(false, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pump_finite_eos_failed_restore_settles_without_stop() {
+        exercise_pump_settlement(false, Some(false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pump_finite_eos_timed_out_restore_settles_without_stop() {
+        exercise_pump_settlement(false, Some(true));
     }
 
     /// AG1: events are observed without any UI-generated Stop, matching direct
