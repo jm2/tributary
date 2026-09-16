@@ -1873,11 +1873,15 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
     // cancelled or superseded before activation returns here without touching
     // the pipeline or the daemon (review R4).
     if !wait_for_activation(&inner) {
+        let _ = pipeline.set_state(gst::State::Null);
         return;
     }
     // Activation owns pipeline startup. A cancelled activation never lets
     // this observer independently start or restart the pipeline.
     if !inner.activation_live() || inner.cancel.is_cancelled() {
+        // Activation may already have started decoding. Stop it before this
+        // observer releases the descriptor, even if close is still pending.
+        let _ = pipeline.set_state(gst::State::Null);
         return;
     }
 
@@ -1885,6 +1889,7 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
         // A pump that cannot run is terminal for the session: latch terminal
         // and publish `Stopped` together, so no control can publish after it
         // (review Y1).
+        let _ = pipeline.set_state(gst::State::Null);
         inner.publish_terminal();
         let _ = inner.event_tx.try_send(PlayerEvent::error(
             inner.generation,
@@ -5205,6 +5210,36 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, PlayerEvent::TrackEnded { .. })),
             "a deadline miss is not a completion: {events:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelled_pump_stops_an_already_activated_pipeline() {
+        gst::init().expect("GStreamer init");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (tx, rx) = async_channel::unbounded();
+        let inner = Arc::new(test_session_inner_with_events(directory.path(), tx));
+        let pipeline = gst::parse::launch("audiotestsrc is-live=true ! fakesink")
+            .expect("build pipeline")
+            .downcast::<gst::Pipeline>()
+            .expect("pipeline");
+        pipeline.set_state(gst::State::Playing).expect("start");
+        assert_eq!(
+            pipeline.state(gst::ClockTime::from_seconds(5)).1,
+            gst::State::Playing
+        );
+        // Activation finished, but cancellation arrives before the observer
+        // consumes that acceptance. The observer must shut down the decoder
+        // itself before returning its descriptor, without waiting for close.
+        inner.activation.lock().unwrap().accepted = true;
+        inner.cancel.cancel();
+        let descriptor = std::fs::File::open("/dev/null").expect("descriptor");
+        run_pump(inner, pipeline.clone(), descriptor.into());
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelled observation published an event"
         );
     }
 

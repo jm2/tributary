@@ -22,7 +22,10 @@ so the pump cannot close its descriptor while the decoder is still writing.
 A bounded in-memory publication under the Stop gate prevents a late daemon
 response from publishing Playing after Stop. Failure never publishes Playing.
 Uncertain daemon effects retain the existing
-quiescence/recovery mechanism. The pump cannot independently restart decoding.
+quiescence/recovery mechanism. The pump cannot independently restart decoding. Its early cancellation exits
+also stop an already-activated decoder before releasing the FIFO descriptor;
+a regression cancels after activation and verifies the real pipeline is Null
+when the observer returns without publishing events.
 
 The protocol follows OwnTone 29.3 commit
 `d6fb3edf5831de38134ebd92fcf09a730ddd37aa`:
