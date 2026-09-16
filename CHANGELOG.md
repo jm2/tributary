@@ -78,6 +78,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OwnTone first-track playback** — Start the configured pipe with PCM autostart
+  instead of asking an empty queue to play. Confirm daemon playback before
+  reporting Playing, while preserving prompt Stop and finite-track completion.
+
 - **OwnTone session restoration is terminal for later controls**
   (`src/audio/airplay_owntone.rs`) — The decode pump restores the dedicated
   daemon on end-of-stream or decode error, but the live session previously

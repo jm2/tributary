@@ -313,6 +313,18 @@ impl SessionGate {
         self.drained.notify_all();
     }
 
+    /// Publish a confirmed state atomically with Stop. Only bounded in-memory
+    /// publication belongs here; network and pipeline effects use `start` so
+    /// they never hold up the caller of Stop.
+    pub(super) fn publish_if_live(&self, publish: impl FnOnce()) -> bool {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.stopped {
+            return false;
+        }
+        publish();
+        true
+    }
+
     /// `true` once a Stop has won the boundary.
     pub(super) fn is_stopped(&self) -> bool {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).stopped

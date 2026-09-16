@@ -1225,7 +1225,7 @@ fn open_pipe_write(
 /// been transmitted and must be covered by restoration (review S4).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ActivationState {
-    /// The load path accepted this session; the decode pump may start.
+    /// Activation reserved this session; the pump may observe after confirmation.
     accepted: bool,
     /// Teardown cancelled this session; no activation may be accepted and no
     /// pump may start.
@@ -1344,14 +1344,13 @@ struct SessionInner {
     media_ticket: Option<Arc<GstreamerMediaTicket>>,
     running: AtomicBool,
     /// The serialized acceptance/cancellation boundary. The decode pump stays
-    /// inert — no pipeline start, no PCM, no daemon play — until acceptance,
-    /// and a cancellation that wins the boundary refuses a late acceptance
+    /// inert until activation finishes. First PCM is driven by activation
+    /// itself under the shared Stop gate; cancellation refuses late activation
     /// (review R4, review S4).
     activation: Mutex<ActivationState>,
     /// The load path's Stop/start boundary (review U3). `activate_and_play`
-    /// authorizes the `player/play` effect through this gate, and the load path
-    /// stops it on teardown, so a Stop can never land between an acceptance
-    /// check and the transmitted play.
+    /// authorizes first PCM or a resume RPC through this gate. Stop prevents
+    /// a new effect; teardown settles an already-authorized effect.
     gate: Arc<SessionGate>,
     /// The load's cancellation currency, so the pump can abort its activation
     /// wait the moment the load is cancelled or replaced (review R4).
@@ -1471,7 +1470,9 @@ impl SessionInner {
                     // Still unterminated: `restore` latches `terminal` only
                     // under this same lock, so it cannot have interleaved
                     // between the transmission and here (review X1).
-                    self.publish_state(state);
+                    if !self.gate.publish_if_live(|| self.publish_state(state)) {
+                        return Err(unavailable("the AirPlay session was stopped"));
+                    }
                 }
                 Ok(())
             }
@@ -1490,8 +1491,9 @@ impl SessionInner {
         if self.terminal.load(Ordering::SeqCst) {
             return None;
         }
-        self.publish_state(PlayerState::Playing);
-        Some(PlayerState::Playing)
+        self.gate
+            .publish_if_live(|| self.publish_state(PlayerState::Playing))
+            .then_some(PlayerState::Playing)
     }
 
     /// Run a caller-supplied publication (the worker's own cache/event write)
@@ -1511,8 +1513,7 @@ impl SessionInner {
         // contender can be placed deterministically behind it (review Z2).
         #[cfg(test)]
         self.note_publication_entered();
-        publish(PlayerState::Playing);
-        true
+        self.gate.publish_if_live(|| publish(PlayerState::Playing))
     }
 
     /// Latch the terminal transition **and** publish the terminal `Stopped` as
@@ -1679,21 +1680,11 @@ impl SessionInner {
             .clone()
     }
 
-    /// Accept activation and transmit `player/play` as **one** serialized
-    /// decision (review S4, review T3, review U3).
-    ///
-    /// The acceptance/cancellation mutex is held across the decision *and* the
-    /// transmission. A Stop/replacement either wins the mutex first — setting
-    /// `cancelled`, so no play is ever sent — or loses it, in which case the
-    /// play completes and the teardown's restoration `player/stop` compensates
-    /// it. There is no check-to-effect window: cancellation cannot land between
-    /// a currency check and a separate play RPC.
-    ///
-    /// `accepted` is set only after the play RPC succeeds, so the inert decode
-    /// pump is released only after a truthful, accepted start. A failed or
-    /// cancelled play clears `accepted`, marks the boundary cancelled, and
-    /// returns `false` — the caller never publishes `Playing`, and the pump
-    /// returns without starting PCM (review U3).
+    /// Serialize first PCM (pipe autostart) or resume with the current load's
+    /// Stop boundary. Initial playback starts decoding inside the settlement
+    /// boundary and waits for daemon-confirmed play before publishing Playing.
+    /// The pump only observes/drains an already-started pipeline; it cannot
+    /// start a cancelled generation independently (AC1).
     fn activate_and_play(&self) -> bool {
         let mut state = self.activation.lock().unwrap_or_else(|p| p.into_inner());
         // Re-check the load's cancellation currency inside the same lock a Stop
@@ -1703,6 +1694,7 @@ impl SessionInner {
         if self.cancel.is_cancelled() {
             state.cancelled = true;
         }
+        let first_start = !state.accepted;
         if !activation_decide(&mut state, self.running.load(Ordering::SeqCst)) {
             return false;
         }
@@ -1717,7 +1709,13 @@ impl SessionInner {
             // critical section, so a terminal transition cannot land between
             // the successful play and its state publication (review X1).
             match self.transmit_mutation_publishing(
-                || self.client.player_control("play"),
+                || {
+                    if let Some(pipeline) = self.pipeline().filter(|_| first_start) {
+                        self.start_pipe(&pipeline)
+                    } else {
+                        self.client.player_control("play")
+                    }
+                },
                 PlayerState::Playing,
             ) {
                 Ok(()) => true,
@@ -1733,6 +1731,11 @@ impl SessionInner {
         if played {
             return true;
         }
+        // Stop decoding before releasing activation: the pump owns the write
+        // descriptor and may return immediately once it observes refusal.
+        if let Some(pipeline) = self.pipeline() {
+            let _ = pipeline.set_state(gst::State::Null);
+        }
         // Either a failed play or a Stop that won the boundary: refuse
         // activation so the inert pump returns, and never report `Playing`
         // (review U3).
@@ -1746,6 +1749,31 @@ impl SessionInner {
             self.publish_state(PlayerState::Stopped);
         }
         false
+    }
+
+    /// Pinned OwnTone pipe_read_cb starts a scanned pipe only after bytes
+    /// arrive. Ordinary play on the queue cleared by open cannot do that.
+    /// This runs under both SessionGate and mutation_lock, so Stop either
+    /// prevents the first PCM effect or teardown settles it before release.
+    fn start_pipe(&self, pipeline: &gst::Pipeline) -> Result<(), SenderError> {
+        pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|_| unavailable("the decode pipeline failed to start"))?;
+        let deadline = Instant::now() + OPEN_DEADLINE;
+        loop {
+            if self.cancel.is_cancelled() || self.gate.is_stopped() {
+                return Err(unavailable("pipe activation was cancelled"));
+            }
+            if self.client.player_state()? == "play" {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(unavailable(
+                    "the dedicated daemon did not autostart the pipe",
+                ));
+            }
+            std::thread::sleep(FIFO_OPEN_POLL);
+        }
     }
 
     /// Cancel activation: after this returns, no activation can be accepted.
@@ -1847,10 +1875,8 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
     if !wait_for_activation(&inner) {
         return;
     }
-    // Final serialized check before any pipeline start, PCM or daemon drive: a
-    // cancellation that won the boundary after the wait must still leave the
-    // pump inert, so an accepted-then-cancelled load never starts playback
-    // (review S4).
+    // Activation owns pipeline startup. A cancelled activation never lets
+    // this observer independently start or restart the pipeline.
     if !inner.activation_live() || inner.cancel.is_cancelled() {
         return;
     }
@@ -1869,18 +1895,9 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
         return;
     };
 
-    if pipeline.set_state(gst::State::Playing).is_err() {
-        let _ = inner.event_tx.try_send(PlayerEvent::error(
-            inner.generation,
-            "OwnTone decode pipeline failed to start".to_string(),
-        ));
-        inner.publish_terminal();
-        let _ = pipeline.set_state(gst::State::Null);
-        return;
-    }
-    // Publish under the settlement boundary and suppress it once the session is
-    // terminal: a decode start must not report `Playing` after a terminal
-    // `Stopped`/`TrackEnded` (review X1).
+    // Activation started the pipeline and confirmed daemon playback while
+    // holding the shared first-effect boundary. Never restart it here: Stop
+    // may already have won after activation released that boundary.
     let _ = inner.publish_start_if_live();
 
     let mut last_position = Instant::now();
@@ -5298,6 +5315,8 @@ mod tests {
         // `stop` — the production completion contract.
         let drained = Arc::new(AtomicBool::new(false));
         let server_drained = Arc::clone(&drained);
+        let received = Arc::new(AtomicBool::new(false));
+        let server_received = Arc::clone(&received);
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let api_base = format!(
             "http://127.0.0.1:{}",
@@ -5307,6 +5326,7 @@ mod tests {
             for incoming in listener.incoming() {
                 let Ok(stream) = incoming else { continue };
                 let drained = Arc::clone(&server_drained);
+                let received = Arc::clone(&server_received);
                 std::thread::spawn(move || {
                     use std::io::{BufRead, BufReader, Write};
                     let Ok(reader_stream) = stream.try_clone() else {
@@ -5342,7 +5362,9 @@ mod tests {
                         "/api/config" => r#"{"version":"29.3"}"#.to_string(),
                         "/api/outputs" => r#"{"outputs":[]}"#.to_string(),
                         "/api/player" => {
-                            let state = if drained.load(Ordering::SeqCst) {
+                            let state = if drained.load(Ordering::SeqCst)
+                                || !received.load(Ordering::SeqCst)
+                            {
                                 "stop"
                             } else {
                                 "play"
@@ -5376,7 +5398,10 @@ mod tests {
             loop {
                 match fifo.read(&mut buffer) {
                     Ok(0) => break,
-                    Ok(read) => total += read,
+                    Ok(read) => {
+                        total += read;
+                        received.store(true, Ordering::SeqCst);
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => break,
                 }
@@ -5387,11 +5412,6 @@ mod tests {
 
         let (tx, rx) = async_channel::unbounded();
         let inner = Arc::new(test_session_inner_at_base(&api_base, state_dir, tx));
-        assert!(
-            inner.activate_and_play(),
-            "the accepted start must transmit"
-        );
-
         let write_fd = open_pipe_write(
             &pipe_path,
             Instant::now() + Duration::from_secs(5),
@@ -5409,6 +5429,10 @@ mod tests {
 
         let pump_inner = Arc::clone(&inner);
         let pump = std::thread::spawn(move || run_pump(pump_inner, pipeline, write_fd));
+        assert!(
+            inner.activate_and_play(),
+            "activation must start the real pipeline"
+        );
 
         let written = reader.join().expect("reader");
         pump.join().expect("pump");
@@ -5826,8 +5850,41 @@ fn serve(stream: std::net::TcpStream) {
     const RECORDING_DAEMON_SOURCE: &str = r##"
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::Mutex;
+use std::os::unix::fs::OpenOptionsExt;
 
+struct State { queued: bool, playing: bool, paused: bool, selected: bool, bytes: usize, autostarted: bool }
+static STATE: Mutex<State> = Mutex::new(State { queued: false, playing: false, paused: false, selected: false, bytes: 0, autostarted: false });
+fn pipe() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::args().nth(2).unwrap()).parent().unwrap().join("airplay.pcm")
+}
 fn main() {
+    let mut fifo = std::fs::OpenOptions::new().read(true)
+        .custom_flags(0x800).open(pipe()).expect("FIFO reader");
+    std::thread::spawn(move || loop {
+        let mut buffer = [0; 4096];
+        if let Ok(n) = fifo.read(&mut buffer) {
+            if n > 0 {
+                let mut state = STATE.lock().unwrap();
+                if state.bytes == 0 {
+                    let record = std::env::var("TRIBUTARY_FAKE_REQUESTS").unwrap();
+                    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(record).unwrap();
+                    writeln!(file, "PCM received").unwrap();
+                }
+                state.bytes += n;
+                // Pinned pipe_read_cb can autostart only on readable PCM.
+                if !state.paused && !pipe().with_extension("fail-play").exists() {
+                    state.queued = true;
+                    state.playing = true;
+                    state.autostarted = true;
+                }
+            } else {
+                let mut state = STATE.lock().unwrap();
+                if state.autostarted { state.playing = false; state.autostarted = false; }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    });
     let addr = std::env::var("TRIBUTARY_FAKE_LISTEN").expect("listen address");
     let listener = TcpListener::bind(&addr).expect("bind");
     for incoming in listener.incoming() {
@@ -5835,7 +5892,6 @@ fn main() {
         std::thread::spawn(move || serve(stream));
     }
 }
-
 fn serve(stream: std::net::TcpStream) {
     let Ok(reader_stream) = stream.try_clone() else { return };
     let mut reader = BufReader::new(reader_stream);
@@ -5853,32 +5909,48 @@ fn serve(stream: std::net::TcpStream) {
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).is_err() || header.trim().is_empty() { break; }
-        if let Some(value) = header
-            .to_ascii_lowercase()
-            .strip_prefix("content-length:")
-            .map(str::trim)
-        {
+        if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:").map(str::trim) {
             content_length = value.parse().unwrap_or(0);
         }
     }
-    if content_length > 0 {
-        let mut body = vec![0u8; content_length];
-        let _ = reader.read_exact(&mut body);
-    }
-    let path = trimmed.split_whitespace().nth(1).unwrap_or_default().to_string();
+    let mut request_body = vec![0u8; content_length];
+    let _ = reader.read_exact(&mut request_body);
+    let path = trimmed.split_whitespace().nth(1).unwrap_or_default();
     let method = trimmed.split_whitespace().next().unwrap_or_default();
     let volume = path.strip_prefix("/api/player/volume?volume=")
         .and_then(|v| v.parse::<u8>().ok()).filter(|v| *v <= 100);
-    let (status, body) = match (method, path.as_str()) {
+    let mut state = STATE.lock().unwrap();
+    let pipe = pipe();
+    let dynamic = format!(r#"{{"state":"{}","pcm_bytes":{}}}"#, if state.playing { "play" } else if state.paused { "pause" } else { "stop" }, state.bytes);
+    let outputs = format!(r#"{{"outputs":[{{"id":"11189196","name":"Test","selected":{}}},{{"id":"42","name":"Prior","selected":{}}}]}}"#, state.selected, !state.selected);
+    let (status, body) = match (method, path) {
         ("GET", "/api/config") => ("200 OK", r#"{"version":"29.3"}"#),
-        ("GET", "/api/outputs") => ("200 OK", r#"{"outputs":[{"id":"11189196","name":"Test","selected":true}]}"#),
-        ("GET", "/api/player") => ("200 OK", r#"{"state":"stop"}"#),
+        ("GET", "/api/outputs") => ("200 OK", outputs.as_str()),
+        ("GET", "/api/player") => ("200 OK", dynamic.as_str()),
+        ("PUT", "/api/queue/clear") => {
+            state.queued = false; state.playing = false; state.paused = false; state.autostarted = false;
+            ("204 No Content", "")
+        }
+        ("PUT", "/api/player/play") => {
+            if !state.queued || pipe.with_extension("fail-play").exists() {
+                ("500 Internal Server Error", "{}")
+            } else { state.playing = true; state.paused = false; ("204 No Content", "") }
+        }
+        ("PUT", "/api/player/stop") => {
+            state.playing = false; state.paused = false; state.autostarted = false;
+            ("204 No Content", "")
+        }
+        ("PUT", "/api/player/pause") => {
+            state.playing = false; state.paused = true; ("204 No Content", "")
+        }
         ("PUT", _) if path.starts_with("/api/player/volume") => {
             if volume.is_some() && content_length == 0 { ("204 No Content", "") }
             else { ("400 Bad Request", "{}") }
         }
-        ("PUT", "/api/outputs/set" | "/api/queue/clear" |
-            "/api/player/play" | "/api/player/pause" | "/api/player/stop") => ("204 No Content", ""),
+        ("PUT", "/api/outputs/set") => {
+            state.selected = String::from_utf8_lossy(&request_body).contains("11189196");
+            ("204 No Content", "")
+        }
         _ => ("404 Not Found", "{}"),
     };
     let response = format!(
@@ -5920,6 +5992,7 @@ fn serve(stream: std::net::TcpStream) {
             let state_dir = directory.path().join("state");
             std::fs::create_dir_all(&state_dir).expect("state dir");
             let pipe = state_dir.join("airplay.pcm");
+            ensure_pipe(&pipe).expect("create scanned FIFO");
             let config_path = state_dir.join(OWNTONE_CONFIG_FILE);
             std::fs::write(&config_path, dedicated_config::fixture(&pipe)).expect("write config");
 
@@ -5997,37 +6070,344 @@ fn serve(stream: std::net::TcpStream) {
         }
     }
 
+    /// Park after the real open, before the real worker activates the session.
+    /// This allows Stop to win the shared first-effect gate deterministically.
+    #[cfg(target_os = "linux")]
+    struct ParkedOwnedSender {
+        sender: OwnToneSender,
+        opened: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl AirplaySender for ParkedOwnedSender {
+        fn name(&self) -> &'static str {
+            "parked-owned"
+        }
+        fn probe(&self) -> Result<(), SenderError> {
+            self.sender.probe()
+        }
+        fn open_session(&self, ctx: &SenderOpenContext) -> OpenOutcome {
+            let outcome = self.sender.open_session(ctx);
+            self.opened.send(()).expect("notify open");
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("release open");
+            outcome
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_startup_wav(path: &Path, seconds: u32) {
+        // Thirty seconds of valid stereo 44.1kHz s16 PCM, long enough to
+        // observe live playback before driving Stop through the worker.
+        let size = 44_100_u32 * 4 * seconds;
+        let mut wav = b"RIFF".to_vec();
+        wav.extend((size + 36).to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        wav.extend(16_u32.to_le_bytes());
+        wav.extend(1_u16.to_le_bytes());
+        wav.extend(2_u16.to_le_bytes());
+        wav.extend(44_100_u32.to_le_bytes());
+        wav.extend(176_400_u32.to_le_bytes());
+        wav.extend(4_u16.to_le_bytes());
+        wav.extend(16_u16.to_le_bytes());
+        wav.extend(b"data");
+        wav.extend(size.to_le_bytes());
+        wav.resize(44 + size as usize, 1);
+        std::fs::write(path, wav).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    enum StartupCase {
+        Play,
+        StopBeforePcm,
+        StopDuringAutostart,
+        FailAutostart,
+        NaturalEos,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exercise_empty_queue_start(case: StartupCase) {
+        use crate::audio::airplay_output::spawn_test_session_worker;
+        use crate::audio::airplay_sender::SenderTarget;
+        use crate::local::resolver::ResolvedLocalMedia;
+        use std::sync::atomic::{AtomicU64, AtomicU8};
+
+        let stop_first = matches!(case, StartupCase::StopBeforePcm);
+        let stop_during = matches!(case, StartupCase::StopDuringAutostart);
+        let fail_play = matches!(case, StartupCase::FailAutostart) || stop_during;
+        let natural_eos = matches!(case, StartupCase::NaturalEos);
+        gst::init().expect("GStreamer");
+        let daemon = RecordingOwnedDaemon::start();
+        let client = OwnToneClient::new(&daemon.config.api_base).expect("client");
+        assert!(!client.outputs().unwrap()[0].selected);
+        client.clear_queue().expect("empty queue");
+        assert!(
+            client.player_control("play").is_err(),
+            "ordinary play needs a queue item"
+        );
+        assert_eq!(client.player_state().unwrap(), "stop");
+        assert_eq!(client.get_json("/api/player").unwrap()["pcm_bytes"], 0);
+        // Merely opening a writer is not pipe autostart.
+        let writer = open_pipe_write(
+            &daemon.config.pipe_path,
+            Instant::now() + OPEN_DEADLINE,
+            &OpenCancel::new(),
+        );
+        assert!(writer.is_ok());
+        assert_eq!(client.player_state().unwrap(), "stop");
+        drop(writer);
+        std::fs::write(&daemon.requests, "").expect("reset request observations");
+
+        let media_root = tempfile::tempdir().expect("media root");
+        let marker = format!("marker:v1:{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            media_root.path().join(".tributary-root-id"),
+            format!("{marker}\n"),
+        )
+        .unwrap();
+        let media_path = media_root.path().join("tone.wav");
+        write_startup_wav(&media_path, if natural_eos { 1 } else { 30 });
+        let media = ResolvedLocalMedia::from_authorized_path_for_test(
+            media_root.path(),
+            &marker,
+            &media_path,
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let prepared = proxy.prepare_local(media).expect("protected usable audio");
+        let ticket = prepared.ticket().expect("route ticket");
+        let cancel = OpenCancel::new();
+        let gate = Arc::new(SessionGate::new());
+        let generation = PlayerEventGeneration::from_raw(71);
+        let (tx, rx) = async_channel::unbounded();
+        let registration = proxy.register_in_flight_cancel(71, prepared.generation(), &cancel);
+        let ctx = SenderOpenContext {
+            target: SenderTarget::new("Test", "127.0.0.1", 7000, Some("aabbcc".to_string())),
+            prepared_uri: prepared.uri().to_string(),
+            event_tx: tx,
+            generation,
+            media_proxy: Arc::clone(&proxy),
+            media_ticket: prepared.ticket(),
+            volume: 0.42,
+            cancel,
+            session_gate: Arc::clone(&gate),
+            open_id: 71,
+        };
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let sender = Arc::new(ParkedOwnedSender {
+            sender: OwnToneSender {
+                config: Some(daemon.config.clone()),
+            },
+            opened: opened_tx,
+            release: Mutex::new(release_rx),
+        });
+        let mut worker = spawn_test_session_worker(
+            sender,
+            ctx,
+            registration,
+            Arc::new(AtomicU8::new(PlayerState::Buffering as u8)),
+            Arc::new(Mutex::new(SenderPosition::unknown(generation))),
+            Arc::new(AtomicU64::new(generation.as_raw())),
+        );
+        opened_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("real open");
+        let competing = open_lock(&daemon.config.lock_path()).unwrap();
+        assert!(rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err());
+        assert!(client.outputs().unwrap()[0].selected);
+        assert_eq!(ticket.route_count(), 1);
+        assert_eq!(client.player_state().unwrap(), "stop");
+        assert_eq!(client.get_json("/api/player").unwrap()["pcm_bytes"], 0);
+        assert!(!daemon.recorded().contains("/api/player/play"));
+        if stop_first {
+            gate.stop();
+        }
+        if fail_play {
+            std::fs::write(daemon.config.pipe_path.with_extension("fail-play"), "fail").unwrap();
+        }
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        if stop_during {
+            while !daemon.recorded().contains("PCM received") {
+                assert!(
+                    Instant::now() < deadline,
+                    "first PCM never reached the daemon"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let started = Instant::now();
+            gate.stop();
+            assert!(
+                started.elapsed() < Duration::from_millis(100),
+                "Stop waited for activation"
+            );
+        }
+        if !stop_first && !fail_play {
+            loop {
+                let player = client.get_json("/api/player").unwrap();
+                if worker.cached_state() == PlayerState::Playing
+                    && player["state"] == "play"
+                    && player["pcm_bytes"].as_u64().unwrap() > 0
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "real worker never played usable PCM"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(ticket.route_count(), 1);
+        } else {
+            while worker.cached_state() != PlayerState::Stopped {
+                assert!(Instant::now() < deadline, "failed activation never stopped");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        if natural_eos {
+            while ticket.route_count() != 0 || worker.cached_state() != PlayerState::Stopped {
+                assert!(
+                    Instant::now() < deadline,
+                    "finite PCM never completed in the live worker"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        worker.stop_and_join();
+        while ticket.route_count() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "restoration never released the route"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_ok());
+        assert!(!daemon.config.takeover_record().exists());
+        assert!(
+            !client.outputs().unwrap()[0].selected,
+            "prior output selection must be restored"
+        );
+        assert_eq!(worker.cached_state(), PlayerState::Stopped);
+        assert_eq!(client.player_state().unwrap(), "stop");
+        let recorded = daemon.recorded();
+        assert!(recorded.contains("/api/player/volume?volume=42"));
+        assert!(recorded.contains("/api/player/stop"));
+        assert!(recorded.matches("/api/outputs/set").count() >= 2);
+        assert_eq!(recorded.contains("PCM received"), !stop_first);
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let playing = |event: &PlayerEvent| {
+            matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Playing,
+                    ..
+                }
+            )
+        };
+        if stop_first || fail_play {
+            assert!(
+                !events.iter().any(playing),
+                "failed start published Playing: {events:?}"
+            );
+            if stop_first {
+                assert_eq!(client.get_json("/api/player").unwrap()["pcm_bytes"], 0);
+            }
+            if stop_first {
+                assert!(!recorded.contains("/api/player/play"));
+            }
+        } else {
+            assert!(events.iter().any(playing));
+            assert!(
+                !recorded.contains("/api/player/play"),
+                "first startup uses PCM autostart"
+            );
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, PlayerEvent::TrackEnded { .. }))
+                .count(),
+            usize::from(natural_eos),
+            "only natural EOF may publish TrackEnded"
+        );
+        if natural_eos {
+            let ended = events
+                .iter()
+                .position(|e| matches!(e, PlayerEvent::TrackEnded { .. }))
+                .unwrap();
+            assert!(events.iter().position(playing).unwrap() < ended);
+            assert!(!events[ended..].iter().any(playing));
+        }
+        if let Some(stopped) = events.iter().position(|e| {
+            matches!(
+                e,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                }
+            )
+        }) {
+            assert!(
+                !events[stopped..].iter().any(playing),
+                "Playing followed terminal Stop"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_queue_start_plays_scanned_pipe_through_real_open_and_worker() {
+        exercise_empty_queue_start(StartupCase::Play);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_queue_start_stop_wins_first_effect_and_restores() {
+        exercise_empty_queue_start(StartupCase::StopBeforePcm);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_queue_start_autostart_failure_never_publishes_playing_and_restores() {
+        exercise_empty_queue_start(StartupCase::FailAutostart);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_queue_start_finite_pcm_completes_once_through_live_worker() {
+        exercise_empty_queue_start(StartupCase::NaturalEos);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_queue_start_stop_during_autostart_settles_pcm_without_playing() {
+        exercise_empty_queue_start(StartupCase::StopDuringAutostart);
+    }
+
     /// Y2: the initial volume is applied **before any activation** through the
     /// real `open()`, so a switch to OwnTone starts at the slider's level and
     /// the daemon never sees a `player/play` before the `player/volume` PUT.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_initial_volume_is_applied_before_the_first_play_through_open() {
-        use std::io::Read;
-
         gst::init().expect("GStreamer init");
         let daemon = RecordingOwnedDaemon::start();
         // `open()` assumes the availability gate created the FIFO; the direct
         // call must set it up the way `probe` would.
         ensure_pipe(&daemon.config.pipe_path).expect("create fifo");
 
-        // A reader must hold the FIFO open for `open_pipe_write` to succeed.
-        let pipe_path = daemon.config.pipe_path.clone();
-        let reader = std::thread::spawn(move || {
-            let mut fifo = std::fs::OpenOptions::new()
-                .read(true)
-                .open(&pipe_path)
-                .expect("open fifo reader");
-            let mut buffer = [0u8; 4096];
-            loop {
-                match fifo.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(_) => break,
-                }
-            }
-        });
+        let media_path = daemon.config.state_dir.join("test.wav");
+        write_startup_wav(&media_path, 30);
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -6045,7 +6425,7 @@ fn serve(stream: std::net::TcpStream) {
                 7000,
                 Some("aabbcc".to_string()),
             ),
-            prepared_uri: "file:///nonexistent/dummy.wav".to_string(),
+            prepared_uri: url::Url::from_file_path(&media_path).unwrap().to_string(),
             event_tx: tx,
             generation,
             media_proxy: Arc::clone(&proxy),
@@ -6085,6 +6465,21 @@ fn serve(stream: std::net::TcpStream) {
             .contains("PUT /api/player/volume?volume=73 HTTP/1.1"));
 
         assert!(session.resume(), "the accepted start must transmit");
+        assert!(
+            !daemon.recorded().contains("/api/player/play"),
+            "initial start uses actual PCM"
+        );
+        assert!(
+            OwnToneClient::new(&daemon.config.api_base)
+                .unwrap()
+                .get_json("/api/player")
+                .unwrap()["pcm_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        session.pause();
+        assert!(session.resume(), "live resume uses the populated queue");
         let deadline = Instant::now() + Duration::from_secs(5);
         while !daemon.recorded().contains("/api/player/play") {
             assert!(
@@ -6108,7 +6503,6 @@ fn serve(stream: std::net::TcpStream) {
         );
 
         session.close();
-        reader.join().expect("reader");
     }
 
     #[cfg(target_os = "linux")]

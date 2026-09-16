@@ -725,6 +725,9 @@ library {
 Set `TRIBUTARY_OWNTONE_PIPE` to a direct child of that directory, such as
 `/absolute/path/to/dedicated-input/airplay.pcm`. Provision that directory and the
 FIFO for the dedicated daemon user. OwnTone has no `pipe_path` configuration key.
+The FIFO must be scanned before playback. Tributary sends PCM to trigger pipe
+autostart and reports Playing only after the daemon confirms playback. If the
+pipe cannot autostart, the load fails and the dedicated instance is restored.
 The authority check accepts a conservative subset: one absolute scanned directory,
 a non-hidden `.pcm` FIFO without a symlink, enabled scanning and autostart, 44.1 kHz
 16-bit samples, and no nonempty ignore filters. Additional library options are limited
