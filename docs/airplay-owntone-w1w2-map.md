@@ -223,48 +223,28 @@ window, leaving a current-generation `Playing` after the terminal event.
   `run_session_worker` with a superseded-generation `OpenOutcome::Opened`; the
   route is released by identity (lease gone, custody empty, route count 0).
 
-## Z1/Z2 (P2) — corrective fixtures
+## Z1/Z2 + AA1/AA2/AA3 (P2) — corrective fixtures
 
-**Review.** `.gc/operations/reviews/refinery-20260915-0ac3fcc-tr-t3a/corrective-instructions.md`
-at rejected head `0ac3fcc87f608cc05abd055f7d07becae565ce1c`, base
-`754fc6d8e6c7e7b99b1fe8844b73482f833d668d`.
+**Reviews.**
 
-### Z1a — controller-level failed-live-close replacement
+- `.gc/operations/reviews/refinery-20260915-0ac3fcc-tr-t3a/corrective-instructions.md`
+  (Z1/Z2) at rejected head `0ac3fcc87f608cc05abd055f7d07becae565ce1c`.
+- `.gc/operations/reviews/refinery-20260915-0f959938-tr-t3a/corrective-instructions.md`
+  (AA1/AA2/AA3) at rejected head `0f95993867a3b0e445a58d90bd6637551805b6ea`.
 
-The prior fixture (`StaleSender`/`StaleSession`) invoked `run_session_worker`
-with an already-stale generation and released the ticket from a test double; it
-never drove `AirPlayOutput`'s controller/replacement path with a **live** real
-OwnTone session whose `close` fails restoration.
+base `754fc6d8e6c7e7b99b1fe8844b73482f833d668d`.
 
-**Fixture (`a_failed_live_close_is_replaced_without_losing_the_recovery_route`).**
-A hermetic, Tributary-owned fake OwnTone daemon (`controller_regression`) fails
-its restoring `PUT`s while a control file exists; a test `AirplaySender`
-builds one real `OwnToneSession` (with a real advisory lock) per open. The
-production controller (`ControllerHarness`, backed by the real
-`AirPlayOutput::begin_load`/`close_session`) runs:
+### AA1 — GStreamer adapter start/Stop, real failed transition and route cleanup
 
-1. a live load with a real protected-media ticket/route;
-2. a `stop` whose worker close fails restoration — the close hands the route to
-   **real recovery custody** and the regression captures the retained
-   `RetainedRecovery` at that boundary (keyed by `api_base`, so no other
-   recovery can steal it);
-3. a replacement load through the same controller while recovery is
-   outstanding.
-
-Asserted: UI `stop` returns promptly (never blocks on the failing restoration);
-the old exact ticket survives in custody (`is_custodied`, route count 1) and its
-advisory lock stays held; the replacement route installs and is usable
-(`has_active_lease`, route count 1); after settlement (clearing the fail file and
-running one real `RecoveryJob::attempt`) only the old route is shut down and only
-the old lock is released — the replacement route and lock are untouched.
-
-### Z1b — GStreamer adapter start/Stop, failed-start and route cleanup
-
-The GStreamer session is now constructible around an **injected pipeline**
-(`GstreamerSenderSession::for_test_session` /
-`for_test_with_start_effect`), retaining the real `resume`/`close`/state paths;
-the injected `fakesink name=raop` carries a buffer probe so consumption is
-observable without the unavailable production `raopsink`.
+The session is constructible around an **injected pipeline**
+(`GstreamerSenderSession::for_test_session`); `resume` always runs the real
+`pipeline.set_state(Playing)` effect. The test-only effect override
+(`for_test_with_start_effect`) that returned `false` without attempting a
+transition was removed, so no regression can substitute a fake for the
+production transition. The injected `fakesink name=raop` carries a buffer probe
+so consumption is observable without the unavailable production `raopsink`, and
+tests drive the real `run_session_worker` through a test sender
+(`InjectedPipelineSender`) rather than the seam in isolation.
 
 - `a_gstreamer_session_start_consumes_buffers_and_close_releases_the_route` —
   the authorized start runs the injected pipeline, whose sink observably consumes
@@ -272,39 +252,90 @@ observable without the unavailable production `raopsink`.
 - `a_stop_before_start_refuses_the_gstreamer_start_and_consumes_no_buffers` — a
   Stop taken before any start refuses the effect (no start after Stop), consumes
   no buffers and publishes no `Playing`.
-- `a_failed_gstreamer_state_transition_consumes_no_buffers_and_publishes_no_playing`
-  — an injected start effect that runs and fails reports no start; the pipeline
-  never plays and no `Playing` is published.
+- `a_real_failed_gstreamer_transition_releases_the_route_without_pcm_or_playing`
+  — a **real** failed transition: `filesrc` cannot open a missing source, so
+  `set_state(Playing)` fails. A synchronous bus recorder proves the transition
+  was attempted (state-changed) and failed (error); driven through
+  `run_session_worker`, no PCM is consumed, no `Playing` is published, the
+  worker reports `Stopped`, and the protected route is released by identity.
+- `a_worker_start_through_the_real_gstreamer_adapter_consumes_buffers` — start
+  wins the shared boundary through the real worker: buffers are consumed, the
+  worker publishes `Playing`, and its teardown releases the route.
+- `a_stop_interposed_at_the_real_gstreamer_transition_refuses_the_start` —
+  deterministic start-vs-Stop interposition at the **real** transition boundary:
+  `set_state(Playing)` is parked inside `filesrc`'s open of a writer-less FIFO,
+  the shared `SessionGate` reports the authorized effect in-flight, a Stop then
+  wins the boundary, and releasing the parked transition yields a genuinely
+  started pipeline whose accepted result is suppressed. No PCM, no `Playing`,
+  and the route is released by identity.
 
 No PCM after refusal, no start after Stop, and identity-bound route cleanup are
 all asserted. The real registry probe (`GstreamerRaopSender::probe`) remains
 fail-closed and untouched.
 
-### Z2 — deterministic worker/terminal race
+### AA2 — worker terminal observation asserted while the worker is live
 
-`the_worker_start_publication_is_atomic_with_the_terminal_transition` previously
-invoked `confirm_started` directly and slept 150 ms as arrival evidence, and it
-inspected the session state rather than the worker's own cache.
+`the_worker_start_publication_is_atomic_with_the_terminal_transition` drives the
+**real `run_session_worker`** (via `spawn_test_session_worker`) with a real
+`OwnToneSession`. A `#[cfg(test)] SessionProbe` on `SessionInner` (a) parks the
+worker's own cache/event publication inside the settlement boundary *before* its
+effects run, (b) signals when the terminal `restore` reaches that boundary, and
+(c) signals on every live `observe` call. After natural completion the test waits
+on the observation signal and asserts the worker's own cache is `Stopped`
+**while the worker is still running** — before any `Stop`/teardown can write the
+same value and mask a missing refresh. If the loop's cache write were removed the
+test times out instead of passing on the teardown store. `Playing` still precedes
+exactly one `TrackEnded`, no `Playing`/`Paused` follows it, and the terminal
+state is final.
 
-The rewritten fixture drives the **real `run_session_worker`** (via the new
-test-only `spawn_test_session_worker`) with a real `OwnToneSession`. A
-`#[cfg(test)] SessionProbe` on `SessionInner` (a) parks the worker's own
-cache/event publication inside the settlement boundary *before* its effects run
-and (b) signals when the terminal `restore` reaches that boundary. The test
-asserts the worker cache is still `Buffering` while parked, waits for the
-terminal contender's explicit boundary arrival (no sleep), releases the
-publication, and asserts `Playing` precedes exactly one `TrackEnded`, no
-`Playing`/`Paused` follows it, and the real worker cache is terminal after
-settlement. All prior behavioral assertions are preserved.
+### AA3 — controller failed-live-close replacement under production authority
+
+The prior fixture gave each session a different `session-{index}.lock` while
+constructing `SessionInner` directly, permitting a replacement on an instance
+production must reject, and asserted replacement usability only as a nonzero
+route count.
+
+**Fixture
+(`a_failed_live_close_is_replaced_on_a_separate_instance_without_losing_the_recovery_route`).**
+Two hermetic, Tributary-owned fake OwnTone instances, each with its own state
+dir, ownership record and **production instance lock**
+(`state_dir/.tributary-lock`, the single lock production `open` takes). A test
+`AirplaySender` builds one real `OwnToneSession` per open, taking that instance
+lock. The production controller (`ControllerHarness`, backed by the real
+`AirPlayOutput::begin_load`/`close_session`) runs:
+
+1. a live load (#1) on instance A with a real protected-media ticket/route;
+2. a `stop` whose worker close fails restoration — the close hands the route to
+   **real recovery custody** and retains A's instance lock; the regression
+   captures the retained `RetainedRecovery` at that boundary (keyed by
+   `api_base`, so no other recovery can steal it);
+3. a **same-instance** replacement load (#2) on A: it must **fail closed** while
+   recovery owns A's lock — asserted via the published "already using" refusal,
+   no live state, and its route released rather than custodied, with A's route
+   and lock untouched;
+4. a replacement load (#3) on the **separate** instance B: it opens on B's own
+   instance lock and plays.
+
+Asserted: UI `stop` returns promptly (never blocks on the failing restoration);
+the old exact ticket survives in custody (`is_custodied`, route count 1) and A's
+instance lock stays held; the replacement on B installs a live route and is
+**observably usable** — it plays, remains `Playing` across A's settlement, and
+accepts a real pause/play control; after settlement (clearing A's fail file and
+running one real `RecoveryJob::attempt`) only A's route is shut down and only A's
+lock is released — B's route and lock are untouched.
 
 ## Remaining gaps (recorded honestly, not claimed)
 
-- A live session whose `close` fails restoration and is replaced mid-custody is
-  now driven through `AirPlayOutput` end-to-end (Z1a above).
+- A live session whose `close` fails restoration is driven through
+  `AirPlayOutput` end-to-end (AA3 above), including the production instance-lock
+  refusal and a separate-instance replacement.
 - The GStreamer adapter's start/Stop, failed-start and route-cleanup paths are
-  now covered with an injected pipeline (Z1b above); the shared `SessionGate`
-  refusal path and the OwnTone decode pipeline (also GStreamer) remain covered by
-  the regressions above.
+  now covered with an injected pipeline and a real failed transition (AA1
+  above); the OwnTone decode pipeline (also GStreamer) remains covered by the
+  regressions above.
+- U5 authority/configuration certification is not claimed in full here. The
+  ownership-binding checks and the initial-volume `open()` fixture exercise the
+  paths they assert, but this leg does not blanket-certify Y2 or U5.
 
 ## Validation
 
@@ -315,6 +346,7 @@ Run in this worktree (all exit 0):
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo clippy --release -- -D warnings`
 - `cargo build --release`
-- `cargo test --all-targets` — 1953 unit + 30 packaging, 0 failed
-- `cargo test --bin tributary audio::airplay` — 89 passed, 0 failed (includes
-  the Z1a/Z1b/Z2 fixtures above)
+- `cargo test --all-targets` — 1955 unit + 30 packaging, 0 failed
+- `cargo test --bin tributary audio::airplay` — 91 passed, 0 failed (includes
+  the AA1/AA2/AA3 fixtures above)
+- `markdownlint-cli2 v0.23.2` on this file — 0 issues

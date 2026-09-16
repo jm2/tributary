@@ -1275,6 +1275,10 @@ struct SessionProbe {
     restore_attempt: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     /// The publication holding the settlement boundary.
     publication_hold: Mutex<PublicationHold>,
+    /// Signalled on every live `observe` call, so a regression can wait for a
+    /// running worker's own observation/cache refresh to become visible
+    /// deterministically instead of sleeping or asserting after teardown.
+    observe: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 #[cfg(test)]
@@ -1338,6 +1342,19 @@ impl SessionInner {
         }
         if let Some(release) = hold.release.take() {
             let _ = release.recv();
+        }
+    }
+
+    /// Arm the worker-observation probe: every later `observe` call signals, so
+    /// a regression can synchronize on the worker's own cache refresh.
+    fn arm_observe_probe(&self, tx: std::sync::mpsc::Sender<()>) {
+        *self.probe.observe.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+    }
+
+    fn note_observe(&self) {
+        let probe = self.probe.observe.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(tx) = probe.as_ref() {
+            let _ = tx.send(());
         }
     }
 }
@@ -2121,6 +2138,11 @@ impl SenderSession for OwnToneSession {
     }
 
     fn observe(&self) -> SenderPosition {
+        // The worker loop refreshes its coarse state cache immediately before
+        // this call, so a regression can synchronize on the observation that
+        // proves its cache is live rather than after teardown overwrites it.
+        #[cfg(test)]
+        self.inner.note_observe();
         *self
             .inner
             .position
@@ -4989,13 +5011,36 @@ mod tests {
         release_tx.send(()).expect("release the worker publication");
 
         completion.join().expect("completion thread");
-        worker.stop_and_join();
 
+        // The worker's own loop observes the session and refreshes its cache
+        // after the terminal transition. Synchronize on that real observation
+        // (signalled from the live session's `observe`), then assert the cache
+        // **while the worker is still running** — before any Stop/teardown can
+        // write the same `Stopped` value and mask a missing refresh. If the
+        // loop's cache write were removed, this loop times out instead of
+        // passing on the teardown store.
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel::<()>();
+        inner.arm_observe_probe(observed_tx);
+        let observe_deadline = Instant::now() + Duration::from_secs(5);
+        while worker.cached_state() != PlayerState::Stopped {
+            let remaining = observe_deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the worker's own cache never observed the terminal state"
+            );
+            observed_rx
+                .recv_timeout(remaining)
+                .expect("the worker must keep observing the live session");
+        }
         assert_eq!(
             worker.cached_state(),
             PlayerState::Stopped,
-            "the worker's own cache must be terminal after settlement"
+            "the worker's own cache must be terminal while the worker is still live"
         );
+
+        // Only now tear the worker down; its unconditional `Stopped` store can
+        // no longer be mistaken for the observation above.
+        worker.stop_and_join();
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -6090,16 +6135,16 @@ fn serve(stream: std::net::TcpStream) {
         reader.join().expect("reader");
     }
 
-    /// Z1: a live session whose close fails restoration must be replaced
-    /// through the **real controller** without losing either route. The close
-    /// hands the old route to real recovery custody; the old exact ticket
-    /// survives only while recovery owns it; a replacement load through the
-    /// same controller installs a usable route; and settlement releases only the
-    /// old route and the old advisory lock. UI Stop never blocks on the failing
-    /// restoration.
+    /// Z1: a live session whose close fails restoration hands its route to real
+    /// recovery custody. The recovery retains the **production** instance lock
+    /// (`.tributary-lock`), so a replacement on the same instance fails closed
+    /// exactly as production does; a replacement on a **separate** legitimate
+    /// instance opens, plays, and stays usable across the old instance's
+    /// settlement. Settlement releases only the old route and the old lock, and
+    /// UI Stop never blocks on the failing restoration.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_failed_live_close_is_replaced_without_losing_the_recovery_route() {
+    fn a_failed_live_close_is_replaced_on_a_separate_instance_without_losing_the_recovery_route() {
         use super::controller_regression::ControllerReplacementFixture;
         use crate::architecture::media::ResolvedHttpRequest;
         use crate::audio::airplay_output::ControllerHarness;
@@ -6110,8 +6155,11 @@ fn serve(stream: std::net::TcpStream) {
             .build()
             .expect("test runtime");
         let fixture = ControllerReplacementFixture::start();
-        let (tx, _rx) = async_channel::unbounded();
-        let harness = ControllerHarness::new(runtime.handle().clone(), fixture.sender(), tx);
+        // A second, independent legitimate instance (its own state dir, binary
+        // binding, ownership record and instance lock) for the replacement.
+        let separate = ControllerReplacementFixture::start();
+        let (tx, rx) = async_channel::unbounded();
+        let mut harness = ControllerHarness::new(runtime.handle().clone(), fixture.sender(), tx);
 
         // --- Live load #1, with a real protected-media route. ---
         let old_generation = PlayerEventGeneration::from_raw(1);
@@ -6148,14 +6196,62 @@ fn serve(stream: std::net::TcpStream) {
         );
         let recovery = wait_for_captured_recovery();
         let old_locks = fixture.lock_paths();
-        assert_eq!(old_locks.len(), 1, "the live session held one real lock");
+        assert_eq!(
+            old_locks,
+            vec![fixture.lock_path()],
+            "the live session must hold the production instance lock"
+        );
         assert!(
             flock_is_held(&old_locks[0]),
-            "the retained recovery must hold the old advisory lock"
+            "the retained recovery must hold the old instance lock"
         );
 
-        // --- Replacement load #2 while the retained recovery is outstanding. ---
-        let new_generation = PlayerEventGeneration::from_raw(2);
+        // --- Same-instance replacement must fail closed while recovery owns the
+        // lock: this is the authority boundary production enforces. ---
+        let same_generation = PlayerEventGeneration::from_raw(2);
+        harness.set_generation(same_generation);
+        let same_prepared = harness.prepare(
+            ResolvedHttpRequest::new(
+                url::Url::parse("https://music.test/stream-a-replacement.flac").expect("url"),
+            )
+            .expect("resolved request"),
+        );
+        let same_ticket = same_prepared
+            .ticket()
+            .expect("same-instance protected ticket");
+        harness.load(same_generation, same_prepared);
+        let refusal = wait_for_error_message(&rx, same_generation);
+        assert!(
+            refusal.contains("already using"),
+            "the same-instance replacement must be refused for exclusivity: {refusal}"
+        );
+        assert_ne!(
+            harness.state(),
+            PlayerState::Playing,
+            "a replacement production must reject must not become live"
+        );
+        assert!(
+            !proxy.is_custodied(&same_ticket),
+            "the refused load's route must not be retained in custody"
+        );
+        assert_eq!(
+            same_ticket.route_count(),
+            0,
+            "the refused load's route must be released, not left live"
+        );
+        assert_eq!(
+            old_ticket.route_count(),
+            1,
+            "the refused attempt must not disturb the recovery route"
+        );
+        assert!(
+            flock_is_held(&old_locks[0]),
+            "the refused attempt must not disturb the recovery's instance lock"
+        );
+
+        // --- Replacement load on a separate legitimate instance succeeds. ---
+        harness.set_sender(separate.sender());
+        let new_generation = PlayerEventGeneration::from_raw(3);
         harness.set_generation(new_generation);
         let new_prepared = harness.prepare(
             ResolvedHttpRequest::new(
@@ -6173,7 +6269,7 @@ fn serve(stream: std::net::TcpStream) {
         assert_eq!(
             new_ticket.route_count(),
             1,
-            "the replacement route must be usable"
+            "the replacement route must be live"
         );
         assert!(!proxy.is_custodied(&new_ticket));
         assert!(
@@ -6181,6 +6277,17 @@ fn serve(stream: std::net::TcpStream) {
             "the old route stays in recovery custody"
         );
         assert_eq!(old_ticket.route_count(), 1);
+        let new_locks = separate.lock_paths();
+        assert_eq!(
+            new_locks,
+            vec![separate.lock_path()],
+            "the separate instance's session must hold its own instance lock"
+        );
+        assert_ne!(
+            new_locks[0], old_locks[0],
+            "the replacement must run on a distinct instance lock"
+        );
+        assert!(flock_is_held(&new_locks[0]));
 
         // --- Settlement releases only the old route and the old lock. ---
         fixture.allow_settlement();
@@ -6197,11 +6304,11 @@ fn serve(stream: std::net::TcpStream) {
         );
         assert!(
             flock_is_acquirable(&old_locks[0]),
-            "settlement must release the old advisory lock"
+            "settlement must release the old instance lock"
         );
         assert!(
-            proxy.has_active_lease(),
-            "the replacement route must remain usable"
+            flock_is_held(&new_locks[0]),
+            "settlement must not touch the replacement instance lock"
         );
         assert_eq!(
             new_ticket.route_count(),
@@ -6209,8 +6316,50 @@ fn serve(stream: std::net::TcpStream) {
             "settlement must not touch the replacement route"
         );
 
+        // Observable usability across the old instance's settlement: the
+        // replacement is still playing and accepts a real control.
+        assert_eq!(
+            harness.state(),
+            PlayerState::Playing,
+            "the replacement instance must remain usable after old-instance settlement"
+        );
+        harness.pause();
+        wait_until(|| harness.state() == PlayerState::Paused);
+        harness.play();
+        wait_until(|| harness.state() == PlayerState::Playing);
+
+        // Cleanup: let the replacement instance settle cleanly as well.
+        separate.allow_settlement();
         harness.stop();
         wait_until(|| !proxy.has_active_lease());
+    }
+
+    /// Poll for the error event a failed load published for `generation`.
+    fn wait_for_error_message(
+        rx: &async_channel::Receiver<PlayerEvent>,
+        generation: PlayerEventGeneration,
+    ) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut observed = Vec::new();
+        loop {
+            while let Ok(event) = rx.try_recv() {
+                if let PlayerEvent::Error {
+                    generation: event_generation,
+                    message,
+                } = &event
+                {
+                    if *event_generation == generation {
+                        return message.clone();
+                    }
+                }
+                observed.push(event);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no error event for generation {generation:?}: {observed:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Poll for the retained recovery the failing close handed off.
@@ -6447,7 +6596,10 @@ fn serve(stream: std::net::TcpStream, fail: Option<String>) {
         }
 
         /// A real sender that builds one real `OwnToneSession` per open, each
-        /// holding a real advisory lock recorded for the regression.
+        /// holding the **production** single-instance advisory lock
+        /// ([`OwnToneConfig::lock_path`], the same `.tributary-lock` production
+        /// `open` takes), recorded for the regression. A second session on this
+        /// instance therefore fails closed exactly as production does.
         pub(super) fn sender(&self) -> Arc<dyn AirplaySender> {
             let config = OwnToneConfig {
                 api_base: self.api_base.clone(),
@@ -6457,7 +6609,6 @@ fn serve(stream: std::net::TcpStream, fail: Option<String>) {
             };
             Arc::new(ControllerSessionSender {
                 config,
-                state_dir: self.state_dir.clone(),
                 lock_paths: Arc::clone(&self.lock_paths),
             })
         }
@@ -6479,6 +6630,18 @@ fn serve(stream: std::net::TcpStream, fail: Option<String>) {
                 .clone()
         }
 
+        /// The **production** single-instance lock path for this fixture
+        /// (`state_dir/.tributary-lock`, exactly what production `open` takes).
+        pub(super) fn lock_path(&self) -> PathBuf {
+            OwnToneConfig {
+                api_base: self.api_base.clone(),
+                pipe_path: self.state_dir.join("airplay.pcm"),
+                state_dir: self.state_dir.clone(),
+                binary: self.binary.clone(),
+            }
+            .lock_path()
+        }
+
         /// Capture the next serialized recovery instead of letting it run inline.
         pub(super) fn arm_capture(&self) {
             arm_retained_recovery_capture(&self.api_base);
@@ -6490,10 +6653,13 @@ fn serve(stream: std::net::TcpStream, fail: Option<String>) {
         }
     }
 
-    /// A real sender that builds real sessions bound to the fixture daemon.
+    /// A real sender that builds real sessions bound to the fixture daemon,
+    /// taking the **production** instance lock (the single
+    /// `state_dir/.tributary-lock` that production `open` uses) rather than a
+    /// per-session test lock. The exclusivity semantics the regression relies on
+    /// are therefore production's, not an artificial arrangement.
     struct ControllerSessionSender {
         config: OwnToneConfig,
-        state_dir: PathBuf,
         lock_paths: Arc<Mutex<Vec<PathBuf>>>,
     }
 
@@ -6511,19 +6677,20 @@ fn serve(stream: std::net::TcpStream, fail: Option<String>) {
                 Ok(client) => Arc::new(client),
                 Err(error) => return OpenOutcome::Failed(error),
             };
-            let index = self
-                .lock_paths
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .len()
-                + 1;
-            let lock_path = self.state_dir.join(format!("session-{index}.lock"));
+            // Production instance exclusivity: the single `.tributary-lock` for
+            // this instance, refused while another session (or the recovery that
+            // retains it) owns it. This is the authority boundary a same-instance
+            // replacement must respect, so the fixture cannot permit a
+            // replacement production would reject.
+            let lock_path = self.config.lock_path();
             let lock = match open_lock(&lock_path) {
                 Ok(lock) => lock,
                 Err(error) => return OpenOutcome::Failed(error),
             };
             if rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).is_err() {
-                return OpenOutcome::Failed(unavailable("the test session lock is contested"));
+                return OpenOutcome::Failed(unavailable(
+                    "another Tributary session is already using the dedicated daemon",
+                ));
             }
             self.lock_paths
                 .lock()

@@ -89,11 +89,6 @@ struct GstreamerSenderSession {
     /// by [`AirPlayOutput::close_session`] serializes with `resume` so a start
     /// can never be authorized after a Stop.
     gate: Arc<SessionGate>,
-    /// Test-only override for the start effect, so a regression can drive a
-    /// deterministic failed state transition through the real session without a
-    /// transmitter. Compiled out of production builds.
-    #[cfg(test)]
-    start_effect: Option<Box<dyn Fn() -> bool + Send>>,
 }
 
 impl GstreamerSenderSession {
@@ -109,14 +104,14 @@ impl GstreamerSenderSession {
             generation: ctx.generation,
             media_proxy: Arc::clone(&ctx.media_proxy),
             gate: Arc::clone(&ctx.session_gate),
-            #[cfg(test)]
-            start_effect: None,
         }
     }
 
     /// Test-only constructor: attach the real bus watch and build the session
     /// around an injected pipeline, retaining the actual `resume`/`close` and
-    /// state paths (review Z1).
+    /// state paths (review Z1). `resume` still runs the **production** effect
+    /// (`pipeline.set_state(Playing)`); callers supply a pipeline whose real
+    /// transition succeeds, is refused by the shared Stop/start gate, or fails.
     #[cfg(test)]
     fn for_test_session(pipeline: gst::Pipeline, ctx: &SenderOpenContext) -> Result<Self, String> {
         let bus_watch = attach_bus_watch(
@@ -127,20 +122,6 @@ impl GstreamerSenderSession {
             ctx.media_ticket.clone(),
         )?;
         Ok(Self::new(pipeline, ctx, bus_watch))
-    }
-
-    /// Test-only constructor with an injected start effect, so a regression can
-    /// drive a genuinely failed state transition (the effect runs and reports
-    /// failure) through the real `resume`.
-    #[cfg(test)]
-    fn for_test_with_start_effect(
-        pipeline: gst::Pipeline,
-        ctx: &SenderOpenContext,
-        start_effect: Box<dyn Fn() -> bool + Send>,
-    ) -> Result<Self, String> {
-        let mut session = Self::for_test_session(pipeline, ctx)?;
-        session.start_effect = Some(start_effect);
-        Ok(session)
     }
 }
 
@@ -165,12 +146,11 @@ impl SenderSession for GstreamerSenderSession {
         // Authorize and perform the pipeline start under the shared Stop/start
         // boundary: a Stop taken by the load path either wins first (refusing
         // the start) or loses and is followed by the session's own `Null`
-        // teardown, which settles the already-started pipeline (review U3).
+        // teardown, which settles the already-started pipeline (review U3). The
+        // effect is always the real `set_state(Playing)` — a regression must
+        // inject a real pipeline whose transition succeeds or fails, never
+        // substitute the effect.
         let pipeline = self.pipeline.clone();
-        #[cfg(test)]
-        if let Some(effect) = self.start_effect.take() {
-            return self.gate.start(effect);
-        }
         self.gate
             .start(move || pipeline.set_state(gst::State::Playing).is_ok())
     }
@@ -1101,6 +1081,23 @@ impl ControllerHarness {
     /// The production non-blocking Stop path (signals and detaches the worker).
     pub(super) fn stop(&self) {
         self.output.stop();
+    }
+
+    /// Repoint the output at another sender, as production does when the
+    /// selected transmission path changes. Used to drive a replacement load on
+    /// a **separate** legitimate instance without rebuilding the controller.
+    pub(super) fn set_sender(&mut self, sender: Arc<dyn AirplaySender>) {
+        self.output.sender = sender;
+    }
+
+    /// Drive the production pause control through the live worker.
+    pub(super) fn pause(&self) {
+        self.output.pause();
+    }
+
+    /// Drive the production resume control through the live worker.
+    pub(super) fn play(&self) {
+        self.output.play();
     }
 }
 
@@ -2114,16 +2111,10 @@ fn main() {
     /// sleep.
     type BufferCounter = Arc<(Mutex<usize>, std::sync::Condvar)>;
 
-    /// Build the injected RAOP-shaped pipeline around a `fakesink` named
-    /// `raop` (the element name [`GstreamerSenderSession`] looks up), with a
-    /// buffer probe on its sink pad so consumption is observable.
-    fn test_pipeline_with_buffer_counter() -> (gst::Pipeline, BufferCounter) {
-        let pipeline = gst::parse::launch(
-            "audiotestsrc ! audioconvert ! audio/x-raw,format=S16LE,rate=44100,channels=2 ! fakesink name=raop sync=false",
-        )
-        .expect("parse test pipeline")
-        .downcast::<gst::Pipeline>()
-        .expect("test pipeline");
+    /// Attach a buffer probe to the injected pipeline's `raop` sink pad, so
+    /// consumption of that element (the one [`GstreamerSenderSession`] looks
+    /// up) is observable without the unavailable production `raopsink`.
+    fn attach_buffer_counter(pipeline: &gst::Pipeline) -> BufferCounter {
         let sink = pipeline.by_name("raop").expect("test sink");
         let counter: BufferCounter = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
         let probe_counter = Arc::clone(&counter);
@@ -2136,7 +2127,246 @@ fn main() {
                 gst::PadProbeReturn::Ok
             },
         );
+        counter
+    }
+
+    /// Build the injected RAOP-shaped pipeline around a `fakesink` named
+    /// `raop`, with a buffer probe on its sink pad so consumption is
+    /// observable. A real source drives real buffers once the pipeline plays.
+    fn test_pipeline_with_buffer_counter() -> (gst::Pipeline, BufferCounter) {
+        let pipeline = gst::parse::launch(
+            "audiotestsrc ! audioconvert ! audio/x-raw,format=S16LE,rate=44100,channels=2 ! fakesink name=raop sync=false",
+        )
+        .expect("parse test pipeline")
+        .downcast::<gst::Pipeline>()
+        .expect("test pipeline");
+        let counter = attach_buffer_counter(&pipeline);
         (pipeline, counter)
+    }
+
+    /// Build an injected RAOP-shaped pipeline whose real transition genuinely
+    /// fails: `filesrc` cannot open a missing file, so the element posts an
+    /// error and `pipeline.set_state(Playing)` returns `StateChange::Failure`
+    /// synchronously. This is a real GStreamer transition failure, not a
+    /// test-only false return.
+    fn failing_transition_pipeline() -> (gst::Pipeline, BufferCounter) {
+        let directory = tempfile::tempdir().expect("tempdir for the missing source");
+        let missing = directory.path().join("definitely-missing.flac");
+        let pipeline = gst::parse::launch(&format!(
+            "filesrc location=\"{}\" ! fakesink name=raop sync=false",
+            missing.display()
+        ))
+        .expect("parse failing test pipeline")
+        .downcast::<gst::Pipeline>()
+        .expect("test pipeline");
+        let counter = attach_buffer_counter(&pipeline);
+        // `directory` is intentionally dropped here: the path must not exist.
+        (pipeline, counter)
+    }
+
+    /// Build an injected pipeline whose real transition parks *inside*
+    /// `filesrc`'s open of a named FIFO with no writer. `set_state(Playing)`
+    /// therefore blocks at the real transition boundary until a writer opens
+    /// the FIFO — a deterministic parking point for a start-vs-Stop
+    /// interposition, using only real GStreamer behavior.
+    #[cfg(unix)]
+    fn parked_transition_pipeline(fifo: &std::path::Path) -> (gst::Pipeline, BufferCounter) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(fifo)
+            .status()
+            .expect("invoke mkfifo");
+        assert!(
+            status.success(),
+            "mkfifo must create the parked-source FIFO"
+        );
+        let pipeline = gst::parse::launch(&format!(
+            "filesrc location=\"{}\" ! fakesink name=raop sync=false",
+            fifo.display()
+        ))
+        .expect("parse parked test pipeline")
+        .downcast::<gst::Pipeline>()
+        .expect("test pipeline");
+        let counter = attach_buffer_counter(&pipeline);
+        (pipeline, counter)
+    }
+
+    /// Observes, synchronously and without a main loop, the bus messages a real
+    /// pipeline transition emits, so a regression can prove a transition was
+    /// actually *attempted* on the injected pipeline and observe its failure.
+    /// The handler is observational only: every message is passed through
+    /// unchanged, and the session's own bus watch (if its main context ever
+    /// runs) still sees them.
+    #[derive(Default)]
+    struct TransitionRecorder {
+        state_changes: Mutex<usize>,
+        errors: Mutex<usize>,
+    }
+
+    impl TransitionRecorder {
+        fn install(pipeline: &gst::Pipeline) -> Arc<Self> {
+            let recorder = Arc::new(Self::default());
+            let bus = pipeline.bus().expect("injected pipeline has a bus");
+            let seen = Arc::clone(&recorder);
+            bus.set_sync_handler(move |_, message| {
+                match message.view() {
+                    gst::MessageView::StateChanged(_) => {
+                        *seen.state_changes.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                    }
+                    gst::MessageView::Error(_) => {
+                        *seen.errors.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                    }
+                    _ => {}
+                }
+                gst::BusSyncReply::Pass
+            });
+            recorder
+        }
+
+        fn state_changes(&self) -> usize {
+            *self.state_changes.lock().unwrap_or_else(|p| p.into_inner())
+        }
+
+        fn errors(&self) -> usize {
+            *self.errors.lock().unwrap_or_else(|p| p.into_inner())
+        }
+    }
+
+    /// A test sender that hands the real [`run_session_worker`] a real
+    /// [`GstreamerSenderSession`] built around an injected pipeline, so the
+    /// worker's real start/refusal/teardown routing is exercised against a
+    /// pipeline whose production transition succeeds, parks, or fails.
+    struct InjectedPipelineSender {
+        pipeline: Mutex<Option<gst::Pipeline>>,
+    }
+
+    impl InjectedPipelineSender {
+        fn new(pipeline: gst::Pipeline) -> Self {
+            Self {
+                pipeline: Mutex::new(Some(pipeline)),
+            }
+        }
+    }
+
+    impl AirplaySender for InjectedPipelineSender {
+        fn name(&self) -> &'static str {
+            "test-injected-pipeline"
+        }
+
+        fn probe(&self) -> Result<(), SenderError> {
+            Ok(())
+        }
+
+        fn open_session(&self, ctx: &SenderOpenContext) -> OpenOutcome {
+            let pipeline = self
+                .pipeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            match pipeline {
+                Some(pipeline) => match GstreamerSenderSession::for_test_session(pipeline, ctx) {
+                    Ok(session) => OpenOutcome::Opened(Box::new(session)),
+                    Err(message) => OpenOutcome::Failed(SenderError::Receiver(message)),
+                },
+                None => OpenOutcome::Failed(SenderError::Receiver(
+                    "no injected pipeline was prepared".to_string(),
+                )),
+            }
+        }
+    }
+
+    /// Everything a worker-driven GStreamer regression needs: a real protected
+    /// route/ticket, the worker's context, its in-flight registration, the
+    /// worker-visible event receiver and the generation.
+    struct WorkerGstreamerFixture {
+        proxy: Arc<GstreamerMediaProxy>,
+        ticket: Arc<GstreamerMediaTicket>,
+        ctx: SenderOpenContext,
+        registration: InFlightCancelRegistration,
+        generation: PlayerEventGeneration,
+        events: async_channel::Receiver<PlayerEvent>,
+        // Kept alive so the prepared route stays valid for the whole fixture.
+        _prepared: PreparedGstreamerMedia,
+    }
+
+    fn worker_gstreamer_fixture(
+        generation: PlayerEventGeneration,
+        gate: Arc<SessionGate>,
+    ) -> WorkerGstreamerFixture {
+        use crate::architecture::media::ResolvedHttpRequest;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let request = ResolvedHttpRequest::new(
+            url::Url::parse("https://music.test/stream.flac").expect("url"),
+        )
+        .expect("resolved request");
+        let prepared = proxy.prepare_resolved(request).expect("prepared media");
+        let ticket = prepared.ticket().expect("protected media ticket");
+        let cancel = OpenCancel::new();
+        let registration = proxy.register_in_flight_cancel(1, prepared.generation(), &cancel);
+        let (tx, events) = async_channel::unbounded();
+        let ctx = SenderOpenContext {
+            target: SenderTarget::new("Test", "127.0.0.1", 7000, None),
+            prepared_uri: prepared.uri().to_string(),
+            event_tx: tx,
+            generation,
+            media_proxy: Arc::clone(&proxy),
+            media_ticket: prepared.ticket(),
+            volume: 1.0,
+            cancel,
+            session_gate: gate,
+            open_id: 1,
+        };
+        WorkerGstreamerFixture {
+            proxy,
+            ticket,
+            ctx,
+            registration,
+            generation,
+            events,
+            _prepared: prepared,
+        }
+    }
+
+    /// Drain the events a worker published.
+    fn drain_events(events: &async_channel::Receiver<PlayerEvent>) -> Vec<PlayerEvent> {
+        let mut drained = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            drained.push(event);
+        }
+        drained
+    }
+
+    /// Bound-poll the worker's own coarse cache until it reports `expected`.
+    /// The pipeline transition itself is observed through its real effects
+    /// (buffers, gate in-flight state, bus messages); this only waits for the
+    /// worker thread's cache write to become visible.
+    fn wait_for_cache(cache: &Arc<AtomicU8>, expected: PlayerState) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state_from_u8(cache.load(Ordering::SeqCst)) != expected {
+            assert!(
+                Instant::now() < deadline,
+                "the worker cache never reached {expected:?}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Wait until the shared gate reports an authorized start effect in-flight
+    /// (running its real transition). Polls the gate's own drain condvar so it
+    /// observes real arrival rather than sleeping as evidence.
+    fn wait_for_start_effect_in_flight(gate: &SessionGate) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gate.wait_effects_drained(Duration::from_millis(1)) {
+            assert!(
+                Instant::now() < deadline,
+                "the start effect never entered the transition"
+            );
+        }
     }
 
     fn buffer_count(counter: &BufferCounter) -> usize {
@@ -2311,58 +2541,264 @@ fn main() {
         assert_eq!(ticket.route_count(), 0);
     }
 
-    /// Z1: a failed state transition. The injected start effect runs and reports
-    /// failure, so `resume` reports no start; the injected pipeline never plays
-    /// (no buffers consumed) and no `Playing` is published — the observable
-    /// "no PCM after refusal" contract.
+    /// Z1: a **real** failed GStreamer state transition, driven through the
+    /// real [`run_session_worker`]. The injected pipeline's `resume` genuinely
+    /// calls `pipeline.set_state(Playing)`; `filesrc` cannot open its source, so
+    /// that transition fails. The bus proves the transition was attempted
+    /// (state-changed) and that it failed (error); the worker reports `Stopped`,
+    /// no PCM or `Playing` is ever produced, and the protected route is released
+    /// by identity. The previous fixture substituted a `false` return for the
+    /// transition; this exercises the production effect end to end.
     #[test]
-    fn a_failed_gstreamer_state_transition_consumes_no_buffers_and_publishes_no_playing() {
+    fn a_real_failed_gstreamer_transition_releases_the_route_without_pcm_or_playing() {
         gst::init().expect("GStreamer init");
 
-        let (tx, rx) = async_channel::unbounded();
-        let proxy = Arc::new(GstreamerMediaProxy::new(None));
-        let gate = Arc::new(SessionGate::new());
         let generation = PlayerEventGeneration::from_raw(12);
-        let ctx = test_session_ctx(&proxy, None, tx, Arc::clone(&gate), generation);
+        let gate = Arc::new(SessionGate::new());
+        let WorkerGstreamerFixture {
+            proxy,
+            ticket,
+            ctx,
+            registration,
+            generation,
+            events,
+            _prepared,
+        } = worker_gstreamer_fixture(generation, gate);
+        assert!(proxy.has_active_lease());
+        assert_eq!(ticket.route_count(), 1);
 
-        let (pipeline, counter) = test_pipeline_with_buffer_counter();
-        let effect_ran = Arc::new(AtomicBool::new(false));
-        let ran = Arc::clone(&effect_ran);
-        let session = GstreamerSenderSession::for_test_with_start_effect(
-            pipeline,
-            &ctx,
-            Box::new(move || {
-                ran.store(true, Ordering::SeqCst);
-                false
-            }),
-        )
-        .expect("session");
-        let mut session = Box::new(session);
+        let (pipeline, counter) = failing_transition_pipeline();
+        let recorder = TransitionRecorder::install(&pipeline);
+        let sender = Arc::new(InjectedPipelineSender::new(pipeline));
+
+        let state_cache = Arc::new(AtomicU8::new(PlayerState::Buffering as u8));
+        let position_cache = Arc::new(Mutex::new(SenderPosition::unknown(generation)));
+        let event_generation = Arc::new(AtomicU64::new(generation.as_raw()));
+        let (_commands, command_rx) = mpsc::channel();
+
+        run_session_worker(
+            sender,
+            ctx,
+            registration,
+            command_rx,
+            Arc::clone(&state_cache),
+            position_cache,
+            event_generation,
+        );
 
         assert!(
-            !session.resume(),
-            "a failed state transition must not report a start"
+            recorder.state_changes() > 0,
+            "the real start must be attempted on the injected pipeline"
         );
         assert!(
-            effect_ran.load(Ordering::SeqCst),
-            "the start effect must actually have run and failed"
-        );
-        assert_eq!(
-            session.state(),
-            PlayerState::Stopped,
-            "a failed transition leaves the pipeline stopped"
+            recorder.errors() > 0,
+            "the attempted transition must post a real failure"
         );
         assert_eq!(
             buffer_count(&counter),
             0,
             "no PCM may be consumed after a failed start"
         );
-        assert!(
-            !rx_has_playing(&rx),
-            "a failed start must not publish Playing"
+        assert_eq!(
+            state_from_u8(state_cache.load(Ordering::SeqCst)),
+            PlayerState::Stopped,
+            "the worker must report the refused start, not a live one"
         );
 
-        session.close();
+        let events = drain_events(&events);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    generation: g,
+                    state: PlayerState::Stopped,
+                } if *g == generation
+            )),
+            "the failed start must publish Stopped: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Playing | PlayerState::Paused,
+                    ..
+                }
+            )),
+            "a failed start must not publish Playing/Paused: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::TrackEnded { .. })),
+            "a failed start must not publish completion: {events:?}"
+        );
+        assert!(
+            !proxy.has_active_lease() && !proxy.has_custody_entries(),
+            "a failed start must release the protected route by identity"
+        );
+        assert_eq!(
+            ticket.route_count(),
+            0,
+            "the released route must be shut down"
+        );
+    }
+
+    /// Z1: start wins the real transition, driven through the worker with the
+    /// production `GstreamerSenderSession`. The authorized start runs the
+    /// injected pipeline, whose sink observably consumes buffers, the worker
+    /// publishes `Playing`, and the worker's own teardown releases the protected
+    /// route by identity.
+    #[test]
+    fn a_worker_start_through_the_real_gstreamer_adapter_consumes_buffers() {
+        gst::init().expect("GStreamer init");
+
+        let generation = PlayerEventGeneration::from_raw(21);
+        let gate = Arc::new(SessionGate::new());
+        let WorkerGstreamerFixture {
+            proxy,
+            ticket,
+            ctx,
+            registration,
+            generation,
+            events,
+            _prepared,
+        } = worker_gstreamer_fixture(generation, Arc::clone(&gate));
+
+        let (pipeline, counter) = test_pipeline_with_buffer_counter();
+        let sender = Arc::new(InjectedPipelineSender::new(pipeline));
+        let state_cache = Arc::new(AtomicU8::new(PlayerState::Buffering as u8));
+        let position_cache = Arc::new(Mutex::new(SenderPosition::unknown(generation)));
+        let event_generation = Arc::new(AtomicU64::new(generation.as_raw()));
+        let mut worker = spawn_test_session_worker(
+            sender,
+            ctx,
+            registration,
+            Arc::clone(&state_cache),
+            position_cache,
+            event_generation,
+        );
+
+        // The pipeline's sink consuming buffers is the real accepted-start
+        // effect; the cache write is only waited for, never used as evidence.
+        wait_for_buffers(&counter, 1);
+        wait_for_cache(&state_cache, PlayerState::Playing);
+        assert!(
+            buffer_count(&counter) >= 1,
+            "the started pipeline must consume buffers"
+        );
+
+        worker.stop_and_join();
+        let events = drain_events(&events);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    generation: g,
+                    state: PlayerState::Playing,
+                } if *g == generation
+            )),
+            "the accepted start must publish Playing: {events:?}"
+        );
+        assert!(
+            !proxy.has_active_lease() && !proxy.has_custody_entries(),
+            "closing the worker must release the session's route by identity"
+        );
+        assert_eq!(ticket.route_count(), 0);
+    }
+
+    /// Z1: Stop wins the real transition. `set_state(Playing)` is parked inside
+    /// `filesrc`'s open of a writer-less FIFO — the actual transition boundary —
+    /// the gate observes the authorized effect in-flight, and a Stop then takes
+    /// the boundary. Releasing the parked transition lets the effect return a
+    /// genuinely started pipeline, which the gate suppresses because the Stop
+    /// won: the worker reports `Stopped`, consumes no PCM, publishes no
+    /// `Playing`, and releases the route by identity.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_interposed_at_the_real_gstreamer_transition_refuses_the_start() {
+        gst::init().expect("GStreamer init");
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let fifo = directory.path().join("parked-source.fifo");
+        let generation = PlayerEventGeneration::from_raw(22);
+        let gate = Arc::new(SessionGate::new());
+        let WorkerGstreamerFixture {
+            proxy,
+            ticket,
+            ctx,
+            registration,
+            generation,
+            events,
+            _prepared,
+        } = worker_gstreamer_fixture(generation, Arc::clone(&gate));
+
+        let (pipeline, counter) = parked_transition_pipeline(&fifo);
+        let recorder = TransitionRecorder::install(&pipeline);
+        let sender = Arc::new(InjectedPipelineSender::new(pipeline));
+        let state_cache = Arc::new(AtomicU8::new(PlayerState::Buffering as u8));
+        let position_cache = Arc::new(Mutex::new(SenderPosition::unknown(generation)));
+        let event_generation = Arc::new(AtomicU64::new(generation.as_raw()));
+        let mut worker = spawn_test_session_worker(
+            sender,
+            ctx,
+            registration,
+            Arc::clone(&state_cache),
+            position_cache,
+            event_generation,
+        );
+
+        // The real `set_state(Playing)` is now parked inside the FIFO open; the
+        // gate reports the authorized effect in-flight.
+        wait_for_start_effect_in_flight(&gate);
+
+        // Stop wins the boundary while the effect is parked in the transition.
+        gate.stop();
+        // Release the parked transition: `filesrc` opens the FIFO, the pipeline
+        // really starts, and the gate suppresses the accepted result.
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fifo)
+            .expect("open the parked FIFO's writer");
+        drop(writer);
+
+        wait_for_cache(&state_cache, PlayerState::Stopped);
+        worker.stop_and_join();
+
+        assert!(
+            recorder.state_changes() > 0,
+            "the start must have attempted the real transition"
+        );
+        assert_eq!(
+            buffer_count(&counter),
+            0,
+            "no PCM may be consumed after a Stop won the boundary"
+        );
+        let events = drain_events(&events);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Playing | PlayerState::Paused,
+                    ..
+                }
+            )),
+            "a suppressed start must publish no Playing/Paused: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    generation: g,
+                    state: PlayerState::Stopped,
+                } if *g == generation
+            )),
+            "the suppressed start must publish Stopped: {events:?}"
+        );
+        assert!(
+            !proxy.has_active_lease() && !proxy.has_custody_entries(),
+            "the refused start must release the route by identity"
+        );
+        assert_eq!(ticket.route_count(), 0);
     }
 
     fn rx_has_playing(rx: &async_channel::Receiver<PlayerEvent>) -> bool {
