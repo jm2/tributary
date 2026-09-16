@@ -7006,6 +7006,180 @@ fn serve(stream: std::net::TcpStream) {
         assert!(!events.iter().any(|event| matches!(event, PlayerEvent::StateChanged { generation: g, state: PlayerState::Playing } if *g == generation)), "late Playing after cancellation: {events:?}");
     }
 
+    /// AG1: events are observed without any UI-generated Stop, matching direct
+    /// radio's mark_resolved_load_failed=false semantics. Protected local PCM
+    /// also lets us verify route custody through the actual controller.
+    #[cfg(target_os = "linux")]
+    fn exercise_live_resume_failure(timeout: bool) {
+        use crate::audio::airplay_output::ControllerHarness;
+        use crate::local::resolver::ResolvedLocalMedia;
+
+        gst::init().unwrap();
+        let daemon = RecordingOwnedDaemon::start();
+        let original_process = listener_process(&daemon.config.api_base)
+            .unwrap()
+            .identity();
+        let client = OwnToneClient::new(&daemon.config.api_base).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        let controller = ControllerHarness::new(
+            runtime.handle().clone(),
+            Arc::new(OwnToneSender {
+                config: Some(daemon.config.clone()),
+            }),
+            tx,
+        )
+        .with_device_id("aabbcc");
+        let root = tempfile::tempdir().unwrap();
+        let marker = format!("marker:v1:{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            root.path().join(".tributary-root-id"),
+            format!("{marker}\n"),
+        )
+        .unwrap();
+        let path = root.path().join("resume.wav");
+        write_startup_wav(&path, 30);
+        let prepare = || {
+            let media =
+                ResolvedLocalMedia::from_authorized_path_for_test(root.path(), &marker, &path)
+                    .unwrap();
+            controller.proxy().prepare_local(media).unwrap()
+        };
+        let prepared = prepare();
+        let ticket = prepared.ticket().unwrap();
+        let mut playback = crate::ui::playback::PlaybackSession::default();
+        let direct = crate::ui::playback::QueueItem::direct_for_test(
+            "https://radio.invalid/live".into(),
+            "Radio".into(),
+            String::new(),
+            String::new(),
+        );
+        assert!(playback.replace_queue(vec![direct], 0));
+        let generation = playback.current_event_generation();
+        controller.set_generation(generation);
+        controller.load(generation, prepared);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        controller.pause();
+        wait_until(|| controller.state() == PlayerState::Paused);
+        while rx.try_recv().is_ok() {}
+        let pipe = &daemon.config.pipe_path;
+        std::fs::write(pipe.with_extension("park-activation"), "resume").unwrap();
+        if !timeout {
+            std::fs::write(pipe.with_extension("fail-play"), "").unwrap();
+        }
+        let started = Instant::now();
+        controller.play();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        wait_until(|| pipe.with_extension("activation-seen").exists());
+        let competing = open_lock(&daemon.config.lock_path()).unwrap();
+        assert!(rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err());
+        assert_eq!(ticket.route_count(), 1);
+        assert!(daemon.config.takeover_record().exists());
+        assert!(client.outputs().unwrap()[0].selected);
+        if !timeout {
+            std::fs::write(pipe.with_extension("activation-release"), "").unwrap();
+        }
+        // No Stop, replacement, controller drop, or event-driven UI cleanup.
+        // The timeout case never releases the request: quiescence must kill it.
+        wait_until(|| ticket.route_count() == 0);
+        wait_until(|| {
+            rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_ok()
+        });
+        wait_until(|| controller.state() == PlayerState::Stopped);
+        assert!(!daemon.config.takeover_record().exists());
+        assert!(!controller.proxy().is_custodied(&ticket));
+        assert!(!controller.proxy().has_custody_entries());
+        assert!(!client.outputs().unwrap()[0].selected);
+        assert!(client.outputs().unwrap()[1].selected);
+        assert_eq!(client.player_state().unwrap(), "stop");
+        assert_ne!(
+            listener_process(&daemon.config.api_base)
+                .unwrap()
+                .identity(),
+            original_process,
+            "failed mutation must be quiesced before releasing ownership"
+        );
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().all(|event| event.generation() == generation));
+        assert!(
+            !playback.mark_resolved_load_failed(generation),
+            "direct-source Error does not ask the UI to stop the output"
+        );
+        assert!(playback.accepts_event_generation(generation));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::Error { .. })),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                }
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::TrackEnded { .. }
+                    | PlayerEvent::StateChanged {
+                        state: PlayerState::Playing,
+                        ..
+                    }
+            )),
+            "{events:?}"
+        );
+        let plays = daemon.recorded().matches("PUT /api/player/play ").count();
+        controller.play();
+        controller.pause();
+        controller.play();
+        assert_eq!(controller.state(), PlayerState::Stopped);
+        assert_eq!(
+            daemon.recorded().matches("PUT /api/player/play ").count(),
+            plays
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "terminal controls cannot publish events"
+        );
+        drop(competing);
+        for suffix in ["fail-play", "park-activation"] {
+            let _ = std::fs::remove_file(pipe.with_extension(suffix));
+        }
+        let prepared = prepare();
+        let next_ticket = prepared.ticket().unwrap();
+        controller.set_generation(generation.next());
+        controller.load(generation.next(), prepared);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        assert_eq!(next_ticket.route_count(), 1);
+        controller.pause();
+        wait_until(|| controller.state() == PlayerState::Paused);
+        controller.play();
+        wait_until(|| controller.state() == PlayerState::Playing);
+        controller.stop();
+        wait_until(|| next_ticket.route_count() == 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_resume_http_failure_settles_without_ui_stop() {
+        exercise_live_resume_failure(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_resume_timeout_settles_without_ui_stop() {
+        exercise_live_resume_failure(true);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn cancelled_activation_autostart_stop_is_silent() {

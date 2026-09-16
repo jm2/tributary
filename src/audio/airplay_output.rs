@@ -897,7 +897,13 @@ fn run_session_worker(
                 match commands.recv_timeout(Duration::from_millis(200)) {
                     Ok(SessionCommand::Pause) => session.pause(),
                     Ok(SessionCommand::Resume) => {
-                        let _ = session.resume();
+                        if !session.resume() {
+                            // A failed live resume is terminal just like a
+                            // failed initial start. Settle on this worker even
+                            // when the UI (e.g. direct radio) sends no Stop.
+                            state_cache.store(PlayerState::Stopped as u8, Ordering::SeqCst);
+                            break;
+                        }
                     }
                     Ok(SessionCommand::SetVolume(level)) => session.set_volume(level),
                     Ok(SessionCommand::Stop) => break,
