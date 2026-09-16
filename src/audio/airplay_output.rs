@@ -132,14 +132,16 @@ impl SenderSession for GstreamerSenderSession {
         SenderWriteOutcome::Accepted(samples.len())
     }
 
-    fn set_volume(&mut self, level: f64) {
+    fn set_volume(&mut self, level: f64) -> bool {
         if let Some(sink) = self.pipeline.by_name("raop") {
             sink.set_property("volume", AirPlayOutput::volume_to_db(level));
         }
+        true
     }
 
-    fn pause(&mut self) {
+    fn pause(&mut self) -> bool {
         let _ = self.pipeline.set_state(gst::State::Paused);
+        true
     }
 
     fn resume(&mut self) -> bool {
@@ -895,7 +897,12 @@ fn run_session_worker(
                     break;
                 }
                 match commands.recv_timeout(Duration::from_millis(200)) {
-                    Ok(SessionCommand::Pause) => session.pause(),
+                    Ok(SessionCommand::Pause) => {
+                        if !session.pause() {
+                            state_cache.store(PlayerState::Stopped as u8, Ordering::SeqCst);
+                            break;
+                        }
+                    }
                     Ok(SessionCommand::Resume) => {
                         if !session.resume() {
                             // A failed live resume is terminal just like a
@@ -905,7 +912,12 @@ fn run_session_worker(
                             break;
                         }
                     }
-                    Ok(SessionCommand::SetVolume(level)) => session.set_volume(level),
+                    Ok(SessionCommand::SetVolume(level)) => {
+                        if !session.set_volume(level) {
+                            state_cache.store(PlayerState::Stopped as u8, Ordering::SeqCst);
+                            break;
+                        }
+                    }
                     Ok(SessionCommand::Stop) => break,
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -1105,6 +1117,11 @@ impl ControllerHarness {
     /// Drive the production pause control through the live worker.
     pub(super) fn pause(&self) {
         self.output.pause();
+    }
+
+    /// Drive the production volume control through the live worker.
+    pub(super) fn set_volume(&mut self, level: f64) {
+        self.output.set_volume(level);
     }
 
     /// Drive the production resume control through the live worker.
@@ -1767,8 +1784,12 @@ fn main() {
         fn write_pcm(&mut self, samples: &[u8]) -> SenderWriteOutcome {
             SenderWriteOutcome::Accepted(samples.len())
         }
-        fn set_volume(&mut self, _level: f64) {}
-        fn pause(&mut self) {}
+        fn set_volume(&mut self, _level: f64) -> bool {
+            true
+        }
+        fn pause(&mut self) -> bool {
+            true
+        }
         fn resume(&mut self) -> bool {
             true
         }
@@ -1945,8 +1966,12 @@ fn main() {
         fn write_pcm(&mut self, samples: &[u8]) -> SenderWriteOutcome {
             SenderWriteOutcome::Accepted(samples.len())
         }
-        fn set_volume(&mut self, _level: f64) {}
-        fn pause(&mut self) {}
+        fn set_volume(&mut self, _level: f64) -> bool {
+            true
+        }
+        fn pause(&mut self) -> bool {
+            true
+        }
         fn resume(&mut self) -> bool {
             true
         }

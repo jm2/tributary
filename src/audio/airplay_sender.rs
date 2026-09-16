@@ -366,10 +366,12 @@ pub(super) trait SenderSession: Send {
     fn write_pcm(&mut self, samples: &[u8]) -> SenderWriteOutcome;
 
     /// Receiver-facing volume in `[0.0, 1.0]`; the adapter maps to its
-    /// protocol's convention.
-    fn set_volume(&mut self, level: f64);
+    /// protocol's convention. False requires worker-owned terminal cleanup;
+    /// adapters publish genuine failures and keep cancellation silent.
+    fn set_volume(&mut self, level: f64) -> bool;
 
-    fn pause(&mut self);
+    /// False requires worker-owned terminal cleanup, as for volume/resume.
+    fn pause(&mut self) -> bool;
 
     /// Resume playback. Returns `true` when the session actually started
     /// playing and `false` when it could not (a cancelled acceptance boundary

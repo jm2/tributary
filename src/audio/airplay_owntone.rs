@@ -1406,11 +1406,12 @@ impl SessionInner {
     /// transmit a late `player/play`/`pause`/`volume` against the restored
     /// output selection. The refusal is fail-closed and does not touch the
     /// outstanding count (nothing was transmitted).
+    #[cfg(test)]
     fn transmit_mutation<F>(&self, effect: F) -> Result<(), SenderError>
     where
         F: FnOnce() -> Result<(), SenderError>,
     {
-        self.transmit_under_boundary(effect, None)
+        self.transmit_under_boundary(effect, None, false)
     }
 
     /// Transmit one daemon-mutating RPC and, on a confirmed success, publish the
@@ -1432,7 +1433,7 @@ impl SessionInner {
     where
         F: FnOnce() -> Result<(), SenderError>,
     {
-        self.transmit_under_boundary(effect, Some(on_success))
+        self.transmit_under_boundary(effect, Some(on_success), false)
     }
 
     /// Shared body of [`Self::transmit_mutation`] and
@@ -1443,6 +1444,7 @@ impl SessionInner {
         &self,
         effect: F,
         on_success: Option<PlayerState>,
+        terminal_on_failure: bool,
     ) -> Result<(), SenderError>
     where
         F: FnOnce() -> Result<(), SenderError>,
@@ -1452,6 +1454,9 @@ impl SessionInner {
             return Err(unavailable(
                 "the AirPlay session is no longer accepting control",
             ));
+        }
+        if terminal_on_failure && (self.cancel.is_cancelled() || self.gate.is_stopped()) {
+            return Err(unavailable("the AirPlay session was stopped"));
         }
         self.unsettled.fetch_add(1, Ordering::SeqCst);
         match effect() {
@@ -1467,7 +1472,25 @@ impl SessionInner {
                 }
                 Ok(())
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                if terminal_on_failure {
+                    // Latch refusal before releasing the transmission boundary:
+                    // no queued control may overtake an uncertain mutation.
+                    // Keep the outstanding count for close()'s quiescence.
+                    self.terminal.store(true, Ordering::SeqCst);
+                    self.running.store(false, Ordering::SeqCst);
+                    self.gate.publish_if_live(|| {
+                        if !self.cancel.is_cancelled() {
+                            let _ = self.event_tx.try_send(PlayerEvent::error(
+                                self.generation,
+                                error.message().to_string(),
+                            ));
+                            self.publish_state(PlayerState::Stopped);
+                        }
+                    });
+                }
+                Err(error)
+            }
         }
     }
 
@@ -2088,33 +2111,21 @@ impl SenderSession for OwnToneSession {
         SenderWriteOutcome::Accepted(samples.len())
     }
 
-    fn set_volume(&mut self, level: f64) {
+    fn set_volume(&mut self, level: f64) -> bool {
         let percent = (level.clamp(0.0, 1.0) * 100.0).round() as u8;
-        // Transmit under the settlement boundary so a failed (or timed-out)
-        // PUT is recorded as outstanding for terminal settlement, and a
-        // concurrent restore cannot observe "settled" while this RPC is in
-        // flight (review T1, review U1).
-        if let Err(error) = self
-            .inner
-            .transmit_mutation(|| self.inner.client.set_volume(percent))
-        {
-            debug!(reason = %error.message(), "OwnTone volume change failed");
-        }
+        self.inner
+            .transmit_under_boundary(|| self.inner.client.set_volume(percent), None, true)
+            .is_ok()
     }
 
-    fn pause(&mut self) {
-        // A successful pause publishes `Paused` inside the settlement boundary,
-        // so a terminal `Stopped`/`TrackEnded` can never be followed by a late
-        // `Paused` (review X1).
-        match self.inner.transmit_mutation_publishing(
-            || self.inner.client.player_control("pause"),
-            PlayerState::Paused,
-        ) {
-            Ok(()) => {}
-            Err(error) => {
-                debug!(reason = %error.message(), "OwnTone pause failed");
-            }
-        }
+    fn pause(&mut self) -> bool {
+        self.inner
+            .transmit_under_boundary(
+                || self.inner.client.player_control("pause"),
+                Some(PlayerState::Paused),
+                true,
+            )
+            .is_ok()
     }
 
     fn resume(&mut self) -> bool {
@@ -6162,6 +6173,20 @@ fn serve(stream: std::net::TcpStream) {
         }
         std::fs::write(pipe.with_extension("activation-replied"), "").unwrap();
     }
+    let control_mode = std::fs::read_to_string(pipe.with_extension("park-control")).unwrap_or_default();
+    let parked_control = method == "PUT" && ((control_mode == "pause" && path == "/api/player/pause")
+        || (control_mode == "volume" && volume == Some(20)));
+    if parked_control {
+        std::fs::write(pipe.with_extension("control-seen"), "").unwrap();
+        while !pipe.with_extension("control-release").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if pipe.with_extension("fail-control").exists() {
+            let mut stream = stream;
+            let _ = stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            return;
+        }
+    }
     let mut state = STATE.lock().unwrap();
     let dynamic = format!(r#"{{"state":"{}","pcm_bytes":{}}}"#, if state.playing { "play" } else if state.paused { "pause" } else { "stop" }, state.bytes);
     let outputs = format!(r#"{{"outputs":[{{"id":"11189196","name":"Test","selected":{}}},{{"id":"42","name":"Prior","selected":{}}}]}}"#, state.selected, !state.selected);
@@ -7166,6 +7191,247 @@ fn serve(stream: std::net::TcpStream) {
         wait_until(|| controller.state() == PlayerState::Playing);
         controller.stop();
         wait_until(|| next_ticket.route_count() == 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exercise_live_control_failure(volume: bool, timeout: bool, cancel: bool) {
+        use crate::audio::airplay_output::ControllerHarness;
+        use crate::local::resolver::ResolvedLocalMedia;
+
+        gst::init().unwrap();
+        let daemon = RecordingOwnedDaemon::start();
+        let original_process = listener_process(&daemon.config.api_base)
+            .unwrap()
+            .identity();
+        let client = OwnToneClient::new(&daemon.config.api_base).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        let mut controller = ControllerHarness::new(
+            runtime.handle().clone(),
+            Arc::new(OwnToneSender {
+                config: Some(daemon.config.clone()),
+            }),
+            tx,
+        )
+        .with_device_id("aabbcc");
+        let root = tempfile::tempdir().unwrap();
+        let marker = format!("marker:v1:{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            root.path().join(".tributary-root-id"),
+            format!("{marker}\n"),
+        )
+        .unwrap();
+        let path = root.path().join("resume.wav");
+        write_startup_wav(&path, 30);
+        let prepare = |controller: &ControllerHarness| {
+            let media =
+                ResolvedLocalMedia::from_authorized_path_for_test(root.path(), &marker, &path)
+                    .unwrap();
+            controller.proxy().prepare_local(media).unwrap()
+        };
+        let prepared = prepare(&controller);
+        let ticket = prepared.ticket().unwrap();
+        let mut playback = crate::ui::playback::PlaybackSession::default();
+        let direct = crate::ui::playback::QueueItem::direct_for_test(
+            "https://radio.invalid/live".into(),
+            "Radio".into(),
+            String::new(),
+            String::new(),
+        );
+        assert!(playback.replace_queue(vec![direct], 0));
+        let generation = playback.current_event_generation();
+        controller.set_generation(generation);
+        controller.load(generation, prepared);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        while rx.try_recv().is_ok() {}
+        let pipe = &daemon.config.pipe_path;
+        std::fs::write(
+            pipe.with_extension("park-control"),
+            if volume { "volume" } else { "pause" },
+        )
+        .unwrap();
+        if !timeout {
+            std::fs::write(pipe.with_extension("fail-control"), "").unwrap();
+        }
+        let started = Instant::now();
+        if volume {
+            controller.set_volume(0.2);
+        } else {
+            controller.pause();
+        }
+        assert!(started.elapsed() < Duration::from_millis(500));
+        wait_until(|| pipe.with_extension("control-seen").exists());
+        let competing = open_lock(&daemon.config.lock_path()).unwrap();
+        assert!(rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err());
+        assert_eq!(ticket.route_count(), 1);
+        assert!(daemon.config.takeover_record().exists());
+        assert!(client.outputs().unwrap()[0].selected);
+        // Queue controls while the failing request owns the worker. Neither
+        // may transmit, even after the real HTTP timeout releases the lock.
+        let before = daemon.recorded();
+        let plays_before = before.matches("PUT /api/player/play ").count();
+        let pauses_before = before.matches("PUT /api/player/pause ").count();
+        let volumes_before = before.matches("PUT /api/player/volume?").count();
+        controller.play();
+        controller.pause();
+        controller.set_volume(0.8);
+        if cancel {
+            let started = Instant::now();
+            controller.stop();
+            assert!(started.elapsed() < Duration::from_millis(500));
+        }
+        if !timeout {
+            std::fs::write(pipe.with_extension("control-release"), "").unwrap();
+        }
+        // Failure cases have no Stop, replacement, drop or UI cleanup.
+        // Cancellation cases separately verify Stop-first silence.
+        // The timeout case never releases the request: quiescence must kill it.
+        wait_until(|| ticket.route_count() == 0);
+        wait_until(|| {
+            rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_ok()
+        });
+        wait_until(|| controller.state() == PlayerState::Stopped);
+        assert!(!daemon.config.takeover_record().exists());
+        assert!(!controller.proxy().is_custodied(&ticket));
+        assert!(!controller.proxy().has_custody_entries());
+        assert!(!client.outputs().unwrap()[0].selected);
+        assert!(client.outputs().unwrap()[1].selected);
+        assert_eq!(client.player_state().unwrap(), "stop");
+        assert_ne!(
+            listener_process(&daemon.config.api_base)
+                .unwrap()
+                .identity(),
+            original_process,
+            "failed mutation must be quiesced before releasing ownership"
+        );
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().all(|event| event.generation() == generation));
+        assert!(
+            !playback.mark_resolved_load_failed(generation),
+            "direct-source Error does not ask the UI to stop the output"
+        );
+        assert!(playback.accepts_event_generation(generation));
+        assert_eq!(
+            events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::Error { .. })),
+            !cancel,
+            "{events:?}"
+        );
+        if !cancel {
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    PlayerEvent::StateChanged {
+                        state: PlayerState::Stopped,
+                        ..
+                    }
+                )),
+                "{events:?}"
+            );
+        }
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::TrackEnded { .. }
+                    | PlayerEvent::StateChanged {
+                        state: PlayerState::Playing | PlayerState::Paused,
+                        ..
+                    }
+            )),
+            "{events:?}"
+        );
+        let after = daemon.recorded();
+        assert_eq!(after.matches("PUT /api/player/play ").count(), plays_before);
+        assert_eq!(
+            after.matches("PUT /api/player/pause ").count(),
+            pauses_before
+        );
+        assert_eq!(
+            after.matches("PUT /api/player/volume?").count(),
+            volumes_before
+        );
+        let plays = daemon.recorded().matches("PUT /api/player/play ").count();
+        controller.play();
+        controller.pause();
+        controller.play();
+        assert_eq!(controller.state(), PlayerState::Stopped);
+        assert_eq!(
+            daemon.recorded().matches("PUT /api/player/play ").count(),
+            plays
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "terminal controls cannot publish events"
+        );
+        drop(competing);
+        for suffix in ["fail-control", "park-control"] {
+            let _ = std::fs::remove_file(pipe.with_extension(suffix));
+        }
+        let prepared = prepare(&controller);
+        let next_ticket = prepared.ticket().unwrap();
+        controller.set_generation(generation.next());
+        controller.load(generation.next(), prepared);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        assert_eq!(next_ticket.route_count(), 1);
+        controller.pause();
+        wait_until(|| controller.state() == PlayerState::Paused);
+        controller.play();
+        wait_until(|| controller.state() == PlayerState::Playing);
+        controller.stop();
+        wait_until(|| next_ticket.route_count() == 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_pause_http_failure_settles() {
+        exercise_live_control_failure(false, false, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_pause_timeout_settles() {
+        exercise_live_control_failure(false, true, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_pause_stop_before_failure_settles() {
+        exercise_live_control_failure(false, false, true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_pause_stop_before_timeout_settles() {
+        exercise_live_control_failure(false, true, true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_volume_http_failure_settles() {
+        exercise_live_control_failure(true, false, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_volume_timeout_settles() {
+        exercise_live_control_failure(true, true, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_volume_stop_before_failure_settles() {
+        exercise_live_control_failure(true, false, true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_volume_stop_before_timeout_settles() {
+        exercise_live_control_failure(true, true, true);
     }
 
     #[cfg(target_os = "linux")]
