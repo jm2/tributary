@@ -1170,9 +1170,9 @@ enum CancelOrError {
 
 /// Open the pipe write end, waiting (bounded) for the daemon's reader.
 ///
-/// The write end is opened non-blocking first — `ENXIO` means the daemon has
-/// not opened the read end yet — then switched to blocking mode so a full pipe
-/// produces natural backpressure in the streaming thread instead of an error.
+/// Keep the write end nonblocking: `ENXIO` means no reader yet. `fdsink`
+/// handles partial writes and EAGAIN with cancellable polling. A blocking
+/// write could strand pipeline shutdown if the daemon stops draining (AD1).
 /// The wait is raced against `cancel`, so a Stop or replacement aborts it
 /// rather than leaving the open blocked on a daemon that never opens the pipe
 /// (review F2).
@@ -1190,16 +1190,7 @@ fn open_pipe_write(
             OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
         ) {
-            Ok(fd) => {
-                let mut flags = rustix::fs::fcntl_getfl(&fd).map_err(|_| {
-                    CancelOrError::Failed(unavailable("the pipe write end could not be configured"))
-                })?;
-                flags.remove(OFlags::NONBLOCK);
-                rustix::fs::fcntl_setfl(&fd, flags).map_err(|_| {
-                    CancelOrError::Failed(unavailable("the pipe write end could not be configured"))
-                })?;
-                return Ok(fd);
-            }
+            Ok(fd) => return Ok(fd),
             Err(rustix::io::Errno::NXIO) => {
                 if Instant::now() >= deadline {
                     return Err(CancelOrError::Failed(unavailable(
@@ -5243,6 +5234,133 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    fn exercise_oversized_fifo_write(cancel_write: bool) {
+        use std::io::Read;
+
+        gst::init().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audio.pcm");
+        ensure_pipe(&path).unwrap();
+        let reader = rustix::fs::open(
+            &path,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let measuring_writer = rustix::fs::open(
+            &path,
+            OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let chunk = [0_u8; 4096];
+        let mut capacity = 0;
+        loop {
+            match rustix::io::write(&measuring_writer, &chunk) {
+                Ok(n) => capacity += n,
+                Err(rustix::io::Errno::AGAIN) => break,
+                other => panic!("measure FIFO capacity: {other:?}"),
+            }
+        }
+        assert!(capacity > 0);
+        let mut seed = vec![0; capacity];
+        let mut reader = std::fs::File::from(reader);
+        reader.read_exact(&mut seed).unwrap();
+        drop(measuring_writer);
+        // A single buffer exceeds the *measured* empty pipe capacity. Waiting
+        // for a full pipe proves the write has begun, before cancelling or
+        // allowing consumption. The reader stays open throughout teardown.
+        let pcm: Vec<u8> = (0..capacity * 4).map(|i| (i % 251) as u8).collect();
+        let media = directory.path().join("pcm.raw");
+        std::fs::write(&media, &pcm).unwrap();
+        let writer = open_pipe_write(&path, Instant::now() + OPEN_DEADLINE, &OpenCancel::new())
+            .unwrap_or_else(|_| panic!("open writer"));
+        let pipeline = gst::parse::launch(&format!(
+            "filesrc location=\"{}\" blocksize={} ! fdsink fd={} sync=false",
+            media.display(),
+            pcm.len(),
+            writer.as_raw_fd(),
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rustix::io::ioctl_fionread(&reader).unwrap() < capacity as u64 {
+            assert!(
+                Instant::now() < deadline,
+                "oversized write never filled FIFO"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let bus = pipeline.bus().unwrap();
+        assert!(
+            bus.timed_pop_filtered(
+                gst::ClockTime::from_mseconds(100),
+                &[gst::MessageType::Error, gst::MessageType::Eos]
+            )
+            .is_none(),
+            "backpressure must neither fail nor prematurely complete the buffer"
+        );
+        if !cancel_write {
+            let mut received = vec![0; pcm.len()];
+            let mut offset = 0;
+            while offset < received.len() {
+                match reader.read(&mut received[offset..]) {
+                    Ok(n) => offset += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    other => panic!("read PCM: {other:?}"),
+                }
+                assert!(Instant::now() < deadline, "partial write did not resume");
+            }
+            assert_eq!(
+                received, pcm,
+                "partial writes must preserve every byte in order"
+            );
+            let terminal = bus
+                .timed_pop_filtered(
+                    gst::ClockTime::from_seconds(2),
+                    &[gst::MessageType::Error, gst::MessageType::Eos],
+                )
+                .expect("EOS");
+            assert_eq!(terminal.type_(), gst::MessageType::Eos);
+        }
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Keep descriptor custody until the streaming task has joined.
+            let stopped = pipeline.set_state(gst::State::Null);
+            stopped_tx.send((stopped, writer)).ok();
+        });
+        let (stopped, writer) = stopped_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("pipeline Null hung in an oversized FIFO write");
+        stopped.unwrap();
+        assert!(rustix::fs::fcntl_getfl(&writer)
+            .unwrap()
+            .contains(OFlags::NONBLOCK));
+        if cancel_write {
+            assert_eq!(
+                rustix::io::ioctl_fionread(&reader).unwrap(),
+                capacity as u64
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_fifo_write_is_interruptible_after_partial_progress() {
+        exercise_oversized_fifo_write(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_fifo_write_resumes_without_losing_pcm() {
+        exercise_oversized_fifo_write(false);
+    }
+
     /// X2/W2: a **failed start** leaves the production pump inert. The play RPC
     /// is refused, the pump's activation gate stays closed, and the real decode
     /// pipeline is never started: the FIFO reader observes EOF with zero bytes
@@ -5897,6 +6015,12 @@ fn main() {
     let mut fifo = std::fs::OpenOptions::new().read(true)
         .custom_flags(0x800).open(pipe()).expect("FIFO reader");
     std::thread::spawn(move || loop {
+        // Keep the reader open but stop consuming after the first PCM. This
+        // models failed autostart and an already-playing receiver that stalls.
+        if pipe().with_extension("stall").exists() && STATE.lock().unwrap().bytes > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
         let mut buffer = [0; 4096];
         if let Ok(n) = fifo.read(&mut buffer) {
             if n > 0 {
@@ -6162,6 +6286,9 @@ fn serve(stream: std::net::TcpStream) {
         StopDuringAutostart,
         FailAutostart,
         NaturalEos,
+        StalledTimeout,
+        StalledStartupStop,
+        StalledPlayingStop,
     }
 
     #[cfg(target_os = "linux")]
@@ -6172,8 +6299,20 @@ fn serve(stream: std::net::TcpStream) {
         use std::sync::atomic::{AtomicU64, AtomicU8};
 
         let stop_first = matches!(case, StartupCase::StopBeforePcm);
-        let stop_during = matches!(case, StartupCase::StopDuringAutostart);
-        let fail_play = matches!(case, StartupCase::FailAutostart) || stop_during;
+        let stop_during = matches!(
+            case,
+            StartupCase::StopDuringAutostart | StartupCase::StalledStartupStop
+        );
+        let stalled = matches!(
+            case,
+            StartupCase::StalledTimeout
+                | StartupCase::StalledStartupStop
+                | StartupCase::StalledPlayingStop
+        );
+        let fail_play = matches!(
+            case,
+            StartupCase::FailAutostart | StartupCase::StalledTimeout
+        ) || stop_during;
         let natural_eos = matches!(case, StartupCase::NaturalEos);
         gst::init().expect("GStreamer");
         let daemon = RecordingOwnedDaemon::start();
@@ -6270,8 +6409,31 @@ fn serve(stream: std::net::TcpStream) {
         if fail_play {
             std::fs::write(daemon.config.pipe_path.with_extension("fail-play"), "fail").unwrap();
         }
+        let fifo_observer = rustix::fs::open(
+            &daemon.config.pipe_path,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        if stalled {
+            std::fs::write(daemon.config.pipe_path.with_extension("stall"), "stall").unwrap();
+        }
         release_tx.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
+        if stalled {
+            // The fixture has consumed only its first chunk and retains the
+            // reader. Observe queued PCM, then give the decoder time to fill
+            // the pipe. The independent oversized-buffer test proves the
+            // partial-write/cancellation behavior without relying on timing.
+            while rustix::io::ioctl_fionread(&fifo_observer).unwrap() == 0
+                || !daemon.recorded().contains("PCM received")
+            {
+                assert!(Instant::now() < deadline, "FIFO never received PCM");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(client.get_json("/api/player").unwrap()["pcm_bytes"], 4096);
+        }
         if stop_during {
             while !daemon.recorded().contains("PCM received") {
                 assert!(
@@ -6318,7 +6480,14 @@ fn serve(stream: std::net::TcpStream) {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
-        worker.stop_and_join();
+        let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            worker.stop_and_join();
+            joined_tx.send(worker).ok();
+        });
+        let worker = joined_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Stop must join even when the FIFO reader does not drain");
         while ticket.route_count() != 0 {
             assert!(
                 Instant::now() < deadline,
@@ -6340,6 +6509,7 @@ fn serve(stream: std::net::TcpStream) {
         assert!(recorded.matches("/api/outputs/set").count() >= 2);
         assert_eq!(recorded.contains("PCM received"), !stop_first);
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().all(|event| event.generation() == generation));
         let playing = |event: &PlayerEvent| {
             matches!(
                 event,
@@ -6427,6 +6597,24 @@ fn serve(stream: std::net::TcpStream) {
     #[test]
     fn empty_queue_start_stop_during_autostart_settles_pcm_without_playing() {
         exercise_empty_queue_start(StartupCase::StopDuringAutostart);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stalled_fifo_startup_timeout_restores_without_hanging() {
+        exercise_empty_queue_start(StartupCase::StalledTimeout);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stalled_fifo_stop_during_startup_restores_without_hanging() {
+        exercise_empty_queue_start(StartupCase::StalledStartupStop);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stalled_fifo_stop_after_playing_restores_without_hanging() {
+        exercise_empty_queue_start(StartupCase::StalledPlayingStop);
     }
 
     /// Y2: the initial volume is applied **before any activation** through the
