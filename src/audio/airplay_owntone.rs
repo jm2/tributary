@@ -1711,10 +1711,18 @@ impl SessionInner {
             ) {
                 Ok(()) => true,
                 Err(error) => {
-                    let _ = self.event_tx.try_send(PlayerEvent::error(
-                        self.generation,
-                        error.message().to_string(),
-                    ));
+                    // Refusal/cancellation is a silent false result to the
+                    // worker; a live failure remains visible. Serialize the
+                    // decision AND send with Stop, in settlement -> gate order.
+                    let _boundary = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+                    self.gate.publish_if_live(|| {
+                        if !self.cancel.is_cancelled() && !self.terminal.load(Ordering::SeqCst) {
+                            let _ = self.event_tx.try_send(PlayerEvent::error(
+                                self.generation,
+                                error.message().to_string(),
+                            ));
+                        }
+                    });
                     false
                 }
             }
@@ -6139,6 +6147,21 @@ fn serve(stream: std::net::TcpStream) {
         let _ = stream.write_all(response.as_bytes());
         return;
     }
+    // Park actual startup observation/resume requests without blocking FIFO
+    // consumption or other daemon requests. Release only after controller Stop.
+    let activation = pipe.with_extension("park-activation");
+    let park_start = method == "GET" && path == "/api/player"
+        && STATE.lock().unwrap().bytes > 0;
+    let park_resume = method == "PUT" && path == "/api/player/play";
+    let activation_mode = std::fs::read_to_string(&activation).unwrap_or_default();
+    if ((activation_mode == "start" && park_start) || (activation_mode == "resume" && park_resume))
+        && !pipe.with_extension("activation-replied").exists() {
+        std::fs::write(pipe.with_extension("activation-seen"), "").unwrap();
+        while !pipe.with_extension("activation-release").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::fs::write(pipe.with_extension("activation-replied"), "").unwrap();
+    }
     let mut state = STATE.lock().unwrap();
     let dynamic = format!(r#"{{"state":"{}","pcm_bytes":{}}}"#, if state.playing { "play" } else if state.paused { "pause" } else { "stop" }, state.bytes);
     let outputs = format!(r#"{{"outputs":[{{"id":"11189196","name":"Test","selected":{}}},{{"id":"42","name":"Prior","selected":{}}}]}}"#, state.selected, !state.selected);
@@ -6579,6 +6602,17 @@ fn serve(stream: std::net::TcpStream) {
         assert_eq!(recorded.contains("PCM received"), !stop_first);
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(events.iter().all(|event| event.generation() == generation));
+        let has_error = events
+            .iter()
+            .any(|event| matches!(event, PlayerEvent::Error { .. }));
+        if stop_first || stop_during {
+            assert!(
+                !has_error,
+                "cancelled activation published Error: {events:?}"
+            );
+        } else if fail_play {
+            assert!(has_error, "genuine activation failure must remain visible");
+        }
         let playing = |event: &PlayerEvent| {
             matches!(
                 event,
@@ -6814,6 +6848,192 @@ fn serve(stream: std::net::TcpStream) {
         assert!(events.iter().all(|event| event.generation() == generation
             || (replace && event.generation() == PlayerEventGeneration::from_raw(82))));
         assert!(events.iter().any(|event| matches!(event, PlayerEvent::StateChanged { generation: g, state: PlayerState::Playing } if *g == generation)));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exercise_cancelled_activation(resume: bool, replace: bool, fail: bool) {
+        use crate::audio::airplay_output::ControllerHarness;
+        use crate::local::resolver::ResolvedLocalMedia;
+
+        gst::init().unwrap();
+        let daemon = RecordingOwnedDaemon::start();
+        let next_daemon = replace.then(RecordingOwnedDaemon::start);
+        let client = OwnToneClient::new(&daemon.config.api_base).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        let mut controller = ControllerHarness::new(
+            runtime.handle().clone(),
+            Arc::new(OwnToneSender {
+                config: Some(daemon.config.clone()),
+            }),
+            tx,
+        )
+        .with_device_id("aabbcc");
+        let root = tempfile::tempdir().unwrap();
+        let marker = format!("marker:v1:{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            root.path().join(".tributary-root-id"),
+            format!("{marker}\n"),
+        )
+        .unwrap();
+        let prepare = |name: &str, seconds| {
+            let path = root.path().join(name);
+            write_startup_wav(&path, seconds);
+            let media =
+                ResolvedLocalMedia::from_authorized_path_for_test(root.path(), &marker, &path)
+                    .unwrap();
+            controller.proxy().prepare_local(media).unwrap()
+        };
+        let prepared = prepare("activation.wav", 30);
+        let ticket = prepared.ticket().unwrap();
+        let generation = PlayerEventGeneration::from_raw(81);
+        controller.set_generation(generation);
+        if !resume {
+            std::fs::write(
+                daemon.config.pipe_path.with_extension("park-activation"),
+                "start",
+            )
+            .unwrap();
+        }
+        controller.load(generation, prepared);
+        if resume {
+            wait_until(|| controller.state() == PlayerState::Playing);
+            controller.pause();
+            wait_until(|| controller.state() == PlayerState::Paused);
+            std::fs::write(
+                daemon.config.pipe_path.with_extension("park-activation"),
+                "resume",
+            )
+            .unwrap();
+            if fail {
+                std::fs::write(daemon.config.pipe_path.with_extension("fail-play"), "").unwrap();
+            }
+            controller.play();
+        }
+        wait_until(|| {
+            daemon
+                .config
+                .pipe_path
+                .with_extension("activation-seen")
+                .exists()
+        });
+        assert_eq!(
+            ticket.route_count(),
+            1,
+            "in-flight activation retains media"
+        );
+        let competing = open_lock(&daemon.config.lock_path()).unwrap();
+        assert!(rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err());
+        assert!(client.outputs().unwrap()[0].selected);
+        let before_stop: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(!before_stop.iter().any(|event| matches!(
+            event,
+            PlayerEvent::Error { .. } | PlayerEvent::TrackEnded { .. }
+        )));
+        let started = Instant::now();
+        let next_ticket = if let Some(next) = next_daemon.as_ref() {
+            let prepared = prepare("replacement.wav", 30);
+            let next_ticket = prepared.ticket().unwrap();
+            controller.set_sender(Arc::new(OwnToneSender {
+                config: Some(next.config.clone()),
+            }));
+            let next_generation = PlayerEventGeneration::from_raw(82);
+            controller.set_generation(next_generation);
+            controller.load(next_generation, prepared);
+            Some(next_ticket)
+        } else {
+            controller.stop();
+            None
+        };
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "controller blocked on activation"
+        );
+        assert_eq!(
+            ticket.route_count(),
+            1,
+            "cancellation must not release unsettled media"
+        );
+        assert!(rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err());
+        std::fs::write(
+            daemon.config.pipe_path.with_extension("activation-release"),
+            "",
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ticket.route_count() != 0
+            || rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "cancelled activation did not settle promptly"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!daemon.config.takeover_record().exists());
+        assert!(!client.outputs().unwrap()[0].selected);
+        assert_eq!(client.player_state().unwrap(), "stop");
+        assert!(!controller.proxy().is_custodied(&ticket));
+        let recorded = daemon.recorded();
+        assert!(recorded.contains("PCM received"));
+        assert!(recorded.contains("/api/player/stop"));
+        assert!(recorded.matches("/api/outputs/set").count() >= 2);
+        if let Some(next_ticket) = next_ticket {
+            wait_until(|| controller.state() == PlayerState::Playing);
+            assert_eq!(next_ticket.route_count(), 1);
+            controller.pause();
+            wait_until(|| controller.state() == PlayerState::Paused);
+            controller.play();
+            wait_until(|| controller.state() == PlayerState::Playing);
+            controller.stop();
+            wait_until(|| next_ticket.route_count() == 0);
+        }
+        assert_eq!(controller.state(), PlayerState::Stopped);
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::TrackEnded { .. } | PlayerEvent::Error { .. }
+            )),
+            "cancelled activation published an outcome: {events:?}"
+        );
+        assert!(events.iter().all(|event| event.generation() == generation
+            || (replace && event.generation() == PlayerEventGeneration::from_raw(82))));
+        assert!(!events.iter().any(|event| matches!(event, PlayerEvent::StateChanged { generation: g, state: PlayerState::Playing } if *g == generation)), "late Playing after cancellation: {events:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelled_activation_autostart_stop_is_silent() {
+        exercise_cancelled_activation(false, false, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelled_activation_autostart_replacement_is_silent() {
+        exercise_cancelled_activation(false, true, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelled_activation_resume_stop_is_silent() {
+        exercise_cancelled_activation(true, false, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelled_activation_resume_replacement_is_silent() {
+        exercise_cancelled_activation(true, true, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelled_activation_resume_failure_stop_is_silent() {
+        exercise_cancelled_activation(true, false, true);
     }
 
     #[cfg(target_os = "linux")]
