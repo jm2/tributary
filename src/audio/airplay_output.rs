@@ -1050,6 +1050,12 @@ impl ControllerHarness {
         Self { output }
     }
 
+    /// Retain the discovered receiver identity for the real OwnTone open path.
+    pub(super) fn with_device_id(mut self, device_id: &str) -> Self {
+        self.output = self.output.with_device_id(Some(device_id.to_string()));
+        self
+    }
+
     /// Mint a protected route through the output's own media proxy.
     pub(super) fn prepare(&self, request: ResolvedHttpRequest) -> PreparedGstreamerMedia {
         self.output

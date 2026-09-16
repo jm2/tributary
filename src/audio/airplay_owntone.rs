@@ -2009,54 +2009,67 @@ fn daemon_completion_reached(state: &str) -> bool {
 /// completed (review F4).
 fn natural_completion(inner: &SessionInner, pipeline: &gst::Pipeline) {
     pipeline.set_state(gst::State::Null).ok();
+    let cancelled = || {
+        inner.cancel.is_cancelled()
+            || inner.gate.is_stopped()
+            || !inner.running.load(Ordering::SeqCst)
+    };
+    // The real finite-EOS path arms the fake daemon's next observation only
+    // after decoder shutdown; this does not alter production ordering.
+    #[cfg(test)]
+    if inner.config.pipe_path.with_extension("park-drain").exists() {
+        std::fs::write(inner.config.pipe_path.with_extension("drain-started"), "").unwrap();
+    }
     let deadline = Instant::now() + DRAIN_DEADLINE;
-    loop {
-        match inner.client.player_state() {
-            Ok(state) if daemon_completion_reached(&state) => break,
-            Ok(_) => {}
-            Err(_) => {
-                let _ = inner.event_tx.try_send(PlayerEvent::error(
-                    inner.generation,
-                    "AirPlay completion could not be confirmed".to_string(),
-                ));
-                // Latch terminal and publish `Stopped` together, so no control
-                // can successfully publish after this terminal state (review
-                // Y1).
-                inner.publish_terminal();
-                let _ = inner.restore();
-                return;
-            }
-        }
-        if Instant::now() >= deadline {
-            let _ = inner.event_tx.try_send(PlayerEvent::error(
-                inner.generation,
-                "AirPlay completion timed out".to_string(),
-            ));
-            // Latched with the publication: no control may follow it (review
-            // Y1).
-            inner.publish_terminal();
-            let _ = inner.restore();
+    let failure = loop {
+        if cancelled() {
+            // close() owns restoration/recovery after joining this pump. Keep
+            // its route and instance lock until that settlement completes.
             return;
         }
+        let observation = inner.client.player_state();
+        // A bounded HTTP observation may have been in flight when Stop won.
+        // Its success, error or timeout is no longer a playback outcome.
+        if cancelled() {
+            return;
+        }
+        match observation {
+            Ok(state) if daemon_completion_reached(&state) => break None,
+            Ok(_) => {}
+            Err(_) => break Some("AirPlay completion could not be confirmed"),
+        }
+        if Instant::now() >= deadline {
+            break Some("AirPlay completion timed out");
+        }
         std::thread::sleep(Duration::from_millis(100));
-    }
-    // Do not publish completion after a failed restore: the daemon may still be
-    // half-taken-over, and a clean `TrackEnded` would misreport it (review R3).
-    if inner.restore().is_err() {
-        let _ = inner.event_tx.try_send(PlayerEvent::error(
-            inner.generation,
-            "AirPlay restoration failed".to_string(),
-        ));
-        inner.publish_terminal();
-        return;
-    }
-    // `restore` already latched terminal under the boundary; publish the
-    // terminal `Stopped` through the same latch so the ordering holds even if
-    // a later restore path re-enters (review Y1).
-    inner.publish_terminal();
-    let _ = inner
-        .event_tx
-        .try_send(PlayerEvent::ended(inner.generation));
+    };
+    // Restoration may block, so it must remain outside the Stop gate. Failed
+    // restoration retains custody for close()'s serialized recovery.
+    let restored = inner.restore();
+    let failure = failure.or_else(|| restored.err().map(|_| "AirPlay restoration failed"));
+    // Lock order matches control publication: settlement boundary then gate.
+    // Stop either wins first and suppresses every completion/error event, or
+    // follows this entire bounded publication. No check-to-send race (AE1).
+    let _boundary = inner
+        .mutation_lock
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    inner.gate.publish_if_live(|| {
+        if inner.cancel.is_cancelled() {
+            return;
+        }
+        if let Some(message) = failure {
+            let _ = inner
+                .event_tx
+                .try_send(PlayerEvent::error(inner.generation, message.to_string()));
+        }
+        inner.publish_state(PlayerState::Stopped);
+        if failure.is_none() {
+            let _ = inner
+                .event_tx
+                .try_send(PlayerEvent::ended(inner.generation));
+        }
+    });
 }
 
 impl SenderSession for OwnToneSession {
@@ -5130,6 +5143,37 @@ mod tests {
         );
     }
 
+    /// AE1: even a confirmed EOS must not publish if Stop wins while the
+    /// restoring RPC is in flight, after the last drain cancellation check.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn natural_completion_stop_during_restore_suppresses_publication() {
+        gst::init().unwrap();
+        let server = FakeOwnToneServer::start_parking_stop();
+        let directory = tempfile::tempdir().unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        let inner = Arc::new(test_session_inner_at_base(
+            &server.api_base,
+            directory.path(),
+            tx,
+        ));
+        let completing = Arc::clone(&inner);
+        let handle =
+            std::thread::spawn(move || natural_completion(&completing, &gst::Pipeline::new()));
+        server.park.wait_seen();
+        let started = Instant::now();
+        inner.gate.stop();
+        inner.cancel.cancel();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        server.park.release();
+        handle.join().unwrap();
+        assert!(inner.restored.load(Ordering::SeqCst));
+        assert!(
+            rx.try_recv().is_err(),
+            "Stop must suppress all late terminal publications"
+        );
+    }
+
     /// W2: a transport loss while waiting for completion is a terminal failure
     /// that restores and publishes no `TrackEnded` — completion is never
     /// inferred from a failed observation.
@@ -6080,8 +6124,22 @@ fn serve(stream: std::net::TcpStream) {
     let method = trimmed.split_whitespace().next().unwrap_or_default();
     let volume = path.strip_prefix("/api/player/volume?volume=")
         .and_then(|v| v.parse::<u8>().ok()).filter(|v| *v <= 100);
-    let mut state = STATE.lock().unwrap();
     let pipe = pipe();
+    if method == "GET" && path == "/api/player" && pipe.with_extension("drain-started").exists()
+        && !pipe.with_extension("drain-replied").exists() {
+        std::fs::write(pipe.with_extension("drain-seen"), "").unwrap();
+        while !pipe.with_extension("drain-release").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let answer = std::fs::read_to_string(pipe.with_extension("drain-release")).unwrap();
+        std::fs::write(pipe.with_extension("drain-replied"), "").unwrap();
+        let body = format!(r#"{{"state":"{}"}}"#, answer);
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+        let mut stream = stream;
+        let _ = stream.write_all(response.as_bytes());
+        return;
+    }
+    let mut state = STATE.lock().unwrap();
     let dynamic = format!(r#"{{"state":"{}","pcm_bytes":{}}}"#, if state.playing { "play" } else if state.paused { "pause" } else { "stop" }, state.bytes);
     let outputs = format!(r#"{{"outputs":[{{"id":"11189196","name":"Test","selected":{}}},{{"id":"42","name":"Prior","selected":{}}}]}}"#, state.selected, !state.selected);
     let (status, body) = match (method, path) {
@@ -6626,6 +6684,160 @@ fn serve(stream: std::net::TcpStream) {
     #[test]
     fn stalled_fifo_stop_after_playing_restores_without_hanging() {
         exercise_empty_queue_start(StartupCase::StalledPlayingStop);
+    }
+
+    /// AE1: real finite PCM enters the pump's EOS drain and parks its HTTP
+    /// observation. Drive Stop/replacement through the production controller
+    /// before releasing either completion or still-playing observations.
+    #[cfg(target_os = "linux")]
+    fn exercise_cancelled_eos_drain(replace: bool, response: &str) {
+        use crate::audio::airplay_output::ControllerHarness;
+        use crate::local::resolver::ResolvedLocalMedia;
+
+        gst::init().unwrap();
+        let daemon = RecordingOwnedDaemon::start();
+        let next_daemon = replace.then(RecordingOwnedDaemon::start);
+        let client = OwnToneClient::new(&daemon.config.api_base).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        let mut controller = ControllerHarness::new(
+            runtime.handle().clone(),
+            Arc::new(OwnToneSender {
+                config: Some(daemon.config.clone()),
+            }),
+            tx,
+        )
+        .with_device_id("aabbcc");
+        let root = tempfile::tempdir().unwrap();
+        let marker = format!("marker:v1:{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            root.path().join(".tributary-root-id"),
+            format!("{marker}\n"),
+        )
+        .unwrap();
+        let prepare = |name: &str, seconds| {
+            let path = root.path().join(name);
+            write_startup_wav(&path, seconds);
+            let media =
+                ResolvedLocalMedia::from_authorized_path_for_test(root.path(), &marker, &path)
+                    .unwrap();
+            controller.proxy().prepare_local(media).unwrap()
+        };
+        let prepared = prepare("finite.wav", 1);
+        let ticket = prepared.ticket().unwrap();
+        let generation = PlayerEventGeneration::from_raw(81);
+        controller.set_generation(generation);
+        std::fs::write(daemon.config.pipe_path.with_extension("park-drain"), "").unwrap();
+        controller.load(generation, prepared);
+        wait_until(|| {
+            daemon
+                .config
+                .pipe_path
+                .with_extension("drain-seen")
+                .exists()
+        });
+        assert_eq!(ticket.route_count(), 1, "in-flight drain retains media");
+        let competing = open_lock(&daemon.config.lock_path()).unwrap();
+        assert!(rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err());
+        assert!(client.outputs().unwrap()[0].selected);
+        let started = Instant::now();
+        let next_ticket = if let Some(next) = next_daemon.as_ref() {
+            let prepared = prepare("replacement.wav", 30);
+            let next_ticket = prepared.ticket().unwrap();
+            controller.set_sender(Arc::new(OwnToneSender {
+                config: Some(next.config.clone()),
+            }));
+            let next_generation = PlayerEventGeneration::from_raw(82);
+            controller.set_generation(next_generation);
+            controller.load(next_generation, prepared);
+            Some(next_ticket)
+        } else {
+            controller.stop();
+            None
+        };
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "controller blocked on drain"
+        );
+        assert_eq!(
+            ticket.route_count(),
+            1,
+            "cancellation must not release unsettled media"
+        );
+        assert!(rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err());
+        std::fs::write(
+            daemon.config.pipe_path.with_extension("drain-release"),
+            response,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ticket.route_count() != 0
+            || rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "cancelled drain did not settle promptly"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!daemon.config.takeover_record().exists());
+        assert!(!client.outputs().unwrap()[0].selected);
+        assert_eq!(client.player_state().unwrap(), "stop");
+        assert!(!controller.proxy().is_custodied(&ticket));
+        let recorded = daemon.recorded();
+        assert!(recorded.contains("PCM received"));
+        assert!(recorded.contains("/api/player/stop"));
+        assert!(recorded.matches("/api/outputs/set").count() >= 2);
+        if let Some(next_ticket) = next_ticket {
+            wait_until(|| controller.state() == PlayerState::Playing);
+            assert_eq!(next_ticket.route_count(), 1);
+            controller.pause();
+            wait_until(|| controller.state() == PlayerState::Paused);
+            controller.play();
+            wait_until(|| controller.state() == PlayerState::Playing);
+            controller.stop();
+            wait_until(|| next_ticket.route_count() == 0);
+        }
+        assert_eq!(controller.state(), PlayerState::Stopped);
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::TrackEnded { .. } | PlayerEvent::Error { .. }
+            )),
+            "cancelled EOS published an outcome: {events:?}"
+        );
+        assert!(events.iter().all(|event| event.generation() == generation
+            || (replace && event.generation() == PlayerEventGeneration::from_raw(82))));
+        assert!(events.iter().any(|event| matches!(event, PlayerEvent::StateChanged { generation: g, state: PlayerState::Playing } if *g == generation)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn eos_drain_stop_suppresses_completed_observation() {
+        exercise_cancelled_eos_drain(false, "stop");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn eos_drain_stop_suppresses_playing_observation() {
+        exercise_cancelled_eos_drain(false, "play");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn eos_drain_replacement_suppresses_completed_observation() {
+        exercise_cancelled_eos_drain(true, "stop");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn eos_drain_replacement_suppresses_playing_observation() {
+        exercise_cancelled_eos_drain(true, "play");
     }
 
     /// Y2: the initial volume is applied **before any activation** through the
