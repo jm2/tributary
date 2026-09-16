@@ -986,6 +986,9 @@ impl OwnToneClient {
     fn new(base: &str) -> Result<Self, SenderError> {
         let http = reqwest::blocking::Client::builder()
             .timeout(API_TIMEOUT)
+            // Ownership is verified for this literal loopback endpoint only.
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| unavailable("the local HTTP client could not be created"))?;
         Ok(Self {
@@ -994,15 +997,23 @@ impl OwnToneClient {
         })
     }
 
+    fn require_success(response: &reqwest::blocking::Response) -> Result<(), SenderError> {
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            // error_for_status accepts redirects; those cannot confirm an
+            // observation or mutation, especially a recovery restoration.
+            Err(unavailable("the dedicated daemon rejected the request"))
+        }
+    }
+
     fn get_json(&self, path: &str) -> Result<serde_json::Value, SenderError> {
         let response = self
             .http
             .get(format!("{}{}", self.base, path))
             .send()
             .map_err(|_| unavailable("the dedicated daemon is unreachable"))?;
-        let response = response
-            .error_for_status()
-            .map_err(|_| unavailable("the dedicated daemon rejected the request"))?;
+        Self::require_success(&response)?;
         response
             .json()
             .map_err(|_| unavailable("the dedicated daemon sent a malformed response"))
@@ -1014,9 +1025,7 @@ impl OwnToneClient {
             .put(format!("{}{}", self.base, path))
             .send()
             .map_err(|_| unavailable("the dedicated daemon is unreachable"))?;
-        response
-            .error_for_status()
-            .map_err(|_| unavailable("the dedicated daemon rejected the request"))?;
+        Self::require_success(&response)?;
         Ok(())
     }
 
@@ -1027,9 +1036,7 @@ impl OwnToneClient {
             .json(body)
             .send()
             .map_err(|_| unavailable("the dedicated daemon is unreachable"))?;
-        response
-            .error_for_status()
-            .map_err(|_| unavailable("the dedicated daemon rejected the request"))?;
+        Self::require_success(&response)?;
         Ok(())
     }
 
@@ -6226,6 +6233,22 @@ fn serve(stream: std::net::TcpStream) {
     let volume = path.strip_prefix("/api/player/volume?volume=")
         .and_then(|v| v.parse::<u8>().ok()).filter(|v| *v <= 100);
     let pipe = pipe();
+    // An on-disk response override survives owned-process recovery restarts.
+    // Never apply the mutation when returning this non-success response.
+    if let Ok(override_response) = std::fs::read_to_string(pipe.with_extension("http-response")) {
+        let mut lines = override_response.lines();
+        let target = lines.next().unwrap_or_default();
+        let status = lines.next().unwrap_or("307 Temporary Redirect");
+        let location = lines.next().unwrap_or_default();
+        if target == path || (target == "mutations" && method == "PUT") {
+            let location = if location.is_empty() { String::new() }
+                else { format!("Location: {location}\r\n") };
+            let response = format!("HTTP/1.1 {status}\r\n{location}Content-Length: 2\r\nConnection: close\r\n\r\n{{}}");
+            let mut stream = stream;
+            let _ = stream.write_all(response.as_bytes());
+            return;
+        }
+    }
     if method == "GET" && path == "/api/player" && pipe.with_extension("drain-started").exists()
         && !pipe.with_extension("drain-replied").exists() {
         std::fs::write(pipe.with_extension("drain-seen"), "").unwrap();
@@ -6444,6 +6467,226 @@ fn serve(stream: std::net::TcpStream) {
         fn recorded(&self) -> String {
             std::fs::read_to_string(&self.requests).unwrap_or_default()
         }
+    }
+
+    /// Run proxy configuration and the recovery capture in a private process;
+    /// neither environment nor capture state is changed in the test runner.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn control_transport_stays_on_verified_daemon() {
+        const CHILD: &str = "TRIBUTARY_CONTROL_TRANSPORT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let foreign = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            foreign.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}", foreign.local_addr().unwrap());
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "audio::airplay_owntone::tests::control_transport_stays_on_verified_daemon",
+                    "--nocapture",
+                ])
+                .env(CHILD, &endpoint)
+                .env("HTTP_PROXY", &endpoint)
+                .env("http_proxy", &endpoint)
+                .env("ALL_PROXY", &endpoint)
+                .env("all_proxy", &endpoint)
+                .env("NO_PROXY", "")
+                .env("no_proxy", "")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated transport regressions failed");
+            assert!(
+                matches!(foreign.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "the foreign redirect target / configured proxy received a connection"
+            );
+            return;
+        }
+        let foreign = std::env::var(CHILD).unwrap();
+        // Existing full controller assertions also prove valid 200 observations
+        // and 204 mutations work with an explicitly configured foreign proxy.
+        exercise_takeover_observation(r#"{"state":"stop"}"#, false, true);
+        for status in [
+            "302 Found",
+            "307 Temporary Redirect",
+            "308 Permanent Redirect",
+        ] {
+            for location in ["", foreign.as_str()] {
+                for path in ["/api/config", "/api/outputs/set", "/api/queue/clear"] {
+                    exercise_transport_refusal(path, status, location, false);
+                }
+                for path in ["/api/player/stop", "/api/outputs/set"] {
+                    exercise_transport_refusal(path, status, location, true);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exercise_transport_refusal(path: &str, status: &str, location: &str, live: bool) {
+        use crate::audio::airplay_output::ControllerHarness;
+        use crate::local::resolver::ResolvedLocalMedia;
+
+        gst::init().unwrap();
+        let daemon = RecordingOwnedDaemon::start();
+        let client = OwnToneClient::new(&daemon.config.api_base).unwrap();
+        let baseline = client.outputs().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        let controller = ControllerHarness::new(
+            runtime.handle().clone(),
+            Arc::new(OwnToneSender {
+                config: Some(daemon.config.clone()),
+            }),
+            tx,
+        )
+        .with_device_id("aabbcc");
+        let root = tempfile::tempdir().unwrap();
+        let marker = format!("marker:v1:{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            root.path().join(".tributary-root-id"),
+            format!("{marker}\n"),
+        )
+        .unwrap();
+        let wav = root.path().join("transport.wav");
+        write_startup_wav(&wav, 30);
+        let proxy = controller.proxy();
+        let prepare = || {
+            proxy
+                .prepare_local(
+                    ResolvedLocalMedia::from_authorized_path_for_test(root.path(), &marker, &wav)
+                        .unwrap(),
+                )
+                .unwrap()
+        };
+        let override_path = daemon.config.pipe_path.with_extension("http-response");
+        let refuse =
+            || std::fs::write(&override_path, format!("{path}\n{status}\n{location}\n")).unwrap();
+        let prepared = prepare();
+        let ticket = prepared.ticket().unwrap();
+        let generation = PlayerEventGeneration::from_raw(81);
+        controller.set_generation(generation);
+        let mutation = path != "/api/config";
+        if mutation {
+            arm_retained_recovery_capture(&daemon.config.api_base);
+        }
+        if !live {
+            refuse();
+            if !mutation {
+                assert!(
+                    client.get_json(path).is_err(),
+                    "non-2xx JSON is not an observation"
+                );
+            }
+        }
+        controller.load(generation, prepared);
+        if live {
+            wait_until(|| controller.state() == PlayerState::Playing);
+            while rx.try_recv().is_ok() {}
+            refuse();
+            controller.stop();
+        }
+        if mutation {
+            let mut recovery = None;
+            wait_until(|| {
+                recovery = recovery.take().or_else(take_captured_retained_recovery);
+                recovery.is_some()
+            });
+            let recovery = recovery.unwrap();
+            wait_until(|| proxy.is_custodied(&ticket));
+            assert_eq!(ticket.route_count(), 1);
+            assert!(flock_is_held(&daemon.config.lock_path()));
+            assert!(daemon.config.takeover_record().exists());
+            // The queue-clear refusal only affects takeover. Make restoration
+            // itself refuse too, before attempting the retained job.
+            if path == "/api/queue/clear" {
+                std::fs::write(&override_path, format!("mutations\n{status}\n{location}\n"))
+                    .unwrap();
+            }
+            assert!(
+                !recovery.attempt(),
+                "a redirect is not confirmed restoration"
+            );
+            assert!(daemon.config.takeover_record().exists());
+            assert!(proxy.is_custodied(&ticket));
+            assert_eq!(ticket.route_count(), 1);
+            assert!(flock_is_held(&daemon.config.lock_path()));
+            std::fs::remove_file(&override_path).unwrap();
+            assert!(recovery.attempt(), "valid responses must settle recovery");
+            drop(recovery);
+        } else {
+            wait_until(|| ticket.route_count() == 0);
+            assert!(!daemon
+                .recorded()
+                .lines()
+                .any(|line| line.starts_with("PUT ")));
+            std::fs::remove_file(&override_path).unwrap();
+        }
+        wait_until(|| ticket.route_count() == 0);
+        assert!(!daemon.config.takeover_record().exists());
+        assert!(!proxy.has_custody_entries());
+        assert!(flock_is_acquirable(&daemon.config.lock_path()));
+        if !live {
+            let mut events = Vec::new();
+            wait_until(|| {
+                events.extend(std::iter::from_fn(|| rx.try_recv().ok()));
+                events.iter().any(|e| {
+                    matches!(
+                        e,
+                        PlayerEvent::StateChanged {
+                            state: PlayerState::Stopped,
+                            ..
+                        }
+                    )
+                })
+            });
+            assert!(
+                events.iter().all(|e| e.generation() == generation),
+                "{events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, PlayerEvent::Error { .. }))
+                    .count(),
+                1,
+                "{events:?}"
+            );
+            assert!(
+                !events.iter().any(|e| matches!(
+                    e,
+                    PlayerEvent::TrackEnded { .. }
+                        | PlayerEvent::StateChanged {
+                            state: PlayerState::Playing,
+                            ..
+                        }
+                )),
+                "{events:?}"
+            );
+        }
+        let restored = client.outputs().unwrap();
+        assert_eq!(
+            restored
+                .iter()
+                .map(|o| (o.id, o.selected))
+                .collect::<Vec<_>>(),
+            baseline
+                .iter()
+                .map(|o| (o.id, o.selected))
+                .collect::<Vec<_>>()
+        );
+        let next = prepare();
+        let next_ticket = next.ticket().unwrap();
+        controller.set_generation(generation.next());
+        controller.load(generation.next(), next);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        assert_eq!(next_ticket.route_count(), 1);
+        controller.stop();
+        wait_until(|| next_ticket.route_count() == 0);
+        wait_until(|| !daemon.config.takeover_record().exists());
     }
 
     /// AK1: malformed observations must fail before any takeover effect.
