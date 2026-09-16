@@ -43,7 +43,13 @@ shutdown reach that cancellation path.
 The shared startup scenarios retain output restoration, initial volume 42,
 media-route release, instance-lock release, takeover-record cleanup, terminal
 worker cache, event ordering and exactly-once natural completion assertions.
-Event generations are also checked. Existing initial/live-volume 42/73,
+Event generations are also checked. A full-suite run exposed the recording
+fixture retaining buffered PCM across Stop and spuriously autostarting again.
+The fixture now serializes FIFO reads with controls and closes/reopens its reader
+on Stop, matching pinned OwnTone `stop` / `pipe_watch_reset`; normal startup tests
+no longer keep an extra observation reader alive across that reset. The stalled
+cases retain their reader through decoder shutdown, so reset cannot hide a
+blocked pipeline teardown. Existing initial/live-volume 42/73,
 recovery-custody, cancellation and natural-EOF tests remain intact.
 
 ## Validation scope

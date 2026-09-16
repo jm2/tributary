@@ -6008,23 +6008,25 @@ use std::os::unix::fs::OpenOptionsExt;
 
 struct State { queued: bool, playing: bool, paused: bool, selected: bool, bytes: usize, autostarted: bool }
 static STATE: Mutex<State> = Mutex::new(State { queued: false, playing: false, paused: false, selected: false, bytes: 0, autostarted: false });
+static FIFO: Mutex<Option<std::fs::File>> = Mutex::new(None);
 fn pipe() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::args().nth(2).unwrap()).parent().unwrap().join("airplay.pcm")
 }
 fn main() {
-    let mut fifo = std::fs::OpenOptions::new().read(true)
-        .custom_flags(0x800).open(pipe()).expect("FIFO reader");
+    *FIFO.lock().unwrap() = Some(std::fs::OpenOptions::new().read(true)
+        .custom_flags(0x800).open(pipe()).expect("FIFO reader"));
     std::thread::spawn(move || loop {
         // Keep the reader open but stop consuming after the first PCM. This
         // models failed autostart and an already-playing receiver that stalls.
-        if pipe().with_extension("stall").exists() && STATE.lock().unwrap().bytes > 0 {
+        let mut state = STATE.lock().unwrap();
+        if pipe().with_extension("stall").exists() && state.bytes > 0 {
+            drop(state);
             std::thread::sleep(std::time::Duration::from_millis(10));
             continue;
         }
         let mut buffer = [0; 4096];
-        if let Ok(n) = fifo.read(&mut buffer) {
+        if let Ok(n) = FIFO.lock().unwrap().as_mut().unwrap().read(&mut buffer) {
             if n > 0 {
-                let mut state = STATE.lock().unwrap();
                 if state.bytes == 0 {
                     let record = std::env::var("TRIBUTARY_FAKE_REQUESTS").unwrap();
                     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(record).unwrap();
@@ -6038,10 +6040,10 @@ fn main() {
                     state.autostarted = true;
                 }
             } else {
-                let mut state = STATE.lock().unwrap();
                 if state.autostarted { state.playing = false; state.autostarted = false; }
             }
         }
+        drop(state);
         std::thread::sleep(std::time::Duration::from_millis(10));
     });
     let addr = std::env::var("TRIBUTARY_FAKE_LISTEN").expect("listen address");
@@ -6096,6 +6098,13 @@ fn serve(stream: std::net::TcpStream) {
             } else { state.playing = true; state.paused = false; ("204 No Content", "") }
         }
         ("PUT", "/api/player/stop") => {
+            // Pinned input stop closes its reader and resets the pipe watcher.
+            // After producer shutdown this discards buffered old PCM instead
+            // of spuriously treating it as a new autostart on the next read.
+            let mut fifo = FIFO.lock().unwrap();
+            drop(fifo.take());
+            *fifo = Some(std::fs::OpenOptions::new().read(true)
+                .custom_flags(0x800).open(&pipe).expect("reset FIFO reader"));
             state.playing = false; state.paused = false; state.autostarted = false;
             ("204 No Content", "")
         }
@@ -6409,12 +6418,14 @@ fn serve(stream: std::net::TcpStream) {
         if fail_play {
             std::fs::write(daemon.config.pipe_path.with_extension("fail-play"), "fail").unwrap();
         }
-        let fifo_observer = rustix::fs::open(
-            &daemon.config.pipe_path,
-            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .unwrap();
+        let fifo_observer = stalled.then(|| {
+            rustix::fs::open(
+                &daemon.config.pipe_path,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap()
+        });
         if stalled {
             std::fs::write(daemon.config.pipe_path.with_extension("stall"), "stall").unwrap();
         }
@@ -6425,7 +6436,7 @@ fn serve(stream: std::net::TcpStream) {
             // reader. Observe queued PCM, then give the decoder time to fill
             // the pipe. The independent oversized-buffer test proves the
             // partial-write/cancellation behavior without relying on timing.
-            while rustix::io::ioctl_fionread(&fifo_observer).unwrap() == 0
+            while rustix::io::ioctl_fionread(fifo_observer.as_ref().unwrap()).unwrap() == 0
                 || !daemon.recorded().contains("PCM received")
             {
                 assert!(Instant::now() < deadline, "FIFO never received PCM");
