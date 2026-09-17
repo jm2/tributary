@@ -221,9 +221,10 @@ which most live rejection directories never advance any counter.
 
 **What a round counts.** `rejection_rounds(bead_id)` counts directories
 matching the glob `refinery-*-<bead-id>` under
-`.gc/operations/reviews/` — the bead id must be the **last**
-dash-separated field. A directory named with the bead id *first*
-(`refinery-<bead>-<date>`) does **not** count. Direct probe of the live
+`.gc/operations/reviews/` — the directory name must **end** with
+`-<bead-id>` (fnmatch `*` also swallows inner dashes, so
+`refinery-20260915-0ac3fcc-tr-t3a` counts for `tr-t3a`). A directory named
+with the bead id *first* (`refinery-<bead>-<date>`) does **not** count. Direct probe of the live
 function against a temporary root containing four directories —
 `refinery-tr-probe-20260917`, `refinery-20260917-tr-probe`,
 `refinery-20260917T1430-tr-probe`, `refinery-20260917-tr-other` — returns:
@@ -235,11 +236,13 @@ function against a temporary root containing four directories —
 - `rejection_rounds('tr-absent') = 0` — a bead with no bead-last directory
   has zero recorded rounds regardless of what else the root contains.
 
-**Operator finding (live coverage gap).** In the live reviews root, 127
-`refinery-*` directories exist, and 81 of them do **not** match the counted
-glob — timestamp-only names such as `refinery-20260911T045659Z` match no
-bead at all, and bead-first names count for nothing. Directories that do
-count for a bead include `refinery-20260915-tr-xaj` and the
+**Operator finding (live coverage gap).** At the time of this revision
+(2026-09-17), the live reviews root held 130 `refinery-*` directories, and
+81 of them did **not** match the counted glob — timestamp-only names such
+as `refinery-20260911T045659Z` match no bead at all, and bead-first or
+suffix-annotated names (`refinery-tr-…-<date>`,
+`refinery-<date>-tr-<bead>-validation`) count for nothing. Directories
+that do count for a bead include `refinery-20260915-tr-xaj` and the
 `refinery-<date>-tr-t3a` family. Consequence: these directories prove that
 reviews happened, but most of them advanced no round counter, so per-bead
 round counts can undercount actual rejection history. Finite routing is
@@ -367,8 +370,9 @@ play.
   probed input/output; corrected the acknowledgement claim
   (`count >= 12 and count > acknowledged`, not "thresholds raised by n";
   probed 0/13/23 at acknowledged = 12); documented `notify_rounds`
-  suppression; recorded the 81-of-127 uncounted live review directories as
-  an operator finding instead of claiming all live rounds are bounded.
+  suppression; recorded the 81 uncounted live review directories (of 130 at
+  revision time) as an operator finding instead of claiming all live rounds
+  are bounded.
 - **R3 → Finding 4 (and Finding 6's hold bullet).** Corrected the draft
   disposition from `pending` to `hold` with the exact live reason string
   and `reconcile_one` storage (`merge_result = blocked`,
