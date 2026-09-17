@@ -7,7 +7,9 @@
 use super::*;
 use crate::architecture::SourceId;
 use crate::ui::preferences::AlbumArtSize;
-use resolver::{classify_pane_authority, resolve_kind, PaneAuthority, ResolvedArtKind};
+use resolver::{
+    classify_pane_authority, resolve_kind, LocalLibrary, PaneAuthority, ResolvedArtKind,
+};
 
 /// A `file://` row that carries a complete registry identity
 /// (source id + session epoch + attached registry) must resolve
@@ -187,7 +189,7 @@ use std::time::Duration;
 
 /// Copy the deterministic FLAC fixture, tag it, and embed one cover
 /// picture so a retained-file extraction has real artwork to find.
-fn tagged_flac_with_embedded_art(path: &std::path::Path, art: &[u8]) {
+pub(super) fn tagged_flac_with_embedded_art(path: &std::path::Path, art: &[u8]) {
     use lofty::config::WriteOptions;
     use lofty::file::{FileType, TaggedFileExt};
     use lofty::picture::{MimeType, Picture, PictureType};
@@ -328,6 +330,7 @@ fn pathless_removable_album_row_resolves_retained_embedded_art_from_glib_context
             Some(epoch),
             Vec::new(),
             Some(application_handle),
+            LocalLibrary::Shared,
             &candidate,
             &liveness,
         ))
@@ -378,6 +381,7 @@ fn pre_revoked_removable_registry_row_fails_closed() {
                 Some(epoch),
                 Vec::new(),
                 Some(application_handle),
+                LocalLibrary::Shared,
                 &candidate,
                 &liveness,
             ))
@@ -418,6 +422,7 @@ fn removable_registry_row_without_runtime_fails_closed() {
                 Some(epoch),
                 Vec::new(),
                 None,
+                LocalLibrary::Shared,
                 &candidate,
                 &liveness,
             ))
@@ -452,6 +457,7 @@ async fn superseded_removable_epoch_stays_on_the_placeholder() {
         Some(epoch + 1),
         Vec::new(),
         Some(tokio::runtime::Handle::current()),
+        LocalLibrary::Shared,
         &candidate,
         &liveness,
     )
@@ -498,6 +504,7 @@ async fn refused_retained_authority_stays_on_the_placeholder() {
         Some(epoch),
         Vec::new(),
         Some(tokio::runtime::Handle::current()),
+        LocalLibrary::Shared,
         &candidate,
         &liveness,
     )
