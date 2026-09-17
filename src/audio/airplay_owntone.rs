@@ -2337,6 +2337,57 @@ impl CompletionTracker {
     }
 }
 
+/// Bounds the *active* drain. Only time the daemon spends in an active state
+/// is charged against [`DRAIN_DEADLINE`]: a healthy `pause` observation
+/// suspends the budget (a paused item is the user's to resume, however long
+/// they leave it — refinery R14), and the first active observation after a
+/// pause — the resume — starts a fresh budget, so time spent paused never
+/// shortens the drain of a just-resumed tail. One budget spans a whole
+/// [`drain_and_restore`]: a completion its epoch check finds superseded
+/// resumes the wait without renewing it, and cancellation is checked on every
+/// poll regardless of the budget.
+struct DrainBudget {
+    remaining: Duration,
+    charged_from: Instant,
+    paused: bool,
+}
+
+impl DrainBudget {
+    fn new() -> Self {
+        Self::starting_at(Instant::now())
+    }
+
+    fn starting_at(now: Instant) -> Self {
+        Self {
+            remaining: DRAIN_DEADLINE,
+            charged_from: now,
+            paused: false,
+        }
+    }
+
+    /// Attribute a healthy observation: `pause` suspends charging; the first
+    /// active state after a pause renews the budget.
+    fn observe(&mut self, state: &str) {
+        let paused = state == "pause";
+        if self.paused && !paused {
+            self.remaining = DRAIN_DEADLINE;
+        }
+        self.paused = paused;
+    }
+
+    /// Charge the interval since the previous tick unless the latest healthy
+    /// observation was a pause. `true` once the active budget is spent.
+    fn tick(&mut self, now: Instant) -> bool {
+        if !self.paused {
+            self.remaining = self
+                .remaining
+                .saturating_sub(now.saturating_duration_since(self.charged_from));
+        }
+        self.charged_from = now;
+        self.remaining.is_zero()
+    }
+}
+
 /// The outcome of one bounded drain wait.
 enum DrainOutcome {
     /// The item completed under the control epoch its deciding observation
@@ -2347,14 +2398,17 @@ enum DrainOutcome {
     Failed(&'static str),
 }
 
-/// Poll the daemon — until `deadline` — until the item counts as completed per
-/// [`CompletionTracker`]. Every observation is bound to the control epoch it
+/// Poll the daemon — while `budget` has active drain time left — until the
+/// item counts as completed per [`CompletionTracker`]. Every observation is bound to the control epoch it
 /// was sampled under: the epoch and the autostart flag are read **before** the
 /// request, and an epoch that moved while the request was in flight discards
 /// the sample and the stall clock (a pause accepted meanwhile has made the
 /// sampled state history; the flag it set must never apply to it). `Err(())`
 /// is a cancellation observed while waiting.
-fn await_daemon_completion(inner: &SessionInner, deadline: Instant) -> Result<DrainOutcome, ()> {
+fn await_daemon_completion(
+    inner: &SessionInner,
+    budget: &mut DrainBudget,
+) -> Result<DrainOutcome, ()> {
     let cancelled = || {
         inner.cancel.is_cancelled()
             || inner.gate.is_stopped()
@@ -2389,6 +2443,7 @@ fn await_daemon_completion(inner: &SessionInner, deadline: Instant) -> Result<Dr
                     {
                         processed += 1;
                     }
+                    budget.observe(&state);
                     if tracker.observe(&state, progress, Instant::now(), stall_completes, epoch) {
                         return Ok(DrainOutcome::Completed { epoch });
                     }
@@ -2400,7 +2455,7 @@ fn await_daemon_completion(inner: &SessionInner, deadline: Instant) -> Result<Dr
                 }
             }
         }
-        if Instant::now() >= deadline {
+        if budget.tick(Instant::now()) {
             return Ok(DrainOutcome::Failed("AirPlay completion timed out"));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -2453,11 +2508,11 @@ fn park_between_requests(inner: &SessionInner, processed: u32) {
 /// cancellation observed while waiting (close() owns restoration then);
 /// `Ok(None)` a completed and restored item; `Ok(Some(reason))` a terminal
 /// failure. A completion whose epoch restoration finds superseded is void:
-/// the wait resumes, still bounded by the original drain deadline.
+/// the wait resumes on the same active-drain budget ([`DrainBudget`]).
 fn drain_and_restore(inner: &SessionInner) -> Result<Option<&'static str>, ()> {
-    let deadline = Instant::now() + DRAIN_DEADLINE;
+    let mut budget = DrainBudget::new();
     loop {
-        match await_daemon_completion(inner, deadline)? {
+        match await_daemon_completion(inner, &mut budget)? {
             DrainOutcome::Failed(reason) => {
                 // Restoration may block, so it must remain outside the Stop
                 // gate. Failed restoration retains custody for close()'s
@@ -4315,6 +4370,55 @@ mod tests {
 
     /// F4: a paused item is not a completed item; only `stop` completes, so a
     /// paused track is never reported as `TrackEnded`.
+    #[test]
+    fn drain_budget_charges_only_active_time_and_renews_on_resume() {
+        let t0 = Instant::now();
+        let mut budget = DrainBudget::starting_at(t0);
+        budget.observe("play");
+        assert!(!budget.tick(t0 + Duration::from_secs(4)));
+        // A healthy pause suspends the budget for as long as it lasts.
+        budget.observe("pause");
+        assert!(!budget.tick(t0 + Duration::from_secs(4) + DRAIN_DEADLINE * 6));
+        assert!(!budget.tick(t0 + Duration::from_secs(4) + DRAIN_DEADLINE * 60));
+        // The resume starts a fresh budget: the 4 s spent draining before the
+        // pause are not held against the resumed tail.
+        let resumed = t0 + Duration::from_secs(4) + DRAIN_DEADLINE * 60;
+        budget.observe("play");
+        assert!(!budget.tick(resumed + DRAIN_DEADLINE.saturating_sub(Duration::from_secs(1))));
+        assert!(budget.tick(resumed + DRAIN_DEADLINE + Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn drain_budget_active_time_alone_spends_the_deadline() {
+        let t0 = Instant::now();
+        let mut budget = DrainBudget::starting_at(t0);
+        budget.observe("play");
+        assert!(!budget.tick(t0 + DRAIN_DEADLINE / 2));
+        // Repeated play samples never renew: only a pause→active edge does.
+        budget.observe("play");
+        assert!(!budget.tick(t0 + DRAIN_DEADLINE.saturating_sub(Duration::from_millis(100))));
+        assert!(budget.tick(t0 + DRAIN_DEADLINE));
+        // Time before the first observation counts as active drain too.
+        let mut fresh = DrainBudget::starting_at(t0);
+        assert!(fresh.tick(t0 + DRAIN_DEADLINE));
+    }
+
+    #[test]
+    fn drain_budget_spent_before_a_pause_is_not_charged_while_paused() {
+        let t0 = Instant::now();
+        let mut budget = DrainBudget::starting_at(t0);
+        budget.observe("play");
+        // Paused just short of the deadline: the pause must hold, and the
+        // resume that follows gets a full budget rather than the leftover.
+        assert!(!budget.tick(t0 + DRAIN_DEADLINE.saturating_sub(Duration::from_millis(500))));
+        budget.observe("pause");
+        assert!(!budget.tick(t0 + DRAIN_DEADLINE * 3));
+        budget.observe("play");
+        let resumed = t0 + DRAIN_DEADLINE * 3;
+        assert!(!budget.tick(resumed + DRAIN_DEADLINE / 2));
+        assert!(budget.tick(resumed + DRAIN_DEADLINE));
+    }
+
     #[test]
     fn completion_tracker_completes_on_stop_or_stalled_play_never_pause() {
         let t0 = Instant::now();
@@ -8663,6 +8767,165 @@ fn serve(stream: std::net::TcpStream) {
         wait_until(|| controller.state() == PlayerState::Playing);
         std::fs::remove_file(&stall).unwrap();
         assert_single_natural_completion(&fixture, &ticket, generation, &baseline);
+    }
+
+    /// R14: a pause accepted during the post-EOF drain suspends the drain
+    /// deadline. The recording daemon holds the drain (stall sentinel) so the
+    /// wait keeps observing healthy `pause` samples for longer than
+    /// [`DRAIN_DEADLINE`]. The session must stay paused — no Error, no
+    /// Stopped, no TrackEnded, no restoration, custody/route/lock retained —
+    /// and a later resume must still drain and settle exactly once.
+    #[cfg(owntone_host)]
+    fn exercise_healthy_pause_beyond_the_drain_deadline(
+        active_before_pause: Duration,
+        generation: PlayerEventGeneration,
+    ) -> (
+        DaemonControllerFixture,
+        Arc<GstreamerMediaTicket>,
+        Vec<OwnToneOutput>,
+    ) {
+        let fixture = DaemonControllerFixture::start_brief(40 * 1024);
+        let controller = &fixture.controller;
+        let client = &fixture.client;
+        let pipe = &fixture.daemon.config.pipe_path;
+        let stall = pipe.with_extension("stall");
+        let baseline = client.outputs().unwrap();
+        std::fs::write(&stall, b"").unwrap();
+        let prepared = fixture.prepare();
+        let ticket = prepared.ticket().unwrap();
+        controller.set_generation(generation);
+        controller.load(generation, prepared);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        wait_until(
+            || matches!(client.player_progress(), Ok((ref s, Some(p))) if s == "play" && p > 0),
+        );
+        // The writer is closed; the drain wait is running against an
+        // autostarted item whose progress the held daemon leaves stalled.
+        std::thread::sleep(active_before_pause);
+
+        controller.pause();
+        wait_until(|| controller.state() == PlayerState::Paused);
+        assert_eq!(client.player_state().unwrap(), "pause");
+        // Leave it paused well past the point where an absolute deadline
+        // taken at the start of the drain would have expired.
+        std::thread::sleep(DRAIN_DEADLINE + Duration::from_millis(1500));
+
+        let events = fixture.drain_events();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::TrackEnded { .. }
+                    | PlayerEvent::Error { .. }
+                    | PlayerEvent::StateChanged {
+                        state: PlayerState::Stopped,
+                        ..
+                    }
+            )),
+            "a healthy pause was cut short by the drain deadline: {events:?}"
+        );
+        assert_eq!(controller.state(), PlayerState::Paused);
+        assert_eq!(client.player_state().unwrap(), "pause");
+        assert!(
+            fixture.daemon.config.takeover_record().exists(),
+            "restoration must not run while the item is paused"
+        );
+        // The media route (the ticket's custody) and the instance lock are
+        // still held: nothing has settled.
+        assert_eq!(ticket.route_count(), 1);
+        assert!(!fixture.lock_is_free());
+        let recorded = fixture.daemon.recorded();
+        let paused = recorded.rfind("PUT /api/player/pause ").unwrap();
+        assert!(
+            !recorded[paused..].contains("PUT /api/player/stop "),
+            "the daemon was stopped under a healthy pause: {recorded}"
+        );
+        (fixture, ticket, baseline)
+    }
+
+    /// R14: paused longer than the drain deadline, then resumed — the item
+    /// drains and settles exactly once.
+    #[cfg(owntone_host)]
+    #[test]
+    fn a_healthy_pause_outlives_the_drain_deadline_and_stays_resumable() {
+        let generation = PlayerEventGeneration::from_raw(52);
+        let (fixture, ticket, baseline) = exercise_healthy_pause_beyond_the_drain_deadline(
+            Duration::from_millis(500),
+            generation,
+        );
+        let controller = &fixture.controller;
+        let client = &fixture.client;
+        controller.play();
+        wait_until(|| controller.state() == PlayerState::Playing);
+        assert_eq!(client.player_state().unwrap(), "play");
+        std::fs::remove_file(fixture.daemon.config.pipe_path.with_extension("stall")).unwrap();
+        assert_single_natural_completion(&fixture, &ticket, generation, &baseline);
+    }
+
+    /// R14: a pause accepted just before the original absolute deadline
+    /// would have expired, held across it, then resumed. The resumed tail
+    /// gets a fresh active budget instead of the leftover the pause consumed.
+    #[cfg(owntone_host)]
+    #[test]
+    fn a_pause_near_the_drain_deadline_then_resume_still_completes() {
+        let generation = PlayerEventGeneration::from_raw(53);
+        let (fixture, ticket, baseline) = exercise_healthy_pause_beyond_the_drain_deadline(
+            DRAIN_DEADLINE.saturating_sub(Duration::from_millis(1500)),
+            generation,
+        );
+        let controller = &fixture.controller;
+        controller.play();
+        wait_until(|| controller.state() == PlayerState::Playing);
+        std::fs::remove_file(fixture.daemon.config.pipe_path.with_extension("stall")).unwrap();
+        assert_single_natural_completion(&fixture, &ticket, generation, &baseline);
+    }
+
+    /// R14: Stop while paused past the drain deadline settles the session
+    /// exactly once — one Stopped, no TrackEnded, no Error — and restores the
+    /// daemon, releases the route, the takeover record and the lock.
+    #[cfg(owntone_host)]
+    #[test]
+    fn a_stop_while_paused_past_the_drain_deadline_settles_without_completion() {
+        let generation = PlayerEventGeneration::from_raw(54);
+        let (fixture, ticket, baseline) = exercise_healthy_pause_beyond_the_drain_deadline(
+            Duration::from_millis(500),
+            generation,
+        );
+        let controller = &fixture.controller;
+        let client = &fixture.client;
+        controller.stop();
+        wait_until(|| ticket.route_count() == 0);
+        wait_until(|| controller.state() == PlayerState::Stopped);
+        wait_until(|| !fixture.daemon.config.takeover_record().exists());
+        wait_until(|| fixture.lock_is_free());
+        let events = fixture.drain_events();
+        assert!(
+            events.iter().all(|event| event.generation() == generation),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    PlayerEvent::StateChanged {
+                        state: PlayerState::Stopped,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::TrackEnded { .. } | PlayerEvent::Error { .. }
+            )),
+            "{events:?}"
+        );
+        assert_eq!(client.player_state().unwrap(), "stop");
+        assert!(!controller.proxy().has_custody_entries());
+        assert_outputs_match(client, &baseline);
     }
 
     /// Pinned OwnTone autostops a pipe only while it is *autostarted*: a

@@ -310,6 +310,7 @@ errors:
     playback_failed: "Сбой воспроизведения аудио"
     airplay_raopsink_missing: "Воспроизведение через AirPlay 1 недоступно: в этой сборке нет совместимого передатчика raopsink для GStreamer"
     airplay_owntone_unavailable: "AirPlay через передатчик OwnTone недоступен: %{reason}"
+    airplay_owntone_no_acquisition_path: "на этой платформе нет поддерживаемого пути получения OwnTone"
     mpd_exclusive_control_required: "Повторно добавьте этот выход MPD, подтвердите исключительный контроль раздела, затем снова выберите его перед воспроизведением"
 
 # ── About dialog ───────────────────────────────────────────────────

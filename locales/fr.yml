@@ -308,6 +308,7 @@ errors:
     playback_failed: "La lecture audio a échoué"
     airplay_raopsink_missing: "La lecture AirPlay 1 n'est pas disponible : cette version ne contient aucun émetteur GStreamer raopsink compatible"
     airplay_owntone_unavailable: "AirPlay via l'émetteur OwnTone n'est pas disponible : %{reason}"
+    airplay_owntone_no_acquisition_path: "cette plateforme n'a aucun chemin d'acquisition OwnTone pris en charge"
     mpd_exclusive_control_required: "Ajoutez à nouveau cette sortie MPD, confirmez le contrôle exclusif de la partition, puis sélectionnez-la à nouveau avant la lecture"
 
 # ── About dialog ───────────────────────────────────────────────────

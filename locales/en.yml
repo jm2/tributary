@@ -341,6 +341,7 @@ errors:
     playback_failed: "Audio playback failed"
     airplay_raopsink_missing: "AirPlay 1 playback is unavailable: this build has no compatible GStreamer raopsink sender"
     airplay_owntone_unavailable: "AirPlay via the OwnTone sender is unavailable: %{reason}"
+    airplay_owntone_no_acquisition_path: "this platform has no supported OwnTone acquisition path"
     mpd_exclusive_control_required: "Re-add this MPD output, confirm exclusive partition control, then select it again before playback"
 
 # ── About dialog ───────────────────────────────────────────────────

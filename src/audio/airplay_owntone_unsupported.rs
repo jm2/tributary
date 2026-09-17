@@ -18,16 +18,27 @@ use super::airplay_sender::{AirplaySender, OpenOutcome, SenderError, SenderOpenC
 /// on every target.
 const ENV_SELECT: &str = "TRIBUTARY_AIRPLAY_SENDER";
 
-/// Localized refusal reason: no OwnTone acquisition path is documented for
-/// this target.
-const UNSUPPORTED_REASON: &str = "this platform has no supported OwnTone acquisition path";
+/// The refusal in the current locale. The reason
+/// (`errors.playback.airplay_owntone_no_acquisition_path`: no OwnTone
+/// acquisition path is documented for this target) is localized in the same
+/// catalog as the outer message, so a translated sentence never carries an
+/// English clause (PR #270 review thread).
+fn unavailable() -> SenderError {
+    unavailable_in(rust_i18n::locale().as_ref())
+}
 
-fn unavailable(reason: &str) -> SenderError {
+/// The refusal as rendered by `locale`'s catalog: outer message and reason
+/// from the same catalog.
+fn unavailable_in(locale: &str) -> SenderError {
+    let reason = rust_i18n::t!(
+        "errors.playback.airplay_owntone_no_acquisition_path",
+        locale = locale
+    );
     SenderError::Dependency(
         rust_i18n::t!(
             "errors.playback.airplay_owntone_unavailable",
-            reason = reason,
-            locale = rust_i18n::locale().as_ref()
+            reason = reason.as_ref(),
+            locale = locale
         )
         .into_owned(),
     )
@@ -67,11 +78,11 @@ impl AirplaySender for OwnToneSender {
     }
 
     fn probe(&self) -> Result<(), SenderError> {
-        Err(unavailable(UNSUPPORTED_REASON))
+        Err(unavailable())
     }
 
     fn open_session(&self, _ctx: &SenderOpenContext) -> OpenOutcome {
-        OpenOutcome::Failed(unavailable(UNSUPPORTED_REASON))
+        OpenOutcome::Failed(unavailable())
     }
 }
 
@@ -93,12 +104,48 @@ mod tests {
     fn unconfigured_sender_probe_fails_closed() {
         let sender = OwnToneSender;
         let error = sender.probe().expect_err("unsupported sender must refuse");
+        // The refusal is the current catalog's rendering of the unavailable
+        // message with the localized reason — never the key path and never
+        // an English clause inside a translated sentence.
+        let locale = rust_i18n::locale();
+        let reason = rust_i18n::t!(
+            "errors.playback.airplay_owntone_no_acquisition_path",
+            locale = locale.as_ref()
+        );
         assert!(
-            error
-                .message()
-                .contains("supported OwnTone acquisition path"),
+            !reason.contains("airplay_owntone_no_acquisition_path"),
+            "{reason}"
+        );
+        assert!(
+            error.message().contains(reason.as_ref()),
             "{}",
             error.message()
         );
+        assert_eq!(error.message(), unavailable_in(locale.as_ref()).message());
+    }
+
+    #[test]
+    fn refusal_reason_is_rendered_from_the_selected_catalog() {
+        let english = unavailable_in("en");
+        assert_eq!(
+            english.message(),
+            "AirPlay via the OwnTone sender is unavailable: this platform has no supported OwnTone acquisition path"
+        );
+        let german = unavailable_in("de");
+        assert!(
+            german
+                .message()
+                .contains("diese Plattform hat keinen unterstützten OwnTone-Erfassungspfad"),
+            "{}",
+            german.message()
+        );
+        assert!(
+            !german
+                .message()
+                .contains("no supported OwnTone acquisition path"),
+            "the reason must not fall back to English: {}",
+            german.message()
+        );
+        assert_ne!(german.message(), english.message());
     }
 }

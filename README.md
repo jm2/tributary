@@ -701,11 +701,15 @@ OwnTone 29.x daemon as its transport when explicitly configured
 `TRIBUTARY_OWNTONE_API`, `TRIBUTARY_OWNTONE_PIPE`, and `TRIBUTARY_OWNTONE_STATE_DIR`). The
 adapter maps the selected receiver to the daemon by its retained device identifier — never
 by display name — and restores the daemon's pre-takeover output set when the session ends.
-Without a configured sender — or on a target with no supported OwnTone acquisition path,
-which the binary today limits to x86_64 Linux (Debian/Ubuntu amd64 is the documented
-package; other x86_64 Linux builds are not fail-closed by the binary) — AirPlay 1 reports unavailable
-rather than silently falling back: current official GStreamer, Homebrew, and MSYS2 packages
-still do not ship the `raopsink` element, and the `raopsink` adapter stays probe-gated for
+When `TRIBUTARY_AIRPLAY_SENDER` is unset, the default is the GStreamer `raopsink` adapter,
+which is probe-gated: AirPlay 1 is offered only when a usable `raopsink` element is found.
+When the variable selects `owntone` on a target with no supported OwnTone acquisition path
+(the binary today limits that path to x86_64 Linux; Debian/Ubuntu amd64 is the documented
+package, and other x86_64 Linux builds are not fail-closed by the binary), the selected
+adapter refuses with a localized reason — it never falls back to `raopsink`. In both cases
+AirPlay 1 reports unavailable rather than silently using another sender: current official
+GStreamer, Homebrew, and MSYS2 packages still do not ship the `raopsink` element, and the
+`raopsink` adapter stays probe-gated for
 user-supplied elements. AirPlay 2 receivers (HomePod, recent Apple TVs, and
 AirPlay-2-certified third-party speakers) advertise via `_airplay._tcp.local.` and are
 detected, but remain filtered out until a path that can actually play to them ships. Both

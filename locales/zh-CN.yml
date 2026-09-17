@@ -308,6 +308,7 @@ errors:
     playback_failed: "音频播放失败"
     airplay_raopsink_missing: "AirPlay 1 播放不可用：此版本不包含兼容的 GStreamer raopsink 发送器"
     airplay_owntone_unavailable: "通过 OwnTone 发送器的 AirPlay 不可用：%{reason}"
+    airplay_owntone_no_acquisition_path: "此平台没有受支持的 OwnTone 获取路径"
     mpd_exclusive_control_required: "请重新添加此 MPD 输出，确认对分区的独占控制，然后在播放前再次选择它"
 
 # ── About dialog ───────────────────────────────────────────────────

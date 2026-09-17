@@ -943,15 +943,14 @@ fn process_chromecast_event(
 /// `HEXMAC@FriendlyName` (e.g. `"8EE58A500A56@Rear Lounge TV"`).
 /// This function strips the MAC prefix to produce just `"Rear Lounge TV"`.
 ///
-/// If no `@` is present or the prefix doesn't look like a hex MAC,
-/// the name is returned unchanged.
+/// If no `@` is present or the prefix is not a device identifier by the same
+/// rule the retained identity uses ([`normalize_airplay_device_id`]: at least
+/// six hex digits, colon/hyphen separators allowed), the name is returned
+/// unchanged — a prefix that identifies the receiver must never remain in
+/// its display name whichever separator form it was advertised in.
 fn strip_airplay_mac_prefix(name: &str) -> String {
     if let Some(at_pos) = name.find('@') {
-        let prefix = &name[..at_pos];
-        // MAC addresses are 12 hex characters (6 bytes, no separators)
-        // or sometimes with colons/dashes.  Accept any all-hex prefix
-        // of reasonable length (≥ 6 chars).
-        if prefix.len() >= 6 && prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+        if normalize_airplay_device_id(&name[..at_pos]).is_some() {
             return name[at_pos + 1..].to_string();
         }
     }
@@ -1737,6 +1736,24 @@ mod tests {
         assert_eq!(strip_airplay_mac_prefix("ABCD@Device"), "ABCD@Device");
         // Exactly 6 hex chars — stripped.
         assert_eq!(strip_airplay_mac_prefix("AABBCC@Speaker"), "Speaker");
+        // Separator forms identify the receiver exactly like the bare form
+        // (the retained identity accepts them), so they are stripped too.
+        assert_eq!(
+            strip_airplay_mac_prefix("8E:E5:8A:50:0A:56@Kitchen"),
+            "Kitchen"
+        );
+        assert_eq!(
+            strip_airplay_mac_prefix("8e-e5-8a-50-0a-56@Kitchen"),
+            "Kitchen"
+        );
+        // Separators around too few hex digits, or non-hex text, are not an
+        // identifier — unchanged.
+        assert_eq!(strip_airplay_mac_prefix("8E:E5@Device"), "8E:E5@Device");
+        assert_eq!(
+            strip_airplay_mac_prefix("not-a-mac@Device"),
+            "not-a-mac@Device"
+        );
+        assert_eq!(strip_airplay_mac_prefix("@Device"), "@Device");
     }
 
     #[test]

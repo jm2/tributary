@@ -308,6 +308,7 @@ errors:
     playback_failed: "Falha na reprodução de áudio"
     airplay_raopsink_missing: "A reprodução via AirPlay 1 não está disponível: esta compilação não inclui um transmissor raopsink compatível do GStreamer"
     airplay_owntone_unavailable: "O AirPlay pelo transmissor OwnTone não está disponível: %{reason}"
+    airplay_owntone_no_acquisition_path: "esta plataforma não tem um caminho de aquisição do OwnTone compatível"
     mpd_exclusive_control_required: "Adicione novamente esta saída MPD, confirme o controle exclusivo da partição e selecione-a novamente antes da reprodução"
 
 # ── About dialog ───────────────────────────────────────────────────
