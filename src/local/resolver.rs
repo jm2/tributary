@@ -1231,6 +1231,17 @@ mod tests {
         }
     }
 
+    /// Free a waiter held inside the `probe_park` predicate-to-wait gap even
+    /// when an assertion unwinds, so a failing test can never strand
+    /// `release()` behind a held wait mutex.
+    struct GapPokeGuard;
+
+    impl Drop for GapPokeGuard {
+        fn drop(&mut self) {
+            probe_park::poke_gap();
+        }
+    }
+
     /// Serializes tests that drive the process-global `probe_park`
     /// instrumentation: only one watcher can be armed at a time, and sibling
     /// tests run in parallel.
@@ -1407,14 +1418,8 @@ mod tests {
         const TRACK: &str = "probe-park-lost-wakeup-track";
         probe_park::watch(TRACK);
         let _park = ParkGuard;
-        /// Declared after `_park` so it drops first and frees the waiter
-        /// from the gap window even when an assertion below panics.
-        struct GapPokeGuard;
-        impl Drop for GapPokeGuard {
-            fn drop(&mut self) {
-                probe_park::poke_gap();
-            }
-        }
+        // Declared after `_park` so it drops first and frees the waiter
+        // from the gap window even when an assertion below panics.
         let _poke = GapPokeGuard;
 
         probe_park::arm_gap();
