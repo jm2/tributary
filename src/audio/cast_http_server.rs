@@ -14,8 +14,9 @@
 //! # Security
 //!
 //! - **Explicit-interface binding**: The Chromecast entry point binds to the
-//!   machine's non-loopback LAN address via the kernel routing table (via
-//!   `local-ip-address::local_ip()`), so on multihomed/VPN/container hosts
+//!   machine's non-loopback LAN address via the kernel routing table (a UDP
+//!   `connect` to the receiver target and a read-back of the chosen local
+//!   address), so on multihomed/VPN/container hosts
 //!   the listener lands on the interface that can actually reach the
 //!   receiver — never on a blind first-match enumeration that could be the
 //!   wrong subnet. It prefers a routable IPv4 address when one is available,
