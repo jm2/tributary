@@ -403,22 +403,7 @@ impl TransferExecutor {
         let staged = Self::flush_and_verify_size(staged, declared_bytes, copied)
             .map_err(StageFailure::Final)?;
         match staged.commit() {
-            Ok(outcome) => {
-                // The publish landed. The source authority now gets the
-                // post-publication revalidation the destination authority
-                // already performs inside `commit`: a source root renamed
-                // aside (or vanished) during the copy must not report
-                // success just because the retained descriptor kept
-                // serving bytes. Record the actual outcome FIRST, so
-                // rollback can reverse exactly what landed, then fail.
-                if let Err(error) = self.request.source.validate() {
-                    context.committed.push(owned_change_for_copy(outcome));
-                    return Err(StageFailure::Final(TransferError::authority(format!(
-                        "source not current at publication: {error}"
-                    ))));
-                }
-                Ok(outcome)
-            }
+            Ok(outcome) => self.revalidate_source_after_publish(outcome, context),
             Err(CommitError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
                 context.bytes_so_far = bytes_before_attempt;
                 context.progress.on_bytes_copied(
@@ -448,6 +433,30 @@ impl TransferExecutor {
                 }))
             }
         }
+    }
+
+    /// Revalidate the source authority after the publish has landed.
+    ///
+    /// Mirrors the destination authority's trailing revalidation inside
+    /// `commit`: a retained source descriptor keeps serving bytes to EOF even
+    /// after its root is renamed aside and a replacement directory takes the
+    /// old name, so a source lease lost during `on_bytes_copied` must not be
+    /// reported as a completed transfer. The publish has already landed, so
+    /// the actual [`CommitOutcome`] is recorded FIRST — rollback must reverse
+    /// exactly what landed, and an outcome dropped behind a wrapper-level
+    /// error could never be undone.
+    fn revalidate_source_after_publish(
+        &self,
+        outcome: CommitOutcome,
+        context: &mut RunContext<'_>,
+    ) -> Result<CommitOutcome, StageFailure> {
+        if let Err(error) = self.request.source.validate() {
+            context.committed.push(owned_change_for_copy(outcome));
+            return Err(StageFailure::Final(TransferError::authority(format!(
+                "source not current at publication: {error}"
+            ))));
+        }
+        Ok(outcome)
     }
 
     /// Resolve a destination that appeared after planning on a fresh-planned
