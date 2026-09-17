@@ -38,7 +38,8 @@ class PolicyError(RuntimeError):
 
 @dataclasses.dataclass(frozen=True)
 class Transition:
-    """One reviewed root-to-fuzz production graph rewrite.
+    """
+    One reviewed root-to-fuzz production graph rewrite.
 
     ``target_root_version`` is the root-selected version the fuzz lock must
     align onto. It is None for a removal: the root no longer declares the
