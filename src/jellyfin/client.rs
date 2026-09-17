@@ -985,7 +985,10 @@ mod tests {
         let rendered = format!("{error:?}\n{error}\n{}", rendered_error_chain(error));
         assert!(!rendered.contains(payload), "response content leaked");
         for secret in secrets {
-            assert!(!rendered.contains(secret), "credential leaked: {secret}");
+            // Do not interpolate `secret` into the failure message: the CodeQL
+            // cleartext-logging query treats the panic payload as a log sink,
+            // and this assertion exists precisely to keep secrets out of one.
+            assert!(!rendered.contains(secret), "credential leaked");
         }
     }
 }
