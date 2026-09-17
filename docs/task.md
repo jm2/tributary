@@ -548,7 +548,8 @@ the review proposal supplies rationale. Operator and physical validation are cou
   consolidated tests. Record native keyboard/screen-reader, contrast, scaling and long-translation
   smoke checks separately; green skipped bodies do not establish interaction acceptance.
 
-- [ ] **Q2 — Explicit security audits for both Cargo lockfiles** (P2; Ready; issue/bead unassigned).
+- [ ] **Q2 — Explicit security audits for both Cargo lockfiles** (P2; Ready;
+  [#279](https://github.com/jm2/tributary/issues/279)).
   Audit root and independent fuzz graphs with scoped advisory exceptions. Prove the fuzz lock is
   actually selected and a graph-specific finding cannot hide behind root-lock coherence. This is
   a missing audit boundary, not evidence of a currently exploitable dependency.
