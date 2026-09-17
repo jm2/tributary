@@ -46,6 +46,21 @@ const MAX_CAST_FRAME_BYTES: u32 = 1024 * 1024;
 /// ceiling in `mpd_output.rs`.
 const MAX_PENDING_WORKER_COMMANDS: usize = 64;
 
+/// Slots of the ingress ceiling kept open for the newest seek and volume.
+///
+/// Ordinary (non-transient) commands stop at the reservation line
+/// `capacity - reserved`, so a flood of pause/play/toggle intent can never
+/// fill the deque far enough to refuse a final seek or volume. Transient
+/// controls may still use the full deque — at capacity their same-kind
+/// supersession rules apply. Channels smaller than twice this value reserve
+/// proportionally less so at least half the deque remains available to
+/// ordinary commands.
+const MAX_RESERVED_FINAL_INTENT_SLOTS: usize = 2;
+
+fn reserved_final_intent_slots(capacity: usize) -> usize {
+    (capacity / 2).min(MAX_RESERVED_FINAL_INTENT_SLOTS)
+}
+
 const CAST_SENDER_ID: &str = "sender-0";
 const CAST_RECEIVER_ID: &str = "receiver-0";
 
@@ -173,11 +188,15 @@ impl WorkerCommandSender {
     /// Admission is finite and explicit:
     /// - a newer intent epoch atomically purges the obsolete backlog;
     /// - below capacity the deque stays an exact FIFO;
-    /// - at capacity, adjacent transient seek/volume runs collapse to their
-    ///   newest instance, and a queued transient is evicted only when a later
-    ///   same-kind instance supersedes it without crossing a lifecycle
-    ///   barrier — so the latest seek and the latest volume are never silently
-    ///   lost;
+    /// - ordinary commands stop at the reservation line
+    ///   `capacity - reserved_final_intent_slots(capacity)`, so a flood of
+    ///   pause/play/toggle intent can never push the deque far enough to
+    ///   refuse a final seek or volume;
+    /// - transient controls may use the full deque; at capacity, adjacent
+    ///   transient seek/volume runs collapse to their newest instance, and a
+    ///   queued transient is evicted only when a later same-kind instance
+    ///   supersedes it without crossing a lifecycle barrier — so the latest
+    ///   seek and the latest volume are never silently lost;
     /// - a command that cannot be admitted without discarding final intent is
     ///   reported `Saturated` rather than reported `Enqueued` and dropped.
     ///
@@ -220,21 +239,36 @@ impl WorkerCommandSender {
                 let _ = pending.commands.remove(evicted);
             }
             pending.commands.push_back(command);
-        } else if pending.commands.len() < pending.capacity {
-            pending.commands.push_back(command);
         } else if command.kind.is_transient_control() {
-            // The incoming transient is the newest intent of its kind. Admit it
-            // only when a queued same-kind instance it supersedes releases a
-            // slot. Evicting the only final seek or volume — or letting the
-            // incoming command evict itself — would silently lose intent while
-            // still reporting success.
-            pending.commands.push_back(command);
-            if let Some(superseded) = superseded_transient_index(&pending.commands) {
-                let _ = pending.commands.remove(superseded);
+            // Seek and volume are absolute-target controls, so a duplicate of
+            // the same kind queued ahead of them is obsolete intent: the
+            // incoming instance wins when it releases a slot. Evicting the
+            // only final seek or volume — or letting the incoming command
+            // evict itself — would silently lose intent while still reporting
+            // success, so that case reports `Saturated` instead.
+            let admitted = if pending.commands.len() < pending.capacity {
+                pending.commands.push_back(command);
+                true
             } else {
-                let _ = pending.commands.pop_back();
+                pending.commands.push_back(command);
+                if let Some(superseded) = superseded_transient_index(&pending.commands) {
+                    let _ = pending.commands.remove(superseded);
+                    true
+                } else {
+                    let _ = pending.commands.pop_back();
+                    false
+                }
+            };
+            if !admitted {
                 return WorkerEnqueueOutcome::Saturated;
             }
+        } else if pending.commands.len()
+            < pending.capacity - reserved_final_intent_slots(pending.capacity)
+        {
+            // Ordinary commands stop at the reservation line so the newest
+            // seek and volume always have somewhere to land even while a
+            // non-transient flood saturates the rest of the deque.
+            pending.commands.push_back(command);
         } else if let Some(superseded) = superseded_transient_index(&pending.commands) {
             let _ = pending.commands.remove(superseded);
             pending.commands.push_back(command);
@@ -397,6 +431,21 @@ fn superseded_transient_index(commands: &VecDeque<WorkerCommand>) -> Option<usiz
             .any(|later| same_transient_kind(&command.kind, &later.kind));
         superseded.then_some(index)
     })
+}
+
+/// Structured-log label for the command a saturation refusal discarded.
+///
+/// Only current-epoch controls (play/pause/toggle/seek/volume) can be refused,
+/// because loads, stops, and shutdown take a fresh epoch or reserved admission
+/// and are therefore always admitted; the catch-all still covers every
+/// remaining variant so the label can never go stale.
+fn saturation_control(kind: &CommandKind) -> &'static str {
+    match kind {
+        CommandKind::Volume(_) => "volume change",
+        CommandKind::Seek(_) => "seek",
+        CommandKind::Play | CommandKind::Pause | CommandKind::Toggle => "playback control",
+        _ => "command",
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2156,15 +2205,31 @@ impl ChromecastOutput {
         }
     }
 
-    fn enqueue(&self, owner: CommandOwner, kind: CommandKind) -> bool {
+    fn enqueue(&self, owner: CommandOwner, kind: CommandKind) -> WorkerEnqueueOutcome {
+        // Named before the command is moved into the ingress, so a saturation
+        // refusal can describe the discarded control without allocating on
+        // the admitted hot path.
+        let control = saturation_control(&kind);
         match self.worker_tx.enqueue(WorkerCommand { owner, kind }) {
-            WorkerEnqueueOutcome::Enqueued | WorkerEnqueueOutcome::Superseded => true,
+            WorkerEnqueueOutcome::Enqueued => WorkerEnqueueOutcome::Enqueued,
+            WorkerEnqueueOutcome::Superseded => WorkerEnqueueOutcome::Superseded,
             WorkerEnqueueOutcome::Saturated => {
+                // Log the refusal truthfully, but keep it off the
+                // `PlayerEvent::Error` channel: the UI treats that event as a
+                // terminal playback failure — it retires external playback,
+                // stops resolved loads, and resets the play controls — so an
+                // overload report there would tear down stable playback
+                // precisely when the receiver is merely slow. Truthfulness is
+                // preserved where it matters: the reserved final-intent slots
+                // keep the newest seek and volume admissible under floods, and
+                // a residual refusal is refused rather than published — the
+                // cached volume keeps describing what the device holds.
                 error!(
                     operation = "worker ingress",
-                    "Chromecast worker command ingress is saturated; dropping a command with no safe superseding intent"
+                    control,
+                    "Chromecast worker command ingress is saturated; {control} was dropped and did not reach the device"
                 );
-                false
+                WorkerEnqueueOutcome::Saturated
             }
             WorkerEnqueueOutcome::Disconnected => {
                 if is_current(owner, &self.intent_epoch) {
@@ -2182,7 +2247,7 @@ impl ChromecastOutput {
                         &self.event_tx,
                     );
                 }
-                false
+                WorkerEnqueueOutcome::Disconnected
             }
         }
     }
@@ -2390,8 +2455,20 @@ impl AudioOutput for ChromecastOutput {
     }
 
     fn set_volume(&mut self, level: f64) {
-        self.volume = level.clamp(0.0, 1.0);
-        let _ = self.enqueue(self.current_owner(), CommandKind::Volume(self.volume));
+        let clamped = level.clamp(0.0, 1.0);
+        // The cached value is published only when the ingress actually
+        // retained the command: a refused level must never be reported by
+        // `volume()` as if the receiver accepted it. The reserved final-intent
+        // slots keep volume changes admissible even while a flood of pause or
+        // play commands saturates the ordinary admission line, so refusals
+        // are rare and flood-bound; a residual refusal leaves the cache
+        // describing the level the device actually holds.
+        if matches!(
+            self.enqueue(self.current_owner(), CommandKind::Volume(clamped)),
+            WorkerEnqueueOutcome::Enqueued
+        ) {
+            self.volume = clamped;
+        }
     }
 
     fn volume(&self) -> f64 {
@@ -4167,7 +4244,10 @@ mod tests {
         output.load_uri("file://[cast-secret-token");
         let owner = output.current_owner();
         let (done_tx, done_rx) = mpsc::channel();
-        assert!(output.enqueue(owner, CommandKind::Fence(done_tx)));
+        assert_eq!(
+            output.enqueue(owner, CommandKind::Fence(done_tx)),
+            WorkerEnqueueOutcome::Enqueued
+        );
         done_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("worker reached fence");
@@ -4562,6 +4642,345 @@ mod tests {
         }
     }
 
+    /// Poll `cond` on a quiet loop until it holds or the timeout expires.
+    /// Production code paths here run on their own worker thread, so the
+    /// test thread can only observe their progress by polling shared state.
+    fn wait_for(timeout_secs: u64, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+        loop {
+            if cond() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    impl ChromecastOutput {
+        /// A production `ChromecastOutput` whose worker runs against the fake
+        /// Cast transport, so public control methods are exercised end to end
+        /// — queue admission, worker delivery, and recorded receiver actions —
+        /// instead of asserting on the private ingress outcome alone.
+        fn new_with_fake_transport(
+            shared: &Arc<FakeShared>,
+            event_tx: async_channel::Sender<PlayerEvent>,
+            initial_volume: f64,
+        ) -> Self {
+            let current_state = Arc::new(Mutex::new(PlayerState::Stopped));
+            let intent_epoch = Arc::new(AtomicU64::new(0));
+            let worker_tx = spawn_cast_worker(
+                FakeConnector {
+                    shared: Arc::clone(shared),
+                },
+                Arc::clone(&intent_epoch),
+                Arc::clone(&current_state),
+                event_tx.clone(),
+                WorkerTiming {
+                    heartbeat: Duration::from_hours(1),
+                    poll: Duration::from_hours(1),
+                    cleanup_retry: Duration::from_millis(10),
+                    tick: Duration::from_millis(10),
+                },
+            );
+            Self {
+                display_name: "Test Receiver".to_string(),
+                device_address: "127.0.0.1:8009".parse().expect("test address"),
+                event_tx,
+                event_generation: AtomicU64::new(0),
+                volume: initial_volume.clamp(0.0, 1.0),
+                current_state,
+                cast_server: Arc::new(Mutex::new(None)),
+                rt_handle: None,
+                intent_epoch,
+                worker_tx,
+            }
+        }
+    }
+
+    /// Production-output proof of the reserved final-intent slots: with the
+    /// worker held inside the fake Cast transport and the ordinary admission
+    /// line saturated by a flood of nontransient pauses, the public
+    /// `set_volume` and `seek_to` calls must still be admitted into the
+    /// reserved final-intent space, delivered to the receiver, and truthfully
+    /// cached — while the flood overflow is refused without emitting the
+    /// UI-terminal overload event and without disturbing the reported
+    /// playback state. A later replacement volume, seek, and stop must still
+    /// settle.
+    #[test]
+    fn held_transport_saturation_admits_final_seek_and_volume_intent_and_still_settles() {
+        let shared = FakeShared::new();
+        let (event_tx, events) = async_channel::unbounded();
+        let mut output = ChromecastOutput::new_with_fake_transport(&shared, event_tx, 0.25);
+
+        // Establish a live media session so the held command is a real
+        // receiver operation rather than a session-less no-op.
+        output.load_uri("https://music.test/track.flac");
+        assert!(
+            wait_for(2, || shared
+                .actions()
+                .iter()
+                .any(|action| matches!(action, Action::Point(Point::Load)))),
+            "worker completed the load"
+        );
+        assert!(
+            wait_for(2, || output.state() == PlayerState::Playing),
+            "load settled into Playing"
+        );
+        let state_before_saturation = output.state();
+
+        // Hold the worker inside the fake transport's pause handling.
+        let (entered, release) = shared.install_gate(Point::Pause);
+        output.pause();
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker entered the held pause");
+
+        // Flood the ordinary admission line exactly: capacity minus the two
+        // reserved final-intent slots.
+        for _ in 0..MAX_PENDING_WORKER_COMMANDS
+            - reserved_final_intent_slots(MAX_PENDING_WORKER_COMMANDS)
+        {
+            output.pause();
+        }
+        // Flood overflow: truthfully refused, logged, and never published on
+        // the event stream.
+        output.pause();
+
+        // Final seek and volume under saturation: admitted into the reserved
+        // space and truthfully cached even though the ordinary line is full.
+        output.set_volume(0.75);
+        assert!(
+            (output.volume() - 0.75).abs() < f64::EPSILON,
+            "admitted final volume must be published as cached state"
+        );
+        output.seek_to(4_321);
+
+        // A residual flood command is still refused after the final intent
+        // landed: no supersable pair, ordinary line saturated.
+        output.pause();
+
+        // Refusals stay off the player event stream: the UI treats an Error
+        // event as a terminal playback failure — it retires external
+        // playback and stops resolved loads — so an overload report there
+        // would tear down stable playback precisely when the receiver is
+        // merely slow.
+        let saturation_errors: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                PlayerEvent::Error { message, .. } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            saturation_errors.is_empty(),
+            "saturation must not emit UI-terminal overload events: {saturation_errors:?}"
+        );
+        assert_eq!(
+            output.state(),
+            state_before_saturation,
+            "overload must not disturb the reported playback state"
+        );
+
+        // Final receiver behavior: the held pause plus every admitted queued
+        // pause are delivered in order, then the retained final volume and
+        // seek. The flood overflow never reaches the receiver.
+        release.send(()).expect("release the held pause");
+        let admitted_pauses = MAX_PENDING_WORKER_COMMANDS + 1
+            - reserved_final_intent_slots(MAX_PENDING_WORKER_COMMANDS);
+        assert!(
+            wait_for(2, || {
+                let actions = shared.actions();
+                actions
+                    .iter()
+                    .filter(|action| matches!(action, Action::Point(Point::Pause)))
+                    .count()
+                    >= admitted_pauses
+                    && actions.iter().any(|action| {
+                        matches!(action, Action::Volume(level) if (*level - 0.75).abs() < f64::EPSILON)
+                    })
+                    && actions
+                        .iter()
+                        .any(|action| matches!(action, Action::Seek(4_321)))
+            }),
+            "receiver received every admitted pause and the retained final volume and seek"
+        );
+        for action in shared.actions() {
+            if let Action::Volume(level) = action {
+                assert!(
+                    (level - 0.25).abs() < f64::EPSILON
+                        || (level - 0.75).abs() < f64::EPSILON
+                        || (level - 0.9).abs() < f64::EPSILON,
+                    "an unexpected volume reached the receiver: {level}"
+                );
+            }
+        }
+
+        // Replacement settlement: after saturation a new volume and seek are
+        // admitted, delivered, and truthfully cached.
+        output.set_volume(0.9);
+        assert!(
+            (output.volume() - 0.9).abs() < f64::EPSILON,
+            "post-overload volume must be admitted and cached"
+        );
+        output.seek_to(7_777);
+        assert!(
+            wait_for(2, || {
+                let actions = shared.actions();
+                actions
+                    .iter()
+                    .any(|action| matches!(action, Action::Volume(level) if (*level - 0.9).abs() < f64::EPSILON))
+                    && actions
+                        .iter()
+                        .any(|action| matches!(action, Action::Seek(7_777)))
+            }),
+            "receiver received the replacement volume and seek"
+        );
+
+        // Stop retains reserved admission and settles after saturation.
+        output.stop();
+        assert!(
+            wait_for(2, || shared
+                .actions()
+                .iter()
+                .any(|action| matches!(action, Action::Stop(_)))),
+            "stop settled after saturation"
+        );
+    }
+
+    /// The residual-refusal case at the reservation boundary: with the
+    /// ordinary admission line saturated and the reserved final-intent space
+    /// occupied by a seek and a volume, an incoming toggle has no supersable
+    /// intent and is truthfully refused. The refusal must stay off the
+    /// UI-terminal event stream, must not disturb the reported playback
+    /// state, and must never reach the receiver — while the admitted final
+    /// volume is delivered, so the cached level and the level the device
+    /// actually holds stay identical.
+    #[test]
+    fn held_transport_residual_refusal_is_truthful_and_final_volume_matches_reality() {
+        let shared = FakeShared::new();
+        let (event_tx, events) = async_channel::unbounded();
+        let mut output = ChromecastOutput::new_with_fake_transport(&shared, event_tx, 0.25);
+
+        output.load_uri("https://music.test/track.flac");
+        assert!(
+            wait_for(2, || shared
+                .actions()
+                .iter()
+                .any(|action| matches!(action, Action::Point(Point::Load)))),
+            "worker completed the load"
+        );
+        assert!(
+            wait_for(2, || output.state() == PlayerState::Playing),
+            "load settled into Playing"
+        );
+        let stable_state = output.state();
+
+        let (entered, release) = shared.install_gate(Point::Pause);
+        output.pause();
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker entered the held pause");
+
+        // Fill the ordinary admission line exactly, then occupy the reserved
+        // final-intent space with the newest seek and volume. The volume is
+        // admitted, so the cache publishes it — and the receiver will really
+        // hold that level.
+        for _ in 0..MAX_PENDING_WORKER_COMMANDS
+            - reserved_final_intent_slots(MAX_PENDING_WORKER_COMMANDS)
+        {
+            output.pause();
+        }
+        output.seek_to(1_000);
+        output.set_volume(0.75);
+        assert!(
+            (output.volume() - 0.75).abs() < f64::EPSILON,
+            "admitted final volume must be published as cached state"
+        );
+
+        // The deque is full with no supersable intent, so a toggle is
+        // truthfully refused: the reported state keeps describing the
+        // playback the device is actually performing.
+        output.toggle_play_pause();
+        assert_eq!(
+            output.state(),
+            stable_state,
+            "refusal must not disturb the reported playback state"
+        );
+
+        // Refusals stay off the player event stream (see the retained-intent
+        // test: an Error event is terminal in the UI).
+        let saturation_errors: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                PlayerEvent::Error { message, .. } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            saturation_errors.is_empty(),
+            "saturation must not emit UI-terminal overload events: {saturation_errors:?}"
+        );
+
+        // The admitted final intent reaches the receiver: the cached level
+        // and the delivered level are the same. The refused toggle never
+        // surfaces as a playback-control point beyond the held and queued
+        // pauses.
+        release.send(()).expect("release the held pause");
+        assert!(
+            wait_for(2, || {
+                output.worker_tx.pending_len() == 0
+                    && shared
+                        .actions()
+                        .iter()
+                        .any(|action| matches!(action, Action::Seek(1_000)))
+                    && shared.actions().iter().any(|action| {
+                        matches!(
+                            action,
+                            Action::Volume(level) if (*level - 0.75).abs() < f64::EPSILON
+                        )
+                    })
+            }),
+            "receiver received the admitted final seek and volume"
+        );
+        let pause_points = shared
+            .actions()
+            .iter()
+            .filter(|action| matches!(action, Action::Point(Point::Pause)))
+            .count();
+        let play_points = shared
+            .actions()
+            .iter()
+            .filter(|action| matches!(action, Action::Point(Point::Play)))
+            .count();
+        assert_eq!(
+            pause_points,
+            MAX_PENDING_WORKER_COMMANDS + 1
+                - reserved_final_intent_slots(MAX_PENDING_WORKER_COMMANDS),
+            "the held pause and the admitted flood must reach the receiver"
+        );
+        assert_eq!(
+            play_points, 0,
+            "the refused toggle must not reach the receiver"
+        );
+
+        // A later volume under a quiet ingress is admitted, delivered, and
+        // truthfully cached.
+        output.set_volume(0.9);
+        assert!(
+            (output.volume() - 0.9).abs() < f64::EPSILON,
+            "post-overload volume must be admitted and cached"
+        );
+        assert!(
+            wait_for(2, || {
+                shared
+                .actions()
+                .iter()
+                .any(|action| matches!(action, Action::Volume(level) if (*level - 0.9).abs() < f64::EPSILON))
+            }),
+            "receiver received the replacement volume"
+        );
+    }
+
     #[test]
     fn worker_ingress_preserves_exact_fifo_below_capacity() {
         let (tx, rx) = worker_command_channel(8);
@@ -4609,11 +5028,11 @@ mod tests {
         let owner = queue_test_owner(1);
         for kind in [
             CommandKind::Pause,
+            CommandKind::Play,
             CommandKind::Seek(1_000),
             CommandKind::Seek(2_000),
             CommandKind::Volume(0.10),
             CommandKind::Volume(0.90),
-            CommandKind::Play,
         ] {
             assert_eq!(
                 tx.enqueue(WorkerCommand { owner, kind }),
@@ -4632,12 +5051,21 @@ mod tests {
         assert!(tx.pending_len() <= 6);
 
         // Only the newest member of each adjacent run survives; the barrier
-        // controls keep their position and a trailing seek is retained.
+        // controls keep their position and a trailing seek is retained. The
+        // two non-transient commands fit the ordinary admission line, so the
+        // fill reaches full capacity and the trailing seek forces the
+        // adjacent runs to coalesce.
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(1))
                 .expect("pause barrier")
                 .kind,
             CommandKind::Pause
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("play barrier")
+                .kind,
+            CommandKind::Play
         ));
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(1))
@@ -4650,12 +5078,6 @@ mod tests {
                 .expect("coalesced volume run")
                 .kind,
             CommandKind::Volume(0.90)
-        ));
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1))
-                .expect("play barrier")
-                .kind,
-            CommandKind::Play
         ));
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(1))
@@ -4673,7 +5095,7 @@ mod tests {
             CommandKind::Pause,
             CommandKind::Seek(1_000),
             CommandKind::Volume(0.10),
-            CommandKind::Play,
+            CommandKind::Seek(2_000),
         ] {
             assert_eq!(
                 tx.enqueue(WorkerCommand { owner, kind }),
@@ -4683,12 +5105,15 @@ mod tests {
         assert_eq!(
             tx.enqueue(WorkerCommand {
                 owner,
-                kind: CommandKind::Seek(2_000),
+                kind: CommandKind::Seek(3_000),
             }),
             WorkerEnqueueOutcome::Enqueued
         );
         assert_eq!(tx.pending_len(), 4);
 
+        // The interleaved kinds leave no adjacent same-kind run for
+        // compaction to relieve, so the incoming seek can only be admitted by
+        // superseding the older same-kind instance ahead of it.
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(1))
                 .expect("pause retained")
@@ -4703,15 +5128,15 @@ mod tests {
         ));
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(1))
-                .expect("play retained")
+                .expect("superseded seek run keeps its newest member")
                 .kind,
-            CommandKind::Play
+            CommandKind::Seek(2_000)
         ));
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(1))
                 .expect("latest seek retained")
                 .kind,
-            CommandKind::Seek(2_000)
+            CommandKind::Seek(3_000)
         ));
     }
 
@@ -4719,15 +5144,27 @@ mod tests {
     fn saturated_ingress_refuses_non_transient_yet_reserves_stop_and_shutdown() {
         let (tx, _rx) = worker_command_channel(3);
         let owner = queue_test_owner(1);
-        for kind in [CommandKind::Pause, CommandKind::Toggle, CommandKind::Play] {
+        // The ordinary admission line is capacity minus the reserved
+        // final-intent slots: with capacity 3, two non-transient commands
+        // fill it.
+        for kind in [CommandKind::Pause, CommandKind::Toggle] {
             assert_eq!(
                 tx.enqueue(WorkerCommand { owner, kind }),
                 WorkerEnqueueOutcome::Enqueued
             );
         }
 
-        // With no transient to evict, a saturated non-transient command is
-        // reported explicitly rather than silently discarded.
+        // At the saturated ordinary line a non-transient command with no
+        // supersable intent is reported explicitly rather than silently
+        // discarded.
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Play,
+            }),
+            WorkerEnqueueOutcome::Saturated
+        );
+        // The line stays saturated for further non-transient commands.
         assert_eq!(
             tx.enqueue(WorkerCommand {
                 owner,
@@ -4767,7 +5204,9 @@ mod tests {
         let capacity = MAX_PENDING_WORKER_COMMANDS;
 
         // Trace 1: a lone Volume behind a full run of non-transient Pause
-        // commands must survive an incoming Seek, which is truthfully refused.
+        // commands must survive an incoming Seek, which is admitted into the
+        // reserved final-intent space; only a control with no supersable
+        // intent is truthfully refused.
         let (tx, rx) = worker_command_channel(capacity);
         assert_eq!(
             tx.enqueue(WorkerCommand {
@@ -4776,7 +5215,7 @@ mod tests {
             }),
             WorkerEnqueueOutcome::Enqueued
         );
-        for _ in 0..capacity - 1 {
+        for _ in 0..capacity - 3 {
             assert_eq!(
                 tx.enqueue(WorkerCommand {
                     owner,
@@ -4785,14 +5224,31 @@ mod tests {
                 WorkerEnqueueOutcome::Enqueued
             );
         }
+        // The ordinary admission line is now exactly full.
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Pause,
+            }),
+            WorkerEnqueueOutcome::Saturated
+        );
         assert_eq!(
             tx.enqueue(WorkerCommand {
                 owner,
                 kind: CommandKind::Seek(9_000),
             }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        // A saturated line with no supersable intent is reported explicitly
+        // rather than silently discarded.
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Toggle,
+            }),
             WorkerEnqueueOutcome::Saturated
         );
-        assert_eq!(tx.pending_len(), capacity);
+        assert_eq!(tx.pending_len(), capacity - 1);
 
         let mut retained_volume = 0;
         let mut retained_seek = 0;
@@ -4804,12 +5260,13 @@ mod tests {
             }
         }
         assert_eq!(retained_volume, 1, "the only final volume intent was lost");
-        assert_eq!(retained_seek, 0, "the refused seek must not be queued");
+        assert_eq!(retained_seek, 1, "the reserved final seek intent was lost");
 
-        // Trace 2: an incoming Volume with no same-kind intent to supersede is
+        // Trace 2: an incoming Volume with the ordinary line saturated still
+        // lands in the reserved final-intent space, while flood overflow is
         // refused instead of evicting itself and reporting `Enqueued`.
         let (tx, rx) = worker_command_channel(capacity);
-        for _ in 0..capacity {
+        for _ in 0..capacity - 2 {
             assert_eq!(
                 tx.enqueue(WorkerCommand {
                     owner,
@@ -4821,20 +5278,34 @@ mod tests {
         assert_eq!(
             tx.enqueue(WorkerCommand {
                 owner,
-                kind: CommandKind::Volume(0.75),
+                kind: CommandKind::Pause,
             }),
             WorkerEnqueueOutcome::Saturated
         );
-        assert_eq!(tx.pending_len(), capacity);
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Volume(0.75),
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        assert_eq!(tx.pending_len(), capacity - 1);
+        let mut retained_volume = 0;
         while let Some(command) = rx.pop_pending() {
-            assert!(matches!(command.kind, CommandKind::Pause));
+            match command.kind {
+                CommandKind::Volume(_) => retained_volume += 1,
+                CommandKind::Pause => {}
+                _ => panic!("unexpected kind retained"),
+            }
         }
+        assert_eq!(retained_volume, 1);
     }
 
-    /// Mixed seek/volume saturation: each new control may only evict an older
-    /// same-kind instance, so the latest seek AND the latest volume both
-    /// survive a full queue. Neither the incoming command nor the sole final
-    /// value of the other kind may be discarded.
+    /// Mixed seek/volume saturation: an incoming control releases a slot by
+    /// superseding the oldest supersable transient, so the retained queue
+    /// stays bounded and settles at the latest seek AND the latest volume.
+    /// Neither the incoming command nor the sole final value of either kind
+    /// may be discarded.
     #[test]
     fn saturated_ingress_preserves_latest_seek_and_volume_together() {
         let (tx, rx) = worker_command_channel(4);
@@ -4843,16 +5314,27 @@ mod tests {
             CommandKind::Volume(0.25),
             CommandKind::Pause,
             CommandKind::Seek(1_000),
-            CommandKind::Play,
         ] {
             assert_eq!(
                 tx.enqueue(WorkerCommand { owner, kind }),
                 WorkerEnqueueOutcome::Enqueued
             );
         }
+        // Ordinary commands stop once the deque holds capacity minus the
+        // reserved final-intent slots: the queued transients already push the
+        // deque past the ordinary line, so Play is refused truthfully.
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Play,
+            }),
+            WorkerEnqueueOutcome::Saturated
+        );
 
-        // Both incoming controls replace their older same-kind instance
-        // without crossing a barrier, so both are admitted.
+        // The incoming volume lands in the reserved final-intent space, and
+        // the incoming seek is admitted by superseding the oldest supersable
+        // transient — the obsolete volume ahead of it — so no control is
+        // discarded while claiming success.
         assert_eq!(
             tx.enqueue(WorkerCommand {
                 owner,
@@ -4888,14 +5370,20 @@ mod tests {
             })
             .collect();
         assert_eq!(volumes, vec![0.90], "latest volume intent was lost");
-        assert_eq!(seeks, vec![2_000], "latest seek intent was lost");
+        assert_eq!(
+            seeks,
+            vec![1_000, 2_000],
+            "retained seek run must settle at the latest position"
+        );
     }
 
     /// End-to-end saturation on the real Cast worker held inside the fake
-    /// transport. New same-kind intents supersede queued ones and are
-    /// admitted, while a control with no safe superseding intent is reported
-    /// `Saturated` instead of being reported `Enqueued` and dropped. The
-    /// receiver must settle on the latest seek and volume intent.
+    /// transport. While the ordinary admission line is saturated by a
+    /// non-transient flood, the newest seek and volume intents are admitted
+    /// into the reserved final-intent slots and delivered, while controls
+    /// with no safe superseding intent are reported `Saturated` instead of
+    /// being reported `Enqueued` and dropped. The receiver must settle on the
+    /// latest seek and volume intent.
     #[test]
     fn slow_receiver_keeps_final_seek_and_volume_intent_under_saturation() {
         let shared = FakeShared::new();
@@ -4925,23 +5413,13 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("fake Cast transport held the first seek");
 
-        // Queue one seek and one volume, then fill the remaining capacity with
-        // non-transient Pause commands.
-        assert_eq!(
-            harness.tx.enqueue(WorkerCommand {
-                owner,
-                kind: CommandKind::Volume(0.25),
-            }),
-            WorkerEnqueueOutcome::Enqueued
-        );
-        assert_eq!(
-            harness.tx.enqueue(WorkerCommand {
-                owner,
-                kind: CommandKind::Seek(1_000),
-            }),
-            WorkerEnqueueOutcome::Enqueued
-        );
-        for _ in 0..MAX_PENDING_WORKER_COMMANDS - 2 {
+        // Fill the ordinary admission line exactly with non-transient Pause
+        // commands: capacity minus the two reserved final-intent slots. The
+        // held seek does not occupy a queue slot — the worker is already
+        // processing it.
+        for _ in 0..MAX_PENDING_WORKER_COMMANDS
+            - reserved_final_intent_slots(MAX_PENDING_WORKER_COMMANDS)
+        {
             assert_eq!(
                 harness.tx.enqueue(WorkerCommand {
                     owner,
@@ -4952,11 +5430,21 @@ mod tests {
         }
         assert_eq!(
             harness.tx.pending_len(),
-            MAX_PENDING_WORKER_COMMANDS,
+            MAX_PENDING_WORKER_COMMANDS - reserved_final_intent_slots(MAX_PENDING_WORKER_COMMANDS),
             "the retained Cast control ingress must stay bounded"
         );
 
-        // A newer same-kind volume supersedes the queued volume and is admitted.
+        // Flood overflow with no supersable intent is refused truthfully.
+        assert_eq!(
+            harness.tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Pause,
+            }),
+            WorkerEnqueueOutcome::Saturated
+        );
+
+        // The newest volume and seek are admitted into the reserved
+        // final-intent space even while the ordinary line is saturated.
         assert_eq!(
             harness.tx.enqueue(WorkerCommand {
                 owner,
@@ -4964,7 +5452,6 @@ mod tests {
             }),
             WorkerEnqueueOutcome::Enqueued
         );
-        // A newer same-kind seek supersedes the queued seek and is admitted.
         assert_eq!(
             harness.tx.enqueue(WorkerCommand {
                 owner,
@@ -5034,7 +5521,7 @@ mod tests {
                 volume: 0.5,
             },
             CommandKind::Seek(1_000),
-            CommandKind::Pause,
+            CommandKind::Seek(2_000),
         ] {
             assert_eq!(
                 tx.enqueue(WorkerCommand { owner: old, kind }),
