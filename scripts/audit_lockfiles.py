@@ -19,7 +19,10 @@ This helper audits each graph on its own terms:
   suppress a finding in the other;
 * the JSON report is validated before it is trusted: its scanned dependency
   count must match the requested lockfile, its applied ignore set must match the
-  graph's scoped exceptions, and it must report no remaining vulnerabilities.
+  graph's scoped exceptions, and it must report no remaining vulnerabilities;
+* a nonzero auditor exit status fails its graph even when the emitted report
+  looks clean, and structurally incomplete or malformed vulnerability results
+  are rejected instead of being read as zero findings.
 
 `root` describes the repository's production lock and `fuzz` the independent
 fuzz workspace lock. The command exits non-zero if either graph fails.
@@ -189,16 +192,42 @@ def audit_graph(graph: Graph, audit_bin: str) -> GraphResult:
     vulnerabilities = report.get("vulnerabilities")
     if not isinstance(vulnerabilities, dict):
         raise AuditError("cargo-audit report is missing the vulnerabilities section")
-    entries = vulnerabilities.get("list") or []
+    entries = vulnerabilities.get("list")
+    if not isinstance(entries, list):
+        raise AuditError(
+            "cargo-audit report vulnerabilities.list is missing or not a list"
+        )
     ids: list[str] = []
-    if isinstance(entries, list):
-        for entry in entries:
-            advisory = entry.get("advisory") if isinstance(entry, dict) else None
-            advisory_id = advisory.get("id") if isinstance(advisory, dict) else None
-            if isinstance(advisory_id, str):
-                ids.append(advisory_id)
-    if vulnerabilities.get("count") or ids:
-        raise AuditError(f"unhandled vulnerabilities reported: {sorted(ids) or 'unknown'}")
+    for entry in entries:
+        advisory = entry.get("advisory") if isinstance(entry, dict) else None
+        advisory_id = advisory.get("id") if isinstance(advisory, dict) else None
+        if not isinstance(advisory_id, str):
+            raise AuditError(
+                "cargo-audit report has a malformed vulnerability entry: "
+                f"{entry!r}"
+            )
+        ids.append(advisory_id)
+    count = vulnerabilities.get("count")
+    if not isinstance(count, int) or isinstance(count, bool) or count != len(ids):
+        raise AuditError(
+            f"cargo-audit report vulnerabilities.count {count!r} does not match "
+            f"its {len(ids)} entries: {sorted(ids)}"
+        )
+    if count:
+        raise AuditError(f"unhandled vulnerabilities reported: {sorted(ids)}")
+
+    # A nonzero auditor status is a failed audit even when the parsed report
+    # looks clean: validate the exit status last so a graph that found
+    # vulnerabilities still names them, but no failing auditor is ever promoted
+    # to a green result by its own JSON output.
+    if completed.returncode != 0:
+        detail = completed.stderr.strip().splitlines()
+        tail = detail[-1] if detail else "no stderr"
+        raise AuditError(
+            f"cargo-audit for graph {graph.name} ({graph.lockfile}) exited with "
+            f"status {completed.returncode} while reporting no unhandled "
+            f"vulnerabilities; last stderr: {tail}"
+        )
 
     return GraphResult(
         name=graph.name,

@@ -24,7 +24,9 @@ REPOSITORY = Path(__file__).resolve().parent.parent
 
 # Stand-in cargo-audit: records every call, counts the requested lockfile's
 # packages, filters canned findings through the passed ignore list, and emits
-# the same JSON shape cargo-audit produces.
+# the same JSON shape cargo-audit produces. A per-lock fixture entry may set
+# "exit" to force a nonzero auditor status and "report" to replace the whole
+# emitted report body.
 FAKE_AUDIT = r'''#!/usr/bin/env python3
 import json
 import os
@@ -59,6 +61,9 @@ with Path(os.environ["AUDIT_FIXTURE_CALLS"]).open("a") as calls:
 lock_path = Path(lock).resolve() if lock else Path("Cargo.lock").resolve()
 fixture = json.loads(Path(os.environ["AUDIT_FIXTURE_REPORT"]).read_text())
 entry = fixture.get(str(lock_path), {})
+if entry.get("report") is not None:
+    sys.stdout.write(json.dumps(entry["report"]))
+    sys.exit(entry.get("exit", 0))
 count = entry.get("count")
 if count is None:
     with lock_path.open("rb") as source:
@@ -75,7 +80,7 @@ report = {
     "warnings": {"count": 0, "list": []},
 }
 sys.stdout.write(json.dumps(report))
-sys.exit(1 if reported else 0)
+sys.exit(entry.get("exit", 1 if reported else 0))
 '''
 
 
@@ -258,6 +263,106 @@ class AuditLockfilesTests(unittest.TestCase):
 
         self.assertIsNotNone(results["fuzz"].error)
         self.assertIn("audit.toml", results["fuzz"].error)
+
+    def test_nonzero_status_fails_despite_valid_green_json(self) -> None:
+        # cargo-audit can exit nonzero after emitting a valid zero-finding
+        # report (denied warnings, a failure after the report is written). The
+        # status is part of the evidence: a clean JSON body must not promote a
+        # failed scan to a green graph.
+        self.build_graphs(
+            fixture={str((self.repository / "fuzz" / "Cargo.lock")): {"exit": 7}}
+        )
+
+        results = {result.name: result for result in self.audit()}
+
+        self.assertIsNone(results["root"].error)
+        self.assertIsNotNone(results["fuzz"].error)
+        self.assertIn("status 7", results["fuzz"].error)
+        # The failed graph must not stop the other graph from being audited.
+        self.assertEqual(len(self.recorded_calls()), 2)
+
+    def test_nonzero_status_fails_the_root_graph_without_touching_fuzz(self) -> None:
+        self.build_graphs(
+            fixture={str(self.repository / "Cargo.lock"): {"exit": 3}}
+        )
+
+        results = {result.name: result for result in self.audit()}
+
+        self.assertIsNotNone(results["root"].error)
+        self.assertIn("status 3", results["root"].error)
+        # The diagnostic names the graph that failed, not just the status.
+        self.assertIn("root", results["root"].error)
+        self.assertIsNone(results["fuzz"].error)
+
+    def test_malformed_vulnerability_list_is_rejected(self) -> None:
+        # A structurally broken vulnerabilities.list must not be read as zero
+        # findings just because its count is falsy.
+        self.build_graphs(
+            fixture={
+                str(self.repository / "fuzz" / "Cargo.lock"): {
+                    "report": {
+                        "lockfile": {"dependency-count": 5},
+                        "settings": {"ignore": []},
+                        "vulnerabilities": {"count": 0, "list": "garbage"},
+                        "warnings": {"count": 0, "list": []},
+                    }
+                }
+            }
+        )
+
+        results = {result.name: result for result in self.audit()}
+
+        self.assertIsNone(results["root"].error)
+        self.assertIsNotNone(results["fuzz"].error)
+        self.assertIn("vulnerabilities.list", results["fuzz"].error)
+
+    def test_vulnerability_entry_without_advisory_id_is_rejected(self) -> None:
+        self.build_graphs(
+            fixture={
+                str(self.repository / "fuzz" / "Cargo.lock"): {
+                    "report": {
+                        "lockfile": {"dependency-count": 5},
+                        "settings": {"ignore": []},
+                        "vulnerabilities": {
+                            "count": 1,
+                            "list": [{"advisory": {"id": None}}],
+                        },
+                        "warnings": {"count": 0, "list": []},
+                    }
+                }
+            }
+        )
+
+        results = {result.name: result for result in self.audit()}
+
+        self.assertIsNotNone(results["fuzz"].error)
+        self.assertIn("malformed vulnerability entry", results["fuzz"].error)
+
+    def test_vulnerability_count_mismatch_is_rejected(self) -> None:
+        # A zero count with a populated list is the dangerous incomplete
+        # report: trusting the count alone would hide a real finding.
+        self.build_graphs(
+            fixture={
+                str(self.repository / "fuzz" / "Cargo.lock"): {
+                    "report": {
+                        "lockfile": {"dependency-count": 5},
+                        "settings": {"ignore": []},
+                        "vulnerabilities": {
+                            "count": 0,
+                            "list": [{"advisory": {"id": "RUSTSEC-HIDDEN"}}],
+                        },
+                        "warnings": {"count": 0, "list": []},
+                    }
+                }
+            }
+        )
+
+        results = {result.name: result for result in self.audit()}
+
+        self.assertIsNone(results["root"].error)
+        self.assertIsNotNone(results["fuzz"].error)
+        self.assertIn("does not match", results["fuzz"].error)
+        self.assertIn("RUSTSEC-HIDDEN", results["fuzz"].error)
 
     def test_checked_in_workflow_runs_the_helper_and_fuzz_config_exists(self) -> None:
         workflow = (REPOSITORY / ".github" / "workflows" / "ci.yml").read_text()
