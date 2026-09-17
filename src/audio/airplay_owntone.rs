@@ -463,13 +463,17 @@ fn read_process(pid: u32) -> Option<ListenerProcess> {
 
 /// The process currently LISTENing on the configured loopback API endpoint —
 /// both the configured address and port must match (review S2).
-fn listener_process(api_base: &str) -> Option<ListenerProcess> {
-    let port = api_port(api_base)?;
+/// The inodes of every listening socket bound to the endpoint's address and
+/// port, whoever holds them.
+fn listening_socket_inodes(api_base: &str) -> Vec<u64> {
+    let Some(port) = api_port(api_base) else {
+        return Vec::new();
+    };
     let addrs = api_host(api_base)
         .map(|host| expected_local_addrs(&host))
         .unwrap_or_default();
     if addrs.is_empty() {
-        return None;
+        return Vec::new();
     }
     let mut inodes = Vec::new();
     for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
@@ -477,6 +481,36 @@ fn listener_process(api_base: &str) -> Option<ListenerProcess> {
             inodes.extend(listening_inodes(&text, port, &addrs));
         }
     }
+    inodes
+}
+
+/// Whether anything still listens on the endpoint. Unlike
+/// [`listener_process`] this needs no owning process: a socket held only by
+/// the exiting sibling threads of a zombie thread-group leader still counts.
+fn endpoint_is_bound(api_base: &str) -> bool {
+    !listening_socket_inodes(api_base).is_empty()
+}
+
+/// After the dedicated instance was signalled, wait until nothing listens on
+/// its endpoint. The kernel reports a multithreaded process's thread-group
+/// leader as a zombie while its sibling threads are still exiting, and those
+/// threads still hold the listening socket; a restart spawned in that window
+/// fails to bind and the instance never comes back within the restart
+/// deadline (observed on CI, 2026-09-17).
+fn wait_for_endpoint_release(api_base: &str, deadline: Instant) -> Result<(), SenderError> {
+    while endpoint_is_bound(api_base) {
+        if Instant::now() >= deadline {
+            return Err(unavailable(
+                "the dedicated daemon did not release its endpoint after terminating",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+fn listener_process(api_base: &str) -> Option<ListenerProcess> {
+    let inodes = listening_socket_inodes(api_base);
     if inodes.is_empty() {
         return None;
     }
@@ -876,6 +910,12 @@ fn quiesce_daemon(config: &OwnToneConfig) -> Result<(), SenderError> {
     }
     let previous = process.identity();
     terminate_process(&process, config, QUIESCE_TERMINATE_DEADLINE)?;
+    // Termination is observed on the leader; the endpoint is released by the
+    // last thread. Never race the restart against that release.
+    wait_for_endpoint_release(
+        &config.api_base,
+        Instant::now() + QUIESCE_TERMINATE_DEADLINE,
+    )?;
     if let Some(command) = config.restart_command() {
         spawn_restart_command(&command)?;
     }
@@ -6823,6 +6863,12 @@ use std::os::unix::fs::OpenOptionsExt;
 struct State { queued: bool, playing: bool, paused: bool, selected: bool, bytes: usize, autostarted: bool }
 static STATE: Mutex<State> = Mutex::new(State { queued: false, playing: false, paused: false, selected: false, bytes: 0, autostarted: false });
 static FIFO: Mutex<Option<std::fs::File>> = Mutex::new(None);
+static TERM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+extern "C" {
+    fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+    fn syscall(num: i64, ...) -> i64;
+}
+extern "C" fn on_term(_sig: i32) { TERM.store(true, std::sync::atomic::Ordering::SeqCst); }
 fn pipe() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::args().nth(2).unwrap()).parent().unwrap().join("airplay.pcm")
 }
@@ -6885,10 +6931,27 @@ fn main() {
     });
     let addr = std::env::var("TRIBUTARY_FAKE_LISTEN").expect("listen address");
     let listener = TcpListener::bind(&addr).expect("bind");
-    for incoming in listener.incoming() {
-        let Ok(stream) = incoming else { continue };
-        std::thread::spawn(move || serve(stream));
+    unsafe { signal(15, on_term); }
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let Ok(stream) = incoming else { continue };
+            std::thread::spawn(move || serve(stream));
+        }
+    });
+    while !TERM.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    if pipe().with_extension("linger-on-term").exists() {
+        // The kernel window a real daemon shows on SIGTERM: the thread-group
+        // leader is already a zombie while a sibling thread still holds the
+        // listening socket. Exit only this thread; the process follows later.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            std::process::exit(0);
+        });
+        unsafe { syscall(60, 0i64); }
+    }
+    std::process::exit(0);
 }
 fn serve(stream: std::net::TcpStream) {
     let Ok(reader_stream) = stream.try_clone() else { return };
@@ -7084,6 +7147,53 @@ fn serve(stream: std::net::TcpStream) {
         config: OwnToneConfig,
         requests: PathBuf,
         child: Option<std::process::Child>,
+    }
+
+    /// The endpoint check follows the listening socket itself, not a process
+    /// that can be named as holding it.
+    #[cfg(owntone_host)]
+    #[test]
+    fn endpoint_is_bound_follows_the_listening_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        assert!(endpoint_is_bound(&api_base));
+        drop(listener);
+        wait_until(|| !endpoint_is_bound(&api_base));
+        assert!(listener_process(&api_base).is_none());
+    }
+
+    /// A restart must never race the previous instance's socket release. The
+    /// recording daemon models the kernel window a real multithreaded daemon
+    /// shows on SIGTERM — its thread-group leader is reported as a zombie
+    /// while a sibling thread still holds the listening socket — and the
+    /// quiescence must still come back with a fresh owned instance well
+    /// inside the restart deadline instead of spawning a restart that cannot
+    /// bind.
+    #[cfg(owntone_host)]
+    #[test]
+    fn quiesce_waits_for_the_endpoint_before_restarting() {
+        let daemon = RecordingOwnedDaemon::start();
+        std::fs::write(
+            daemon.config.pipe_path.with_extension("linger-on-term"),
+            b"",
+        )
+        .unwrap();
+        let before = listener_process(&daemon.config.api_base)
+            .expect("the daemon listens")
+            .identity();
+        let started = Instant::now();
+        quiesce_daemon(&daemon.config).expect("quiescence restarts the instance");
+        let after =
+            listener_process(&daemon.config.api_base).expect("the restarted instance listens");
+        assert!(process_is_owned(&after, &daemon.config));
+        assert_ne!(after.identity(), before);
+        assert!(
+            started.elapsed() < QUIESCE_RESTART_DEADLINE,
+            "the restart waited for the release instead of timing out: {:?}",
+            started.elapsed()
+        );
+        let client = OwnToneClient::new(&daemon.config.api_base).unwrap();
+        assert!(client.outputs().is_ok());
     }
 
     #[cfg(owntone_host)]
