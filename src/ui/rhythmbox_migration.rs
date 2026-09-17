@@ -752,9 +752,12 @@ fn present_preview(
         if !arm_request(generation, request_id) {
             return;
         }
-        if !admission.try_send(LibraryCommand::ApplyRhythmboxMigration(Box::new(request))) {
+        let admission_outcome =
+            admission.try_send(LibraryCommand::ApplyRhythmboxMigration(Box::new(request)));
+        if !admission_outcome.is_accepted() {
             disarm_request(generation, request_id);
             invalidate_generation(generation);
+            tracing::warn!(?admission_outcome, "Rhythmbox migration was not admitted");
             show_fixed_alert(
                 &parent,
                 "rhythmbox_migration.unavailable_heading",

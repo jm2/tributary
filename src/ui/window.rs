@@ -2165,7 +2165,10 @@ pub(crate) fn build_window(
                     services,
                     engine_scan_cancellation,
                 );
-                engine.run().await;
+                // Boxed: the engine's startup future carries the whole
+                // scan/command state machine and exceeds clippy's
+                // `large_futures` threshold for the GTK task stack frame.
+                Box::pin(engine.run()).await;
             }
             Err(e) => {
                 if let Err(error) = server_playlist_coordinator_shutdown.shutdown().await {
@@ -3156,11 +3159,13 @@ pub(crate) fn build_window(
                 );
                 if let Some(track_id) = history_track_id {
                     let counted_at_ms = Utc::now().timestamp_millis();
-                    if !playback_history_commands.try_send(LibraryCommand::RecordPlaybackHistory {
-                        track_id,
-                        counted_at_ms,
-                    }) {
-                        warn!("Playback history command admission is closed");
+                    let admission_outcome =
+                        playback_history_commands.try_send(LibraryCommand::RecordPlaybackHistory {
+                            track_id,
+                            counted_at_ms,
+                        });
+                    if !admission_outcome.is_accepted() {
+                        warn!(?admission_outcome, "Playback history command was not admitted");
                     }
                 }
                 match event {
