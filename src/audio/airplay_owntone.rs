@@ -7231,6 +7231,8 @@ fn serve(stream: std::net::TcpStream) {
         let override_path = daemon.config.pipe_path.with_extension("http-response");
         let refuse =
             || std::fs::write(&override_path, format!("{path}\n{status}\n{location}\n")).unwrap();
+        let step = format!("{path} {status} location={location:?} live={live}");
+        let started = Instant::now();
         let prepared = prepare();
         let ticket = prepared.ticket().unwrap();
         let generation = PlayerEventGeneration::from_raw(81);
@@ -7274,14 +7276,19 @@ fn serve(stream: std::net::TcpStream) {
             }
             assert!(
                 !recovery.attempt(),
-                "a redirect is not confirmed restoration"
+                "a redirect is not confirmed restoration ({})",
+                transport_refusal_context(&step, &daemon, &override_path)
             );
             assert!(daemon.config.takeover_record().exists());
             assert!(proxy.is_custodied(&ticket));
             assert_eq!(ticket.route_count(), 1);
             assert!(flock_is_held(&daemon.config.lock_path()));
             std::fs::remove_file(&override_path).unwrap();
-            assert!(recovery.attempt(), "valid responses must settle recovery");
+            assert!(
+                recovery.attempt(),
+                "valid responses must settle recovery ({})",
+                transport_refusal_context(&step, &daemon, &override_path)
+            );
             drop(recovery);
         } else {
             wait_until(|| ticket.route_count() == 0);
@@ -7300,6 +7307,38 @@ fn serve(stream: std::net::TcpStream) {
         }
         assert_outputs_match(&client, &baseline);
         assert_next_load_plays(&controller, &daemon, prepare(), generation.next());
+        // The isolated child runs with --nocapture, so this lands in CI logs.
+        eprintln!(
+            "transport refusal {step}: settled in {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// What the daemon side looked like when a transport-refusal step did not
+    /// settle: the listener bound to the endpoint (and whether it is the owned
+    /// instance), the response override, the takeover record and the last
+    /// requests the daemon recorded.
+    #[cfg(owntone_host)]
+    fn transport_refusal_context(
+        step: &str,
+        daemon: &RecordingOwnedDaemon,
+        override_path: &Path,
+    ) -> String {
+        let listener = listener_process(&daemon.config.api_base).map(|process| {
+            format!(
+                "pid {} owned={} exe={:?}",
+                process.pid,
+                process_is_owned(&process, &daemon.config),
+                process.exe
+            )
+        });
+        let recorded = daemon.recorded();
+        let recent: Vec<&str> = recorded.lines().rev().take(8).collect();
+        format!(
+            "{step}: listener={listener:?} override_present={} takeover_record={} recent requests={recent:?}",
+            override_path.exists(),
+            daemon.config.takeover_record().exists()
+        )
     }
 
     /// AK1: malformed observations must fail before any takeover effect.
