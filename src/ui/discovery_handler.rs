@@ -633,13 +633,12 @@ pub mod widget_tests {
         names
     }
 
-    /// An AirPlay loss removes exactly the AirPlay rows at that endpoint: a
-    /// Chromecast advertised at the same `host:port` keeps its row, and two
-    /// same-named AirPlay receivers are still removed independently.
-    pub fn airplay_loss_removes_only_airplay_rows_at_a_shared_endpoint() {
+    /// The selector as discovery leaves it: the local-output header row (the
+    /// Chromecast path skips row 0, so both removal paths see the same shape),
+    /// a Chromecast and an AirPlay receiver sharing `10.0.0.5:7000`, and a
+    /// same-named AirPlay receiver at `10.0.0.6:7000`.
+    fn selector_with_a_shared_endpoint() -> gtk::ListBox {
         let output_list = gtk::ListBox::new();
-        // The selector's first row is the local-output header the Chromecast
-        // path skips; give the list one so both removal paths see the same shape.
         let header = header_bar::build_output_row("This Computer", "audio-speakers-symbolic", true);
         header.set_widget_name("This Computer");
         output_list.append(&header);
@@ -666,6 +665,14 @@ pub mod widget_tests {
                 Some("112233445566"),
             ),
         );
+        output_list
+    }
+
+    /// An AirPlay loss removes exactly the AirPlay rows at that endpoint: a
+    /// Chromecast advertised at the same `host:port` keeps its row, and two
+    /// same-named AirPlay receivers are still removed independently.
+    pub fn airplay_loss_removes_only_airplay_rows_at_a_shared_endpoint() {
+        let output_list = selector_with_a_shared_endpoint();
         assert_eq!(
             row_names(&output_list),
             vec![
