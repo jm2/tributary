@@ -95,12 +95,37 @@ fn pane_track_id(candidate: &AlbumArtCandidate) -> Option<crate::architecture::T
     }
 }
 
+/// The library connection the built-in local artwork arm resolves
+/// against.
+///
+/// Production resolves against the process-wide shared library. Tests
+/// inject a private, already-migrated connection so a normal
+/// `cargo test` run never opens, migrates, or changes the real user
+/// library: the previous builtin-local fixture reached the production
+/// `init_db()` seam and therefore created and migrated
+/// `dirs::data_dir()/tributary/library.db` on every developer machine
+/// (R1, 2026-09-17 refinery audit).
+pub enum LocalLibrary {
+    /// Open the process-wide shared library database. Production only.
+    Shared,
+    /// Resolve against this private connection; `init_db` is never
+    /// consulted on this path. Constructed by tests only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Injected(sea_orm::DatabaseConnection),
+}
+
+// The parameter list mirrors the resolution inputs (authority chain,
+// configured roots, runtime hand-off, library seam, row, liveness);
+// callers construct them inline, so a parameter struct would only add
+// indirection at the call sites.
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_kind(
     source_registry: Option<crate::source_registry::SourceRegistry>,
     source_id: Option<SourceId>,
     source_epoch: Option<u64>,
     configured_roots: Vec<String>,
     rt_handle: Option<tokio::runtime::Handle>,
+    library: LocalLibrary,
     candidate: &AlbumArtCandidate,
     liveness: &album_art::ScopedArtFetch,
 ) -> ResolvedArtKind {
@@ -155,8 +180,14 @@ pub async fn resolve_kind(
             resolve_remote_artwork(registry, &id, epoch, candidate).await
         }
         PaneAuthority::BuiltinLocal => {
-            resolve_builtin_local_art_on_runtime(rt_handle, candidate, &configured_roots, liveness)
-                .await
+            resolve_builtin_local_art_on_runtime(
+                rt_handle,
+                library,
+                candidate,
+                &configured_roots,
+                liveness,
+            )
+            .await
         }
         PaneAuthority::IncompleteRetained => {
             // A retained source identity whose registry handle or session
@@ -203,6 +234,7 @@ fn resolve_external_art(candidate: &AlbumArtCandidate) -> ResolvedArtKind {
 /// placeholder. This preserves local artwork without classifying every
 /// local row as external (2026-09-12 review finding).
 async fn resolve_builtin_local_art(
+    library: &LocalLibrary,
     candidate: &AlbumArtCandidate,
     configured_roots: &[String],
     liveness: &album_art::ScopedArtFetch,
@@ -212,16 +244,23 @@ async fn resolve_builtin_local_art(
     if candidate.track_id.is_empty() || !liveness.is_live() {
         return ResolvedArtKind::NoArtwork;
     }
-    let db = match crate::db::connection::init_db().await {
-        Ok(db) => db,
-        Err(error) => {
-            tracing::debug!(
-                %error,
-                track_id = %candidate.track_id,
-                "Album pane local library database unavailable"
-            );
-            return ResolvedArtKind::NoArtwork;
-        }
+    let db = match library {
+        LocalLibrary::Shared => match crate::db::connection::init_db().await {
+            Ok(db) => db,
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    track_id = %candidate.track_id,
+                    "Album pane local library database unavailable"
+                );
+                return ResolvedArtKind::NoArtwork;
+            }
+        },
+        // An injected connection is already migrated: `init_db` is
+        // unreachable on this path, so an injected resolution can never
+        // create, migrate, or change any library outside the fixture
+        // (R1, 2026-09-17 refinery audit).
+        LocalLibrary::Injected(db) => db.clone(),
     };
     // Stop before the retained-authority probe if the row was revoked
     // while the database connection was being established. The probe
@@ -258,6 +297,7 @@ async fn resolve_builtin_local_art(
 /// task — mirroring the playback resolver's `rt_handle.spawn` hand-off.
 async fn resolve_builtin_local_art_on_runtime(
     rt_handle: Option<tokio::runtime::Handle>,
+    library: LocalLibrary,
     candidate: &AlbumArtCandidate,
     configured_roots: &[String],
     liveness: &album_art::ScopedArtFetch,
@@ -284,7 +324,7 @@ async fn resolve_builtin_local_art_on_runtime(
     let configured_roots = configured_roots.to_vec();
     let task_liveness = liveness.clone();
     let resolved = run_until_revoked(&rt_handle, liveness, async move {
-        resolve_builtin_local_art(&candidate, &configured_roots, &task_liveness).await
+        resolve_builtin_local_art(&library, &candidate, &configured_roots, &task_liveness).await
     })
     .await;
     resolved.unwrap_or(ResolvedArtKind::NoArtwork)
@@ -475,5 +515,7 @@ async fn resolve_remote_artwork(
     }
 }
 
+#[cfg(test)]
+mod local_library_tests;
 #[cfg(test)]
 mod tests;

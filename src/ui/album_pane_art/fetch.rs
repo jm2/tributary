@@ -18,7 +18,7 @@ use crate::architecture::SourceId;
 use crate::ui::album_art;
 use crate::ui::objects::AlbumArtCandidate;
 
-use super::resolver::{resolve_kind, ResolvedArtKind};
+use super::resolver::{resolve_kind, LocalLibrary, ResolvedArtKind};
 use super::{
     AlbumArtCache, AlbumArtCellState, AlbumArtController, BindGeneration, FALLBACK_PLACEHOLDER_ICON,
 };
@@ -89,6 +89,10 @@ pub(super) fn orchestrate_pane_fetch(
             fetch.source_epoch,
             fetch.configured_roots.clone(),
             fetch.rt_handle.clone(),
+            // Production resolves against the process-wide shared
+            // library; tests inject a private connection instead (R1,
+            // 2026-09-17 refinery audit).
+            LocalLibrary::Shared,
             &candidate,
             &liveness,
         )

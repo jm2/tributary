@@ -116,6 +116,7 @@ async fn incomplete_retained_identity_leaves_the_placeholder() {
         no_epoch.source_session_epoch,
         Vec::new(),
         None,
+        LocalLibrary::Shared,
         &no_epoch,
         &liveness,
     )
@@ -138,6 +139,7 @@ async fn incomplete_retained_identity_leaves_the_placeholder() {
         no_registry.source_session_epoch,
         Vec::new(),
         None,
+        LocalLibrary::Shared,
         &no_registry,
         &liveness,
     )
@@ -156,52 +158,56 @@ async fn incomplete_retained_identity_leaves_the_placeholder() {
 async fn external_rows_keep_the_transitional_direct_path() {
     let liveness = album_art::ScopedArtFetch::new();
     let file_row = candidate("file:///tmp/external.flac", "", None, None);
-    let resolved = resolve_kind(None, None, None, Vec::new(), None, &file_row, &liveness).await;
+    let resolved = resolve_kind(
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        LocalLibrary::Shared,
+        &file_row,
+        &liveness,
+    )
+    .await;
     assert!(matches!(resolved, ResolvedArtKind::DirectFile { .. }));
 
     let url_row = candidate("", "https://example.test/cover.jpg", None, None);
-    let resolved = resolve_kind(None, None, None, Vec::new(), None, &url_row, &liveness).await;
+    let resolved = resolve_kind(
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        LocalLibrary::Shared,
+        &url_row,
+        &liveness,
+    )
+    .await;
     assert!(matches!(resolved, ResolvedArtKind::DirectUrl { .. }));
 
     let empty_row = candidate("", "", None, None);
-    let resolved = resolve_kind(None, None, None, Vec::new(), None, &empty_row, &liveness).await;
-    assert!(matches!(resolved, ResolvedArtKind::NoArtwork));
-}
-
-/// The built-in local library arm must resolve on the application's
-/// Tokio runtime, never the GTK main context: the pane fetch is driven
-/// on a glib main context with no entered runtime, and
-/// [`crate::local::resolver::resolve_track`] polls
-/// `tokio::time::timeout` / `spawn_blocking`, which panic without one
-/// (2026-09-13 review finding). This drives the real resolution path on
-/// a glib context whose only runtime is the supplied handle, so the old
-/// direct call panics while the runtime hand-off resolves.
-#[test]
-fn builtin_local_artwork_resolves_on_the_application_runtime() {
-    // The runtime lives on its own thread — exactly the production
-    // shape, and NOT entered on the glib context thread below.
-    let runtime = tokio::runtime::Runtime::new().expect("application tokio runtime");
-    let handle = runtime.handle().clone();
-
-    let row = candidate("file:///media/music/album/01.flac", "", Some(local()), None);
-    let liveness = album_art::ScopedArtFetch::new();
-    let context = glib::MainContext::new();
-    let resolved = context.block_on(resolve_kind(
+    let resolved = resolve_kind(
         None,
-        row.source_id,
-        row.source_session_epoch,
+        None,
+        None,
         Vec::new(),
-        Some(handle),
-        &row,
+        None,
+        LocalLibrary::Shared,
+        &empty_row,
         &liveness,
-    ));
-
-    // The track is not in this process's library, so the retained
-    // authority resolves to no artwork; the contract under test is that
-    // it resolves on the runtime rather than panicking on the main
-    // context.
+    )
+    .await;
     assert!(matches!(resolved, ResolvedArtKind::NoArtwork));
 }
+
+// The built-in local resolution tests live in `super::local_library_tests`:
+// the former `builtin_local_artwork_resolves_on_the_application_runtime`
+// test reached the production `init_db()` seam, so a normal `cargo test`
+// run created, migrated, and opened the real user library, and its single
+// NoArtwork assertion also accepted a database error (R1, 2026-09-17
+// refinery audit). The replacement tests resolve against an injected
+// in-memory library with an authorized temporary root and assert a
+// successful retained-file resolution with real embedded-art extraction.
 
 /// N3 regression (2026-09-14 review finding): a built-in-local row
 /// whose token is revoked mid-resolution must not continue its
@@ -328,6 +334,15 @@ fn pre_revoked_builtin_local_row_is_refused_at_admission() {
     let liveness = album_art::ScopedArtFetch::new();
     liveness.revoke();
     let row = candidate("file:///media/music/album/01.flac", "", Some(local()), None);
+    // An injected (empty, in-memory) library keeps even a regressed
+    // admission order from touching the real user library: the revoked
+    // check fires before any database access, and the injected path can
+    // never reach `init_db` at all (R1, 2026-09-17 refinery audit).
+    let library = LocalLibrary::Injected(
+        tokio::runtime::Runtime::new()
+            .expect("fixture setup runtime")
+            .block_on(super::local_library_tests::memory_library()),
+    );
     let context = glib::MainContext::new();
     let resolved = context.block_on(resolve_kind(
         None,
@@ -335,6 +350,7 @@ fn pre_revoked_builtin_local_row_is_refused_at_admission() {
         row.source_session_epoch,
         Vec::new(),
         None,
+        library,
         &row,
         &liveness,
     ));
