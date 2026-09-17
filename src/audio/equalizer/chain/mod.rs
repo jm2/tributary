@@ -10,9 +10,13 @@ use gstreamer as gst;
 
 use super::{ClipProtection, EqSettings};
 
-/// How long the dynamic limiter edit waits for its blocking pad probe to
-/// engage before deferring to the caller's pause/relink fallback. Bounded
-/// so a pad that never reports idle can never stall the UI thread.
+/// How long the dynamic limiter edit waits, after installing its blocking
+/// pad probe, for the callback to publish an outcome or to demonstrably
+/// engage. This is the *engagement* window: a pad that never reports idle
+/// can never stall the UI thread, and an edit that has not started when
+/// the window closes is cancelled. Once the callback has engaged, the
+/// caller waits for its published outcome instead of cancelling, because
+/// the edit already owns the graph mutation and the `rglimiter` handle.
 const LIMITER_PROBE_ENGAGE_TIMEOUT: Duration = Duration::from_millis(200);
 
 // ── Bin construction ────────────────────────────────────────────────────
@@ -132,6 +136,93 @@ pub enum LimiterRemoveFault {
     EveryLinkBlocked,
 }
 
+/// Test-only deterministic seam that suspends the blocking-probe callback
+/// *after* it has engaged the edit, until a regression test releases it.
+///
+/// The engagement handshake only exists to cancel an edit that has
+/// demonstrably not started; an asynchronous callback that is already
+/// executing must never have its probe removed on a missing outcome. This
+/// hold lets the tests reproduce exactly that interleaving on a live
+/// pipeline: the callback engages, blocks here while the caller's bounded
+/// engagement window expires, and then completes so the caller can be
+/// observed to retain the outcome, the probe, and the limiter handle.
+#[cfg(test)]
+pub(crate) struct ProbeEditHold {
+    state: Mutex<ProbeEditHoldState>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+struct ProbeEditHoldState {
+    entered: bool,
+    released: bool,
+    /// The thread the held callback is running on (the streaming thread).
+    thread: Option<std::thread::ThreadId>,
+}
+
+#[cfg(test)]
+impl ProbeEditHold {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(ProbeEditHoldState {
+                entered: false,
+                released: false,
+                thread: None,
+            }),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Called on the streaming thread from inside the probe callback:
+    /// publish entry, then block until the test releases the callback.
+    fn enter_and_wait(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.entered = true;
+        state.thread = Some(std::thread::current().id());
+        self.cv.notify_all();
+        while !state.released {
+            state = self
+                .cv
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Block (bounded) until the callback has entered the hold.
+    pub(crate) fn wait_until_entered(&self, timeout: Duration) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (state, _) = self
+            .cv
+            .wait_timeout_while(state, timeout, |state| !state.entered)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.entered
+    }
+
+    /// The thread the held callback is running on, once it has entered.
+    pub(crate) fn callback_thread(&self) -> Option<std::thread::ThreadId> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .thread
+    }
+
+    /// Let the held callback run to completion.
+    pub(crate) fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.released = true;
+        self.cv.notify_all();
+    }
+}
+
 // ── Installed chain ─────────────────────────────────────────────────────
 
 /// Handles into one installed equalizer bin. Retained by the local
@@ -156,6 +247,10 @@ pub struct EqChain {
     /// Test-only armed surgery fault; production builds never carry it.
     #[cfg(test)]
     remove_fault: Option<LimiterRemoveFault>,
+    /// Test-only seam that suspends the blocking-probe callback after
+    /// engagement; production builds never carry it.
+    #[cfg(test)]
+    probe_hold: Option<Arc<ProbeEditHold>>,
 }
 
 impl EqChain {
@@ -190,6 +285,8 @@ impl EqChain {
             wedged: false,
             #[cfg(test)]
             remove_fault: None,
+            #[cfg(test)]
+            probe_hold: None,
         };
         chain.apply_band_transaction(settings);
         Ok(chain)
@@ -362,8 +459,12 @@ impl EqChain {
     /// unlinked pad (contract: *Live-reconfiguration boundary*).
     ///
     /// A pipeline that never reports the pad idle within the bounded
-    /// window is left untouched and the caller falls back to the
-    /// pause/relink seam.
+    /// engagement window is left untouched and the caller falls back to the
+    /// pause/relink seam. The window only ever cancels an edit that has
+    /// **demonstrably not started**: once the callback publishes its
+    /// engagement, the caller waits for its outcome instead, because the
+    /// edit already owns the graph mutation and the `rglimiter` handle and
+    /// cancelling it would strand both.
     ///
     /// Returns `Some(true)` when the requested toggle is installed,
     /// `Some(false)` when the dynamic re-link failed and the pre-edit
@@ -378,35 +479,79 @@ impl EqChain {
         let graph = self.limiter_graph();
         // The probe callback runs on the streaming thread, so it cannot
         // borrow the chain: the owned `rglimiter` handle is threaded
-        // through a shared slot and the outcome is reported over a channel.
-        // The test-fault decisions are resolved before the closure is built
-        // and captured by value, so the callback never touches the chain.
+        // through a shared slot, the outcome is reported over a channel,
+        // and a shared gate serializes the caller's cancel decision with
+        // the callback's start. The test-fault decisions are resolved
+        // before the closure is built and captured by value, so the
+        // callback never touches the chain.
         let decisions = self.take_limiter_fault_decisions();
         let slot = Arc::new(Mutex::new(self.clipper.take()));
         let (tx, rx) = std::sync::mpsc::sync_channel::<LimiterEditOutcome>(1);
-        let signal = Mutex::new(tx);
+        let signal = Arc::new(Mutex::new(tx));
+        let gate = Arc::new(Mutex::new(LimiterEditGate::default()));
+        let graph_cb = graph.clone();
         let slot_cb = Arc::clone(&slot);
-        let probe_id = eq_src.add_probe(
+        let signal_cb = Arc::clone(&signal);
+        let gate_cb = Arc::clone(&gate);
+        #[cfg(test)]
+        let hold_cb = self.probe_hold.take();
+        let mut probe_id = eq_src.add_probe(
             gst::PadProbeType::BLOCK_DOWNSTREAM | gst::PadProbeType::IDLE,
             move |_pad, _info| {
                 limiter_edit_probe_callback(
+                    &gate_cb,
                     &slot_cb,
-                    &signal,
+                    &signal_cb,
                     LimiterProbeEdit {
-                        graph: &graph,
+                        graph: &graph_cb,
                         soft,
                         decisions,
+                        #[cfg(test)]
+                        hold: hold_cb.clone(),
                     },
                 )
             },
         );
         // A pad that reports idle synchronously runs the callback before
         // `add_probe` returns and reports no id; either way the outcome
-        // arrives over the channel. A missing outcome means the probe
-        // could not engage (or the pad never went idle), so the graph is
-        // left untouched for the caller's pause/relink fallback.
-        let outcome = rx.recv_timeout(LIMITER_PROBE_ENGAGE_TIMEOUT).ok();
-        let wedged = outcome == Some(LimiterEditOutcome::Unlinked);
+        // arrives over the channel. A missing outcome within the bounded
+        // window means the callback either never engaged (cancel it) or
+        // already started and is merely slow to publish (await it).
+        let mut engagement_confirmed = false;
+        let outcome = match rx.recv_timeout(LIMITER_PROBE_ENGAGE_TIMEOUT) {
+            Ok(outcome) => Some(outcome),
+            Err(_) => {
+                let mut gate = gate
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if gate.engaged {
+                    // The edit is already executing on the streaming thread.
+                    // Do not remove its probe: wait for the outcome it
+                    // publishes, so the final topology and the owned handle
+                    // are retained rather than stranded.
+                    engagement_confirmed = true;
+                    drop(gate);
+                    rx.recv().ok()
+                } else {
+                    // Demonstrably not started: mark it cancelled under the
+                    // same gate the callback checks, then retire the probe.
+                    // A callback that starts afterwards observes `cancelled`
+                    // and skips the edit.
+                    gate.cancelled = true;
+                    drop(gate);
+                    if let Some(id) = probe_id.take() {
+                        eq_src.remove_probe(id);
+                    }
+                    None
+                }
+            }
+        };
+        // An engaged edit whose outcome never arrived is conservatively
+        // treated as wedged: the probe stays installed and the fallback is
+        // refused, so it can never resume a graph whose topology was not
+        // validated.
+        let wedged = outcome == Some(LimiterEditOutcome::Unlinked)
+            || (engagement_confirmed && outcome.is_none());
         if let Some(probe_id) = probe_id {
             // Harmless when the callback already uninstalled itself over a
             // validated topology. A wedged callback returned `Ok`, so the
@@ -426,6 +571,13 @@ impl EqChain {
             self.wedged = true;
         }
         outcome.map(|outcome| outcome == LimiterEditOutcome::Installed)
+    }
+
+    /// Test-only seam: arm a hold that suspends the blocking-probe callback
+    /// after it has engaged, until the test releases it.
+    #[cfg(test)]
+    pub(crate) fn inject_probe_edit_hold(&mut self, hold: Arc<ProbeEditHold>) {
+        self.probe_hold = Some(hold);
     }
 
     /// Test-only: resolve and consume the armed surgery fault into the
@@ -510,6 +662,21 @@ enum LimiterEditOutcome {
     Unlinked,
 }
 
+/// Engagement handshake between [`EqChain::swap_clip_protection_under_block_probe`]
+/// and its blocking-probe callback. The caller serializes its cancel decision
+/// with the callback's start on this gate, so an edit is either cancelled
+/// before it starts or allowed to finish — never cancelled mid-flight on a
+/// missing outcome.
+#[derive(Default)]
+struct LimiterEditGate {
+    /// Set by the callback before it touches the graph.
+    engaged: bool,
+    /// Set by the caller when it decides the callback demonstrably has not
+    /// started; the callback observes it under the same lock and skips the
+    /// edit.
+    cancelled: bool,
+}
+
 /// Whether the `equalizer-10bands` src pad currently has a linked downstream
 /// peer. The pad is the single boundary every limiter edit rewires, so this
 /// is the ground truth for the contract's "never uninstall the probe while
@@ -545,6 +712,10 @@ struct LimiterProbeEdit<'a> {
     /// `(direct_blocked, restore_blocked, forced_blocked)`, in the order the
     /// removal surgery consumes them.
     decisions: (bool, bool, bool),
+    /// Test-only hold that suspends the callback after engagement; never
+    /// present in production builds.
+    #[cfg(test)]
+    hold: Option<Arc<ProbeEditHold>>,
 }
 
 /// Run one limiter edit inside the blocking-probe callback and choose the
@@ -556,17 +727,36 @@ struct LimiterProbeEdit<'a> {
 /// the wedged pipeline instead of resuming it. The outcome reaches the
 /// waiting caller over `signal`. Extracted from the public seam to keep that
 /// method within the file's method-length budget.
+///
+/// The callback publishes engagement on `gate` before touching the graph,
+/// so the caller can only cancel an edit that has demonstrably not started.
 fn limiter_edit_probe_callback(
+    gate: &Mutex<LimiterEditGate>,
     slot: &Mutex<Option<gst::Element>>,
     signal: &Mutex<std::sync::mpsc::SyncSender<LimiterEditOutcome>>,
     edit: LimiterProbeEdit<'_>,
 ) -> gst::PadProbeReturn {
-    let LimiterProbeEdit {
-        graph,
-        soft,
-        decisions,
-    } = edit;
-    let (direct_blocked, restore_blocked, forced_blocked) = decisions;
+    // Publish engagement before touching the graph. The caller's cancel
+    // decision is serialized on the same gate, so an edit that started is
+    // never cancelled and a cancelled edit never starts.
+    {
+        let mut gate = gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if gate.cancelled {
+            return gst::PadProbeReturn::Remove;
+        }
+        gate.engaged = true;
+    }
+    let graph = edit.graph;
+    let soft = edit.soft;
+    let (direct_blocked, restore_blocked, forced_blocked) = edit.decisions;
+    #[cfg(test)]
+    let hold = edit.hold;
+    #[cfg(test)]
+    if let Some(hold) = hold.as_ref() {
+        hold.enter_and_wait();
+    }
     let outcome = {
         let mut current = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         edit_limiter_topology(
