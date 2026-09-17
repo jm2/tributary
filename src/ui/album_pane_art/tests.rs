@@ -279,36 +279,62 @@ fn pane_candidate_for(
         .expect("album row must carry an artwork candidate")
 }
 
-/// The P2 regression (2026-09-14 review finding): a mounted removable
-/// album reaches the pane as a production registry row with an empty
-/// URI. Its retained-file capability must route it to the retained
-/// file extractor and the embedded art must come back through the
-/// exact retained capability — never through a raw path.
-#[tokio::test]
-async fn pathless_removable_album_row_resolves_retained_embedded_art() {
+/// The P2 regression (2026-09-14 review finding; production shape from the
+/// 2026-09-17 review finding): a mounted removable album reaches the pane as
+/// a production registry row with an empty URI. Its retained-file capability
+/// must route it to the retained file extractor, and the embedded art must
+/// come back through the exact retained capability — never through a raw
+/// path.
+///
+/// This drives the resolver from a GLib main context on a thread with NO
+/// entered Tokio runtime, exactly as `orchestrate_pane_fetch` does in
+/// production (`src/main.rs` parks the runtime on a background thread). The
+/// direct await this replaced constructed `tokio::time::timeout_at` on the
+/// main context and panicked before extraction; a `#[tokio::test]` would
+/// mask that.
+#[test]
+fn pathless_removable_album_row_resolves_retained_embedded_art_from_glib_context() {
+    let runtime = tokio::runtime::Runtime::new().expect("application tokio runtime");
+    let application_handle = runtime.handle().clone();
+
     let mount = tempfile::tempdir().expect("temporary removable mount");
     let art = b"retained-removable-cover-art";
     tagged_flac_with_embedded_art(&mount.path().join("cover.flac"), art);
     let source_id =
         SourceId::removable("pane:test:retained-art").expect("removable source identity");
-    let (registry, epoch, track) = adopted_removable(mount.path(), source_id).await;
+    let (registry, epoch, track) = runtime.block_on(adopted_removable(mount.path(), source_id));
 
     let candidate = pane_candidate_for(&track, source_id, epoch);
     assert_eq!(candidate.uri, "", "production registry rows are pathless");
     assert_eq!(candidate.source_id, Some(source_id));
     assert_eq!(candidate.source_session_epoch, Some(epoch));
 
+    let shutdown_registry = registry.clone();
+    let resolution_registry = registry.clone();
     let liveness = album_art::ScopedArtFetch::new();
-    let resolved = resolve_kind(
-        Some(registry.clone()),
-        Some(source_id),
-        Some(epoch),
-        Vec::new(),
-        Some(tokio::runtime::Handle::current()),
-        &candidate,
-        &liveness,
-    )
-    .await;
+
+    // The runtime lives on `runtime` above and is reachable only through the
+    // supplied handle, mirroring production: the resolving thread has no
+    // entered runtime, so any main-context Tokio API call panics.
+    let resolved = std::thread::spawn(move || {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the pane resolution thread must have no entered Tokio runtime"
+        );
+        let context = gtk::glib::MainContext::new();
+        context.block_on(resolve_kind(
+            Some(resolution_registry),
+            Some(source_id),
+            Some(epoch),
+            Vec::new(),
+            Some(application_handle),
+            &candidate,
+            &liveness,
+        ))
+    })
+    .join()
+    .expect("pane resolution thread");
+
     let ResolvedArtKind::ResolvedFile { media } = resolved else {
         panic!("a pathless removable row must reach retained-file artwork");
     };
@@ -319,7 +345,93 @@ async fn pathless_removable_album_row_resolves_retained_embedded_art() {
     );
 
     drop(media);
-    registry.shutdown().wait().await;
+    runtime.block_on(shutdown_registry.shutdown().wait());
+}
+
+/// A retained-file-capable registry row whose token was revoked before its
+/// fetch was driven must fail closed: the runtime resolution is refused at
+/// admission, so no authority probe is scheduled for a row that can no
+/// longer paint (2026-09-17 review finding).
+#[test]
+fn pre_revoked_removable_registry_row_fails_closed() {
+    let runtime = tokio::runtime::Runtime::new().expect("application tokio runtime");
+    let application_handle = runtime.handle().clone();
+
+    let mount = tempfile::tempdir().expect("temporary removable mount");
+    tagged_flac_with_embedded_art(&mount.path().join("cover.flac"), b"art");
+    let source_id =
+        SourceId::removable("pane:test:pre-revoked").expect("removable source identity");
+    let (registry, epoch, track) = runtime.block_on(adopted_removable(mount.path(), source_id));
+    let candidate = pane_candidate_for(&track, source_id, epoch);
+
+    let liveness = album_art::ScopedArtFetch::new();
+    liveness.revoke();
+
+    let resolved = std::thread::spawn({
+        let registry = registry.clone();
+        let liveness = liveness.clone();
+        move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            gtk::glib::MainContext::new().block_on(resolve_kind(
+                Some(registry),
+                Some(source_id),
+                Some(epoch),
+                Vec::new(),
+                Some(application_handle),
+                &candidate,
+                &liveness,
+            ))
+        }
+    })
+    .join()
+    .expect("pane resolution thread");
+
+    assert!(
+        matches!(resolved, ResolvedArtKind::NoArtwork),
+        "a pre-revoked registry row must leave the placeholder"
+    );
+
+    runtime.block_on(registry.shutdown().wait());
+}
+
+/// A retained-file-capable registry row with no attached application
+/// runtime must fail closed: the retained route polls Tokio time/blocking
+/// APIs, so resolving it on the runtime-less main context would panic
+/// (2026-09-17 review finding).
+#[test]
+fn removable_registry_row_without_runtime_fails_closed() {
+    let runtime = tokio::runtime::Runtime::new().expect("application tokio runtime");
+    let mount = tempfile::tempdir().expect("temporary removable mount");
+    tagged_flac_with_embedded_art(&mount.path().join("cover.flac"), b"art");
+    let source_id = SourceId::removable("pane:test:no-runtime").expect("removable source identity");
+    let (registry, epoch, track) = runtime.block_on(adopted_removable(mount.path(), source_id));
+    let candidate = pane_candidate_for(&track, source_id, epoch);
+
+    let resolved = std::thread::spawn({
+        let registry = registry.clone();
+        move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            let liveness = album_art::ScopedArtFetch::new();
+            gtk::glib::MainContext::new().block_on(resolve_kind(
+                Some(registry),
+                Some(source_id),
+                Some(epoch),
+                Vec::new(),
+                None,
+                &candidate,
+                &liveness,
+            ))
+        }
+    })
+    .join()
+    .expect("pane resolution thread");
+
+    assert!(
+        matches!(resolved, ResolvedArtKind::NoArtwork),
+        "a retained row without a runtime must leave the placeholder"
+    );
+
+    runtime.block_on(registry.shutdown().wait());
 }
 
 /// A superseded session epoch must leave the placeholder: the live

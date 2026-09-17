@@ -122,15 +122,30 @@ pub async fn resolve_kind(
             // credential and reopens no pathname merely to discover the
             // source kind (2026-09-14 review finding).
             if registry.retains_file_streams(id, epoch) {
-                if let Some(resolved) =
-                    resolve_retained_file_art(registry, &id, epoch, candidate).await
+                // The retained route reaches adapter code that polls Tokio
+                // time/blocking APIs (`acquire_retained_probe_permit`
+                // constructs a `tokio::time::timeout_at`), which panics on
+                // the runtime-less GTK main context this fetch is driven on.
+                // Dispatch it onto the application runtime and abort it if
+                // the row is revoked mid-flight; a revoked or
+                // missing-runtime row fails closed (2026-09-17 review
+                // finding). Only a genuine remote/refused result may fall
+                // through to the lease-isolated remote resolver below.
+                let owned_registry = registry.clone();
+                let owned_candidate = candidate.clone();
+                match resolve_on_application_runtime(rt_handle.clone(), liveness, async move {
+                    resolve_retained_file_art(&owned_registry, &id, epoch, &owned_candidate).await
+                })
+                .await
                 {
-                    return resolved;
+                    RuntimeResolution::Completed(Some(resolved)) => return resolved,
+                    // `Ok(Http)` or an error means the retained local route
+                    // did not produce a file capability; fall through to the
+                    // lease-isolated remote resolver for this registry-backed
+                    // row. Never a raw pathname.
+                    RuntimeResolution::Completed(None) => {}
+                    RuntimeResolution::Aborted => return ResolvedArtKind::NoArtwork,
                 }
-                // `Ok(Http)` or an error means the retained local route
-                // did not produce a file capability; fall through to the
-                // lease-isolated remote resolver for this registry-backed
-                // row. Never a raw pathname.
             }
             // Lease-isolated remote resolver. For a registry-backed row
             // this is TERMINAL: an explicit no-artwork or a refused
@@ -305,6 +320,54 @@ where
             task.abort();
             None
         }
+    }
+}
+
+/// Outcome of one resolution dispatched onto the application runtime.
+enum RuntimeResolution<T> {
+    /// The runtime-hosted work ran to completion and produced `T`.
+    Completed(T),
+    /// The row was revoked before or while the work ran, or no application
+    /// runtime was attached. The caller must fail closed.
+    Aborted,
+}
+
+/// Run one resolution on the application's Tokio runtime, cancelling it the
+/// moment the row's liveness token is revoked.
+///
+/// The retained registry route reaches adapter code that awaits Tokio
+/// time/blocking APIs ([`crate::local::resolver::acquire_retained_probe_permit`]
+/// constructs a `tokio::time::timeout_at`), which panics on the runtime-less
+/// GTK main context the pane fetch is driven on (`src/main.rs` parks the
+/// runtime on a background thread). Merely carrying a runtime handle does not
+/// enter it, so the work is spawned onto the handle. A revoked row aborts the
+/// pending task, and a missing runtime fails closed instead of polling those
+/// APIs from the main context (2026-09-17 review finding).
+async fn resolve_on_application_runtime<T>(
+    rt_handle: Option<tokio::runtime::Handle>,
+    liveness: &album_art::ScopedArtFetch,
+    work: impl std::future::Future<Output = T> + Send + 'static,
+) -> RuntimeResolution<T>
+where
+    T: Send + 'static,
+{
+    // Bound admission: a row whose fetch was already revoked (rebind,
+    // unbind, teardown, factory swap) never schedules resolution work at
+    // all, so rapid scrolling cannot pile up authority probes for rows
+    // that can no longer paint (2026-09-14 review finding).
+    if !liveness.is_live() {
+        return RuntimeResolution::Aborted;
+    }
+    let Some(rt_handle) = rt_handle else {
+        // No application runtime is attached (the controller was built
+        // without one). Retained extraction needs the runtime's timer and
+        // blocking pool, so fail closed to the placeholder instead of
+        // polling those APIs from the main context and panicking.
+        return RuntimeResolution::Aborted;
+    };
+    match run_until_revoked(&rt_handle, liveness, work).await {
+        Some(value) => RuntimeResolution::Completed(value),
+        None => RuntimeResolution::Aborted,
     }
 }
 
@@ -668,6 +731,66 @@ mod tests {
         });
 
         assert_eq!(result, None, "a revoked row yields no resolved value");
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "the runtime resolution must be cancelled once the row is revoked"
+        );
+
+        // Release the parked work so a late completion cannot leak.
+        let _ = release_tx.send(());
+    }
+
+    /// The registry retained-file arm relies on the same runtime dispatch
+    /// primitive as the built-in local arm: work hosted on the application
+    /// runtime must be cancelled the moment the row's token is revoked, so
+    /// a rebind that lands while a retained authority probe is still
+    /// waiting does not run the probe to completion for a row that can no
+    /// longer paint (2026-09-17 review finding).
+    #[test]
+    fn revoked_registry_resolution_on_runtime_is_cancelled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let runtime = tokio::runtime::Runtime::new().expect("application tokio runtime");
+        let handle = runtime.handle().clone();
+        let liveness = album_art::ScopedArtFetch::new();
+
+        let started = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let work_started = started.clone();
+        let work_completed = completed.clone();
+        let work = async move {
+            work_started.store(true, Ordering::SeqCst);
+            // Park where the real retained authority probe awaits its
+            // permit/blocking work.
+            let _ = release_rx.await;
+            work_completed.store(true, Ordering::SeqCst);
+            0usize
+        };
+
+        // Revoke only once the work is definitely running, exactly like a
+        // rebind that lands while the row's resolution is in flight.
+        let revoker_token = liveness.clone();
+        let revoker_started = started.clone();
+
+        let outcome = runtime.block_on(async move {
+            let revoker = tokio::spawn(async move {
+                while !revoker_started.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                revoker_token.revoke();
+            });
+            let outcome = resolve_on_application_runtime(Some(handle), &liveness, work).await;
+            revoker.await.expect("revoker task");
+            outcome
+        });
+
+        assert!(
+            matches!(outcome, RuntimeResolution::Aborted),
+            "a revoked registry resolution must abort rather than complete"
+        );
         assert!(
             !completed.load(Ordering::SeqCst),
             "the runtime resolution must be cancelled once the row is revoked"
