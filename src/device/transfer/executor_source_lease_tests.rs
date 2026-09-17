@@ -29,9 +29,7 @@ use std::path::PathBuf;
 use super::executor_rollback_tests::entry_names;
 use super::executor_tests::transfer_request;
 use super::test_support::{authority_pair, read_authority, write_source_file};
-#[cfg(unix)]
-use super::types::TransferError;
-use super::types::{Stage, TransferItem, TransferProgress, TransferSummary};
+use super::types::{Stage, TransferError, TransferItem, TransferProgress, TransferSummary};
 use super::{TransferExecutor, TransferPlanner};
 use crate::local::write_authority::ConflictPolicy;
 use crate::source_lifecycle::CancellationObserver;
@@ -152,6 +150,130 @@ fn replacement_sink(source: &RenameableSource) -> ReplaceSourceRootDuringCopy {
     }
 }
 
+/// Everything the two root-replacement regressions share: the executed
+/// single-final-stage run with the replacement sink attached, plus the
+/// state their assertions inspect. Extracted so each regression stays
+/// within the static-analysis method-length budget without dropping a
+/// single interposition or rollback assertion.
+struct ReplacementRace {
+    run: Result<TransferSummary, TransferError>,
+    progress: ReplaceSourceRootDuringCopy,
+    /// Windows only: the source (and the outer tree owning it) must stay
+    /// alive through the refusal assertions; on Unix nothing after the run
+    /// reads it, so the helper's drop of the tree is harmless.
+    #[cfg(windows)]
+    source: RenameableSource,
+    destination_root: tempfile::TempDir,
+}
+
+/// Executes the single-final-stage transfer with the root-replacement sink
+/// attached — the shared body of both interposition regressions. Pass
+/// `existing_destination` (with `ConflictPolicy::Overwrite`) to pre-seed
+/// the destination with an original, as the overwrite regression requires.
+fn race_source_root_replacement(
+    source_bytes: &[u8],
+    policy: ConflictPolicy,
+    existing_destination: Option<&[u8]>,
+) -> ReplacementRace {
+    let source = RenameableSource::new();
+    source.write("song.flac", source_bytes);
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    if let Some(original) = existing_destination {
+        std::fs::write(destination_root.path().join("song.flac"), original)
+            .expect("write existing original");
+    }
+    let read = read_authority(&source.root);
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = transfer_request(
+        read,
+        destination,
+        vec![TransferItem::same(PathBuf::from("song.flac"))],
+        policy,
+    );
+    let plan = TransferPlanner::new().plan(&request).expect("plan");
+    let observer = CancellationObserver::never_cancelled();
+    let mut progress = replacement_sink(&source);
+    let run = TransferExecutor::new(request, plan).run(&mut progress, &observer);
+    ReplacementRace {
+        run,
+        progress,
+        #[cfg(windows)]
+        source,
+        destination_root,
+    }
+}
+
+/// The Unix authority-loss prefix shared by both regressions: the run must
+/// fail with the typed authority loss and the failed stage must never have
+/// reported a completion callback. Returns the error so each test keeps its
+/// own publication-message and rollback assertions.
+#[cfg(unix)]
+fn assert_authority_lost_with_no_completion(
+    run: Result<TransferSummary, TransferError>,
+    context: &str,
+    progress: &ReplaceSourceRootDuringCopy,
+) -> TransferError {
+    let error = run.expect_err(context);
+    assert!(
+        matches!(error, TransferError::AuthorityLost { .. }),
+        "the failure must be the typed authority loss: {error:?}"
+    );
+    assert_eq!(
+        progress.stage_completes, 0,
+        "the failed stage must not report a completion callback"
+    );
+    error
+}
+
+/// The Windows lease-refusal assertion block shared by both regressions:
+/// the retained lease must have refused the interposed replacement (the
+/// platform's authority evidence) and the legitimate transfer must have
+/// completed exactly once, publishing `published_bytes` and no litter.
+/// Messages are threaded through verbatim so each regression keeps its
+/// own wording.
+#[cfg(windows)]
+fn assert_lease_refusal_completion(
+    race: ReplacementRace,
+    completion: &str,
+    published_bytes: &[u8],
+    read_message: &str,
+    published_message: &str,
+    survivors_message: &str,
+) {
+    let summary = race.run.expect(completion);
+    assert!(
+        race.progress.replacement_refused,
+        "the interposition must have been attempted and refused by the lease"
+    );
+    assert_eq!(
+        race.progress.stage_completes, 1,
+        "the completed stage must report exactly one completion callback"
+    );
+    assert!(summary.completed, "the transfer must complete: {summary:?}");
+    assert_eq!(summary.committed_stages, 1);
+    assert_eq!(
+        std::fs::read(race.destination_root.path().join("song.flac")).expect(read_message),
+        published_bytes,
+        "{}",
+        published_message
+    );
+    assert!(
+        race.source.root.is_dir(),
+        "the source root must still stand at its original path"
+    );
+    assert!(
+        !race.source.moved.exists(),
+        "the lease must have prevented any move of the source root"
+    );
+    let survivors = entry_names(race.destination_root.path());
+    assert_eq!(
+        survivors,
+        vec!["song.flac".to_string()],
+        "{}: {survivors:?}",
+        survivors_message
+    );
+}
+
 /// A root replaced during `on_bytes_copied` on a single final stage to a
 /// FRESH destination must fail the transfer (the retained source descriptor
 /// alone cannot prove the lease). The failed stage reports no completion
@@ -163,27 +285,13 @@ fn replacement_sink(source: &RenameableSource) -> ReplaceSourceRootDuringCopy {
 /// refusal and that the legitimate transfer still completes correctly.
 #[test]
 fn source_root_replaced_during_copy_fails_a_fresh_publish() {
-    let source = RenameableSource::new();
-    source.write("song.flac", b"copy me");
-    let destination_root = tempfile::tempdir().expect("temporary destination root");
-    let read = read_authority(&source.root);
-    let (_, destination) = authority_pair(destination_root.path());
-    let request = transfer_request(
-        read,
-        destination,
-        vec![TransferItem::same(PathBuf::from("song.flac"))],
-        ConflictPolicy::Preserve,
-    );
-    let plan = TransferPlanner::new().plan(&request).expect("plan");
-    let observer = CancellationObserver::never_cancelled();
-    let mut progress = replacement_sink(&source);
-    let run = TransferExecutor::new(request, plan).run(&mut progress, &observer);
+    let race = race_source_root_replacement(b"copy me", ConflictPolicy::Preserve, None);
     #[cfg(unix)]
     {
-        let error = run.expect_err("a source lease lost during the copy must fail the transfer");
-        assert!(
-            matches!(error, TransferError::AuthorityLost { .. }),
-            "the failure must be the typed authority loss: {error:?}"
+        let error = assert_authority_lost_with_no_completion(
+            race.run,
+            "a source lease lost during the copy must fail the transfer",
+            &race.progress,
         );
         assert!(
             error
@@ -191,15 +299,11 @@ fn source_root_replaced_during_copy_fails_a_fresh_publish() {
                 .contains("source not current at publication"),
             "the error must name the publication-boundary source loss: {error}"
         );
-        assert_eq!(
-            progress.stage_completes, 0,
-            "the failed stage must not report a completion callback"
-        );
         assert!(
-            !destination_root.path().join("song.flac").exists(),
+            !race.destination_root.path().join("song.flac").exists(),
             "rollback must remove the fresh publication"
         );
-        let survivors = entry_names(destination_root.path());
+        let survivors = entry_names(race.destination_root.path());
         assert!(
             survivors.is_empty(),
             "no published file or staged/backup litter may survive: {survivors:?}"
@@ -207,38 +311,14 @@ fn source_root_replaced_during_copy_fails_a_fresh_publish() {
     }
     #[cfg(windows)]
     {
-        let summary = run.expect(
+        assert_lease_refusal_completion(
+            race,
             "the retained lease refuses the replacement, so the legitimate transfer must \
              complete",
-        );
-        assert!(
-            progress.replacement_refused,
-            "the interposition must have been attempted and refused by the lease"
-        );
-        assert_eq!(
-            progress.stage_completes, 1,
-            "the completed stage must report exactly one completion callback"
-        );
-        assert!(summary.completed, "the transfer must complete: {summary:?}");
-        assert_eq!(summary.committed_stages, 1);
-        assert_eq!(
-            std::fs::read(destination_root.path().join("song.flac")).expect("read published file"),
             b"copy me",
-            "the legitimate publication must hold the transferred bytes"
-        );
-        assert!(
-            source.root.is_dir(),
-            "the source root must still stand at its original path"
-        );
-        assert!(
-            !source.moved.exists(),
-            "the lease must have prevented any move of the source root"
-        );
-        let survivors = entry_names(destination_root.path());
-        assert_eq!(
-            survivors,
-            vec!["song.flac".to_string()],
-            "the published file only — no litter: {survivors:?}"
+            "read published file",
+            "the legitimate publication must hold the transferred bytes",
+            "the published file only — no litter",
         );
     }
 }
@@ -252,41 +332,22 @@ fn source_root_replaced_during_copy_fails_a_fresh_publish() {
 /// still completes correctly.
 #[test]
 fn source_root_replaced_during_copy_restores_an_overwritten_destination() {
-    let source = RenameableSource::new();
-    source.write("song.flac", b"new song");
-    let destination_root = tempfile::tempdir().expect("temporary destination root");
-    std::fs::write(destination_root.path().join("song.flac"), b"old song")
-        .expect("write existing original");
-    let read = read_authority(&source.root);
-    let (_, destination) = authority_pair(destination_root.path());
-    let request = transfer_request(
-        read,
-        destination,
-        vec![TransferItem::same(PathBuf::from("song.flac"))],
-        ConflictPolicy::Overwrite,
-    );
-    let plan = TransferPlanner::new().plan(&request).expect("plan");
-    let observer = CancellationObserver::never_cancelled();
-    let mut progress = replacement_sink(&source);
-    let run = TransferExecutor::new(request, plan).run(&mut progress, &observer);
+    let race =
+        race_source_root_replacement(b"new song", ConflictPolicy::Overwrite, Some(b"old song"));
     #[cfg(unix)]
     {
-        let error = run.expect_err("a source lease lost during the copy must fail the overwrite");
-        assert!(
-            matches!(error, TransferError::AuthorityLost { .. }),
-            "the failure must be the typed authority loss: {error:?}"
+        assert_authority_lost_with_no_completion(
+            race.run,
+            "a source lease lost during the copy must fail the overwrite",
+            &race.progress,
         );
         assert_eq!(
-            progress.stage_completes, 0,
-            "the failed stage must not report a completion callback"
-        );
-        assert_eq!(
-            std::fs::read(destination_root.path().join("song.flac"))
+            std::fs::read(race.destination_root.path().join("song.flac"))
                 .expect("read restored original"),
             b"old song",
             "rollback must restore the overwritten original"
         );
-        let survivors = entry_names(destination_root.path());
+        let survivors = entry_names(race.destination_root.path());
         assert_eq!(
             survivors,
             vec!["song.flac".to_string()],
@@ -295,38 +356,14 @@ fn source_root_replaced_during_copy_restores_an_overwritten_destination() {
     }
     #[cfg(windows)]
     {
-        let summary = run.expect(
+        assert_lease_refusal_completion(
+            race,
             "the retained lease refuses the replacement, so the legitimate overwrite must \
              complete",
-        );
-        assert!(
-            progress.replacement_refused,
-            "the interposition must have been attempted and refused by the lease"
-        );
-        assert_eq!(
-            progress.stage_completes, 1,
-            "the completed stage must report exactly one completion callback"
-        );
-        assert!(summary.completed, "the transfer must complete: {summary:?}");
-        assert_eq!(summary.committed_stages, 1);
-        assert_eq!(
-            std::fs::read(destination_root.path().join("song.flac")).expect("read final"),
             b"new song",
-            "the legitimate overwrite must hold the transferred bytes"
-        );
-        assert!(
-            source.root.is_dir(),
-            "the source root must still stand at its original path"
-        );
-        assert!(
-            !source.moved.exists(),
-            "the lease must have prevented any move of the source root"
-        );
-        let survivors = entry_names(destination_root.path());
-        assert_eq!(
-            survivors,
-            vec!["song.flac".to_string()],
-            "the overwritten file only — no backup litter: {survivors:?}"
+            "read final",
+            "the legitimate overwrite must hold the transferred bytes",
+            "the overwritten file only — no backup litter",
         );
     }
 }
