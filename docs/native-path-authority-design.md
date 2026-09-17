@@ -214,7 +214,7 @@ registered in `mod.rs`). The next free slot is `000021` after
 - `tracks.native_path_state INTEGER NOT NULL DEFAULT 0` — a closed enum:
 
   | Value | Name | Meaning |
-  |---|---|---|
+  | --- | --- | --- |
   | 0 | `legacy_unresolved` | Column default; a keyless row with no proof; no authority |
   | 1 | `authoritative` | `native_path` is encoded, canonical, and current |
   | 2 | `legacy_verified_utf8` | Backfilled from a U+FFFD-free display string |
@@ -339,15 +339,16 @@ distinct native paths.
 ### 4.4 Quarantine state machine
 
 ```text
-                 migration
+                migration
   (none) ────────────────────> authoritative (1) ── rename/scan ──> authoritative
-              │  display has no U+FFFD (exact round-trip)
-              │
-              ├──────────────> legacy_verified_utf8 (2) ── exact key re-observed ──> authoritative (1)
-              │                                          └─ key mismatch / not observed ──> quarantined (3)
-              │
-              └── display has U+FFFD ────> quarantined_ambiguous (3) ── exact retained key only ──> authoritative (1)
-                                                                    └─ otherwise ────────────────> stays (3)
+         │  display has no U+FFFD (exact round-trip)
+         │
+         ├──────────────> legacy_verified_utf8 (2) ── exact key re-observed ──> authoritative (1)
+         │                └─ key mismatch / not observed ──> quarantined (3)
+         │
+         └── display has U+FFFD ────> quarantined_ambiguous (3)
+                 ├─ exact retained key only ──> authoritative (1)
+                 └─ otherwise ────────────────> stays (3)
 ```
 
 - **Quarantined rows are never deleted or silently re-identified.** Their id,
@@ -764,28 +765,66 @@ safe alone, not only the final architecture.
 
 ## 12. Acceptance mapping
 
-| Acceptance item | Where satisfied |
-|---|---|
-| Versioned reversible representation or explicit boundary | §1, §3, §7 |
-| Display text separated from authoritative identity (enforced by the column rename) | §1, §3.4, §4.1, §4.2, §5, §6.4 |
-| Preserve IDs/history/ratings/playlists only where exact identity is provable | §2.1, §4.2, §4.3, §5.4, §8.4a, §8.13 |
-| Quarantine ambiguous legacy rows, no guessing (heuristics withdrawn) | §4.3, §4.4, §5.4, §8.4a |
-| Scanner lookup/reconciliation, migration, playback, tag writes, import/export | §4, §5, §6 |
-| Linux fixtures: invalid bytes, literal replacement collisions, Unicode/normalization, rename | §8 |
-| Safe rejection/diagnostics until lossless support | §7 |
-| No lossy consumer exposed to newly encoded rows (fail-closed-first) | §7, §9, §8.12 |
-| Older-binary / version-guard containment (no false authority re-enabled) | §4.2, §4.5, §8.11 |
+Each acceptance item, with the sections where it is satisfied:
+
+- Versioned reversible representation or explicit boundary — §1, §3, §7
+- Display text separated from authoritative identity (enforced by the column
+  rename) — §1, §3.4, §4.1, §4.2, §5, §6.4
+- Preserve IDs/history/ratings/playlists only where exact identity is provable —
+  §2.1, §4.2, §4.3, §5.4, §8.4a, §8.13
+- Quarantine ambiguous legacy rows, no guessing (heuristics withdrawn) — §4.3,
+  §4.4, §5.4, §8.4a
+- Scanner lookup/reconciliation, migration, playback, tag writes, import/export —
+  §4, §5, §6
+- Linux fixtures: invalid bytes, literal replacement collisions,
+  Unicode/normalization, rename — §8
+- Safe rejection/diagnostics until lossless support — §7
+- No lossy consumer exposed to newly encoded rows (fail-closed-first) — §7, §9,
+  §8.12
+- Older-binary / version-guard containment (no false authority re-enabled) —
+  §4.2, §4.5, §8.11
 
 ## 13. Corrective revision mapping (independent review of `16140be0`)
 
 This revision answers the three P1 findings in
-`refinery-20260917-tr-ldhwt/corrective-instructions.md`:
+`refinery-20260917-tr-ldhwt/corrective-instructions.md`. For each finding: the
+required correction, where the design changed, and the validation added.
 
-| Finding | Required correction | Where changed | Validation added |
-|---|---|---|---|
-| **F1** — single-candidate size/mtime legacy adoption guesses identity | Adoption must rest on independently retained exact evidence, or the row stays quarantined and the observed file enrolls fresh; align the state machine, acceptance mapping, and fixture 4; add the missing-original/single-stranger trace | Withdrew the §5.4 one-to-one size/mtime rule; made state 3 terminal absent an exact retained key; updated the §4.4 machine, §12 mapping, and §8.4 fixtures | §8.4a mandatory non-adoption trace; §8.4b exact-key-only promotion |
-| **F2** — staged rollout exposes lossy consumers to newly lossless rows | Every authority consumer must fail closed first, or activation and consumer switches must be atomic; specify export handling and rollback/restart; add intermediate-version integration tests | Split out the §7 fail-closed baseline as R11a and gated schema/scanner activation (R11b) on it; made export refusal part of the baseline; specified the single-transaction marker write and restart behavior; added the §9 intermediate matrix | §8.12 per-slice refusal matrix; §8.6 stale-removal refusal; §9 ordering |
-| **F3** — older-binary compatibility re-enables false authority | A real supported-version/startup guard or a demonstrable compatibility barrier; remove the SQL-compatibility claim; add an old-binary/open-database rejection trace; separate downgrade from reopening | Rewrote §4.5: `schema_capabilities`/`user_version` guard, `file_path` → `display_path` carrier removal, no compatibility claim, `down()` only as downgrade, transactional rollback | §8.11 old-binary rejection trace and intact-history assertion |
+### F1 — single-candidate size/mtime legacy adoption guesses identity
+
+- **Required correction:** Adoption must rest on independently retained exact
+  evidence, or the row stays quarantined and the observed file enrolls fresh;
+  align the state machine, acceptance mapping, and fixture 4; add the
+  missing-original/single-stranger trace
+- **Where changed:** Withdrew the §5.4 one-to-one size/mtime rule; made state 3
+  terminal absent an exact retained key; updated the §4.4 machine, §12 mapping,
+  and §8.4 fixtures
+- **Validation added:** §8.4a mandatory non-adoption trace; §8.4b
+  exact-key-only promotion
+
+### F2 — staged rollout exposes lossy consumers to newly lossless rows
+
+- **Required correction:** Every authority consumer must fail closed first, or
+  activation and consumer switches must be atomic; specify export handling and
+  rollback/restart; add intermediate-version integration tests
+- **Where changed:** Split out the §7 fail-closed baseline as R11a and gated
+  schema/scanner activation (R11b) on it; made export refusal part of the
+  baseline; specified the single-transaction marker write and restart behavior;
+  added the §9 intermediate matrix
+- **Validation added:** §8.12 per-slice refusal matrix; §8.6 stale-removal
+  refusal; §9 ordering
+
+### F3 — older-binary compatibility re-enables false authority
+
+- **Required correction:** A real supported-version/startup guard or a
+  demonstrable compatibility barrier; remove the SQL-compatibility claim; add
+  an old-binary/open-database rejection trace; separate downgrade from
+  reopening
+- **Where changed:** Rewrote §4.5: `schema_capabilities`/`user_version` guard,
+  `file_path` → `display_path` carrier removal, no compatibility claim,
+  `down()` only as downgrade, transactional rollback
+- **Validation added:** §8.11 old-binary rejection trace and intact-history
+  assertion
 
 Nothing in this revision expands product behavior; every change makes the
 contract stricter. The mechanical check results recorded at `16140be0` remain
@@ -795,11 +834,32 @@ historical; the next independent re-review should evaluate this corrected head.
 
 Revision 3 answers the migration reference-loss finding in
 `refinery-20260917-tr-ldhwt-migration/corrective-instructions.md`
-(exact head `bc49dbe514334e94c081e3156ab97a12df11f066`):
+(exact head `bc49dbe514334e94c081e3156ab97a12df11f066`). Fields: the finding,
+the required correction, where the design changed, and the validation added.
 
-| Finding | Required correction | Where changed | Validation added |
-|---|---|---|---|
-| **M1** — the §4.2 rebuild toggled `foreign_keys` inside the transaction (a change SQLite silently ignores) or proposed `legacy_alter_table` semantics (which do not disable `ON DELETE` actions), so `DROP TABLE tracks` fired `playlist_entries.local_track_id ON DELETE SET NULL` undetected; `foreign_key_check` stayed empty because NULL is legal | Specify an executable connection/transaction sequence: FK suppression set and read-back verified on the dedicated connection **before** `BEGIN`; populated preservation plus `foreign_key_check` gates inside the transaction before `COMMIT`; restore with verified read-back on every exit path; `legacy_alter_table` banned with the reproduction rationale; require populated preservation and rollback/failure tests, not only `foreign_key_check` | Rewrote §4.2 as steps 0–8 (connection prelude, in-transaction preservation gate, connection epilogue) with the explicit `legacy_alter_table` ban; extended the §4.5 rollback/restart contract; updated the §12 mapping | §8.13 populated preservation + failure-injection tests: pre-`BEGIN` abort on failed suppression, mid-rebuild rollback to a byte-identical database with bindings intact, no `legacy_alter_table` issued, verified FK restore on success/error/panic; §12 preservation row cites §8.13 |
+#### M1
+
+- **Finding:** the §4.2 rebuild toggled `foreign_keys` inside the transaction
+  (a change SQLite silently ignores) or proposed `legacy_alter_table` semantics
+  (which do not disable `ON DELETE` actions), so `DROP TABLE tracks` fired
+  `playlist_entries.local_track_id ON DELETE SET NULL` undetected;
+  `foreign_key_check` stayed empty because NULL is legal
+- **Required correction:** Specify an executable connection/transaction
+  sequence: FK suppression set and read-back verified on the dedicated
+  connection **before** `BEGIN`; populated preservation plus
+  `foreign_key_check` gates inside the transaction before `COMMIT`; restore
+  with verified read-back on every exit path; `legacy_alter_table` banned with
+  the reproduction rationale; require populated preservation and
+  rollback/failure tests, not only `foreign_key_check`
+- **Where changed:** Rewrote §4.2 as steps 0–8 (connection prelude,
+  in-transaction preservation gate, connection epilogue) with the explicit
+  `legacy_alter_table` ban; extended the §4.5 rollback/restart contract;
+  updated the §12 mapping
+- **Validation added:** §8.13 populated preservation + failure-injection
+  tests: pre-`BEGIN` abort on failed suppression, mid-rebuild rollback to a
+  byte-identical database with bindings intact, no `legacy_alter_table`
+  issued, verified FK restore on success/error/panic; §12 preservation row
+  cites §8.13
 
 ## Appendix A — Lossy conversion inventory (`src/local/`)
 
@@ -808,7 +868,7 @@ key. The `file_path` column is renamed `display_path` by this contract; the
 entries below name the legacy identifier as it exists at the design commit.
 
 | Location | Current lossy use | New authority |
-|---|---|---|
+| --- | --- | --- |
 | `tag_parser.rs:169` | `ParsedTrack.file_path` | carry native key + display |
 | `engine.rs:3892-3893` | scan dedup + `on_disk_paths` | native-key set/map |
 | `engine.rs:2114,2184,2237` | dir-rename observed/destination keys | native-key set |
@@ -818,10 +878,12 @@ entries below name the legacy identifier as it exists at the design commit.
 | `engine.rs:6400-6444` | file rename retarget | native key |
 | `engine.rs:6504-6573` | dir rename prefix/join | native key |
 | `engine.rs:1180-1182,1233` | root reauthorization non-UTF-8 refusal | native codec |
-| `engine.rs:2753,2868,2953,2989,3647,3705,4343,4356` | `library_roots.path` keys | unchanged (root boundary) |
+| `engine.rs:2753,2868,2953,2989` | `library_roots.path` keys | unchanged (root boundary) |
+| `engine.rs:3647,3705,4343,4356` | `library_roots.path` keys | unchanged (root boundary) |
 | `resolver.rs:353` | playback `PathBuf::from(file_path)` | decode `native_path` |
 | `playlist_io.rs:89,732,754-766` | XSPF location encode/decode | lossless mapping |
 | `playlist_io.rs:591-700` | import match index | native key, then fingerprint |
 | `rhythmbox_import.rs:1534` | non-UTF-8 refusal | R11d decision |
 | `rhythmbox_migration.rs:1026-1264` | path string matching | native key |
-| `ui/window.rs:4622-4624`, `ui/context_menu.rs:1349-1354` | display-URI tag target | id-keyed lookup |
+| `ui/window.rs:4622-4624` | display-URI tag target | id-keyed lookup |
+| `ui/context_menu.rs:1349-1354` | display-URI tag target | id-keyed lookup |
