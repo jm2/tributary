@@ -5,10 +5,13 @@
 invariants are maintained by hand and were previously unenforced:
 
 * every top-level checkbox is one record with a unique stable ID;
-* the literal completion counters written in prose match the checkbox state;
+* the literal completion counters written in prose match the checkbox state,
+  including the archived remediation counter, which is recounted from its
+  archived source document;
 * every relative link (and ``#anchor``) resolves inside the checkout;
-* each active record maps to a GitHub issue, a Gas City bead, and (when one
-  exists) a pull request, with no merged-but-unreconciled record and no stale
+* each active record maps to a GitHub issue, a Gas City bead, and a pull
+  request (``"pr": null`` meaning "not yet published"), with no
+  merged-but-unreconciled record and no stale
   review head.
 
 This module is deliberately **read-only**.  It never edits the index, never
@@ -40,6 +43,8 @@ from urllib.parse import unquote
 
 REPOSITORY = Path(__file__).resolve().parent.parent
 TASK_INDEX_NAME = "docs/task.md"
+# The archived remediation counter is recounted from this source document.
+ARCHIVED_INDEX_NAME = "docs/task-remediation-2026-07.md"
 
 # One countable record: a top-level checkbox whose title begins with a bold
 # stable ID (for example ``- [x] **P1.5-A** — ...`` or ``- [ ] **R1 — ...**``).
@@ -83,6 +88,18 @@ COUNTER_PATTERNS = (
         ),
     ),
 )
+
+# The archived remediation counter is anchored on its own stable phrasing.
+# Unlike the active counters it is validated against a mechanical recount of
+# the archived source document, not merely for arithmetic.
+ARCHIVED_COUNTER_PATTERN = re.compile(
+    r"archived\s+remediation[^*]*remains\s*\*\*(?P<complete>\d+)/(?P<total>\d+)\s*"
+    r"\((?P<percent>\d+(?:\.\d+)?)%\)\*\*"
+)
+
+# One checkbox in the archived remediation source.  Unlike the active index,
+# archived boxes carry plain titles instead of bold stable IDs.
+ARCHIVED_BOX_PATTERN = re.compile(r"^- \[(?P<mark>[ xX])\]")
 
 # Directories that never contain tracked documentation worth checking.
 SKIPPED_DIRECTORIES = frozenset({".git", "target", "node_modules", "dist"})
@@ -283,8 +300,9 @@ def check_counters(text: str, records: Sequence[Record]) -> list[str]:
                     f"rounds to {computed}%"
                 )
 
-    # Every explicit percentage, including the archived remediation counter that
-    # this checker does not recount, must at least be arithmetically consistent.
+    # Every explicit percentage must at least be arithmetically consistent.
+    # The archived remediation counter additionally gets a mechanical recount
+    # against its source document in check_archived_counter.
     for match in PERCENT_COUNTER.finditer(text):
         complete = int(match.group("complete"))
         total = int(match.group("total"))
@@ -295,6 +313,100 @@ def check_counters(text: str, records: Sequence[Record]) -> list[str]:
                 f"counter: '{complete}/{total} ({stated}%)' is arithmetically "
                 f"inconsistent (rounds to {computed}%)"
             )
+    return problems
+
+
+def derive_archived_counts(path: Path) -> tuple[int, int, list[str]]:
+    """Mechanically recount the archived remediation checkboxes.
+
+    The archived counter describes the in-scope task checkboxes of the
+    archived remediation document.  That document's own prose documents the
+    exclusions, which this recount applies mechanically:
+
+    * the status-summary boxes in the "How to use this file" section are
+      section summaries, not task progress;
+    * every box in the "Global validation gate" section is a gate, not a task;
+    * a struck-through (``~~...~~``) box marked "Withdrawn" is a retracted
+      false finding.
+
+    Every other top-level checkbox under a ``P0``-``P3`` section is in scope.
+    A checkbox under any other heading is unclassifiable and is reported as a
+    structural problem instead of being silently ignored.
+
+    Returns ``(complete, total, problems)``.
+    """
+    display = path.name
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:  # pragma: no cover - unreadable checkout file
+        return 0, 0, [
+            f"counter: archived remediation source {display} is unreadable ({error})"
+        ]
+    complete = 0
+    total = 0
+    problems: list[str] = []
+    unclassified: dict[str, int] = {}
+    in_summary = False
+    in_gate = False
+    section: str | None = None
+    for _, line in iter_content_lines(text):
+        heading = HEADING.match(line)
+        if heading:
+            title = heading.group("title").strip()
+            lowered = title.lower()
+            in_summary = lowered.startswith("how to use")
+            in_gate = "global validation" in lowered
+            section = title
+            continue
+        match = ARCHIVED_BOX_PATTERN.match(line)
+        if match is None:
+            continue
+        if in_summary or in_gate or ("~~" in line and "withdrawn" in line.lower()):
+            continue
+        if section is None or not re.match(r"^P[0-3]\b", section):
+            key = section or "<top>"
+            unclassified[key] = unclassified.get(key, 0) + 1
+            continue
+        total += 1
+        if match.group("mark").lower() == "x":
+            complete += 1
+    for title, count in sorted(unclassified.items()):
+        problems.append(
+            f"counter: {display} has {count} checkbox(es) under section "
+            f"'{title}', which is neither a P0-P3 task section nor a documented "
+            "exclusion; the archived recount cannot classify them"
+        )
+    return complete, total, problems
+
+
+def check_archived_counter(text: str, root: Path) -> list[str]:
+    """Report drift between the archived counter prose and its source boxes."""
+    match = ARCHIVED_COUNTER_PATTERN.search(text)
+    if match is None:
+        return [
+            "counter: could not find the archived remediation counter; "
+            "if the wording changed, update ARCHIVED_COUNTER_PATTERN"
+        ]
+    source = root / ARCHIVED_INDEX_NAME
+    if not source.is_file():
+        return [f"counter: archived remediation source {ARCHIVED_INDEX_NAME} is missing"]
+    problems: list[str] = []
+    complete, total, structural = derive_archived_counts(source)
+    problems.extend(structural)
+    stated_complete = int(match.group("complete"))
+    stated_total = int(match.group("total"))
+    if (stated_complete, stated_total) != (complete, total):
+        problems.append(
+            f"counter: archived remediation says {stated_complete}/{stated_total} but "
+            f"{ARCHIVED_INDEX_NAME} contains {complete}/{total} in-scope task checkboxes"
+        )
+    stated = float(match.group("percent"))
+    computed = round(complete / total * 100, 1) if total else 0.0
+    if abs(stated - computed) > 0.05:
+        problems.append(
+            f"counter: archived remediation states {stated}% but {complete}/{total} "
+            f"rounds to {computed}%"
+        )
     return problems
 
 
@@ -339,6 +451,32 @@ def _short(sha: str) -> str:
     return sha[:12] if len(sha) > 12 else sha
 
 
+def _pr_evidence(entry: dict) -> tuple[str, object]:
+    """Classify the ``pr`` mapping of a ledger entry.
+
+    Returns a ``(state, value)`` pair where *state* is one of:
+
+    * ``"missing"`` — the ``pr`` key is absent.  Silence is not a published
+      representation of "no pull request"; it is a missing mapping.
+    * ``"none"`` — the key is explicitly ``null``, the documented
+      not-yet-published representation.
+    * ``"invalid"`` — present but not a positive PR identifier.
+    * ``"published"`` — a usable pull-request identifier.
+    """
+    if "pr" not in entry:
+        return "missing", None
+    value = entry["pr"]
+    if value is None:
+        return "none", None
+    if isinstance(value, bool):
+        return "invalid", value
+    if isinstance(value, int) and value > 0:
+        return "published", value
+    if isinstance(value, str) and value.isdigit() and int(value) > 0:
+        return "published", value
+    return "invalid", value
+
+
 def check_ledger(
     snapshot: object, records: Sequence[Record], task_index: Path
 ) -> list[str]:
@@ -359,8 +497,15 @@ def check_ledger(
           }
         }
 
-    Every active (unchecked) record must appear with an issue and a bead; a
-    record missing either is reported.  ``merged`` on an unchecked record is a
+    Every active (unchecked) record must appear with an issue, a bead, and a
+    pull-request mapping.  ``"pr": null`` is the explicit not-yet-published
+    representation; omitting the ``pr`` key is reported as a missing mapping.
+    A published ``pr`` (a positive integer or digit string) must carry
+    ``head_sha`` evidence, which the stale-review check below validates.
+
+    The task index is authoritative for checked state: an ``active`` snapshot
+    flag that disagrees with the index is reported and never downgrades the
+    required-field checks.  ``merged`` on an active record is a
     merged-but-unreconciled report, and ``reviewed_sha`` differing from
     ``head_sha`` is a stale review head.  Completed records may be omitted.
     """
@@ -378,11 +523,39 @@ def check_ledger(
         if not isinstance(entry, dict):
             problems.append(f"ledger: mapping for '{identifier}' must be an object")
             continue
-        if entry.get("active", not record.complete):
+        # The task index decides whether a record is active.  A snapshot
+        # ``active`` flag may not silently override it: the required-field
+        # checks below always run on the index-derived state, and a flag that
+        # contradicts the index is itself reportable drift.
+        active = not record.complete
+        if "active" in entry and bool(entry["active"]) != active:
+            state_word = "active" if active else "complete"
+            problems.append(
+                f"ledger: record '{identifier}' snapshot flag "
+                f"active={entry['active']} disagrees with the index state "
+                f"({state_word}); the index decides"
+            )
+        if active:
             if not entry.get("bead"):
                 problems.append(f"ledger: active record '{identifier}' has no bead mapping")
             if not entry.get("issue"):
                 problems.append(f"ledger: active record '{identifier}' has no issue mapping")
+            state, value = _pr_evidence(entry)
+            if state == "missing":
+                problems.append(
+                    f"ledger: active record '{identifier}' has no pr mapping "
+                    "(use null for 'not yet published')"
+                )
+            elif state == "invalid":
+                problems.append(
+                    f"ledger: active record '{identifier}' has an invalid pr "
+                    f"mapping ({value!r})"
+                )
+            elif state == "published" and not entry.get("head_sha"):
+                problems.append(
+                    f"ledger: active record '{identifier}' references PR {value} "
+                    "without head_sha evidence"
+                )
         head = entry.get("head_sha")
         reviewed = entry.get("reviewed_sha")
         if head and reviewed and head != reviewed:
@@ -417,6 +590,7 @@ def run_checks(
     problems: list[str] = []
     problems.extend(check_unique_ids(records, root, task_index))
     problems.extend(check_counters(text, records))
+    problems.extend(check_archived_counter(text, root))
     problems.extend(check_links(root, markdown_files))
     if ledger is not None:
         try:

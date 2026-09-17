@@ -16,14 +16,19 @@ is a read-only, dependency-free checker for those invariants. It runs in the CI
    (`R1`, `P1.5-A`, `Q7`, ...). A duplicate is a failure that names both lines.
 2. **Literal counters.** The completion counters written in prose must equal the
    mechanically derived checkbox counts: the overall `N/M`, the retained
-   baseline, the corrective `R` family, and the engineering `Q` family. Every
-   explicit percentage in the file, including the archived remediation counter
-   that this check does not recount, must at least be arithmetically consistent.
+   baseline, the corrective `R` family, the engineering `Q` family, and the
+   archived remediation counter. The archived counter is recounted from its
+   source document `task-remediation-2026-07.md`: status-summary boxes, the
+   global-validation-gate section, and withdrawn (struck-through) false-finding
+   boxes are excluded, mirroring that document's own accounting, and a
+   checkbox under any other heading is reported as unclassifiable rather than
+   silently ignored. Every explicit percentage in the file must also be
+   arithmetically consistent.
 3. **Internal links and anchors.** Every relative Markdown link target must
    exist, and every `#anchor` into another Markdown file must match a heading.
 4. **Issue/bead/PR mappings** (optional, see below). Active records must map to
-   a GitHub issue and a Gas City bead; merged-but-unreconciled records and
-   stale review heads are surfaced.
+   a GitHub issue, a Gas City bead, and a pull request; merged-but-unreconciled
+   records and stale review heads are surfaced.
 
 ## Running it
 
@@ -59,14 +64,20 @@ python3 scripts/check_backlog_consistency.py --ledger path/to/snapshot.json
 }
 ```
 
-- `bead` and `issue` are required for every active (unchecked) record; a record
-  missing either, or absent from the snapshot, is reported.
+- `bead`, `issue`, and `pr` are required for every active (unchecked) record; a
+  record missing any of them, or absent from the snapshot, is reported.
+- `"pr": null` is the explicit *not yet published* representation and passes;
+  omitting the `pr` key is reported as a missing mapping. A published `pr` (a
+  positive integer or digit string) must carry `head_sha` evidence.
 - `merged: true` on a record that is still unchecked is reported as
   *merged-but-unreconciled*.
 - `reviewed_sha` that differs from `head_sha` is reported as a *stale review
   head*.
-- Completed records may be omitted. `pr`, `head_sha`, and `reviewed_sha` are
-  optional and only used for the reports above.
+- The task index decides whether a record is active: an `active` snapshot flag
+  that disagrees with the index is reported and never downgrades the required
+  fields.
+- Completed records may be omitted. `head_sha` and `reviewed_sha` are optional
+  and only used for the reports above.
 
 ## Guarantees and non-goals
 
@@ -82,7 +93,15 @@ There is deliberately no scheduler or automatic synchronizer here.
 - **Duplicate ID or counter mismatch** — correct `docs/task.md` so the prose
   matches the checkboxes, or fix the checkbox state. Do not weaken the counter
   to hide a discrepancy.
+- **Archived counter mismatch** — one side moved: either the archived
+  `task-remediation-2026-07.md` checkboxes changed, or the prose counter in
+  `docs/task.md` is stale. Recount from the archived source (status-summary
+  boxes, the validation gate, and withdrawn boxes excluded) and update the
+  prose counter and its percentage together. An *unclassifiable checkbox*
+  finding means a box lives under a heading that is neither a `P0`-`P3` task
+  section nor a documented exclusion — move it or document the exclusion.
 - **Broken link or anchor** — repair the target path, or update the heading so
   the anchor matches.
 - **Mapping finding** — resolve it in GitHub and the Gas City ledger first; the
-  snapshot is only a report of that state.
+  snapshot is only a report of that state. Use `"pr": null` for an active
+  record whose pull request has not been published yet.

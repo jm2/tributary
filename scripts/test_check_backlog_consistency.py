@@ -54,6 +54,47 @@ def sample_records():
     )
 
 
+def archived_remediation_doc(*, complete=223, open_boxes=3):
+    """Build an archived remediation source matching the default counter.
+
+    The structural classes the checker applies — status-summary boxes, the
+    global-validation gate, a withdrawn false finding, and P0-P3 task boxes —
+    are all represented so fixtures exercise the real derivation.
+    """
+    lines = [
+        "# Tributary remediation tracker",
+        "",
+        "## How to use this file",
+        "",
+        "- [x] P0 release blockers complete",
+        "",
+        "## P0 — Release blockers",
+        "",
+        "### P0.1 Fixture",
+        "",
+    ]
+    lines.extend(f"- [x] Fixture task {index}" for index in range(complete))
+    lines.extend(["", "### P0.2 Fixture open", ""])
+    lines.extend(f"- [ ] Open fixture task {index}" for index in range(open_boxes))
+    lines.extend(
+        [
+            "",
+            "## P2.6 Synchronize packaging metadata",
+            "",
+            "- [x] ~~Fix withdrawn packaging metadata.~~ **Withdrawn 2026-07-14 — false finding.**",
+            "",
+            "## Global validation gate",
+            "",
+            "- [x] `cargo test --all-targets`",
+            "",
+            "## Decisions",
+            "",
+            "Nothing to record.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
 class BacklogConsistencyTests(unittest.TestCase):
     """One test per invariant plus the pass paths and the real repository."""
 
@@ -203,6 +244,16 @@ class BacklogConsistencyTests(unittest.TestCase):
         text = counter_paragraph() + sample_records()
         return checker.parse_records(text)
 
+    def full_mapping(self):
+        """Return a snapshot satisfying the full active-record contract."""
+        return {
+            "records": {
+                "P1.1-B": {"bead": "tr-b", "issue": 1, "pr": None},
+                "R1": {"bead": "tr-r", "issue": 2, "pr": None},
+                "Q1": {"bead": "tr-q", "issue": 3, "pr": None},
+            }
+        }
+
     def test_ledger_missing_active_mapping_fails(self):
         records = self.records_fixture()
         snapshot = {"records": {"P1.1-B": {"bead": "tr-b", "issue": 1}}}
@@ -211,30 +262,93 @@ class BacklogConsistencyTests(unittest.TestCase):
         )
         self.assertTrue(any("'R1' has no mapping entry" in p for p in problems), problems)
         self.assertTrue(any("'Q1' has no mapping entry" in p for p in problems), problems)
+        self.assertTrue(
+            any("'P1.1-B' has no pr mapping" in p for p in problems), problems
+        )
 
     def test_ledger_complete_record_may_be_omitted(self):
         records = self.records_fixture()
-        snapshot = {
-            "records": {
-                "P1.1-B": {"bead": "tr-b", "issue": 1},
-                "R1": {"bead": "tr-r", "issue": 2},
-                "Q1": {"bead": "tr-q", "issue": 3},
-            }
-        }
+        snapshot = self.full_mapping()
         self.assertEqual(checker.check_ledger(snapshot, records, Path("docs/task.md")), [])
 
     def test_ledger_active_record_needs_bead_and_issue(self):
         records = self.records_fixture()
         snapshot = {
             "records": {
-                "P1.1-B": {"bead": "tr-b", "issue": 1},
-                "R1": {"issue": 2},
-                "Q1": {"bead": "tr-q"},
+                "P1.1-B": {"bead": "tr-b", "issue": 1, "pr": None},
+                "R1": {"issue": 2, "pr": None},
+                "Q1": {"bead": "tr-q", "pr": None},
             }
         }
         problems = checker.check_ledger(snapshot, records, Path("docs/task.md"))
         self.assertTrue(any("'R1' has no bead mapping" in p for p in problems), problems)
         self.assertTrue(any("'Q1' has no issue mapping" in p for p in problems), problems)
+
+    def test_ledger_active_record_needs_pr_mapping(self):
+        records = self.records_fixture()
+        snapshot = self.full_mapping()
+        del snapshot["records"]["Q1"]["pr"]
+        problems = checker.check_ledger(snapshot, records, Path("docs/task.md"))
+        self.assertTrue(any("'Q1' has no pr mapping" in p for p in problems), problems)
+
+    def test_ledger_explicit_not_published_pr_passes(self):
+        records = self.records_fixture()
+        snapshot = self.full_mapping()
+        self.assertEqual(checker.check_ledger(snapshot, records, Path("docs/task.md")), [])
+
+    def test_ledger_published_pr_with_head_evidence_passes(self):
+        records = self.records_fixture()
+        snapshot = self.full_mapping()
+        snapshot["records"]["R1"] = {
+            "bead": "tr-r",
+            "issue": 2,
+            "pr": 42,
+            "head_sha": "aaaaaaaaaaaa",
+            "reviewed_sha": "aaaaaaaaaaaa",
+        }
+        self.assertEqual(checker.check_ledger(snapshot, records, Path("docs/task.md")), [])
+
+    def test_ledger_published_pr_without_head_evidence_fails(self):
+        records = self.records_fixture()
+        snapshot = self.full_mapping()
+        snapshot["records"]["R1"]["pr"] = 42
+        problems = checker.check_ledger(snapshot, records, Path("docs/task.md"))
+        self.assertTrue(
+            any("'R1' references PR 42 without head_sha evidence" in p for p in problems),
+            problems,
+        )
+
+    def test_ledger_invalid_pr_mapping_fails(self):
+        records = self.records_fixture()
+        for bad in (0, "abc", True, ""):
+            snapshot = self.full_mapping()
+            snapshot["records"]["Q1"]["pr"] = bad
+            problems = checker.check_ledger(snapshot, records, Path("docs/task.md"))
+            self.assertTrue(
+                any("'Q1' has an invalid pr mapping" in p for p in problems),
+                (bad, problems),
+            )
+
+    def test_ledger_active_flag_cannot_bypass_required_fields(self):
+        records = self.records_fixture()
+        snapshot = {"records": {"Q1": {"active": False}}}
+        problems = checker.check_ledger(snapshot, records, Path("docs/task.md"))
+        self.assertTrue(any("'Q1' has no bead mapping" in p for p in problems), problems)
+        self.assertTrue(any("'Q1' has no issue mapping" in p for p in problems), problems)
+        self.assertTrue(any("'Q1' has no pr mapping" in p for p in problems), problems)
+        self.assertTrue(
+            any("disagrees with the index state (active)" in p for p in problems),
+            problems,
+        )
+
+    def test_ledger_active_flag_contradicting_complete_record_fails(self):
+        records = self.records_fixture()
+        snapshot = {"records": {"P1.1-A": {"active": True}}}
+        problems = checker.check_ledger(snapshot, records, Path("docs/task.md"))
+        self.assertTrue(
+            any("'P1.1-A' snapshot flag active=True disagrees" in p for p in problems),
+            problems,
+        )
 
     def test_ledger_unknown_id_fails(self):
         records = self.records_fixture()
@@ -246,9 +360,9 @@ class BacklogConsistencyTests(unittest.TestCase):
         records = self.records_fixture()
         snapshot = {
             "records": {
-                "P1.1-B": {"bead": "tr-b", "issue": 1},
-                "R1": {"bead": "tr-r", "issue": 2},
-                "Q1": {"bead": "tr-q", "issue": 3, "merged": True},
+                "P1.1-B": {"bead": "tr-b", "issue": 1, "pr": None},
+                "R1": {"bead": "tr-r", "issue": 2, "pr": None},
+                "Q1": {"bead": "tr-q", "issue": 3, "pr": None, "merged": True},
             }
         }
         problems = checker.check_ledger(snapshot, records, Path("docs/task.md"))
@@ -258,14 +372,15 @@ class BacklogConsistencyTests(unittest.TestCase):
         records = self.records_fixture()
         snapshot = {
             "records": {
-                "P1.1-B": {"bead": "tr-b", "issue": 1},
+                "P1.1-B": {"bead": "tr-b", "issue": 1, "pr": None},
                 "R1": {
                     "bead": "tr-r",
                     "issue": 2,
+                    "pr": 5,
                     "head_sha": "aaaaaaaaaaaa",
                     "reviewed_sha": "bbbbbbbbbbbb",
                 },
-                "Q1": {"bead": "tr-q", "issue": 3},
+                "Q1": {"bead": "tr-q", "issue": 3, "pr": None},
             }
         }
         problems = checker.check_ledger(snapshot, records, Path("docs/task.md"))
@@ -276,6 +391,68 @@ class BacklogConsistencyTests(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("'records'", problems[0])
 
+    # ── archived remediation counter ────────────────────────────────────────
+    def write_archived_fixture(self, root, **kwargs):
+        return self.write(root, checker.ARCHIVED_INDEX_NAME, archived_remediation_doc(**kwargs))
+
+    def test_archived_counter_matches_derived_boxes(self):
+        root = self.make_root()
+        text = counter_paragraph() + sample_records()
+        self.write(root, "docs/task.md", text)
+        self.write_archived_fixture(root)
+        self.assertEqual(checker.check_archived_counter(text, root), [])
+
+    def test_archived_checkbox_change_reports_drift(self):
+        root = self.make_root()
+        text = counter_paragraph() + sample_records()
+        self.write(root, "docs/task.md", text)
+        # One archived checkbox flips from unchecked to checked: the total is
+        # unchanged but the derived complete count is now 224.
+        self.write_archived_fixture(root, complete=224, open_boxes=2)
+        problems = checker.check_archived_counter(text, root)
+        self.assertTrue(
+            any("archived remediation says 223/226" in p for p in problems), problems
+        )
+        self.assertTrue(any("224/226" in p for p in problems), problems)
+
+    def test_archived_wrong_prose_count_fails_even_when_arithmetic_consistent(self):
+        root = self.make_root()
+        text = counter_paragraph(archived=(222, 226, 98.2)) + sample_records()
+        self.write(root, "docs/task.md", text)
+        self.write_archived_fixture(root)
+        problems = checker.check_archived_counter(text, root)
+        self.assertTrue(
+            any("archived remediation says 222/226" in p for p in problems), problems
+        )
+
+    def test_archived_missing_source_fails(self):
+        root = self.make_root()
+        text = counter_paragraph() + sample_records()
+        self.write(root, "docs/task.md", text)
+        problems = checker.check_archived_counter(text, root)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(
+            f"source {checker.ARCHIVED_INDEX_NAME} is missing", problems[0]
+        )
+
+    def test_archived_derivation_excludes_documented_boxes(self):
+        root = self.make_root()
+        path = self.write(
+            root, checker.ARCHIVED_INDEX_NAME, archived_remediation_doc(complete=2, open_boxes=1)
+        )
+        complete, total, problems = checker.derive_archived_counts(path)
+        self.assertEqual((complete, total), (2, 3))
+        self.assertEqual(problems, [])
+
+    def test_archived_unclassifiable_section_is_reported(self):
+        root = self.make_root()
+        doc = archived_remediation_doc() + "\n## Notes\n\n- [x] A stray box\n"
+        path = self.write(root, checker.ARCHIVED_INDEX_NAME, doc)
+        complete, total, problems = checker.derive_archived_counts(path)
+        self.assertEqual((complete, total), (223, 226))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'Notes'", problems[0])
+
     # ── integration ──────────────────────────────────────────────────────────
     def test_repository_index_is_consistent(self):
         records, markdown_files, problems = checker.run_checks(
@@ -285,12 +462,17 @@ class BacklogConsistencyTests(unittest.TestCase):
         self.assertEqual(len(records), 57)
         self.assertEqual(sum(1 for record in records if record.complete), 17)
         self.assertGreater(len(markdown_files), 0)
+        archived = REPOSITORY / checker.ARCHIVED_INDEX_NAME
+        complete, total, structural = checker.derive_archived_counts(archived)
+        self.assertEqual((complete, total), (223, 226))
+        self.assertEqual(structural, [])
 
     def test_main_is_read_only(self):
         root = self.make_root()
         index = self.write(
             root, "docs/task.md", counter_paragraph() + sample_records()
         )
+        self.write_archived_fixture(root)
         target = self.write(root, "docs/target.md", "## Topic\n")
         before = {
             path: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -306,24 +488,18 @@ class BacklogConsistencyTests(unittest.TestCase):
     def test_main_reports_failures(self):
         root = self.make_root()
         self.write(root, "docs/task.md", counter_paragraph() + sample_records())
+        self.write_archived_fixture(root)
         self.write(root, "docs/broken.md", "[x](missing.md)\n")
         self.assertEqual(checker.main(["--root", str(root), "--quiet"]), 1)
 
     def test_main_accepts_ledger_snapshot(self):
         root = self.make_root()
         self.write(root, "docs/task.md", counter_paragraph() + sample_records())
+        self.write_archived_fixture(root)
         snapshot = self.write(
             root,
             "docs/ledger.json",
-            json.dumps(
-                {
-                    "records": {
-                        "P1.1-B": {"bead": "tr-b", "issue": 1},
-                        "R1": {"bead": "tr-r", "issue": 2},
-                        "Q1": {"bead": "tr-q", "issue": 3},
-                    }
-                }
-            ),
+            json.dumps(self.full_mapping()),
         )
         self.assertEqual(
             checker.main(["--root", str(root), "--ledger", str(snapshot), "--quiet"]), 0
@@ -332,6 +508,7 @@ class BacklogConsistencyTests(unittest.TestCase):
     def test_main_rejects_malformed_ledger_snapshot(self):
         root = self.make_root()
         self.write(root, "docs/task.md", counter_paragraph() + sample_records())
+        self.write_archived_fixture(root)
         malformed = self.write(root, "docs/ledger.json", "{not valid json")
         self.assertEqual(
             checker.main(["--root", str(root), "--ledger", str(malformed), "--quiet"]),
