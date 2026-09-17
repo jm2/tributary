@@ -2348,6 +2348,38 @@ pub(crate) fn object_identity(_file: &File) -> io::Result<ObjectIdentity> {
     Err(unsupported_platform())
 }
 
+/// Identify the directory currently named by `path`.
+///
+/// This is the selection-evidence twin of the mounted authority's ancestor
+/// treatment. On unix the whole pathname is resolved: the authority itself
+/// tolerates intermediate symlink components (notably `/var` on macOS), so an
+/// ancestor is compared by its resolved object identity and a symlink whose
+/// target is unchanged still matches. On Windows the final component is
+/// opened no-follow and any reparse point is refused, exactly as the mounted
+/// authority's per-ancestor prefix walk treats each ancestor. A capture-time
+/// and save-time comparison of these identities therefore proves the complete
+/// location of a selection, not just its immediate containing directory.
+pub(crate) fn directory_identity(path: &Path) -> io::Result<ObjectIdentity> {
+    #[cfg(unix)]
+    {
+        // A plain open resolves every component, including the final one.
+        // Directory reads are never attempted; only the identity is
+        // consulted.
+        let file = File::open(path)?;
+        object_identity(&file)
+    }
+    #[cfg(windows)]
+    {
+        let opened = open_windows_directory(path, true, false)?;
+        object_identity(&opened.target)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(unsupported_platform())
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn boundary_identity(file: &File) -> io::Result<BoundaryIdentity> {
     root_mount_generation(file)?

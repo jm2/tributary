@@ -41,8 +41,8 @@ use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem};
 use uuid::Uuid;
 
 use super::root_authority::{
-    ContentRevision, MountedMutationCommit, MountedMutationTarget, MountedRootAuthority,
-    ObjectIdentity,
+    directory_identity, ContentRevision, MountedMutationCommit, MountedMutationTarget,
+    MountedRootAuthority, ObjectIdentity,
 };
 // Only the unix anchored staging flow captures a staged object identity;
 // the Windows and fallback authorities prove staging identity from the
@@ -1150,9 +1150,18 @@ pub enum LocalTagPreflightError {
 
 /// Snapshot evidence that one exact local-library file was the user's
 /// selection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The evidence retains the complete directory chain above the selection, not
+/// just its immediate parent: `ancestor_identities` mirrors the resolved
+/// identity of every directory from the containing directory's parent up to
+/// the filesystem root, in [`Path::ancestors`] order (nearest first). A save
+/// re-proves the whole chain, so an ancestor directory replaced between
+/// selection and save refuses the write even when the immediate parent, the
+/// file object, and the content revision all still match.
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct LocalSelectionEvidence {
     parent_identity: ObjectIdentity,
+    ancestor_identities: Vec<ObjectIdentity>,
     file_identity: ObjectIdentity,
     revision: ContentRevision,
 }
@@ -1164,8 +1173,9 @@ struct LocalSelectionEvidence {
 /// while the dialog was open could be silently edited at its old name, and an
 /// in-place edit between the staged copy and the commit could be silently
 /// overwritten. A `LocalMutationTarget` instead snapshots the exact selected
-/// object — the file's filesystem identity and its containing directory's
-/// identity — together with the object's content revision.
+/// object — the file's filesystem identity, its containing directory's
+/// identity, and the resolved identity of every directory above it — together
+/// with the object's content revision.
 ///
 /// Every write re-admits the file through a retained authority over that
 /// directory, proves the directory, object, and revision all still hold, and
@@ -1222,7 +1232,7 @@ impl LocalMutationTarget {
     /// only: the commit revalidates everything fail-closed. Blocking — worker
     /// threads only.
     pub fn preflight_write_capability(&self) -> Result<(), LocalTagPreflightError> {
-        let Some(evidence) = self.evidence else {
+        let Some(evidence) = self.evidence.clone() else {
             // No evidence was captured, so no write can be proven against the
             // selection. That is the selection-identity conflict, not a
             // capability failure.
@@ -1234,6 +1244,16 @@ impl LocalMutationTarget {
             LocalTagPreflightError::Unavailable(TagWritePreflightError::Unavailable)
         })?;
         if authority.root_identity() != evidence.parent_identity {
+            return Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::ParentChanged,
+            ));
+        }
+        if reprove_ancestor_chain(
+            self.path.parent().unwrap_or_else(|| Path::new("")),
+            &evidence,
+        )
+        .is_err()
+        {
             return Err(LocalTagPreflightError::Conflict(
                 LocalTagWriteConflict::ParentChanged,
             ));
@@ -1289,7 +1309,7 @@ impl LocalMutationTarget {
     ///
     /// This is the local-library twin of [`write_tags_with_mutation_target`]:
     /// the selected object is re-admitted through a retained authority over its
-    /// containing directory, the selection-time directory identity, object
+    /// containing directory, the selection-time directory chain, object
     /// identity, and content revision are all re-proven, and the commit
     /// re-proves the revision immediately before displacing anything. A file
     /// renamed, replaced, or edited in between refuses the write with a
@@ -1304,7 +1324,7 @@ impl LocalMutationTarget {
         // rewritten for an edit we are going to silently discard.
         edits.validate()?;
 
-        let Some(evidence) = self.evidence else {
+        let Some(evidence) = self.evidence.clone() else {
             return Err(conflict_error(LocalTagWriteConflict::SelectionUnavailable));
         };
 
@@ -1312,6 +1332,14 @@ impl LocalMutationTarget {
             anyhow::Error::new(error).context("the selected file is unavailable")
         })?;
         if authority.root_identity() != evidence.parent_identity {
+            return Err(conflict_error(LocalTagWriteConflict::ParentChanged));
+        }
+        if reprove_ancestor_chain(
+            self.path.parent().unwrap_or_else(|| Path::new("")),
+            &evidence,
+        )
+        .is_err()
+        {
             return Err(conflict_error(LocalTagWriteConflict::ParentChanged));
         }
         if target.admitted_identity().map_err(|error| {
@@ -1385,13 +1413,49 @@ fn capture_local_selection_evidence(path: &Path) -> std::io::Result<LocalSelecti
     let authority = std::sync::Arc::new(MountedRootAuthority::acquire(parent)?);
     let target = authority.open_mutation_target(Path::new(leaf))?;
     let parent_identity = authority.root_identity();
+    let ancestor_identities = ancestor_identities(parent)?;
     let file_identity = target.admitted_identity()?;
     let revision = target.content_revision()?;
     Ok(LocalSelectionEvidence {
         parent_identity,
+        ancestor_identities,
         file_identity,
         revision,
     })
+}
+
+/// Snapshot the resolved identity of every directory above `parent`.
+///
+/// [`Path::ancestors`] yields `parent` itself first; the caller already
+/// retains that identity as the authority root, so the chain recorded here
+/// starts at the parent's parent and ends at the filesystem root. Ancestor
+/// identities resolve symlinked components (unix) and refuse reparse points
+/// (Windows) exactly as the [`super::root_authority`] authorities do, so a
+/// capture-time and save-time comparison proves the complete location of the
+/// selection.
+fn ancestor_identities(parent: &Path) -> std::io::Result<Vec<ObjectIdentity>> {
+    parent.ancestors().skip(1).map(directory_identity).collect()
+}
+
+/// Re-prove the complete directory chain of a selection against its
+/// capture-time evidence.
+///
+/// The save path acquires a fresh authority over the parent pathname, so its
+/// root identity proves only the immediate directory; the recorded ancestor
+/// chain must be re-identified through the same pathname. A chain that no
+/// longer resolves to the recorded identities — an ancestor replaced, renamed
+/// away, or retargeted — refuses the write with
+/// [`LocalTagWriteConflict::ParentChanged`]. The proof is fail-closed: an
+/// ancestor that cannot be re-identified at all is treated as changed, never
+/// as unchanged.
+fn reprove_ancestor_chain(
+    parent: &Path,
+    evidence: &LocalSelectionEvidence,
+) -> Result<(), LocalTagWriteConflict> {
+    match ancestor_identities(parent) {
+        Ok(current) if current == evidence.ancestor_identities => Ok(()),
+        _ => Err(LocalTagWriteConflict::ParentChanged),
+    }
 }
 
 /// Re-label a local write failure as the localized conflict it represents.
@@ -2929,6 +2993,70 @@ mod tests {
             "the admitted file must be byte-for-byte untouched"
         );
         assert_no_tag_write_siblings_under(&directory.path);
+    }
+
+    /// An ancestor above the unchanged containing directory is replaced
+    /// before Save. Renaming the ancestor away and moving the
+    /// inode-stable deeper chain back under a fresh ancestor leaves the
+    /// containing directory, file, and revision evidence all matching; only
+    /// the retained ancestor chain notices the swap, and the save must refuse
+    /// rather than rewrite the file through a location the selection never
+    /// admitted.
+    #[test]
+    fn a_local_selection_refuses_a_replaced_ancestor_above_an_unchanged_parent() {
+        let directory = TestDirectory::new("local-ancestor-change");
+        let library = directory.path.join("library");
+        let album = library.join("album");
+        std::fs::create_dir_all(&album).expect("create library/album");
+        let track = album.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write fixture");
+
+        let target = LocalMutationTarget::capture(&track);
+
+        // Replace `library` wholesale while keeping the deeper chain
+        // byte-for-byte and inode-for-inode identical: rename it aside, put a
+        // fresh directory at its old name, and move the album back in.
+        let displaced_library = directory.path.join("library-old");
+        std::fs::rename(&library, &displaced_library).expect("displace the ancestor");
+        std::fs::create_dir(&library).expect("install a fresh ancestor");
+        std::fs::rename(displaced_library.join("album"), library.join("album"))
+            .expect("move the unchanged album under the fresh ancestor");
+
+        let error = target
+            .write_tags(&year("2026"))
+            .expect_err("a replaced ancestor must refuse the save");
+        assert_eq!(conflict_of(&error), LocalTagWriteConflict::ParentChanged);
+
+        assert_eq!(
+            std::fs::read(&track).expect("read the relocated file"),
+            silence_fixture_bytes(),
+            "the admitted file must be byte-for-byte untouched"
+        );
+        assert_no_tag_write_siblings_under(&directory.path);
+    }
+
+    /// A selection with an intact multi-level ancestor chain still saves
+    /// normally: the retained chain proof admits what did not change, so the
+    /// added ancestor check cannot regress ordinary nested-library writes.
+    #[test]
+    fn a_local_selection_with_an_intact_ancestor_chain_still_saves() {
+        let directory = TestDirectory::new("local-ancestor-intact");
+        let library = directory.path.join("library");
+        let album = library.join("album");
+        std::fs::create_dir_all(&album).expect("create library/album");
+        let track = album.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write fixture");
+
+        let target = LocalMutationTarget::capture(&track);
+
+        target
+            .write_tags(&year("2026"))
+            .expect("an intact ancestor chain must admit the save");
+
+        let tagged = lofty::read_from_path(&track).expect("reopen the written file");
+        let tag = tagged.primary_tag().expect("primary tag");
+        assert_eq!(tag.get_string(ItemKey::Year), Some("2026"));
+        assert!(directory.temp_files().is_empty());
     }
 
     /// Cancelling (dropping an uncommitted selection) performs no write and
