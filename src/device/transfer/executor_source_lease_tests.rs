@@ -12,13 +12,26 @@
 //! the publication (removing a fresh destination, restoring an overwritten
 //! original). A valid-root control pins that the added revalidation does
 //! not fail an ordinary transfer.
+//!
+//! The replacement interposition is platform-specific by necessity. On Unix
+//! a concurrent writer can rename the leased root aside, so the tests race
+//! the copy exactly that way and assert the full authority-loss path: the
+//! typed failure, no completion callback, and correct rollback. On Windows
+//! the retained root handle omits delete sharing, so the OS itself refuses
+//! to rename the root aside while the transfer holds it — the retained
+//! lease prevents the interposition outright. There the tests assert that
+//! refusal (the platform's authority evidence) and that the legitimate
+//! transfer still completes correctly; delete-share protection is never
+//! weakened to simulate a loss the platform prevents.
 
 use std::path::PathBuf;
 
 use super::executor_rollback_tests::entry_names;
 use super::executor_tests::transfer_request;
 use super::test_support::{authority_pair, read_authority, write_source_file};
-use super::types::{Stage, TransferError, TransferItem, TransferProgress, TransferSummary};
+#[cfg(unix)]
+use super::types::TransferError;
+use super::types::{Stage, TransferItem, TransferProgress, TransferSummary};
 use super::{TransferExecutor, TransferPlanner};
 use crate::local::write_authority::ConflictPolicy;
 use crate::source_lifecycle::CancellationObserver;
@@ -63,6 +76,10 @@ struct ReplaceSourceRootDuringCopy {
     source_root: PathBuf,
     moved_root: PathBuf,
     fired: bool,
+    /// Set when the platform refused the replacement outright: the
+    /// retained source lease omits delete sharing, so the OS rejects
+    /// renaming the root aside while the transfer holds it (Windows).
+    replacement_refused: bool,
     stage_completes: u32,
 }
 
@@ -92,8 +109,36 @@ impl TransferProgress for ReplaceSourceRootDuringCopy {
             return;
         }
         self.fired = true;
-        std::fs::rename(&self.source_root, &self.moved_root).expect("rename source root aside");
-        std::fs::create_dir(&self.source_root).expect("create replacement source root");
+        match std::fs::rename(&self.source_root, &self.moved_root) {
+            Ok(()) => {
+                std::fs::create_dir(&self.source_root).expect("create replacement source root");
+            }
+            Err(error) => {
+                // On Unix the rename must succeed: a concurrent writer CAN
+                // replace a read-leased root, which is exactly the
+                // interposition the publication boundary must catch.
+                #[cfg(unix)]
+                {
+                    panic!("unix must permit the source-root replacement interposition: {error}");
+                }
+                // On Windows the retained root handle omits delete sharing,
+                // so the OS refuses to rename the root aside while the
+                // transfer holds it. That refusal is the platform's
+                // authority evidence: the lease itself prevents the
+                // replacement, so the legitimate transfer must remain
+                // correct. Access denied (5) and sharing violation (32) are
+                // the refusals Windows reports for an open directory
+                // without delete sharing.
+                #[cfg(windows)]
+                {
+                    assert!(
+                        matches!(error.raw_os_error(), Some(5 | 32)),
+                        "windows must refuse the root replacement via the retained lease: {error}"
+                    );
+                    self.replacement_refused = true;
+                }
+            }
+        }
     }
 }
 
@@ -102,6 +147,7 @@ fn replacement_sink(source: &RenameableSource) -> ReplaceSourceRootDuringCopy {
         source_root: source.root.clone(),
         moved_root: source.moved.clone(),
         fired: false,
+        replacement_refused: false,
         stage_completes: 0,
     }
 }
@@ -111,6 +157,10 @@ fn replacement_sink(source: &RenameableSource) -> ReplaceSourceRootDuringCopy {
 /// alone cannot prove the lease). The failed stage reports no completion
 /// callback and rollback removes the just-published file, leaving no staged
 /// or backup litter behind.
+///
+/// On Windows the retained lease refuses the replacement outright (the root
+/// handle omits delete sharing), so the same interposition asserts the
+/// refusal and that the legitimate transfer still completes correctly.
 #[test]
 fn source_root_replaced_during_copy_fails_a_fresh_publish() {
     let source = RenameableSource::new();
@@ -127,37 +177,79 @@ fn source_root_replaced_during_copy_fails_a_fresh_publish() {
     let plan = TransferPlanner::new().plan(&request).expect("plan");
     let observer = CancellationObserver::never_cancelled();
     let mut progress = replacement_sink(&source);
-    let error = TransferExecutor::new(request, plan)
-        .run(&mut progress, &observer)
-        .expect_err("a source lease lost during the copy must fail the transfer");
-    assert!(
-        matches!(error, TransferError::AuthorityLost { .. }),
-        "the failure must be the typed authority loss: {error:?}"
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("source not current at publication"),
-        "the error must name the publication-boundary source loss: {error}"
-    );
-    assert_eq!(
-        progress.stage_completes, 0,
-        "the failed stage must not report a completion callback"
-    );
-    assert!(
-        !destination_root.path().join("song.flac").exists(),
-        "rollback must remove the fresh publication"
-    );
-    let survivors = entry_names(destination_root.path());
-    assert!(
-        survivors.is_empty(),
-        "no published file or staged/backup litter may survive: {survivors:?}"
-    );
+    let run = TransferExecutor::new(request, plan).run(&mut progress, &observer);
+    #[cfg(unix)]
+    {
+        let error = run.expect_err("a source lease lost during the copy must fail the transfer");
+        assert!(
+            matches!(error, TransferError::AuthorityLost { .. }),
+            "the failure must be the typed authority loss: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("source not current at publication"),
+            "the error must name the publication-boundary source loss: {error}"
+        );
+        assert_eq!(
+            progress.stage_completes, 0,
+            "the failed stage must not report a completion callback"
+        );
+        assert!(
+            !destination_root.path().join("song.flac").exists(),
+            "rollback must remove the fresh publication"
+        );
+        let survivors = entry_names(destination_root.path());
+        assert!(
+            survivors.is_empty(),
+            "no published file or staged/backup litter may survive: {survivors:?}"
+        );
+    }
+    #[cfg(windows)]
+    {
+        let summary = run.expect(
+            "the retained lease refuses the replacement, so the legitimate transfer must \
+             complete",
+        );
+        assert!(
+            progress.replacement_refused,
+            "the interposition must have been attempted and refused by the lease"
+        );
+        assert_eq!(
+            progress.stage_completes, 1,
+            "the completed stage must report exactly one completion callback"
+        );
+        assert!(summary.completed, "the transfer must complete: {summary:?}");
+        assert_eq!(summary.committed_stages, 1);
+        assert_eq!(
+            std::fs::read(destination_root.path().join("song.flac")).expect("read published file"),
+            b"copy me",
+            "the legitimate publication must hold the transferred bytes"
+        );
+        assert!(
+            source.root.is_dir(),
+            "the source root must still stand at its original path"
+        );
+        assert!(
+            !source.moved.exists(),
+            "the lease must have prevented any move of the source root"
+        );
+        let survivors = entry_names(destination_root.path());
+        assert_eq!(
+            survivors,
+            vec!["song.flac".to_string()],
+            "the published file only — no litter: {survivors:?}"
+        );
+    }
 }
 
 /// The same interposition against an OVERWRITE destination must fail and
 /// roll back by restoring the saved original, consuming its backup — a
 /// failed transfer must never destroy the pre-existing destination.
+///
+/// On Windows the retained lease refuses the replacement outright, so the
+/// same interposition asserts the refusal and that the legitimate overwrite
+/// still completes correctly.
 #[test]
 fn source_root_replaced_during_copy_restores_an_overwritten_destination() {
     let source = RenameableSource::new();
@@ -176,28 +268,67 @@ fn source_root_replaced_during_copy_restores_an_overwritten_destination() {
     let plan = TransferPlanner::new().plan(&request).expect("plan");
     let observer = CancellationObserver::never_cancelled();
     let mut progress = replacement_sink(&source);
-    let error = TransferExecutor::new(request, plan)
-        .run(&mut progress, &observer)
-        .expect_err("a source lease lost during the copy must fail the overwrite");
-    assert!(
-        matches!(error, TransferError::AuthorityLost { .. }),
-        "the failure must be the typed authority loss: {error:?}"
-    );
-    assert_eq!(
-        progress.stage_completes, 0,
-        "the failed stage must not report a completion callback"
-    );
-    assert_eq!(
-        std::fs::read(destination_root.path().join("song.flac")).expect("read restored original"),
-        b"old song",
-        "rollback must restore the overwritten original"
-    );
-    let survivors = entry_names(destination_root.path());
-    assert_eq!(
-        survivors,
-        vec!["song.flac".to_string()],
-        "the restored original only — no backup litter: {survivors:?}"
-    );
+    let run = TransferExecutor::new(request, plan).run(&mut progress, &observer);
+    #[cfg(unix)]
+    {
+        let error = run.expect_err("a source lease lost during the copy must fail the overwrite");
+        assert!(
+            matches!(error, TransferError::AuthorityLost { .. }),
+            "the failure must be the typed authority loss: {error:?}"
+        );
+        assert_eq!(
+            progress.stage_completes, 0,
+            "the failed stage must not report a completion callback"
+        );
+        assert_eq!(
+            std::fs::read(destination_root.path().join("song.flac"))
+                .expect("read restored original"),
+            b"old song",
+            "rollback must restore the overwritten original"
+        );
+        let survivors = entry_names(destination_root.path());
+        assert_eq!(
+            survivors,
+            vec!["song.flac".to_string()],
+            "the restored original only — no backup litter: {survivors:?}"
+        );
+    }
+    #[cfg(windows)]
+    {
+        let summary = run.expect(
+            "the retained lease refuses the replacement, so the legitimate overwrite must \
+             complete",
+        );
+        assert!(
+            progress.replacement_refused,
+            "the interposition must have been attempted and refused by the lease"
+        );
+        assert_eq!(
+            progress.stage_completes, 1,
+            "the completed stage must report exactly one completion callback"
+        );
+        assert!(summary.completed, "the transfer must complete: {summary:?}");
+        assert_eq!(summary.committed_stages, 1);
+        assert_eq!(
+            std::fs::read(destination_root.path().join("song.flac")).expect("read final"),
+            b"new song",
+            "the legitimate overwrite must hold the transferred bytes"
+        );
+        assert!(
+            source.root.is_dir(),
+            "the source root must still stand at its original path"
+        );
+        assert!(
+            !source.moved.exists(),
+            "the lease must have prevented any move of the source root"
+        );
+        let survivors = entry_names(destination_root.path());
+        assert_eq!(
+            survivors,
+            vec!["song.flac".to_string()],
+            "the overwritten file only — no backup litter: {survivors:?}"
+        );
+    }
 }
 
 /// The valid-root control: an untouched source root still publishes
