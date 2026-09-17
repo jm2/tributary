@@ -5,6 +5,14 @@ same day: the display-backed evidence was regenerated with the GTK 4 Broadway
 daemon and fail-closed positive runs after refinery rejection of the original
 record (its reproduction pointed the GTK 4 test binary at the GTK 3
 `broadwayd`, so the widget contract skipped silently behind a green suite).
+Revision 3, same day: the refinery's repeat review reproduced that the
+revision-2 harness block discarded cargo's own exit status (`cargo | tee`
+followed by `SUITE=$?` reports tee's status, masking an injected exit 101 as
+success), never required the contract ok-line it described, proceeded after
+the readiness loop exhausted its timeout, and reaped the daemon only on the
+success path. The reproduction below was rewritten fail-closed end to end
+and then validated with a display-backed success run plus four failure
+injections against the published text (harness-validation section).
 
 This record supplies the visual/accessibility acceptance evidence for the merged
 presentation refinements. PR #179 (`polecat/tr-ewq` → `main`, merge commit
@@ -44,8 +52,10 @@ every widget assertion while the suite still reports `ok` — the original
 it. The procedure below was re-executed end to end on this host. Every
 positive run now fails closed twice: in code — `TRIBUTARY_WIDGET_TESTS_FAIL_CLOSED`
 makes both acquisition skip paths assert instead of skipping — and in the
-harness, where grepping any skip diagnostic aborts the run regardless of
-cargo's exit code.
+harness, which captures cargo's own exit status (no pipeline sits between
+cargo and the status check), aborts on either skip diagnostic, requires the
+consolidated contract's ok-line, fails when daemon readiness times out, and
+reaps the daemon through an EXIT trap on every exit path.
 
 Two further traps this regeneration demonstrated first-hand, both now baked
 into the procedure:
@@ -68,22 +78,35 @@ mkdir -m 700 -p "$EVIDENCE/runtime"
 export XDG_RUNTIME_DIR="$EVIDENCE/runtime"      # shared by daemon AND test process
 export TRIBUTARY_WIDGET_TESTS_FAIL_CLOSED=1     # skip paths assert instead of skipping
 
+BROADWAY_PID=
+cleanup() {                     # every exit path reaps exactly OUR daemon
+  rc=$?
+  [ -n "$BROADWAY_PID" ] && kill "$BROADWAY_PID" 2>/dev/null
+  [ -n "$BROADWAY_PID" ] && wait "$BROADWAY_PID" 2>/dev/null
+  exit "$rc"
+}
+trap cleanup EXIT
+
 gtk4-broadwayd :6 >"$EVIDENCE/daemon.log" 2>&1 &
 BROADWAY_PID=$!
+READY=0
 for _ in $(seq 1 40); do                        # readiness: wait for the socket
-  ls "$XDG_RUNTIME_DIR"/broadway*.socket >/dev/null 2>&1 && break
+  ls "$XDG_RUNTIME_DIR"/broadway*.socket >/dev/null 2>&1 && { READY=1; break; }
   kill -0 "$BROADWAY_PID" 2>/dev/null || exit 1 # daemon died: fail
   sleep 0.25
 done
+[ "$READY" -eq 1 ] || exit 1                    # readiness timeout: fail, never proceed
 
 DISPLAY=:6 GDK_BACKEND=broadway BROADWAY_DISPLAY=:6 \
-  cargo test --all-targets -- --nocapture 2>&1 | tee "$EVIDENCE/suite.log"
-SUITE=$?
+  cargo test --all-targets -- --nocapture >"$EVIDENCE/suite.log" 2>&1
+SUITE=$?                        # cargo's own status: no pipe, nothing masks it
 
 # Harness-side fail-closed: green-but-unexercised is a failure even at exit 0.
 grep -q "no display session" "$EVIDENCE/suite.log" && SUITE=1
 grep -q "GTK unavailable"     "$EVIDENCE/suite.log" && SUITE=1
-kill "$BROADWAY_PID"; wait "$BROADWAY_PID"
+grep -Fq "test ui::browser::tests::gtk_widget_contracts_hold_on_one_session ... ok" \
+  "$EVIDENCE/suite.log" || SUITE=1              # the contract must have executed
+printf 'suite status: %s (log: %s/suite.log)\n' "$SUITE" "$EVIDENCE"
 exit "$SUITE"
 ```
 
@@ -92,6 +115,11 @@ The acquisition helper prints two and only two skip diagnostics
 `TRIBUTARY_WIDGET_TESTS_FAIL_CLOSED` was set, neither diagnostic appears
 anywhere in the log, and the log contains
 `test ui::browser::tests::gtk_widget_contracts_hold_on_one_session ... ok`.
+The published harness enforces all of that mechanically: cargo's exit status
+is captured directly (nothing sits between cargo and `SUITE=$?`), either skip
+diagnostic forces `SUITE=1`, the exact contract ok-line is required, a
+readiness timeout or early daemon death exits nonzero, and the EXIT trap
+terminates and waits for the daemon this invocation started on every path.
 
 Results at this head (source tree identical to `730fc36e`; only this document
 changed afterwards):
