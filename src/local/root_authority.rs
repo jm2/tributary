@@ -758,7 +758,7 @@ impl MountedMutationTarget {
 /// ancestor that was replaced inside the save window even when the parent
 /// object, the file object, and the content revision all still match.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SelectionLocationEvidence {
+pub struct SelectionLocationEvidence {
     /// The resolved identity of the selection's containing directory — the
     /// same object the retained authority is rooted at.
     pub(crate) parent_identity: ObjectIdentity,
@@ -778,7 +778,7 @@ pub(crate) struct SelectionLocationEvidence {
 /// compare by resolved object and reparse points (Windows) refuse, exactly as
 /// the authority bindings do. The resolution is fail-closed: an ancestor that
 /// cannot be identified at all is an error, never an absent link.
-pub(crate) fn resolve_ancestor_chain(parent: &Path) -> io::Result<Vec<ObjectIdentity>> {
+pub fn resolve_ancestor_chain(parent: &Path) -> io::Result<Vec<ObjectIdentity>> {
     parent.ancestors().skip(1).map(directory_identity).collect()
 }
 
@@ -1043,21 +1043,14 @@ impl MountedMutationCommit<'_> {
     /// or retargeted after the save started — refuses the commit before
     /// anything is displaced. The proof is fail-closed: an ancestor that
     /// cannot be re-identified at all is treated as changed.
-    fn confirm_selection_location(
-        &self,
-        selection: &SelectionLocationEvidence,
-    ) -> io::Result<()> {
+    fn confirm_selection_location(&self, selection: &SelectionLocationEvidence) -> io::Result<()> {
         if self.target.authority.root_identity() != selection.parent_identity {
             return Err(authority_changed(
                 "the selection's containing directory changed before the commit",
             ));
         }
-        let current = resolve_ancestor_chain(
-            self.target
-                .path
-                .parent()
-                .unwrap_or_else(|| Path::new("")),
-        )?;
+        let current =
+            resolve_ancestor_chain(self.target.path.parent().unwrap_or_else(|| Path::new("")))?;
         if current != selection.ancestor_identities {
             return Err(authority_changed(
                 "the selection's ancestor directory chain changed before the commit",

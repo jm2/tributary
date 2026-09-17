@@ -1644,7 +1644,14 @@ pub fn write_tags_with_mutation_target_revision(
     let source = commit
         .source_file()
         .with_context(|| "Failed to read the exact retained mutation target".to_string())?;
-    write_tag_edits_for_commit(&mut commit, source, target, edits, expected_revision, selection)
+    write_tag_edits_for_commit(
+        &mut commit,
+        source,
+        target,
+        edits,
+        expected_revision,
+        selection,
+    )
 }
 
 /// Perform the staged tag replacement for an open commit section.
@@ -3141,11 +3148,8 @@ mod tests {
                     .expect("displace the ancestor during staging");
                 std::fs::create_dir(&fresh_library)
                     .expect("install a fresh ancestor during staging");
-                std::fs::rename(
-                    closure_displaced.join("album"),
-                    fresh_library.join("album"),
-                )
-                .expect("move the unchanged album under the fresh ancestor");
+                std::fs::rename(closure_displaced.join("album"), fresh_library.join("album"))
+                    .expect("move the unchanged album under the fresh ancestor");
             }),
             || {
                 let error = target
