@@ -242,6 +242,12 @@ jobs:
             pkgconf-pkg-config git curl xorg-x11-server-Xvfb
 
       - uses: actions/checkout@v7
+        with:
+          # The job body runs cargo (and thus third-party build scripts)
+          # inside a container; it never needs Git credentials. Dropping the
+          # persisted token closes the artipacked credential-exposure finding
+          # on this checkout.
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
