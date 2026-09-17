@@ -2885,10 +2885,23 @@ pub mod tests {
             });
         }
 
+        let expected_rows = store.n_items() as usize;
         let list_view = gtk::ListView::new(Some(gtk::NoSelection::new(Some(store))), Some(factory));
         let window = gtk::Window::builder().child(&list_view).build();
         window.present();
+        // Item binding happens on the view's frame clock after the window
+        // maps, so a single pending-event sweep can exit before the factory
+        // has seen every row: pump until all rows are recorded, yielding to
+        // the frame clock between sweeps (bounded, then asserted by the
+        // caller's position check).
         let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while recorded.borrow().len() < expected_rows && std::time::Instant::now() < deadline {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         while context.pending() {
             context.iteration(false);
         }
