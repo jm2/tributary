@@ -991,15 +991,28 @@ fn collect_selected_add_candidates(
         .collect()
 }
 
-fn playlist_add_candidate(track: &TrackObject) -> Option<PlaylistAddCandidate> {
+/// The complete application identity of one row.
+///
+/// The track string alone is only a relative identity inside one source's
+/// namespace: two devices (or a device and the local library) can expose
+/// the same relative track ID. [`MediaKey`] pairs the track with its owning
+/// source, so selection snapshots and completion re-proofs compare full
+/// identities, never bare track strings. `None` means the row cannot prove
+/// an identity at all; every caller treats that as fail-closed — the row is
+/// dropped with the whole action at build time, and refused at completion.
+fn row_media_key(track: &TrackObject) -> Option<MediaKey> {
     let source_id = track.source_id()?;
     let track_id = if source_id == SourceId::local() {
         TrackId::new(track.track_id()).ok()?
     } else {
         TrackId::remote(track.track_id()).ok()?
     };
-    let media_key = MediaKey::new(source_id, track_id);
-    if source_id == SourceId::local() {
+    Some(MediaKey::new(source_id, track_id))
+}
+
+fn playlist_add_candidate(track: &TrackObject) -> Option<PlaylistAddCandidate> {
+    let media_key = row_media_key(track)?;
+    if media_key.source_id == SourceId::local() {
         Some(PlaylistAddCandidate::Local(media_key))
     } else {
         Some(PlaylistAddCandidate::Remote {
@@ -1153,7 +1166,7 @@ fn build_properties_action(
     // device snapshot their exact source-scoped identity for resolution
     // through the live session when the action fires.
     let mut track_infos = Vec::new();
-    let mut track_ids = Vec::new();
+    let mut media_keys = Vec::new();
     for &position in &selection.positions {
         let Some(item) = sm.item(position) else {
             return;
@@ -1164,7 +1177,14 @@ fn build_properties_action(
         let Some(target) = properties_save_target(track, sidebar_store) else {
             return;
         };
-        track_ids.push(track.track_id());
+        // The completion re-proves the live selection by complete
+        // source-scoped identity, so the snapshot must carry it. A row that
+        // cannot prove which source owns it is dropped with the whole
+        // action — never admitted under an unprovable identity.
+        let Some(media_key) = row_media_key(track) else {
+            return;
+        };
+        media_keys.push(media_key);
         track_infos.push(super::properties_dialog::TrackInfo {
             target,
             title: track.title(),
@@ -1195,13 +1215,16 @@ fn build_properties_action(
     // Re-proving evidence for the completion: menu build and target
     // admission are separated by asynchronous work, during which the user
     // can keep scrolling, reordering, or changing the selection. The
-    // completion re-proves the live selection before opening the dialog so
+    // completion re-proves the live selection before opening the dialog —
+    // every snapshotted position still selected and still naming the same
+    // source-scoped identity (MediaKey), with no additional selection — so
     // admitted targets are stitched onto the rows the user actually
-    // activated — never onto rows that moved into place while the worker
-    // ran.
+    // activated, never onto rows that moved into place while the worker
+    // ran. A track string alone cannot decide this: two sources can expose
+    // equal relative track IDs, so only the full identity proves the row.
     let selection_evidence = PropertiesSelectionEvidence {
         positions: selection.positions.clone(),
-        track_ids,
+        media_keys,
     };
 
     let props_action = gtk::gio::SimpleAction::new("properties", None);
@@ -1330,35 +1353,49 @@ fn build_properties_action(
                 failure_context.show_mutation_failed();
                 return;
             };
-            if !selection_evidence.still_holds(&live_selection) {
-                tracing::warn!(
-                    "properties selection changed while targets were admitted; surfacing the cancelled action"
-                );
-                failure_context.show_mutation_failed();
-                return;
+            let selected = live_selection.selection();
+            match resolve_properties_completion(
+                &selection_evidence,
+                selected.size() as usize,
+                &|position| selected.contains(position),
+                &|position| {
+                    live_selection
+                        .item(position)
+                        .and_downcast::<TrackObject>()
+                        .and_then(|track| row_media_key(&track))
+                },
+                track_infos_for_resolve,
+                &admission,
+            ) {
+                PropertiesCompletion::Open(infos) => {
+                    // Successful removable writes republish refreshed metadata for
+                    // exactly the written identities; the dialog triggers the
+                    // registry's catalogue refresh lane itself. A local-path-only
+                    // selection can never write through a removable authority, so no
+                    // post-mutation catalogue refresh can apply.
+                    let has_removable = infos
+                        .iter()
+                        .any(|info| matches!(info.target, SaveTarget::Removable(_)));
+                    super::properties_dialog::show_properties_dialog(
+                        &win,
+                        &infos,
+                        automatic_device,
+                        has_removable.then_some(registry_for_catalogue),
+                    );
+                }
+                PropertiesCompletion::SelectionChanged => {
+                    tracing::warn!(
+                        "properties selection changed while targets were admitted; surfacing the cancelled action"
+                    );
+                    failure_context.show_mutation_failed();
+                }
+                PropertiesCompletion::StitchFault => {
+                    // Unreachable: every pending target in `infos` came from the
+                    // same admitted set. An admission must be exact, never
+                    // partial.
+                    tracing::warn!("properties admission left a target unresolved");
+                }
             }
-            let mut infos = track_infos_for_resolve;
-            if !stitch_admitted_targets(&mut infos, &admission) {
-                // Unreachable: every pending target in `infos` came from the
-                // same admitted set. An admission must be exact, never
-                // partial.
-                tracing::warn!("properties admission left a target unresolved");
-                return;
-            }
-            // Successful removable writes republish refreshed metadata for
-            // exactly the written identities; the dialog triggers the
-            // registry's catalogue refresh lane itself. A local-path-only
-            // selection can never write through a removable authority, so no
-            // post-mutation catalogue refresh can apply.
-            let has_removable = infos
-                .iter()
-                .any(|info| matches!(info.target, SaveTarget::Removable(_)));
-            super::properties_dialog::show_properties_dialog(
-                &win,
-                &infos,
-                automatic_device,
-                has_removable.then_some(registry_for_catalogue),
-            );
         });
     });
 
@@ -1542,59 +1579,92 @@ struct PropertiesAdmission {
 }
 
 /// The selection a Properties activation was built from, as exact row
-/// positions plus each row's track identity.
+/// positions plus each row's complete source-scoped identity.
 ///
 /// Menu build and target admission are separated by asynchronous work,
 /// during which the user can keep scrolling, reordering, or changing the
 /// selection. Re-proving the live selection at completion — every
-/// snapshotted position still selected and still naming the same track,
-/// with no additional selection — guarantees admitted targets are stitched
-/// back onto the rows the user actually activated, never onto rows that
-/// moved into place while the worker ran.
+/// snapshotted position still selected and still naming the same
+/// [`MediaKey`] — guarantees admitted targets are stitched back onto the
+/// rows the user actually activated, never onto rows that moved into place
+/// while the worker ran. The identity is the full `(source, track)` pair,
+/// never the track string alone: different sources can expose equal
+/// relative track IDs, and a row that cannot prove any identity fails
+/// closed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PropertiesSelectionEvidence {
     positions: Vec<u32>,
-    track_ids: Vec<String>,
+    media_keys: Vec<MediaKey>,
 }
 
 impl PropertiesSelectionEvidence {
-    fn still_holds(&self, selection: &gtk::MultiSelection) -> bool {
-        let selected = selection.selection();
-        self.matches(
-            selected.size() as usize,
-            &|position| selected.contains(position),
-            &|position| {
-                selection
-                    .item(position)
-                    .and_downcast::<TrackObject>()
-                    .map(|track| track.track_id())
-            },
-        )
-    }
-
     /// The selection-model-free core, testable headless: the live selected
     /// set must have exactly the snapshotted size — no row deselected, none
     /// added — and every snapshotted position must still be selected and
-    /// still name the track that was activated.
+    /// still name the source-scoped identity that was activated. A live row
+    /// whose identity cannot be proven at all counts as changed: the
+    /// refusal is fail-closed.
     fn matches(
         &self,
         selected_count: usize,
         is_selected: &dyn Fn(u32) -> bool,
-        track_id_at: &dyn Fn(u32) -> Option<String>,
+        media_key_at: &dyn Fn(u32) -> Option<MediaKey>,
     ) -> bool {
         if selected_count != self.positions.len() {
             return false;
         }
-        for (&position, track_id) in self.positions.iter().zip(&self.track_ids) {
+        for (&position, media_key) in self.positions.iter().zip(&self.media_keys) {
             if !is_selected(position) {
                 return false;
             }
-            if track_id_at(position).as_deref() != Some(track_id.as_str()) {
+            if media_key_at(position).as_ref() != Some(media_key) {
                 return false;
             }
         }
         true
     }
+}
+
+/// What the Properties completion does once the worker delivers an admitted
+/// target set.
+#[derive(Debug)]
+enum PropertiesCompletion {
+    /// The live selection still names the activated rows exactly and every
+    /// admitted target stitched: open the dialog over this write set.
+    Open(Vec<super::properties_dialog::TrackInfo>),
+    /// The live selection no longer names the activated rows — deselected,
+    /// extended, moved, or replaced by rows carrying the same track strings
+    /// under different sources: refuse visibly.
+    SelectionChanged,
+    /// Wiring fault: the admitted set cannot be stitched exactly. The
+    /// dialog must never open over a partial stitch.
+    StitchFault,
+}
+
+/// The completion core the UI dispatch runs once the worker delivers its
+/// admitted set, with the live-selection probes passed in so tests drive
+/// the exact decision the dialog opening depends on.
+///
+/// The re-proof compares complete source-scoped identities
+/// ([`PropertiesSelectionEvidence::matches`]); the stitch must cover every
+/// pending target exactly. Only then is the write set handed back for the
+/// dialog to open.
+fn resolve_properties_completion(
+    evidence: &PropertiesSelectionEvidence,
+    selected_count: usize,
+    is_selected: &dyn Fn(u32) -> bool,
+    media_key_at: &dyn Fn(u32) -> Option<MediaKey>,
+    infos: Vec<super::properties_dialog::TrackInfo>,
+    admission: &PropertiesAdmission,
+) -> PropertiesCompletion {
+    if !evidence.matches(selected_count, is_selected, media_key_at) {
+        return PropertiesCompletion::SelectionChanged;
+    }
+    let mut infos = infos;
+    if !stitch_admitted_targets(&mut infos, admission) {
+        return PropertiesCompletion::StitchFault;
+    }
+    PropertiesCompletion::Open(infos)
 }
 
 /// Replace every pending target with its admitted exact form.
@@ -2778,33 +2848,177 @@ pub mod tests {
     }
 
     #[test]
-    fn local_admission_waits_for_the_test_gate_and_admits_by_path() {
+    fn held_admission_drives_the_completion_decision_and_refuses_a_source_swap() {
+        // Two devices exposing the same relative track ID form the live
+        // view. The activation snapshotted device A's row; while the
+        // admission worker is parked in the test gate the view switches to
+        // device B, whose row at the same position carries the same track
+        // string. The completion must refuse on the source-scoped identity
+        // and open for the unchanged control.
+        let device_a = SourceId::from_uuid(uuid::Uuid::new_v4());
+        let device_b = SourceId::from_uuid(uuid::Uuid::new_v4());
+        let device_key = |source: &SourceId| {
+            MediaKey::new(*source, TrackId::remote("track-9").expect("device track id"))
+        };
+        let pending_path = PathBuf::from("/definitely/not/here.flac");
+
+        // The worker parks inside the admission gate exactly as the
+        // dispatch's spawn_blocking worker can. `at_gate` marks the parked
+        // state without any timed sleep.
         let (release, gate) = std::sync::mpsc::channel();
         *HELD_ADMISSION_GATE.lock().expect("gate lock") = Some(gate);
+        let at_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let at_gate_worker = at_gate.clone();
+        let worker_paths = vec![pending_path.clone()];
+        let worker = std::thread::spawn(move || {
+            at_gate_worker.store(true, std::sync::atomic::Ordering::SeqCst);
+            capture_pending_locals(&worker_paths)
+        });
+        let mut waited = 0;
+        while !at_gate.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                waited < 10_000,
+                "the admission worker never reached the test gate"
+            );
+            waited += 1;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
 
-        let paths = vec![
-            PathBuf::from("/definitely/not/here.flac"),
-            PathBuf::from("/music/second.flac"),
-        ];
-        let worker_paths = paths.clone();
-        let worker = std::thread::spawn(move || capture_pending_locals(&worker_paths));
+        // While the worker is parked, the main context the UI runs on must
+        // keep dispatching — that is the responsiveness the off-thread
+        // admission buys. An idle must run while the worker is still
+        // blocked.
+        let dispatched = std::rc::Rc::new(std::cell::Cell::new(false));
+        let dispatched_for_idle = dispatched.clone();
+        glib::idle_add_local_once(move || dispatched_for_idle.set(true));
+        let context = glib::MainContext::default();
+        let mut pumped = 0;
+        while !dispatched.get() {
+            assert!(
+                pumped < 10_000,
+                "the main context stopped dispatching while the admission worker was parked"
+            );
+            pumped += 1;
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            !worker.is_finished(),
+            "the responsiveness proof must run while the worker is still parked"
+        );
 
-        // The worker is parked inside the gate: release it and the
-        // admission must complete with one exact target per distinct path
-        // (capture is best-effort, so unidentifiable paths still admit —
-        // every later write refuses on the missing evidence).
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Release the worker and deliver its admitted set through the same
+        // async-channel + main-context transport the dispatch uses, decided
+        // by the same completion core the dialog opening depends on.
         release.send(()).expect("release admission gate");
         let admitted = worker.join().expect("admission worker");
+        assert_eq!(admitted.len(), 1, "admission must admit by path");
+        let (tx, rx) = async_channel::bounded::<PropertiesAdmission>(1);
+        tx.send_blocking(PropertiesAdmission {
+            locals: admitted,
+            removables: std::collections::HashMap::new(),
+        })
+        .expect("deliver the admitted set");
 
-        *HELD_ADMISSION_GATE.lock().expect("gate lock") = None;
-        assert_eq!(admitted.len(), paths.len());
-        for path in &paths {
+        // The live rows now name device B at the snapshotted position:
+        // equal track string, different source-scoped identity.
+        let evidence = PropertiesSelectionEvidence {
+            positions: vec![0],
+            media_keys: vec![device_key(&device_a)],
+        };
+        let outcome: std::rc::Rc<std::cell::RefCell<Option<PropertiesCompletion>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let outcome_for_task = outcome.clone();
+        let infos_for_task = vec![track_info_with_target(SaveTarget::PendingLocal(
+            PendingLocalMutation {
+                path: pending_path.clone(),
+            },
+        ))];
+        context.spawn_local(async move {
+            let Ok(admission) = rx.recv().await else {
+                panic!("the admitted set must arrive");
+            };
+            *outcome_for_task.borrow_mut() = Some(resolve_properties_completion(
+                &evidence,
+                1,
+                &|position| position == 0,
+                &move |position| (position == 0).then(|| device_key(&device_b)),
+                infos_for_task,
+                &admission,
+            ));
+        });
+        let mut settled = 0;
+        while outcome.borrow().is_none() {
             assert!(
-                admitted.contains_key(path),
-                "missing admission for {path:?}"
+                settled < 10_000,
+                "the completion never ran on the main context"
             );
+            settled += 1;
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        *HELD_ADMISSION_GATE.lock().expect("gate lock") = None;
+        assert!(
+            matches!(
+                outcome.borrow().as_ref(),
+                Some(PropertiesCompletion::SelectionChanged)
+            ),
+            "a same-track-ID row from another source must refuse the completion, got {:?}",
+            outcome.borrow()
+        );
+
+        // The unchanged control: the same activation snapshot over rows that
+        // still name device A stitches the admitted set and opens, through
+        // the same delivery transport.
+        let evidence = PropertiesSelectionEvidence {
+            positions: vec![0],
+            media_keys: vec![device_key(&device_a)],
+        };
+        let admitted = capture_pending_locals(std::slice::from_ref(&pending_path));
+        assert_eq!(admitted.len(), 1, "admission must admit by path");
+        let (tx, rx) = async_channel::bounded::<PropertiesAdmission>(1);
+        tx.send_blocking(PropertiesAdmission {
+            locals: admitted,
+            removables: std::collections::HashMap::new(),
+        })
+        .expect("deliver the admitted set");
+        let outcome: std::rc::Rc<std::cell::RefCell<Option<PropertiesCompletion>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let outcome_for_task = outcome.clone();
+        let infos_for_task = vec![track_info_with_target(SaveTarget::PendingLocal(
+            PendingLocalMutation {
+                path: pending_path.clone(),
+            },
+        ))];
+        context.spawn_local(async move {
+            let Ok(admission) = rx.recv().await else {
+                panic!("the admitted set must arrive");
+            };
+            *outcome_for_task.borrow_mut() = Some(resolve_properties_completion(
+                &evidence,
+                1,
+                &|position| position == 0,
+                &move |position| (position == 0).then(|| device_key(&device_a)),
+                infos_for_task,
+                &admission,
+            ));
+        });
+        let mut settled = 0;
+        while outcome.borrow().is_none() {
+            assert!(
+                settled < 10_000,
+                "the completion never ran on the main context"
+            );
+            settled += 1;
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        match outcome.borrow().as_ref() {
+            Some(PropertiesCompletion::Open(opened)) => {
+                assert!(matches!(opened[0].target, SaveTarget::Local(_)));
+            }
+            other => panic!("the unchanged selection must open, got {other:?}"),
+        };
     }
 
     #[test]
@@ -2812,16 +3026,17 @@ pub mod tests {
         // Selection-model types assert gtk::init, so the selection mechanics
         // are exercised through the headless core: the live selected count,
         // the same per-position membership test, and the same per-position
-        // lookup the model view performs.
+        // source-scoped identity lookup (row_media_key) the model view
+        // performs.
         let store = gtk::gio::ListStore::new::<TrackObject>();
         for id in ["row-0", "row-1", "row-2"] {
             store.append(&local_ctx_track(id, &format!("file:///music/{id}.flac")));
         }
-        let track_id_at = |position: u32| {
+        let media_key_at = |position: u32| {
             store
                 .item(position)
                 .and_downcast::<TrackObject>()
-                .map(|track| track.track_id())
+                .and_then(|track| row_media_key(&track))
         };
         let mask = std::rc::Rc::new(std::cell::RefCell::new(vec![false, false, false]));
         let is_selected = {
@@ -2830,27 +3045,50 @@ pub mod tests {
         };
         let evidence = PropertiesSelectionEvidence {
             positions: vec![1],
-            track_ids: vec!["row-1".to_string()],
+            media_keys: vec![media_key_at(1).expect("row 1 proves its identity")],
         };
 
         // Activation snapshot: only row 1 is selected and still row 1.
         *mask.borrow_mut() = vec![false, true, false];
-        assert!(evidence.matches(1, &is_selected, &track_id_at));
+        assert!(evidence.matches(1, &is_selected, &media_key_at));
 
         // The row was deselected while the worker ran.
         *mask.borrow_mut() = vec![false, false, false];
-        assert!(!evidence.matches(0, &is_selected, &track_id_at));
+        assert!(!evidence.matches(0, &is_selected, &media_key_at));
 
         // The user extended the selection while the worker ran.
         *mask.borrow_mut() = vec![false, true, true];
-        assert!(!evidence.matches(2, &is_selected, &track_id_at));
+        assert!(!evidence.matches(2, &is_selected, &media_key_at));
 
         // A row moved into place at the same position: the position is
         // still selected but no longer names the activated track.
         *mask.borrow_mut() = vec![false, true, false];
         let moved = local_ctx_track("row-moved", "file:///music/moved.flac");
         store.splice(1, 1, &[moved]);
-        assert!(!evidence.matches(1, &is_selected, &track_id_at));
+        assert!(!evidence.matches(1, &is_selected, &media_key_at));
+
+        // A replacement row that cannot prove any identity at all refuses
+        // fail-closed: an unprovable row is never accepted as the row that
+        // was activated. (No source id is ever assigned, so row_media_key
+        // has nothing to prove.)
+        let anonymous = TrackObject::new(
+            1,
+            "Context title",
+            60,
+            "Artist",
+            "Album",
+            "",
+            "",
+            0,
+            "",
+            0,
+            0,
+            0,
+            "",
+            "file:///music/anonymous.flac",
+        );
+        store.splice(1, 1, &[anonymous]);
+        assert!(!evidence.matches(1, &is_selected, &media_key_at));
     }
 
     #[test]
