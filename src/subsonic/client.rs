@@ -10,6 +10,7 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
+use crate::architecture::remote_json::parse_remote_json;
 use crate::architecture::{AdvertisedHttpRoute, ResolvedHttpRequest};
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
@@ -364,11 +365,7 @@ impl SubsonicClient {
             .await
             .map_err(|error| response_body_error("Failed to parse Subsonic JSON", error))?;
 
-        let envelope: SubsonicEnvelope =
-            serde_json::from_slice(&body).map_err(|e| BackendError::ParseError {
-                message: format!("Failed to parse Subsonic JSON: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+        let envelope: SubsonicEnvelope = parse_remote_json("Failed to parse Subsonic JSON", &body)?;
 
         if envelope.response.status != "ok" {
             if let Some(err) = &envelope.response.error {
@@ -474,6 +471,9 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, SocketAddr, TcpListener};
     use std::thread;
+
+    use crate::architecture::remote_json::rendered_error_chain;
+    use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
 
     use super::*;
 
@@ -778,5 +778,59 @@ mod tests {
         let rendered = error.to_string();
         assert!(!rendered.contains(&username));
         assert!(!rendered.contains(&password));
+    }
+
+    /// A Subsonic envelope whose `error.code` is a string instead of the
+    /// expected `i32` makes `serde_json` quote the entire wrong-type value.
+    /// The production catalogue path must reduce that to a fixed category and
+    /// position without retaining any of the server-controlled content, for
+    /// both a short and a large sentinel value.
+    #[tokio::test]
+    async fn catalogue_parse_failures_omit_response_content_from_diagnostics() {
+        let cases = [
+            "SUBSONIC-PARSE-SENTINEL-2f7c".to_string(),
+            format!(
+                "{}{}",
+                "y".repeat(48 * 1024),
+                "SUBSONIC-LARGE-SENTINEL-81dd"
+            ),
+        ];
+
+        for payload in cases {
+            let service = MockHttpService::start(vec![MockRoute::get("/rest/ping.view").reply(
+                MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "failed",
+                        "version": "1.16.1",
+                        "error": { "code": payload, "message": "fixture" }
+                    }
+                })),
+            )])
+            .await;
+            let password = uuid::Uuid::new_v4().to_string();
+            let client =
+                SubsonicClient::new(&service.base_url(), "user", &password).expect("client");
+            let error = client
+                .get("ping.view")
+                .await
+                .expect_err("wrong-type envelope must not deserialize");
+            service.finish().await;
+
+            match &error {
+                BackendError::ParseError { message, source } => {
+                    assert!(source.is_none(), "content-bearing source retained");
+                    assert!(
+                        message.contains("unexpected type or shape"),
+                        "unexpected category: {message}"
+                    );
+                }
+                other => panic!("expected ParseError, got {other:?}"),
+            }
+            let rendered = format!("{error:?}\n{error}\n{}", rendered_error_chain(&error));
+            assert!(
+                !rendered.contains(&payload),
+                "remote response content leaked into diagnostics"
+            );
+        }
     }
 }

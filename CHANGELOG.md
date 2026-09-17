@@ -101,6 +101,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of being published as a terminal player error — an overload can no longer
   tear down stable external playback. Stop/Shutdown reserved admission, epoch
   purge, and the exact FIFO below capacity are unchanged.
+- **Remote JSON parse diagnostics** (`src/architecture/remote_json.rs`,
+  `src/subsonic/client.rs`, `src/plex/client.rs`, `src/jellyfin/client.rs`) —
+  Subsonic, Plex, and Jellyfin response bodies now decode through one
+  content-free parser that reports only a fixed failure category and the safe
+  line/column. `serde_json`'s wrong-type diagnostics quote the offending value,
+  which can be private catalogue metadata or an echoed credential; they are no
+  longer retained in the error message, `Debug`, error chain, tracing, or UI
+  projection. Last.fm's existing strict parser is unchanged.
 - **Supervised MPD control TOCTOU** (`src/audio/mpd_output.rs`) — A playback
   control (play/pause/toggle/seek) whose own pre-control `status` observed
   partition-option drift or a foreign current song lapsed the supervisor yet was
