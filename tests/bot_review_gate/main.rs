@@ -22,6 +22,7 @@ mod evidence;
 mod fail_closed;
 mod harness;
 mod preflight;
+mod preflight_inventory;
 mod preflight_live;
 mod preflight_support;
 mod publication;
