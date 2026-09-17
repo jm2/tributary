@@ -1128,6 +1128,39 @@ mod tests {
     const USER_STATE_ISOLATION_TEST: &str =
         "audio::tests::production_state_resolution_ignores_an_external_user_state_file";
 
+    /// Seed `<root>/tributary/volume` with `value` and return its path.
+    fn seed_user_state_volume(root: &std::path::Path, value: &str) -> std::path::PathBuf {
+        let volume = root.join("tributary").join("volume");
+        std::fs::create_dir_all(volume.parent().expect("state parent")).expect("create state dir");
+        std::fs::write(&volume, value).expect("seed volume");
+        volume
+    }
+
+    /// Spawn this test executable as the isolated user-state child, pointing
+    /// the test-scoped sandbox redirect at `sandbox` and `HOME`/`XDG_*` at the
+    /// distinct `external` tree, then capture its output.
+    fn run_user_state_isolation_child(
+        sandbox: &std::path::Path,
+        external: &std::path::Path,
+    ) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                USER_STATE_ISOLATION_TEST,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(USER_STATE_ISOLATION_CHILD, USER_STATE_ISOLATION_CHILD_VALUE)
+            .env(crate::paths::TEST_USER_STATE_DIR_ENV, sandbox)
+            .env("HOME", external)
+            .env("XDG_DATA_HOME", external)
+            .env("XDG_CONFIG_HOME", external)
+            .env("XDG_CACHE_HOME", external)
+            .env("XDG_STATE_HOME", external)
+            .output()
+            .expect("run isolated user-state child")
+    }
+
     /// Behavioral regression for tr-cy381: run the *production* user-state
     /// resolution ([`volume_path`] + [`load_saved_volume`]) in a separate
     /// test process and prove it reads the sandbox, not an external
@@ -1150,37 +1183,14 @@ mod tests {
         }
 
         let sandbox = tempfile::tempdir().expect("sandbox root");
-        let sandbox_volume = sandbox.path().join("tributary").join("volume");
-        std::fs::create_dir_all(sandbox_volume.parent().expect("sandbox parent"))
-            .expect("create sandbox state dir");
-        std::fs::write(&sandbox_volume, "0.250").expect("seed sandbox volume");
+        let sandbox_volume = seed_user_state_volume(sandbox.path(), "0.250");
 
         // A distinct external tree the platform resolver would select if the
         // test-scoped redirect were absent (Linux/macOS via XDG/HOME).
         let external = tempfile::tempdir().expect("external root");
-        let external_volume = external.path().join("tributary").join("volume");
-        std::fs::create_dir_all(external_volume.parent().expect("external parent"))
-            .expect("create external state dir");
-        std::fs::write(&external_volume, "0.750").expect("seed external volume");
+        seed_user_state_volume(external.path(), "0.750");
 
-        let output =
-            std::process::Command::new(std::env::current_exe().expect("current test executable"))
-                .args([
-                    "--exact",
-                    USER_STATE_ISOLATION_TEST,
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(USER_STATE_ISOLATION_CHILD, USER_STATE_ISOLATION_CHILD_VALUE)
-                .env(crate::paths::TEST_USER_STATE_DIR_ENV, sandbox.path())
-                .env("HOME", external.path())
-                .env("XDG_DATA_HOME", external.path())
-                .env("XDG_CONFIG_HOME", external.path())
-                .env("XDG_CACHE_HOME", external.path())
-                .env("XDG_STATE_HOME", external.path())
-                .output()
-                .expect("run isolated user-state child");
-
+        let output = run_user_state_isolation_child(sandbox.path(), external.path());
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success(),
