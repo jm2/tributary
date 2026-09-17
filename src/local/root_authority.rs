@@ -2359,7 +2359,7 @@ pub(crate) fn object_identity(_file: &File) -> io::Result<ObjectIdentity> {
 /// authority's per-ancestor prefix walk treats each ancestor. A capture-time
 /// and save-time comparison of these identities therefore proves the complete
 /// location of a selection, not just its immediate containing directory.
-pub(crate) fn directory_identity(path: &Path) -> io::Result<ObjectIdentity> {
+pub fn directory_identity(path: &Path) -> io::Result<ObjectIdentity> {
     #[cfg(unix)]
     {
         // A plain open resolves every component, including the final one.

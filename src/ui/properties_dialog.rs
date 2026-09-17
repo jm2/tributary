@@ -36,6 +36,11 @@ pub enum SaveTarget {
     /// exact local-library file. A bare pathname is never enough: the file the
     /// user selected must still be the file the save replaces.
     Local(LocalMutationTarget),
+    /// A local row's validated native pathname awaiting exact-object
+    /// admission. The context menu admits it — off the UI thread — and
+    /// replaces this with [`SaveTarget::Local`] before the dialog can open;
+    /// an unresolved value never reaches a preflight or a write.
+    PendingLocal(PendingLocalMutation),
     /// A removable row's identity awaiting resolution through its exact live
     /// source session. The context menu replaces this with
     /// [`SaveTarget::Removable`] before the dialog can open; an unresolved
@@ -49,6 +54,7 @@ impl PartialEq for SaveTarget {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Local(left), Self::Local(right)) => left == right,
+            (Self::PendingLocal(left), Self::PendingLocal(right)) => left == right,
             (Self::PendingRemovable(left), Self::PendingRemovable(right)) => left == right,
             // Retained authorities are equal when they name the same exact
             // source-scoped file, never when they merely hold equal evidence.
@@ -61,6 +67,13 @@ impl PartialEq for SaveTarget {
 }
 
 impl Eq for SaveTarget {}
+
+/// The native pathname a dialog save must admit to an exact object — never a
+/// bare pathname — before it may commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingLocalMutation {
+    pub path: PathBuf,
+}
 
 /// The removable identity a dialog save must resolve before it may commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,8 +100,10 @@ fn save_target_key(target: &SaveTarget) -> Option<SaveTargetKey> {
             authority.track_id().as_str().to_owned(),
         )),
         // An unresolved pending value has no identity to deduplicate and must
-        // never reach the probe or write phase.
-        SaveTarget::PendingRemovable(_) => None,
+        // never reach the probe or write phase. Both pending kinds are
+        // admitted to their retained exact-object form before the dialog
+        // opens, so reaching this arm is a caller wiring fault.
+        SaveTarget::PendingLocal(_) | SaveTarget::PendingRemovable(_) => None,
     }
 }
 
@@ -109,17 +124,20 @@ fn unique_save_targets(tracks: &[TrackInfo]) -> Vec<SaveTarget> {
 }
 
 /// Release-enforced gate on the ORIGINAL selection, before any
-/// deduplication: a row still carrying an unresolved removable identity is
-/// a caller wiring fault — the context menu resolves every pending identity
-/// through its exact live session before the dialog may open. A pending
-/// row has no deduplication identity, so dedup alone would silently drop
-/// that row's edit and report success over a partial write set; the check
-/// therefore runs on the original selection, where the whole dialog
-/// refuses instead.
-fn selection_has_unresolved_removable(tracks: &[TrackInfo]) -> bool {
-    tracks
-        .iter()
-        .any(|track| matches!(track.target, SaveTarget::PendingRemovable(_)))
+/// deduplication: a row still carrying an unresolved pending identity — a
+/// local pathname not yet admitted to an exact object, or a removable
+/// identity not yet resolved through its live session — is a caller wiring
+/// fault. A pending row has no deduplication identity, so dedup alone would
+/// silently drop that row's edit and report success over a partial write
+/// set; the check therefore runs on the original selection, where the whole
+/// dialog refuses instead.
+fn selection_has_unresolved_target(tracks: &[TrackInfo]) -> bool {
+    tracks.iter().any(|track| {
+        matches!(
+            track.target,
+            SaveTarget::PendingLocal(_) | SaveTarget::PendingRemovable(_)
+        )
+    })
 }
 
 /// Information about a track passed into the dialog.
@@ -287,12 +305,15 @@ fn preflight_save_targets(targets: &[SaveTarget]) -> SelectionPreflight {
     if targets.is_empty() {
         return SelectionPreflight::Unavailable(TagEditingAvailability::InvalidFile);
     }
-    if targets
-        .iter()
-        .any(|target| matches!(target, SaveTarget::PendingRemovable(_)))
-    {
-        // Unresolved removable identities are a wiring fault: the context
-        // menu must resolve them through their live session first.
+    if targets.iter().any(|target| {
+        matches!(
+            target,
+            SaveTarget::PendingLocal(_) | SaveTarget::PendingRemovable(_)
+        )
+    }) {
+        // Unresolved pending identities are a wiring fault: the context menu
+        // must admit the local pathname to an exact object and resolve every
+        // removable identity through its live session first.
         return SelectionPreflight::Unavailable(TagEditingAvailability::Unavailable);
     }
 
@@ -312,7 +333,7 @@ fn preflight_save_targets(targets: &[SaveTarget]) -> SelectionPreflight {
                     availability = merge_preflight_failure(availability, failure);
                 }
             }
-            SaveTarget::PendingRemovable(_) => {
+            SaveTarget::PendingLocal(_) | SaveTarget::PendingRemovable(_) => {
                 availability = TagEditingAvailability::Unavailable;
             }
         }
@@ -502,16 +523,17 @@ pub fn show_properties_dialog(
     }
 
     // Fail closed on the original selection, before any deduplication: an
-    // unresolved removable identity is a caller wiring fault, and dedup
+    // unresolved pending identity (an unadmitted local pathname or an
+    // unresolved removable identity) is a caller wiring fault, and dedup
     // cannot see such a row — the fault would silently shrink the write
     // set. This gate is release-enforced (not a debug assertion): the
     // dialog never opens and the refusal is surfaced, while
     // `preflight_save_targets`' pending refusal stays as the layered
     // defense behind it.
-    if selection_has_unresolved_removable(tracks) {
+    if selection_has_unresolved_target(tracks) {
         tracing::warn!(
             selection = tracks.len(),
-            "properties dialog refused: selection still carries an unresolved removable identity (caller wiring fault)"
+            "properties dialog refused: selection still carries an unresolved pending identity (caller wiring fault)"
         );
         let refusal = adw::AlertDialog::builder()
             .heading("Cannot Edit These Files")
@@ -570,7 +592,7 @@ pub fn show_properties_dialog(
     // Repeated playlist rows may refer to the same file or the same
     // removable identity. Probe and write each exact save target once while
     // retaining every selected row for batch-field presentation. Unresolved
-    // removable identities were refused above, on the original selection,
+    // pending identities were refused above, on the original selection,
     // before this deduplication could silently drop one.
     let save_targets = unique_save_targets(tracks);
 
@@ -982,7 +1004,7 @@ pub fn show_properties_dialog(
                 let outcome = match target {
                     SaveTarget::Local(local) => local.write_tags(&edits),
                     SaveTarget::Removable(authority) => authority.write_tags(&edits),
-                    SaveTarget::PendingRemovable(_) => {
+                    SaveTarget::PendingLocal(_) | SaveTarget::PendingRemovable(_) => {
                         failed += 1;
                         continue;
                     }
@@ -1019,7 +1041,7 @@ pub fn show_properties_dialog(
                                     "Failed to write tags to removable target"
                                 );
                             }
-                            SaveTarget::PendingRemovable(_) => {}
+                            SaveTarget::PendingLocal(_) | SaveTarget::PendingRemovable(_) => {}
                         }
                         failed += 1;
                     }
@@ -1410,7 +1432,7 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_removable_identities_never_reach_the_probe_or_write_set() {
+    fn unresolved_pending_identities_never_reach_the_probe_or_write_set() {
         let pending = PendingRemovableMutation {
             source_id: crate::architecture::SourceId::local(),
             session_epoch: 3,
@@ -1424,10 +1446,10 @@ mod tests {
         ];
 
         // Fail closed on the ORIGINAL selection, before any deduplication:
-        // an unresolved removable identity is a caller wiring fault, so the
+        // an unresolved pending identity is a caller wiring fault, so the
         // dialog refuses entirely instead of opening with a partial write
         // set — in release builds too, not behind a debug assertion.
-        assert!(selection_has_unresolved_removable(&tracks));
+        assert!(selection_has_unresolved_target(&tracks));
 
         // The reason the gate must precede dedup: a pending value has no
         // deduplication identity, so dedup alone would silently drop the
@@ -1442,7 +1464,7 @@ mod tests {
             local_track(local.clone()),
             local_track(local),
         ];
-        assert!(!selection_has_unresolved_removable(&resolved));
+        assert!(!selection_has_unresolved_target(&resolved));
         assert_eq!(
             unique_save_targets(&resolved),
             vec![SaveTarget::Local(LocalMutationTarget::capture(
@@ -1460,6 +1482,34 @@ mod tests {
                 track_id: crate::architecture::TrackId::new("unix:01").expect("track id"),
             })])
             .availability(),
+            TagEditingAvailability::Unavailable
+        );
+    }
+
+    #[test]
+    fn an_unadmitted_local_pathname_is_an_unresolved_pending_identity() {
+        // A PendingLocal row is the local twin of a PendingRemovable row: a
+        // validated pathname that has not yet been admitted to an exact
+        // object. The same release-enforced gate and no-dedup-identity rules
+        // apply, so a wiring fault can never open a dialog whose write set
+        // silently lost the row.
+        let path = PathBuf::from("/music/album/song.flac");
+        let tracks = vec![
+            track(SaveTarget::PendingLocal(PendingLocalMutation {
+                path: path.clone(),
+            })),
+            local_track(path.clone()),
+        ];
+        assert!(selection_has_unresolved_target(&tracks));
+        assert!(
+            save_target_key(&SaveTarget::PendingLocal(PendingLocalMutation {
+                path: path.clone()
+            }))
+            .is_none()
+        );
+        assert_eq!(
+            preflight_save_targets(&[SaveTarget::PendingLocal(PendingLocalMutation { path })])
+                .availability(),
             TagEditingAvailability::Unavailable
         );
     }
@@ -1483,7 +1533,7 @@ mod tests {
             track(SaveTarget::PendingRemovable(pending)),
         ];
 
-        assert!(selection_has_unresolved_removable(&tracks));
+        assert!(selection_has_unresolved_target(&tracks));
     }
 
     #[test]
