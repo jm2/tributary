@@ -13,11 +13,23 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::local::engine::LibraryCommand;
 
 struct AdmissionInner {
     open: bool,
     tx: async_channel::Sender<LibraryCommand>,
+    /// Cooperative cancellation for the engine's initial scan.
+    ///
+    /// Closing the window must not wait on a scan that is blocked in a
+    /// read-only traversal or parser kernel call. `close_and_flush` therefore
+    /// cancels this token at the same moment it closes admission, so the scan
+    /// stops admitting new durable mutations at its next boundary. The token is
+    /// deliberately separate from the command FIFO: the FIFO's `Flush` marker
+    /// remains the reserved drain path that the engine must service after the
+    /// scan yields.
+    scan_cancellation: CancellationToken,
 }
 
 /// Cloneable, GTK-main-thread admission boundary for library commands.
@@ -32,7 +44,11 @@ impl LibraryCommandAdmission {
         let (tx, rx) = async_channel::unbounded();
         (
             Self {
-                inner: Rc::new(RefCell::new(AdmissionInner { open: true, tx })),
+                inner: Rc::new(RefCell::new(AdmissionInner {
+                    open: true,
+                    tx,
+                    scan_cancellation: CancellationToken::new(),
+                })),
             },
             rx,
         )
@@ -43,23 +59,40 @@ impl LibraryCommandAdmission {
         self.inner.borrow().open
     }
 
+    /// Borrow a clone of the scan-cancellation handle for the engine.
+    ///
+    /// The engine moves this into its runtime task; the UI keeps the sole
+    /// admission clone here so window close can cancel the scan without ever
+    /// sharing the non-`Send` `RefCell` boundary across threads.
+    pub(super) fn scan_cancellation(&self) -> CancellationToken {
+        self.inner.borrow().scan_cancellation.clone()
+    }
+
     /// Queue one ordinary mutation only while admission remains open.
     pub(super) fn try_send(&self, command: LibraryCommand) -> bool {
         let inner = self.inner.borrow();
         inner.open && inner.tx.try_send(command).is_ok()
     }
 
-    /// Atomically close ordinary admission and append the terminal FIFO marker.
+    /// Atomically close ordinary admission, cancel the initial scan, and append
+    /// the terminal FIFO marker.
     ///
     /// All clones share the same `RefCell`, and every caller runs on GTK's main
     /// thread. No callback can interleave between closing the gate and queuing
     /// `Flush`, while every later producer observes `open == false`.
+    ///
+    /// Cancelling the scan here is what bounds close latency. The scan can only
+    /// settle read-only blocking work up to a fixed budget (a `spawn_blocking`
+    /// kernel call cannot be interrupted), but it never drops an admitted
+    /// durable mutation. Once the scan yields, the engine services the FIFO and
+    /// acknowledges `Flush` — the reserved shutdown/drain path.
     pub(super) fn close_and_flush(&self, completion: async_channel::Sender<()>) -> bool {
         let mut inner = self.inner.borrow_mut();
         if !inner.open {
             return false;
         }
         inner.open = false;
+        inner.scan_cancellation.cancel();
         inner
             .tx
             .try_send(LibraryCommand::Flush { completion })
@@ -85,6 +118,26 @@ mod tests {
             track_id: TrackId::new(id).expect("valid rating test ID"),
             rating: rating.map(|value| Rating::new(value).expect("valid test rating")),
         }
+    }
+
+    #[test]
+    fn close_cancels_the_initial_scan_while_admission_is_still_open() {
+        let (admission, _rx) = LibraryCommandAdmission::channel();
+
+        // A producer that already observed the open gate still gets its
+        // command queued; the scan is not cancelled until close.
+        let scan_token = admission.scan_cancellation();
+        assert!(!scan_token.is_cancelled());
+        assert!(admission.try_send(rating_command("rating-open", Some(10))));
+        assert!(!scan_token.is_cancelled());
+
+        let (completion_tx, _completion_rx) = async_channel::bounded(1);
+        assert!(admission.close_and_flush(completion_tx));
+        assert!(scan_token.is_cancelled());
+
+        // Every clone shares the token, so the engine's moved clone observes
+        // the cancellation raised by the UI thread.
+        assert!(admission.scan_cancellation().is_cancelled());
     }
 
     #[test]

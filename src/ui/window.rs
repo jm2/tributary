@@ -1654,6 +1654,11 @@ pub(crate) fn build_window(
     // normal shutdown wait for every earlier admitted command to finish.
     let (library_commands, library_command_rx) =
         super::library_commands::LibraryCommandAdmission::channel();
+    // Cancelled synchronously by `close_and_flush` below so the engine's
+    // initial scan stops admitting mutations instead of delaying the reserved
+    // Flush drain. The token is `Send + Sync`, unlike the `Rc` admission gate,
+    // so it can cross into the library runtime task.
+    let engine_scan_cancellation = library_commands.scan_cancellation();
     let (playlist_sidebar_refresh, playlist_sidebar_refresh_rx) =
         crate::local::playlist_sidebar::playlist_sidebar_refresh_channel();
     let playlist_sidebar_replacing = Rc::new(Cell::new(false));
@@ -2158,6 +2163,7 @@ pub(crate) fn build_window(
                     engine_tx_clone,
                     library_command_rx,
                     services,
+                    engine_scan_cancellation,
                 );
                 engine.run().await;
             }

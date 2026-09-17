@@ -347,6 +347,9 @@ pub struct LibraryEngine {
     tx: async_channel::Sender<LibraryEvent>,
     command_rx: async_channel::Receiver<LibraryCommand>,
     services: LibraryEngineServices,
+    /// Cancelled by the UI admission boundary when the window closes. It bounds
+    /// how long the initial scan may keep the reserved `Flush` drain waiting.
+    scan_cancellation: CancellationToken,
 }
 
 /// Lifecycle-owned services consumed together by one library engine run.
@@ -388,6 +391,7 @@ impl LibraryEngine {
     /// Create a new engine. Does NOT start scanning yet.
     ///
     /// Accepts multiple music directories — all will be scanned and watched.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: DatabaseConnection,
         music_dirs: Vec<PathBuf>,
@@ -395,6 +399,7 @@ impl LibraryEngine {
         tx: async_channel::Sender<LibraryEvent>,
         command_rx: async_channel::Receiver<LibraryCommand>,
         services: LibraryEngineServices,
+        scan_cancellation: CancellationToken,
     ) -> Self {
         Self {
             db,
@@ -403,6 +408,7 @@ impl LibraryEngine {
             tx,
             command_rx,
             services,
+            scan_cancellation,
         }
     }
 
@@ -416,6 +422,7 @@ impl LibraryEngine {
             tx,
             command_rx,
             services,
+            scan_cancellation,
         } = self;
         let LibraryEngineServices {
             playlist_sidebar_refresh,
@@ -515,7 +522,15 @@ impl LibraryEngine {
         for dir in &music_dirs {
             info!(dir = %dir.display(), "Starting initial library scan");
         }
-        if let Err(e) = initial_scan(&db, &music_dirs, &tx, &playlist_sidebar_refresh).await {
+        if let Err(e) = initial_scan_shutdown_aware(
+            &db,
+            &music_dirs,
+            &tx,
+            &playlist_sidebar_refresh,
+            &scan_cancellation,
+        )
+        .await
+        {
             error!(error = %e, "Initial scan failed");
             let _ = tx.send(LibraryEvent::Error(e.to_string())).await;
         }
@@ -1314,6 +1329,17 @@ impl RootScan {
     fn is_complete(&self) -> bool {
         self.errors.is_empty()
     }
+
+    /// Record that a shutdown cancelled this root's scan.
+    ///
+    /// The cancellation is treated as a traversal error so every downstream
+    /// completeness check (`is_complete`, reconciliation authority, stale
+    /// deletion) fails closed: a cancelled scan never deletes catalogue rows.
+    fn mark_cancelled(&mut self, reason: &str) {
+        self.errors.push(format!("scan cancelled: {reason}"));
+        self.reconciliation_authoritative = false;
+        self.content_authorized = false;
+    }
 }
 
 /// Run one retained-authority filesystem probe outside Tokio's async worker
@@ -1325,6 +1351,50 @@ where
     T: Send + 'static,
 {
     tokio::task::spawn_blocking(probe).await
+}
+
+/// Shutdown latency budget for read-only blocking scan work.
+///
+/// `tokio::task::spawn_blocking` cannot cancel a kernel call that has already
+/// entered `readdir`/`open`/`read`. When window close cancels the initial scan
+/// we therefore give the in-flight read-only traversal/parser this long to
+/// return on its own. If it does not, the join handle is dropped and the worker
+/// is left to finish detached. That is safe precisely because the abandoned
+/// closure only reads: it cannot mutate durable catalogue state, and any result
+/// it later produces is discarded.
+///
+/// Durable mutations (track upserts, stale deletes, root-status persists) are
+/// never subject to this budget — they are awaited to settlement so the FIFO
+/// `Flush` barrier cannot acknowledge work that did not commit.
+const SCAN_READONLY_SETTLE_BUDGET: Duration = Duration::from_millis(2_000);
+
+/// Await a read-only blocking scan job under the shutdown isolation contract.
+///
+/// Without cancellation this is a plain `await`. Once cancellation is observed
+/// (either before the call or while the job runs), the wait is bounded by
+/// [`SCAN_READONLY_SETTLE_BUDGET`]; `None` means the read-only worker outlived
+/// the budget and was intentionally abandoned. Callers must treat `None` as an
+/// incomplete observation: skip the mutation that depended on it and preserve
+/// the no-deletion authority semantics.
+async fn await_readonly_blocking<T>(
+    cancellation: &CancellationToken,
+    job: tokio::task::JoinHandle<T>,
+) -> Option<Result<T, tokio::task::JoinError>> {
+    if cancellation.is_cancelled() {
+        return tokio::time::timeout(SCAN_READONLY_SETTLE_BUDGET, job)
+            .await
+            .ok();
+    }
+
+    tokio::pin!(job);
+    tokio::select! {
+        result = &mut job => Some(result),
+        () = cancellation.cancelled() => {
+            tokio::time::timeout(SCAN_READONLY_SETTLE_BUDGET, &mut job)
+                .await
+                .ok()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -3587,6 +3657,35 @@ async fn initial_scan(
     .await
 }
 
+/// Engine-startup initial scan with the window-close cancellation signal.
+///
+/// Kept separate from [`initial_scan`] so the root-trust command paths, which
+/// run *inside* the engine command loop, never observe scan cancellation: they
+/// must finish their own authority work. Only the startup scan is bounded by
+/// the UI admission boundary's shutdown signal.
+async fn initial_scan_shutdown_aware(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
+    cancellation: &CancellationToken,
+) -> anyhow::Result<()> {
+    let forced_conversions = HashMap::new();
+    let authority_guards = HashMap::new();
+    let evidence_refreshes = HashMap::new();
+    initial_scan_with_control(
+        db,
+        music_dirs,
+        tx,
+        &forced_conversions,
+        &authority_guards,
+        &evidence_refreshes,
+        playlist_sidebar_refresh,
+        cancellation,
+    )
+    .await
+}
+
 async fn initial_scan_with_root_trust_guards(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
@@ -3596,6 +3695,41 @@ async fn initial_scan_with_root_trust_guards(
     evidence_refreshes: &HashMap<PathBuf, RootTrustEvidenceRefresh>,
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
 ) -> anyhow::Result<()> {
+    // Command-loop scans are never cancelled: a root-trust command must finish
+    // its authority work before the FIFO barrier it was admitted behind.
+    let cancellation = CancellationToken::new();
+    initial_scan_with_control(
+        db,
+        music_dirs,
+        tx,
+        forced_conversions,
+        authority_guards,
+        evidence_refreshes,
+        playlist_sidebar_refresh,
+        &cancellation,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn initial_scan_with_control(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+    forced_conversions: &HashMap<PathBuf, ForcedRootTrustConversion>,
+    authority_guards: &HashMap<PathBuf, RootTrustAuthorityGuard>,
+    evidence_refreshes: &HashMap<PathBuf, RootTrustEvidenceRefresh>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
+    cancellation: &CancellationToken,
+) -> anyhow::Result<()> {
+    // A window that closes before (or during) database setup cancels the scan
+    // before it can admit any mutation. Return immediately so the engine can
+    // service the reserved `Flush` drain path without touching the catalogue.
+    if cancellation.is_cancelled() {
+        info!("Initial scan cancelled before start; no catalogue mutations admitted");
+        return Ok(());
+    }
+
     // The explicit conversion pass establishes only root identity. Track
     // upserts and deletions are reserved for the separate ordinary scan that
     // the engine schedules at its next loop boundary.
@@ -3619,12 +3753,20 @@ async fn initial_scan_with_root_trust_guards(
     // completeness from the number of audio files: a healthy empty directory
     // is authoritative, while even a single WalkDir error makes that root's
     // view incomplete and therefore unsafe for stale deletion.
-    let mut root_scans = tokio::task::spawn_blocking(move || {
+    //
+    // Traversal is read-only, so it runs under the shutdown isolation contract:
+    // if close cancels the scan while a root is enumerating, the join handle is
+    // abandoned after the settle budget rather than blocking window teardown.
+    let traversal = tokio::task::spawn_blocking(move || {
         dirs.into_iter()
             .map(|root| scan_root_with_exclusions(root, &all_roots))
             .collect::<Vec<_>>()
-    })
-    .await?;
+    });
+    let Some(traversal) = await_readonly_blocking(cancellation, traversal).await else {
+        info!("Initial scan cancelled while traversal was in flight; abandoning read-only enumeration");
+        return Ok(());
+    };
+    let mut root_scans = traversal?;
 
     // Preload existing rows once so the per-file loop can decide needs_update
     // from memory instead of issuing one SELECT per file. The same snapshot is
@@ -3643,7 +3785,19 @@ async fn initial_scan_with_root_trust_guards(
     // Marker creation happens only for roots the user explicitly configured.
     // Always discard the pre-marker traversal and rescan through the newly
     // created marker before deciding whether any content may be trusted.
-    for scan in &mut root_scans {
+    for index in 0..root_scans.len() {
+        // Marker creation is durable. Once close has cancelled the scan, stop
+        // enrolling further roots and fail this run closed.
+        if cancellation.is_cancelled() {
+            for remaining in &mut root_scans {
+                remaining.mark_cancelled("root identity enrollment interrupted at shutdown");
+            }
+            info!(
+                "Initial scan cancelled during root enrollment; no further durable identity writes"
+            );
+            return Ok(());
+        }
+        let scan = &mut root_scans[index];
         let root_path = scan.root.to_string_lossy();
         let previous = persisted_by_path.get(root_path.as_ref()).copied();
         let existing_track_count = existing_tracks
@@ -3666,9 +3820,17 @@ async fn initial_scan_with_root_trust_guards(
 
         let root = scan.root.clone();
         let exclusions = evidence_roots.clone();
-        let mut marker_scan =
-            tokio::task::spawn_blocking(move || scan_root_with_exclusions(root, &exclusions))
-                .await?;
+        let root_label = scan.root.display().to_string();
+        let marker_rescan =
+            tokio::task::spawn_blocking(move || scan_root_with_exclusions(root, &exclusions));
+        let Some(marker_result) = await_readonly_blocking(cancellation, marker_rescan).await else {
+            info!(
+                root = %root_label,
+                "Initial scan cancelled during marker-backed rescan; abandoning read-only rescan"
+            );
+            return Ok(());
+        };
+        let mut marker_scan = marker_result?;
         if marker_scan.device_id.as_deref() != Some(identity.as_str()) {
             marker_scan.errors.push(format!(
                 "library root marker changed before marker-backed rescan completed: {}",
@@ -3889,6 +4051,20 @@ async fn initial_scan_with_root_trust_guards(
     let mut on_disk_paths = HashSet::new();
 
     for path in &audio_files {
+        // Check the shutdown boundary before admitting the next parse/upsert.
+        // Everything already committed above stands; nothing new is admitted,
+        // and the no-deletion phase below is skipped entirely.
+        if cancellation.is_cancelled() {
+            for scan in &mut root_scans {
+                scan.mark_cancelled("catalogue mutation loop interrupted at shutdown");
+            }
+            info!(
+                scanned,
+                total, "Initial scan cancelled; no further catalogue mutations admitted"
+            );
+            return Ok(());
+        }
+
         let path_str = path.to_string_lossy().to_string();
         on_disk_paths.insert(path_str.clone());
 
@@ -3930,32 +4106,46 @@ async fn initial_scan_with_root_trust_guards(
             };
             let open_lease = authority_lease.clone();
             let open_path = path.clone();
-            let (observed_file, parse_file) = match spawn_authority_probe(move || {
+            let open_job = tokio::task::spawn_blocking(move || {
                 let observed_file = Arc::new(open_lease.open_regular_file(&open_path)?);
                 let parse_file = observed_file.try_clone_file()?;
                 Ok::<_, std::io::Error>((observed_file, parse_file))
-            })
-            .await
+            });
+            let (observed_file, parse_file) = match await_readonly_blocking(cancellation, open_job)
+                .await
             {
-                Ok(Ok(opened)) => opened,
-                Ok(Err(error)) => {
+                Some(Ok(Ok(opened))) => opened,
+                Some(Ok(Err(error))) => {
                     warn!(path = %path.display(), %error, "Audio file could not be opened and cloned through retained root authority — upsert discarded");
                     continue;
                 }
-                Err(error) => {
+                Some(Err(error)) => {
                     warn!(path = %path.display(), %error, "Initial-scan audio authority task failed — upsert discarded");
                     continue;
+                }
+                None => {
+                    // Read-only open did not settle inside the shutdown
+                    // budget; abandon it rather than blocking close.
+                    info!(path = %path.display(), "Initial-scan audio open abandoned at shutdown");
+                    return Ok(());
                 }
             };
 
             let p = path.clone();
-            let parse_result = tokio::task::spawn_blocking(move || {
+            let parse_job = tokio::task::spawn_blocking(move || {
                 tag_parser::parse_audio_file_from_file(parse_file, &p)
-            })
-            .await;
+            });
+            let parse_result = await_readonly_blocking(cancellation, parse_job).await;
 
             match parse_result {
-                Ok(Ok(parsed)) => {
+                // The read-only parser did not settle inside the shutdown
+                // budget. No mutation depended on it yet, so abandoning it is
+                // safe; the next loop boundary observes cancellation.
+                None => {
+                    info!(path = %path.display(), "Initial-scan parse abandoned at shutdown");
+                    return Ok(());
+                }
+                Some(Ok(Ok(parsed))) => {
                     let (identity_allows_upsert, invalidated_root) =
                         match revalidate_scan_root_for_path(path, &mut root_scans).await {
                             Ok(result) => result,
@@ -4025,10 +4215,10 @@ async fn initial_scan_with_root_trust_guards(
                         }
                     }
                 }
-                Ok(Err(e)) => {
+                Some(Ok(Err(e))) => {
                     warn!(path = %path_str, error = %e, "Skipping unparseable file");
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     warn!(path = %path_str, error = %e, "spawn_blocking failed");
                 }
             }
@@ -4038,6 +4228,17 @@ async fn initial_scan_with_root_trust_guards(
         if scanned.is_multiple_of(50) || scanned == total {
             let _ = tx.send(LibraryEvent::ScanProgress(scanned, total)).await;
         }
+    }
+
+    // A cancelled scan is incomplete by contract. Never enter the destructive
+    // phase: preserve every catalogue row and the incomplete-scan authority
+    // semantics even if the traversal itself called itself complete.
+    if cancellation.is_cancelled() {
+        for scan in &mut root_scans {
+            scan.mark_cancelled("stale-deletion reconciliation skipped at shutdown");
+        }
+        info!("Initial scan cancelled before stale deletion; preserving all catalogue metadata");
+        return Ok(());
     }
 
     // Parsing can outlive a removable-media transition. Revalidate each
@@ -9565,6 +9766,126 @@ mod tests {
                 .count(),
             1,
             "one initial scan produces one post-reconciliation invalidation"
+        );
+    }
+
+    // ── Initial-scan shutdown cancellation ──────────────────────────────
+
+    #[test]
+    fn mark_cancelled_fails_closed_for_stale_deletion() {
+        let directory = TestDirectory::new("mark-cancelled");
+        let mut scan = scan_root(directory.path().to_path_buf());
+        scan.errors.clear();
+        scan.reconciliation_authoritative = true;
+        scan.content_authorized = true;
+        assert!(scan.is_complete());
+
+        scan.mark_cancelled("shutdown");
+
+        assert!(!scan.is_complete(), "a cancelled scan is incomplete");
+        assert!(!scan.reconciliation_authoritative);
+        assert!(!scan.content_authorized);
+        assert!(
+            scan.errors.iter().any(|error| error.contains("shutdown")),
+            "the cancellation reason is retained for diagnostics"
+        );
+    }
+
+    #[tokio::test]
+    async fn readonly_blocking_job_completes_when_not_cancelled() {
+        let cancellation = CancellationToken::new();
+        let job = tokio::task::spawn_blocking(|| 41 + 1);
+
+        let result = await_readonly_blocking(&cancellation, job).await;
+
+        assert_eq!(result.expect("awaited").expect("joined"), 42);
+    }
+
+    #[tokio::test]
+    async fn readonly_blocking_job_that_settles_inside_the_budget_is_kept() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let job = tokio::task::spawn_blocking(|| 7);
+
+        let result = await_readonly_blocking(&cancellation, job).await;
+
+        assert_eq!(result.expect("settled inside budget").expect("joined"), 7);
+    }
+
+    #[tokio::test]
+    async fn held_readonly_blocking_job_is_abandoned_at_the_settle_budget() {
+        // Simulates the "spawn_blocking cannot cancel an in-progress kernel
+        // call" case: the worker is held past the budget. The scan must abandon
+        // the read-only handle rather than blocking window teardown.
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let job = tokio::task::spawn_blocking(move || {
+            let _ = release_rx.recv();
+        });
+
+        let started = std::time::Instant::now();
+        let result = await_readonly_blocking(&cancellation, job).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_none(), "held read-only work must be abandoned");
+        assert!(
+            elapsed >= SCAN_READONLY_SETTLE_BUDGET.saturating_sub(Duration::from_millis(50)),
+            "the job was not given the full settle budget: {elapsed:?}"
+        );
+        // Release the detached worker so it cannot linger across tests.
+        let _ = release_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn cancelled_initial_scan_admits_no_mutations_and_preserves_stale_tracks() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("cancelled-scan");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join("present.wav"));
+        // A row whose file is absent would normally be a stale-deletion
+        // candidate. A cancelled scan must preserve it.
+        insert_rename_test_track(
+            &db,
+            "stale-before-cancel",
+            directory
+                .path()
+                .join("missing.wav")
+                .to_string_lossy()
+                .as_ref(),
+            "Stale",
+            0,
+        )
+        .await;
+
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        initial_scan_with_control(
+            &db,
+            &[directory.path().to_path_buf()],
+            &event_tx,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &test_playlist_sidebar_refresh(),
+            &cancellation,
+        )
+        .await
+        .expect("cancelled scan returns cleanly");
+
+        let tracks = track::Entity::find().all(&db).await.expect("query tracks");
+        assert_eq!(
+            tracks.len(),
+            1,
+            "a cancelled scan admits no new tracks and deletes none"
+        );
+        assert_eq!(tracks[0].id, "stale-before-cancel");
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(
+            events.is_empty(),
+            "a cancelled scan emits no completion events: {events:?}"
         );
     }
 
