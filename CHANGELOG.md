@@ -78,27 +78,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **OwnTone first-track playback** — Start the configured pipe with PCM autostart
-  instead of asking an empty queue to play. Confirm daemon playback before
-  reporting Playing, while preserving prompt Stop and finite-track completion.
-
-- **OwnTone session restoration is terminal for later controls**
-  (`src/audio/airplay_owntone.rs`) — The decode pump restores the dedicated
-  daemon on end-of-stream or decode error, but the live session previously
-  remained usable: a Pause/Resume/volume control queued behind the settlement
-  boundary could still transmit after restoration, re-driving an
-  already-restored output selection, resume could re-issue `player/play`, and
-  the later `close` restore could short-circuit over that newly outstanding
-  mutation and release the instance lock without settling it. `SessionInner`
-  now latches a terminal flag under the settlement boundary *before* the first
-  restoring RPC; `transmit_mutation` refuses every later control transmission,
-  the pump loop and activation gate stop, and a `restore` that observes an
-  outstanding mutation forces a quiescence before ownership can be released —
-  failing closed and retaining the lock when quiescence cannot be established.
-  Covered by HTTP-faithful regressions that park a control behind a terminal
-  restoration, refuse a late `resume`/`player/play`, and prove a second restore
-  never releases over an outstanding mutation, plus a real
-  `RetainedRecovery`/advisory-lock retention test.
 - **Supervised MPD control TOCTOU** (`src/audio/mpd_output.rs`) — A playback
   control (play/pause/toggle/seek) whose own pre-control `status` observed
   partition-option drift or a foreign current song lapsed the supervisor yet was

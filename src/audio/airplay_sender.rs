@@ -24,17 +24,20 @@
 //! # Scope of this record
 //!
 //! This module lands the seam with the existing GStreamer `raopsink` path as
-//! the first [`AirplaySender`]. Behavior is unchanged for every existing
-//! load: the availability gate still runs before media preparation, and a
-//! load still publishes the same generation-tagged events.
+//! the first [`AirplaySender`] and the OwnTone process adapter
+//! (`super::airplay_owntone`) as the second. Behavior is unchanged for every
+//! existing load: the availability gate still runs before media preparation,
+//! and a load still publishes the same generation-tagged events.
 //!
-//! The recovery-custody capability the design attaches to the seam
-//! (`MediaTicketCustody`, `InFlightCancelRegistration`, and the
-//! `SenderError::RecoveryPending` outcome) is deliberately deferred to the
-//! process-adapter record: it exists to unwind a *transmitted mutating
-//! daemon RPC*, and the GStreamer adapter never transmits one. The
-//! [`OpenCancel`] currency is landed now because the load path owns it on
-//! every backend, and it is the signal an in-flight open observes.
+//! The recovery-custody capability the design attaches to the seam — the
+//! in-flight cancel registration and recovery custody kept by the media proxy
+//! (`GstreamerMediaProxy::register_in_flight_cancel`,
+//! `GstreamerMediaProxy::move_to_recovery_custody`) and the
+//! [`SenderError::RecoveryPending`] outcome — exists to unwind a
+//! *transmitted mutating daemon RPC*. The GStreamer adapter never transmits
+//! one; the OwnTone adapter is its first user. The [`OpenCancel`] currency is
+//! owned by the load path on every backend and is the signal an in-flight
+//! open observes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};

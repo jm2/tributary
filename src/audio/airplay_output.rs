@@ -157,6 +157,14 @@ impl SenderSession for GstreamerSenderSession {
             .start(move || pipeline.set_state(gst::State::Playing).is_ok())
     }
 
+    fn confirm_started(&self, publish: &mut dyn FnMut(PlayerState)) -> bool {
+        // The worker's start publication is one step with the shared Stop
+        // boundary: a Stop that won after the pipeline transition suppresses
+        // it, so no `Playing` for this generation can follow the Stop's own
+        // `Stopped`. The session's `Null` teardown settles the transmitted start.
+        self.gate.publish_if_live(|| publish(PlayerState::Playing))
+    }
+
     fn flush(&mut self) {
         // A live RAOP stream exposes no seekable timeline to flush.
     }
@@ -761,9 +769,19 @@ impl AirPlayOutput {
         match self.sender.probe() {
             Ok(()) => match prepare() {
                 Ok(prepared) => self.start_session_worker(generation, prepared),
-                Err(message) => self.report_load_failure(generation, &message),
+                Err(message) => {
+                    self.close_session();
+                    self.report_load_failure(generation, &message);
+                }
             },
-            Err(error) => self.report_load_failure(generation, error.message()),
+            Err(error) => {
+                // A refused load still replaces the previous one: the old
+                // session is torn down (as it was before the seam landed)
+                // rather than streaming on behind a failure reported for the
+                // new generation.
+                self.close_session();
+                self.report_load_failure(generation, error.message());
+            }
         }
         true
     }
@@ -829,6 +847,32 @@ impl AirPlayOutput {
             }
         }
     }
+}
+
+/// Publish a load failure for its generation — unless the controller has
+/// already stopped or replaced this load. The decision and the publication are
+/// one step under the shared Stop boundary, which `close_session` stops before
+/// it cancels, so a failure observed while (or because) a Stop interrupted the
+/// open publishes nothing for the cancelled generation (design §4.1: no event
+/// for a cancelled generation). The route release that accompanies the failure
+/// stays unconditional.
+fn publish_load_failure(
+    ctx: &SenderOpenContext,
+    event_generation: &AtomicU64,
+    generation: PlayerEventGeneration,
+    error: &SenderError,
+) {
+    if event_generation.load(Ordering::SeqCst) != generation.as_raw() {
+        return;
+    }
+    let _ = ctx.session_gate.publish_if_live(|| {
+        let _ = ctx
+            .event_tx
+            .try_send(PlayerEvent::error(generation, error.message()));
+        let _ = ctx
+            .event_tx
+            .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
+    });
 }
 
 /// Worker for one load: its in-flight cancellation registration was taken by
@@ -943,14 +987,7 @@ fn run_session_worker(
                 if let Some(ticket) = ctx.media_ticket.as_ref() {
                     proxy.move_to_recovery_custody(ticket);
                 }
-                if event_generation.load(Ordering::SeqCst) == generation.as_raw() {
-                    let _ = ctx
-                        .event_tx
-                        .try_send(PlayerEvent::error(generation, error.message()));
-                    let _ = ctx
-                        .event_tx
-                        .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
-                }
+                publish_load_failure(&ctx, &event_generation, generation, &error);
                 match completion.wait() {
                     // Quiescence was never established, so the recovery retains
                     // the lock and the route custody for the supervisor. Do not
@@ -961,14 +998,7 @@ fn run_session_worker(
             } else {
                 // Restoration completed inside the seam; release on receipt.
                 release_ticket(&proxy, &ctx);
-                if event_generation.load(Ordering::SeqCst) == generation.as_raw() {
-                    let _ = ctx
-                        .event_tx
-                        .try_send(PlayerEvent::error(generation, error.message()));
-                    let _ = ctx
-                        .event_tx
-                        .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
-                }
+                publish_load_failure(&ctx, &event_generation, generation, &error);
             }
         }
     }
@@ -1629,14 +1659,34 @@ mod tests {
         let sender =
             crate::audio::airplay_owntone::test_owned_sender(&api_base, &state_dir, &binary);
 
-        let (tx, _rx) = async_channel::unbounded();
-        let mut output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (tx, rx) = async_channel::unbounded();
+        let mut output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0)
+            .with_runtime(runtime.handle().clone());
         output.sender = Arc::new(sender);
         let generation = PlayerEventGeneration::from_raw(64);
         output.set_event_generation(generation);
+        // Protected local media mints a loopback route, so the worker's
+        // eventual release of that route is the observable end of the load.
+        let root = tempfile::tempdir().expect("media root");
+        let marker = format!("marker:v1:{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            root.path().join(".tributary-root-id"),
+            format!("{marker}\n"),
+        )
+        .expect("root marker");
+        let media_path = root.path().join("stalled.wav");
+        std::fs::write(&media_path, b"RIFF").expect("media file");
+        let media =
+            ResolvedLocalMedia::from_authorized_path_for_test(root.path(), &marker, &media_path)
+                .expect("authorized media");
 
         let started = Instant::now();
-        output.load_uri("http://127.0.0.1:1/media");
+        assert!(output.load_local(media));
         assert!(
             started.elapsed() < Duration::from_millis(500),
             "load blocked on the stalled OwnTone endpoint: {:?}",
@@ -1667,8 +1717,39 @@ mod tests {
             stopped.elapsed()
         );
 
+        // Dropping the daemon's held connection now fails the stalled
+        // handshake *after* the Stop. That failure belongs to the cancelled
+        // load, not to playback: the route is released, and neither an Error
+        // nor a Playing is published for the stopped generation.
         let _ = child.kill();
         let _ = child.wait();
+        let release_deadline = Instant::now() + Duration::from_secs(10);
+        while output.media_proxy.has_active_lease() {
+            assert!(
+                Instant::now() < release_deadline,
+                "the cancelled load never released its route"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::Error { .. }
+                    | PlayerEvent::StateChanged {
+                        state: PlayerState::Playing,
+                        ..
+                    }
+            )),
+            "a Stop-interrupted open published a playback outcome: {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged {
+                state: PlayerState::Stopped,
+                ..
+            }
+        )));
     }
 
     /// The fake OwnTone daemon source compiled by the stalled-endpoint fixture.
@@ -1720,47 +1801,12 @@ fn main() {
 }
 "#;
 
-    /// R1: off Linux the kernel process binding is unsupported, so the load
-    /// fails closed before any network handshake — and it must still never
-    /// block the caller. Unix-only: the dedicated-instance adapter owns a FIFO,
-    /// an advisory `flock` and a `/proc`-verified process binding.
-    #[cfg(all(unix, not(target_os = "linux")))]
-    #[test]
-    fn a_stalled_owntone_endpoint_does_not_block_load_or_stop() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let binary = directory.path().join("owntone");
-        std::fs::write(&binary, b"#!/bin/true\n").expect("dummy binary");
-        let api_base = "http://127.0.0.1:1";
-        let sender =
-            crate::audio::airplay_owntone::test_owned_sender(api_base, directory.path(), &binary);
-
-        let (tx, _rx) = async_channel::unbounded();
-        let mut output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0);
-        output.sender = Arc::new(sender);
-        output.set_event_generation(PlayerEventGeneration::from_raw(64));
-
-        let started = Instant::now();
-        output.load_uri("http://127.0.0.1:1/media");
-        assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "load blocked on the unsupported OwnTone endpoint: {:?}",
-            started.elapsed()
-        );
-        let stopped = Instant::now();
-        output.stop();
-        assert!(
-            stopped.elapsed() < Duration::from_millis(500),
-            "stop blocked on the unsupported OwnTone endpoint: {:?}",
-            stopped.elapsed()
-        );
-    }
-
-    /// S1: on a target with no documented OwnTone acquisition path, the
-    /// unsupported shim is compiled instead of the Unix adapter. Selection is
-    /// still recognized and the sender still refuses explicitly, so a load can
-    /// never be misreported as an OwnTone session — and the Unix-only stalled
-    /// endpoint regression above is never compiled here.
-    #[cfg(not(unix))]
+    /// S1: on a target other than Linux the unsupported shim is compiled
+    /// instead of the real adapter. Selection is still recognized and the
+    /// sender still refuses explicitly, so a load can never be misreported as
+    /// an OwnTone session — and the Linux-only stalled-endpoint regression
+    /// above is never compiled here.
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn an_unsupported_platform_owntone_sender_refuses_the_load() {
         let sender = crate::audio::airplay_owntone::OwnToneSender::from_env();
@@ -1768,6 +1814,102 @@ fn main() {
             .probe()
             .expect_err("the unsupported shim must refuse every load");
         assert!(error.message().contains("OwnTone"), "{}", error.message());
+    }
+
+    /// Bounded wait for a condition established by a detached worker.
+    fn wait_for(mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !predicate() {
+            assert!(Instant::now() < deadline, "timed out waiting for condition");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A load whose availability gate fails still replaces the previous one:
+    /// the old session is torn down instead of streaming on behind an
+    /// Error/Stopped reported for the new generation.
+    #[test]
+    fn a_failing_probe_still_tears_down_the_previous_session() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let live = Arc::new(AtomicBool::new(true));
+        let closed = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = async_channel::unbounded();
+        let mut output = AirPlayOutput::new("Test", "127.0.0.1", 7000, tx, 1.0)
+            .with_runtime(runtime.handle().clone());
+        output.sender = Arc::new(BoundarySender {
+            live: Arc::clone(&live),
+            closed: Arc::clone(&closed),
+        });
+        let first = PlayerEventGeneration::from_raw(31);
+        output.set_event_generation(first);
+        assert!(output.load_uri("https://music.test/first"));
+        wait_for(|| output.state() == PlayerState::Playing);
+        assert!(!closed.load(Ordering::SeqCst));
+        while rx.try_recv().is_ok() {}
+
+        output.sender = Arc::new(FailingSender(SenderError::Dependency(
+            "sender unavailable".to_string(),
+        )));
+        let second = first.next();
+        output.set_event_generation(second);
+        assert!(output.load_uri("https://music.test/second"));
+        wait_for(|| closed.load(Ordering::SeqCst));
+        assert_eq!(output.state(), PlayerState::Stopped);
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.generation() == second
+                    && matches!(event, PlayerEvent::Error { .. })),
+            "{events:?}"
+        );
+    }
+
+    /// The GStreamer session's start confirmation is one step with the Stop
+    /// boundary: once a Stop has won, the worker's `Playing` publication is
+    /// suppressed rather than following the Stop's own `Stopped`.
+    #[test]
+    fn a_gstreamer_start_confirmation_is_suppressed_once_stop_has_won() {
+        gst::init().expect("GStreamer init");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let request = ResolvedHttpRequest::new(
+            url::Url::parse("https://music.test/stream.flac").expect("url"),
+        )
+        .expect("resolved request");
+        let prepared = proxy.prepare_resolved(request).expect("prepared media");
+        let ticket = prepared.ticket().expect("protected media ticket");
+        let (tx, _rx) = async_channel::unbounded();
+        let gate = Arc::new(SessionGate::new());
+        let ctx = test_session_ctx(
+            &proxy,
+            Some(Arc::clone(&ticket)),
+            tx,
+            Arc::clone(&gate),
+            PlayerEventGeneration::from_raw(13),
+        );
+        let (pipeline, _counter) = test_pipeline_with_buffer_counter();
+        let mut session =
+            GstreamerSenderSession::for_test_session(pipeline, &ctx).expect("session");
+        assert!(session.resume());
+        let mut published = Vec::new();
+        assert!(session.confirm_started(&mut |state| published.push(state)));
+        assert_eq!(published, vec![PlayerState::Playing]);
+
+        gate.stop();
+        published.clear();
+        assert!(!session.confirm_started(&mut |state| published.push(state)));
+        assert!(published.is_empty(), "{published:?}");
+        Box::new(session).close();
+        assert_eq!(ticket.route_count(), 0);
     }
 
     /// Y1 regression double: a session whose `confirm_started` runs the

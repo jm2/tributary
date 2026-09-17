@@ -7,6 +7,7 @@
 //! (sec_library), src/library/filescanner.c and owntone.conf.in.
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 
 #[derive(Debug, PartialEq)]
@@ -203,7 +204,10 @@ pub(super) fn binds_pipe(config: &Path, pipe: &Path) -> bool {
     if name.starts_with(['.', '_']) || pipe.extension().and_then(|s| s.to_str()) != Some("pcm") {
         return false;
     }
-    if std::fs::symlink_metadata(pipe).is_ok_and(|m| m.file_type().is_symlink()) {
+    // The scanned input must be the FIFO itself. A symlink, a regular file or
+    // any other object at that pathname is refused (AM1): the adapter's PCM
+    // writer is later bound to this same FIFO's identity.
+    if !std::fs::symlink_metadata(pipe).is_ok_and(|m| m.file_type().is_fifo()) {
         return false;
     }
     let Some(parent) = pipe.parent().filter(|p| p.is_absolute()) else {
@@ -241,6 +245,7 @@ mod tests {
     fn pinned_library_config_binds_only_an_enabled_unfiltered_pcm_input() {
         let directory = tempfile::tempdir().unwrap();
         let pipe = directory.path().join("airplay.pcm");
+        super::super::ensure_pipe(&pipe).unwrap();
         let config = directory.path().join("owntone.conf");
         let valid = fixture(&pipe);
         let check = |text: &str| {
@@ -288,10 +293,21 @@ mod tests {
             assert!(!check(&invalid), "must reject {invalid}");
         }
         assert!(check(&valid));
-        assert!(!binds_pipe(&config, &directory.path().join("_hidden.pcm")));
+        let hidden = directory.path().join("_hidden.pcm");
+        super::super::ensure_pipe(&hidden).unwrap();
+        assert!(!binds_pipe(&config, &hidden));
         assert!(!binds_pipe(&config, &directory.path().join("playlist.m3u")));
+        // Only the FIFO itself binds: a missing pathname, a regular file and
+        // a symlink (even one pointing at a FIFO) are refused.
+        std::fs::remove_file(&pipe).unwrap();
+        assert!(!binds_pipe(&config, &pipe));
+        std::fs::write(&pipe, b"not a fifo").unwrap();
+        assert!(!binds_pipe(&config, &pipe));
+        std::fs::remove_file(&pipe).unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(elsewhere.path().join("airplay.pcm"), &pipe).unwrap();
+        let target = elsewhere.path().join("airplay.pcm");
+        super::super::ensure_pipe(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &pipe).unwrap();
         assert!(!binds_pipe(&config, &pipe));
     }
 
@@ -301,6 +317,7 @@ mod tests {
         let parent = directory.path().join("input#one");
         std::fs::create_dir(&parent).unwrap();
         let pipe = parent.join("airplay.pcm");
+        super::super::ensure_pipe(&pipe).unwrap();
         let config = directory.path().join("owntone.conf");
         std::fs::write(&config, fixture(&pipe)).unwrap();
         assert!(binds_pipe(&config, &pipe));

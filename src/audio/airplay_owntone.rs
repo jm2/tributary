@@ -54,6 +54,13 @@ const OWNTONE_MIN_MAJOR: u32 = 29;
 const API_TIMEOUT: Duration = Duration::from_secs(2);
 const OPEN_DEADLINE: Duration = Duration::from_secs(10);
 const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+/// How long the daemon's reported item progress must stand still — while it
+/// still reports `play` after end-of-input — before a finite item counts as
+/// rendered. Pinned OwnTone 29.3 advances `pos_ms` only for samples it read
+/// (`player.c: source_read` → `event_read`) and, once a pipe that is not
+/// autostarted runs dry, waits instead of streaming (`inputs/pipe.c: play` →
+/// `input_wait`), so a stalled progress under `play` is a drained pipe.
+const COMPLETION_PROGRESS_STALL: Duration = Duration::from_secs(1);
 const FIFO_OPEN_POLL: Duration = Duration::from_millis(50);
 const POSITION_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -718,13 +725,6 @@ impl SignalHandle {
                 )),
             }
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            match identity_still_ours(identity)? {
-                false => Ok(None),
-                true => Ok(Some(Self { identity })),
-            }
-        }
     }
 
     /// Deliver `signal` through the handle. `Ok(false)` when the process is
@@ -733,21 +733,6 @@ impl SignalHandle {
         #[cfg(target_os = "linux")]
         {
             match rustix::process::pidfd_send_signal(&self.pidfd, signal) {
-                Ok(()) => Ok(true),
-                Err(rustix::io::Errno::SRCH) => Ok(false),
-                Err(_) => Err(unavailable("the dedicated daemon could not be signalled")),
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            use rustix::process::{kill_process, Pid};
-            if !identity_still_ours(self.identity)? {
-                return Ok(false);
-            }
-            let Some(pid) = Pid::from_raw(self.identity.pid as i32) else {
-                return Err(unavailable("the dedicated daemon process id is invalid"));
-            };
-            match kill_process(pid, signal) {
                 Ok(()) => Ok(true),
                 Err(rustix::io::Errno::SRCH) => Ok(false),
                 Err(_) => Err(unavailable("the dedicated daemon could not be signalled")),
@@ -835,7 +820,14 @@ fn spawn_restart_command(command: &str) -> Result<(), SenderError> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map(|_| ())
+        .map(|mut child| {
+            // Reap the restart command so a quiescence never leaves a zombie.
+            let _ = std::thread::Builder::new()
+                .name("airplay-owntone-reap".to_string())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
+        })
         .map_err(|_| unavailable("the dedicated daemon could not be restarted"))
 }
 
@@ -1174,6 +1166,53 @@ fn ensure_pipe(path: &Path) -> Result<(), SenderError> {
     }
 }
 
+/// The identity of the owned FIFO, bound on the load worker at the same
+/// verification step that proves the dedicated daemon scans this pathname
+/// ([`OwnToneConfig::verify_owned`]). The writer descriptor acquired later
+/// must resolve to this exact object: a pathname substituted in the interval
+/// — a regular file, a symlink to a foreign file, a swapped parent directory —
+/// is refused before any PCM can be written (AM1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PipeIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// Inspect the configured pipe pathname without following symlinks and
+/// require a FIFO. The returned identity is what the writer must match.
+fn verify_pipe_identity(path: &Path) -> Result<PipeIdentity, SenderError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| unavailable("the configured pipe could not be inspected"))?;
+    if !metadata.file_type().is_fifo() {
+        return Err(unavailable("the configured pipe path is not a FIFO"));
+    }
+    Ok(PipeIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+/// Bind a freshly opened writer to the verified FIFO. The check is made on
+/// the descriptor (`fstat`), never on the pathname, so a substitution between
+/// verification and acquisition cannot slip through. A descriptor that is not
+/// that FIFO is closed untouched: nothing is written, truncated, removed or
+/// replaced at the pathname (AM1).
+fn bind_pipe_writer(fd: OwnedFd, expected: PipeIdentity) -> Result<OwnedFd, SenderError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let file = std::fs::File::from(fd);
+    let metadata = file
+        .metadata()
+        .map_err(|_| unavailable("the pipe write end could not be inspected"))?;
+    if !metadata.file_type().is_fifo() {
+        return Err(unavailable("the configured pipe path is not a FIFO"));
+    }
+    if (metadata.dev(), metadata.ino()) != (expected.device, expected.inode) {
+        return Err(unavailable("the configured pipe was replaced"));
+    }
+    Ok(OwnedFd::from(file))
+}
+
 /// Distinguishes a cancellation observed while waiting from a real failure, so
 /// the FIFO wait can be aborted ("cancellation must be silent").
 enum CancelOrError {
@@ -1189,8 +1228,15 @@ enum CancelOrError {
 /// The wait is raced against `cancel`, so a Stop or replacement aborts it
 /// rather than leaving the open blocked on a daemon that never opens the pipe
 /// (review F2).
+///
+/// Every successful descriptor is bound to `expected` before it is returned
+/// (AM1): `NOFOLLOW` refuses a symlink planted at the pathname outright,
+/// `NOCTTY` keeps a substituted terminal device from becoming the controlling
+/// terminal before the descriptor check can refuse it, and
+/// [`bind_pipe_writer`] refuses any object other than the verified FIFO.
 fn open_pipe_write(
     path: &Path,
+    expected: PipeIdentity,
     deadline: Instant,
     cancel: &OpenCancel,
 ) -> Result<OwnedFd, CancelOrError> {
@@ -1200,10 +1246,15 @@ fn open_pipe_write(
         }
         match rustix::fs::open(
             path,
-            OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NOCTTY,
             Mode::empty(),
         ) {
-            Ok(fd) => return Ok(fd),
+            Ok(fd) => return bind_pipe_writer(fd, expected).map_err(CancelOrError::Failed),
+            Err(rustix::io::Errno::LOOP) => {
+                return Err(CancelOrError::Failed(unavailable(
+                    "the configured pipe path is a symlink",
+                )))
+            }
             Err(rustix::io::Errno::NXIO) => {
                 if Instant::now() >= deadline {
                     return Err(CancelOrError::Failed(unavailable(
@@ -1360,6 +1411,13 @@ struct SessionInner {
     /// wait the moment the load is cancelled or replaced (review R4).
     cancel: OpenCancel,
     restored: AtomicBool,
+    /// Set once a `player/pause` has been accepted by the daemon. Pinned
+    /// OwnTone's pipe input `stop` runs on pause and clears
+    /// `pipe_autostart_id`, so from then on the item is a plain source that
+    /// will never autostop at EOF: natural completion must then be decided
+    /// from stalled progress instead of waiting for the daemon's `stop`
+    /// ([`CompletionTracker`]). Never cleared.
+    autostart_lost: AtomicBool,
     /// The session's **terminal** flag. Set under [`Self::mutation_lock`] at
     /// the start of [`Self::restore`], i.e. *before* the daemon is restored, so
     /// the terminal transition and any concurrent control transmission are one
@@ -1729,6 +1787,32 @@ impl SessionInner {
             .clone()
     }
 
+    /// Hold the decode pipeline while the daemon pauses. Pinned pause stops
+    /// the pipe input and re-arms its watcher (`inputs/pipe.c: stop` →
+    /// `pipe_watch_reset`), which closes and reopens the daemon's reader: a
+    /// PCM write that lands in that reader-less window gets `EPIPE`, which
+    /// `fdsink` reports as a fatal stream error and would end the session.
+    /// Pausing the pipeline first keeps the writer idle across that window;
+    /// [`Self::release_pipeline`] lets it write again once the daemon has
+    /// accepted `play` and reopened its input. A pipeline that is not
+    /// playing (never activated, or already torn down) is left alone.
+    fn hold_pipeline(&self) {
+        if let Some(pipeline) = self.pipeline() {
+            if pipeline.state(gst::ClockTime::ZERO).1 == gst::State::Playing {
+                let _ = pipeline.set_state(gst::State::Paused);
+            }
+        }
+    }
+
+    /// Counterpart of [`Self::hold_pipeline`], after an accepted resume.
+    fn release_pipeline(&self) {
+        if let Some(pipeline) = self.pipeline() {
+            if pipeline.state(gst::ClockTime::ZERO).1 == gst::State::Paused {
+                let _ = pipeline.set_state(gst::State::Playing);
+            }
+        }
+    }
+
     /// Serialize first PCM (pipe autostart) or resume with the current load's
     /// Stop boundary. Initial playback starts decoding inside the settlement
     /// boundary and waits for daemon-confirmed play before publishing Playing.
@@ -1762,7 +1846,11 @@ impl SessionInner {
                     if let Some(pipeline) = self.pipeline().filter(|_| first_start) {
                         self.start_pipe(&pipeline)
                     } else {
-                        self.client.player_control("play")
+                        self.client.player_control("play")?;
+                        // The daemon reopened its pipe input: let the decoder
+                        // held across the pause write again.
+                        self.release_pipeline();
+                        Ok(())
                     }
                 },
                 PlayerState::Playing,
@@ -1988,6 +2076,10 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
                     // route so an intentional teardown is never mistaken for a
                     // transient fetch error (§4.4).
                     let _ = pipeline.set_state(gst::State::Null);
+                    // Close the write end before the restoring `player/stop`,
+                    // exactly as the EOS path does: the daemon's reset pipe
+                    // watcher must never find this writer still attached.
+                    drop(write_fd.take());
                     // Terminal failure and publication share the Stop gate.
                     inner.publish_terminal("AirPlay playback failed");
                     // A failed restore is not a clean teardown; the session
@@ -2046,11 +2138,73 @@ fn sample_position(inner: &SessionInner) {
     *inner.state.lock().unwrap_or_else(|p| p.into_inner()) = state;
 }
 
-/// The daemon must report `stop` for a finite item to count as completed:
-/// `pause` is a user-visible state, not a finished item (review F4). Kept as a
-/// predicate so the pause-is-not-completion regression is unit-testable.
+/// The daemon's own autostop: it reports `stop` for a finite item once its
+/// autostarted pipe hit EOF. `pause` is a user-visible state, not a finished
+/// item (review F4). Kept as a predicate so the pause-is-not-completion
+/// regression is unit-testable.
 fn daemon_completion_reached(state: &str) -> bool {
     state == "stop"
+}
+
+/// Decides completion from successive `/api/player` observations after the
+/// writer closed.
+///
+/// Pinned OwnTone 29.3 autostops a pipe only while it is *autostarted*. A
+/// `player/pause` stops the pipe input (`inputs/pipe.c: stop` →
+/// `pipe_watch_reset`, which clears `pipe_autostart_id`), and the following
+/// `player/play` restarts the same item as a plain source (`setup`:
+/// `is_autostarted = (source->id == pipe_autostart_id)` is now false). Such a
+/// pipe never emits EOF: at end-of-input `play` loops in `input_wait` and the
+/// daemon keeps reporting `play`. Its `pos_ms` keeps counting across the
+/// resume (`source_restart` resumes at the paused position) and stops moving
+/// once the pipe is dry, so a `play` whose progress has not moved for
+/// [`COMPLETION_PROGRESS_STALL`] is a rendered item: the caller then issues
+/// the restoring `player/stop` itself. `pause` never completes.
+struct CompletionTracker {
+    /// Whether stalled progress may complete the item: true only once the
+    /// daemon's autostart binding was lost (a pause was accepted). An
+    /// autostarted pipe is expected to autostop; a `play` that merely
+    /// stalls is then a fault and falls to the drain deadline.
+    stall_completes: bool,
+    last_state: String,
+    last_progress: Option<u64>,
+    unchanged_since: Option<Instant>,
+}
+
+impl CompletionTracker {
+    fn new(stall_completes: bool) -> Self {
+        Self {
+            stall_completes,
+            last_state: String::new(),
+            last_progress: None,
+            unchanged_since: None,
+        }
+    }
+
+    /// The stall is measured under continuous `play`: a state change (a
+    /// resume after a pause that outlived the drain) restarts the clock, so a
+    /// tail the daemon is about to read is never cut off as "already stalled".
+    /// A `play` that reports no progress at all is not evidence of a drained
+    /// pipe: it keeps waiting and falls to the drain deadline.
+    fn observe(&mut self, state: &str, progress: Option<u64>, now: Instant) -> bool {
+        if daemon_completion_reached(state) {
+            return true;
+        }
+        match self.unchanged_since {
+            Some(since) if progress == self.last_progress && state == self.last_state => {
+                self.stall_completes
+                    && state == "play"
+                    && progress.is_some()
+                    && now.duration_since(since) >= COMPLETION_PROGRESS_STALL
+            }
+            _ => {
+                self.last_state = state.to_string();
+                self.last_progress = progress;
+                self.unchanged_since = Some(now);
+                false
+            }
+        }
+    }
 }
 
 /// Natural EOS: close the write end so the daemon sees end-of-input, wait
@@ -2059,10 +2213,12 @@ fn daemon_completion_reached(state: &str) -> bool {
 /// transport loss is terminal failure, never completion.
 ///
 /// The caller has already closed the pipe write end via the owned descriptor it
-/// passed in; this function only waits. Completion requires the daemon to
-/// report `stop` — `pause` is a user-visible state, not a finished item, and
-/// treating any state other than `play` as success reported a paused track as
-/// completed (review F4).
+/// passed in; this function only waits. Completion is the daemon's own `stop`
+/// (an autostarted pipe hitting EOF) or, for a pipe the pinned daemon can no
+/// longer autostop after a pause/resume cycle, a `play` whose progress has
+/// stalled since the writer closed ([`CompletionTracker`]). `pause` is a
+/// user-visible state, not a finished item, and treating any state other than
+/// `play` as success reported a paused track as completed (review F4).
 fn natural_completion(inner: &SessionInner, pipeline: &gst::Pipeline) {
     pipeline.set_state(gst::State::Null).ok();
     let cancelled = || {
@@ -2077,21 +2233,25 @@ fn natural_completion(inner: &SessionInner, pipeline: &gst::Pipeline) {
         std::fs::write(inner.config.pipe_path.with_extension("drain-started"), "").unwrap();
     }
     let deadline = Instant::now() + DRAIN_DEADLINE;
+    let mut tracker = CompletionTracker::new(inner.autostart_lost.load(Ordering::SeqCst));
     let failure = loop {
         if cancelled() {
             // close() owns restoration/recovery after joining this pump. Keep
             // its route and instance lock until that settlement completes.
             return;
         }
-        let observation = inner.client.player_state();
+        let observation = inner.client.player_progress();
         // A bounded HTTP observation may have been in flight when Stop won.
         // Its success, error or timeout is no longer a playback outcome.
         if cancelled() {
             return;
         }
         match observation {
-            Ok(state) if daemon_completion_reached(&state) => break None,
-            Ok(_) => {}
+            Ok((state, progress)) => {
+                if tracker.observe(&state, progress, Instant::now()) {
+                    break None;
+                }
+            }
             Err(_) => break Some("AirPlay completion could not be confirmed"),
         }
         if Instant::now() >= deadline {
@@ -2168,13 +2328,25 @@ impl SenderSession for OwnToneSession {
     }
 
     fn pause(&mut self) -> bool {
-        self.inner
+        let paused = self
+            .inner
             .transmit_under_boundary(
-                || self.inner.client.player_control("pause"),
+                || {
+                    // Idle the writer before the daemon resets its reader.
+                    self.inner.hold_pipeline();
+                    self.inner.client.player_control("pause")
+                },
                 Some(PlayerState::Paused),
                 true,
             )
-            .is_ok()
+            .is_ok();
+        if paused {
+            // The daemon's pipe input stopped: the item is no longer
+            // autostarted and will not autostop at EOF (see
+            // `SessionInner::autostart_lost`).
+            self.inner.autostart_lost.store(true, Ordering::SeqCst);
+        }
+        paused
     }
 
     fn resume(&mut self) -> bool {
@@ -2392,6 +2564,18 @@ fn check_daemon_health(client: &OwnToneClient) -> Result<(), SenderError> {
     Ok(())
 }
 
+/// A failure observed before the first mutating RPC. A load the controller
+/// already stopped or replaced has nothing to unwind and, per §4.1, nothing
+/// to report: the observation that failed may be the very request its Stop
+/// interrupted, and a cancelled generation publishes no event.
+fn pre_mutation_failure(ctx: &SenderOpenContext, error: SenderError) -> OpenOutcome {
+    if ctx.cancel.is_cancelled() {
+        OpenOutcome::Cancelled
+    } else {
+        OpenOutcome::Failed(error)
+    }
+}
+
 /// Acquire exclusivity, map the receiver, record the pre-takeover state, take
 /// the daemon over, and start the decode pump (§4.3).
 ///
@@ -2404,15 +2588,22 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
     let deadline = Instant::now() + OPEN_DEADLINE;
     let client = match OwnToneClient::new(&config.api_base) {
         Ok(client) => Arc::new(client),
-        Err(error) => return OpenOutcome::Failed(error),
+        Err(error) => return pre_mutation_failure(ctx, error),
     };
     // The route hand-off a recovery-pending outcome carries: the seat moves
     // this load's ticket into custody before constructing that outcome (review
     // S5).
     let custody = CustodyHandoff::from_ctx(ctx);
     if let Err(error) = config.verify_owned() {
-        return OpenOutcome::Failed(error);
+        return pre_mutation_failure(ctx, error);
     }
+    // Bind the FIFO's identity at the same verification step that proved the
+    // dedicated daemon scans this pathname. The writer acquired after the
+    // takeover mutations must resolve to this exact object (AM1).
+    let pipe_identity = match verify_pipe_identity(&config.pipe_path) {
+        Ok(identity) => identity,
+        Err(error) => return pre_mutation_failure(ctx, error),
+    };
     if ctx.cancel.is_cancelled() {
         return OpenOutcome::Cancelled;
     }
@@ -2422,7 +2613,7 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
     // the synchronous `probe` must not perform; running them before the lock
     // and before any receiver state read preserves the fail-closed ordering.
     if let Err(error) = check_daemon_health(&client) {
-        return OpenOutcome::Failed(error);
+        return pre_mutation_failure(ctx, error);
     }
     if ctx.cancel.is_cancelled() {
         return OpenOutcome::Cancelled;
@@ -2431,21 +2622,56 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
     // Exclusivity is locked before the first state read.
     let lock = match open_lock(&config.lock_path()) {
         Ok(lock) => lock,
-        Err(error) => return OpenOutcome::Failed(error),
+        Err(error) => return pre_mutation_failure(ctx, error),
     };
-    if rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).is_err() {
-        return OpenOutcome::Failed(unavailable(
-            "another Tributary session is already using the dedicated daemon",
-        ));
+    // The previous session on this same output releases its lock only after
+    // its own worker has restored the daemon, and the controller does not
+    // serialize that worker behind this open, so a sequential hand-over is
+    // waited for — bounded by the open deadline and raced against
+    // cancellation — while a genuinely concurrent holder is still refused at
+    // the deadline (§9 item 5: a replacement opens cleanly).
+    while rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).is_err() {
+        if ctx.cancel.is_cancelled() {
+            return OpenOutcome::Cancelled;
+        }
+        if Instant::now() >= deadline {
+            return pre_mutation_failure(
+                ctx,
+                unavailable("another Tributary session is already using the dedicated daemon"),
+            );
+        }
+        std::thread::sleep(FIFO_OPEN_POLL);
     }
 
     // A record left by a crashed holder means the daemon may be half-taken
-    // over. Refuse and let the supervisor (or the next opener) recover rather
-    // than adopting it silently (§4.3).
-    if config.takeover_record().exists() {
-        return OpenOutcome::Failed(unavailable(
-            "a previous takeover is incomplete and must be recovered first",
-        ));
+    // over. Under the freshly taken lock, recover it the way §4.3 requires of
+    // the next opener: quiesce the instance (dropping anything the dead holder
+    // left in flight), restore its recorded output set — which removes the
+    // record — and only then proceed. A recovery that cannot be completed
+    // refuses the open and leaves the record for the next attempt; the record
+    // is never adopted silently.
+    let record_path = config.takeover_record();
+    if record_path.exists() {
+        let Some(stale) = TakeoverRecord::read(&record_path) else {
+            return pre_mutation_failure(
+                ctx,
+                unavailable(
+                    "a previous takeover record is unreadable and must be recovered by hand",
+                ),
+            );
+        };
+        if ctx.cancel.is_cancelled() {
+            return OpenOutcome::Cancelled;
+        }
+        if quiesce_daemon(&config).is_err() || restore_daemon(&client, &config, &stale).is_err() {
+            return pre_mutation_failure(
+                ctx,
+                unavailable("a previous takeover is incomplete and could not be recovered"),
+            );
+        }
+        if ctx.cancel.is_cancelled() {
+            return OpenOutcome::Cancelled;
+        }
     }
     if ctx.cancel.is_cancelled() {
         return OpenOutcome::Cancelled;
@@ -2455,20 +2681,23 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
     // has no takeover to unwind.
     let outputs = match client.outputs() {
         Ok(outputs) => outputs,
-        Err(error) => return OpenOutcome::Failed(error),
+        Err(error) => return pre_mutation_failure(ctx, error),
     };
     let selected = match map_receiver_to_output(&outputs, ctx.target.device_id.as_deref()) {
         Ok(selected) => selected,
-        Err(failure) => return OpenOutcome::Failed(unavailable(&failure.to_string())),
+        Err(failure) => return pre_mutation_failure(ctx, unavailable(&failure.to_string())),
     };
 
     // Never preempt audible playback on the dedicated instance.
     match client.player_state() {
         Ok(state) if state == "play" => {
-            return OpenOutcome::Failed(unavailable("the dedicated daemon is already playing"));
+            return pre_mutation_failure(
+                ctx,
+                unavailable("the dedicated daemon is already playing"),
+            );
         }
         Ok(_) => {}
-        Err(error) => return OpenOutcome::Failed(error),
+        Err(error) => return pre_mutation_failure(ctx, error),
     }
     if ctx.cancel.is_cancelled() {
         return OpenOutcome::Cancelled;
@@ -2522,7 +2751,7 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
         return cancel_outcome(client, config, recorded, lock, unsettled, &custody);
     }
 
-    let write_fd = match open_pipe_write(&config.pipe_path, deadline, &ctx.cancel) {
+    let write_fd = match open_pipe_write(&config.pipe_path, pipe_identity, deadline, &ctx.cancel) {
         Ok(fd) => fd,
         Err(CancelOrError::Cancelled) => {
             return cancel_outcome(client, config, recorded, lock, unsettled, &custody);
@@ -2556,6 +2785,7 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
         gate: Arc::clone(&ctx.session_gate),
         cancel: ctx.cancel.clone(),
         restored: AtomicBool::new(false),
+        autostart_lost: AtomicBool::new(false),
         terminal: AtomicBool::new(false),
         mutation_lock: Mutex::new(()),
         unsettled: AtomicUsize::new(0),
@@ -3575,6 +3805,72 @@ mod tests {
         assert!(ensure_pipe(&file).is_err());
     }
 
+    /// AM1: the writer is bound to the FIFO verified on the load worker, never
+    /// to whatever the pathname resolves to at acquisition time. A foreign
+    /// object planted at the pathname is refused and left untouched.
+    #[test]
+    fn pipe_writer_is_bound_to_the_verified_fifo() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let pipe = directory.path().join("airplay.pcm");
+        ensure_pipe(&pipe).expect("create fifo");
+        let identity = verify_pipe_identity(&pipe).expect("fifo identity");
+        let deadline = || Instant::now() + Duration::from_millis(200);
+        let cancel = OpenCancel::new();
+        let read_end = || {
+            rustix::fs::open(
+                &pipe,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .expect("open reader")
+        };
+        // Holding the original FIFO open keeps its inode from being reused by
+        // the replacement FIFO below.
+        let reader = read_end();
+        assert!(open_pipe_write(&pipe, identity, deadline(), &cancel).is_ok());
+
+        // A regular file planted at the pathname.
+        std::fs::remove_file(&pipe).unwrap();
+        std::fs::write(&pipe, b"foreign bytes").unwrap();
+        assert!(verify_pipe_identity(&pipe).is_err());
+        assert!(matches!(
+            open_pipe_write(&pipe, identity, deadline(), &cancel),
+            Err(CancelOrError::Failed(_))
+        ));
+        assert_eq!(std::fs::read(&pipe).unwrap(), b"foreign bytes");
+
+        // A symlink to a foreign file is refused without being followed.
+        std::fs::remove_file(&pipe).unwrap();
+        let foreign = directory.path().join("foreign");
+        std::fs::write(&foreign, b"foreign bytes").unwrap();
+        std::os::unix::fs::symlink(&foreign, &pipe).unwrap();
+        assert!(verify_pipe_identity(&pipe).is_err());
+        assert!(matches!(
+            open_pipe_write(&pipe, identity, deadline(), &cancel),
+            Err(CancelOrError::Failed(_))
+        ));
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign bytes");
+        assert!(std::fs::symlink_metadata(&pipe)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // Another FIFO at the pathname, even one with a reader, is not the
+        // verified object; it is accepted only once it is verified itself.
+        std::fs::remove_file(&pipe).unwrap();
+        ensure_pipe(&pipe).unwrap();
+        let other_reader = read_end();
+        assert!(matches!(
+            open_pipe_write(&pipe, identity, deadline(), &cancel),
+            Err(CancelOrError::Failed(_))
+        ));
+        let replacement = verify_pipe_identity(&pipe).unwrap();
+        assert_ne!(replacement, identity);
+        assert!(open_pipe_write(&pipe, replacement, deadline(), &cancel).is_ok());
+        drop(other_reader);
+        drop(reader);
+    }
+
     fn owned_config(dir: &Path) -> OwnToneConfig {
         OwnToneConfig {
             api_base: "http://127.0.0.1:3689".to_string(),
@@ -3665,6 +3961,51 @@ mod tests {
 
     /// F4: a paused item is not a completed item; only `stop` completes, so a
     /// paused track is never reported as `TrackEnded`.
+    #[test]
+    fn completion_tracker_completes_on_stop_or_stalled_play_never_pause() {
+        let t0 = Instant::now();
+        let stall = COMPLETION_PROGRESS_STALL;
+        let mut tracker = CompletionTracker::new(false);
+        assert!(
+            tracker.observe("stop", None, t0),
+            "autostop completes at once"
+        );
+
+        // An autostarted pipe never completes on stalled progress alone.
+        let mut tracker = CompletionTracker::new(false);
+        assert!(!tracker.observe("play", Some(100), t0));
+        assert!(!tracker.observe("play", Some(100), t0 + stall * 3));
+
+        let mut tracker = CompletionTracker::new(true);
+        assert!(!tracker.observe("play", Some(100), t0));
+        assert!(!tracker.observe("play", Some(200), t0 + stall), "advancing");
+        assert!(!tracker.observe("play", Some(200), t0 + stall + stall / 2));
+        assert!(
+            tracker.observe("play", Some(200), t0 + stall * 2),
+            "drained"
+        );
+
+        let mut tracker = CompletionTracker::new(true);
+        assert!(!tracker.observe("play", None, t0));
+        assert!(
+            !tracker.observe("play", None, t0 + stall * 3),
+            "no progress evidence never counts as drained"
+        );
+
+        let mut tracker = CompletionTracker::new(true);
+        assert!(!tracker.observe("pause", Some(300), t0));
+        assert!(
+            !tracker.observe("pause", Some(300), t0 + stall * 3),
+            "a paused item is never complete"
+        );
+        assert!(
+            !tracker.observe("play", Some(300), t0 + stall * 3),
+            "a resume restarts the stall clock"
+        );
+        assert!(!tracker.observe("play", Some(300), t0 + stall * 3 + stall / 2));
+        assert!(tracker.observe("play", Some(300), t0 + stall * 4));
+    }
+
     #[test]
     fn completion_requires_stop_and_never_accepts_pause() {
         assert!(daemon_completion_reached("stop"));
@@ -3760,7 +4101,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let state_dir = directory.path();
         let pipe = state_dir.join("airplay.pcm");
-        std::fs::write(&pipe, b"fifo").expect("write pipe placeholder");
+        // The binding accepts only a real FIFO at the scanned pathname.
+        ensure_pipe(&pipe).expect("create scanned FIFO");
         let config = state_dir.join(OWNTONE_CONFIG_FILE);
         std::fs::write(&config, dedicated_config::fixture(&pipe)).expect("write config");
         std::fs::create_dir_all(state_dir.join("sub")).expect("sub dir");
@@ -3869,7 +4211,7 @@ mod tests {
         // A configuration that binds a different FIFO is refused.
         let other_dir = tempfile::tempdir().expect("tempdir");
         let other_pipe = other_dir.path().join("other.pcm");
-        std::fs::write(&other_pipe, b"other").expect("other pipe");
+        ensure_pipe(&other_pipe).expect("create other FIFO");
         let other_config = other_dir.path().join(OWNTONE_CONFIG_FILE);
         std::fs::write(&other_config, dedicated_config::fixture(&other_pipe))
             .expect("other config");
@@ -3898,20 +4240,6 @@ mod tests {
             binary,
         };
         assert!(verify_daemon_process(&config).is_err());
-    }
-
-    /// T6: on platforms without a Linux `/proc`, the kernel-side process
-    /// binding is explicitly unsupported and fails closed — it never silently
-    /// accepts a listener as the owned instance.
-    #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn process_resolution_is_unsupported_off_linux() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let port = listener.local_addr().expect("addr").port();
-        assert!(
-            listener_process(&format!("http://127.0.0.1:{port}")).is_none(),
-            "no /proc enumeration exists off Linux, so no listener may resolve"
-        );
     }
 
     /// R2/S3/T5: quiescence terminates the owned process (escalating to
@@ -4012,6 +4340,7 @@ mod tests {
             gate: Arc::new(SessionGate::new()),
             cancel: OpenCancel::new(),
             restored: AtomicBool::new(false),
+            autostart_lost: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
             mutation_lock: Mutex::new(()),
             unsettled: AtomicUsize::new(0),
@@ -4052,6 +4381,7 @@ mod tests {
             gate: Arc::new(SessionGate::new()),
             cancel: OpenCancel::new(),
             restored: AtomicBool::new(false),
+            autostart_lost: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
             mutation_lock: Mutex::new(()),
             unsettled: AtomicUsize::new(0),
@@ -4127,6 +4457,7 @@ mod tests {
             gate: Arc::new(SessionGate::new()),
             cancel: OpenCancel::new(),
             restored: AtomicBool::new(false),
+            autostart_lost: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
             mutation_lock: Mutex::new(()),
             unsettled: AtomicUsize::new(0),
@@ -4319,10 +4650,29 @@ mod tests {
         }
     }
 
-    fn wait_until(mut predicate: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+    /// Bounded wait that names the waiting call site when it expires, so an
+    /// intermittent expiry under suite concurrency identifies which predicate
+    /// stalled (tr-9utsm) instead of an anonymous timeout.
+    #[track_caller]
+    fn wait_until(predicate: impl FnMut() -> bool) {
+        wait_until_within(Duration::from_secs(10), predicate);
+    }
+
+    /// [`wait_until`] with an explicit bound, for phases that legitimately
+    /// span the adapter's own bounded quiescence/recovery deadlines.
+    #[track_caller]
+    fn wait_until_within(limit: Duration, mut predicate: impl FnMut() -> bool) {
+        let caller = std::panic::Location::caller();
+        let started = Instant::now();
+        let deadline = started + limit;
         while !predicate() {
-            assert!(Instant::now() < deadline, "timed out waiting for condition");
+            assert!(
+                Instant::now() < deadline,
+                "timed out after {:?} waiting for the condition at {}:{}",
+                started.elapsed(),
+                caller.file(),
+                caller.line()
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -5420,8 +5770,13 @@ mod tests {
         let pcm: Vec<u8> = (0..capacity * 4).map(|i| (i % 251) as u8).collect();
         let media = directory.path().join("pcm.raw");
         std::fs::write(&media, &pcm).unwrap();
-        let writer = open_pipe_write(&path, Instant::now() + OPEN_DEADLINE, &OpenCancel::new())
-            .unwrap_or_else(|_| panic!("open writer"));
+        let writer = open_pipe_write(
+            &path,
+            verify_pipe_identity(&path).unwrap(),
+            Instant::now() + OPEN_DEADLINE,
+            &OpenCancel::new(),
+        )
+        .unwrap_or_else(|_| panic!("open writer"));
         let pipeline = gst::parse::launch(&format!(
             "filesrc location=\"{}\" blocksize={} ! fdsink fd={} sync=false",
             media.display(),
@@ -5550,6 +5905,7 @@ mod tests {
 
         let write_fd = open_pipe_write(
             &pipe_path,
+            verify_pipe_identity(&pipe_path).unwrap(),
             Instant::now() + Duration::from_secs(5),
             &inner.cancel,
         )
@@ -5713,6 +6069,7 @@ mod tests {
         let inner = Arc::new(test_session_inner_at_base(&api_base, state_dir, tx));
         let write_fd = open_pipe_write(
             &pipe_path,
+            verify_pipe_identity(&pipe_path).unwrap(),
             Instant::now() + Duration::from_secs(5),
             &inner.cancel,
         )
@@ -5959,6 +6316,9 @@ fn serve(stream: std::net::TcpStream) {
             let state_dir = directory.path().join("state");
             std::fs::create_dir_all(&state_dir).expect("state dir");
             let pipe = state_dir.join("airplay.pcm");
+            // The dedicated-config authority check binds only a real FIFO at
+            // the scanned pathname, so the fixture provisions one.
+            ensure_pipe(&pipe).expect("create scanned FIFO");
             let config_path = state_dir.join(OWNTONE_CONFIG_FILE);
             std::fs::write(&config_path, dedicated_config::fixture(&pipe)).expect("write config");
 
@@ -6158,14 +6518,31 @@ static FIFO: Mutex<Option<std::fs::File>> = Mutex::new(None);
 fn pipe() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::args().nth(2).unwrap()).parent().unwrap().join("airplay.pcm")
 }
+fn open_fifo_reader() -> Option<std::fs::File> {
+    use std::os::unix::fs::FileTypeExt;
+    // The pinned pipe watcher only ever holds a FIFO. A foreign object planted
+    // at the pathname (the AM1 fixture's sentinel file or symlink) is never
+    // opened here, so PCM observations can only come from the real FIFO.
+    let is_fifo = std::fs::symlink_metadata(pipe())
+        .map(|m| m.file_type().is_fifo())
+        .unwrap_or(false);
+    is_fifo.then(|| std::fs::OpenOptions::new().read(true)
+        .custom_flags(0x800).open(pipe()).expect("FIFO reader"))
+}
 fn main() {
-    *FIFO.lock().unwrap() = Some(std::fs::OpenOptions::new().read(true)
-        .custom_flags(0x800).open(pipe()).expect("FIFO reader"));
+    *FIFO.lock().unwrap() = open_fifo_reader();
     std::thread::spawn(move || loop {
         // Keep the reader open but stop consuming after the first PCM. This
         // models failed autostart and an already-playing receiver that stalls.
         let mut state = STATE.lock().unwrap();
         if pipe().with_extension("stall").exists() && state.bytes > 0 {
+            drop(state);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        // Pinned pause stopped the pipe input: nothing reads the FIFO until
+        // the item is resumed (the re-armed watcher sees "already playing").
+        if state.paused {
             drop(state);
             std::thread::sleep(std::time::Duration::from_millis(10));
             continue;
@@ -6306,8 +6683,31 @@ fn serve(stream: std::net::TcpStream) {
             return;
         }
     }
+    // AM1 fixture: substitute the scanned pipe pathname while serving the
+    // adapter's last pre-acquisition mutation (the initial volume PUT), i.e.
+    // after every probe and ownership check and immediately before the writer
+    // descriptor is acquired. One-shot; the planted object is never opened
+    // by this daemon (see open_fifo_reader).
+    if method == "PUT" && path.starts_with("/api/player/volume") {
+        if let Ok(mode) = std::fs::read_to_string(pipe.with_extension("substitute")) {
+            std::fs::remove_file(pipe.with_extension("substitute")).unwrap();
+            let sentinel = pipe.with_extension("sentinel");
+            match mode.trim() {
+                "regular" => std::fs::rename(&sentinel, &pipe).unwrap(),
+                "symlink" => {
+                    let link = pipe.with_extension("substitute-link");
+                    std::os::unix::fs::symlink(&sentinel, &link).unwrap();
+                    std::fs::rename(&link, &pipe).unwrap();
+                }
+                other => panic!("unknown pipe substitution {}", other),
+            }
+            std::fs::write(pipe.with_extension("substituted"), "").unwrap();
+        }
+    }
     let mut state = STATE.lock().unwrap();
-    let dynamic = format!(r#"{{"state":"{}","pcm_bytes":{},"queued":{}}}"#, if state.playing { "play" } else if state.paused { "pause" } else { "stop" }, state.bytes, state.queued);
+    // item_progress_ms models pinned pos_ms: it advances only for PCM the
+    // input actually read and stands still once the pipe is dry.
+    let dynamic = format!(r#"{{"state":"{}","pcm_bytes":{},"queued":{},"item_progress_ms":{}}}"#, if state.playing { "play" } else if state.paused { "pause" } else { "stop" }, state.bytes, state.queued, state.bytes as u64 * 1000 / 176_400);
     let outputs = format!(r#"{{"outputs":[{{"id":"11189196","name":"Test","selected":{}}},{{"id":"42","name":"Prior","selected":{}}}]}}"#, state.selected, !state.selected);
     let overridden = match (method, path) {
         ("GET", "/api/player") => std::fs::read_to_string(pipe.with_extension("player-response")).ok(),
@@ -6334,13 +6734,20 @@ fn serve(stream: std::net::TcpStream) {
             // of spuriously treating it as a new autostart on the next read.
             let mut fifo = FIFO.lock().unwrap();
             drop(fifo.take());
-            *fifo = Some(std::fs::OpenOptions::new().read(true)
-                .custom_flags(0x800).open(&pipe).expect("reset FIFO reader"));
+            *fifo = open_fifo_reader();
             state.playing = false; state.paused = false; state.autostarted = false;
             ("204 No Content", "")
         }
         ("PUT", "/api/player/pause") => {
-            state.playing = false; state.paused = true; ("204 No Content", "")
+            // Pinned pause stops the pipe input (inputs/pipe.c: stop): its
+            // reader closes, discarding buffered PCM, the watcher is re-armed
+            // and pipe_autostart_id is cleared, so the later resume restarts
+            // the item as a plain, never-autostopping source.
+            let mut fifo = FIFO.lock().unwrap();
+            drop(fifo.take());
+            *fifo = open_fifo_reader();
+            state.playing = false; state.paused = true; state.autostarted = false;
+            ("204 No Content", "")
         }
         ("PUT", _) if path.starts_with("/api/player/volume") => {
             if volume.is_some() && content_length == 0 { ("204 No Content", "") }
@@ -6893,6 +7300,626 @@ fn serve(stream: std::net::TcpStream) {
         }
     }
 
+    /// AM1: which foreign object is planted at the scanned pipe pathname
+    /// between the adapter's ownership checks and its writer acquisition.
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy)]
+    enum PipeSubstitution {
+        RegularFile,
+        Symlink,
+    }
+
+    /// AM1: the recording daemon substitutes the pipe pathname while it serves
+    /// the initial volume PUT — the production adapter's last mutation before
+    /// `open_pipe_write` — so the substitution lands after every probe and
+    /// ownership check and immediately before the descriptor is acquired. The
+    /// production controller must refuse without delivering a byte to the
+    /// foreign object, fail this generation truthfully (Error + Stopped, no
+    /// Playing, no TrackEnded), restore the daemon or retain every piece of
+    /// ownership evidence until a refused restoration settles, leave the
+    /// planted object exactly as it found it, and stay usable afterwards.
+    #[cfg(target_os = "linux")]
+    fn exercise_pipe_substitution(substitution: PipeSubstitution, restore_fault: bool) {
+        use crate::audio::airplay_output::ControllerHarness;
+        use crate::local::resolver::ResolvedLocalMedia;
+
+        gst::init().unwrap();
+        let daemon = RecordingOwnedDaemon::start();
+        let original_process = listener_process(&daemon.config.api_base)
+            .unwrap()
+            .identity();
+        let client = OwnToneClient::new(&daemon.config.api_base).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        let controller = ControllerHarness::new(
+            runtime.handle().clone(),
+            Arc::new(OwnToneSender {
+                config: Some(daemon.config.clone()),
+            }),
+            tx,
+        )
+        .with_device_id("aabbcc");
+        let root = tempfile::tempdir().unwrap();
+        let marker = format!("marker:v1:{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            root.path().join(".tributary-root-id"),
+            format!("{marker}\n"),
+        )
+        .unwrap();
+        let path = root.path().join("substitution.wav");
+        write_startup_wav(&path, 30);
+        let proxy = controller.proxy();
+        let prepare = || {
+            proxy
+                .prepare_local(
+                    ResolvedLocalMedia::from_authorized_path_for_test(root.path(), &marker, &path)
+                        .unwrap(),
+                )
+                .unwrap()
+        };
+        let baseline_outputs = client.outputs().unwrap();
+        let pipe = daemon.config.pipe_path.clone();
+
+        // The foreign object: larger than one decoded PCM buffer, so a writer
+        // that reached it would have changed bytes from offset zero.
+        let sentinel = pipe.with_extension("sentinel");
+        let sentinel_bytes = vec![0xA5u8; 256 * 1024];
+        std::fs::write(&sentinel, &sentinel_bytes).unwrap();
+        let foreign = match substitution {
+            PipeSubstitution::RegularFile => pipe.clone(),
+            PipeSubstitution::Symlink => sentinel.clone(),
+        };
+        let planted_as_expected = || {
+            let planted = std::fs::symlink_metadata(&pipe).unwrap().file_type();
+            match substitution {
+                PipeSubstitution::RegularFile => assert!(planted.is_file()),
+                PipeSubstitution::Symlink => {
+                    assert!(planted.is_symlink());
+                    assert_eq!(std::fs::read_link(&pipe).unwrap(), sentinel);
+                }
+            }
+        };
+        std::fs::write(
+            pipe.with_extension("substitute"),
+            match substitution {
+                PipeSubstitution::RegularFile => "regular",
+                PipeSubstitution::Symlink => "symlink",
+            },
+        )
+        .unwrap();
+        if restore_fault {
+            std::fs::write(pipe.with_extension("park-restore"), "fail").unwrap();
+        }
+
+        let prepared = prepare();
+        let ticket = prepared.ticket().unwrap();
+        let generation = PlayerEventGeneration::from_raw(43);
+        controller.set_generation(generation);
+        let started = Instant::now();
+        controller.load(generation, prepared);
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        // The daemon applied the substitution while serving the initial volume
+        // PUT: every takeover mutation has succeeded and the very next
+        // production step is descriptor acquisition.
+        wait_until(|| pipe.with_extension("substituted").exists());
+        let recorded = daemon.recorded();
+        assert!(recorded.contains("PUT /api/outputs/set "), "{recorded}");
+        assert!(recorded.contains("PUT /api/queue/clear "), "{recorded}");
+        assert!(
+            recorded.contains("/api/player/volume?volume="),
+            "{recorded}"
+        );
+        planted_as_expected();
+        let competing = open_lock(&daemon.config.lock_path()).unwrap();
+        let lock_is_free =
+            || rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_ok();
+        if restore_fault {
+            // The refused writer unwinds through the takeover restoration
+            // path. While the restoring stop is parked, every piece of
+            // ownership evidence is retained.
+            wait_until(|| pipe.with_extension("restore-seen").exists());
+            assert_eq!(ticket.route_count(), 1, "restoring mutation retains media");
+            assert!(daemon.config.takeover_record().exists());
+            assert!(!lock_is_free());
+            assert!(client.outputs().unwrap()[0].selected);
+            std::fs::write(pipe.with_extension("restore-release"), "").unwrap();
+            // The refused restoration forces quiescence, and the restarted
+            // daemon cannot be verified as the dedicated instance while a
+            // foreign object sits where its scanned FIFO must be. Recovery is
+            // therefore retained — route custody, takeover record and
+            // instance lock all held by a live recovery owner — and the load
+            // fails truthfully instead of releasing ownership.
+            wait_until_within(Duration::from_secs(90), || proxy.is_custodied(&ticket));
+            wait_until(|| controller.state() == PlayerState::Stopped);
+            assert!(daemon.config.takeover_record().exists());
+            assert!(!lock_is_free());
+            assert_eq!(ticket.route_count(), 1, "custodied route is retained");
+        } else {
+            wait_until(|| ticket.route_count() == 0);
+            wait_until(lock_is_free);
+            assert!(!daemon.config.takeover_record().exists());
+            assert!(!proxy.is_custodied(&ticket));
+            assert!(!proxy.has_custody_entries());
+        }
+        let mut events = Vec::new();
+        wait_until(|| {
+            events.extend(std::iter::from_fn(|| rx.try_recv().ok()));
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    PlayerEvent::StateChanged {
+                        state: PlayerState::Stopped,
+                        ..
+                    }
+                )
+            })
+        });
+        assert!(
+            events.iter().all(|event| event.generation() == generation),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PlayerEvent::Error { .. }))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::TrackEnded { .. }
+                    | PlayerEvent::StateChanged {
+                        state: PlayerState::Playing,
+                        ..
+                    }
+            )),
+            "{events:?}"
+        );
+        assert_eq!(controller.state(), PlayerState::Stopped);
+
+        // Not one byte reached the foreign object, the daemon never observed
+        // PCM, and the adapter left the planted object exactly where it was.
+        assert_eq!(std::fs::read(&foreign).unwrap(), sentinel_bytes);
+        assert!(
+            !daemon.recorded().contains("PCM received"),
+            "{}",
+            daemon.recorded()
+        );
+        planted_as_expected();
+
+        // Only the operator (here, the test) removes the foreign object and
+        // provisions the scanned FIFO again.
+        std::fs::remove_file(&pipe).unwrap();
+        ensure_pipe(&pipe).unwrap();
+        if restore_fault {
+            // The retained recovery settles on its own once the dedicated
+            // instance can be verified again: quiescence restarts the daemon,
+            // restoration succeeds, and only then are custody, route, record
+            // and lock released. The original process was replaced.
+            wait_until_within(Duration::from_secs(90), || ticket.route_count() == 0);
+            wait_until(lock_is_free);
+            assert!(!daemon.config.takeover_record().exists());
+            assert!(!proxy.is_custodied(&ticket));
+            assert!(!proxy.has_custody_entries());
+            assert_ne!(
+                listener_process(&daemon.config.api_base)
+                    .unwrap()
+                    .identity(),
+                original_process
+            );
+        }
+        let restored = client.outputs().unwrap();
+        assert_eq!(restored.len(), baseline_outputs.len());
+        for (actual, prior) in restored.iter().zip(&baseline_outputs) {
+            assert_eq!((actual.id, actual.selected), (prior.id, prior.selected));
+        }
+        assert_eq!(client.player_state().unwrap(), "stop");
+        drop(competing);
+
+        // The daemon re-arms its FIFO reader on stop; then a fresh load must
+        // play normally against the restored FIFO.
+        client.player_control("stop").unwrap();
+        while rx.try_recv().is_ok() {}
+        let next = prepare();
+        let next_ticket = next.ticket().unwrap();
+        controller.set_generation(generation.next());
+        controller.load(generation.next(), next);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        assert!(daemon.recorded().contains("PCM received"));
+        assert_eq!(next_ticket.route_count(), 1);
+        controller.stop();
+        wait_until(|| next_ticket.route_count() == 0);
+        wait_until(|| !daemon.config.takeover_record().exists());
+        let restored = client.outputs().unwrap();
+        assert_eq!(restored.len(), baseline_outputs.len());
+        for (actual, prior) in restored.iter().zip(&baseline_outputs) {
+            assert_eq!((actual.id, actual.selected), (prior.id, prior.selected));
+        }
+        if matches!(substitution, PipeSubstitution::Symlink) {
+            assert_eq!(std::fs::read(&sentinel).unwrap(), sentinel_bytes);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn substituted_regular_file_at_the_pipe_path_is_refused_and_restored() {
+        exercise_pipe_substitution(PipeSubstitution::RegularFile, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn substituted_symlink_at_the_pipe_path_is_refused_and_restored() {
+        exercise_pipe_substitution(PipeSubstitution::Symlink, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn substituted_regular_file_retains_ownership_until_a_refused_restore_settles() {
+        exercise_pipe_substitution(PipeSubstitution::RegularFile, true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn substituted_symlink_retains_ownership_until_a_refused_restore_settles() {
+        exercise_pipe_substitution(PipeSubstitution::Symlink, true);
+    }
+
+    /// Shared production-controller setup against one owned recording daemon:
+    /// a controller wired to the real OwnTone sender, an event channel, and a
+    /// prepared protected local WAV of `seconds` seconds.
+    #[cfg(target_os = "linux")]
+    struct DaemonControllerFixture {
+        daemon: RecordingOwnedDaemon,
+        client: OwnToneClient,
+        _runtime: tokio::runtime::Runtime,
+        controller: crate::audio::airplay_output::ControllerHarness,
+        rx: async_channel::Receiver<PlayerEvent>,
+        root: tempfile::TempDir,
+        marker: String,
+        media: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl DaemonControllerFixture {
+        fn start(seconds: u32) -> Self {
+            use crate::audio::airplay_output::ControllerHarness;
+            gst::init().unwrap();
+            let daemon = RecordingOwnedDaemon::start();
+            let client = OwnToneClient::new(&daemon.config.api_base).unwrap();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (tx, rx) = async_channel::unbounded();
+            let controller = ControllerHarness::new(
+                runtime.handle().clone(),
+                Arc::new(OwnToneSender {
+                    config: Some(daemon.config.clone()),
+                }),
+                tx,
+            )
+            .with_device_id("aabbcc");
+            let root = tempfile::tempdir().unwrap();
+            let marker = format!("marker:v1:{}", uuid::Uuid::new_v4());
+            std::fs::write(
+                root.path().join(".tributary-root-id"),
+                format!("{marker}\n"),
+            )
+            .unwrap();
+            let media = root.path().join("fixture.wav");
+            write_startup_wav(&media, seconds);
+            Self {
+                daemon,
+                client,
+                _runtime: runtime,
+                controller,
+                rx,
+                root,
+                marker,
+                media,
+            }
+        }
+
+        fn prepare(&self) -> crate::audio::gstreamer_media::PreparedGstreamerMedia {
+            use crate::local::resolver::ResolvedLocalMedia;
+            self.controller
+                .proxy()
+                .prepare_local(
+                    ResolvedLocalMedia::from_authorized_path_for_test(
+                        self.root.path(),
+                        &self.marker,
+                        &self.media,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        }
+
+        fn drain_events(&self) -> Vec<PlayerEvent> {
+            std::iter::from_fn(|| self.rx.try_recv().ok()).collect()
+        }
+
+        fn lock_is_free(&self) -> bool {
+            let competing = open_lock(&self.daemon.config.lock_path()).unwrap();
+            rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_ok()
+        }
+    }
+
+    /// Pinned OwnTone autostops a pipe only while it is *autostarted*: a
+    /// `player/pause` stops the pipe input and clears that binding, and the
+    /// following `player/play` resumes the same item as a plain source that
+    /// never emits EOF. The adapter must still complete the item exactly once
+    /// after the pipe drains — by observing the daemon's stalled progress under
+    /// `play` and issuing the restoring stop itself — instead of timing out
+    /// into an Error.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_resumed_pipe_completes_naturally_after_a_pause() {
+        // Long enough that the pause lands mid-stream: the recording daemon
+        // drains PCM faster than real time.
+        let fixture = DaemonControllerFixture::start(12);
+        let controller = &fixture.controller;
+        let client = &fixture.client;
+        let prepared = fixture.prepare();
+        let ticket = prepared.ticket().unwrap();
+        let generation = PlayerEventGeneration::from_raw(47);
+        controller.set_generation(generation);
+        controller.load(generation, prepared);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        controller.pause();
+        wait_until(|| controller.state() == PlayerState::Paused);
+        assert_eq!(client.player_state().unwrap(), "pause");
+        controller.play();
+        wait_until(|| controller.state() == PlayerState::Playing);
+        assert_eq!(client.player_state().unwrap(), "play");
+
+        // The resumed item is no longer autostarted: the daemon never reports
+        // `stop` on its own once the writer closes.
+        let mut events = Vec::new();
+        wait_until_within(Duration::from_secs(40), || {
+            events.extend(fixture.drain_events());
+            events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
+        });
+        wait_until(|| ticket.route_count() == 0);
+        wait_until(|| controller.state() == PlayerState::Stopped);
+        events.extend(fixture.drain_events());
+        assert!(
+            events.iter().all(|event| event.generation() == generation),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::Error { .. })),
+            "{events:?}"
+        );
+        let ended = events
+            .iter()
+            .position(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
+            .unwrap();
+        assert!(
+            !events[ended..].iter().any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Playing | PlayerState::Paused,
+                    ..
+                }
+            )),
+            "{events:?}"
+        );
+        // The adapter's own restoring stop ended the daemon's playback after
+        // the resume, and the prior output set was restored.
+        let recorded = fixture.daemon.recorded();
+        let resumed = recorded.rfind("PUT /api/player/play ").unwrap();
+        assert!(
+            recorded[resumed..].contains("PUT /api/player/stop "),
+            "{recorded}"
+        );
+        wait_until(|| !fixture.daemon.config.takeover_record().exists());
+        wait_until(|| fixture.lock_is_free());
+        assert!(!client.outputs().unwrap()[0].selected);
+        assert!(client.outputs().unwrap()[1].selected);
+        assert_eq!(client.player_state().unwrap(), "stop");
+        assert!(!controller.proxy().has_custody_entries());
+    }
+
+    /// Skipping to the next item on the same output replaces the session while
+    /// the previous worker is still restoring the daemon and holding the
+    /// instance lock. The replacement must wait for that sequential hand-over
+    /// instead of failing as if a concurrent session held the lock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn back_to_back_loads_hand_over_the_instance_lock() {
+        let fixture = DaemonControllerFixture::start(30);
+        let controller = &fixture.controller;
+        let client = &fixture.client;
+        let first = fixture.prepare();
+        let first_ticket = first.ticket().unwrap();
+        let generation = PlayerEventGeneration::from_raw(53);
+        controller.set_generation(generation);
+        controller.load(generation, first);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        assert!(!fixture.lock_is_free());
+        fixture.drain_events();
+
+        // Replace immediately: the previous worker has neither restored the
+        // daemon nor released the lock yet.
+        let second = fixture.prepare();
+        let second_ticket = second.ticket().unwrap();
+        let next = generation.next();
+        controller.set_generation(next);
+        let started = Instant::now();
+        controller.load(next, second);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        wait_until_within(Duration::from_secs(20), || {
+            controller.state() == PlayerState::Playing && second_ticket.route_count() == 1
+        });
+        let events = fixture.drain_events();
+        assert!(
+            !events.iter().any(|event| {
+                event.generation() == next && matches!(event, PlayerEvent::Error { .. })
+            }),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.generation() == next
+                    && matches!(
+                        event,
+                        PlayerEvent::StateChanged {
+                            state: PlayerState::Playing,
+                            ..
+                        }
+                    )
+            }),
+            "{events:?}"
+        );
+        wait_until(|| first_ticket.route_count() == 0);
+        assert!(fixture.daemon.config.takeover_record().exists());
+        assert!(client.outputs().unwrap()[0].selected);
+        controller.stop();
+        wait_until(|| second_ticket.route_count() == 0);
+        wait_until(|| !fixture.daemon.config.takeover_record().exists());
+        wait_until(|| fixture.lock_is_free());
+        assert!(!client.outputs().unwrap()[0].selected);
+        assert!(client.outputs().unwrap()[1].selected);
+        assert!(!controller.proxy().has_custody_entries());
+    }
+
+    /// A takeover record left behind by a crashed holder (the OS released its
+    /// lock; the daemon is still taken over) must be recovered by the next
+    /// opener under its own lock — quiesce, restore the recorded output set,
+    /// remove the record — and only then admit the load. A recovery that
+    /// cannot be completed refuses the load and leaves the record in place.
+    #[cfg(target_os = "linux")]
+    fn exercise_stale_record_recovery(recoverable: bool) {
+        let fixture = DaemonControllerFixture::start(30);
+        let controller = &fixture.controller;
+        let client = &fixture.client;
+        let pipe = fixture.daemon.config.pipe_path.clone();
+        let original_process = listener_process(&fixture.daemon.config.api_base)
+            .unwrap()
+            .identity();
+        // The dead holder's state: target selected, prior output disabled,
+        // record on disk, no lock held.
+        client.set_outputs(&[11_189_196]).unwrap();
+        assert!(client.outputs().unwrap()[0].selected);
+        assert!(!client.outputs().unwrap()[1].selected);
+        TakeoverRecord {
+            enabled_outputs: vec![42],
+            selected_output: 11_189_196,
+        }
+        .write(&fixture.daemon.config.takeover_record())
+        .unwrap();
+        if !recoverable {
+            std::fs::write(pipe.with_extension("park-restore"), "fail").unwrap();
+        }
+        let prepared = fixture.prepare();
+        let ticket = prepared.ticket().unwrap();
+        let generation = PlayerEventGeneration::from_raw(59);
+        controller.set_generation(generation);
+        let started = Instant::now();
+        controller.load(generation, prepared);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        if recoverable {
+            wait_until_within(Duration::from_secs(30), || {
+                controller.state() == PlayerState::Playing
+            });
+            // Recovery quiesced the instance and restored the recorded set
+            // before this load's own takeover.
+            assert_ne!(
+                listener_process(&fixture.daemon.config.api_base)
+                    .unwrap()
+                    .identity(),
+                original_process
+            );
+            let events = fixture.drain_events();
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, PlayerEvent::Error { .. })),
+                "{events:?}"
+            );
+            assert_eq!(ticket.route_count(), 1);
+            controller.stop();
+            wait_until(|| ticket.route_count() == 0);
+            wait_until(|| !fixture.daemon.config.takeover_record().exists());
+        } else {
+            wait_until_within(Duration::from_secs(30), || {
+                pipe.with_extension("restore-seen").exists()
+            });
+            std::fs::write(pipe.with_extension("restore-release"), "").unwrap();
+            wait_until(|| controller.state() == PlayerState::Stopped);
+            wait_until(|| ticket.route_count() == 0);
+            let events = fixture.drain_events();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, PlayerEvent::Error { .. }))
+                    .count(),
+                1,
+                "{events:?}"
+            );
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    PlayerEvent::TrackEnded { .. }
+                        | PlayerEvent::StateChanged {
+                            state: PlayerState::Playing,
+                            ..
+                        }
+                )),
+                "{events:?}"
+            );
+            assert!(
+                fixture.daemon.config.takeover_record().exists(),
+                "an unrecoverable record stays for the next attempt"
+            );
+            assert!(
+                !fixture.daemon.recorded().contains("PUT /api/queue/clear "),
+                "no takeover happened behind an unrecovered record"
+            );
+        }
+        wait_until(|| fixture.lock_is_free());
+        assert!(!controller.proxy().is_custodied(&ticket));
+        assert!(!controller.proxy().has_custody_entries());
+        if recoverable {
+            assert!(!client.outputs().unwrap()[0].selected);
+            assert!(client.outputs().unwrap()[1].selected);
+            assert_eq!(client.player_state().unwrap(), "stop");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stale_takeover_record_is_recovered_by_the_next_opener() {
+        exercise_stale_record_recovery(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unrecoverable_stale_takeover_record_refuses_the_load() {
+        exercise_stale_record_recovery(false);
+    }
+
     /// Park after the real open, before the real worker activates the session.
     /// This allows Stop to win the shared first-effect gate deterministically.
     #[cfg(target_os = "linux")]
@@ -6992,6 +8019,7 @@ fn serve(stream: std::net::TcpStream) {
         // Merely opening a writer is not pipe autostart.
         let writer = open_pipe_write(
             &daemon.config.pipe_path,
+            verify_pipe_identity(&daemon.config.pipe_path).unwrap(),
             Instant::now() + OPEN_DEADLINE,
             &OpenCancel::new(),
         );
@@ -8897,6 +9925,9 @@ fn serve(stream: std::net::TcpStream, fail: Option<String>) {
             let state_dir = directory.path().join("state");
             std::fs::create_dir_all(&state_dir).expect("state dir");
             let pipe = state_dir.join("airplay.pcm");
+            // The dedicated-config authority check binds only a real FIFO at
+            // the scanned pathname, so the fixture provisions one.
+            ensure_pipe(&pipe).expect("create scanned FIFO");
             let config_path = state_dir.join(OWNTONE_CONFIG_FILE);
             std::fs::write(&config_path, dedicated_config::fixture(&pipe)).expect("write config");
 
@@ -9095,6 +10126,7 @@ fn serve(stream: std::net::TcpStream, fail: Option<String>) {
                 gate: Arc::clone(&ctx.session_gate),
                 cancel: ctx.cancel.clone(),
                 restored: AtomicBool::new(false),
+                autostart_lost: AtomicBool::new(false),
                 terminal: AtomicBool::new(false),
                 mutation_lock: Mutex::new(()),
                 unsettled: AtomicUsize::new(0),

@@ -1,8 +1,9 @@
 //! Fail-closed OwnTone sender for platforms with no supported acquisition path.
 //!
-//! The real adapter ([`super::airplay_owntone`] on Unix) owns a FIFO, an
-//! advisory `flock` and a blocking loopback JSON-API client built on
-//! `rustix`/`std::os::unix`. Those APIs do not exist here, so this shim
+//! The real adapter ([`super::airplay_owntone`] on Linux) owns a FIFO, an
+//! advisory `flock`, a `/proc`-verified process binding and a blocking
+//! loopback JSON-API client built on `rustix`/`std::os::unix`. Those APIs are
+//! not all available here (macOS has no `/proc` and no `mkfifoat`), so this shim
 //! provides the same public shape with the fail-closed behavior the design
 //! requires on every unsupported target (design §4.3, §4.4, §9 platform
 //! scope): an explicit `TRIBUTARY_AIRPLAY_SENDER=owntone` is recognized — so

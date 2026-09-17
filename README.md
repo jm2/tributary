@@ -702,7 +702,8 @@ OwnTone 29.x daemon as its transport when explicitly configured
 adapter maps the selected receiver to the daemon by its retained device identifier — never
 by display name — and restores the daemon's pre-takeover output set when the session ends.
 Without a configured sender — or on a target with no supported OwnTone acquisition path,
-which today is anything other than Debian/Ubuntu amd64 — AirPlay 1 reports unavailable
+which the binary today limits to x86_64 Linux (Debian/Ubuntu amd64 is the documented
+package; other x86_64 Linux builds are not fail-closed by the binary) — AirPlay 1 reports unavailable
 rather than silently falling back: current official GStreamer, Homebrew, and MSYS2 packages
 still do not ship the `raopsink` element, and the `raopsink` adapter stays probe-gated for
 user-supplied elements. AirPlay 2 receivers (HomePod, recent Apple TVs, and

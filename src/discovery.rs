@@ -981,13 +981,29 @@ fn strip_airplay_mac_prefix(name: &str) -> String {
 /// `None` when neither source yields a plausible identifier — a receiver
 /// without one must fail closed rather than be addressed by display name.
 fn airplay_device_identifier(info: &mdns_sd::ResolvedService, raw_name: &str) -> Option<String> {
-    if let Some(txt) = info.get_property_val_str("deviceid") {
-        if let Some(normalized) = normalize_airplay_device_id(txt) {
-            return Some(normalized);
-        }
+    airplay_device_identifier_from(
+        info.get_property_val_str("deviceid"),
+        raw_name,
+        info.get_fullname(),
+    )
+}
+
+/// Pure identifier derivation behind [`airplay_device_identifier`]. The
+/// service's full instance name is consulted as well as the display name: a
+/// receiver whose TXT record carries a `name` still advertises its `HEXMAC@`
+/// prefix in the mDNS instance label, and must not be left unaddressable.
+fn airplay_device_identifier_from(
+    deviceid: Option<&str>,
+    raw_name: &str,
+    fullname: &str,
+) -> Option<String> {
+    if let Some(normalized) = deviceid.and_then(normalize_airplay_device_id) {
+        return Some(normalized);
     }
-    let at_pos = raw_name.find('@')?;
-    normalize_airplay_device_id(&raw_name[..at_pos])
+    [raw_name, fullname].into_iter().find_map(|candidate| {
+        let at_pos = candidate.find('@')?;
+        normalize_airplay_device_id(&candidate[..at_pos])
+    })
 }
 
 /// Normalize a MAC/`deviceid` string to uppercase hex without separators.
@@ -1736,6 +1752,39 @@ mod tests {
         assert_eq!(normalize_airplay_device_id("ABCD"), None);
         assert_eq!(normalize_airplay_device_id("not-a-mac"), None);
         assert_eq!(normalize_airplay_device_id(""), None);
+    }
+
+    #[test]
+    fn airplay_device_identifier_prefers_txt_then_any_instance_prefix() {
+        let fullname = "8EE58A500A56@Rear Lounge TV._raop._tcp.local.";
+        assert_eq!(
+            super::airplay_device_identifier_from(
+                Some("8e:e5:8a:50:0a:57"),
+                "8EE58A500A56@Rear",
+                fullname
+            )
+            .as_deref(),
+            Some("8EE58A500A57")
+        );
+        assert_eq!(
+            super::airplay_device_identifier_from(None, "8EE58A500A56@Rear Lounge TV", fullname)
+                .as_deref(),
+            Some("8EE58A500A56")
+        );
+        // A TXT `name` replaced the display name: the instance label still
+        // identifies the receiver.
+        assert_eq!(
+            super::airplay_device_identifier_from(None, "Rear Lounge TV", fullname).as_deref(),
+            Some("8EE58A500A56")
+        );
+        assert_eq!(
+            super::airplay_device_identifier_from(
+                None,
+                "Rear Lounge TV",
+                "Rear Lounge TV._airplay._tcp.local."
+            ),
+            None
+        );
     }
 
     /// Two receivers that advertise the same display name must still be

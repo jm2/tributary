@@ -23,32 +23,32 @@
 //! to the pattern used by [`LibraryEngine`](crate::local::engine::LibraryEngine).
 
 pub mod airplay_output;
-// The seam lands the complete §4.1 sender contract (design revision 18, PR
-// #170) ahead of its second implementation. Parts that only the forthcoming
-// OwnTone process adapter exercises — pushed PCM, `RecoveryPending` custody,
-// the `Deadline`/`Authentication` failure variants — are deliberately present
-// and not yet constructed by the GStreamer adapter, which owns its decode and
-// transmits no mutating daemon RPC (design §10 step 2). Silence dead-code
-// noise for that forward contract rather than deleting the accepted shape.
+// The seam carries the complete §4.1 sender contract (design revision 18, PR
+// #170). Parts of it are exercised by only one of the two adapters — pushed
+// PCM and `RecoveryPending` custody by the OwnTone process adapter, and some
+// failure variants by neither yet — so the accepted shape is kept whole and
+// dead-code noise is silenced rather than trimming the contract.
 #[allow(dead_code)]
 mod airplay_sender;
 // The OwnTone process adapter (design §4.3, §5.4, §6, §10 step 2): the
 // selected maintained AirPlay sender path. Selected only by explicit
 // configuration and fail-closed everywhere else.
 //
-// The adapter's real implementation is Unix-only: it owns a FIFO, an `flock`
-// and a blocking JSON-API client built on `rustix`/`std::os::unix`, and
-// `rustix` is declared only under `cfg(unix)` in Cargo.toml. Declaring the
+// The adapter's real implementation is Linux-only: it owns a FIFO created
+// with `rustix::fs::mkfifoat` (not provided on Apple targets), an `flock`, a
+// `/proc`-verified process binding and a blocking loopback JSON-API client,
+// and `platform_available()` admits only x86_64 Linux anyway. Declaring the
 // module unconditionally made every non-Unix target fail to compile (review
-// F1). On `not(unix)` a fail-closed shim of the same shape is compiled
-// instead, so an explicit `TRIBUTARY_AIRPLAY_SENDER=owntone` still refuses
-// with localized guidance and never silently falls back to another sender
-// (design §4.4, §9 platform scope).
+// F1), and compiling it under `cfg(unix)` broke the macOS build on
+// `mkfifoat`. On every other target a fail-closed shim of the same shape is
+// compiled instead, so an explicit `TRIBUTARY_AIRPLAY_SENDER=owntone` still
+// refuses with localized guidance and never silently falls back to another
+// sender (design §4.4, §9 platform scope).
 #[allow(dead_code)]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod airplay_owntone;
 #[allow(dead_code)]
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 #[path = "airplay_owntone_unsupported.rs"]
 mod airplay_owntone;
 pub mod cast_http_server;
