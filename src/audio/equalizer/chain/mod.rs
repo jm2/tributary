@@ -521,9 +521,7 @@ impl EqChain {
         let outcome = match rx.recv_timeout(LIMITER_PROBE_ENGAGE_TIMEOUT) {
             Ok(outcome) => Some(outcome),
             Err(_) => {
-                let mut gate = gate
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 if gate.engaged {
                     // The edit is already executing on the streaming thread.
                     // Do not remove its probe: wait for the outcome it
@@ -740,9 +738,7 @@ fn limiter_edit_probe_callback(
     // decision is serialized on the same gate, so an edit that started is
     // never cancelled and a cancelled edit never starts.
     {
-        let mut gate = gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if gate.cancelled {
             return gst::PadProbeReturn::Remove;
         }
