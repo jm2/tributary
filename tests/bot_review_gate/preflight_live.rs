@@ -196,6 +196,138 @@ fn live_empty_ruleset_rules_remains_valid() {
 }
 
 #[test]
+fn live_missing_nested_required_status_checks_fails_closed() {
+    // The reproduced defect: a required_status_checks rule whose parameters
+    // omit the nested list was coerced to `[]`, so the staged-inactive
+    // preflight declared the configuration consistent. It must fail closed.
+    let fixture = LiveFixture::new("live-nested-checks-missing");
+    fixture
+        .page(
+            "rules_branches_main.page.1.json",
+            r#"[{"ruleset_id":17650907}]"#,
+        )
+        .page(
+            "rulesets_17650907.json",
+            r#"{"rules":[{"type":"required_status_checks","parameters":{}}]}"#,
+        );
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a missing nested check list must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("PARSE-FAILED"),
+        "the incomplete nested inventory must be reported:\n{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn live_null_nested_required_status_checks_fails_closed() {
+    let fixture = LiveFixture::new("live-nested-checks-null");
+    fixture
+        .page(
+            "rules_branches_main.page.1.json",
+            r#"[{"ruleset_id":17650907}]"#,
+        )
+        .page(
+            "rulesets_17650907.json",
+            r#"{"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":null}}]}"#,
+        );
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a null nested check list must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("PARSE-FAILED"),
+        "the null nested check list must be reported:\n{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn live_wrong_type_nested_required_status_checks_fails_closed() {
+    let fixture = LiveFixture::new("live-nested-checks-object");
+    fixture
+        .page(
+            "rules_branches_main.page.1.json",
+            r#"[{"ruleset_id":17650907}]"#,
+        )
+        .page(
+            "rulesets_17650907.json",
+            r#"{"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":{}}}]}"#,
+        );
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a non-array nested check list must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("PARSE-FAILED"),
+        "the non-array nested check list must be reported:\n{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn live_malformed_check_entry_fails_closed() {
+    let fixture = LiveFixture::new("live-nested-check-entry-scalar");
+    fixture
+        .page(
+            "rules_branches_main.page.1.json",
+            r#"[{"ruleset_id":17650907}]"#,
+        )
+        .page(
+            "rulesets_17650907.json",
+            r#"{"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[42]}}]}"#,
+        );
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a scalar check entry must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("PARSE-FAILED"),
+        "the malformed check entry must be reported:\n{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn live_empty_nested_required_status_checks_remains_valid() {
+    // Control: a genuine empty nested check list still passes, so the fix is
+    // targeted at incompleteness and malformed entries, not at rulesets
+    // without required checks.
+    let fixture = LiveFixture::new("live-nested-checks-empty");
+    fixture
+        .page(
+            "rules_branches_main.page.1.json",
+            r#"[{"ruleset_id":17650907}]"#,
+        )
+        .page(
+            "rulesets_17650907.json",
+            r#"{"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[]}}]}"#,
+        );
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "a genuine empty nested check list must stay valid:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(stdout_of(&output).contains("configuration is consistent"));
+}
+
+#[test]
 fn live_malformed_activation_document_fails_closed() {
     // A present-but-unparseable activation document must not read as unset.
     let fixture = LiveFixture::new("live-malformed-activation");

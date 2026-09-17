@@ -200,6 +200,173 @@ fn offline_empty_ruleset_rules_remains_valid() {
 }
 
 #[test]
+fn offline_missing_nested_required_status_checks_fails_closed() {
+    // A `required_status_checks` rule whose `parameters` omit the check list
+    // must fail closed: an incomplete rule is never proof that the Bot Review
+    // Gate is not required.
+    let fixture = Fixture::new("nested-checks-missing");
+    fixture
+        .file("branch-rules.json", r#"[{"ruleset_id":17650907}]"#)
+        .file(
+            "rulesets/17650907.json",
+            r#"{"rules":[{"type":"required_status_checks","parameters":{}}]}"#,
+        );
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a required_status_checks rule without a check list must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("PARSE-FAILED"),
+        "the incomplete nested inventory must be reported:\n{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn offline_null_nested_required_status_checks_fails_closed() {
+    // `required_status_checks: null` is incomplete: GitHub never reports a null
+    // check list, so it must not read as an empty one.
+    let fixture = Fixture::new("nested-checks-null");
+    fixture
+        .file("branch-rules.json", r#"[{"ruleset_id":17650907}]"#)
+        .file(
+            "rulesets/17650907.json",
+            r#"{"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":null}}]}"#,
+        );
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a null nested check list must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("PARSE-FAILED"),
+        "the null nested check list must be reported:\n{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn offline_wrong_type_nested_required_status_checks_fails_closed() {
+    // An object (or any non-array) check list is malformed and must not be
+    // coerced into an absent requirement.
+    let fixture = Fixture::new("nested-checks-object");
+    fixture
+        .file("branch-rules.json", r#"[{"ruleset_id":17650907}]"#)
+        .file(
+            "rulesets/17650907.json",
+            r#"{"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":{}}}]}"#,
+        );
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a non-array nested check list must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("PARSE-FAILED"),
+        "the non-array nested check list must be reported:\n{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn offline_malformed_check_entry_fails_closed() {
+    // A check list entry that is not an object cannot bind a context; it is
+    // rejected rather than dropped from the inventory.
+    let fixture = Fixture::new("nested-check-entry-scalar");
+    fixture
+        .file("branch-rules.json", r#"[{"ruleset_id":17650907}]"#)
+        .file(
+            "rulesets/17650907.json",
+            r#"{"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[42]}}]}"#,
+        );
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a scalar check entry must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("PARSE-FAILED"),
+        "the malformed check entry must be reported:\n{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn offline_check_entry_without_context_fails_closed() {
+    // An object check entry without a non-empty `context` is malformed.
+    let fixture = Fixture::new("nested-check-entry-no-context");
+    fixture
+        .file("branch-rules.json", r#"[{"ruleset_id":17650907}]"#)
+        .file(
+            "rulesets/17650907.json",
+            r#"{"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"integration_id":1}]}}]}"#,
+        );
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a check entry without a context must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("PARSE-FAILED"),
+        "the malformed check entry must be reported:\n{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn offline_empty_nested_required_status_checks_remains_valid() {
+    // Control: a genuine empty check list is a complete observation and the
+    // staged-inactive preflight stays consistent.
+    let fixture = Fixture::new("nested-checks-empty");
+    fixture
+        .file("branch-rules.json", r#"[{"ruleset_id":17650907}]"#)
+        .file(
+            "rulesets/17650907.json",
+            r#"{"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[]}}]}"#,
+        );
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "a genuine empty nested check list must stay valid:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(stdout_of(&output).contains("configuration is consistent"));
+}
+
+#[test]
+fn offline_unrelated_rule_type_without_checks_remains_valid() {
+    // Control: a ruleset with no required_status_checks rule (only an unrelated
+    // rule type) is not malformed and must keep passing.
+    let fixture = Fixture::new("unrelated-rule-only");
+    fixture
+        .file("branch-rules.json", r#"[{"ruleset_id":17650907}]"#)
+        .file(
+            "rulesets/17650907.json",
+            r#"{"rules":[{"type":"pull_request","parameters":{"required_review_thread_resolution":true}}]}"#,
+        );
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "an unrelated rule type must stay valid:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(stdout_of(&output).contains("configuration is consistent"));
+}
+
+#[test]
 fn offline_missing_referenced_ruleset_record_fails_closed() {
     // The applicable branch rules name a ruleset whose recorded detail is
     // absent; the inventory is incomplete and cannot be validated as consistent.

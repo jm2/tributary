@@ -376,6 +376,29 @@ while IFS= read -r id; do
   fi
 done < "$referenced_rulesets"
 
+# Count structurally malformed `required_status_checks` rules in a ruleset
+# detail. Each such rule must carry object-valued `parameters`, an EXPLICIT
+# array-valued `required_status_checks`, and object entries with a non-empty
+# string `context`. A missing, null, or wrong-typed list is an incomplete
+# structural observation — never proof that the gate is absent — and malformed
+# entries are rejected rather than filtered out of the inventory. Unrelated
+# rule types are ignored and a genuine empty list stays valid.
+malformed_required_checks() {
+  jq -r '
+    [ .rules[]
+      | select(type == "object" and .type == "required_status_checks")
+      | if (.parameters | type) != "object" then "parameters-not-object"
+        elif (.parameters | has("required_status_checks") | not) then "checks-missing"
+        elif (.parameters.required_status_checks | type) != "array" then "checks-not-array"
+        elif any(.parameters.required_status_checks[];
+                 if type != "object" then true
+                 elif (.context | type) != "string" then true
+                 elif (.context | length) == 0 then true
+                 else false end) then "check-entry-malformed"
+        else empty end
+    ] | length' "$1"
+}
+
 live_contexts="$scratch/live-contexts.txt"
 : > "$live_contexts"
 for detail in "$src"/rulesets/*.json; do
@@ -388,13 +411,20 @@ for detail in "$src"/rulesets/*.json; do
     parse_error "malformed ruleset detail (missing or non-array .rules): $detail"
     continue
   fi
+  if ! malformed_count="$(malformed_required_checks "$detail" 2>>"$scratch/jq.err")"; then
+    parse_error "could not read required_status_checks rules from $detail"
+    continue
+  fi
+  if [ "$malformed_count" -ne 0 ]; then
+    parse_error "malformed required_status_checks rule(s) in $detail: parameters must be an object with an explicit array-valued required_status_checks whose entries are objects with a non-empty context"
+    continue
+  fi
   if ! jq -r '.rules[]
       | select(type == "object" and .type == "required_status_checks")
-      | (.parameters.required_status_checks // [])
-      | if type == "array" then .[] else empty end
-      | select(type == "object")
-      | "\(.context // "")|\(.integration_id // "")"' "$detail" >> "$live_contexts" 2>>"$scratch/jq.err"; then
+      | .parameters.required_status_checks[]
+      | "\(.context)|\(.integration_id // "")"' "$detail" >> "$live_contexts" 2>>"$scratch/jq.err"; then
     parse_error "could not read required contexts from $detail"
+    continue
   fi
 done
 sort -u -o "$live_contexts" "$live_contexts"
