@@ -6,13 +6,18 @@ representation plus an explicit unsupported-input boundary, for review before
 any behavior changes. It authorizes follow-up implementation beads; it does not
 ship them.
 
-Revision 2 (this head) is a corrective revision of the independently rejected
-head `16140be0d03d17c1f299cf7690adea6648722160`. It withdraws the size/mtime
-legacy-adoption rule (F1), makes the rollout fail-closed-first so no authority
-consumer is ever exposed to a row it cannot prove (F2), and removes the
+Revision 3 (this head) is a corrective revision of the independently rejected
+heads `16140be0d03d17c1f299cf7690adea6648722160` and
+`bc49dbe514334e94c081e3156ab97a12df11f066`. Revision 2 withdrew the size/mtime
+legacy-adoption rule (F1), made the rollout fail-closed-first so no authority
+consumer is ever exposed to a row it cannot prove (F2), and removed the
 older-binary compatibility claim in favor of an enforced version guard plus a
-mechanical carrier removal (F3). §13 is the finding-to-revision map. No
-behavior changes: the revision makes the contract stricter, not more permissive.
+mechanical carrier removal (F3). Revision 3 additionally corrects the migration
+rebuild sequence: foreign-key suppression is a connection-level prelude before
+the transaction begins, restoration is verified on every exit path, and
+`legacy_alter_table` is banned as a substitute (the migration reference-loss
+finding). §13 is the finding-to-revision map. No behavior changes: every
+revision makes the contract stricter, not more permissive.
 
 Scope: the built-in local library only. No change to removable media,
 SourceId, remote adapters, or shared city policy. Scratch and fixture paths use
@@ -240,11 +245,34 @@ authoritative locator), and a unique index on `native_path` (partial,
 
 SQLite cannot drop a UNIQUE constraint in place, so the migration performs a
 table rebuild following the existing raw-SQL migration style used by migration
-13 and 20:
+13 and 20. `playlist_entries.local_track_id` references `tracks(id)` with
+`ON DELETE SET NULL` (`fk_entry_local_track`, §2.1), so the drop/rename window
+must run with foreign-key enforcement suppressed — and the suppression is a
+**connection-level prelude, never a statement inside the transaction**:
 
-1. `PRAGMA foreign_keys` is off for the rebuild window (or the table is rebuilt
-   with `legacy_alter_table` semantics), because
-   `playlist_entries.local_track_id` references `tracks(id)`.
+- SQLite silently ignores a `PRAGMA foreign_keys` change issued inside a
+  transaction, so an in-transaction toggle leaves enforcement on and the
+  `DROP TABLE tracks` fires `ON DELETE SET NULL` against
+  `playlist_entries.local_track_id`, silently detaching every playlist entry
+  from its track.
+- `PRAGMA legacy_alter_table` is **not** a substitute and must not be used. It
+  changes rename/linking behavior; it does not disable `ON DELETE` actions.
+  With `foreign_keys=ON, legacy_alter_table=ON`, copying `tracks_new` then
+  dropping/renaming still nulls existing playlist references, and
+  `PRAGMA foreign_key_check` cannot see the damage because a NULL binding is
+  legal.
+
+The executable sequence on the single dedicated migration connection is:
+
+0. **Connection prelude (before `BEGIN`).** Execute
+   `PRAGMA foreign_keys = OFF` on the migration connection, then read
+   `PRAGMA foreign_keys` back and require the result to be `0`; if the
+   connection reports anything else, abort closed before any transaction or
+   write. Record the prior value so it can be restored on every exit path.
+   While the pragma is off at connection level, `ON DELETE` actions do not
+   fire, which is what makes the drop/rename window safe. `playlist_entries`
+   itself is never written by this migration.
+1. `BEGIN` a single transaction for everything below.
 2. Create `tracks_new` with the full current column set, the renamed
    `display_path` column, and the three new native-path columns; `id` stays the
    primary key and there is **no `file_path` column**.
@@ -257,11 +285,26 @@ table rebuild following the existing raw-SQL migration style used by migration
 4. Drop `tracks`, rename `tracks_new` to `tracks`, recreate the artist/album/
    genre indexes, the `display_path` display index, and the new partial unique
    `native_path` index.
-5. Re-enable foreign keys and run `PRAGMA foreign_key_check`; a non-empty result
-   aborts the migration.
+5. **In-transaction preservation gate (before `COMMIT`).** Compare snapshots
+   taken before the drop against the rebuilt table and require all of: the same
+   `tracks` row count with an identical id set; the same `playlist_entries`
+   row count; the same count of non-NULL `playlist_entries.local_track_id`
+   values bound to the identical set of track ids — no binding may change, in
+   particular none may go from non-NULL to NULL; and an empty
+   `PRAGMA foreign_key_check`. `foreign_key_check` alone is explicitly
+   insufficient — `SET NULL` damage is invisible to it because NULL is legal —
+   so the populated binding comparison is mandatory. Any mismatch aborts the
+   transaction and rolls everything back.
 6. Record the authority marker (a validated `schema_capabilities` singleton row
    and the mirrored `PRAGMA user_version`, §4.5), written **last** inside the
    same transaction.
+7. `COMMIT`.
+8. **Connection epilogue (after the transaction ends, on every exit path).**
+   Restore `PRAGMA foreign_keys` to its recorded prior value (normally `ON`)
+   and read it back to verify the restoration took effect; run a final
+   `PRAGMA foreign_key_check` as a belt-and-braces assertion. The restoration
+   is wired so it also runs on the error and panic paths (a Rust drop guard),
+   never only on the happy path.
 
 Because the rebuilt table exposes no `file_path` identifier, a pre-R11 binary's
 `SELECT`/`INSERT` naming `file_path` fails closed at statement preparation; this
@@ -370,10 +413,15 @@ display text, or any state-0/3 row — matching the `drop_if_lossless` refusal
 pattern of migration 20. `down()` is transactional and idempotent.
 
 **Rollback / restart.** The table rebuild, the backfill, the index creation, and
-the `schema_capabilities` marker write all execute in a single transaction. A
+the `schema_capabilities` marker write all execute in a single transaction
+(§4.2 steps 1–7). The connection-level foreign-key prelude and epilogue sit
+outside that transaction by necessity: the suppression must be in effect before
+`BEGIN`, and it is restored — with a verified read-back — after the transaction
+ends, on the success, error, and panic paths alike (§4.2 steps 0 and 8). A
 crash or power loss leaves either the fully pre-migration or the fully
-post-migration schema; a restart re-runs idempotently. No partially activated
-intermediate schema is observable to a reader.
+post-migration schema; the pragma is per-connection state, not stored data, so
+it never persists into the file. A restart re-runs idempotently. No partially
+activated intermediate schema is observable to a reader.
 
 ## 5. Contract: scanner lookup and reconciliation
 
@@ -602,6 +650,23 @@ Required tests:
     (b) a literal replacement-character row, and (c) an authoritative native
     row before its consumer has shipped; assert a closed refusal with no
     wrong-file open, no write, and no lossy export.
+13. **Migration reference preservation and failure injection (rebuild gate).**
+    Run migration `000021` against a populated database: several `tracks` rows
+    covering states 2 and 3, live `playlist_entries` rows whose non-NULL
+    `local_track_id` values reference them, plus ratings, play counts, and
+    history. Assert after the migration: playlist binding rows are unchanged
+    (same entry ids, same non-NULL `local_track_id` set — in particular no
+    binding became NULL), track ids/ratings/play counts/history are
+    byte-identical (the migration-grain form of §8.11's cross-upgrade
+    assertion), and `foreign_key_check` is empty. Additionally assert the
+    failure paths: (a) a connection where `PRAGMA foreign_keys = OFF` does not
+    take effect (read-back not `0`) aborts before `BEGIN` with no writes; (b)
+    an injected mid-rebuild failure (unique-index violation during the copy)
+    rolls the transaction back to a byte-identical pre-migration database with
+    all playlist bindings intact; (c) the migration code path never issues
+    `PRAGMA legacy_alter_table`; and (d) the connection epilogue restores
+    foreign-key enforcement with a verified read-back, including when the
+    migration body returns an error or panics.
 
 Physical-platform validation remains separate from automated checks: APFS and
 Windows reject invalid-byte filenames, so the end-to-end scan/reproduction is a
@@ -703,7 +768,7 @@ safe alone, not only the final architecture.
 |---|---|
 | Versioned reversible representation or explicit boundary | §1, §3, §7 |
 | Display text separated from authoritative identity (enforced by the column rename) | §1, §3.4, §4.1, §4.2, §5, §6.4 |
-| Preserve IDs/history/ratings/playlists only where exact identity is provable | §2.1, §4.2, §4.3, §5.4, §8.4a |
+| Preserve IDs/history/ratings/playlists only where exact identity is provable | §2.1, §4.2, §4.3, §5.4, §8.4a, §8.13 |
 | Quarantine ambiguous legacy rows, no guessing (heuristics withdrawn) | §4.3, §4.4, §5.4, §8.4a |
 | Scanner lookup/reconciliation, migration, playback, tag writes, import/export | §4, §5, §6 |
 | Linux fixtures: invalid bytes, literal replacement collisions, Unicode/normalization, rename | §8 |
@@ -725,6 +790,16 @@ This revision answers the three P1 findings in
 Nothing in this revision expands product behavior; every change makes the
 contract stricter. The mechanical check results recorded at `16140be0` remain
 historical; the next independent re-review should evaluate this corrected head.
+
+### 13.1 Revision 3 mapping (independent review of `bc49dbe5`)
+
+Revision 3 answers the migration reference-loss finding in
+`refinery-20260917-tr-ldhwt-migration/corrective-instructions.md`
+(exact head `bc49dbe514334e94c081e3156ab97a12df11f066`):
+
+| Finding | Required correction | Where changed | Validation added |
+|---|---|---|---|
+| **M1** — the §4.2 rebuild toggled `foreign_keys` inside the transaction (a change SQLite silently ignores) or proposed `legacy_alter_table` semantics (which do not disable `ON DELETE` actions), so `DROP TABLE tracks` fired `playlist_entries.local_track_id ON DELETE SET NULL` undetected; `foreign_key_check` stayed empty because NULL is legal | Specify an executable connection/transaction sequence: FK suppression set and read-back verified on the dedicated connection **before** `BEGIN`; populated preservation plus `foreign_key_check` gates inside the transaction before `COMMIT`; restore with verified read-back on every exit path; `legacy_alter_table` banned with the reproduction rationale; require populated preservation and rollback/failure tests, not only `foreign_key_check` | Rewrote §4.2 as steps 0–8 (connection prelude, in-transaction preservation gate, connection epilogue) with the explicit `legacy_alter_table` ban; extended the §4.5 rollback/restart contract; updated the §12 mapping | §8.13 populated preservation + failure-injection tests: pre-`BEGIN` abort on failed suppression, mid-rebuild rollback to a byte-identical database with bindings intact, no `legacy_alter_table` issued, verified FK restore on success/error/panic; §12 preservation row cites §8.13 |
 
 ## Appendix A — Lossy conversion inventory (`src/local/`)
 
