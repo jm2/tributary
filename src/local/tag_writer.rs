@@ -41,8 +41,8 @@ use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem};
 use uuid::Uuid;
 
 use super::root_authority::{
-    directory_identity, ContentRevision, MountedMutationCommit, MountedMutationTarget,
-    MountedRootAuthority, ObjectIdentity,
+    resolve_ancestor_chain, ContentRevision, MountedMutationCommit, MountedMutationTarget,
+    MountedRootAuthority, ObjectIdentity, SelectionLocationEvidence,
 };
 // Only the unix anchored staging flow captures a staged object identity;
 // the Windows and fallback authorities prove staging identity from the
@@ -1166,6 +1166,23 @@ struct LocalSelectionEvidence {
     revision: ContentRevision,
 }
 
+impl LocalSelectionEvidence {
+    /// The location half of this evidence, carried unchanged to the final
+    /// commit gate.
+    ///
+    /// The save-start proofs run before any byte is staged; the commit gate
+    /// re-proves the same location evidence inside the commit lock, so an
+    /// ancestor displaced inside the save window — after the start proofs,
+    /// while the replacement is being staged — still refuses the commit
+    /// before anything is displaced.
+    fn location(&self) -> SelectionLocationEvidence {
+        SelectionLocationEvidence {
+            parent_identity: self.parent_identity,
+            ancestor_identities: self.ancestor_identities.clone(),
+        }
+    }
+}
+
 /// Retained selection evidence for one exact local-library file, and the only
 /// way a local properties-dialog write may replace it.
 ///
@@ -1355,7 +1372,12 @@ impl LocalMutationTarget {
             return Err(conflict_error(LocalTagWriteConflict::TargetEdited));
         }
 
-        match write_tags_with_mutation_target_revision(&target, edits, Some(&evidence.revision)) {
+        match write_tags_with_mutation_target_revision(
+            &target,
+            edits,
+            Some(&evidence.revision),
+            Some(&evidence.location()),
+        ) {
             Ok(()) => Ok(()),
             Err(error) => Err(classify_local_write_failure(&target, &evidence, error)),
         }
@@ -1428,13 +1450,12 @@ fn capture_local_selection_evidence(path: &Path) -> std::io::Result<LocalSelecti
 ///
 /// [`Path::ancestors`] yields `parent` itself first; the caller already
 /// retains that identity as the authority root, so the chain recorded here
-/// starts at the parent's parent and ends at the filesystem root. Ancestor
-/// identities resolve symlinked components (unix) and refuse reparse points
-/// (Windows) exactly as the [`super::root_authority`] authorities do, so a
-/// capture-time and save-time comparison proves the complete location of the
-/// selection.
+/// starts at the parent's parent and ends at the filesystem root. The chain
+/// resolves through the same [`super::root_authority`] resolver the final
+/// commit gate re-proves with, so a capture-time and save-time comparison
+/// proves the complete location of the selection with one shared definition.
 fn ancestor_identities(parent: &Path) -> std::io::Result<Vec<ObjectIdentity>> {
-    parent.ancestors().skip(1).map(directory_identity).collect()
+    resolve_ancestor_chain(parent)
 }
 
 /// Re-prove the complete directory chain of a selection against its
@@ -1483,10 +1504,27 @@ fn classify_local_write_failure(
     }
     match target.content_revision() {
         Ok(current) if current != evidence.revision => {
-            conflict_error(LocalTagWriteConflict::TargetEdited)
+            return conflict_error(LocalTagWriteConflict::TargetEdited);
         }
-        _ => error,
+        _ => {}
     }
+    // An ancestor above the retained parent was replaced during the save
+    // window: the retained parent object, the leaf, and the revision can all
+    // still match when the unchanged deeper chain was moved back beneath the
+    // replacement. Re-prove the complete capture-time chain and surface the
+    // localized ParentChanged conflict instead of a generic authority error.
+    if reprove_ancestor_chain(
+        target
+            .replacement_path()
+            .parent()
+            .unwrap_or_else(|| Path::new("")),
+        evidence,
+    )
+    .is_err()
+    {
+        return conflict_error(LocalTagWriteConflict::ParentChanged);
+    }
+    error
 }
 
 /// Write tag edits to an audio file.
@@ -1548,11 +1586,11 @@ pub fn write_tags_with_mutation_target(
     target: &MountedMutationTarget,
     edits: &TagEdits,
 ) -> Result<()> {
-    write_tags_with_mutation_target_revision(target, edits, None)
+    write_tags_with_mutation_target_revision(target, edits, None, None)
 }
 
 /// Write tag edits through a retained authority with an optional content
-/// revision gate.
+/// revision gate and the selection's location evidence.
 ///
 /// This is the revision-aware form of
 /// [`write_tags_with_mutation_target`]. When `expected_revision` is supplied,
@@ -1562,10 +1600,21 @@ pub fn write_tags_with_mutation_target(
 /// staged-write-to-commit window refuses the write instead of being silently
 /// overwritten. Authority flows that never captured a selection revision pass
 /// `None` and keep the prior contract.
+///
+/// When `selection` is supplied, the commit additionally re-proves the
+/// capture-time ancestor chain of the selection — inside the commit lock,
+/// immediately before anything is displaced. The save-start ancestor proof
+/// cannot cover the save window itself, and on unix the retained binding
+/// pins only the immediate parent directory, so an ancestor replaced during
+/// staging — with the unchanged deeper chain moved back beneath it — would
+/// otherwise be adopted because the parent object, the leaf identity, and
+/// the revision all still match. The refusal leaves the selection and every
+/// competing file untouched.
 pub fn write_tags_with_mutation_target_revision(
     target: &MountedMutationTarget,
     edits: &TagEdits,
     expected_revision: Option<&ContentRevision>,
+    selection: Option<&SelectionLocationEvidence>,
 ) -> Result<()> {
     if edits.is_empty() {
         return Ok(());
@@ -1595,7 +1644,7 @@ pub fn write_tags_with_mutation_target_revision(
     let source = commit
         .source_file()
         .with_context(|| "Failed to read the exact retained mutation target".to_string())?;
-    write_tag_edits_for_commit(&mut commit, source, target, edits, expected_revision)
+    write_tag_edits_for_commit(&mut commit, source, target, edits, expected_revision, selection)
 }
 
 /// Perform the staged tag replacement for an open commit section.
@@ -1615,6 +1664,7 @@ fn write_tag_edits_for_commit(
     target: &MountedMutationTarget,
     edits: &TagEdits,
     expected_revision: Option<&ContentRevision>,
+    selection: Option<&SelectionLocationEvidence>,
 ) -> Result<()> {
     // Anchor the staging at the retained parent before anything is staged:
     // the pinned parent identity makes staging and the later install agree
@@ -1632,7 +1682,13 @@ fn write_tag_edits_for_commit(
         "the retained mutation target",
         edits,
         |temp, expected_staged| {
-            finish_committed_tag_replacement(commit, temp, Some(expected_staged), expected_revision)
+            finish_committed_tag_replacement(
+                commit,
+                temp,
+                Some(expected_staged),
+                expected_revision,
+                selection,
+            )
         },
     )
 }
@@ -1648,6 +1704,7 @@ fn write_tag_edits_for_commit(
     target: &MountedMutationTarget,
     edits: &TagEdits,
     expected_revision: Option<&ContentRevision>,
+    selection: Option<&SelectionLocationEvidence>,
 ) -> Result<()> {
     let replacement_path = target.replacement_path().to_path_buf();
     atomic_tag_replacement(
@@ -1655,7 +1712,7 @@ fn write_tag_edits_for_commit(
         &replacement_path,
         "the retained mutation target",
         edits,
-        |temp| finish_committed_tag_replacement(commit, temp, None, expected_revision),
+        |temp| finish_committed_tag_replacement(commit, temp, None, expected_revision, selection),
     )
 }
 
@@ -1675,14 +1732,24 @@ fn write_tag_edits_for_commit(
 /// displaced. Path-based staging flows have no retained handle and pass
 /// `None`. `expected_revision`, when supplied, additionally proves the
 /// retained source was not edited in place before anything is displaced.
+/// `selection`, when supplied, additionally re-proves the capture-time
+/// ancestor chain of the selection in the same pre-displacement window —
+/// the save-start proof cannot cover the save window itself, and on unix
+/// the retained binding pins only the immediate parent directory.
 fn finish_committed_tag_replacement(
     commit: &mut MountedMutationCommit<'_>,
     temp: &mut TempFile,
     expected_staged_identity: Option<&ObjectIdentity>,
     expected_revision: Option<&ContentRevision>,
+    selection: Option<&SelectionLocationEvidence>,
 ) -> Result<()> {
     commit
-        .commit_replacement_checked(temp.path(), expected_staged_identity, expected_revision)
+        .commit_replacement_checked(
+            temp.path(),
+            expected_staged_identity,
+            expected_revision,
+            selection,
+        )
         .map_err(|error| {
             anyhow::Error::new(error)
                 .context("The retained mutation authority refused the tagged replacement")
@@ -3029,6 +3096,67 @@ mod tests {
 
         assert_eq!(
             std::fs::read(&track).expect("read the relocated file"),
+            silence_fixture_bytes(),
+            "the admitted file must be byte-for-byte untouched"
+        );
+        assert_no_tag_write_siblings_under(&directory.path);
+    }
+
+    /// The replaced-ancestor regression, replayed inside the save window:
+    /// the ancestor swap lands DURING staging — after the write-start
+    /// ancestor proof, via the pre-staging interpose — so every save-start
+    /// check has already passed. The final commit gate must still re-prove
+    /// the capture-time ancestor chain and refuse with the localized
+    /// `ParentChanged` conflict, leaving the selection byte-for-byte intact
+    /// and no private siblings under either the displaced or the fresh
+    /// ancestor.
+    #[cfg(unix)]
+    #[test]
+    fn an_ancestor_swapped_during_staging_refuses_the_commit_with_parent_changed() {
+        let directory = TestDirectory::new("local-ancestor-swap-during-staging");
+        let library = directory.path.join("library");
+        let album = library.join("album");
+        std::fs::create_dir_all(&album).expect("create library/album");
+        let track = album.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write fixture");
+
+        let target = LocalMutationTarget::capture(&track);
+
+        // The reviewed swap, replayed while the save is mid-staging: rename
+        // the library away, install a fresh directory at its old name, and
+        // move the unchanged (inode-stable) album back beneath the
+        // replacement. The retained parent object, the leaf identity, and
+        // the content revision all still match afterwards — only the
+        // ancestor chain above the parent differs.
+        let displaced_library = directory.path.join("library-old");
+        let fresh_library = library.clone();
+        let watched = track.clone();
+        let closure_displaced = displaced_library.clone();
+        with_pre_staging_interpose(
+            Box::new(move |interposed| {
+                if interposed.replacement_path() != watched.as_path() {
+                    return;
+                }
+                std::fs::rename(&fresh_library, &closure_displaced)
+                    .expect("displace the ancestor during staging");
+                std::fs::create_dir(&fresh_library)
+                    .expect("install a fresh ancestor during staging");
+                std::fs::rename(
+                    closure_displaced.join("album"),
+                    fresh_library.join("album"),
+                )
+                .expect("move the unchanged album under the fresh ancestor");
+            }),
+            || {
+                let error = target
+                    .write_tags(&year("2026"))
+                    .expect_err("an ancestor swapped during staging must refuse the save");
+                assert_eq!(conflict_of(&error), LocalTagWriteConflict::ParentChanged);
+            },
+        );
+
+        assert_eq!(
+            std::fs::read(&track).expect("read the relocated selection"),
             silence_fixture_bytes(),
             "the admitted file must be byte-for-byte untouched"
         );

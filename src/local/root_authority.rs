@@ -746,6 +746,42 @@ impl MountedMutationTarget {
     }
 }
 
+/// The complete selection-time location evidence a local save must re-prove
+/// at its final commit gate.
+///
+/// The commit's own revalidation proves the retained mount binding and the
+/// exact retained file object — but on unix the retained binding pins only
+/// the immediate parent directory, and the full ancestor comparison in the
+/// binding validation runs on Windows. This evidence carries the resolved
+/// identity of the containing directory plus every directory above it,
+/// captured when the user selected the file, so the commit can refuse an
+/// ancestor that was replaced inside the save window even when the parent
+/// object, the file object, and the content revision all still match.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SelectionLocationEvidence {
+    /// The resolved identity of the selection's containing directory — the
+    /// same object the retained authority is rooted at.
+    pub(crate) parent_identity: ObjectIdentity,
+    /// The resolved identities of every directory above the containing
+    /// directory, in [`Path::ancestors`] order (nearest first, filesystem
+    /// root last), as captured at selection time.
+    pub(crate) ancestor_identities: Vec<ObjectIdentity>,
+}
+
+/// Resolve the identity of every directory above `parent`.
+///
+/// [`Path::ancestors`] yields `parent` itself first; the caller retains that
+/// identity as its authority root or as
+/// [`SelectionLocationEvidence::parent_identity`], so the chain recorded here
+/// starts at the parent's parent and ends at the filesystem root. Ancestor
+/// identities resolve through [`directory_identity`], so symlinked components
+/// compare by resolved object and reparse points (Windows) refuse, exactly as
+/// the authority bindings do. The resolution is fail-closed: an ancestor that
+/// cannot be identified at all is an error, never an absent link.
+pub(crate) fn resolve_ancestor_chain(parent: &Path) -> io::Result<Vec<ObjectIdentity>> {
+    parent.ancestors().skip(1).map(directory_identity).collect()
+}
+
 /// One serialized commit section over a [`MountedMutationTarget`].
 pub struct MountedMutationCommit<'a> {
     target: &'a MountedMutationTarget,
@@ -948,10 +984,11 @@ impl MountedMutationCommit<'_> {
         staged: &Path,
         expected_staged_identity: Option<&ObjectIdentity>,
     ) -> io::Result<()> {
-        self.commit_replacement_checked(staged, expected_staged_identity, None)
+        self.commit_replacement_checked(staged, expected_staged_identity, None, None)
     }
 
-    /// Confirm and commit with an additional content-revision gate.
+    /// Confirm and commit with an additional content-revision gate and the
+    /// selection's complete location evidence.
     ///
     /// The retained object's identity alone cannot detect an external writer
     /// that edits the admitted file in place: the leaf still names the admitted
@@ -960,11 +997,21 @@ impl MountedMutationCommit<'_> {
     /// immediately before anything is displaced. A local-library write supplies
     /// the revision captured at selection time; authority flows that never
     /// captured one pass `None` and keep their prior contract.
+    ///
+    /// The same holds for the selection's location. On unix the retained
+    /// binding proves the immediate parent object only, so an ancestor above
+    /// it can be replaced inside the save window — with the unchanged deeper
+    /// chain moved back beneath the replacement — while every retained
+    /// identity, the leaf, and the revision still match. When `selection` is
+    /// supplied, the complete capture-time ancestor chain is re-proven here,
+    /// inside the commit lock and before anything is displaced, so the
+    /// replacement is refused and the selection is preserved untouched.
     pub(crate) fn commit_replacement_checked(
         &mut self,
         staged: &Path,
         expected_staged_identity: Option<&ObjectIdentity>,
         expected_revision: Option<&ContentRevision>,
+        selection: Option<&SelectionLocationEvidence>,
     ) -> io::Result<()> {
         #[cfg(unix)]
         let key = self.leaf_commit_key()?;
@@ -972,6 +1019,9 @@ impl MountedMutationCommit<'_> {
         let key = self.leaf_commit_key();
         with_leaf_commit_lock(key, || {
             self.confirm_replacement_target()?;
+            if let Some(selection) = selection {
+                self.confirm_selection_location(selection)?;
+            }
             #[cfg(test)]
             run_post_confirm_interpose(self);
             if let Some(expected) = expected_revision {
@@ -982,6 +1032,38 @@ impl MountedMutationCommit<'_> {
             run_pre_reanchor_interpose(self);
             self.reanchor_target_to_installed(installed)
         })
+    }
+
+    /// Prove the selection-time location evidence is still intact.
+    ///
+    /// The retained binding proves the containing directory object; the chain
+    /// above it is re-resolved through the exact pathname the selection still
+    /// lives under and compared against the capture-time identities. A chain
+    /// that no longer resolves to them — an ancestor replaced, renamed away,
+    /// or retargeted after the save started — refuses the commit before
+    /// anything is displaced. The proof is fail-closed: an ancestor that
+    /// cannot be re-identified at all is treated as changed.
+    fn confirm_selection_location(
+        &self,
+        selection: &SelectionLocationEvidence,
+    ) -> io::Result<()> {
+        if self.target.authority.root_identity() != selection.parent_identity {
+            return Err(authority_changed(
+                "the selection's containing directory changed before the commit",
+            ));
+        }
+        let current = resolve_ancestor_chain(
+            self.target
+                .path
+                .parent()
+                .unwrap_or_else(|| Path::new("")),
+        )?;
+        if current != selection.ancestor_identities {
+            return Err(authority_changed(
+                "the selection's ancestor directory chain changed before the commit",
+            ));
+        }
+        Ok(())
     }
 
     /// Prove the retained source object's content revision is unchanged.
