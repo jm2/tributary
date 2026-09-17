@@ -6,38 +6,36 @@ Coverage job and the cross-compiled aarch64 matrix tail; the fast end of a
 clean run is ~20 minutes (measured 1211s on a typical green PR, run
 30173146972). Anything under 1200s to a readable verdict is the lower bound.
 
-The upstream refinery pack (`mol-refinery-patrol`) defaults the hosted-CI
-gate deadline `ci_timeout_seconds` to 900s (15 minutes). Honoring that
-literally rejects branches whose checks are still running — by the deadline
-the `Coverage` and cross-compile jobs are routinely in-flight, so a green
-branch reads as "pending at deadline" and is rejected for the wrong reason.
-On a red branch, the eventual verdict would have been a rejection anyway, but
-the timer would have blamed the wrong check.
+## Hosted-CI gate history and the live deadline-free gate
 
-## What this rig overrides
+The upstream refinery pack (`mol-refinery-patrol`) once defaulted a hosted-CI
+gate deadline, `ci_timeout_seconds`, to 900s (15 minutes). Honoring that
+literally rejected branches whose checks were still running — by the deadline
+the `Coverage` and cross-compile jobs were routinely in-flight, so a green
+branch read as "pending at deadline" and was rejected for the wrong reason
+(bead tr-3h7). This rig first raised the deadline to 3600s under
+`[rigs.formula_vars]` in the city config; the 2026-09-08 rendered-workflow
+snapshot still records that override, alongside `ci_poll_seconds = "30"` and
+an eleven-entry `hosted_required_checks_json` allowlist.
 
-Configured under `[rigs.formula_vars]` in the city config (the rig-side
-clone does not own this value — `city.toml` does):
+**That mechanism is retired.** None of those `ci_*` variables exists in any
+live layer today — not in `city.toml`, not in the rig-local refinery formula
+override (2026-09-03), not in the pinned upstream pack — and the upstream
+keys they tuned were removed from the pack as well. The live completion gate
+is the guarded reconciler `.gc/operations/reconcile.py`, run every five
+minutes by the `tributary-reconcile` order. It polls GitHub's
+`statusCheckRollup` per open PR head and is **deadline-free and fail-closed**:
+checks still running simply park the bead as pending until they conclude,
+an empty rollup never reads as green, and any failure conclusion routes the
+bead back to the polecat pool as rework. There is no deadline at which a
+pending branch can be wrongly rejected, and no check-name allowlist — every
+check observed on the head (required or advisory) must be completed and
+green, which is the machine enforcement of the all-green operator policy
+below.
 
-```toml
-ci_timeout_seconds = "3600"   # 1 hour, comfortable margin over the tail
-```
-
-Everything else stays at the upstream defaults:
-
-- `ci_gate` — `true` — "pending is never green" — fail-closed when checks are
-  still running. **Preserved.**
-- `ci_poll_seconds` — `60` — Poll GitHub for check-runs every minute.
-  **Preserved.**
-- `ci_zero_check_grace_seconds` — `300` — Allow the workflow runs to
-  materialize before declaring zero-on-this-branch. **Preserved.**
-- `ci_timeout_seconds` — `3600` — **Raised from 900**: covers the observed
-  ~20-53 min tail with margin.
-
-The change is the deadline alone; the fail-closed policy is intentionally
-left intact. A bead (tr-3h7) opened the issue and another polecat can land
-the city-config edit through the usual refinery handoff if the change
-hasn't already been applied out-of-band.
+Verification against the live rig, including the exact ruleset-required
+check contexts and fresh dry-run decisions, is recorded in
+[ci-gate-verification-2026-09-17.md](ci-gate-verification-2026-09-17.md).
 
 ## Reviewer policy
 
