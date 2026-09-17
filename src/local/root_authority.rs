@@ -112,6 +112,46 @@ enum WindowsFileId {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ObjectIdentity;
 
+/// Point-in-time evidence of one retained file object's content revision.
+///
+/// The tag writer copies the admitted file to a staged sibling and later
+/// replaces the admitted object with the tagged copy. The object identity
+/// alone cannot detect an external writer that edits the *same* object in
+/// place inside that window: the leaf still names the admitted object, but its
+/// bytes changed, and the replacement would silently discard the competing
+/// edit. The revision — the exact byte length together with the
+/// last-modification time read from the retained handle — is captured when the
+/// file is selected, re-proven when a write starts, and re-proven again
+/// immediately before the commit displaces anything. A changed revision
+/// refuses the write and preserves both the competing edit and the staged
+/// copy.
+///
+/// Residual limitation, stated honestly: a filesystem with a coarse
+/// modification timestamp (or one whose handle cannot report a modification
+/// time) can miss an in-place edit that keeps the exact byte length and lands
+/// inside the timestamp granularity. The length is always compared; the
+/// timestamp narrows the window but cannot close it without reading the whole
+/// file at selection time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContentRevision {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl ContentRevision {
+    /// Capture the revision of the exact file object `file` names.
+    ///
+    /// Reading from the retained handle — never through a pathname — binds the
+    /// captured revision to the object an authority admitted.
+    pub fn capture(file: &File) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BoundaryIdentity(u64);
@@ -434,6 +474,16 @@ impl MountedRootAuthority {
         &self.root
     }
 
+    /// The exact filesystem identity of the retained root directory.
+    ///
+    /// A local write target captures this when it is selected and compares it
+    /// against the authority it re-admits at write time, so a root or ancestor
+    /// directory replaced in between refuses the write instead of retargeting
+    /// it.
+    pub(crate) fn root_identity(&self) -> ObjectIdentity {
+        self.root_handle.identity
+    }
+
     /// Open a real regular file using only normal components relative to the
     /// retained mounted root.
     pub(super) fn open_relative_regular_file(&self, relative: &Path) -> io::Result<BoundFile> {
@@ -562,6 +612,33 @@ impl MountedMutationTarget {
             .lock()
             .map_err(|_| io::Error::other("mutation target commit section is unavailable"))?;
         validate_mounted_bound(self.authority.as_ref(), &file)
+    }
+
+    /// The exact filesystem identity of the file object this target admitted.
+    ///
+    /// This is the identity a local write target captured when the user
+    /// selected the file; a write compares it against the object the authority
+    /// admits now so a replacement at the same pathname refuses.
+    pub(crate) fn admitted_identity(&self) -> io::Result<ObjectIdentity> {
+        let file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("mutation target commit section is unavailable"))?;
+        file.object.validate_live()?;
+        Ok(file.object.identity)
+    }
+
+    /// The current content revision of the exact retained file object.
+    ///
+    /// Read from the retained handle, never through a pathname, so the value
+    /// describes the admitted object even after its leaf name was disturbed.
+    pub(crate) fn content_revision(&self) -> io::Result<ContentRevision> {
+        let file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("mutation target commit section is unavailable"))?;
+        file.object.validate_live()?;
+        ContentRevision::capture(&file.object.file)
     }
 
     /// Begin one serialized commit section over this exact target.
@@ -871,6 +948,24 @@ impl MountedMutationCommit<'_> {
         staged: &Path,
         expected_staged_identity: Option<&ObjectIdentity>,
     ) -> io::Result<()> {
+        self.commit_replacement_checked(staged, expected_staged_identity, None)
+    }
+
+    /// Confirm and commit with an additional content-revision gate.
+    ///
+    /// The retained object's identity alone cannot detect an external writer
+    /// that edits the admitted file in place: the leaf still names the admitted
+    /// object, but its bytes changed. When `expected_revision` is supplied, the
+    /// retained handle's exact length and modification time must still match it
+    /// immediately before anything is displaced. A local-library write supplies
+    /// the revision captured at selection time; authority flows that never
+    /// captured one pass `None` and keep their prior contract.
+    pub(crate) fn commit_replacement_checked(
+        &mut self,
+        staged: &Path,
+        expected_staged_identity: Option<&ObjectIdentity>,
+        expected_revision: Option<&ContentRevision>,
+    ) -> io::Result<()> {
         #[cfg(unix)]
         let key = self.leaf_commit_key()?;
         #[cfg(not(unix))]
@@ -879,11 +974,31 @@ impl MountedMutationCommit<'_> {
             self.confirm_replacement_target()?;
             #[cfg(test)]
             run_post_confirm_interpose(self);
+            if let Some(expected) = expected_revision {
+                self.confirm_content_revision(expected)?;
+            }
             let installed = self.replace_confirmed_staging(staged, expected_staged_identity)?;
             #[cfg(test)]
             run_pre_reanchor_interpose(self);
             self.reanchor_target_to_installed(installed)
         })
+    }
+
+    /// Prove the retained source object's content revision is unchanged.
+    ///
+    /// The revision is read from the retained handle — the exact object the
+    /// confirm step just proved the leaf still names — so a competing in-place
+    /// edit that keeps the identity but changes the bytes fails the commit
+    /// before anything is displaced, preserving the competing edit.
+    fn confirm_content_revision(&self, expected: &ContentRevision) -> io::Result<()> {
+        let current = ContentRevision::capture(&self.file.object.file)?;
+        if current == *expected {
+            Ok(())
+        } else {
+            Err(authority_changed(
+                "the retained mutation target changed content before the commit",
+            ))
+        }
     }
 
     /// Re-anchor the target's retained binding to the installed replacement.

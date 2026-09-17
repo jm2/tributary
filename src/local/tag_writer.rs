@@ -40,7 +40,10 @@ use lofty::file::{TaggedFile, TaggedFileExt};
 use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem};
 use uuid::Uuid;
 
-use super::root_authority::{MountedMutationCommit, MountedMutationTarget, ObjectIdentity};
+use super::root_authority::{
+    ContentRevision, MountedMutationCommit, MountedMutationTarget, MountedRootAuthority,
+    ObjectIdentity,
+};
 // Only the unix anchored staging flow captures a staged object identity;
 // the Windows and fallback authorities prove staging identity from the
 // pathname-side commit, so the helper import must not gate their builds.
@@ -1089,10 +1092,302 @@ pub fn preflight_tag_write_directory_retained(
     Ok(())
 }
 
+/// Why a local properties-dialog save refused to displace the selected file.
+///
+/// This is a localized conflict: the file the user was editing is no longer
+/// the file the dialog selected, or it was edited underneath the dialog. The
+/// refusal always leaves the competing file/update in place, so the user can
+/// reopen Properties and retry against the current state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalTagWriteConflict {
+    /// The pathname now names a different filesystem object.
+    TargetReplaced,
+    /// The selected object's content changed in place.
+    TargetEdited,
+    /// The containing directory (or an ancestor) no longer names the selected
+    /// directory.
+    ParentChanged,
+    /// The selection could not be identified when it was captured, so no
+    /// write can be proven against it.
+    SelectionUnavailable,
+}
+
+impl std::fmt::Display for LocalTagWriteConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::TargetReplaced => "the file was replaced",
+            Self::TargetEdited => "the file was edited",
+            Self::ParentChanged => "its containing folder changed",
+            Self::SelectionUnavailable => "the file could not be identified when it was selected",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for LocalTagWriteConflict {}
+
+fn conflict_error(reason: LocalTagWriteConflict) -> anyhow::Error {
+    anyhow::Error::new(reason)
+}
+
+/// Snapshot evidence that one exact local-library file was the user's
+/// selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LocalSelectionEvidence {
+    parent_identity: ObjectIdentity,
+    file_identity: ObjectIdentity,
+    revision: ContentRevision,
+}
+
+/// Retained selection evidence for one exact local-library file, and the only
+/// way a local properties-dialog write may replace it.
+///
+/// The dialog used to snapshot a bare pathname, so a file renamed or replaced
+/// while the dialog was open could be silently edited at its old name, and an
+/// in-place edit between the staged copy and the commit could be silently
+/// overwritten. A `LocalMutationTarget` instead snapshots the exact selected
+/// object — the file's filesystem identity and its containing directory's
+/// identity — together with the object's content revision.
+///
+/// Every write re-admits the file through a retained authority over that
+/// directory, proves the directory, object, and revision all still hold, and
+/// only then stages and commits through the same identity-conditioned
+/// replacement the removable-media authority uses. Any change refuses the write
+/// with a [`LocalTagWriteConflict`], preserving both the competing file/update
+/// and the staged copy. Capture is best-effort: a file that cannot be
+/// identified at selection carries no evidence and every write refuses, so a
+/// transient selection failure can never authorize a blind write.
+#[derive(Clone)]
+pub struct LocalMutationTarget {
+    path: PathBuf,
+    evidence: Option<LocalSelectionEvidence>,
+}
+
+impl std::fmt::Debug for LocalMutationTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalMutationTarget")
+            .field("path", &self.path)
+            .field("identified", &self.evidence.is_some())
+            .finish()
+    }
+}
+
+impl LocalMutationTarget {
+    /// Snapshot the exact object, containing directory, and content revision
+    /// currently named by `path`.
+    ///
+    /// Never fails: a file that cannot be identified at selection is retained
+    /// without evidence, and the write path refuses it rather than editing an
+    /// unproven target.
+    pub fn capture(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            evidence: capture_local_selection_evidence(path).ok(),
+        }
+    }
+
+    /// The exact native pathname the user selected.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Point-in-time write-capability probe for the properties dialog.
+    ///
+    /// Re-admits the selected file through its retained directory authority,
+    /// proves the selection evidence still holds, and rehearses the complete
+    /// atomic replacement shape beside the exact file. Advisory only: the
+    /// commit revalidates everything fail-closed. Blocking — worker threads
+    /// only.
+    pub fn preflight_write_capability(&self) -> Result<(), TagWritePreflightError> {
+        let Some(evidence) = self.evidence else {
+            return Err(TagWritePreflightError::Unavailable);
+        };
+        let (authority, target) = self
+            .retained_target()
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
+        if authority.root_identity() != evidence.parent_identity {
+            return Err(TagWritePreflightError::Unavailable);
+        }
+        if target
+            .admitted_identity()
+            .map_err(|_| TagWritePreflightError::Unavailable)?
+            != evidence.file_identity
+        {
+            return Err(TagWritePreflightError::Unavailable);
+        }
+        if target
+            .content_revision()
+            .map_err(|_| TagWritePreflightError::Unavailable)?
+            != evidence.revision
+        {
+            return Err(TagWritePreflightError::Unavailable);
+        }
+        if !supports_tag_writes(target.replacement_path()) {
+            return Err(TagWritePreflightError::UnsupportedFormat);
+        }
+        // Rehearse the anchored replacement through the retained parent — the
+        // same directory object the commit resolves — so an ancestor displaced
+        // after the selection can neither take the probe siblings outside the
+        // admitted directory nor reject a write the anchored writer could
+        // safely perform.
+        #[cfg(unix)]
+        {
+            let (parent, leaf) = target
+                .retained_directory_handle()
+                .map_err(|_| TagWritePreflightError::Unavailable)?;
+            crate::local::tag_writer::preflight_tag_write_directory_retained(
+                &parent,
+                &leaf,
+                "the selected local file",
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            preflight_tag_write(target.replacement_path())
+        }
+    }
+
+    /// Write tag edits to the exact file the user selected.
+    ///
+    /// This is the local-library twin of [`write_tags_with_mutation_target`]:
+    /// the selected object is re-admitted through a retained authority over its
+    /// containing directory, the selection-time directory identity, object
+    /// identity, and content revision are all re-proven, and the commit
+    /// re-proves the revision immediately before displacing anything. A file
+    /// renamed, replaced, or edited in between refuses the write with a
+    /// [`LocalTagWriteConflict`] and leaves every competing file/update intact.
+    /// Blocking — worker threads only.
+    pub fn write_tags(&self, edits: &TagEdits) -> Result<()> {
+        if edits.is_empty() {
+            return Ok(());
+        }
+
+        // Reject the whole edit before opening anything. A file must never be
+        // rewritten for an edit we are going to silently discard.
+        edits.validate()?;
+
+        let Some(evidence) = self.evidence else {
+            return Err(conflict_error(LocalTagWriteConflict::SelectionUnavailable));
+        };
+
+        let (authority, target) = self.retained_target().map_err(|error| {
+            anyhow::Error::new(error).context("the selected file is unavailable")
+        })?;
+        if authority.root_identity() != evidence.parent_identity {
+            return Err(conflict_error(LocalTagWriteConflict::ParentChanged));
+        }
+        if target.admitted_identity().map_err(|error| {
+            anyhow::Error::new(error).context("the selected file is unavailable")
+        })? != evidence.file_identity
+        {
+            return Err(conflict_error(LocalTagWriteConflict::TargetReplaced));
+        }
+        if target.content_revision().map_err(|error| {
+            anyhow::Error::new(error).context("the selected file is unavailable")
+        })? != evidence.revision
+        {
+            return Err(conflict_error(LocalTagWriteConflict::TargetEdited));
+        }
+
+        match write_tags_with_mutation_target_revision(&target, edits, Some(&evidence.revision)) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(classify_local_write_failure(&target, &evidence, error)),
+        }
+    }
+
+    /// Re-admit the selected file through a retained authority over its
+    /// containing directory.
+    fn retained_target(
+        &self,
+    ) -> std::io::Result<(std::sync::Arc<MountedRootAuthority>, MountedMutationTarget)> {
+        let parent = self.path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the selected file has no containing directory",
+            )
+        })?;
+        let leaf = self.path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the selected file has no name",
+            )
+        })?;
+        let authority = std::sync::Arc::new(MountedRootAuthority::acquire(parent)?);
+        let target = authority.open_mutation_target(Path::new(leaf))?;
+        Ok((authority, target))
+    }
+}
+
+impl PartialEq for LocalMutationTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.evidence == other.evidence
+    }
+}
+
+impl Eq for LocalMutationTarget {}
+
+/// Snapshot the exact directory, object, and content revision named by `path`.
+///
+/// The identities are read through the same retained-authority machinery the
+/// write uses, so the snapshot and the write agree on exactly what "the same
+/// file" means on every platform.
+fn capture_local_selection_evidence(path: &Path) -> std::io::Result<LocalSelectionEvidence> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the selected file has no containing directory",
+        )
+    })?;
+    let leaf = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the selected file has no name",
+        )
+    })?;
+    let authority = std::sync::Arc::new(MountedRootAuthority::acquire(parent)?);
+    let target = authority.open_mutation_target(Path::new(leaf))?;
+    let parent_identity = authority.root_identity();
+    let file_identity = target.admitted_identity()?;
+    let revision = target.content_revision()?;
+    Ok(LocalSelectionEvidence {
+        parent_identity,
+        file_identity,
+        revision,
+    })
+}
+
+/// Re-label a local write failure as a localized conflict when the retained
+/// source object's revision changed while the commit was running.
+///
+/// The commit's own revision gate refuses an in-place edit with a generic
+/// authority error. Re-reading the exact retained handle after the failure
+/// distinguishes that case from an ordinary I/O failure and reports it as the
+/// conflict the dialog can explain: the competing edit was preserved and the
+/// user must reopen Properties. On a successful commit the target is
+/// re-anchored, so this only ever runs on the failure path.
+fn classify_local_write_failure(
+    target: &MountedMutationTarget,
+    evidence: &LocalSelectionEvidence,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match target.content_revision() {
+        Ok(current) if current != evidence.revision => {
+            conflict_error(LocalTagWriteConflict::TargetEdited)
+        }
+        _ => error,
+    }
+}
+
 /// Write tag edits to an audio file.
 ///
 /// Only fields that are `Some(...)` in `edits` are modified.
 /// This is a blocking operation — call from a background thread.
+///
+/// This pathname-addressed form carries no selection evidence: it edits
+/// whatever the path currently names. The properties dialog uses
+/// [`LocalMutationTarget`] instead, so a file replaced after selection is
+/// refused rather than silently rewritten.
 pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
     if edits.is_empty() {
         return Ok(());
@@ -1143,6 +1438,25 @@ pub fn write_tags_with_mutation_target(
     target: &MountedMutationTarget,
     edits: &TagEdits,
 ) -> Result<()> {
+    write_tags_with_mutation_target_revision(target, edits, None)
+}
+
+/// Write tag edits through a retained authority with an optional content
+/// revision gate.
+///
+/// This is the revision-aware form of
+/// [`write_tags_with_mutation_target`]. When `expected_revision` is supplied,
+/// the commit re-proves the retained object's exact length and modification
+/// time after confirming the leaf still names that object and immediately
+/// before displacing anything, so a competing in-place edit inside the
+/// staged-write-to-commit window refuses the write instead of being silently
+/// overwritten. Authority flows that never captured a selection revision pass
+/// `None` and keep the prior contract.
+pub fn write_tags_with_mutation_target_revision(
+    target: &MountedMutationTarget,
+    edits: &TagEdits,
+    expected_revision: Option<&ContentRevision>,
+) -> Result<()> {
     if edits.is_empty() {
         return Ok(());
     }
@@ -1171,7 +1485,7 @@ pub fn write_tags_with_mutation_target(
     let source = commit
         .source_file()
         .with_context(|| "Failed to read the exact retained mutation target".to_string())?;
-    write_tag_edits_for_commit(&mut commit, source, target, edits)
+    write_tag_edits_for_commit(&mut commit, source, target, edits, expected_revision)
 }
 
 /// Perform the staged tag replacement for an open commit section.
@@ -1190,6 +1504,7 @@ fn write_tag_edits_for_commit(
     source: File,
     target: &MountedMutationTarget,
     edits: &TagEdits,
+    expected_revision: Option<&ContentRevision>,
 ) -> Result<()> {
     // Anchor the staging at the retained parent before anything is staged:
     // the pinned parent identity makes staging and the later install agree
@@ -1207,7 +1522,7 @@ fn write_tag_edits_for_commit(
         "the retained mutation target",
         edits,
         |temp, expected_staged| {
-            finish_committed_tag_replacement(commit, temp, Some(expected_staged))
+            finish_committed_tag_replacement(commit, temp, Some(expected_staged), expected_revision)
         },
     )
 }
@@ -1222,6 +1537,7 @@ fn write_tag_edits_for_commit(
     source: File,
     target: &MountedMutationTarget,
     edits: &TagEdits,
+    expected_revision: Option<&ContentRevision>,
 ) -> Result<()> {
     let replacement_path = target.replacement_path().to_path_buf();
     atomic_tag_replacement(
@@ -1229,7 +1545,7 @@ fn write_tag_edits_for_commit(
         &replacement_path,
         "the retained mutation target",
         edits,
-        |temp| finish_committed_tag_replacement(commit, temp, None),
+        |temp| finish_committed_tag_replacement(commit, temp, None, expected_revision),
     )
 }
 
@@ -1247,14 +1563,16 @@ fn write_tag_edits_for_commit(
 /// staging handle before the commit reopens the staging leaf: the commit
 /// verifies the leaf still names that exact object before anything is
 /// displaced. Path-based staging flows have no retained handle and pass
-/// `None`.
+/// `None`. `expected_revision`, when supplied, additionally proves the
+/// retained source was not edited in place before anything is displaced.
 fn finish_committed_tag_replacement(
     commit: &mut MountedMutationCommit<'_>,
     temp: &mut TempFile,
     expected_staged_identity: Option<&ObjectIdentity>,
+    expected_revision: Option<&ContentRevision>,
 ) -> Result<()> {
     commit
-        .commit_replacement(temp.path(), expected_staged_identity)
+        .commit_replacement_checked(temp.path(), expected_staged_identity, expected_revision)
         .map_err(|error| {
             anyhow::Error::new(error)
                 .context("The retained mutation authority refused the tagged replacement")
@@ -2350,6 +2668,310 @@ mod tests {
             directory.temp_files().is_empty(),
             "a refused commit leaves no private sibling behind"
         );
+    }
+
+    /// Build a local selection target over a fresh fixture directory holding
+    /// one valid `silence.flac`.
+    fn local_selection_fixture(label: &str) -> (TestDirectory, PathBuf, LocalMutationTarget) {
+        let directory = TestDirectory::new(label);
+        let track = directory.audio_file(
+            "silence.flac",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        );
+        let target = LocalMutationTarget::capture(&track);
+        (directory, track, target)
+    }
+
+    /// The silence fixture bytes, used to compare preserved files.
+    fn silence_fixture_bytes() -> &'static [u8] {
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/audio/silence.flac"
+        ))
+    }
+
+    /// Extract the localized conflict a refused local write must carry.
+    fn conflict_of(error: &anyhow::Error) -> LocalTagWriteConflict {
+        *error
+            .downcast_ref::<LocalTagWriteConflict>()
+            .unwrap_or_else(|| panic!("expected a localized conflict, got: {error:#}"))
+    }
+
+    /// Edit the file at `path` in place — the same filesystem object, a new
+    /// content revision — with a valid, parseable FLAC tag, simulating a
+    /// competing writer that does not replace the file.
+    fn write_competing_tag_in_place(path: &Path, competing_year: &str) {
+        let mut tagged_file = lofty::read_from_path(path).expect("read competing fixture");
+        let tag =
+            ensure_primary_tag(&mut tagged_file, "competing fixture").expect("primary tag exists");
+        tag.insert(TagItem::new(
+            ItemKey::Year,
+            ItemValue::Text(competing_year.to_string()),
+        ));
+        tag.save_to_path(path, WriteOptions::default())
+            .expect("write the competing in-place edit");
+    }
+
+    /// The selection captured file A; A is renamed away and a different valid
+    /// FLAC B is installed at the path before Save. The save must refuse and
+    /// edit neither file.
+    #[test]
+    fn a_local_selection_refuses_a_file_replaced_before_save() {
+        let (directory, track, target) = local_selection_fixture("local-replaced-before-save");
+        let original = silence_fixture_bytes().to_vec();
+
+        let displaced = directory.path.join("displaced.flac");
+        std::fs::rename(&track, &displaced).expect("displace the selected file");
+        let stranger = b"a different file now occupies the selected pathname".to_vec();
+        std::fs::write(&track, &stranger).expect("install a different file");
+
+        let error = target
+            .write_tags(&year("2026"))
+            .expect_err("a replaced file must refuse the save");
+        assert_eq!(conflict_of(&error), LocalTagWriteConflict::TargetReplaced);
+
+        assert_eq!(
+            std::fs::read(&track).expect("read the replacement"),
+            stranger,
+            "the replacement must be preserved exactly"
+        );
+        assert_eq!(
+            std::fs::read(&displaced).expect("read the displaced original"),
+            original,
+            "the admitted file must be byte-for-byte untouched"
+        );
+        assert!(
+            directory.temp_files().is_empty(),
+            "a refused save leaves no private sibling behind"
+        );
+    }
+
+    /// The selected file is edited in place while the save stages and tags —
+    /// after the write-start revision proof, before the commit. The commit's
+    /// revision gate must refuse and preserve the competing edit.
+    #[test]
+    fn a_local_selection_refuses_an_in_place_edit_during_the_commit() {
+        use std::sync::{Arc, Mutex};
+
+        let (directory, track, target) = local_selection_fixture("local-edit-during-commit");
+        let watched_path = track.clone();
+        let competing = Arc::new(Mutex::new(false));
+        let competing_closure = Arc::clone(&competing);
+        let interposed_path = track.clone();
+
+        with_pre_staging_interpose(
+            Box::new(move |interposed| {
+                if interposed.replacement_path() != interposed_path.as_path() {
+                    return;
+                }
+                write_competing_tag_in_place(&watched_path, "1999");
+                *competing_closure.lock().unwrap() = true;
+            }),
+            || {
+                let error = target
+                    .write_tags(&year("2026"))
+                    .expect_err("an in-place edit must refuse the commit");
+                assert_eq!(conflict_of(&error), LocalTagWriteConflict::TargetEdited);
+            },
+        );
+
+        assert!(
+            *competing.lock().unwrap(),
+            "the competing edit must have run"
+        );
+
+        // The competing edit is preserved; the requested year never landed.
+        let tagged = lofty::read_from_path(&track).expect("reopen the competing file");
+        let tag = tagged.primary_tag().expect("primary tag");
+        assert_eq!(tag.get_string(ItemKey::Year), Some("1999"));
+        assert!(
+            directory.temp_files().is_empty(),
+            "a refused commit leaves no staged sibling behind"
+        );
+    }
+
+    /// The selected file is replaced during the staging window — after the
+    /// write-start proof, before the commit. The commit must refuse and
+    /// preserve both the admitted file (displaced) and the newcomer.
+    #[test]
+    fn a_local_selection_refuses_a_replacement_during_the_commit() {
+        use std::sync::{Arc, Mutex};
+
+        let (directory, track, target) = local_selection_fixture("local-replace-during-commit");
+        let original = silence_fixture_bytes().to_vec();
+        let displaced = directory.path.join("displaced.flac");
+        let newcomer = b"a newcomer replaced the selected file mid-commit".to_vec();
+
+        let swapped = Arc::new(Mutex::new(false));
+        let swapped_closure = Arc::clone(&swapped);
+        let watched_path = track.clone();
+        let interposed_path = track.clone();
+        let displaced_closure = displaced.clone();
+        let newcomer_closure = newcomer.clone();
+
+        with_pre_staging_interpose(
+            Box::new(move |interposed| {
+                if interposed.replacement_path() != interposed_path.as_path() {
+                    return;
+                }
+                std::fs::rename(&watched_path, &displaced_closure)
+                    .expect("displace the admitted file");
+                std::fs::write(&watched_path, &newcomer_closure).expect("install the newcomer");
+                *swapped_closure.lock().unwrap() = true;
+            }),
+            || {
+                target
+                    .write_tags(&year("2026"))
+                    .expect_err("a mid-commit replacement must refuse");
+            },
+        );
+
+        assert!(*swapped.lock().unwrap(), "the replacement must have run");
+        assert_eq!(
+            std::fs::read(&track).expect("read the newcomer"),
+            newcomer,
+            "the newcomer must be preserved exactly"
+        );
+        assert_eq!(
+            std::fs::read(&displaced).expect("read the admitted file"),
+            original,
+            "the admitted file must be byte-for-byte untouched"
+        );
+        assert!(
+            directory.temp_files().is_empty(),
+            "a refused commit leaves no staged sibling behind"
+        );
+    }
+
+    /// The selected file's containing directory is replaced before Save. The
+    /// save must refuse rather than retarget the edit into the impostor
+    /// directory, and must preserve both directories.
+    #[test]
+    fn a_local_selection_refuses_a_changed_containing_directory() {
+        let directory = TestDirectory::new("local-root-change");
+        let album = directory.path.join("album");
+        std::fs::create_dir(&album).expect("create album");
+        let track = album.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write fixture");
+
+        let target = LocalMutationTarget::capture(&track);
+
+        let displaced_album = directory.path.join("displaced-album");
+        std::fs::rename(&album, &displaced_album).expect("displace the selected directory");
+        std::fs::create_dir(&album).expect("install an impostor directory");
+        let impostor = album.join("silence.flac");
+        std::fs::write(&impostor, b"impostor audio").expect("install impostor file");
+
+        let error = target
+            .write_tags(&year("2026"))
+            .expect_err("a changed containing directory must refuse the save");
+        assert_eq!(conflict_of(&error), LocalTagWriteConflict::ParentChanged);
+
+        assert_eq!(
+            std::fs::read(&impostor).expect("read the impostor file"),
+            b"impostor audio",
+            "the impostor directory must receive nothing"
+        );
+        let admitted = displaced_album.join("silence.flac");
+        assert_eq!(
+            std::fs::read(&admitted).expect("read the admitted file"),
+            silence_fixture_bytes(),
+            "the admitted file must be byte-for-byte untouched"
+        );
+        assert_no_tag_write_siblings_under(&directory.path);
+    }
+
+    /// Cancelling (dropping an uncommitted selection) performs no write and
+    /// leaves no private sibling behind.
+    #[test]
+    fn a_cancelled_local_selection_leaves_no_residue() {
+        let (directory, track, target) = local_selection_fixture("local-cancelled");
+        let original = std::fs::read(&track).expect("read the original");
+
+        drop(target);
+
+        assert_eq!(
+            std::fs::read(&track).expect("reread the file"),
+            original,
+            "a cancelled selection never touches the file"
+        );
+        assert!(directory.temp_files().is_empty());
+    }
+
+    /// A selected file inside a directory the process cannot create in must
+    /// refuse rather than half-write, leaving the file untouched and no
+    /// private sibling behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_selection_refuses_an_unwritable_containing_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (directory, track, target) = local_selection_fixture("local-readonly-parent");
+        let original = std::fs::read(&track).expect("read the original");
+        let original_permissions = std::fs::metadata(&directory.path)
+            .expect("read directory metadata")
+            .permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_mode(0o500);
+        std::fs::set_permissions(&directory.path, read_only_permissions)
+            .expect("make the containing directory read-only");
+
+        // A privileged or ACL-granted test process may still create here;
+        // compare against the operation itself rather than guessing from mode
+        // bits, exactly as the production preflight does.
+        let sentinel = directory.path.join("sentinel");
+        let effective_create = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&sentinel)
+            .is_ok();
+        if effective_create {
+            std::fs::remove_file(&sentinel).expect("remove the privileged sentinel");
+        }
+
+        let preflight = target.preflight_write_capability();
+        let write = target.write_tags(&year("2026"));
+
+        std::fs::set_permissions(&directory.path, original_permissions)
+            .expect("restore the directory permissions");
+
+        if !effective_create {
+            assert_eq!(preflight, Err(TagWritePreflightError::Unavailable));
+            assert!(
+                write.is_err(),
+                "an unwritable containing directory must refuse the save"
+            );
+            assert_eq!(
+                std::fs::read(&track).expect("reread the file"),
+                original,
+                "a refused save leaves the file byte-for-byte untouched"
+            );
+            assert!(
+                directory.temp_files().is_empty(),
+                "a refused save leaves no private sibling behind"
+            );
+        }
+    }
+
+    /// Repeatedly walk `root` and require no reserved tag-write sibling to
+    /// survive a refused save anywhere beneath it.
+    fn assert_no_tag_write_siblings_under(root: &Path) {
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).expect("read directory") {
+                let path = entry.expect("directory entry").path();
+                assert!(
+                    !is_tag_write_temp_file(&path),
+                    "a refused save must leave no private sibling: {path:?}"
+                );
+                if path.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
     }
 
     /// Create an album directory holding the silence.flac fixture — the

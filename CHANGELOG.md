@@ -101,6 +101,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of being published as a terminal player error — an overload can no longer
   tear down stable external playback. Stop/Shutdown reserved admission, epoch
   purge, and the exact FIFO below capacity are unchanged.
+- **Local tag saves retarget a replaced or edited file** (`src/ui/properties_dialog.rs`,
+  `src/ui/context_menu.rs`, `src/local/tag_writer.rs`, `src/local/root_authority.rs`) — Properties
+  snapshotted a bare pathname, so a file moved or replaced while the dialog was open was silently
+  edited at its old name, and a competing in-place edit between the staged copy and the commit was
+  overwritten. Each local row now captures the selected file's exact object identity, its containing
+  directory's identity, and its content revision, and Save re-admits the file through the same
+  retained authority used for removable media before staging or committing. A replaced file, a
+  changed containing directory, or a competing edit now refuses with a localized conflict, leaves
+  every competing file/update byte-for-byte intact, and surfaces a "changed on disk" message instead
+  of a generic failure. A successful save drops its target before any retry. Residual race stated
+  honestly: a coarse modification timestamp can miss an in-place edit that keeps the exact byte
+  length and lands inside the timestamp granularity; the length is always compared.
 - **Supervised MPD control TOCTOU** (`src/audio/mpd_output.rs`) — A playback
   control (play/pause/toggle/seek) whose own pre-control `status` observed
   partition-option drift or a foreign current song lapsed the supervisor yet was

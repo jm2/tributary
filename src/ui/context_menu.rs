@@ -15,6 +15,7 @@ use super::properties_dialog::SaveTarget;
 use super::window_state::WindowState;
 use crate::architecture::{MediaKey, SourceId, TrackId};
 use crate::local::playlist_manager::{PlaylistEntryAddOutcome, PlaylistEntryInput};
+use crate::local::tag_writer::LocalMutationTarget;
 use crate::source_registry::{RegularPlaylistTrackResolution, SourceRegistry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1215,7 +1216,7 @@ fn build_properties_action(
         };
         if track_infos
             .iter()
-            .all(|info| matches!(info.target, SaveTarget::LocalPath(_)))
+            .all(|info| matches!(info.target, SaveTarget::Local(_)))
         {
             // A local-path-only selection can never write through a removable
             // authority, so no post-mutation catalogue refresh can apply.
@@ -1398,9 +1399,16 @@ fn properties_save_target(
             },
         ));
     }
-    // Every other row remains a path-authorized local-file edit.
+    // Every other row is a local-file edit. Snapshot the exact selected
+    // object — its filesystem identity, its containing directory's identity,
+    // and its content revision — so the later Save refuses if the file was
+    // renamed, replaced, or edited while the dialog was open instead of
+    // silently rewriting whatever now occupies the pathname. Capture is
+    // best-effort; a file that cannot be identified at selection carries no
+    // evidence and every write refuses, so a transient failure never
+    // authorizes a blind write.
     let path = local_file_path(&track.uri())?;
-    Some(SaveTarget::LocalPath(path))
+    Some(SaveTarget::Local(LocalMutationTarget::capture(&path)))
 }
 
 /// One pending mutation per distinct removable identity, in selection order.
