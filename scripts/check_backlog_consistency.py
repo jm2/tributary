@@ -1,44 +1,35 @@
 #!/usr/bin/env python3
-"""
-Read-only consistency checks for the Tributary implementation backlog.
-
-``docs/task.md`` is the repository's countable execution index.  Several of its
-invariants are maintained by hand and were previously unenforced:
-
-* every top-level checkbox is one record with a unique stable ID;
-* the literal completion counters written in prose match the checkbox state,
-  including the archived remediation counter, which is recounted from its
-  archived source document;
-* every relative link (and ``#anchor``) resolves inside the checkout;
-* each active record maps to a GitHub issue, a Gas City bead, and a pull
-  request (``"pr": null`` meaning "not yet published"), with no
-  merged-but-unreconciled record and no stale
-  review head.
-
-This module is deliberately **read-only**.  It never edits the index, never
-closes a parent record, never assigns a worker, and never talks to GitHub or
-the Gas City ledger.  A caller may pass an optional ledger snapshot
-(``--ledger``); the checker then only *reports* missing mappings,
-merged-but-unreconciled records, and stale review heads.  Acting on those
-findings stays with the operator and the authoritative ledgers.
-
-Usage::
-
-    python3 scripts/check_backlog_consistency.py
-    python3 scripts/check_backlog_consistency.py --ledger path/to/snapshot.json
-
-Exit status is 0 when every check passes and 1 when any check fails.
-"""
+"""Read-only consistency checks for the Tributary implementation backlog."""
+# docs/task.md is the repository's countable execution index.  Several of its
+# invariants are maintained by hand and were previously unenforced:
+#
+# * every top-level checkbox is one record with a unique stable ID;
+# * the literal completion counters written in prose match the checkbox state,
+#   including the archived remediation counter, which is recounted from its
+#   archived source document;
+# * every relative link (and #anchor) resolves inside the checkout;
+# * each active record maps to a GitHub issue, a Gas City bead, and a pull
+#   request ("pr": null meaning "not yet published"), with no
+#   merged-but-unreconciled record and no stale review head.
+#
+# This module is deliberately READ-ONLY.  It never edits the index, never
+# closes a parent record, never assigns a worker, and never talks to GitHub or
+# the Gas City ledger.  A caller may pass an optional ledger snapshot
+# (--ledger); the checker then only *reports* missing mappings,
+# merged-but-unreconciled records, and stale review heads.  Acting on those
+# findings stays with the operator and the authoritative ledgers.
+#
+# Usage:
+#     python3 scripts/check_backlog_consistency.py
+#     python3 scripts/check_backlog_consistency.py --ledger path/to/snapshot.json
+#
+# Exit status is 0 when every check passes and 1 when any check fails.
 
 from __future__ import annotations
 
 import argparse
 import json
 import re
-import shutil
-# The single subprocess use below is a fixed, read-only ``git ls-files``
-# invocation whose arguments never include untrusted input (Bandit B404).
-import subprocess  # nosec B404
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -105,8 +96,9 @@ ARCHIVED_COUNTER_PATTERN = re.compile(
 # archived boxes carry plain titles instead of bold stable IDs.
 ARCHIVED_BOX_PATTERN = re.compile(r"^- \[(?P<mark>[ xX])\]")
 
-# Directories that never contain tracked documentation worth checking.
-SKIPPED_DIRECTORIES = frozenset({".git", "target", "node_modules", "dist"})
+# Directories that never contain tracked documentation worth checking: VCS
+# metadata, build output, and scratch/operations trees.
+SKIPPED_DIRECTORIES = frozenset({".git", ".gc", "target", "node_modules", "dist"})
 
 
 @dataclass(frozen=True)
@@ -127,13 +119,10 @@ def relative_display(root: Path, path: Path) -> str:
 
 
 def iter_content_lines(text: str) -> Iterable[tuple[int, str]]:
-    """
-    Yield ``(line_number, line)`` outside fenced code blocks.
-
-    Fenced code blocks frequently contain shell snippets whose ``#`` comment
-    lines would otherwise be mistaken for headings and whose bracketed text
-    would be mistaken for links.
-    """
+    """Yield ``(line_number, line)`` pairs outside fenced code blocks."""
+    # Fenced code blocks frequently contain shell snippets whose ``#`` comment
+    # lines would otherwise be mistaken for headings and whose bracketed text
+    # would be mistaken for links.
     fence: str | None = None
     for number, line in enumerate(text.splitlines(), start=1):
         stripped = line.lstrip()
@@ -188,31 +177,11 @@ def document_anchors(path: Path) -> set[str]:
 
 
 def collect_markdown_files(root: Path) -> list[Path]:
-    """
-    Return the tracked Markdown files to link-check.
-
-    Tracked files are preferred because they exclude build output and scratch
-    trees; a plain recursive walk is the fallback for a tarball or a synthetic
-    test tree that is not a Git checkout.
-    """
-    git = shutil.which("git")
-    result = None
-    if git is not None:
-        # The executable is fully resolved above and every argument is fixed;
-        # nothing user-controlled reaches the command line (Bandit B603/B607).
-        try:
-            result = subprocess.run(  # nosec B603
-                [git, "-C", str(root), "ls-files", "*.md"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except OSError:
-            result = None
-    if result is not None and result.returncode == 0:
-        tracked = [root / name for name in result.stdout.split("\n") if name]
-        if tracked:
-            return sorted(tracked)
+    """Return every Markdown file below *root* that is worth link-checking."""
+    # A recursive walk with a fixed skip list keeps this a pure-Python, static
+    # operation: no subprocess, no shell, no PATH dependence.  The skip list
+    # covers VCS metadata, build output and scratch/operations trees, so the
+    # result matches the tracked file set for a normal checkout.
     return sorted(
         path
         for path in root.rglob("*.md")
@@ -231,12 +200,9 @@ def iter_link_targets(line: str) -> Iterable[str]:
 
 
 def split_target(target: str) -> tuple[str | None, str]:
-    """
-    Split a link target into ``(path, fragment)``.
-
-    ``None`` means the target is external and must be skipped.  An empty path
-    means the fragment points inside the containing file.
-    """
+    """Split a link target into ``(path, fragment)`` for one link target."""
+    # ``None`` means the target is external and must be skipped.  An empty
+    # path means the fragment points inside the containing file.
     target = target.strip()
     if target.startswith("<") and target.endswith(">"):
         target = target[1:-1]
@@ -328,32 +294,26 @@ def check_counters(text: str, records: Sequence[Record]) -> list[str]:
     return problems
 
 
-def _archived_section_flags(title: str) -> tuple[bool, bool]:
+def _archived_section_flags(title: str | None) -> tuple[bool, bool]:
     """Return ``(in_summary, in_gate)`` for one archived-document heading."""
-    lowered = title.lower()
+    lowered = (title or "").lower()
     return lowered.startswith("how to use"), "global validation" in lowered
 
 
 def _is_excluded_archived_box(line: str, in_summary: bool, in_gate: bool) -> bool:
-    """
-    Return whether an archived checkbox is one of the documented exclusions.
-
-    Status-summary boxes, global-validation gate boxes and withdrawn false
-    findings are all documented in the archive as non-task boxes.
-    """
+    """Return whether an archived checkbox is one of the documented exclusions."""
+    # Status-summary boxes, global-validation gate boxes and withdrawn false
+    # findings are all documented in the archive as non-task boxes.
     if in_summary or in_gate:
         return True
     return "~~" in line and "withdrawn" in line.lower()
 
 
 def _collect_archived_boxes(text: str) -> tuple[int, int, dict[str, int]]:
-    """
-    Count the in-scope archived checkboxes.
-
-    Returns ``(complete, total, unclassified)`` where *unclassified* maps each
-    section title that holds boxes outside the P0-P3 task sections and the
-    documented exclusions to its box count.
-    """
+    """Count the in-scope archived checkboxes of the remediation source."""
+    # Returns ``(complete, total, unclassified)`` where *unclassified* maps
+    # each section title that holds boxes outside the P0-P3 task sections and
+    # the documented exclusions to its box count.
     complete = 0
     total = 0
     unclassified: dict[str, int] = {}
@@ -382,25 +342,22 @@ def _collect_archived_boxes(text: str) -> tuple[int, int, dict[str, int]]:
 
 
 def derive_archived_counts(path: Path) -> tuple[int, int, list[str]]:
-    """
-    Mechanically recount the archived remediation checkboxes.
-
-    The archived counter describes the in-scope task checkboxes of the
-    archived remediation document.  That document's own prose documents the
-    exclusions, which this recount applies mechanically:
-
-    * the status-summary boxes in the "How to use this file" section are
-      section summaries, not task progress;
-    * every box in the "Global validation gate" section is a gate, not a task;
-    * a struck-through (``~~...~~``) box marked "Withdrawn" is a retracted
-      false finding.
-
-    Every other top-level checkbox under a ``P0``-``P3`` section is in scope.
-    A checkbox under any other heading is unclassifiable and is reported as a
-    structural problem instead of being silently ignored.
-
-    Returns ``(complete, total, problems)``.
-    """
+    """Mechanically recount the archived remediation checkboxes."""
+    # The archived counter describes the in-scope task checkboxes of the
+    # archived remediation document.  That document's prose documents the
+    # exclusions, which this recount applies mechanically:
+    #
+    # * the status-summary boxes in the "How to use this file" section are
+    #   section summaries, not task progress;
+    # * every box in the "Global validation gate" section is a gate, not a
+    #   task;
+    # * a struck-through (``~~...~~``) box marked "Withdrawn" is a retracted
+    #   false finding.
+    #
+    # Every other top-level checkbox under a ``P0``-``P3`` section is in
+    # scope.  A checkbox under any other heading is unclassifiable and is
+    # reported as a structural problem instead of being silently ignored.
+    # Returns ``(complete, total, problems)``.
     display = path.name
     try:
         text = path.read_text(encoding="utf-8")
@@ -506,18 +463,15 @@ def _short(sha: str) -> str:
 
 
 def _pr_evidence(entry: dict) -> tuple[str, object]:
-    """
-    Classify the ``pr`` mapping of a ledger entry.
-
-    Returns a ``(state, value)`` pair where *state* is one of:
-
-    * ``"missing"`` — the ``pr`` key is absent.  Silence is not a published
-      representation of "no pull request"; it is a missing mapping.
-    * ``"none"`` — the key is explicitly ``null``, the documented
-      not-yet-published representation.
-    * ``"invalid"`` — present but not a positive PR identifier.
-    * ``"published"`` — a usable pull-request identifier.
-    """
+    """Classify the ``pr`` mapping of a ledger entry for one record."""
+    # Returns a ``(state, value)`` pair where *state* is one of:
+    #
+    # * ``"missing"`` - the ``pr`` key is absent.  Silence is not a published
+    #   representation of "no pull request"; it is a missing mapping.
+    # * ``"none"`` - the key is explicitly ``null``, the documented
+    #   not-yet-published representation.
+    # * ``"invalid"`` - present but not a positive PR identifier.
+    # * ``"published"`` - a usable pull-request identifier.
     if "pr" not in entry:
         return "missing", None
     value = entry["pr"]
@@ -546,14 +500,11 @@ def _check_active_flag(identifier: str, entry: dict, active: bool) -> list[str]:
 
 
 def _check_active_mapping(identifier: str, entry: dict) -> list[str]:
-    """
-    Report missing bead, issue and pull-request mapping fields of one record.
-
-    The record is index-derived active.  ``"pr": null`` is the documented
-    not-yet-published representation; a published ``pr`` (a positive integer
-    or digit string) must carry ``head_sha`` evidence for the stale-review
-    check in :func:`_check_entry_state`.
-    """
+    """Report missing bead, issue and pull-request mapping fields of one record."""
+    # The record is index-derived active.  ``"pr": null`` is the documented
+    # not-yet-published representation; a published ``pr`` (a positive
+    # integer or digit string) must carry ``head_sha`` evidence for the
+    # stale-review check in _check_entry_state.
     problems: list[str] = []
     if not entry.get("bead"):
         problems.append(f"ledger: active record '{identifier}' has no bead mapping")
@@ -612,36 +563,34 @@ def _check_unmapped_records(
 def check_ledger(
     snapshot: object, records: Sequence[Record], task_index: Path
 ) -> list[str]:
-    """
-    Report mapping problems from an optional read-only ledger snapshot.
-
-    The snapshot is a JSON object::
-
-        {
-          "records": {
-            "Q7": {
-              "issue": 276,
-              "bead": "tr-bps4d",
-              "pr": 999,
-              "head_sha": "abc123",
-              "reviewed_sha": "def456",
-              "merged": false
-            }
-          }
-        }
-
-    Every active (unchecked) record must appear with an issue, a bead, and a
-    pull-request mapping.  ``"pr": null`` is the explicit not-yet-published
-    representation; omitting the ``pr`` key is reported as a missing mapping.
-    A published ``pr`` must carry ``head_sha`` evidence, which the
-    stale-review check validates.
-
-    The task index is authoritative for checked state: an ``active`` snapshot
-    flag that disagrees with the index is reported and never downgrades the
-    required-field checks.  ``merged`` on an active record is a
-    merged-but-unreconciled report, and ``reviewed_sha`` differing from
-    ``head_sha`` is a stale review head.  Completed records may be omitted.
-    """
+    """Report mapping problems from an optional read-only ledger snapshot."""
+    # The snapshot is a JSON object of the shape::
+    #
+    #     {
+    #       "records": {
+    #         "Q7": {
+    #           "issue": 276,
+    #           "bead": "tr-bps4d",
+    #           "pr": 999,
+    #           "head_sha": "abc123",
+    #           "reviewed_sha": "def456",
+    #           "merged": false
+    #         }
+    #       }
+    #     }
+    #
+    # Every active (unchecked) record must appear with an issue, a bead, and
+    # a pull-request mapping.  ``"pr": null`` is the explicit
+    # not-yet-published representation; omitting the ``pr`` key is reported
+    # as a missing mapping.  A published ``pr`` must carry ``head_sha``
+    # evidence, which the stale-review check validates.
+    #
+    # The task index is authoritative for checked state: an ``active``
+    # snapshot flag that disagrees with the index is reported and never
+    # downgrades the required-field checks.  ``merged`` on an active record
+    # is a merged-but-unreconciled report, and ``reviewed_sha`` differing
+    # from ``head_sha`` is a stale review head.  Completed records may be
+    # omitted.
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("records"), dict):
         return ["ledger: snapshot must be an object with a 'records' object"]
     entries: dict[str, object] = snapshot["records"]

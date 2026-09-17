@@ -55,13 +55,10 @@ def sample_records():
 
 
 def archived_remediation_doc(*, complete=223, open_boxes=3):
-    """
-    Build an archived remediation source matching the default counter.
-
-    The structural classes the checker applies — status-summary boxes, the
-    global-validation gate, a withdrawn false finding, and P0-P3 task boxes —
-    are all represented so fixtures exercise the real derivation.
-    """
+    """Build an archived remediation source matching the default counter."""
+    # The structural classes the checker applies — status-summary boxes, the
+    # global-validation gate, a withdrawn false finding, and P0-P3 task
+    # boxes — are all represented so fixtures exercise the real derivation.
     lines = [
         "# Tributary remediation tracker",
         "",
@@ -454,25 +451,22 @@ class BacklogConsistencyTests(unittest.TestCase):
 
     # ── integration ──────────────────────────────────────────────────────────
     def assert_repository_consistency(self, root):
-        """
-        Validate a repository root's index consistency without frozen totals.
-
-        The real repository's record, completion and archived totals
-        legitimately advance as backlog work lands.  Hard-coding them here
-        would fail CI on every legitimate completion (rejected finding F1),
-        so this helper validates the invariants that must hold at *any*
-        point in history:
-
-        * every checker invariant passes (unique IDs, literal counters,
-          percentages, archived recount, links);
-        * the index parses to a non-empty population of uniquely identified
-          records whose completion count is arithmetically possible;
-        * the archived remediation recount is well-formed (non-empty,
-          structurally classifiable, complete <= total).
-
-        Precise count expectations stay in the synthetic fixtures above,
-        where the document state is fixed by construction.
-        """
+        """Validate a repository root's index consistency without frozen totals."""
+        # The real repository's record, completion and archived totals
+        # legitimately advance as backlog work lands.  Hard-coding them here
+        # would fail CI on every legitimate completion (rejected finding F1),
+        # so this helper validates the invariants that must hold at *any*
+        # point in history:
+        #
+        # * every checker invariant passes (unique IDs, literal counters,
+        #   percentages, archived recount, links);
+        # * the index parses to a non-empty population of uniquely identified
+        #   records whose completion count is arithmetically possible;
+        # * the archived remediation recount is well-formed (non-empty,
+        #   structurally classifiable, complete <= total).
+        #
+        # Precise count expectations stay in the synthetic fixtures above,
+        # where the document state is fixed by construction.
         records, markdown_files, problems = checker.run_checks(
             root, root / checker.TASK_INDEX_NAME
         )
