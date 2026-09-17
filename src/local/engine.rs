@@ -522,15 +522,30 @@ impl LibraryEngine {
         for dir in &music_dirs {
             info!(dir = %dir.display(), "Starting initial library scan");
         }
-        if let Err(e) = initial_scan_shutdown_aware(
+        // Commands are serviced *while* the scan runs. The scan's read-only
+        // traversal/parsing cannot be cancelled while the window is open, so
+        // awaiting it before this loop would let a held discovery step delay
+        // every admitted rating/history edit until close (R9/R1). Both share
+        // one engine task, so catalogue mutations stay serialized.
+        let mut completed_commands = HashMap::new();
+        let scan_result = service_commands_while_scanning(
+            initial_scan_shutdown_aware(
+                &db,
+                &music_dirs,
+                &tx,
+                &playlist_sidebar_refresh,
+                &scan_cancellation,
+                &ScanDiscoveryHold::none(),
+            ),
             &db,
             &music_dirs,
             &tx,
+            &command_rx,
+            &mut completed_commands,
             &playlist_sidebar_refresh,
-            &scan_cancellation,
         )
-        .await
-        {
+        .await;
+        if let Err(e) = scan_result {
             error!(error = %e, "Initial scan failed");
             let _ = tx.send(LibraryEvent::Error(e.to_string())).await;
         }
@@ -548,7 +563,6 @@ impl LibraryEngine {
         }
 
         // ── Filesystem watcher (all directories) ─────────────────────
-        let mut completed_commands = HashMap::new();
         if let Some(watcher) = watcher {
             if let Err(e) = process_directory_events(
                 &db,
@@ -1342,6 +1356,14 @@ impl RootScan {
     }
 }
 
+/// Fail every root in this scan closed when shutdown interrupts it, so no
+/// later completeness check can authorize a durable mutation or deletion.
+fn mark_scan_cancelled(root_scans: &mut [RootScan], reason: &str) {
+    for scan in root_scans {
+        scan.mark_cancelled(reason);
+    }
+}
+
 /// Run one retained-authority filesystem probe outside Tokio's async worker
 /// threads. Library roots may live on removable or network filesystems, so
 /// even a small handle validation can block indefinitely at the OS boundary.
@@ -1394,6 +1416,119 @@ async fn await_readonly_blocking<T>(
                 .await
                 .ok()
         }
+    }
+}
+
+/// Durable-mutation admission boundary for the initial scan.
+///
+/// `true` means a durable catalogue mutation may *begin*. Once it has begun it
+/// must be awaited to settlement — it is never dropped or cancelled — so the
+/// reserved `Flush` drain cannot acknowledge work that did not commit. `false`
+/// means shutdown has been observed and no new durable work may start.
+///
+/// The read-only parser deliberately settles inside its grace after
+/// cancellation (a `spawn_blocking` kernel call cannot be interrupted). That
+/// makes this explicit boundary the only thing standing between a post-cancel
+/// parser completion and a brand-new upsert plus unbounded authority probe.
+fn admit_scan_mutation(cancellation: &CancellationToken) -> bool {
+    !cancellation.is_cancelled()
+}
+
+/// Deterministic rendezvous for the initial scan's read-only discovery.
+///
+/// Production always constructs [`ScanDiscoveryHold::none`]. Tests install a
+/// controlling handle so they can hold a specific discovery stage open and
+/// observe how cancellation, command service, and the durable-mutation
+/// admission boundary behave without depending on filesystem timing. The hold
+/// is a plain `Option`, so production carries no shared synchronization state.
+#[derive(Clone, Default)]
+struct ScanDiscoveryHold {
+    inner: Option<std::sync::Arc<ScanDiscoveryHoldInner>>,
+}
+
+/// A single read-only discovery stage a [`ScanDiscoveryHold`] can hold.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanDiscoveryStage {
+    /// Before the first read-only traversal is submitted.
+    Traversal,
+    /// After a file's read-only parse settles and before any durable mutation.
+    PostParse,
+}
+
+#[derive(Default)]
+struct ScanDiscoveryHoldInner {
+    traversal: DiscoveryRendezvous,
+    post_parse: DiscoveryRendezvous,
+}
+
+#[derive(Default)]
+struct DiscoveryRendezvous {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    engaged: std::sync::atomic::AtomicBool,
+}
+
+impl ScanDiscoveryHoldInner {
+    fn stage(&self, stage: ScanDiscoveryStage) -> &DiscoveryRendezvous {
+        match stage {
+            ScanDiscoveryStage::Traversal => &self.traversal,
+            ScanDiscoveryStage::PostParse => &self.post_parse,
+        }
+    }
+}
+
+impl ScanDiscoveryHold {
+    fn none() -> Self {
+        Self::default()
+    }
+
+    #[cfg(test)]
+    fn controlling() -> (Self, ScanDiscoveryControl) {
+        let inner = std::sync::Arc::new(ScanDiscoveryHoldInner::default());
+        (
+            Self {
+                inner: Some(inner.clone()),
+            },
+            ScanDiscoveryControl { inner },
+        )
+    }
+
+    /// Hold this stage open the first time the scan reaches it.
+    ///
+    /// The `engaged` swap makes the hold one-shot: only the first visit to a
+    /// stage blocks, so multi-file fixtures still make progress after release.
+    async fn arrive(&self, stage: ScanDiscoveryStage) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let rendezvous = inner.stage(stage);
+        if rendezvous
+            .engaged
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        rendezvous.reached.notify_one();
+        rendezvous.release.notified().await;
+    }
+}
+
+/// Test-side control for a [`ScanDiscoveryHold`].
+#[cfg(test)]
+struct ScanDiscoveryControl {
+    inner: std::sync::Arc<ScanDiscoveryHoldInner>,
+}
+
+#[cfg(test)]
+impl ScanDiscoveryControl {
+    /// Wait until the scan reaches `stage`, leaving it held.
+    async fn wait_until_reached(&self, stage: ScanDiscoveryStage) {
+        self.inner.stage(stage).reached.notified().await;
+    }
+
+    /// Release a scan held at `stage`.
+    fn release(&self, stage: ScanDiscoveryStage) {
+        self.inner.stage(stage).release.notify_one();
     }
 }
 
@@ -2333,13 +2468,34 @@ fn root_scan_for_path<'a>(path: &Path, root_scans: &'a [RootScan]) -> Option<&'a
         .max_by_key(|scan| scan.root.components().count())
 }
 
+/// Outcome of rechecking the most-specific authorized root for one pending
+/// initial-scan write.
+#[derive(Debug)]
+enum RootRevalidation {
+    /// The root still authorizes durable work for this path.
+    Authorized,
+    /// The root no longer authorizes work; the named root (if any) was
+    /// invalidated and its unavailable state must be persisted.
+    Rejected(Option<PathBuf>),
+    /// Shutdown abandoned the read-only authority probe before it settled. The
+    /// caller must not admit a durable mutation and must preserve the
+    /// incomplete-scan/no-deletion semantics.
+    Abandoned,
+}
+
 /// Recheck the most-specific authorized root for one pending initial-scan
 /// write. A failed probe invalidates that root for every later file in this
 /// scan; callers persist the returned root's unavailable state.
+///
+/// `cancellation` is `Some` only for the initial scan's **pre-admission**
+/// call sites, where the probe is read-only discovery that must not outlive
+/// the shutdown budget. It is `None` for guards that run *inside* an already
+/// admitted durable mutation, which must settle rather than be abandoned.
 async fn revalidate_scan_root_for_path(
     path: &Path,
     root_scans: &mut [RootScan],
-) -> Result<(bool, Option<PathBuf>), tokio::task::JoinError> {
+    cancellation: Option<&CancellationToken>,
+) -> Result<RootRevalidation, tokio::task::JoinError> {
     let Some(index) = root_scans
         .iter()
         .enumerate()
@@ -2347,10 +2503,10 @@ async fn revalidate_scan_root_for_path(
         .max_by_key(|(_, scan)| scan.root.components().count())
         .map(|(index, _)| index)
     else {
-        return Ok((false, None));
+        return Ok(RootRevalidation::Rejected(None));
     };
     if !root_scans[index].content_authorized {
-        return Ok((false, None));
+        return Ok(RootRevalidation::Rejected(None));
     }
     let expected = root_scans[index]
         .device_id
@@ -2360,21 +2516,29 @@ async fn revalidate_scan_root_for_path(
     let authority_lease = root_scans[index].authority_lease.clone();
     let matches = match (expected, authority_lease) {
         (Some(expected), Some(lease)) => {
-            spawn_authority_probe(move || {
-                lease.expected_marker() == expected && lease.validate().is_ok()
-            })
-            .await?
+            let probe = move || lease.expected_marker() == expected && lease.validate().is_ok();
+            match cancellation {
+                Some(cancellation) => {
+                    match await_readonly_blocking(cancellation, tokio::task::spawn_blocking(probe))
+                        .await
+                    {
+                        Some(result) => result?,
+                        None => return Ok(RootRevalidation::Abandoned),
+                    }
+                }
+                None => spawn_authority_probe(probe).await?,
+            }
         }
         _ => false,
     };
     if matches {
-        return Ok((true, None));
+        return Ok(RootRevalidation::Authorized);
     }
 
     let scan = &mut root_scans[index];
     scan.content_authorized = false;
     scan.reconciliation_authoritative = false;
-    Ok((false, Some(scan.root.clone())))
+    Ok(RootRevalidation::Rejected(Some(scan.root.clone())))
 }
 
 fn most_specific_root_for_path<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<&'a Path> {
@@ -3636,6 +3800,82 @@ async fn process_library_commands_without_watcher(
     }
 }
 
+/// Service admitted library commands while the initial scan runs.
+///
+/// The scan's read-only traversal and parsing run on blocking workers that
+/// cannot be cancelled while the window is open. Driving command service from
+/// the same task with `select!` means a held discovery step cannot delay an
+/// admitted rating or history edit until close: while the scan future is
+/// pending on its worker, the command branch is polled and the durable
+/// mutation settles. Because both branches run in one task, a scan mutation
+/// and a command mutation can never be in flight at the same time.
+///
+/// `Flush` is the reserved drain marker. By the time the loop receives it,
+/// every earlier admitted command has settled in FIFO order, so the loop waits
+/// for the (cancelled) scan to reach settlement before acknowledging. That
+/// keeps the close drain behind every already admitted durable mutation.
+async fn service_commands_while_scanning<F>(
+    scan: F,
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+    command_rx: &async_channel::Receiver<LibraryCommand>,
+    completed_commands: &mut HashMap<Uuid, CompletedRootTrustCommand>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
+) -> F::Output
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    // The scan future is large (it embeds the whole traversal/parse state
+    // machine); boxing keeps the driver's own future small, which matters
+    // because `LibraryEngine::run` is polled inside the GTK main-loop task.
+    let mut scan = Box::pin(scan);
+    let mut commands_open = true;
+    loop {
+        if !commands_open {
+            return scan.as_mut().await;
+        }
+        let next = tokio::select! {
+            biased;
+            result = scan.as_mut() => return result,
+            command = command_rx.recv() => command,
+        };
+        match next {
+            Ok(LibraryCommand::Flush { completion }) => {
+                // Reserved drain: let the cancelled scan settle (admitted
+                // durable work completes; held read-only work is abandoned
+                // under budget) before acknowledging the writer.
+                let result = scan.as_mut().await;
+                let _ = completion.send(()).await;
+                return result;
+            }
+            Ok(command) => {
+                if let Some(pending) = process_library_command(
+                    db,
+                    music_dirs,
+                    tx,
+                    playlist_sidebar_refresh,
+                    completed_commands,
+                    command,
+                )
+                .await
+                {
+                    finish_pending_root_trust_scan(
+                        db,
+                        music_dirs,
+                        tx,
+                        playlist_sidebar_refresh,
+                        completed_commands,
+                        pending,
+                    )
+                    .await;
+                }
+            }
+            Err(_) => commands_open = false,
+        }
+    }
+}
+
 async fn initial_scan(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
@@ -3669,6 +3909,7 @@ async fn initial_scan_shutdown_aware(
     tx: &async_channel::Sender<LibraryEvent>,
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     cancellation: &CancellationToken,
+    discovery: &ScanDiscoveryHold,
 ) -> anyhow::Result<()> {
     let forced_conversions = HashMap::new();
     let authority_guards = HashMap::new();
@@ -3682,6 +3923,7 @@ async fn initial_scan_shutdown_aware(
         &evidence_refreshes,
         playlist_sidebar_refresh,
         cancellation,
+        discovery,
     )
     .await
 }
@@ -3707,6 +3949,7 @@ async fn initial_scan_with_root_trust_guards(
         evidence_refreshes,
         playlist_sidebar_refresh,
         &cancellation,
+        &ScanDiscoveryHold::none(),
     )
     .await
 }
@@ -3721,6 +3964,7 @@ async fn initial_scan_with_control(
     evidence_refreshes: &HashMap<PathBuf, RootTrustEvidenceRefresh>,
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     cancellation: &CancellationToken,
+    discovery: &ScanDiscoveryHold,
 ) -> anyhow::Result<()> {
     // A window that closes before (or during) database setup cancels the scan
     // before it can admit any mutation. Return immediately so the engine can
@@ -3757,6 +4001,11 @@ async fn initial_scan_with_control(
     // Traversal is read-only, so it runs under the shutdown isolation contract:
     // if close cancels the scan while a root is enumerating, the join handle is
     // abandoned after the settle budget rather than blocking window teardown.
+    //
+    // The hold is a production no-op (`ScanDiscoveryHold::none`); tests use it
+    // to keep the scan parked in read-only discovery while they exercise
+    // command admission and the reserved drain.
+    discovery.arrive(ScanDiscoveryStage::Traversal).await;
     let traversal = tokio::task::spawn_blocking(move || {
         dirs.into_iter()
             .map(|root| scan_root_with_exclusions(root, &all_roots))
@@ -4055,9 +4304,10 @@ async fn initial_scan_with_control(
         // Everything already committed above stands; nothing new is admitted,
         // and the no-deletion phase below is skipped entirely.
         if cancellation.is_cancelled() {
-            for scan in &mut root_scans {
-                scan.mark_cancelled("catalogue mutation loop interrupted at shutdown");
-            }
+            mark_scan_cancelled(
+                &mut root_scans,
+                "catalogue mutation loop interrupted at shutdown",
+            );
             info!(
                 scanned,
                 total, "Initial scan cancelled; no further catalogue mutations admitted"
@@ -4078,13 +4328,37 @@ async fn initial_scan_with_control(
         };
 
         if needs_update {
+            // Pre-admission boundary: no new durable mutation may begin after
+            // shutdown. This also bounds the read-only authority probe below,
+            // which validates the retained root before the parser runs.
+            if !admit_scan_mutation(cancellation) {
+                mark_scan_cancelled(
+                    &mut root_scans,
+                    "catalogue mutation loop interrupted at shutdown",
+                );
+                info!(
+                    scanned,
+                    total, "Initial scan cancelled; no further catalogue mutations admitted"
+                );
+                return Ok(());
+            }
             let (identity_allows_parse, invalidated_root) = match revalidate_scan_root_for_path(
                 path,
                 &mut root_scans,
+                Some(cancellation),
             )
             .await
             {
-                Ok(result) => result,
+                Ok(RootRevalidation::Authorized) => (true, None),
+                Ok(RootRevalidation::Rejected(root)) => (false, root),
+                Ok(RootRevalidation::Abandoned) => {
+                    mark_scan_cancelled(
+                        &mut root_scans,
+                        "pre-parse authority probe abandoned at shutdown",
+                    );
+                    info!(path = %path.display(), "Initial scan cancelled while revalidating before parse");
+                    return Ok(());
+                }
                 Err(error) => {
                     warn!(path = %path.display(), %error, "Initial-scan authority validation task failed — upsert discarded");
                     continue;
@@ -4146,9 +4420,40 @@ async fn initial_scan_with_control(
                     return Ok(());
                 }
                 Some(Ok(Ok(parsed))) => {
+                    // Deterministic test rendezvous: the parser has settled.
+                    discovery.arrive(ScanDiscoveryStage::PostParse).await;
+
+                    // Durable-mutation admission boundary. The read-only parser
+                    // may have settled inside its shutdown grace *after*
+                    // cancellation; in that case no new durable work may begin.
+                    // Refusing here is what prevents the post-cancel upsert and
+                    // its unbounded authority probes.
+                    if !admit_scan_mutation(cancellation) {
+                        mark_scan_cancelled(
+                            &mut root_scans,
+                            "post-parse mutation admission refused at shutdown",
+                        );
+                        info!(path = %path.display(), "Initial scan cancelled before upsert admission; no new durable work");
+                        return Ok(());
+                    }
                     let (identity_allows_upsert, invalidated_root) =
-                        match revalidate_scan_root_for_path(path, &mut root_scans).await {
-                            Ok(result) => result,
+                        match revalidate_scan_root_for_path(
+                            path,
+                            &mut root_scans,
+                            Some(cancellation),
+                        )
+                        .await
+                        {
+                            Ok(RootRevalidation::Authorized) => (true, None),
+                            Ok(RootRevalidation::Rejected(root)) => (false, root),
+                            Ok(RootRevalidation::Abandoned) => {
+                                mark_scan_cancelled(
+                                    &mut root_scans,
+                                    "post-parse authority probe abandoned at shutdown",
+                                );
+                                info!(path = %path.display(), "Initial scan cancelled while revalidating after parse");
+                                return Ok(());
+                            }
                             Err(error) => {
                                 warn!(path = %path.display(), %error, "Post-parse authority validation task failed — upsert discarded");
                                 continue;
@@ -4160,6 +4465,19 @@ async fn initial_scan_with_control(
                     }
                     if !identity_allows_upsert {
                         continue;
+                    }
+
+                    // Final admission boundary: shutdown observed between the
+                    // post-parse revalidation and the upsert itself must still
+                    // refuse to begin durable work. Once the upsert below is
+                    // entered it is awaited to settlement (never dropped).
+                    if !admit_scan_mutation(cancellation) {
+                        mark_scan_cancelled(
+                            &mut root_scans,
+                            "upsert admission refused at shutdown",
+                        );
+                        info!(path = %path.display(), "Initial scan cancelled before upsert; no new durable work");
+                        return Ok(());
                     }
 
                     // During the initial scan we do NOT emit a TrackUpserted
@@ -4184,17 +4502,29 @@ async fn initial_scan_with_control(
                                 false
                             }
                         };
-                        let root_still_current =
-                            match revalidate_scan_root_for_path(path, &mut root_scans).await {
-                                Ok((still_current, invalidated)) => {
-                                    invalidated_root = invalidated;
-                                    still_current
-                                }
-                                Err(_) => {
-                                    authority_task_failed = true;
-                                    false
-                                }
-                            };
+                        let root_still_current = match revalidate_scan_root_for_path(
+                            path,
+                            &mut root_scans,
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(RootRevalidation::Authorized) => true,
+                            Ok(RootRevalidation::Rejected(invalidated)) => {
+                                invalidated_root = invalidated;
+                                false
+                            }
+                            // The guard runs inside an already admitted
+                            // mutation, so it is never abandoned: `None`
+                            // cancellation means it cannot return this arm.
+                            Ok(RootRevalidation::Abandoned) => {
+                                unreachable!("a mutation guard cannot abandon its authority probe")
+                            }
+                            Err(_) => {
+                                authority_task_failed = true;
+                                false
+                            }
+                        };
                         root_still_current && file_still_current
                     })
                     .await
@@ -4234,9 +4564,10 @@ async fn initial_scan_with_control(
     // phase: preserve every catalogue row and the incomplete-scan authority
     // semantics even if the traversal itself called itself complete.
     if cancellation.is_cancelled() {
-        for scan in &mut root_scans {
-            scan.mark_cancelled("stale-deletion reconciliation skipped at shutdown");
-        }
+        mark_scan_cancelled(
+            &mut root_scans,
+            "stale-deletion reconciliation skipped at shutdown",
+        );
         info!("Initial scan cancelled before stale deletion; preserving all catalogue metadata");
         return Ok(());
     }
@@ -4244,26 +4575,36 @@ async fn initial_scan_with_control(
     // Parsing can outlive a removable-media transition. Revalidate each
     // retained root object immediately before the destructive phase; a
     // changed, removed, copied-marker, or unreadable root disables every stale
-    // deletion for that scope.
+    // deletion for that scope. The probe is read-only pre-admission work, so it
+    // is bounded by the shutdown budget: an abandoned probe must never lead to
+    // a deletion.
+    let mut deletion_preflight_abandoned = false;
     for scan in &mut root_scans {
         if !scan.reconciliation_authoritative {
             continue;
         }
         let expected = scan.device_id.clone();
         let authority_still_matches = if let Some(lease) = scan.authority_lease.clone() {
-            match spawn_authority_probe(move || {
+            let probe = move || {
                 expected.as_deref() == Some(lease.expected_marker()) && lease.validate().is_ok()
-            })
-            .await
-            {
-                Ok(matches) => matches,
-                Err(error) => {
+            };
+            match await_readonly_blocking(cancellation, tokio::task::spawn_blocking(probe)).await {
+                Some(Ok(matches)) => matches,
+                Some(Err(error)) => {
                     // Reject reconciliation for this scan, but a task failure
                     // is not evidence that the persisted root changed.
                     scan.reconciliation_authoritative = false;
                     scan.content_authorized = false;
                     warn!(root = %scan.root.display(), %error, "Library-root authority validation task failed before reconciliation — stale deletion disabled");
                     continue;
+                }
+                None => {
+                    // Shutdown abandoned the pre-deletion authority probe. The
+                    // root is unproven, so no stale deletion may follow.
+                    scan.reconciliation_authoritative = false;
+                    scan.content_authorized = false;
+                    deletion_preflight_abandoned = true;
+                    break;
                 }
             }
         } else {
@@ -4279,6 +4620,15 @@ async fn initial_scan_with_control(
         // just-persisted available row is revoked as well.
         mark_root_path_unavailable(db, &scan.root).await;
         warn!(root = %scan.root.display(), "Library root authority changed before reconciliation — stale deletion disabled");
+    }
+
+    if deletion_preflight_abandoned || !admit_scan_mutation(cancellation) {
+        mark_scan_cancelled(
+            &mut root_scans,
+            "destructive-phase admission refused at shutdown",
+        );
+        info!("Initial scan cancelled before stale deletion; preserving all catalogue metadata");
+        return Ok(());
     }
 
     // Remove DB entries for files no longer on disk. Reuse the preloaded
@@ -4317,10 +4667,20 @@ async fn initial_scan_with_control(
             let (root_allows_delete, invalidated_root) = match revalidate_scan_root_for_path(
                 row_path,
                 &mut root_scans,
+                Some(cancellation),
             )
             .await
             {
-                Ok(result) => result,
+                Ok(RootRevalidation::Authorized) => (true, None),
+                Ok(RootRevalidation::Rejected(root)) => (false, root),
+                Ok(RootRevalidation::Abandoned) => {
+                    mark_scan_cancelled(
+                        &mut root_scans,
+                        "stale-delete authority probe abandoned at shutdown",
+                    );
+                    info!(path = %row.file_path, "Initial scan cancelled during stale-delete revalidation; preserving metadata");
+                    return Ok(());
+                }
                 Err(error) => {
                     warn!(path = %row.file_path, %error, "Stale-delete root validation task failed — preserving metadata");
                     continue;
@@ -4331,6 +4691,17 @@ async fn initial_scan_with_control(
             }
             if !root_allows_delete {
                 continue;
+            }
+            // Final admission boundary for the destructive phase: shutdown
+            // observed after the per-row revalidation must still preserve the
+            // row. Once entered, the delete is awaited to settlement.
+            if !admit_scan_mutation(cancellation) {
+                mark_scan_cancelled(
+                    &mut root_scans,
+                    "stale-delete admission refused at shutdown",
+                );
+                info!(path = %row.file_path, "Initial scan cancelled before stale deletion; preserving metadata");
+                return Ok(());
             }
             info!(path = %row.file_path, "Removing stale track from database");
             let mut invalidated_root = None;
@@ -4351,10 +4722,15 @@ async fn initial_scan_with_control(
                     }
                 };
                 let root_still_current =
-                    match revalidate_scan_root_for_path(row_path, &mut root_scans).await {
-                        Ok((still_current, invalidated)) => {
+                    match revalidate_scan_root_for_path(row_path, &mut root_scans, None).await {
+                        Ok(RootRevalidation::Authorized) => true,
+                        Ok(RootRevalidation::Rejected(invalidated)) => {
                             invalidated_root = invalidated;
-                            still_current
+                            false
+                        }
+                        // Admitted-mutation guard: never abandoned.
+                        Ok(RootRevalidation::Abandoned) => {
+                            unreachable!("a mutation guard cannot abandon its authority probe")
                         }
                         Err(_) => {
                             authority_task_failed = true;
@@ -9871,6 +10247,7 @@ mod tests {
             &HashMap::new(),
             &test_playlist_sidebar_refresh(),
             &cancellation,
+            &ScanDiscoveryHold::none(),
         )
         .await
         .expect("cancelled scan returns cleanly");
@@ -9887,6 +10264,341 @@ mod tests {
             events.is_empty(),
             "a cancelled scan emits no completion events: {events:?}"
         );
+    }
+
+    /// A parser that settles inside its shutdown grace is *kept* by the
+    /// read-only isolation contract, but the explicit durable-mutation
+    /// admission boundary still refuses to begin new work from it (R2).
+    #[tokio::test]
+    async fn parser_settling_inside_the_grace_is_refused_at_the_mutation_boundary() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let job = tokio::task::spawn_blocking(|| 7_u32);
+        let settled = await_readonly_blocking(&cancellation, job).await;
+        assert_eq!(
+            settled.expect("settled inside the grace").expect("joined"),
+            7
+        );
+        assert!(
+            !admit_scan_mutation(&cancellation),
+            "a post-cancellation parser completion must not admit durable work"
+        );
+    }
+
+    /// Deterministic R2 regression: hold a real initial scan right after its
+    /// read-only parser settles, cancel while it is held, then release. The
+    /// admission boundary must refuse the upsert, so no track is written.
+    #[tokio::test]
+    async fn post_parse_cancellation_refuses_the_durable_upsert() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("post-parse-cancel");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join("present.wav"));
+
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let cancellation = CancellationToken::new();
+        let (hold, control) = ScanDiscoveryHold::controlling();
+        let forced_conversions = HashMap::new();
+        let authority_guards = HashMap::new();
+        let evidence_refreshes = HashMap::new();
+
+        let scan = initial_scan_with_control(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &forced_conversions,
+            &authority_guards,
+            &evidence_refreshes,
+            &refresh,
+            &cancellation,
+            &hold,
+        );
+        let driver = async {
+            // The traversal hold engages first; release it so the scan can
+            // reach the parser and settle.
+            control
+                .wait_until_reached(ScanDiscoveryStage::Traversal)
+                .await;
+            control.release(ScanDiscoveryStage::Traversal);
+            // The parser has settled with the window still open.
+            control
+                .wait_until_reached(ScanDiscoveryStage::PostParse)
+                .await;
+            // Shutdown arrives after the parse and before any durable
+            // mutation; the boundary must refuse the upsert.
+            cancellation.cancel();
+            control.release(ScanDiscoveryStage::PostParse);
+        };
+
+        let (scan_result, ()) = tokio::join!(scan, async {
+            tokio::time::timeout(Duration::from_secs(60), driver)
+                .await
+                .expect("scan must reach the post-parse hold");
+        });
+        scan_result.expect("cancelled scan returns cleanly");
+
+        let tracks = track::Entity::find().all(&db).await.expect("query tracks");
+        assert!(
+            tracks.is_empty(),
+            "a post-parse cancellation must not upsert: {tracks:?}"
+        );
+    }
+
+    /// Deterministic restart reconciliation: the durable work a cancelled scan
+    /// refused at the admission boundary is not lost — the next startup's scan
+    /// (fresh cancellation token, no discovery hold) finds the same file and
+    /// upserts it. The cancelled run must leave the persisted catalogue exactly
+    /// as the last committed transaction left it so the restart can reconcile.
+    #[tokio::test]
+    async fn restart_after_post_parse_cancellation_reconciles_the_track() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("post-parse-cancel-restart");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join("present.wav"));
+
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let cancellation = CancellationToken::new();
+        let (hold, control) = ScanDiscoveryHold::controlling();
+        let forced_conversions = HashMap::new();
+        let authority_guards = HashMap::new();
+        let evidence_refreshes = HashMap::new();
+
+        // ── First startup: cancel right after the parser settles. ──
+        let cancelled_scan = initial_scan_with_control(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &forced_conversions,
+            &authority_guards,
+            &evidence_refreshes,
+            &refresh,
+            &cancellation,
+            &hold,
+        );
+        let driver = async {
+            // The traversal hold engages first; release it so the scan can
+            // reach the parser and settle.
+            control
+                .wait_until_reached(ScanDiscoveryStage::Traversal)
+                .await;
+            control.release(ScanDiscoveryStage::Traversal);
+            // Shutdown arrives after the parse and before any durable
+            // mutation; the admission boundary must refuse the upsert.
+            control
+                .wait_until_reached(ScanDiscoveryStage::PostParse)
+                .await;
+            cancellation.cancel();
+            control.release(ScanDiscoveryStage::PostParse);
+        };
+        let (first_result, ()) = tokio::join!(cancelled_scan, async {
+            tokio::time::timeout(Duration::from_secs(60), driver)
+                .await
+                .expect("cancelled scan must reach the post-parse hold");
+        });
+        first_result.expect("cancelled scan returns cleanly");
+
+        let tracks = track::Entity::find().all(&db).await.expect("query tracks");
+        assert!(
+            tracks.is_empty(),
+            "the cancelled run must not upsert: {tracks:?}"
+        );
+
+        // ── Restart: a fresh scan with a live token must reconcile the track. ──
+        let restart_cancellation = CancellationToken::new();
+        initial_scan_shutdown_aware(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &refresh,
+            &restart_cancellation,
+            &ScanDiscoveryHold::none(),
+        )
+        .await
+        .expect("the restarting scan completes");
+
+        let restarted = track::Entity::find()
+            .all(&db)
+            .await
+            .expect("query tracks after restart");
+        assert_eq!(
+            restarted.len(),
+            1,
+            "the restart must upsert the previously refused track: {restarted:?}"
+        );
+        assert!(
+            restarted[0].file_path.ends_with("present.wav"),
+            "the reconciled track is the scanned file: {:?}",
+            restarted[0].file_path
+        );
+    }
+
+    /// Deterministic R1 regression: hold a real initial scan inside read-only
+    /// traversal, then admit a rating edit. The edit must settle while the
+    /// discovery step is still held, because command service is driven
+    /// independently of the scan's read-only work.
+    #[tokio::test]
+    async fn startup_services_an_admitted_rating_while_discovery_is_held() {
+        let db = rename_test_database().await;
+        // The rating target lives outside the scan root, so the scan can never
+        // race it and the root stays unenrolled (zero existing tracks).
+        let rating_path = std::env::temp_dir().join("tributary-held-rating.flac");
+        insert_rename_test_track(
+            &db,
+            "held-rating-track",
+            rating_path.to_string_lossy().as_ref(),
+            "Held",
+            0,
+        )
+        .await;
+        let directory = TestDirectory::new("startup-held-discovery");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join("present.wav"));
+
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let cancellation = CancellationToken::new();
+        let (hold, control) = ScanDiscoveryHold::controlling();
+        let mut completed = HashMap::new();
+
+        let engine = service_commands_while_scanning(
+            initial_scan_shutdown_aware(
+                &db,
+                &music_dirs,
+                &event_tx,
+                &refresh,
+                &cancellation,
+                &hold,
+            ),
+            &db,
+            &music_dirs,
+            &event_tx,
+            &command_rx,
+            &mut completed,
+            &refresh,
+        );
+        let driver = async {
+            control
+                .wait_until_reached(ScanDiscoveryStage::Traversal)
+                .await;
+            command_tx
+                .send(LibraryCommand::SetTrackRating {
+                    track_id: TrackId::new("held-rating-track").expect("valid track ID"),
+                    rating: Some(Rating::new(80).expect("valid rating")),
+                })
+                .await
+                .expect("admit the rating command");
+            // The rating update must settle *before* the held discovery is
+            // released; otherwise this receive never completes and the test
+            // deadlocks rather than passing.
+            loop {
+                let event = event_rx.recv().await.expect("event channel stays open");
+                if matches!(event, LibraryEvent::TrackRatingUpdated(_)) {
+                    break;
+                }
+            }
+            control.release(ScanDiscoveryStage::Traversal);
+            // The scan's own parse will engage the post-parse hold next; the
+            // rating has already settled, so let the whole scan finish rather
+            // than parking the engine on a hold nobody will release.
+            control.release(ScanDiscoveryStage::PostParse);
+        };
+
+        let (scan_result, ()) = tokio::join!(engine, async {
+            tokio::time::timeout(Duration::from_secs(60), driver)
+                .await
+                .expect("the held discovery must admit a settling command");
+        });
+        scan_result.expect("scan completes after the discovery hold is released");
+
+        let rated = track::Entity::find_by_id("held-rating-track")
+            .one(&db)
+            .await
+            .expect("query rated track")
+            .expect("rated track exists");
+        assert_eq!(rated.rating, Some(80));
+    }
+
+    /// Deterministic reserved-drain regression: a `Flush` admitted after an
+    /// earlier rating is acknowledged only once the held scan settles, so no
+    /// already-admitted command can be reported drained while discovery still
+    /// runs.
+    #[tokio::test]
+    async fn reserved_flush_drain_waits_for_held_discovery_to_settle() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("reserved-drain");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join("present.wav"));
+
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let cancellation = CancellationToken::new();
+        let (hold, control) = ScanDiscoveryHold::controlling();
+        let (flush_tx, flush_rx) = async_channel::bounded(1);
+        let mut completed = HashMap::new();
+
+        let engine = service_commands_while_scanning(
+            initial_scan_shutdown_aware(
+                &db,
+                &music_dirs,
+                &event_tx,
+                &refresh,
+                &cancellation,
+                &hold,
+            ),
+            &db,
+            &music_dirs,
+            &event_tx,
+            &command_rx,
+            &mut completed,
+            &refresh,
+        );
+        let driver = async {
+            control
+                .wait_until_reached(ScanDiscoveryStage::Traversal)
+                .await;
+            command_tx
+                .send(LibraryCommand::Flush {
+                    completion: flush_tx,
+                })
+                .await
+                .expect("admit the reserved flush");
+            // Let the engine observe the Flush and park on the held scan.
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                matches!(flush_rx.try_recv(), Err(async_channel::TryRecvError::Empty)),
+                "Flush must not be acknowledged while discovery is held"
+            );
+            control.release(ScanDiscoveryStage::Traversal);
+            // The scan's parse engages the post-parse hold on its way to
+            // settlement; release it too, or the drain being asserted here
+            // would never be acknowledged.
+            control.release(ScanDiscoveryStage::PostParse);
+            flush_rx
+                .recv()
+                .await
+                .expect("flush is acknowledged once the scan settles");
+        };
+
+        let (scan_result, ()) = tokio::join!(engine, async {
+            tokio::time::timeout(Duration::from_secs(60), driver)
+                .await
+                .expect("the reserved drain must settle once discovery is released");
+        });
+        scan_result.expect("scan completes after the discovery hold is released");
+        // The rating/Flush channel is still open at this point; closing it is
+        // not required because the engine returned at the Flush marker.
+        drop(command_tx);
+        let _ = event_rx.try_recv();
     }
 
     // ── Paired directory renames ────────────────────────────────────────
@@ -12498,31 +13210,31 @@ mod tests {
         let mut scans = vec![scan_root(directory.path().to_path_buf())];
         scans[0].content_authorized = true;
 
-        assert_eq!(
-            revalidate_scan_root_for_path(&audio_path, &mut scans)
+        assert!(matches!(
+            revalidate_scan_root_for_path(&audio_path, &mut scans, None)
                 .await
                 .expect("run initial authority task"),
-            (true, None)
-        );
+            RootRevalidation::Authorized
+        ));
         std::fs::write(
             root_identity_path(directory.path()),
             format!("{ROOT_IDENTITY_PREFIX}{}\n", Uuid::new_v4()),
         )
         .expect("replace root identity");
-        assert_eq!(
-            revalidate_scan_root_for_path(&audio_path, &mut scans)
+        assert!(matches!(
+            revalidate_scan_root_for_path(&audio_path, &mut scans, None)
                 .await
                 .expect("run changed authority task"),
-            (false, Some(directory.path().to_path_buf()))
-        );
+            RootRevalidation::Rejected(Some(root)) if root == directory.path()
+        ));
         assert!(!scans[0].content_authorized);
         assert!(!scans[0].reconciliation_authoritative);
-        assert_eq!(
-            revalidate_scan_root_for_path(&audio_path, &mut scans)
+        assert!(matches!(
+            revalidate_scan_root_for_path(&audio_path, &mut scans, None)
                 .await
                 .expect("skip disabled authority task"),
-            (false, None)
-        );
+            RootRevalidation::Rejected(None)
+        ));
     }
 
     #[test]

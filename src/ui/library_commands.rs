@@ -9,6 +9,13 @@
 //! finishes after admission closes is rejected. Playlist CRUD and
 //! filesystem-watcher mutations use separate boundaries and are not covered
 //! here.
+//!
+//! The FIFO is **bounded**. R9 showed that an initial scan holding read-only
+//! discovery could stall command service indefinitely, so ordinary admission
+//! is a finite budget: one slot is permanently reserved for the shutdown
+//! `Flush` marker and the rest bound how many admitted-but-unserviced commands
+//! may be retained. Producers observe an explicit [`CommandAdmissionOutcome`]
+//! instead of silently growing a backlog.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -16,6 +23,33 @@ use std::rc::Rc;
 use tokio_util::sync::CancellationToken;
 
 use crate::local::engine::LibraryCommand;
+
+/// Maximum admitted-but-unserviced library commands.
+///
+/// One slot is reserved for the terminal `Flush` marker, so this is also the
+/// hard ceiling on ordinary commands the engine may be behind by. It is far
+/// above any interactive burst (a rating gesture or a playback-history event)
+/// yet finite, which is what lets admission report overload instead of
+/// accumulating without bound while the scan holds read-only discovery.
+pub(super) const COMMAND_FIFO_CAPACITY: usize = 1024;
+
+/// Result of one producer's attempt to admit a command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CommandAdmissionOutcome {
+    /// The command is in the FIFO and will be serviced.
+    Accepted,
+    /// Shutdown closed admission; the command was not retained.
+    Closed,
+    /// The bounded FIFO is full; the command was not retained. The producer
+    /// must surface this to the user (or retry) rather than assume delivery.
+    Overloaded,
+}
+
+impl CommandAdmissionOutcome {
+    pub(super) fn is_accepted(self) -> bool {
+        matches!(self, Self::Accepted)
+    }
+}
 
 struct AdmissionInner {
     open: bool,
@@ -39,9 +73,12 @@ pub(super) struct LibraryCommandAdmission {
 }
 
 impl LibraryCommandAdmission {
-    /// Create an unbounded FIFO and its sole UI-side admission boundary.
+    /// Create a bounded FIFO and its sole UI-side admission boundary.
+    ///
+    /// One slot is reserved for the shutdown `Flush` marker so a saturated
+    /// ordinary backlog can never make graceful close impossible.
     pub(super) fn channel() -> (Self, async_channel::Receiver<LibraryCommand>) {
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = async_channel::bounded(COMMAND_FIFO_CAPACITY);
         (
             Self {
                 inner: Rc::new(RefCell::new(AdmissionInner {
@@ -68,10 +105,26 @@ impl LibraryCommandAdmission {
         self.inner.borrow().scan_cancellation.clone()
     }
 
-    /// Queue one ordinary mutation only while admission remains open.
-    pub(super) fn try_send(&self, command: LibraryCommand) -> bool {
+    /// Queue one ordinary mutation if admission is open and has capacity.
+    ///
+    /// The reserved shutdown slot is never consumed here, so `close_and_flush`
+    /// always has room for its terminal marker.
+    pub(super) fn try_send(&self, command: LibraryCommand) -> CommandAdmissionOutcome {
         let inner = self.inner.borrow();
-        inner.open && inner.tx.try_send(command).is_ok()
+        if !inner.open {
+            return CommandAdmissionOutcome::Closed;
+        }
+        let capacity = inner.tx.capacity().unwrap_or(COMMAND_FIFO_CAPACITY);
+        if inner.tx.len() >= capacity.saturating_sub(1) {
+            return CommandAdmissionOutcome::Overloaded;
+        }
+        if inner.tx.try_send(command).is_ok() {
+            CommandAdmissionOutcome::Accepted
+        } else {
+            // The only way a send fails after the capacity and open checks is a
+            // concurrently closed receiver. Treat it as shutdown.
+            CommandAdmissionOutcome::Closed
+        }
     }
 
     /// Atomically close ordinary admission, cancel the initial scan, and append
@@ -93,6 +146,8 @@ impl LibraryCommandAdmission {
         }
         inner.open = false;
         inner.scan_cancellation.cancel();
+        // The reserved slot makes this send succeed even when ordinary
+        // admission is saturated.
         inner
             .tx
             .try_send(LibraryCommand::Flush { completion })
@@ -128,7 +183,9 @@ mod tests {
         // command queued; the scan is not cancelled until close.
         let scan_token = admission.scan_cancellation();
         assert!(!scan_token.is_cancelled());
-        assert!(admission.try_send(rating_command("rating-open", Some(10))));
+        assert!(admission
+            .try_send(rating_command("rating-open", Some(10)))
+            .is_accepted());
         assert!(!scan_token.is_cancelled());
 
         let (completion_tx, _completion_rx) = async_channel::bounded(1);
@@ -141,16 +198,76 @@ mod tests {
     }
 
     #[test]
+    fn admission_reports_overload_without_consuming_the_shutdown_slot() {
+        let (admission, rx) = LibraryCommandAdmission::channel();
+
+        // Fill every ordinary slot; the last slot stays reserved for Flush.
+        let ordinary_capacity = COMMAND_FIFO_CAPACITY - 1;
+        for index in 0..ordinary_capacity {
+            assert_eq!(
+                admission.try_send(rating_command(&format!("rating-{index}"), Some(1))),
+                CommandAdmissionOutcome::Accepted,
+            );
+        }
+
+        // One more ordinary command is an explicit overload, not a silent
+        // unbounded enqueue.
+        assert_eq!(
+            admission.try_send(rating_command("rating-overflow", Some(2))),
+            CommandAdmissionOutcome::Overloaded,
+        );
+
+        // Shutdown still gets its reserved slot and its marker.
+        let (completion_tx, completion_rx) = async_channel::bounded(1);
+        assert!(admission.close_and_flush(completion_tx));
+        assert!(!admission.is_open());
+        assert_eq!(
+            admission.try_send(rating_command("rating-after-close", None)),
+            CommandAdmissionOutcome::Closed,
+        );
+
+        // Drain the ordinary commands, then the reserved marker.
+        for _ in 0..ordinary_capacity {
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(LibraryCommand::SetTrackRating { .. })
+            ));
+        }
+        let completion = match rx.try_recv() {
+            Ok(LibraryCommand::Flush { completion }) => completion,
+            other => panic!("expected the reserved FIFO flush, got {other:?}"),
+        };
+        assert!(matches!(
+            rx.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
+        completion
+            .try_send(())
+            .expect("acknowledge the reserved flush");
+        completion_rx
+            .try_recv()
+            .expect("flush acknowledgment reaches shutdown waiter");
+    }
+
+    #[test]
     fn close_rejects_post_marker_work_while_flush_is_pending() {
         let (admission, rx) = LibraryCommandAdmission::channel();
-        assert!(admission.try_send(rating_command("rating-before-close", Some(72))));
-        assert!(admission.try_send(history_command("history-before-close", 1)));
+        assert!(admission
+            .try_send(rating_command("rating-before-close", Some(72)))
+            .is_accepted());
+        assert!(admission
+            .try_send(history_command("history-before-close", 1))
+            .is_accepted());
 
         let (completion_tx, completion_rx) = async_channel::bounded(1);
         assert!(admission.close_and_flush(completion_tx));
         assert!(!admission.is_open());
-        assert!(!admission.try_send(rating_command("rating-after-close", None)));
-        assert!(!admission.try_send(history_command("history-after-close", 2)));
+        assert!(!admission
+            .try_send(rating_command("rating-after-close", None))
+            .is_accepted());
+        assert!(!admission
+            .try_send(history_command("history-after-close", 2))
+            .is_accepted());
         assert!(matches!(
             completion_rx.try_recv(),
             Err(async_channel::TryRecvError::Empty)
@@ -176,8 +293,12 @@ mod tests {
             Err(async_channel::TryRecvError::Empty)
         ));
         assert!(!admission.close_and_flush(async_channel::bounded(1).0));
-        assert!(!admission.try_send(rating_command("rating-still-closed", Some(50))));
-        assert!(!admission.try_send(history_command("history-still-closed", 3)));
+        assert!(!admission
+            .try_send(rating_command("rating-still-closed", Some(50)))
+            .is_accepted());
+        assert!(!admission
+            .try_send(history_command("history-still-closed", 3))
+            .is_accepted());
         assert!(matches!(
             rx.try_recv(),
             Err(async_channel::TryRecvError::Empty)

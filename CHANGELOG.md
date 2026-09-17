@@ -86,6 +86,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Initial scan no longer delays commands or window close** (`src/local/engine.rs`,
+  `src/ui/library_commands.rs`, `src/ui/tracklist.rs`, `src/ui/root_trust.rs`,
+  `src/ui/rhythmbox_migration.rs`, `src/ui/window.rs`) — The engine awaited the
+  whole initial traversal/parse before servicing any UI command, so a slow or
+  stalled filesystem operation could hold a rating or playback-history edit
+  until the window closed, and the command FIFO was unbounded. Admitted
+  commands are now serviced *while* the scan runs (both branches share one
+  engine task, so catalogue mutations stay serialized), the FIFO is bounded
+  with an explicitly reported overload outcome and a reserved shutdown slot for
+  the `Flush` marker, and the reserved close drain waits for the scan to settle
+  before acknowledging. Cancellation gained an explicit durable-mutation
+  admission boundary: a read-only parser that settles inside its shutdown grace
+  can no longer start a new upsert and its unbounded authority probes, and
+  pre-deletion authority probes are bounded too. A cancelled scan still fails
+  closed, preserving the incomplete-scan/no-deletion semantics.
 - **Chromecast control saturation** (`src/audio/chromecast_output.rs`) — A slow
   but responsive Cast receiver could previously lose the final seek or volume
   intent when the bounded worker ingress saturated: the oldest transient
