@@ -1469,11 +1469,6 @@ struct SessionInner {
     /// the same lock (refinery R11: an accepted pause must never turn an
     /// older `play` sample into a completed, restored item).
     control_epoch: AtomicU64,
-    /// The control epoch at which the most recent `Playing` was published
-    /// under the boundary. The pump's startup publication (refinery R13) is
-    /// admitted only while `control_epoch` still equals it: any control
-    /// accepted since — a pause, above all — has made that start history.
-    playing_epoch: AtomicU64,
     /// The session's **terminal** flag. Set under [`Self::mutation_lock`] at
     /// the start of [`Self::restore`], i.e. *before* the daemon is restored, so
     /// the terminal transition and any concurrent control transmission are one
@@ -1619,10 +1614,7 @@ impl SessionInner {
                         // (see `Self::autostart_lost`).
                         self.autostart_lost.store(true, Ordering::SeqCst);
                     }
-                    let epoch = self.control_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-                    if state == PlayerState::Playing {
-                        self.playing_epoch.store(epoch, Ordering::SeqCst);
-                    }
+                    self.control_epoch.fetch_add(1, Ordering::SeqCst);
                 }
                 Ok(())
             }
@@ -1646,30 +1638,6 @@ impl SessionInner {
                 Err(error)
             }
         }
-    }
-
-    /// Publish the start state for a successful [`Self::activate_and_play`]
-    /// under the settlement boundary, so a terminal transition can never
-    /// interleave between the accepted start and its `Playing` publication
-    /// (review X1). Returns `None` — publishing nothing — once the session is
-    /// terminal, because no `Playing` may follow a terminal
-    /// `Stopped`/`TrackEnded`.
-    fn publish_start_if_live(&self) -> Option<PlayerState> {
-        let _boundary = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
-        if self.terminal.load(Ordering::SeqCst) {
-            return None;
-        }
-        // The start this republishes was accepted at `playing_epoch`. A
-        // control accepted since then (a pause the command worker took while
-        // the pump was descheduled, refinery R13) wins permanently: republish
-        // nothing rather than overwrite `Paused` with a `Playing` the daemon
-        // is no longer in.
-        if self.control_epoch.load(Ordering::SeqCst) != self.playing_epoch.load(Ordering::SeqCst) {
-            return None;
-        }
-        self.gate
-            .publish_if_live(|| self.publish_state(PlayerState::Playing))
-            .then_some(PlayerState::Playing)
     }
 
     /// Run a caller-supplied publication (the worker's own cache/event write)
@@ -2146,12 +2114,17 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
         return;
     };
 
-    // Activation started the pipeline and confirmed daemon playback while
-    // holding the shared first-effect boundary. Never restart it here: Stop
-    // may already have won after activation released that boundary.
+    // Activation started the pipeline, confirmed daemon playback and
+    // published `Playing` while holding the shared first-effect boundary.
+    // Never restart it here — Stop may already have won after activation
+    // released that boundary — and never republish it: the pump has no
+    // control state of its own, so a late `Playing` from here could only
+    // overwrite a control the command worker has accepted since (refinery
+    // R13). The test-only park below marks the point where that
+    // republication used to run, so a regression can prove nothing is
+    // published here across an accepted pause.
     #[cfg(test)]
     park_at_sentinel(&inner, "park-startup", "startup-parked", "startup-release");
-    let _ = inner.publish_start_if_live();
 
     let mut last_position = Instant::now();
     let duration_ms = pipeline
@@ -3169,7 +3142,6 @@ fn start_session(
         restored: AtomicBool::new(false),
         autostart_lost: AtomicBool::new(false),
         control_epoch: AtomicU64::new(0),
-        playing_epoch: AtomicU64::new(0),
         terminal: AtomicBool::new(false),
         mutation_lock: Mutex::new(()),
         unsettled: AtomicUsize::new(0),
@@ -4800,7 +4772,6 @@ mod tests {
             restored: AtomicBool::new(false),
             autostart_lost: AtomicBool::new(false),
             control_epoch: AtomicU64::new(0),
-            playing_epoch: AtomicU64::new(0),
             terminal: AtomicBool::new(false),
             mutation_lock: Mutex::new(()),
             unsettled: AtomicUsize::new(0),
@@ -4843,7 +4814,6 @@ mod tests {
             restored: AtomicBool::new(false),
             autostart_lost: AtomicBool::new(false),
             control_epoch: AtomicU64::new(0),
-            playing_epoch: AtomicU64::new(0),
             terminal: AtomicBool::new(false),
             mutation_lock: Mutex::new(()),
             unsettled: AtomicUsize::new(0),
@@ -4921,7 +4891,6 @@ mod tests {
             restored: AtomicBool::new(false),
             autostart_lost: AtomicBool::new(false),
             control_epoch: AtomicU64::new(0),
-            playing_epoch: AtomicU64::new(0),
             terminal: AtomicBool::new(false),
             mutation_lock: Mutex::new(()),
             unsettled: AtomicUsize::new(0),
@@ -5723,18 +5692,23 @@ mod tests {
 
     // ----- X1: control/start publication is serialized with the terminal transition -----
 
-    /// X1: the start-state publication is taken under the settlement boundary.
-    /// Before the terminal transition it is live and publishes `Playing`; after
-    /// the transition it publishes nothing, because no `Playing` may follow the
-    /// terminal state. A bare `terminal` check outside the boundary would leave
-    /// a fresh check-to-effect race between the check and the publication.
+    /// X1: the start-state publication (the worker's `confirm_started`, run
+    /// through [`SessionInner::publish_under_boundary`]) is taken under the
+    /// settlement boundary. Before the terminal transition it is live and
+    /// publishes `Playing`; after the transition it publishes nothing, because
+    /// no `Playing` may follow the terminal state. A bare `terminal` check
+    /// outside the boundary would leave a fresh check-to-effect race between
+    /// the check and the publication. (The pump's own republication of the
+    /// start is gone — refinery R13 — so this is the only start publication
+    /// after activation.)
     #[test]
     fn a_start_publication_after_the_terminal_transition_publishes_nothing() {
         let directory = tempfile::tempdir().expect("tempdir");
         let (tx, rx) = async_channel::unbounded();
         let inner = test_session_inner_with_events(directory.path(), tx);
+        let mut publish = |state: PlayerState| inner.publish_state(state);
 
-        assert_eq!(inner.publish_start_if_live(), Some(PlayerState::Playing));
+        assert!(inner.publish_under_boundary(&mut publish));
         assert!(matches!(
             rx.try_recv(),
             Ok(PlayerEvent::StateChanged {
@@ -5748,7 +5722,7 @@ mod tests {
         assert!(inner.restore().is_err());
         assert!(inner.terminal.load(Ordering::SeqCst));
 
-        assert_eq!(inner.publish_start_if_live(), None);
+        assert!(!inner.publish_under_boundary(&mut publish));
         assert!(
             rx.try_recv().is_err(),
             "no start state may follow the terminal transition"
@@ -8425,9 +8399,10 @@ fn serve(stream: std::net::TcpStream) {
     }
 
     /// R13 (pump path): activation confirmed daemon playback and published
-    /// `Playing`; the pump is parked before its own startup publication; the
-    /// command worker accepts a pause meanwhile. Releasing the pump must not
-    /// republish `Playing` over the accepted `Paused`: the daemon stays paused,
+    /// `Playing`; the pump is parked at the point where it used to republish
+    /// that start; the command worker accepts a pause meanwhile. Releasing
+    /// the pump must publish nothing over the accepted `Paused` (the
+    /// republication is gone; this guards its return): the daemon stays paused,
     /// the controller cache stays paused, resume still works, and Stop settles
     /// with generation-correct events and no duplicate terminal event.
     #[cfg(owntone_host)]
@@ -11310,7 +11285,6 @@ fn serve(stream: std::net::TcpStream, fail: Option<String>) {
                 restored: AtomicBool::new(false),
                 autostart_lost: AtomicBool::new(false),
                 control_epoch: AtomicU64::new(0),
-                playing_epoch: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 mutation_lock: Mutex::new(()),
                 unsettled: AtomicUsize::new(0),
