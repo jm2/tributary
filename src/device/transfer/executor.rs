@@ -349,7 +349,7 @@ impl TransferExecutor {
             .map_err(|error| {
                 StageFailure::Final(TransferError::io("failed to stage destination file", error))
             })?;
-        Self::copy_and_commit_staged(staged, declared_bytes, stage_index, context, source_file)
+        self.copy_and_commit_staged(staged, declared_bytes, stage_index, context, source_file)
             .map(Some)
     }
 
@@ -360,7 +360,21 @@ impl TransferExecutor {
     /// but failed its post-publish verification is reported as a final
     /// failure with the outcome recorded first, so rollback can undo the
     /// committed bytes.
+    ///
+    /// The source authority is revalidated AFTER the publish, mirroring the
+    /// destination authority's trailing revalidation: a retained source
+    /// descriptor keeps serving bytes to EOF even after its root is renamed
+    /// aside and a replacement directory takes the old name, so without a
+    /// publication-boundary check a source lease lost during
+    /// `on_bytes_copied` would still produce `completed = true`. The check
+    /// runs on every publish attempt, so the Preserve/Overwrite collision
+    /// retry paths revalidate too. When it fails the publish has already
+    /// landed, so the actual `CommitOutcome` is recorded before the failure
+    /// surfaces — rollback must be able to remove (fresh/preserved) or
+    /// restore (overwrite) exactly what landed, and an outcome dropped
+    /// behind a wrapper-level error could never be undone.
     fn copy_and_commit_staged(
+        &self,
         staged: PreparedWriteTarget,
         declared_bytes: u64,
         stage_index: u32,
@@ -389,7 +403,22 @@ impl TransferExecutor {
         let staged = Self::flush_and_verify_size(staged, declared_bytes, copied)
             .map_err(StageFailure::Final)?;
         match staged.commit() {
-            Ok(outcome) => Ok(outcome),
+            Ok(outcome) => {
+                // The publish landed. The source authority now gets the
+                // post-publication revalidation the destination authority
+                // already performs inside `commit`: a source root renamed
+                // aside (or vanished) during the copy must not report
+                // success just because the retained descriptor kept
+                // serving bytes. Record the actual outcome FIRST, so
+                // rollback can reverse exactly what landed, then fail.
+                if let Err(error) = self.request.source.validate() {
+                    context.committed.push(owned_change_for_copy(outcome));
+                    return Err(StageFailure::Final(TransferError::authority(format!(
+                        "source not current at publication: {error}"
+                    ))));
+                }
+                Ok(outcome)
+            }
             Err(CommitError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
                 context.bytes_so_far = bytes_before_attempt;
                 context.progress.on_bytes_copied(
@@ -571,7 +600,7 @@ impl TransferExecutor {
             .destination
             .prepare_write_relative_file(destination_relative, policy)
             .map_err(|error| TransferError::io(stage_context, error))?;
-        Self::copy_and_commit_staged(staged, declared_bytes, stage_index, context, source_file)
+        self.copy_and_commit_staged(staged, declared_bytes, stage_index, context, source_file)
             .map(Some)
             .map_err(|failure| match failure {
                 StageFailure::Final(error) => error,
