@@ -1357,20 +1357,29 @@ fn capture_local_selection_evidence(path: &Path) -> std::io::Result<LocalSelecti
     })
 }
 
-/// Re-label a local write failure as a localized conflict when the retained
-/// source object's revision changed while the commit was running.
+/// Re-label a local write failure as the localized conflict it represents.
 ///
-/// The commit's own revision gate refuses an in-place edit with a generic
-/// authority error. Re-reading the exact retained handle after the failure
-/// distinguishes that case from an ordinary I/O failure and reports it as the
-/// conflict the dialog can explain: the competing edit was preserved and the
-/// user must reopen Properties. On a successful commit the target is
-/// re-anchored, so this only ever runs on the failure path.
+/// A commit fails when a competing writer replaced the admitted file (the leaf
+/// no longer names that object) or edited it in place (the retained handle's
+/// revision changed) while the save was running. Both are the conflict the
+/// dialog explains: the competing file/update was preserved and the user must
+/// reopen Properties. Re-proving the retained target's leaf binding and content
+/// revision after the failure distinguishes them from an ordinary I/O failure.
+/// On a successful commit the target is re-anchored, so this only ever runs on
+/// the failure path.
 fn classify_local_write_failure(
     target: &MountedMutationTarget,
     evidence: &LocalSelectionEvidence,
     error: anyhow::Error,
 ) -> anyhow::Error {
+    // A leaf that no longer names the admitted object was replaced (or removed)
+    // during the commit. This is checked before the revision comparison because
+    // a replacement can leave the retained handle's own revision untouched —
+    // the displaced object was never edited — so the comparison below would
+    // otherwise miss it and surface a generic failure instead.
+    if target.confirm_leaf_names_admitted_object().is_err() {
+        return conflict_error(LocalTagWriteConflict::TargetReplaced);
+    }
     match target.content_revision() {
         Ok(current) if current != evidence.revision => {
             conflict_error(LocalTagWriteConflict::TargetEdited)
@@ -2823,9 +2832,10 @@ mod tests {
                 *swapped_closure.lock().unwrap() = true;
             }),
             || {
-                target
+                let error = target
                     .write_tags(&year("2026"))
                     .expect_err("a mid-commit replacement must refuse");
+                assert_eq!(conflict_of(&error), LocalTagWriteConflict::TargetReplaced);
             },
         );
 
