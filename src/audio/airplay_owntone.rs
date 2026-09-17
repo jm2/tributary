@@ -20,7 +20,7 @@
 
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1460,6 +1460,15 @@ struct SessionInner {
     /// from stalled progress instead of waiting for the daemon's `stop`
     /// ([`CompletionTracker`]). Never cleared.
     autostart_lost: AtomicBool,
+    /// The session's **control epoch**: the count of accepted control
+    /// transitions (`pause`/`play`) published under [`Self::mutation_lock`].
+    /// A completion observation is bound to the epoch it was sampled under;
+    /// an observation that a transition overtook while it was in flight
+    /// describes a state the user has already left and proves nothing, and
+    /// the decision to enter terminal restoration re-validates the epoch under
+    /// the same lock (refinery R11: an accepted pause must never turn an
+    /// older `play` sample into a completed, restored item).
+    control_epoch: AtomicU64,
     /// The session's **terminal** flag. Set under [`Self::mutation_lock`] at
     /// the start of [`Self::restore`], i.e. *before* the daemon is restored, so
     /// the terminal transition and any concurrent control transmission are one
@@ -1597,6 +1606,15 @@ impl SessionInner {
                     if !self.gate.publish_if_live(|| self.publish_state(state)) {
                         return Err(unavailable("the AirPlay session was stopped"));
                     }
+                    // The accepted transition and everything the drain wait
+                    // derives from it are one decision under this boundary.
+                    if state == PlayerState::Paused {
+                        // The daemon's pipe input stopped: the item is no
+                        // longer autostarted and will not autostop at EOF
+                        // (see `Self::autostart_lost`).
+                        self.autostart_lost.store(true, Ordering::SeqCst);
+                    }
+                    self.control_epoch.fetch_add(1, Ordering::SeqCst);
                 }
                 Ok(())
             }
@@ -1725,6 +1743,30 @@ impl SessionInner {
         #[cfg(test)]
         self.note_restore_attempt();
         let _boundary = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.restore_locked()
+    }
+
+    /// Restore for a natural completion decided under control epoch `epoch`.
+    /// The epoch is re-validated under the settlement boundary, atomically
+    /// with the decision to latch `terminal`: a control transition accepted
+    /// since the deciding observation (an accepted pause, or a pause/resume
+    /// pair) makes that completion void — the drain wait resumes — instead of
+    /// restoring and reporting `TrackEnded` for an item the user just paused
+    /// (refinery R11).
+    fn restore_completion(&self, epoch: u64) -> Result<(), CompletionRestore> {
+        #[cfg(test)]
+        self.note_restore_attempt();
+        let _boundary = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let paused = *self.state.lock().unwrap_or_else(|p| p.into_inner()) == PlayerState::Paused;
+        if self.control_epoch.load(Ordering::SeqCst) != epoch || paused {
+            return Err(CompletionRestore::Superseded);
+        }
+        self.restore_locked().map_err(CompletionRestore::Failed)
+    }
+
+    /// Shared body of [`Self::restore`] and [`Self::restore_completion`];
+    /// the caller holds [`Self::mutation_lock`].
+    fn restore_locked(&self) -> Result<(), SenderError> {
         // Terminal transition, taken under the settlement boundary **before**
         // any restoring RPC. This is what makes "this session is finished" and
         // "a control may transmit" one ordered decision instead of a
@@ -1781,6 +1823,13 @@ impl SessionInner {
             Err(error) => Err(error),
         }
     }
+}
+
+/// Why a natural completion did not restore.
+enum CompletionRestore {
+    /// A control transition was accepted after the deciding observation.
+    Superseded,
+    Failed(SenderError),
 }
 
 /// Restore the dedicated daemon to the state recorded before takeover and
@@ -2217,6 +2266,14 @@ impl CompletionTracker {
         }
     }
 
+    /// Forget every sample: a control transition was accepted, so no stall
+    /// interval measured before it may carry over.
+    fn reset(&mut self) {
+        self.last_state.clear();
+        self.last_progress = None;
+        self.unchanged_since = None;
+    }
+
     /// `stall_completes` is whether stalled progress may complete the item:
     /// true only once the daemon's autostart binding was lost (a pause was
     /// accepted). It is read afresh on every observation because a pause can
@@ -2258,45 +2315,89 @@ impl CompletionTracker {
     }
 }
 
-/// Poll the daemon — bounded by [`DRAIN_DEADLINE`] — until the item counts as
-/// completed per [`CompletionTracker`]. `Ok(None)` is completion,
-/// `Ok(Some(reason))` a terminal failure, and `Err(())` a cancellation
-/// observed while waiting.
-fn await_daemon_completion(inner: &SessionInner) -> Result<Option<&'static str>, ()> {
+/// The outcome of one bounded drain wait.
+enum DrainOutcome {
+    /// The item completed under the control epoch its deciding observation
+    /// was sampled in; restoration must re-validate that epoch.
+    Completed {
+        epoch: u64,
+    },
+    Failed(&'static str),
+}
+
+/// Poll the daemon — until `deadline` — until the item counts as completed per
+/// [`CompletionTracker`]. Every observation is bound to the control epoch it
+/// was sampled under: the epoch and the autostart flag are read **before** the
+/// request, and an epoch that moved while the request was in flight discards
+/// the sample and the stall clock (a pause accepted meanwhile has made the
+/// sampled state history; the flag it set must never apply to it). `Err(())`
+/// is a cancellation observed while waiting.
+fn await_daemon_completion(inner: &SessionInner, deadline: Instant) -> Result<DrainOutcome, ()> {
     let cancelled = || {
         inner.cancel.is_cancelled()
             || inner.gate.is_stopped()
             || !inner.running.load(Ordering::SeqCst)
     };
-    let deadline = Instant::now() + DRAIN_DEADLINE;
     let mut tracker = CompletionTracker::new();
     loop {
         if cancelled() {
             return Err(());
         }
+        let epoch = inner.control_epoch.load(Ordering::SeqCst);
+        let stall_completes = inner.autostart_lost.load(Ordering::SeqCst);
         let observation = inner.client.player_progress();
         // A bounded HTTP observation may have been in flight when Stop won.
         // Its success, error or timeout is no longer a playback outcome.
         if cancelled() {
             return Err(());
         }
-        match observation {
-            Ok((state, progress)) => {
-                // Read after the observation: a pause accepted while it was in
-                // flight is then visible for this very observation, and a
-                // resume (which serialises behind that pause on the command
-                // worker) can never be observed under a stale flag.
-                let stall_completes = inner.autostart_lost.load(Ordering::SeqCst);
-                if tracker.observe(&state, progress, Instant::now(), stall_completes) {
-                    return Ok(None);
+        if inner.control_epoch.load(Ordering::SeqCst) != epoch {
+            tracker.reset();
+        } else {
+            match observation {
+                Ok((state, progress)) => {
+                    if tracker.observe(&state, progress, Instant::now(), stall_completes) {
+                        return Ok(DrainOutcome::Completed { epoch });
+                    }
+                }
+                Err(_) => {
+                    return Ok(DrainOutcome::Failed(
+                        "AirPlay completion could not be confirmed",
+                    ))
                 }
             }
-            Err(_) => return Ok(Some("AirPlay completion could not be confirmed")),
         }
         if Instant::now() >= deadline {
-            return Ok(Some("AirPlay completion timed out"));
+            return Ok(DrainOutcome::Failed("AirPlay completion timed out"));
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Wait for the item to complete and restore the daemon. `Err(())` is a
+/// cancellation observed while waiting (close() owns restoration then);
+/// `Ok(None)` a completed and restored item; `Ok(Some(reason))` a terminal
+/// failure. A completion whose epoch restoration finds superseded is void:
+/// the wait resumes, still bounded by the original drain deadline.
+fn drain_and_restore(inner: &SessionInner) -> Result<Option<&'static str>, ()> {
+    let deadline = Instant::now() + DRAIN_DEADLINE;
+    loop {
+        match await_daemon_completion(inner, deadline)? {
+            DrainOutcome::Failed(reason) => {
+                // Restoration may block, so it must remain outside the Stop
+                // gate. Failed restoration retains custody for close()'s
+                // serialized recovery; the drain failure is the reported one.
+                let _ = inner.restore();
+                return Ok(Some(reason));
+            }
+            DrainOutcome::Completed { epoch } => match inner.restore_completion(epoch) {
+                Ok(()) => return Ok(None),
+                Err(CompletionRestore::Superseded) => {}
+                Err(CompletionRestore::Failed(_)) => {
+                    return Ok(Some("AirPlay restoration failed"));
+                }
+            },
+        }
     }
 }
 
@@ -2322,13 +2423,9 @@ fn natural_completion(inner: &SessionInner, pipeline: &gst::Pipeline) {
     }
     // On cancellation, close() owns restoration/recovery after joining this
     // pump. Keep its route and instance lock until that settlement completes.
-    let Ok(failure) = await_daemon_completion(inner) else {
+    let Ok(failure) = drain_and_restore(inner) else {
         return;
     };
-    // Restoration may block, so it must remain outside the Stop gate. Failed
-    // restoration retains custody for close()'s serialized recovery.
-    let restored = inner.restore();
-    let failure = failure.or_else(|| restored.err().map(|_| "AirPlay restoration failed"));
     // Deterministically expose the restore-to-publication gap to real-pump
     // controller regressions; this adds no production synchronization.
     #[cfg(test)]
@@ -2394,8 +2491,9 @@ impl SenderSession for OwnToneSession {
     }
 
     fn pause(&mut self) -> bool {
-        let paused = self
-            .inner
+        // An accepted pause is published, marks the autostart binding lost and
+        // advances the control epoch as one decision under the boundary.
+        self.inner
             .transmit_under_boundary(
                 || {
                     // Idle the writer before the daemon resets its reader.
@@ -2405,14 +2503,7 @@ impl SenderSession for OwnToneSession {
                 Some(PlayerState::Paused),
                 true,
             )
-            .is_ok();
-        if paused {
-            // The daemon's pipe input stopped: the item is no longer
-            // autostarted and will not autostop at EOF (see
-            // `SessionInner::autostart_lost`).
-            self.inner.autostart_lost.store(true, Ordering::SeqCst);
-        }
-        paused
+            .is_ok()
     }
 
     fn resume(&mut self) -> bool {
@@ -2975,6 +3066,7 @@ fn start_session(
         cancel: ctx.cancel.clone(),
         restored: AtomicBool::new(false),
         autostart_lost: AtomicBool::new(false),
+        control_epoch: AtomicU64::new(0),
         terminal: AtomicBool::new(false),
         mutation_lock: Mutex::new(()),
         unsettled: AtomicUsize::new(0),
@@ -4196,6 +4288,21 @@ mod tests {
         assert!(tracker.observe("play", Some(300), t0 + stall * 4, true));
     }
 
+    /// A reset forgets the stall clock: the next stalled sample starts over.
+    #[test]
+    fn completion_tracker_reset_forgets_the_stall_clock() {
+        let t0 = Instant::now();
+        let stall = COMPLETION_PROGRESS_STALL;
+        let mut tracker = CompletionTracker::new();
+        assert!(!tracker.observe("play", Some(500), t0, true));
+        tracker.reset();
+        assert!(
+            !tracker.observe("play", Some(500), t0 + stall * 2, true),
+            "a pre-reset sample must not count towards the stall"
+        );
+        assert!(tracker.observe("play", Some(500), t0 + stall * 3, true));
+    }
+
     /// R10: the autostart binding can be lost while the drain wait is already
     /// running (a pause accepted after the writer closed). The tracker must
     /// act on the flag as it is now, not as it was when the wait began: the
@@ -4563,6 +4670,7 @@ mod tests {
             cancel: OpenCancel::new(),
             restored: AtomicBool::new(false),
             autostart_lost: AtomicBool::new(false),
+            control_epoch: AtomicU64::new(0),
             terminal: AtomicBool::new(false),
             mutation_lock: Mutex::new(()),
             unsettled: AtomicUsize::new(0),
@@ -4604,6 +4712,7 @@ mod tests {
             cancel: OpenCancel::new(),
             restored: AtomicBool::new(false),
             autostart_lost: AtomicBool::new(false),
+            control_epoch: AtomicU64::new(0),
             terminal: AtomicBool::new(false),
             mutation_lock: Mutex::new(()),
             unsettled: AtomicUsize::new(0),
@@ -4680,6 +4789,7 @@ mod tests {
             cancel: OpenCancel::new(),
             restored: AtomicBool::new(false),
             autostart_lost: AtomicBool::new(false),
+            control_epoch: AtomicU64::new(0),
             terminal: AtomicBool::new(false),
             mutation_lock: Mutex::new(()),
             unsettled: AtomicUsize::new(0),
@@ -7005,7 +7115,9 @@ fn serve(stream: std::net::TcpStream) {
         }
         let answer = std::fs::read_to_string(pipe.with_extension("drain-release")).unwrap();
         std::fs::write(pipe.with_extension("drain-replied"), "").unwrap();
-        let body = format!(r#"{{"state":"{}"}}"#, answer);
+        // A JSON object is served verbatim (a parked sample with progress).
+        let body = if answer.trim_start().starts_with('{') { answer.trim().to_string() }
+            else { format!(r#"{{"state":"{}"}}"#, answer) };
         let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
         let mut stream = stream;
         let _ = stream.write_all(response.as_bytes());
@@ -8023,7 +8135,20 @@ fn serve(stream: std::net::TcpStream) {
         // Let the daemon read again: the pipe is dry and no longer
         // autostarted, so its progress stalls under `play`.
         std::fs::remove_file(&stall).unwrap();
+        assert_single_natural_completion(&fixture, &ticket, generation, &baseline);
+    }
 
+    /// The item completes exactly once after a resume: one generation-correct
+    /// `TrackEnded`, no `Error`, no play/pause after the terminal event, the
+    /// outputs restored, no takeover record, a released route and a free lock.
+    #[cfg(owntone_host)]
+    fn assert_single_natural_completion(
+        fixture: &DaemonControllerFixture,
+        ticket: &GstreamerMediaTicket,
+        generation: PlayerEventGeneration,
+        baseline: &[OwnToneOutput],
+    ) {
+        let controller = &fixture.controller;
         let mut events = Vec::new();
         wait_until_within(Duration::from_secs(20), || {
             events.extend(fixture.drain_events());
@@ -8038,7 +8163,7 @@ fn serve(stream: std::net::TcpStream) {
             !events
                 .iter()
                 .any(|event| matches!(event, PlayerEvent::Error { .. })),
-            "a pause after the writer closed must not fail the item: {events:?}"
+            "the item must complete, not fail: {events:?}"
         );
         assert_eq!(
             events
@@ -8066,9 +8191,82 @@ fn serve(stream: std::net::TcpStream) {
             )),
             "no play/pause may follow the terminal TrackEnded: {events:?}"
         );
-        assert_outputs_match(client, &baseline);
+        assert_outputs_match(&fixture.client, baseline);
         assert!(!fixture.daemon.config.takeover_record().exists());
         assert!(fixture.lock_is_free());
+    }
+
+    /// R11: a playing sample taken before a pause is history once the pause
+    /// is accepted. The recording daemon parks the drain wait's next
+    /// observation; the controller pauses while it is parked; the parked
+    /// reply is then released as the stale `play` sample it is (same stalled
+    /// progress as the samples before it). The session must stay paused with
+    /// no completion and no restoration; after a resume and drain the item
+    /// completes exactly once.
+    #[cfg(owntone_host)]
+    #[test]
+    fn a_stale_playing_observation_never_completes_a_paused_item() {
+        let fixture = DaemonControllerFixture::start_brief(40 * 1024);
+        let controller = &fixture.controller;
+        let client = &fixture.client;
+        let pipe = &fixture.daemon.config.pipe_path;
+        let stall = pipe.with_extension("stall");
+        let baseline = client.outputs().unwrap();
+        std::fs::write(&stall, b"").unwrap();
+        let prepared = fixture.prepare();
+        let ticket = prepared.ticket().unwrap();
+        let generation = PlayerEventGeneration::from_raw(49);
+        controller.set_generation(generation);
+        controller.load(generation, prepared);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        wait_until(
+            || matches!(client.player_progress(), Ok((ref s, Some(p))) if s == "play" && p > 0),
+        );
+        // The writer is closed and the drain wait has sampled `play` at the
+        // stalled progress at least once.
+        std::thread::sleep(Duration::from_millis(500));
+        let (_, progress) = client.player_progress().unwrap();
+        let progress = progress.expect("stalled progress");
+
+        // Park the next observation, pause while it is parked, then release it
+        // as the pre-pause sample it is.
+        std::fs::write(pipe.with_extension("drain-started"), b"").unwrap();
+        wait_until(|| pipe.with_extension("drain-seen").exists());
+        controller.pause();
+        wait_until(|| controller.state() == PlayerState::Paused);
+        // Release it only once a full stall interval has passed since the
+        // fresh samples before it: combined with the eligibility the pause
+        // created, this is exactly the sample that used to complete the item.
+        std::thread::sleep(COMPLETION_PROGRESS_STALL + Duration::from_millis(300));
+        std::fs::write(
+            pipe.with_extension("drain-release"),
+            format!(r#"{{"state":"play","item_progress_ms":{progress}}}"#),
+        )
+        .unwrap();
+        wait_until(|| pipe.with_extension("drain-replied").exists());
+        std::thread::sleep(COMPLETION_PROGRESS_STALL * 2);
+        let events = fixture.drain_events();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::TrackEnded { .. }
+                    | PlayerEvent::Error { .. }
+                    | PlayerEvent::StateChanged {
+                        state: PlayerState::Stopped,
+                        ..
+                    }
+            )),
+            "a stale playing sample completed a paused item: {events:?}"
+        );
+        assert_eq!(controller.state(), PlayerState::Paused);
+        assert_eq!(client.player_state().unwrap(), "pause");
+        assert!(fixture.daemon.config.takeover_record().exists());
+        assert_eq!(ticket.route_count(), 1);
+
+        controller.play();
+        wait_until(|| controller.state() == PlayerState::Playing);
+        std::fs::remove_file(&stall).unwrap();
+        assert_single_natural_completion(&fixture, &ticket, generation, &baseline);
     }
 
     /// Pinned OwnTone autostops a pipe only while it is *autostarted*: a
@@ -10690,6 +10888,7 @@ fn serve(stream: std::net::TcpStream, fail: Option<String>) {
                 cancel: ctx.cancel.clone(),
                 restored: AtomicBool::new(false),
                 autostart_lost: AtomicBool::new(false),
+                control_epoch: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 mutation_lock: Mutex::new(()),
                 unsettled: AtomicUsize::new(0),
