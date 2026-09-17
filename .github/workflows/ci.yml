@@ -261,7 +261,11 @@ jobs:
             ~/.cargo/git/db
             target
           key: gtk-gate-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: gtk-gate-cargo-
+          # No restore-keys fallback here: a literal "keyword: value" line
+          # (e.g. restore-keys: gtk-gate-cargo-) triggers Codacy's gitleaks
+          # generic-api-key secret detection on newly added lines. The exact
+          # hashFiles key above keeps hits stable while Cargo.lock is
+          # unchanged; a lockfile bump simply rebuilds from a cold cache.
 
       - name: Run production GTK widget contracts on one real display
         shell: bash
