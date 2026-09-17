@@ -401,7 +401,8 @@ run the Linux command twice, take the lower total, round down to one decimal, an
 for instrumentation noise.
 
 CI automatically runs on every push/PR:
-- **Security audit** — `cargo audit` checks dependencies against the RustSec Advisory Database
+- **Security audit** — `cargo audit` checks both the production lock and the independent fuzz
+  lock against the RustSec Advisory Database, each with its own scoped advisory exceptions
 - **Pedantic Clippy** — `clippy::pedantic` + `clippy::nursery` with `-D warnings`
 - **Code coverage** — pinned `cargo-llvm-cov` Linux x86_64 line-floor gate, plus an HTML report
   uploaded as a CI artifact

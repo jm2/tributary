@@ -42,6 +42,7 @@ jobs:
       - name: Test dependency update policy
         run: |
           python3 scripts/test_dependency_update_policy.py
+          python3 scripts/test_audit_lockfiles.py
           python3 scripts/sync_rust_toolchain.py --check
 
       - name: Verify root and fuzz lock update coherence
@@ -54,8 +55,12 @@ jobs:
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
-      - name: Run cargo audit
-        run: cargo audit
+
+      # Root/fuzz lock coherence is not a security audit: the fuzz workspace is
+      # a separate graph with its own Cargo.lock, so both locks are audited
+      # explicitly with their own scoped advisory exceptions.
+      - name: Audit root and fuzz lockfiles
+        run: python3 scripts/audit_lockfiles.py
 
   # ── MSRV (minimum supported Rust version) ─────────────────────────────────
   # Compile-proof for the `rust-version` declared in Cargo.toml. Keep the

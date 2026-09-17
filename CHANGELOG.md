@@ -57,6 +57,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scrobbling activation, with transactional updates and validation. Scrobbling remains disabled.
 - **Dependency maintenance** — Refresh Rust dependencies and the release-upload action,
   and keep the fuzz lockfile synchronized with dependency updates.
+- **Dependency security audits** — Audit the root and independent fuzz Cargo lockfiles
+  separately, each with its own scoped advisory exceptions and fixture proof that the
+  intended lock was selected, so a fuzz-only finding cannot hide behind a green root audit.
 - **macOS packaging throughput** — Inspect each immutable Homebrew dylib source once per
   bundle build instead of once per plugin that links it, and apply each binary's equivalent
   `install_name_tool -change` edits in a single invocation. Forbidden-component policy is
