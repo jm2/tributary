@@ -1173,7 +1173,15 @@ mod tests {
     ///   a disabled pane, no dangling edge gutters
     ///   ([`crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones`]);
     /// - tracklist drags must start only from the data row area (folded
-    ///   into the popover contract).
+    ///   into the popover contract);
+    /// - the per-row playlist drop target must resolve the row under the
+    ///   pointer, drive the production `connect_accept`/`connect_drop`
+    ///   handlers, and forward the exact displayed candidate order
+    ///   ([`crate::ui::context_menu::tests::per_row_playlist_drop_target_drives_the_production_drop_path`]);
+    /// - the keyboard "Add to Playlist" action must carry the identical
+    ///   displayed-order candidates as the drag payload and refuse the same
+    ///   destinations
+    ///   ([`crate::ui::context_menu::tests::keyboard_add_action_matches_the_drag_payload_contract`]).
     ///
     /// This is deliberately the only GTK-initializing `#[test]` in the
     /// crate: the `ui::widget_test_session` mutex serializes but does not
@@ -1203,6 +1211,8 @@ mod tests {
                 assert_unbind_reset(&list_item, &row);
 
                 crate::ui::context_menu::tests::popover_from_menu_model_attaches_a_visible_child_widget();
+                crate::ui::context_menu::tests::per_row_playlist_drop_target_drives_the_production_drop_path();
+                crate::ui::context_menu::tests::keyboard_add_action_matches_the_drag_payload_contract();
                 crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones();
             },
         ) else {
