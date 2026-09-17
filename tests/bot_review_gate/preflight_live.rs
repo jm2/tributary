@@ -328,6 +328,133 @@ fn live_empty_nested_required_status_checks_remains_valid() {
 }
 
 #[test]
+fn live_null_branch_rules_record_fails_closed() {
+    // A null record served on a live branch-rules page must be reported as a
+    // malformed record; filtering it would leave an empty inventory that reads
+    // as "no rulesets apply to main".
+    let fixture = LiveFixture::new("live-branch-rules-null-record");
+    fixture.page("rules_branches_main.page.1.json", r"[null]");
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a null branch-rules record must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("PARSE-FAILED")
+            && stderr.contains("malformed branch-rules record (entry-not-object)"),
+        "the null branch-rules record must be reported:\n{stderr}"
+    );
+}
+
+#[test]
+fn live_string_ruleset_id_fails_closed() {
+    // The reproduced defect shape: a string-typed ruleset id on the live
+    // branch-rules page was silently filtered out, so no detail was fetched
+    // and the staged-inactive preflight reported success. It must be reported
+    // as a malformed reference instead.
+    let fixture = LiveFixture::new("live-branch-rules-string-id");
+    fixture.page(
+        "rules_branches_main.page.1.json",
+        r#"[{"ruleset_id":"17650907"}]"#,
+    );
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a string-typed ruleset id must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("PARSE-FAILED")
+            && stderr.contains("malformed branch-rules record (ruleset-id-not-number)"),
+        "the string-typed ruleset id must be reported:\n{stderr}"
+    );
+}
+
+#[test]
+fn live_null_ruleset_rule_fails_closed() {
+    // A live ruleset detail whose rules array carries a null entry must fail
+    // closed: the entry cannot be classified, so the gate's absence cannot be
+    // established from this observation.
+    let fixture = LiveFixture::new("live-rules-null-entry");
+    fixture
+        .page(
+            "rules_branches_main.page.1.json",
+            r#"[{"ruleset_id":17650907}]"#,
+        )
+        .page("rulesets_17650907.json", r#"{"rules":[null]}"#);
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a null live rules entry must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("PARSE-FAILED") && stderr.contains("malformed .rules entry"),
+        "the null rules entry must be reported:\n{stderr}"
+    );
+}
+
+#[test]
+fn live_ruleset_rule_without_type_fails_closed() {
+    // A live rule entry carrying a required_status_checks list without the
+    // `type` discriminator was invisible to the recognized-type selectors; it
+    // must be rejected as a malformed entry.
+    let fixture = LiveFixture::new("live-rule-type-missing");
+    fixture
+        .page(
+            "rules_branches_main.page.1.json",
+            r#"[{"ruleset_id":17650907}]"#,
+        )
+        .page(
+            "rulesets_17650907.json",
+            r#"{"rules":[{"parameters":{"required_status_checks":[{"context":"Bot Review Gate","integration_id":424242}]}}]}"#,
+        );
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a typeless live rules entry must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("PARSE-FAILED") && stderr.contains("malformed .rules entry"),
+        "the typeless rules entry must be reported:\n{stderr}"
+    );
+}
+
+#[test]
+fn live_unknown_rule_type_remains_valid() {
+    // Control: a live rule entry with a valid (unrecognized) type stays a
+    // well-formed record and the staged-inactive preflight stays consistent.
+    let fixture = LiveFixture::new("live-rule-type-unknown");
+    fixture
+        .page(
+            "rules_branches_main.page.1.json",
+            r#"[{"ruleset_id":17650907}]"#,
+        )
+        .page(
+            "rulesets_17650907.json",
+            r#"{"rules":[{"type":"scalars","parameters":{"ref":"main"}}]}"#,
+        );
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "an unknown but well-formed live rule type must stay valid:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(stdout_of(&output).contains("configuration is consistent"));
+}
+
+#[test]
 fn live_malformed_activation_document_fails_closed() {
     // A present-but-unparseable activation document must not read as unset.
     let fixture = LiveFixture::new("live-malformed-activation");

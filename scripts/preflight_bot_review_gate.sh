@@ -23,7 +23,11 @@
 # exhaustion, every page must parse to the expected JSON shape, and a required
 # read that fails — a non-404 error, a malformed document, a referenced
 # ruleset that cannot be read, or an inventory that terminates short of its
-# declared total — fails the validation closed. An unreadable observation is
+# declared total — fails the validation closed. Inventory records are
+# validated before any recognized-shape filtering: a branch-rules reference
+# without a numeric ruleset id, or a ruleset rule entry without a type
+# discriminator, is an incomplete observation that fails closed — never a
+# record silently filtered out of the inventory. An unreadable observation is
 # never treated as proof that a prerequisite is absent or unset.
 #
 # The environment policy is validated in full: the deployment branch policy
@@ -280,6 +284,23 @@ gather_paged_object() {
   return 0
 }
 
+# Classify every record of the applicable branch-rules inventory before any
+# recognized-shape filtering. Valid records print their numeric ruleset id;
+# every other record prints a `MALFORMED:` classification instead of being
+# silently dropped: GitHub reports a numeric `ruleset_id` on each applicable
+# branch rule, so a non-object record, a missing id, or a string-typed id is
+# a malformed reference — an incomplete observation, never a ruleset that
+# can be proven absent.
+referenced_ruleset_ids() {
+  jq -r '
+    .[]
+    | if type != "object" then "MALFORMED:entry-not-object"
+      elif (has("ruleset_id") | not) then "MALFORMED:ruleset-id-missing"
+      elif (.ruleset_id | type) != "number" then "MALFORMED:ruleset-id-not-number"
+      else (.ruleset_id | tostring)
+      end' "$1"
+}
+
 # Read every document the validation needs. Every reference must resolve: a
 # ruleset named by the applicable branch rules that cannot be read makes the
 # inventory incomplete and leaves a nested `.failed` sentinel.
@@ -301,7 +322,7 @@ fetch_live() {
         read_failed "referenced ruleset $id could not be read; the applicable ruleset inventory is incomplete."
         : > "$src/rulesets/$id.json.failed"
       fi
-    done < <(jq -r '.[] | select(type == "object") | .ruleset_id | select(type == "number") | tostring' "$src/branch-rules.json")
+    done < <(referenced_ruleset_ids "$src/branch-rules.json" | grep -E '^[0-9]+$' || true)
   fi
 }
 
@@ -354,17 +375,28 @@ names_of() {
 # ── Live main required contexts, as "context|integration_id" ────────────────
 
 # Referenced-record completeness: every ruleset named by the applicable branch
-# rules must have a recorded detail. In live mode `fetch_live` already plants a
-# `.failed` sentinel for an unreadable referenced ruleset; this pass covers
-# offline recordings and any referenced record that is simply absent (neither a
-# detail nor a sentinel). An absent record is an incomplete observation, not an
-# absent gate.
+# rules must have a recorded detail, and every branch-rules record must be
+# structurally valid (an object carrying a numeric ruleset id). In live mode
+# `fetch_live` already plants a `.failed` sentinel for an unreadable referenced
+# ruleset; this pass covers offline recordings, any referenced record that is
+# simply absent (neither a detail nor a sentinel), and malformed records that
+# a recognized-shape filter would otherwise drop from the inventory. An absent
+# or unreadable record is an incomplete observation, not an absent gate.
 referenced_rulesets="$scratch/referenced-rulesets.txt"
 : > "$referenced_rulesets"
 if [ -f "$src/branch-rules.json" ]; then
   if jq -e 'type == "array"' "$src/branch-rules.json" >/dev/null 2>&1; then
-    jq -r '.[] | select(type == "object") | .ruleset_id | select(type == "number") | tostring' \
-      "$src/branch-rules.json" > "$referenced_rulesets" 2>/dev/null || true
+    while IFS= read -r record; do
+      [ -n "$record" ] || continue
+      case "$record" in
+        MALFORMED:*)
+          parse_error "malformed branch-rules record (${record#MALFORMED:}): $src/branch-rules.json"
+          ;;
+        *)
+          printf '%s\n' "$record" >> "$referenced_rulesets"
+          ;;
+      esac
+    done < <(referenced_ruleset_ids "$src/branch-rules.json")
   else
     parse_error "malformed branch-rules inventory: $src/branch-rules.json"
   fi
@@ -375,6 +407,24 @@ while IFS= read -r id; do
     parse_error "missing referenced ruleset record: $src/rulesets/$id.json"
   fi
 done < "$referenced_rulesets"
+
+# Count structurally malformed entries of a ruleset's `.rules` array. Every
+# entry must be an object carrying a non-empty string `type` discriminator:
+# null entries, non-object entries, and entries with a missing, non-string, or
+# empty type are incomplete structural observations — never ignorable noise —
+# because the recognized-type selectors below would silently drop them, and an
+# inventory that cannot describe its own rules cannot prove the gate absent.
+# Rule types outside the recognized set remain valid and are simply ignored.
+malformed_rules_entries() {
+  jq -r '
+    [ .rules[]
+      | if type != "object" then "entry-not-object"
+        elif (has("type") | not) then "type-missing"
+        elif (.type | type) != "string" then "type-not-string"
+        elif (.type | length) == 0 then "type-empty"
+        else empty end
+    ] | length' "$1"
+}
 
 # Count structurally malformed `required_status_checks` rules in a ruleset
 # detail. Each such rule must carry object-valued `parameters`, an EXPLICIT
@@ -401,6 +451,8 @@ malformed_required_checks() {
 
 live_contexts="$scratch/live-contexts.txt"
 : > "$live_contexts"
+invalid_details="$scratch/invalid-details.txt"
+: > "$invalid_details"
 for detail in "$src"/rulesets/*.json; do
   [ -e "$detail" ] || continue
   # A ruleset detail is an object whose `.rules` is an EXPLICIT array. GitHub
@@ -409,14 +461,31 @@ for detail in "$src"/rulesets/*.json; do
   # required contexts, so it fails closed. A genuine empty array stays valid.
   if ! jq -e 'type == "object" and (.rules | type) == "array"' "$detail" >/dev/null 2>&1; then
     parse_error "malformed ruleset detail (missing or non-array .rules): $detail"
+    printf '%s\n' "$detail" >> "$invalid_details"
+    continue
+  fi
+  # Every `.rules` entry is validated before any recognized-type filtering: a
+  # null or typeless entry would otherwise be silently dropped by the
+  # recognized-type selectors, and an inventory that cannot describe its own
+  # rules cannot prove the gate absent.
+  if ! rules_malformed_count="$(malformed_rules_entries "$detail" 2>>"$scratch/jq.err")"; then
+    parse_error "could not read rules entries from $detail"
+    printf '%s\n' "$detail" >> "$invalid_details"
+    continue
+  fi
+  if [ "$rules_malformed_count" -ne 0 ]; then
+    parse_error "malformed .rules entry(ies) in $detail: every rule must be an object with a non-empty string type discriminator; null or typeless entries are rejected rather than filtered"
+    printf '%s\n' "$detail" >> "$invalid_details"
     continue
   fi
   if ! malformed_count="$(malformed_required_checks "$detail" 2>>"$scratch/jq.err")"; then
     parse_error "could not read required_status_checks rules from $detail"
+    printf '%s\n' "$detail" >> "$invalid_details"
     continue
   fi
   if [ "$malformed_count" -ne 0 ]; then
     parse_error "malformed required_status_checks rule(s) in $detail: parameters must be an object with an explicit array-valued required_status_checks whose entries are objects with a non-empty context"
+    printf '%s\n' "$detail" >> "$invalid_details"
     continue
   fi
   if ! jq -r '.rules[]
@@ -424,6 +493,7 @@ for detail in "$src"/rulesets/*.json; do
       | .parameters.required_status_checks[]
       | "\(.context)|\(.integration_id // "")"' "$detail" >> "$live_contexts" 2>>"$scratch/jq.err"; then
     parse_error "could not read required contexts from $detail"
+    printf '%s\n' "$detail" >> "$invalid_details"
     continue
   fi
 done
@@ -433,6 +503,9 @@ resolution_enforced=0
 for detail in "$src"/rulesets/*.json; do
   [ -e "$detail" ] || continue
   # Invalid details were already reported above; skip them here.
+  if grep -Fxq "$detail" "$invalid_details"; then
+    continue
+  fi
   jq -e 'type == "object" and (.rules | type) == "array"' "$detail" >/dev/null 2>&1 || continue
   enforcement="$(jq -r '
     [.rules[]
