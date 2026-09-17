@@ -454,18 +454,118 @@ class BacklogConsistencyTests(unittest.TestCase):
         self.assertIn("'Notes'", problems[0])
 
     # ── integration ──────────────────────────────────────────────────────────
-    def test_repository_index_is_consistent(self):
+    def assert_repository_consistency(self, root):
+        """Validate a repository root's index consistency without frozen totals.
+
+        The real repository's record, completion and archived totals
+        legitimately advance as backlog work lands.  Hard-coding them here
+        would fail CI on every legitimate completion (rejected finding F1),
+        so this helper validates the invariants that must hold at *any*
+        point in history:
+
+        * every checker invariant passes (unique IDs, literal counters,
+          percentages, archived recount, links);
+        * the index parses to a non-empty population of uniquely identified
+          records whose completion count is arithmetically possible;
+        * the archived remediation recount is well-formed (non-empty,
+          structurally classifiable, complete <= total).
+
+        Precise count expectations stay in the synthetic fixtures above,
+        where the document state is fixed by construction.
+        """
         records, markdown_files, problems = checker.run_checks(
-            REPOSITORY, REPOSITORY / checker.TASK_INDEX_NAME
+            root, root / checker.TASK_INDEX_NAME
         )
         self.assertEqual(problems, [])
-        self.assertEqual(len(records), 57)
-        self.assertEqual(sum(1 for record in records if record.complete), 17)
+        self.assertGreater(len(records), 0)
         self.assertGreater(len(markdown_files), 0)
-        archived = REPOSITORY / checker.ARCHIVED_INDEX_NAME
-        complete, total, structural = checker.derive_archived_counts(archived)
-        self.assertEqual((complete, total), (223, 226))
+        identifiers = [record.identifier for record in records]
+        self.assertEqual(len(identifiers), len(set(identifiers)))
+        complete = sum(1 for record in records if record.complete)
+        self.assertGreaterEqual(complete, 0)
+        self.assertLessEqual(complete, len(records))
+        archived = root / checker.ARCHIVED_INDEX_NAME
+        archived_complete, archived_total, structural = checker.derive_archived_counts(
+            archived
+        )
         self.assertEqual(structural, [])
+        self.assertGreater(archived_total, 0)
+        self.assertLessEqual(archived_complete, archived_total)
+        return records
+
+    def test_repository_index_is_consistent(self):
+        self.assert_repository_consistency(REPOSITORY)
+
+    # ── progress-state regressions (rejected finding F1) ─────────────────────
+    # A legitimate completion — a checkbox flipped together with its prose
+    # counters — must pass both the checker and the integration validation,
+    # and the same consistency reasoning must hold for record additions and
+    # archived progress.  The negative twins prove the drift checks still
+    # fire when a checkbox changes without its counters.
+    def test_consistent_completion_change_passes_checker_and_integration(self):
+        root = self.make_root()
+        text = counter_paragraph() + sample_records()
+        progressed = text.replace(
+            "- [ ] **Q1** — engineering\n", "- [x] **Q1** — engineering\n"
+        ).replace(
+            "Current status: **1/4 (25.0%)**",
+            "Current status: **2/4 (50.0%)**",
+        ).replace(
+            "with **0/1** new corrective and **0/1** engineering",
+            "with **0/1** new corrective and **1/1** engineering",
+        )
+        self.assertNotEqual(progressed, text)
+        self.write(root, "docs/task.md", progressed)
+        self.write_archived_fixture(root)
+        records, _, problems = checker.run_checks(root, root / checker.TASK_INDEX_NAME)
+        self.assertEqual(problems, [])
+        self.assertEqual(sum(1 for record in records if record.complete), 2)
+        self.assert_repository_consistency(root)
+
+    def test_completion_change_without_counter_update_fails(self):
+        root = self.make_root()
+        text = counter_paragraph() + sample_records()
+        stale = text.replace(
+            "- [ ] **Q1** — engineering\n", "- [x] **Q1** — engineering\n"
+        )
+        self.write(root, "docs/task.md", stale)
+        self.write_archived_fixture(root)
+        _, _, problems = checker.run_checks(root, root / checker.TASK_INDEX_NAME)
+        self.assertTrue(any("overall says 1/4" in p for p in problems), problems)
+        self.assertTrue(any("engineering says 0/1" in p for p in problems), problems)
+
+    def test_record_addition_with_updated_counters_passes_integration(self):
+        root = self.make_root()
+        text = (
+            counter_paragraph(
+                overall=(1, 5, 20.0), baseline=(1, 2), corrective=(0, 2), engineering=(0, 1)
+            )
+            + sample_records()
+            + "- [ ] **R2** — second corrective\n"
+        )
+        self.write(root, "docs/task.md", text)
+        self.write_archived_fixture(root)
+        records, _, problems = checker.run_checks(root, root / checker.TASK_INDEX_NAME)
+        self.assertEqual(problems, [])
+        self.assertEqual([r.identifier for r in records][-1], "R2")
+        self.assert_repository_consistency(root)
+
+    def test_record_addition_without_counter_update_fails(self):
+        root = self.make_root()
+        text = counter_paragraph() + sample_records() + "- [ ] **R2** — second corrective\n"
+        self.write(root, "docs/task.md", text)
+        self.write_archived_fixture(root)
+        _, _, problems = checker.run_checks(root, root / checker.TASK_INDEX_NAME)
+        self.assertTrue(any("overall says 1/4" in p for p in problems), problems)
+        self.assertTrue(any("corrective says 0/1" in p for p in problems), problems)
+
+    def test_archived_progress_with_updated_prose_passes(self):
+        root = self.make_root()
+        text = counter_paragraph(archived=(224, 226, 99.1)) + sample_records()
+        self.write(root, "docs/task.md", text)
+        self.write_archived_fixture(root, complete=224, open_boxes=2)
+        self.assertEqual(checker.check_archived_counter(text, root), [])
+        self.assert_repository_consistency(root)
 
     def test_main_is_read_only(self):
         root = self.make_root()
