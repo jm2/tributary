@@ -38,9 +38,17 @@ class PolicyError(RuntimeError):
 
 @dataclasses.dataclass(frozen=True)
 class Transition:
+    """One reviewed root-to-fuzz production graph rewrite.
+
+    ``target_root_version`` is the root-selected version the fuzz lock must
+    align onto. It is None for a removal: the root no longer declares the
+    dependency, so the transition proves the fuzz graph dropped the removed
+    direct edge and its orphaned closure instead of aligning onto a version.
+    """
+
     name: str
     current_fuzz_version: str
-    target_root_version: str
+    target_root_version: str | None
 
 
 def required_executable(name: str) -> str:
@@ -631,6 +639,12 @@ def validate_dependency_edges(
     transition_targets = {
         transition.name: (transition.name, transition.target_root_version)
         for transition in transitions
+        if transition.target_root_version is not None
+    }
+    removal_names = {
+        transition.name
+        for transition in transitions
+        if transition.target_root_version is None
     }
     for identity in sorted(before_records.keys() & after_records.keys()):
         before_metadata = {
@@ -676,6 +690,13 @@ def validate_dependency_edges(
                 for name in set(before_names) - set(after_names)
                 for target in before_edges[name]
             }
+            # A removal review has no new root closure to bound resulting
+            # edges against. Its authority is the removed dependency's old
+            # closure — the pruned record and every lost target were
+            # reachable only through the reviewed removal — combined with
+            # the strict prune shape below, and the submitted lock is still
+            # independently verified by Cargo's locked materialization.
+            removal_review = bool(removal_names)
             pure_prune = (
                 identity in old_identities
                 and set(after_names) < set(before_names)
@@ -683,7 +704,10 @@ def validate_dependency_edges(
                     before_edges[name] == after_edges[name] for name in after_names
                 )
                 and removed_edge_targets <= old_identities
-                and resulting_edge_targets <= target_identities
+                and (
+                    resulting_edge_targets <= target_identities
+                    or removal_review
+                )
             )
             if identity[0] != "tributary" and (
                 (
@@ -697,6 +721,32 @@ def validate_dependency_edges(
                 or pure_prune
             ):
                 continue
+            if identity[0] == "tributary":
+                # A reviewed root-to-fuzz transition rewrites the Tributary
+                # path record in exactly one shape: the surface strictly
+                # shrinks by dropping direct edges on reviewed removals only
+                # (their pruned targets sit inside the removed dependency's
+                # old closure), every retained edge is either untouched or
+                # rebinds onto exactly its reviewed update target, and no
+                # dependency name is added. Any other Tributary surface
+                # rewrite stays rejected.
+                tributary_reviewed_rewrite = (
+                    removal_names
+                    and set(after_names) < set(before_names)
+                    and set(before_names) - set(after_names) <= removal_names
+                    and removed_edge_targets <= old_identities
+                    and all(
+                        before_edges[name] == after_edges[name]
+                        or (
+                            name in transition_targets
+                            and after_edges[name]
+                            == (transition_targets[name],)
+                        )
+                        for name in after_names
+                    )
+                )
+                if tributary_reviewed_rewrite:
+                    continue
             raise PolicyError(
                 "fuzz lock repair rewrote the dependency-name surface of "
                 f"{identity[0]}@{identity[1]}: {before_names} -> {after_names}"
@@ -753,9 +803,13 @@ def validate_bounded_package_changes(
         (transition.name, transition.current_fuzz_version)
         for transition in transitions
     }
+    # A removal has no new root identity: its after-closure contribution is
+    # empty and the checks below bound the submitted lock to dropping
+    # exactly the removed dependency's old closure — nothing else.
     new_roots = {
         (transition.name, transition.target_root_version)
         for transition in transitions
+        if transition.target_root_version is not None
     }
     old_identities = dependency_closure_identities(before_fuzz_lock, old_roots)
     after_identities = dependency_closure_identities(after_fuzz_lock, new_roots)
@@ -849,12 +903,20 @@ def validate_submitted_fuzz_update(
     transitions and remains owned by its dedicated Dependabot/CI lane. When
     the base fuzz lock is stale relative to the current root, every submitted
     base-to-head change must instead fit the bounded exact-closure proof.
+
+    A removed root dependency is requested as a graph rewrite: the base fuzz
+    view records the removal transition, while the submitted view below
+    fails closed until the submitted lock no longer carries the removed
+    direct edge. A submitted lock that performs the removal exactly is then
+    bounded by validate_bounded_package_changes to dropping only the removed
+    dependency's old closure.
     """
     requested_transitions = required_transitions(
         base_root_lock,
         current_root_lock,
         base_fuzz_lock,
         current_manifest,
+        treat_removals_as_requested=True,
     )
     remaining_transitions = required_transitions(
         base_root_lock,
@@ -878,7 +940,21 @@ def required_transitions(
     current_root_lock: dict[str, Any],
     current_fuzz_lock: dict[str, Any],
     current_manifest: dict[str, Any],
+    *,
+    treat_removals_as_requested: bool = False,
 ) -> list[Transition]:
+    """
+    Compute the root-to-fuzz transitions the reviewed update must prove.
+
+    The default view is the submitted one: a removed root dependency that is
+    still a direct edge of the reviewed fuzz lock means the lock was not
+    regenerated, which fails closed. The base-fuzz view
+    (``treat_removals_as_requested=True``) records the removal as the
+    requested transition instead — the base lock retains every dependency
+    the root removed by definition, so there the removal is precisely the
+    graph rewrite under review, and ``validate_submitted_fuzz_update``
+    still rejects the submitted lock separately while it retains the edge.
+    """
     base = resolved_direct_versions(base_root_lock)
     current = resolved_direct_versions(current_root_lock)
     fuzz = resolved_direct_versions(current_fuzz_lock)
@@ -889,10 +965,12 @@ def required_transitions(
     # This is a graph rewrite, not a version substitution, and requires a
     # reviewed lock regeneration rather than an unsafe best guess.
     for name in sorted((set(base) - set(current)) & set(fuzz)):
-        raise PolicyError(
-            f"root production dependency {name!r} was removed but remains in "
-            "fuzz/Cargo.lock; regenerate the fuzz lock under review"
-        )
+        if not treat_removals_as_requested:
+            raise PolicyError(
+                f"root production dependency {name!r} was removed but remains in "
+                "fuzz/Cargo.lock; regenerate the fuzz lock under review"
+            )
+        transitions.append(Transition(name, fuzz[name], None))
 
     for name in sorted(set(current) & production):
         after = current[name]

@@ -247,6 +247,179 @@ class FuzzLockPolicyTests(unittest.TestCase):
         with self.assertRaises(sync_fuzz_lock.PolicyError):
             sync_fuzz_lock.required_transitions(base, current, fuzz, {})
 
+    def test_removed_production_dependency_allows_reviewed_fuzz_removal(self):
+        # Removing a root dependency is a legitimate fuzz graph rewrite: the
+        # submitted lock drops the removed direct edge and its exact orphaned
+        # closure. The base fuzz view records the removal as the requested
+        # transition (the base lock retains the dependency by definition),
+        # while the submitted view proves the edge is gone.
+        base = lock(
+            ["local-ip 1.0.0", "kept 1.0.0"],
+            {"local-ip": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
+        )
+        # package order: tributary, local-ip, kept, edge.
+        base["package"][1]["dependencies"] = ["edge 1.0.0"]
+        current = lock(["kept 1.0.0"], {"kept": ["1.0.0"], "edge": ["1.0.0"]})
+        base_fuzz = lock(
+            ["local-ip 1.0.0", "kept 1.0.0"],
+            {"local-ip": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
+        )
+        base_fuzz["package"][1]["dependencies"] = ["edge 1.0.0"]
+        submitted_fuzz = lock(["kept 1.0.0"], {"kept": ["1.0.0"], "edge": ["1.0.0"]})
+        manifest = {"dependencies": {"kept": "1"}}
+
+        self.assertEqual(
+            sync_fuzz_lock.required_transitions(
+                base,
+                current,
+                base_fuzz,
+                manifest,
+                treat_removals_as_requested=True,
+            ),
+            [sync_fuzz_lock.Transition("local-ip", "1.0.0", None)],
+        )
+        requested, remaining = sync_fuzz_lock.validate_submitted_fuzz_update(
+            base,
+            current,
+            base_fuzz,
+            submitted_fuzz,
+            manifest,
+        )
+        self.assertEqual(
+            requested,
+            [sync_fuzz_lock.Transition("local-ip", "1.0.0", None)],
+        )
+        self.assertEqual(remaining, [])
+
+    def test_removed_production_dependency_rejects_retained_submitted_edge(self):
+        # A submitted lock that still carries the removed direct edge was not
+        # regenerated; the submitted view fails closed even though the base
+        # view recorded the removal as the requested transition.
+        base = lock(
+            ["local-ip 1.0.0", "kept 1.0.0"],
+            {"local-ip": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
+        )
+        base["package"][1]["dependencies"] = ["edge 1.0.0"]
+        current = lock(["kept 1.0.0"], {"kept": ["1.0.0"], "edge": ["1.0.0"]})
+        base_fuzz = lock(
+            ["local-ip 1.0.0", "kept 1.0.0"],
+            {"local-ip": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
+        )
+        base_fuzz["package"][1]["dependencies"] = ["edge 1.0.0"]
+        stale_submitted = lock(
+            ["local-ip 1.0.0", "kept 1.0.0"],
+            {"local-ip": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
+        )
+        stale_submitted["package"][1]["dependencies"] = ["edge 1.0.0"]
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError, "regenerate the fuzz lock under review"
+        ):
+            sync_fuzz_lock.validate_submitted_fuzz_update(
+                base,
+                current,
+                base_fuzz,
+                stale_submitted,
+                {"dependencies": {"kept": "1"}},
+            )
+
+    def test_removed_dependency_review_rejects_unrelated_surface_rewrite(self):
+        # Feature pruning is bounded to the removed dependency's old closure.
+        # kept@1.0.0 is a retained root dependency outside that closure, so
+        # dropping its edge to the surviving edge@1.0.0 record is not a
+        # rewrite the removal can justify.
+        base = lock(
+            ["local-ip 1.0.0", "kept 1.0.0"],
+            {"local-ip": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
+        )
+        base["package"][1]["dependencies"] = ["edge 1.0.0"]
+        current = lock(["kept 1.0.0"], {"kept": ["1.0.0"], "edge": ["1.0.0"]})
+        base_fuzz = lock(
+            ["local-ip 1.0.0", "kept 1.0.0"],
+            {"local-ip": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
+        )
+        base_fuzz["package"][1]["dependencies"] = ["edge 1.0.0"]
+        # package order: tributary, kept, edge.
+        base_fuzz["package"][2]["dependencies"] = ["edge 1.0.0"]
+        rewritten_fuzz = lock(
+            ["kept 1.0.0"], {"kept": ["1.0.0"], "edge": ["1.0.0"]}
+        )
+        rewritten_fuzz["package"][1]["dependencies"] = []
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError,
+            "rewrote the dependency-name surface of kept@1.0.0",
+        ):
+            sync_fuzz_lock.validate_submitted_fuzz_update(
+                base,
+                current,
+                base_fuzz,
+                rewritten_fuzz,
+                {"dependencies": {"kept": "1"}},
+            )
+
+    def test_removed_dependency_review_rejects_dropping_still_required_package(self):
+        # edge@1.0.0 was pruned from the submitted lock, yet the retained
+        # kept@1.0.0 record still declares it; every surviving edge must
+        # resolve inside the submitted graph.
+        base = lock(
+            ["local-ip 1.0.0", "kept 1.0.0"],
+            {"local-ip": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
+        )
+        base["package"][1]["dependencies"] = ["edge 1.0.0"]
+        current = lock(["kept 1.0.0"], {"kept": ["1.0.0"], "edge": ["1.0.0"]})
+        base_fuzz = lock(
+            ["local-ip 1.0.0", "kept 1.0.0"],
+            {"local-ip": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
+        )
+        base_fuzz["package"][1]["dependencies"] = ["edge 1.0.0"]
+        base_fuzz["package"][2]["dependencies"] = ["edge 1.0.0"]
+        holed_fuzz = lock(["kept 1.0.0"], {"kept": ["1.0.0"]})
+        # package order: tributary, kept.
+        holed_fuzz["package"][1]["dependencies"] = ["edge 1.0.0"]
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError, "has no package record"
+        ):
+            sync_fuzz_lock.validate_submitted_fuzz_update(
+                base,
+                current,
+                base_fuzz,
+                holed_fuzz,
+                {"dependencies": {"kept": "1"}},
+            )
+
+    def test_removed_dependency_review_rejects_added_package_identity(self):
+        # A removal review may only shrink the graph; smuggling an added
+        # package identity alongside the reviewed removal stays rejected.
+        base = lock(
+            ["local-ip 1.0.0", "kept 1.0.0"],
+            {"local-ip": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
+        )
+        base["package"][1]["dependencies"] = ["edge 1.0.0"]
+        current = lock(["kept 1.0.0"], {"kept": ["1.0.0"], "edge": ["1.0.0"]})
+        base_fuzz = lock(
+            ["local-ip 1.0.0", "kept 1.0.0"],
+            {"local-ip": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
+        )
+        base_fuzz["package"][1]["dependencies"] = ["edge 1.0.0"]
+        smuggled_fuzz = lock(
+            ["kept 1.0.0"],
+            {"kept": ["1.0.0"], "edge": ["1.0.0"], "intruder": ["9.0.0"]},
+        )
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError,
+            "added package identities outside the exact new dependency closure",
+        ):
+            sync_fuzz_lock.validate_submitted_fuzz_update(
+                base,
+                current,
+                base_fuzz,
+                smuggled_fuzz,
+                {"dependencies": {"kept": "1"}},
+            )
+
     def test_new_direct_major_can_coexist_with_required_transitive_old_major(self):
         base = lock(["sha2"], {"sha2": ["0.10.9"]})
         current = lock(
