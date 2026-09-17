@@ -907,10 +907,12 @@ the window and its single recovery resolution:
    a single intent-clear for a pre-rename or successful resolution, or a
    terminal-verdict record followed by an intent-clear for a post-rename
    terminal — so the job's whole-lifecycle worst case is
-   `publish_attempt_budget` such record-sets plus the one fixed record that
-   reports an exhausted budget. That worst case is the exact size of the
-   single per-job `lifecycle_reserve` charged once before the job's first
-   byte ([Cancellation, quota, and
+   `publish_attempt_budget` intent records, `publish_attempt_budget`
+   resolution record-sets for those attempts, and one final exhaustion
+   resolution record-set (the terminal `Failed(PublishRetriesExhausted)`
+   verdict and its intent-clear). That whole-lifecycle bound is the exact
+   size of the single per-job `lifecycle_reserve` charged once before the
+   job's first byte ([Cancellation, quota, and
    eviction](#cancellation-quota-and-eviction)), so no sequence of retries
    can make more durable lifecycle bytes than the job already holds. The
    durable journal carries a `publish_attempt` counter, `fsync`'d with the
@@ -1157,7 +1159,8 @@ policy:
    [publish-intent protocol](#publish-intent-and-restart-recovery): a job
    begins at most a fixed `publish_attempt_budget` publish attempts, each
    writing at most one intent and one resolution record-set, plus one
-   exhaustion record, so the worst-case lifecycle footprint is a fixed
+   exhaustion resolution record-set (a terminal verdict and its
+   intent-clear), so the worst-case lifecycle footprint is a fixed
    number of fixed-size records whatever the job's size and however many
    times it crashes and retries. Because it is not derived from the
    payload, that overhead is covered by a **single per-job
