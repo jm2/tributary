@@ -24,7 +24,8 @@ use tracing::{info, warn};
 
 use crate::architecture::{SourceId, TrackId};
 use crate::local::tag_writer::{
-    LocalMutationTarget, LocalTagWriteConflict, TagEdits, TagWritePreflightError,
+    LocalMutationTarget, LocalTagPreflightError, LocalTagWriteConflict, TagEdits,
+    TagWritePreflightError,
 };
 use crate::source_registry::{RemovableMutationTarget, SourceRegistry};
 
@@ -150,6 +151,11 @@ enum TagEditingAvailability {
     UnsupportedFormat,
     InvalidFile,
     Unavailable,
+    /// At least one selected file changed on disk since Properties opened.
+    /// This is a localized conflict, not a read-only/unavailable failure:
+    /// the competing file/update was preserved and reopening Properties is
+    /// the only way to edit the current files.
+    Conflict,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +184,7 @@ impl TagEditingAvailability {
             Self::InvalidFile => "properties.write_invalid_file",
             Self::Unavailable if automatic_device => "properties.write_device_unavailable",
             Self::Unavailable => "properties.write_unavailable",
+            Self::Conflict => "properties.write_conflict",
         };
         rust_i18n::t!(key).into_owned()
     }
@@ -185,7 +192,15 @@ impl TagEditingAvailability {
 
 #[derive(Debug)]
 enum SaveOutcome {
-    Blocked(TagEditingAvailability),
+    /// The whole-selection pre-write probe refused before any byte was
+    /// written. A positive conflict count is a localized changed-on-disk
+    /// conflict that must be explained with reopen guidance rather than the
+    /// generic read-only/unavailable message.
+    Blocked {
+        availability: TagEditingAvailability,
+        conflicts: usize,
+        total: usize,
+    },
     Finished {
         modified: usize,
         failed: usize,
@@ -201,6 +216,29 @@ enum SaveOutcome {
     },
 }
 
+/// The verdict of the whole-selection pre-write probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionPreflight {
+    /// Every target is currently writable; the save may proceed.
+    Ready,
+    /// At least one selected target changed on disk since selection. Nothing
+    /// may be written, and reopening Properties is the fix.
+    Changed { conflicts: usize, total: usize },
+    /// A capability failure unrelated to a changed selection.
+    Unavailable(TagEditingAvailability),
+}
+
+impl SelectionPreflight {
+    /// The availability the dialog applies to the controls and label.
+    fn availability(self) -> TagEditingAvailability {
+        match self {
+            Self::Ready => TagEditingAvailability::Ready,
+            Self::Changed { .. } => TagEditingAvailability::Conflict,
+            Self::Unavailable(availability) => availability,
+        }
+    }
+}
+
 fn merge_preflight_failure(
     current: TagEditingAvailability,
     failure: TagWritePreflightError,
@@ -213,14 +251,16 @@ fn merge_preflight_failure(
 
     // Report a deterministic, actionable reason independent of selection
     // order. An unsupported format is most specific; a missing/non-file path
-    // is more specific than a generic access failure.
+    // is more specific than a generic access failure. A conflict is tracked
+    // separately from this capability ladder and never reaches here.
     let priority = |availability| match availability {
         TagEditingAvailability::UnsupportedFormat => 3,
         TagEditingAvailability::InvalidFile => 2,
         TagEditingAvailability::Unavailable => 1,
         TagEditingAvailability::Checking
         | TagEditingAvailability::Saving
-        | TagEditingAvailability::Ready => 0,
+        | TagEditingAvailability::Ready
+        | TagEditingAvailability::Conflict => 0,
     };
     if priority(candidate) > priority(current) {
         candidate
@@ -236,9 +276,16 @@ fn merge_preflight_failure(
 /// atomic replacement beside the exact file; a removable target revalidates
 /// its retained authority the same way. No path-scoped rehearsal runs, because
 /// no target is a bare pathname that could resolve to a different file.
-fn preflight_save_targets(targets: &[SaveTarget]) -> TagEditingAvailability {
+///
+/// A changed local selection is reported as [`SelectionPreflight::Changed`],
+/// not folded into the capability ladder, so the dialog can show localized
+/// changed-on-disk guidance before any write. If a changed selection and a
+/// capability failure are both present, the conflict wins: it is the
+/// condition that requires reopening Properties, and it is the one #248
+/// requires to be surfaced.
+fn preflight_save_targets(targets: &[SaveTarget]) -> SelectionPreflight {
     if targets.is_empty() {
-        return TagEditingAvailability::InvalidFile;
+        return SelectionPreflight::Unavailable(TagEditingAvailability::InvalidFile);
     }
     if targets
         .iter()
@@ -246,23 +293,83 @@ fn preflight_save_targets(targets: &[SaveTarget]) -> TagEditingAvailability {
     {
         // Unresolved removable identities are a wiring fault: the context
         // menu must resolve them through their live session first.
-        return TagEditingAvailability::Unavailable;
+        return SelectionPreflight::Unavailable(TagEditingAvailability::Unavailable);
     }
 
-    targets.iter().fold(
-        TagEditingAvailability::Ready,
-        |result, target| match target {
+    let mut availability = TagEditingAvailability::Ready;
+    let mut conflicts = 0usize;
+    for target in targets {
+        match target {
             SaveTarget::Local(local) => match local.preflight_write_capability() {
-                Ok(()) => result,
-                Err(failure) => merge_preflight_failure(result, failure),
+                Ok(()) => {}
+                Err(LocalTagPreflightError::Unavailable(failure)) => {
+                    availability = merge_preflight_failure(availability, failure);
+                }
+                Err(LocalTagPreflightError::Conflict(_)) => conflicts += 1,
             },
-            SaveTarget::Removable(authority) => match authority.preflight_write_capability() {
-                Ok(()) => result,
-                Err(failure) => merge_preflight_failure(result, failure),
-            },
-            SaveTarget::PendingRemovable(_) => TagEditingAvailability::Unavailable,
-        },
-    )
+            SaveTarget::Removable(authority) => {
+                if let Err(failure) = authority.preflight_write_capability() {
+                    availability = merge_preflight_failure(availability, failure);
+                }
+            }
+            SaveTarget::PendingRemovable(_) => {
+                availability = TagEditingAvailability::Unavailable;
+            }
+        }
+    }
+
+    if conflicts > 0 {
+        SelectionPreflight::Changed {
+            conflicts,
+            total: targets.len(),
+        }
+    } else if availability == TagEditingAvailability::Ready {
+        SelectionPreflight::Ready
+    } else {
+        SelectionPreflight::Unavailable(availability)
+    }
+}
+
+/// The targets still needing a write after the listed keys committed.
+///
+/// A successful local write intentionally replaces its selected object, so
+/// the original entry no longer proves the selection evidence. Keeping it
+/// would make the post-save probe report a conflict for a file that was just
+/// saved and disable retry for the files that still need it.
+fn remaining_save_targets(
+    targets: &[SaveTarget],
+    written_keys: &[SaveTargetKey],
+) -> Vec<SaveTarget> {
+    targets
+        .iter()
+        .filter(|target| match save_target_key(target) {
+            Some(key) => !written_keys.contains(&key),
+            None => true,
+        })
+        .cloned()
+        .collect()
+}
+
+/// Drop every target whose write committed from a stored target list, so a
+/// retry never re-proves (and never rewrites) an already-saved file.
+fn retain_pending_save_targets(targets: &mut Vec<SaveTarget>, written_keys: &[SaveTargetKey]) {
+    targets.retain(|target| match save_target_key(target) {
+        Some(key) => !written_keys.contains(&key),
+        None => true,
+    });
+}
+
+/// Derive the availability shown after a partial save over only the targets
+/// that still need a write, never over the already-replaced ones.
+fn post_save_availability(
+    targets: &[SaveTarget],
+    written_keys: &[SaveTargetKey],
+    failed: usize,
+) -> TagEditingAvailability {
+    if failed == 0 {
+        return TagEditingAvailability::Ready;
+    }
+    preflight_save_targets(&remaining_save_targets(targets, written_keys)).availability()
 }
 
 fn apply_tag_editing_availability(
@@ -291,6 +398,7 @@ fn apply_tag_editing_availability(
         TagEditingAvailability::UnsupportedFormat
             | TagEditingAvailability::InvalidFile
             | TagEditingAvailability::Unavailable
+            | TagEditingAvailability::Conflict
     );
     if blocked {
         capability_label.add_css_class("error");
@@ -299,6 +407,81 @@ fn apply_tag_editing_availability(
         capability_label.remove_css_class("error");
         save_button.set_tooltip_text(None);
     }
+}
+
+/// Localized copy for one save that did not fully apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SaveFailureCopy {
+    heading: String,
+    body: String,
+}
+
+/// Build the localized heading/body for a save that did not fully apply.
+///
+/// A localized conflict (the selected file changed on disk and was preserved)
+/// gets changed-on-disk guidance; a plain I/O failure keeps the generic
+/// explanation. Counts are interpolated placeholders so every catalog
+/// translates the whole sentence instead of inheriting an English `format!`.
+fn save_failure_copy(
+    locale: &str,
+    modified: usize,
+    failed: usize,
+    conflicts: usize,
+) -> SaveFailureCopy {
+    let total = modified + failed;
+    if conflicts > 0 && conflicts == failed {
+        SaveFailureCopy {
+            heading: rust_i18n::t!("properties.save_conflict_heading", locale = locale)
+                .into_owned(),
+            body: rust_i18n::t!(
+                "properties.save_conflict_all",
+                locale = locale,
+                conflicts = conflicts,
+                total = total
+            )
+            .into_owned(),
+        }
+    } else if conflicts > 0 {
+        SaveFailureCopy {
+            heading: rust_i18n::t!("properties.save_conflict_heading", locale = locale)
+                .into_owned(),
+            body: rust_i18n::t!(
+                "properties.save_conflict_mixed",
+                locale = locale,
+                conflicts = conflicts,
+                other = failed - conflicts,
+                total = total
+            )
+            .into_owned(),
+        }
+    } else {
+        SaveFailureCopy {
+            heading: rust_i18n::t!("properties.save_failure_heading", locale = locale).into_owned(),
+            body: rust_i18n::t!(
+                "properties.save_failure",
+                locale = locale,
+                failed = failed,
+                total = total
+            )
+            .into_owned(),
+        }
+    }
+}
+
+/// Present the localized explanation for a save that did not fully apply.
+fn show_save_failure_alert(
+    parent: &adw::ApplicationWindow,
+    modified: usize,
+    failed: usize,
+    conflicts: usize,
+) {
+    let copy = save_failure_copy(&rust_i18n::locale(), modified, failed, conflicts);
+    let alert = adw::AlertDialog::builder()
+        .heading(&copy.heading)
+        .body(&copy.body)
+        .build();
+    alert.add_response("ok", "OK");
+    alert.present(Some(parent));
 }
 
 /// Show the properties dialog for one or more tracks.
@@ -766,10 +949,26 @@ pub fn show_properties_dialog(
         let edits = edits.clone();
 
         std::thread::spawn(move || {
-            let availability = preflight_save_targets(&targets);
-            if availability != TagEditingAvailability::Ready {
-                let _ = tx.send_blocking(SaveOutcome::Blocked(availability));
-                return;
+            match preflight_save_targets(&targets) {
+                SelectionPreflight::Ready => {}
+                SelectionPreflight::Changed { conflicts, total } => {
+                    // A changed selection must be explained as a localized
+                    // conflict before any write runs; nothing is written.
+                    let _ = tx.send_blocking(SaveOutcome::Blocked {
+                        availability: TagEditingAvailability::Conflict,
+                        conflicts,
+                        total,
+                    });
+                    return;
+                }
+                SelectionPreflight::Unavailable(availability) => {
+                    let _ = tx.send_blocking(SaveOutcome::Blocked {
+                        availability,
+                        conflicts: 0,
+                        total: 0,
+                    });
+                    return;
+                }
             }
 
             let mut modified = 0usize;
@@ -840,11 +1039,7 @@ pub fn show_properties_dialog(
                 }
             }
 
-            let current_availability = if failed == 0 {
-                TagEditingAvailability::Ready
-            } else {
-                preflight_save_targets(&targets)
-            };
+            let current_availability = post_save_availability(&targets, &written_keys, failed);
             let _ = tx.send_blocking(SaveOutcome::Finished {
                 modified,
                 failed,
@@ -870,7 +1065,11 @@ pub fn show_properties_dialog(
             }
 
             match outcome {
-                Ok(SaveOutcome::Blocked(availability)) => {
+                Ok(SaveOutcome::Blocked {
+                    availability,
+                    conflicts,
+                    total,
+                }) => {
                     dialog.set_can_close(true);
                     cancel_button.set_sensitive(true);
                     apply_tag_editing_availability(
@@ -882,6 +1081,13 @@ pub fn show_properties_dialog(
                         is_batch,
                         automatic_device,
                     );
+                    // A changed selection is refused before the first write;
+                    // explain it with the same localized changed-on-disk
+                    // guidance the post-write path uses, not the generic
+                    // unavailable message the availability ladder produces.
+                    if conflicts > 0 {
+                        show_save_failure_alert(&parent, 0, total, conflicts);
+                    }
                 }
                 Ok(SaveOutcome::Finished {
                     modified,
@@ -899,12 +1105,8 @@ pub fn show_properties_dialog(
                     // Re-proving an already-replaced file would report a
                     // spurious conflict instead of the real remaining failure.
                     if !written_keys.is_empty() {
-                        targets_for_completion
-                            .borrow_mut()
-                            .retain(|target| match save_target_key(target) {
-                                Some(key) => !written_keys.contains(&key),
-                                None => true,
-                            });
+                        let mut stored = targets_for_completion.borrow_mut();
+                        retain_pending_save_targets(&mut stored, &written_keys);
                     }
 
                     if failed == 0 {
@@ -933,35 +1135,7 @@ pub fn show_properties_dialog(
                     // file changed on disk since it was selected and was
                     // preserved untouched — retrying the same dialog state
                     // cannot succeed, so say so instead of inviting a retry.
-                    let total = modified + failed;
-                    let body = if conflicts == failed {
-                        format!(
-                            "{conflicts} of {total} file(s) changed on disk since Properties \
-                             opened. The competing files were left untouched — reopen \
-                             Properties to edit the current files."
-                        )
-                    } else if conflicts > 0 {
-                        format!(
-                            "{conflicts} file(s) changed on disk and {rest} other file(s) could \
-                             not be saved; all were left unchanged. Reopen Properties for the \
-                             changed files.",
-                            rest = failed - conflicts
-                        )
-                    } else {
-                        format!(
-                            "{failed} of {total} file(s) could not be saved and were left unchanged."
-                        )
-                    };
-                    let alert = adw::AlertDialog::builder()
-                        .heading(if conflicts > 0 {
-                            "Some Files Changed on Disk"
-                        } else {
-                            "Could Not Save Some Files"
-                        })
-                        .body(&body)
-                        .build();
-                    alert.add_response("ok", "OK");
-                    alert.present(Some(&parent));
+                    show_save_failure_alert(&parent, modified, failed, conflicts);
                 }
                 Err(_) => {
                     dialog.set_can_close(true);
@@ -986,7 +1160,8 @@ pub fn show_properties_dialog(
     let (preflight_tx, preflight_rx) = async_channel::bounded(1);
     let targets_for_preflight = save_targets;
     std::thread::spawn(move || {
-        let _ = preflight_tx.send_blocking(preflight_save_targets(&targets_for_preflight));
+        let _ = preflight_tx
+            .send_blocking(preflight_save_targets(&targets_for_preflight).availability());
     });
 
     let entries_for_preflight = entries_for_save;
@@ -1283,7 +1458,8 @@ mod tests {
                 source_id: crate::architecture::SourceId::local(),
                 session_epoch: 1,
                 track_id: crate::architecture::TrackId::new("unix:01").expect("track id"),
-            })]),
+            })])
+            .availability(),
             TagEditingAvailability::Unavailable
         );
     }
@@ -1318,6 +1494,7 @@ mod tests {
             TagEditingAvailability::UnsupportedFormat,
             TagEditingAvailability::InvalidFile,
             TagEditingAvailability::Unavailable,
+            TagEditingAvailability::Conflict,
         ] {
             assert_eq!(
                 availability.controls(false),
@@ -1369,7 +1546,7 @@ mod tests {
     #[test]
     fn empty_and_mixed_preflight_selections_fail_closed() {
         assert_eq!(
-            preflight_save_targets(&[]),
+            preflight_save_targets(&[]).availability(),
             TagEditingAvailability::InvalidFile
         );
 
@@ -1383,7 +1560,8 @@ mod tests {
             preflight_save_targets(&[
                 SaveTarget::Local(LocalMutationTarget::capture(&supported)),
                 SaveTarget::Local(LocalMutationTarget::capture(&unsupported)),
-            ]),
+            ])
+            .availability(),
             TagEditingAvailability::UnsupportedFormat
         );
         assert!(
@@ -1404,5 +1582,247 @@ mod tests {
         assert_ne!(generic, device);
         assert!(!generic.is_empty());
         assert!(!device.is_empty());
+    }
+
+    /// The `silence.flac` fixture the local-editor tests select.
+    fn selection_fixture_bytes() -> &'static [u8] {
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/audio/silence.flac"
+        ))
+    }
+
+    /// Write a fresh valid FLAC named `name` under `directory`.
+    fn writable_selection(directory: &std::path::Path, name: &str) -> PathBuf {
+        let path = directory.join(name);
+        std::fs::write(&path, selection_fixture_bytes()).expect("write selection fixture");
+        path
+    }
+
+    /// No reserved tag-write sibling may survive a blocked preflight.
+    fn assert_no_preflight_residue(directory: &std::path::Path) {
+        assert!(
+            std::fs::read_dir(directory)
+                .expect("read fixture")
+                .all(|entry| !crate::local::tag_writer::is_tag_write_temp_file(
+                    &entry.expect("directory entry").path()
+                )),
+            "a blocked preflight must leave no private sibling"
+        );
+    }
+
+    /// #248 F1: a file replaced before Save is reported as a localized
+    /// changed-on-disk conflict by the pre-write probe — not folded into the
+    /// generic unavailable result — and no byte is written.
+    #[test]
+    fn a_file_replaced_before_save_is_a_preflight_conflict_before_any_write() {
+        let directory = tempfile::tempdir().expect("create selection fixture");
+        let selected = writable_selection(directory.path(), "song.flac");
+        let target = LocalMutationTarget::capture(&selected);
+
+        let displaced = directory.path().join("displaced.flac");
+        std::fs::rename(&selected, &displaced).expect("displace the selection");
+        let stranger = b"a different file now occupies the selected pathname".to_vec();
+        std::fs::write(&selected, &stranger).expect("install a replacement");
+
+        let targets = vec![SaveTarget::Local(target)];
+        let verdict = preflight_save_targets(&targets);
+        assert_eq!(
+            verdict,
+            SelectionPreflight::Changed {
+                conflicts: 1,
+                total: 1
+            }
+        );
+        assert_eq!(verdict.availability(), TagEditingAvailability::Conflict);
+
+        // The probe must explain the conflict and leave both files exactly
+        // as the competing writer left them.
+        assert_eq!(
+            std::fs::read(&selected).expect("read the replacement"),
+            stranger,
+            "the replacement must be preserved byte-for-byte"
+        );
+        assert_eq!(
+            std::fs::read(&displaced).expect("read the displaced selection"),
+            selection_fixture_bytes(),
+            "the admitted selection must be byte-for-byte untouched"
+        );
+        assert_no_preflight_residue(directory.path());
+    }
+
+    /// #248 F1: an in-place edit before Save is the localized `TargetEdited`
+    /// conflict, distinct from a plain I/O failure, and nothing is written.
+    #[test]
+    fn an_in_place_edit_before_save_is_a_preflight_conflict() {
+        let directory = tempfile::tempdir().expect("create selection fixture");
+        let selected = writable_selection(directory.path(), "song.flac");
+        let target = LocalMutationTarget::capture(&selected);
+
+        let competing = b"a competing in-place edit landed after selection".to_vec();
+        std::fs::write(&selected, &competing).expect("edit the selection in place");
+
+        let verdict = preflight_save_targets(&[SaveTarget::Local(target)]);
+        assert_eq!(
+            verdict,
+            SelectionPreflight::Changed {
+                conflicts: 1,
+                total: 1
+            }
+        );
+        assert_eq!(verdict.availability(), TagEditingAvailability::Conflict);
+        assert_eq!(
+            std::fs::read(&selected).expect("read the competing edit"),
+            competing,
+            "the competing edit must be preserved byte-for-byte"
+        );
+        assert_no_preflight_residue(directory.path());
+    }
+
+    /// #248 F2: after one target commits, post-save availability is derived
+    /// from the remaining targets, so a recoverable second target keeps Save
+    /// enabled and a retry re-writes only that second target.
+    #[test]
+    fn a_partial_save_recomputes_retry_availability_over_unwritten_targets() {
+        let directory = tempfile::tempdir().expect("create selection fixture");
+        let first = writable_selection(directory.path(), "first.flac");
+        let second = writable_selection(directory.path(), "second.flac");
+
+        let first_target = LocalMutationTarget::capture(&first);
+        let second_target = LocalMutationTarget::capture(&second);
+        let targets = vec![
+            SaveTarget::Local(first_target.clone()),
+            SaveTarget::Local(second_target.clone()),
+        ];
+
+        // The first target commits and its selected object is replaced, as
+        // the real save worker leaves it.
+        let first_edits = TagEdits {
+            year: Some("2026".to_string()),
+            ..Default::default()
+        };
+        first_target
+            .write_tags(&first_edits)
+            .expect("first target commits");
+        let written_keys = vec![SaveTargetKey::Local(first.clone())];
+        let first_bytes_after_commit =
+            std::fs::read(&first).expect("read the committed first target");
+
+        // Probing the ORIGINAL list can no longer be Ready — the committed
+        // file's retained evidence is deliberately stale. That is exactly
+        // why the old code disabled retry.
+        assert_ne!(
+            preflight_save_targets(&targets).availability(),
+            TagEditingAvailability::Ready
+        );
+
+        // Derived over only the unwritten targets, retry stays enabled and
+        // targets only the second file.
+        assert_eq!(
+            post_save_availability(&targets, &written_keys, 1),
+            TagEditingAvailability::Ready
+        );
+        let remaining = remaining_save_targets(&targets, &written_keys);
+        assert_eq!(
+            remaining,
+            vec![SaveTarget::Local(second_target)],
+            "only the recoverable target is retried"
+        );
+
+        let second_edits = TagEdits {
+            year: Some("2027".to_string()),
+            ..Default::default()
+        };
+        for target in &remaining {
+            if let SaveTarget::Local(local) = target {
+                local
+                    .write_tags(&second_edits)
+                    .expect("the retry writes the remaining target");
+            }
+        }
+
+        assert_eq!(
+            std::fs::read(&first).expect("read the first target after the retry"),
+            first_bytes_after_commit,
+            "the committed first target must not be rewritten by the retry"
+        );
+        assert_ne!(
+            std::fs::read(&second).expect("read the retried second target"),
+            selection_fixture_bytes(),
+            "the retry must write the remaining target"
+        );
+        assert_no_preflight_residue(directory.path());
+    }
+
+    /// #248 F3: the conflict alert copy is localized in every shipped
+    /// catalog, for both the all-conflict and the mixed-conflict result, and
+    /// its count placeholders are interpolated.
+    #[test]
+    fn save_failure_copy_localizes_all_and_mixed_conflicts() {
+        let english_all = save_failure_copy("en", 0, 2, 2);
+        let english_mixed = save_failure_copy("en", 0, 3, 1);
+        let english_io = save_failure_copy("en", 0, 2, 0);
+
+        assert!(!english_all.heading.is_empty());
+        assert!(!english_all.body.is_empty());
+        assert!(!english_mixed.heading.is_empty());
+        assert!(!english_mixed.body.is_empty());
+        assert_ne!(english_all.body, english_mixed.body);
+        assert_ne!(english_all.heading, english_io.heading);
+        assert!(!english_all.body.contains("%{"));
+        assert!(!english_mixed.body.contains("%{"));
+
+        for locale in rust_i18n::available_locales!() {
+            let all = save_failure_copy(&locale, 0, 2, 2);
+            let mixed = save_failure_copy(&locale, 0, 3, 1);
+            assert!(!all.heading.is_empty(), "{locale}: empty all heading");
+            assert!(!all.body.is_empty(), "{locale}: empty all body");
+            assert!(!mixed.heading.is_empty(), "{locale}: empty mixed heading");
+            assert!(!mixed.body.is_empty(), "{locale}: empty mixed body");
+            if locale != "en" {
+                assert_ne!(
+                    all.heading, english_all.heading,
+                    "{locale}: all heading fell back to English"
+                );
+                assert_ne!(
+                    all.body, english_all.body,
+                    "{locale}: all body fell back to English"
+                );
+                assert_ne!(
+                    mixed.body, english_mixed.body,
+                    "{locale}: mixed body fell back to English"
+                );
+            }
+            assert!(
+                !all.body.contains("%{"),
+                "{locale}: all-conflict placeholder not interpolated"
+            );
+            assert!(
+                !mixed.body.contains("%{"),
+                "{locale}: mixed-conflict placeholder not interpolated"
+            );
+        }
+    }
+
+    /// #248 F3: the capability label's changed-on-disk guidance is localized
+    /// in every shipped catalog and differs from the generic unavailable
+    /// explanation.
+    #[test]
+    fn conflict_guidance_is_localized_for_every_catalog() {
+        let english = rust_i18n::t!("properties.write_conflict", locale = "en").into_owned();
+        assert!(!english.is_empty());
+        assert_ne!(english, TagEditingAvailability::Unavailable.message(false));
+
+        for locale in rust_i18n::available_locales!() {
+            let localized =
+                rust_i18n::t!("properties.write_conflict", locale = locale).into_owned();
+            assert!(!localized.is_empty(), "{locale}: empty conflict guidance");
+            if locale != "en" {
+                assert_ne!(
+                    localized, english,
+                    "{locale} must not fall back to English conflict guidance"
+                );
+            }
+        }
     }
 }

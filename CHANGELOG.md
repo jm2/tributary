@@ -110,7 +110,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retained authority used for removable media before staging or committing. A replaced file, a
   changed containing directory, or a competing edit now refuses with a localized conflict, leaves
   every competing file/update byte-for-byte intact, and surfaces a "changed on disk" message instead
-  of a generic failure. A successful save drops its target before any retry. Residual race stated
+  of a generic failure. A changed selection is classified by the pre-write probe — not collapsed
+  into a generic read-only/unavailable result — so the localized conflict guidance appears before
+  any byte is written. A successful save drops its target before any retry and post-save
+  availability is recomputed over the remaining targets only, so one committed file can no longer
+  disable retry for the recoverable files that still need it. The changed-on-disk heading, bodies,
+  and capability label are localized in every shipped catalog. Residual race stated
   honestly: a coarse modification timestamp can miss an in-place edit that keeps the exact byte
   length and lands inside the timestamp granularity; the length is always compared.
 - **Supervised MPD control TOCTOU** (`src/audio/mpd_output.rs`) — A playback

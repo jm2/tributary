@@ -1130,6 +1130,24 @@ fn conflict_error(reason: LocalTagWriteConflict) -> anyhow::Error {
     anyhow::Error::new(reason)
 }
 
+/// Why a local selection failed its point-in-time write-capability probe.
+///
+/// A changed target file, containing directory, or content revision is a
+/// localized conflict: the exact object the dialog selected is no longer
+/// there, and reopening Properties is the fix. Every other failure is a
+/// genuine availability problem — unsupported format, non-file, permissions,
+/// or I/O — independent of any change. Keeping the two apart lets the dialog
+/// show changed-on-disk guidance before the first write instead of collapsing
+/// a conflict into the generic read-only/unavailable explanation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalTagPreflightError {
+    /// The selection changed on disk since capture (or could not be
+    /// identified then). Nothing may be written; reopen Properties.
+    Conflict(LocalTagWriteConflict),
+    /// The target cannot currently be written, independent of any change.
+    Unavailable(TagWritePreflightError),
+}
+
 /// Snapshot evidence that one exact local-library file was the user's
 /// selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1196,35 +1214,52 @@ impl LocalMutationTarget {
     ///
     /// Re-admits the selected file through its retained directory authority,
     /// proves the selection evidence still holds, and rehearses the complete
-    /// atomic replacement shape beside the exact file. Advisory only: the
-    /// commit revalidates everything fail-closed. Blocking — worker threads
-    /// only.
-    pub fn preflight_write_capability(&self) -> Result<(), TagWritePreflightError> {
+    /// atomic replacement shape beside the exact file. A changed target,
+    /// containing directory, or content revision is reported as a
+    /// [`LocalTagPreflightError::Conflict`] — the same localized condition the
+    /// commit refuses with — so the dialog explains "changed on disk" before
+    /// any write instead of a generic read-only/unavailable message. Advisory
+    /// only: the commit revalidates everything fail-closed. Blocking — worker
+    /// threads only.
+    pub fn preflight_write_capability(&self) -> Result<(), LocalTagPreflightError> {
         let Some(evidence) = self.evidence else {
-            return Err(TagWritePreflightError::Unavailable);
+            // No evidence was captured, so no write can be proven against the
+            // selection. That is the selection-identity conflict, not a
+            // capability failure.
+            return Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::SelectionUnavailable,
+            ));
         };
-        let (authority, target) = self
-            .retained_target()
-            .map_err(|_| TagWritePreflightError::Unavailable)?;
+        let (authority, target) = self.retained_target().map_err(|_| {
+            LocalTagPreflightError::Unavailable(TagWritePreflightError::Unavailable)
+        })?;
         if authority.root_identity() != evidence.parent_identity {
-            return Err(TagWritePreflightError::Unavailable);
+            return Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::ParentChanged,
+            ));
         }
         if target
             .admitted_identity()
-            .map_err(|_| TagWritePreflightError::Unavailable)?
+            .map_err(|_| LocalTagPreflightError::Unavailable(TagWritePreflightError::Unavailable))?
             != evidence.file_identity
         {
-            return Err(TagWritePreflightError::Unavailable);
+            return Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::TargetReplaced,
+            ));
         }
         if target
             .content_revision()
-            .map_err(|_| TagWritePreflightError::Unavailable)?
+            .map_err(|_| LocalTagPreflightError::Unavailable(TagWritePreflightError::Unavailable))?
             != evidence.revision
         {
-            return Err(TagWritePreflightError::Unavailable);
+            return Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::TargetEdited,
+            ));
         }
         if !supports_tag_writes(target.replacement_path()) {
-            return Err(TagWritePreflightError::UnsupportedFormat);
+            return Err(LocalTagPreflightError::Unavailable(
+                TagWritePreflightError::UnsupportedFormat,
+            ));
         }
         // Rehearse the anchored replacement through the retained parent — the
         // same directory object the commit resolves — so an ancestor displaced
@@ -1233,18 +1268,20 @@ impl LocalMutationTarget {
         // safely perform.
         #[cfg(unix)]
         {
-            let (parent, leaf) = target
-                .retained_directory_handle()
-                .map_err(|_| TagWritePreflightError::Unavailable)?;
+            let (parent, leaf) = target.retained_directory_handle().map_err(|_| {
+                LocalTagPreflightError::Unavailable(TagWritePreflightError::Unavailable)
+            })?;
             crate::local::tag_writer::preflight_tag_write_directory_retained(
                 &parent,
                 &leaf,
                 "the selected local file",
             )
+            .map_err(LocalTagPreflightError::Unavailable)
         }
         #[cfg(not(unix))]
         {
             preflight_tag_write(target.replacement_path())
+                .map_err(LocalTagPreflightError::Unavailable)
         }
     }
 
@@ -2949,7 +2986,12 @@ mod tests {
             .expect("restore the directory permissions");
 
         if !effective_create {
-            assert_eq!(preflight, Err(TagWritePreflightError::Unavailable));
+            assert_eq!(
+                preflight,
+                Err(LocalTagPreflightError::Unavailable(
+                    TagWritePreflightError::Unavailable
+                ))
+            );
             assert!(
                 write.is_err(),
                 "an unwritable containing directory must refuse the save"
@@ -2964,6 +3006,105 @@ mod tests {
                 "a refused save leaves no private sibling behind"
             );
         }
+    }
+
+    /// The pre-write probe must report a replaced selection as the localized
+    /// conflict the commit itself refuses with — not a generic unavailable
+    /// condition — and must write nothing.
+    #[test]
+    fn local_preflight_reports_a_replaced_selection_as_a_conflict() {
+        let (directory, track, target) = local_selection_fixture("local-preflight-replaced");
+        let original = silence_fixture_bytes().to_vec();
+
+        let displaced = directory.path.join("displaced.flac");
+        std::fs::rename(&track, &displaced).expect("displace the selected file");
+        let stranger = b"a different file now occupies the selected pathname".to_vec();
+        std::fs::write(&track, &stranger).expect("install a different file");
+
+        assert_eq!(
+            target.preflight_write_capability(),
+            Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::TargetReplaced
+            ))
+        );
+        assert_eq!(
+            std::fs::read(&track).expect("read the replacement"),
+            stranger
+        );
+        assert_eq!(std::fs::read(&displaced).expect("read displaced"), original);
+        assert!(directory.temp_files().is_empty());
+    }
+
+    /// The pre-write probe must report an in-place edit as the localized
+    /// `TargetEdited` conflict, distinct from a permissions/I/O failure.
+    #[test]
+    fn local_preflight_reports_an_in_place_edit_as_a_conflict() {
+        let (directory, track, target) = local_selection_fixture("local-preflight-edited");
+        write_competing_tag_in_place(&track, "1999");
+
+        assert_eq!(
+            target.preflight_write_capability(),
+            Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::TargetEdited
+            ))
+        );
+
+        let tagged = lofty::read_from_path(&track).expect("reopen the competing file");
+        let tag = tagged.primary_tag().expect("primary tag");
+        assert_eq!(tag.get_string(ItemKey::Year), Some("1999"));
+        assert!(directory.temp_files().is_empty());
+    }
+
+    /// The pre-write probe must report a replaced containing directory as the
+    /// localized `ParentChanged` conflict.
+    #[test]
+    fn local_preflight_reports_a_changed_containing_directory_as_a_conflict() {
+        let directory = TestDirectory::new("local-preflight-root-change");
+        let album = directory.path.join("album");
+        std::fs::create_dir(&album).expect("create album");
+        let track = album.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write fixture");
+        let target = LocalMutationTarget::capture(&track);
+
+        let displaced_album = directory.path.join("displaced-album");
+        std::fs::rename(&album, &displaced_album).expect("displace the selected directory");
+        std::fs::create_dir(&album).expect("install an impostor directory");
+        let impostor = album.join("silence.flac");
+        std::fs::write(&impostor, b"impostor audio").expect("install impostor file");
+
+        assert_eq!(
+            target.preflight_write_capability(),
+            Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::ParentChanged
+            ))
+        );
+        assert_eq!(
+            std::fs::read(&impostor).expect("read the impostor file"),
+            b"impostor audio"
+        );
+        assert_eq!(
+            std::fs::read(displaced_album.join("silence.flac")).expect("read admitted"),
+            silence_fixture_bytes()
+        );
+        assert_no_tag_write_siblings_under(&directory.path);
+    }
+
+    /// A capability failure that is not a changed selection stays typed as
+    /// unavailable, so the dialog never tells the user to reopen Properties
+    /// for a format or permissions problem.
+    #[test]
+    fn local_preflight_reports_a_capability_failure_as_unavailable() {
+        let directory = TestDirectory::new("local-preflight-unsupported");
+        let track = directory.path.join("song.wav");
+        std::fs::write(&track, b"audio").expect("write unsupported fixture");
+        let target = LocalMutationTarget::capture(&track);
+
+        assert_eq!(
+            target.preflight_write_capability(),
+            Err(LocalTagPreflightError::Unavailable(
+                TagWritePreflightError::UnsupportedFormat
+            ))
+        );
     }
 
     /// Repeatedly walk `root` and require no reserved tag-write sibling to

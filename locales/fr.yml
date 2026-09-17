@@ -237,6 +237,12 @@ properties:
   write_invalid_file: "La modification des tags est indisponible, car au moins une piste sélectionnée ne correspond pas à un fichier local ordinaire."
   write_unavailable: "La modification des tags est indisponible, car au moins un fichier sélectionné ou son dossier est en lecture seule ou indisponible."
   write_device_unavailable: "Ce périphérique est actuellement en lecture seule ou indisponible. Dans Flatpak, ajoutez son dossier comme bibliothèque personnalisée dans les Préférences afin de demander l’accès en écriture."
+  write_conflict: "Au moins un fichier sélectionné a changé sur le disque depuis l’ouverture des Propriétés. Rouvrez les Propriétés pour modifier les fichiers actuels."
+  save_conflict_heading: "Certains fichiers ont changé sur le disque"
+  save_failure_heading: "Impossible d’enregistrer certains fichiers"
+  save_conflict_all: "%{conflicts} fichier(s) sur %{total} ont changé sur le disque depuis l’ouverture des Propriétés. Les fichiers concurrents ont été laissés intacts — rouvrez les Propriétés pour modifier les fichiers actuels."
+  save_conflict_mixed: "%{conflicts} fichier(s) sur %{total} ont changé sur le disque et %{other} autre(s) fichier(s) n’ont pas pu être enregistrés ; tous ont été laissés inchangés. Rouvrez les Propriétés pour les fichiers modifiés."
+  save_failure: "%{failed} fichier(s) sur %{total} n’ont pas pu être enregistrés et ont été laissés inchangés."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:

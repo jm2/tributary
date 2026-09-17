@@ -270,6 +270,12 @@ properties:
   write_invalid_file: "Tag editing is unavailable because at least one selected track is not a regular local file."
   write_unavailable: "Tag editing is unavailable because at least one selected file or its folder is read-only or unavailable."
   write_device_unavailable: "This device is currently read-only or unavailable. In Flatpak, add its folder as a custom library in Preferences to request write access."
+  write_conflict: "At least one selected file changed on disk since Properties opened. Reopen Properties to edit the current files."
+  save_conflict_heading: "Some Files Changed on Disk"
+  save_failure_heading: "Could Not Save Some Files"
+  save_conflict_all: "%{conflicts} of %{total} file(s) changed on disk since Properties opened. The competing files were left untouched — reopen Properties to edit the current files."
+  save_conflict_mixed: "%{conflicts} of %{total} file(s) changed on disk and %{other} other file(s) could not be saved; all were left unchanged. Reopen Properties for the changed files."
+  save_failure: "%{failed} of %{total} file(s) could not be saved and were left unchanged."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:

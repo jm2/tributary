@@ -237,6 +237,12 @@ properties:
   write_invalid_file: "由于至少一首所选曲目不是常规本地文件，标签编辑不可用。"
   write_unavailable: "由于至少一个所选文件或其文件夹为只读或不可用，标签编辑不可用。"
   write_device_unavailable: "此设备目前为只读或不可用。在 Flatpak 中，请在“首选项”中将其文件夹添加为自定义音乐库，以请求写入权限。"
+  write_conflict: "自打开属性以来，至少有一个所选文件已在磁盘上更改。请重新打开属性以编辑当前文件。"
+  save_conflict_heading: "部分文件已在磁盘上更改"
+  save_failure_heading: "部分文件无法保存"
+  save_conflict_all: "自打开属性以来，%{total} 个文件中有 %{conflicts} 个已在磁盘上更改。发生冲突的文件保持不变——请重新打开属性以编辑当前文件。"
+  save_conflict_mixed: "%{total} 个文件中有 %{conflicts} 个已在磁盘上更改，另有 %{other} 个文件无法保存；所有文件均保持不变。请为已更改的文件重新打开属性。"
+  save_failure: "%{total} 个文件中有 %{failed} 个无法保存，均已保持不变。"
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
