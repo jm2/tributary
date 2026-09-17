@@ -147,7 +147,7 @@ pub enum LimiterRemoveFault {
 /// engagement window expires, and then completes so the caller can be
 /// observed to retain the outcome, the probe, and the limiter handle.
 #[cfg(test)]
-pub(crate) struct ProbeEditHold {
+struct ProbeEditHold {
     state: Mutex<ProbeEditHoldState>,
     cv: std::sync::Condvar,
 }
@@ -162,7 +162,7 @@ struct ProbeEditHoldState {
 
 #[cfg(test)]
 impl ProbeEditHold {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
             state: Mutex::new(ProbeEditHoldState {
                 entered: false,
@@ -192,7 +192,7 @@ impl ProbeEditHold {
     }
 
     /// Block (bounded) until the callback has entered the hold.
-    pub(crate) fn wait_until_entered(&self, timeout: Duration) -> bool {
+    fn wait_until_entered(&self, timeout: Duration) -> bool {
         let state = self
             .state
             .lock()
@@ -205,7 +205,7 @@ impl ProbeEditHold {
     }
 
     /// The thread the held callback is running on, once it has entered.
-    pub(crate) fn callback_thread(&self) -> Option<std::thread::ThreadId> {
+    fn callback_thread(&self) -> Option<std::thread::ThreadId> {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -213,7 +213,7 @@ impl ProbeEditHold {
     }
 
     /// Let the held callback run to completion.
-    pub(crate) fn release(&self) {
+    fn release(&self) {
         let mut state = self
             .state
             .lock()
@@ -574,7 +574,7 @@ impl EqChain {
     /// Test-only seam: arm a hold that suspends the blocking-probe callback
     /// after it has engaged, until the test releases it.
     #[cfg(test)]
-    pub(crate) fn inject_probe_edit_hold(&mut self, hold: Arc<ProbeEditHold>) {
+    fn inject_probe_edit_hold(&mut self, hold: Arc<ProbeEditHold>) {
         self.probe_hold = Some(hold);
     }
 

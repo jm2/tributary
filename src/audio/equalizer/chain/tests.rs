@@ -580,7 +580,7 @@ impl LiveEqChain {
 
     fn stop(&mut self) {
         if let Some(delivery_probe) = self.delivery_probe.take() {
-            let _ = self.sink_pad.remove_probe(delivery_probe);
+            self.sink_pad.remove_probe(delivery_probe);
         }
         let _ = self.pipeline.set_state(gst::State::Null);
     }
