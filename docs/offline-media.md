@@ -50,7 +50,7 @@ the download/cache engine must satisfy.
 | --- | --- | --- |
 | Identity | Cache entries use the same `SourceId` + `TrackId` shape as live playback. The download engine adopts the live per-source `MediaKey`; it never invents a new identity kind. | New persisted media identifier kinds, new schema migrations for media identity, on-disk naming conventions beyond `task.md` and the credential-boundary section. The durable `SourceIncarnationId` of [restart authorization](#authenticated-resumable-download-jobs) is a registry-side durable field, not a media identifier kind; pre-existing saved sources receive one stable, persisted value at first load. |
 | Authority | Every cached media entry remains owned by its source. The source registry's exact-snapshot capability gates download admission, reconciliation, and retirement. A committed snapshot renders offline without a live registry round-trip; disconnect and refresh never gate playback of committed bytes. No offline bypass of the registry for admission. | Concurrent access contracts for the registry's offline catalogue; specific read-side materialisation policies. |
-| Download jobs | A bounded resumable job model keyed by exact `(SourceId, TrackId)` with a durable, `fsync`'d progress journal, entity validators (`If-Range`) on every range request, opaque server caps, deterministic cancellation, and structured redacted failures. Job state survives restart; it is never memory-only. The journal's bounded per-segment metadata and its fixed publish-intent, intent-clear, and terminal-verdict lifecycle records are engine-owned and charged against the same global quota as payload, while the per-track cap remains a payload limit; the lifecycle records are covered by a single per-job lifecycle reservation, charged once and held for the job's whole life so the mandatory durable intent and verdict records are always writable at the quota boundary without being charged twice. Restart authorization is by durable source-incarnation identity (`SourceId` + `SourceIncarnationId`), never by the transient accepted-generation number, applied consistently to lease reacquisition, resumption, and publish-intent adoption. | Concrete worker pool scheduling, threading model, runtime selection, telemetry. |
+| Download jobs | A bounded resumable job model keyed by exact `(SourceId, TrackId)` with a durable, `fsync`'d progress journal, entity validators (`If-Range`) on every range request, opaque server caps, deterministic cancellation, and structured redacted failures. Job state survives restart; it is never memory-only. The journal's bounded per-segment metadata and its fixed publish-intent, intent-clear, and terminal-verdict lifecycle records are engine-owned and charged against the same global quota as payload, while the per-track cap remains a payload limit; the lifecycle records are bounded by a capped publish-attempt budget and covered by a single per-job lifecycle reservation sized to that whole bounded worst case, charged once and held for the job's whole life so the mandatory durable intent, clear, verdict, and exhaustion records are always writable at the quota boundary without being charged twice and without a run of retries outgrowing the reserve. Restart authorization is by durable source-incarnation identity (`SourceId` + `SourceIncarnationId`), never by the transient accepted-generation number, applied consistently to lease reacquisition, resumption, and publish-intent adoption. | Concrete worker pool scheduling, threading model, runtime selection, telemetry. |
 | Storage | Verify-then-publish: the temp file lives in the same directory (same filesystem) as its final cache path, integrity is verified on the temp file before any rename, and publish is an atomic rename — durability-ordered on Unix by a parent-directory `fsync` chain that re-derives and re-syncs the complete ancestor chain on every attempt, and on Windows by the documented `MOVEFILE_WRITE_THROUGH` barrier ([Atomic storage](#atomic-storage)). The final path is snapshot-scoped, so a refresh publishes a sibling instead of overwriting a predecessor's bytes; a journaled publish intent makes the rename-to-commit window crash-recoverable — adoption at startup completes the pending publication barrier, re-syncing the directory entry for the already-renamed file, and acquires an exact session commit authority atomically at the final admission before it may insert the row or clear the intent — and a durable delete intent — the publish intent itself, or the `fsync`'d terminal-verdict record that supersedes it on a post-rename terminal transition — is the delete owner for a file published without a row. Cross-filesystem publish is refused at admission, never emulated with copy+sync+delete. A `tracks` row may link to a cache path only when integrity passed, the per-track cap held before the rename, and the file is current. | Database migrations, schema, table layout, index choice, cache placement, encryption. |
 | Integrity | SHA-256 is computed over the bytes on disk and compared against an expected digest whose provenance is declared per backend (capability matrix below). A backend that advertises no digest is verified by independent double-fetch; the absence of any verification path is terminal, never a silent pass. Verification completes before publish. | Hashing algorithm extension, content-defined chunking, content-addressable stores. |
 | Capabilities | The remote source owns a default-deny `OfflineSnapshot` capability. Only the same set of backends that opt into live `ServerPlaylist`-style read authority may opt in. Radio-Browser, removable, external-file, and built-in local sources cannot. | Adapter-specific download strategies beyond HTTP(S) `Range` and Subsonic/Jellyfin/Plex/DAAP download endpoints. |
@@ -197,7 +197,7 @@ job model is:
 | `resume_validator` | `Option<EntityValidator>` | Strong `ETag` (preferred) or `Last-Modified` captured from the first successful response. `Some` is required for any resumption; `None` disables resume and restricts the job to full restart. |
 | `current_bytes` | `u64` | Monotonic committed byte count. Durable: journaled and `fsync`'d before it is trusted as a resume point. |
 | `current_sha256` | `Option<[u8; 32]>` | Engine-computed SHA-256 over the received bytes. Not trusted on its own: it is compared against the expected digest per provenance on the temp file before publish. |
-| `journal_bytes` | `u64` | Engine-owned journal/sidecar metadata made durable so far: one bounded, fixed-size segment record per committed segment (offset, length, SHA-256, framing) plus the publish-intent, intent-clear, and terminal-verdict lifecycle records. Charged against the same global quota as payload, because it is part of the cache root's engine-owned footprint. The payload-derived segment records are bounded by the segment coalescing rule; the fixed lifecycle records are covered by a single per-job lifecycle reservation, charged once before the job's first byte and held until terminal cleanup, so the mandatory intent, intent-clear, and verdict records are always writable at the quota boundary. This field counts only records already durable; the still-unwritten lifecycle obligation is reconstructed as a fresh reservation on restart. Re-derived from the durable journal, never from a process-local counter, on restart. |
+| `journal_bytes` | `u64` | Engine-owned journal/sidecar metadata made durable so far: one bounded, fixed-size segment record per committed segment (offset, length, SHA-256, framing) plus the publish-intent, intent-clear, and terminal-verdict lifecycle records. Charged against the same global quota as payload, because it is part of the cache root's engine-owned footprint. The payload-derived segment records are bounded by the segment coalescing rule; the lifecycle records are bounded because a job may begin at most a fixed `publish_attempt_budget` publish attempts ([the publish-intent protocol](#publish-intent-and-restart-recovery)), and they are covered by a single per-job lifecycle reservation sized to that whole bounded worst case, charged once before the job's first byte and held until terminal cleanup, so the mandatory intent, intent-clear, and verdict records — including the final record of an exhausted budget — are always writable at the quota boundary. This field counts only records already durable; the still-unwritten lifecycle obligation is reconstructed as a fresh reservation on restart and is at all times bounded by the same budget, so it can never exceed the reservation already charged. Re-derived from the durable journal, never from a process-local counter, on restart. |
 | `state` | `JobState` | `Queued`, `Connecting`, `Receiving`, `Verifying`, `Committing`, `Committed`, `Failed`, `Cancelled`. |
 | `last_lease` | `Option<LeaseId>` | Opaque lease reference of the in-flight HTTP request. Owned by the source registry and process-local only: it is never persisted across a restart, and a restarted job reacquires under the restart-authorization rule below. |
 | `failure` | `Option<OfflineError>` | Redacted, structured, terminal cause when `state = Failed`. |
@@ -247,7 +247,11 @@ The rules:
 4. **Failure is structured.** `OfflineError` is a typed enum with redacted
    variants (`Network`, `AuthExpired`, `LeaseRevoked`, `Denied`,
    `IntegrityMismatch`, `IntegrityUnverifiable`, `LicenceDenied`,
-   `QuotaExceeded`, `StorageUnavailable`, `UnsupportedSource`). `Denied` is
+   `QuotaExceeded`, `PublishRetriesExhausted`, `StorageUnavailable`,
+   `UnsupportedSource`). `PublishRetriesExhausted` is the defined safe refusal
+   when a job has spent its bounded publish-attempt budget on repeated crashes
+   in the rename window; it is not a quota failure and never stands for an
+   uncharged write. `Denied` is
    the capability-level refusal surfaced by `offline_snapshot` for a source
    that explicitly opts out; it is distinct from `LicenceDenied`, which is
    the operational-licence verdict. No raw HTTP status, redirect
@@ -835,7 +839,8 @@ the window and its single recovery resolution:
      path whose rename entry is not durable.
    - The file is present and the digest does not match: the bytes are not
      the verified publication. The engine unlinks the file, clears the
-     intent, and restarts the job from zero.
+     intent, and restarts the job from zero, subject to the bounded
+     publish-attempt budget (rule 6).
    - The file is absent: the rename never happened — or the published name
      was lost in a power-loss crash that took a not-yet-durable ancestor
      entry with it (on Unix, step 5's chain-durability ordering keeps that
@@ -843,7 +848,11 @@ the window and its single recovery resolution:
      resolves here, and the same loss after the commit resolves through
      the post-commit loss row of the crash-point matrix). The engine
      clears the intent and continues per the journal — resume or restart
-     from zero under the normal resumption rules.
+     from zero under the normal resumption rules — while the
+     publish-attempt budget is not yet exhausted. At the budget it begins
+     no further attempt: it records the terminal
+     `Failed(PublishRetriesExhausted)` safe refusal of rule 6 and finishes
+     cleanup.
 4. **The gap is invisible downstream.** Between the rename and the commit
    or adoption there is no cache row, so lookups return the live endpoint
    exactly as before admission. The transient unowned file is observable
@@ -872,13 +881,14 @@ the window and its single recovery resolution:
    | Crash point | Durable state at restart | Startup resolution | Invariant |
    | --- | --- | --- | --- |
    | Ancestors created (step 1 or an earlier attempt), process crash before the step-5 ancestor-durability pass | No commit; temp present; final absent; ancestor directories may exist but their entry durability is unproven; no intent, or a pending one. | Ordinary journal recovery resumes or restarts per the journal; on reaching step 5 it re-derives the complete ancestor chain from the recorded final path and re-runs the top-down, idempotent pass before the rename, never trusting the crashed process's creation set. | The pass is path-derived and idempotent, so a resumed process completes it without the creator's memory. |
-   | Power loss before or during the step-5 ancestor-durability pass, before the rename | No commit; final absent; the temp or some created ancestors may or may not have survived; a pending intent may be present. | File-absent resolution for any pending intent; on the next attempt the complete chain pass runs from the top before the rename. | Nothing was published; re-syncing the chain is unconditional and cannot double-publish. |
-   | Power loss after the rename, before the snapshot-directory `fsync` and the commit | Intent present; the published name may or may not have survived, because the rename's own entry was not yet synced; the ancestor chain is already durable from the pass. | Final present with the intent's digest → the adoption path first completes the interrupted publication barrier — on Unix re-deriving the recorded final path's complete ancestor chain and `fsync`-ing the snapshot directory that holds the already-renamed file, without repeating the rename — then acquires the exact session commit authority and, with it held, inserts the row and clears the intent; if the barrier or the authority acquisition fails, no row is created and the intent stays as the durable owner, retried on a later pass. Final absent → clear the intent and resume or restart per the journal. | Ancestors are durable before the rename, so only the rename's own entry is at stake; a barrier- or authority-blocked arm leaves the pending intent as the durable owner and may need more than one pass, and no committed Unix row exists until that entry is durable. |
+   | Power loss before or during the step-5 ancestor-durability pass, before the rename | No commit; final absent; the temp or some created ancestors may or may not have survived; a pending intent may be present. | File-absent resolution for any pending intent; on the next attempt the complete chain pass runs from the top before the rename, subject to the bounded publish-attempt rule (rule 6). | Nothing was published; re-syncing the chain is unconditional and cannot double-publish. |
+   | Power loss after the rename, before the snapshot-directory `fsync` and the commit | Intent present; the published name may or may not have survived, because the rename's own entry was not yet synced; the ancestor chain is already durable from the pass. | Final present with the intent's digest → the adoption path first completes the interrupted publication barrier — on Unix re-deriving the recorded final path's complete ancestor chain and `fsync`-ing the snapshot directory that holds the already-renamed file, without repeating the rename — then acquires the exact session commit authority and, with it held, inserts the row and clears the intent; if the barrier or the authority acquisition fails, no row is created and the intent stays as the durable owner, retried on a later pass. Final absent → clear the intent and resume or restart per the journal while the publish-attempt budget is not exhausted; at the budget, record the `Failed(PublishRetriesExhausted)` safe refusal (rule 6). | Ancestors are durable before the rename, so only the rename's own entry is at stake; a barrier- or authority-blocked arm leaves the pending intent as the durable owner and may need more than one pass, and no committed Unix row exists until that entry is durable. |
    | Process crash after the rename, before the snapshot-directory `fsync` and the commit | Intent present; the published name resolves in the still-running kernel and matches the intent's digest; the rename's own entry is not yet durable; the ancestor chain is durable from the pass; job `Committing`. | Adoption first completes the pending publication barrier — on Unix re-derives the recorded final path's complete ancestor chain and `fsync`s the snapshot directory holding the already-renamed file, never repeating the rename — then acquires the exact session commit authority and, with it held, inserts the row and clears the intent; if the barrier or the authority acquisition fails, no row is created and the intent remains the durable owner, retried on a later pass. Because the barrier precedes the row insert, the recovery's own commit is durable and a subsequent power loss cannot lose the name. | The step-5 ordering is completed by recovery under a retained commit authority: a committed Unix row never exists before its publish-directory entry is durable. |
    | Verify passed, publish-intent record not yet durable | No intent; temp present; final absent; job pre-`Committing`. | Ordinary journal recovery; the job proceeds from its journaled state. | Nothing was published; no recovery protocol engages. |
-   | Intent `fsync`'d, before the rename | Intent present; temp present; final absent; job `Committing`. | File absent → clear the intent; resume or restart per the journal. | No publish without a commit; temp resume intact. |
+   | Intent `fsync`'d, before the rename | Intent present; temp present; final absent; job `Committing`. | File absent → clear the intent; resume or restart per the journal while the publish-attempt budget is not exhausted; at the budget, record the `Failed(PublishRetriesExhausted)` safe refusal (rule 6). | No publish without a commit; temp resume intact. |
+   | Repeated intent-before-rename crashes reach the publish-attempt budget (including with the free global quota at zero) | Intent present, or just cleared, with the durable `publish_attempt` counter at `publish_attempt_budget`; no further attempt is admissible. | Terminal safe refusal: write `Failed(PublishRetriesExhausted)`, clear any pending intent, release reservations at terminal cleanup; no new intent is written. | The bounded lifecycle footprint is what lets the exhaustion record fit; the exhausted job never writes an unbudgeted lifecycle record. |
    | Rename applied, before the step-6 commit | Intent present; final present with the intent's digest; temp gone; job `Committing`; no verdict record. | Adoption path: digest match → complete the pending publication barrier first (on Unix re-derive the recorded final path's chain and `fsync` the snapshot directory of the already-renamed file; never repeat the rename), then acquire the exact session commit authority; with it held the idempotent row insert completes step 6 and the intent is cleared; a barrier or authority failure creates no row and retains the intent, retried on a later pass. | A row exists only after a verified rename and a completed durable publish barrier under a retained commit authority; an authority- or barrier-blocked file stays durably owned and non-playable, not an orphan. |
-   | Rename applied, then a newly created ancestor entry lost for want of durability | Intent present; final absent (the published name did not survive); job `Committing`. | File-absent resolution: clear the intent; the job continues per the journal — resume or restart from zero; missing ancestor directories are rebuilt under the ordinary creation rules. | On Unix, step 5's chain-durability ordering confines this row below the commit. On Windows the same crash before the commit resolves through this row; the same loss after the commit resolves through the post-commit loss row below. |
+   | Rename applied, then a newly created ancestor entry lost for want of durability | Intent present; final absent (the published name did not survive); job `Committing`. | File-absent resolution: clear the intent; the job continues per the journal — resume or restart from zero, subject to the bounded publish-attempt rule (rule 6); missing ancestor directories are rebuilt under the ordinary creation rules. | On Unix, step 5's chain-durability ordering confines this row below the commit. On Windows the same crash before the commit resolves through this row; the same loss after the commit resolves through the post-commit loss row below. |
    | Row committed (Windows), then power loss loses a newly created ancestor entry or the published name | Intent cleared at the commit; row present; the recorded path does not resolve. | Post-commit loss path: the row is never served — lookup and the startup reconciliation pass mark it non-playable and recoverable, a fresh download job may republish a new snapshot, and the never-a-silent-pass rule applies. The predecessor snapshot, if any, is untouched. | Windows documents no normal-user ancestor-entry durability barrier; detection and repair, not an undocumented flush, bound this case. Unix excludes it by the step-5 `fsync` chain. |
    | Crash during the step-6 commit (row inserted, intent not yet cleared) | Intent present; row present; final present. | Row-recognition path: the exact committed row — identity, recorded path, and recorded digest all matching the intent — stands; preserve its bytes, clear the intent. The insert an adoption would re-run is an idempotent no-op. | Completion is idempotent; a committed row is never re-adjudicated by adoption gates. |
    | Row committed (Windows), intent not yet cleared, and the recorded path lost to post-commit ancestor loss | Intent present; row present; the recorded path does not resolve. | Row-recognition path: the committed row stands on its durable evidence — identity, recorded path, recorded digest — and the intent is cleared; the unresolvable path routes the row through the post-commit loss reconciliation (never served, marked non-playable and recoverable, a fresh download job may republish a new snapshot), never through this recovery's unlink. | Recognition never consults the file to authorize cleanup; a committed row is never unlinked by publish-intent recovery, whatever the file's state. |
@@ -888,6 +898,40 @@ the window and its single recovery resolution:
    | Verdict record `fsync`'d, before the unlink | Intent present; verdict present; final present. | Cleanup path: never adopt; idempotent unlink; then intent clear. | The verdict is durable before any destructive step. |
    | Unlink done, intent-clear not yet recorded | Intent present; verdict present; final absent. | Cleanup path: never adopt; clear the intent. | The verdict outlives the file; no resurrection. |
    | Pre-rename terminal decided, intent-clear not yet recorded | Intent present; temp present; final absent. | File absent → clear the intent; continue per the journal; the temp is cleaned by the ordinary exit rules. | The decision had not reached the journal; no destructive effect preceded its durability. |
+
+6. **The publish protocol is bounded, so its fixed reservation can never
+   be outgrown by retries.** The crash-safe lifecycle representation is
+   bounded, not append-unbounded: one job may begin at most a fixed,
+   compile-time `publish_attempt_budget` publish attempts. Each attempt
+   writes at most one publish-intent record and one resolution record-set —
+   a single intent-clear for a pre-rename or successful resolution, or a
+   terminal-verdict record followed by an intent-clear for a post-rename
+   terminal — so the job's whole-lifecycle worst case is
+   `publish_attempt_budget` such record-sets plus the one fixed record that
+   reports an exhausted budget. That worst case is the exact size of the
+   single per-job `lifecycle_reserve` charged once before the job's first
+   byte ([Cancellation, quota, and
+   eviction](#cancellation-quota-and-eviction)), so no sequence of retries
+   can make more durable lifecycle bytes than the job already holds. The
+   durable journal carries a `publish_attempt` counter, `fsync`'d with the
+   intent record it opens; recovery resolves only the open attempt's
+   intent, never re-adopts a resolved attempt's records, and treats an
+   intent whose attempt number is below the durable counter as already
+   settled. Every file-absent resolution and every ordinary restart or
+   retry that would begin a further publication first checks the counter:
+   while `publish_attempt < publish_attempt_budget` the job may begin
+   another attempt within its reservation, and at the budget it begins
+   none. Instead it writes the fixed terminal
+   `Failed(PublishRetriesExhausted)` record — the defined safe refusal,
+   whose bytes its reservation already covers — clears any pending intent,
+   and reaches terminal cleanup, where its reservations are released. A
+   fresh download requested after that refusal is a new job with its own
+   admission and its own lifecycle reservation; it never inherits the
+   exhausted job's charge and never revives its attempt count. The budget
+   is what makes the lifecycle footprint payload-independent and finite:
+   `n` crash-and-retry cycles add lifecycle records only up to the cap, so
+   a job at the global quota limit can still write every mandatory
+   resolution and its exhaustion record.
 
 Restart recovery and the staged delete of
 [Eviction](#cancellation-quota-and-eviction) are the two crash-recovery
@@ -1108,22 +1152,32 @@ policy:
    record), so the segment-record metadata a job can grow is a
    deterministic, bounded function of the payload it receives. The
    **lifecycle records** — the publish-intent, intent-clear, and
-   terminal-verdict records — are a fixed, payload-independent overhead:
-   a bounded number of fixed-size records the crash-safe publish protocol
-   may have to write for any job, whatever its size. Because they are not
-   derived from the payload, they are covered by a **single per-job
-   lifecycle reservation** (`lifecycle_reserve`, the fixed
-   intent/verdict overhead), taken exactly once before the job receives
+   terminal-verdict records — are a fixed, payload-independent overhead,
+   bounded by the capped publish-attempt budget of the
+   [publish-intent protocol](#publish-intent-and-restart-recovery): a job
+   begins at most a fixed `publish_attempt_budget` publish attempts, each
+   writing at most one intent and one resolution record-set, plus one
+   exhaustion record, so the worst-case lifecycle footprint is a fixed
+   number of fixed-size records whatever the job's size and however many
+   times it crashes and retries. Because it is not derived from the
+   payload, that overhead is covered by a **single per-job
+   lifecycle reservation** (`lifecycle_reserve`, sized to the whole bounded
+   worst case), taken exactly once before the job receives
    its first byte and held for the job's whole life, rather than by the
    payload-derived segment bound. The reservation's unwritten portion
-   survives every append, short read, verification, cancellation, and
-   deferred recovery; its bytes convert to durable charges exactly once
+   survives every append, short read, verification, cancellation, deferred
+   recovery, and repeated publication retry; its bytes convert to durable
+   charges exactly once
    as the intent, intent-clear, and verdict records are actually written;
    and its unused capacity is released only at terminal cleanup, when no
-   remaining lifecycle transition can need it. A job sitting exactly at
-   the global limit can therefore still write the mandatory `fsync`'d
-   verdict and intent records its cleanup protocol requires, without
-   charging those bytes twice. In addition to the global
+   remaining lifecycle transition can need it. A retry never re-charges and
+   never enlarges the reservation: its size bounds all admissible attempts,
+   not one. A job sitting exactly at
+   the global limit can therefore still write every mandatory `fsync`'d
+   intent, clear, and verdict record its cleanup protocol requires — and
+   the final record of an exhausted budget — without
+   charging those bytes twice and without the count of retries consuming
+   capacity its terminal cleanup still needs. In addition to the global
    quota, each snapshot is bounded by a **per-track byte cap** on its
    payload — its durable snapshot bytes, not its metadata — that is
    enforced
@@ -1139,28 +1193,30 @@ policy:
      against the engine's same-process quota accounting, the same global
      total an unknown-length response draws on, before it reads or writes
      a byte. Its single lifecycle reservation is charged at the same
-     admission, exactly once for the job; the payload-and-segment term
-     never re-charges that allowance.
+     admission, exactly once for the job, and is sized to the whole bounded
+     publish-attempt budget — so it is an upper bound on every lifecycle
+     record the job can ever write across all attempts and retries; the
+     payload-and-segment term never re-charges that allowance.
      The metadata term is bounded, not guessed: the engine never opens a
      new segment record for fewer than a fixed minimum number of payload
      bytes — it coalesces appended bytes into the open record instead — so
      the remaining payload can grow at most a bounded number of fixed-size
      records, and the combined reservation is an exact upper bound on the
-     engine-owned bytes the job can make durable, segment records and the
-     fixed intent/verdict records included. The payload-and-segment
+      engine-owned bytes the job can make durable, segment records and the
+      bounded lifecycle records included. The payload-and-segment
      reservation is charged to the global total at reservation time, and
      any unused remainder of it — the payload not received and the
      segment records not written — is released back to the global total,
      while the lifecycle reservation's unused portion stays charged until
      terminal cleanup (see the lifecycle rule above), so a
      declared-length job whose remaining payload plus its bounded
-     segment-record metadata plus the fixed lifecycle-record reserve the
+     segment-record metadata plus the budget-sized lifecycle reservation the
      free global quota cannot cover fails `QuotaExceeded` at admission
      instead of writing into another job's allowance. Declared-length and
      unknown-length jobs thus share one global budget and can never jointly
      oversubscribe it: with 10 MiB free, a declared job is admitted only
      when its declared payload plus the bounded segment metadata those
-     bytes can grow plus the fixed lifecycle-record reserve all fit the
+     bytes can grow plus the budget-sized lifecycle reservation all fit the
      free global quota, so a declared job whose payload alone is 10 MiB is
      refused at admission — its metadata and lifecycle records would push
      the engine-owned footprint past the free total — while a smaller
@@ -1169,10 +1225,11 @@ policy:
      refused if it cannot cover its own combined reservation. A resumed job
      reserves only its not-yet-durable payload
      remainder and the segment metadata for the records it has still to
-     write, plus the remainder of its lifecycle obligation reconstructed
-     from the durable journal (see the restart rule below), because the
-     payload and the records already durable on its temp file are already
-     charged.
+     write, plus the remainder of its bounded lifecycle obligation
+     reconstructed from the durable journal (see the restart rule below),
+     which never exceeds the budget-sized reservation the job already held,
+     because the payload and the records already durable on its temp file
+     are already charged.
    - A response of unknown length is bounded before each append, not
      charged after it. Because a segment's bytes are made durable before
      the journal records that segment's progress (the resumption rule
@@ -1189,6 +1246,9 @@ policy:
      global total, so the free global quota this formula tests is net of
      it: an append reservation covers incremental payload and segment
      metadata only and never re-charges the lifecycle allowance. The
+     reservation is sized to the whole bounded attempt budget, so a retry
+     neither re-charges nor enlarges it and this formula is unchanged
+     across attempts. The
      payload-and-segment reservation is charged to the
      global total at reservation time, so two jobs appending concurrently
      can never both observe the same free global quota: with 10 MiB free,
@@ -1255,12 +1315,17 @@ policy:
      disk are counted exactly once. `journal_bytes` alone is not the whole
      obligation: it counts only the records already durable. The engine
      also **reconstructs the job's remaining lifecycle obligation** from
-     the durable journal state — the fixed intent, intent-clear, and
-     verdict records its protocol has still to write before the job can
-     reach terminal cleanup — and re-charges that remainder as a fresh
-     lifecycle reservation before it admits any competing job; a resumed
+     the durable journal state and the durable `publish_attempt` counter —
+     the records for the attempts still admissible under
+     `publish_attempt_budget`, plus the budget-exhaustion record, less the
+     lifecycle records already durable — and re-charges that remainder
+     before it admits any competing job; a resumed
      job likewise re-derives its remaining payload-and-segment allowance
-     from the journal. Without that reconstruction a competing job could
+     from the journal. Because the attempt count is capped, that remainder
+     is at all times bounded by, and charged together with the durable
+     lifecycle bytes to exactly, the budget-sized `lifecycle_reserve` the
+     job already held, so the reconstruction can never demand bytes the
+     reservation did not cover and a competing job cannot
      be admitted against a budget that already spent the cleanup records'
      bytes. Eviction and retirement release a
      job's journal metadata when its journal is removed at terminal
@@ -1269,11 +1334,13 @@ policy:
      emergent: because a segment record is fixed-size and a new segment
      record opens only every minimum-segment worth of payload, a segment
      record is covered by the payload-derived part of the reservation,
-     while the single lifecycle reservation is held from admission so
-     the mandatory intent, intent-clear, and verdict records always fit;
+     while the single lifecycle reservation is sized to the capped
+     publish-attempt budget and held from admission, so
+     the mandatory intent, intent-clear, and verdict records always fit
+     and repeated retries add no lifecycle bytes beyond that bound;
      no admitted job
      can grow metadata its reservation did not cover, and a job that
-     cannot cover the next record fails `QuotaExceeded` before that
+     cannot cover the next segment record fails `QuotaExceeded` before that
      record — or any byte it would certify — is made durable.
    - **Worked invariant check.** Two unknown-length jobs `A` and `B`
      share an exact total quota. `A` takes its single `lifecycle_reserve`
@@ -1298,6 +1365,31 @@ policy:
      durable bytes plus outstanding reservations never exceed the quota,
      the lifecycle overhead is charged once per job, and the mandatory
      cleanup records always fit.
+
+     **Bounded-retry check at exact quota.** Place `A` alone at the exact
+     total: admission charges `A`'s `lifecycle_reserve` and its
+     payload-and-segment reservation, leaving the free global total zero,
+     so no competing job can be admitted against bytes `A` has not yet
+     written. `A` now runs the rejection's counterexample: append and
+     `fsync` intent `I₁`, crash before the rename, wake to a file-absent
+     resolution that clears with `C₁`, resume, append `I₂`, crash again,
+     clear `C₂`, and so on. Each cycle writes its intent and clear from
+     `A`'s single reservation; the durable `publish_attempt` counter
+     advances with each intent and stops the job at
+     `publish_attempt_budget`. After at most that many cycles `A` writes
+     its terminal `PublishRetriesExhausted` record — from the same
+     reservation — and reaches terminal cleanup, where all its
+     reservations are released. In no cycle does `A` need a byte beyond
+     its reservation, so the free global total being zero never blocks a
+     mandatory record. If instead `A` succeeds on attempt
+     `k ≤ publish_attempt_budget`, it writes that attempt's intent and
+     resolving clear and completes; a cancellation landing after the
+     rename writes the verdict and then the clear. Every branch is covered
+     by the same reservation: durable lifecycle bytes never exceed
+     `lifecycle_reserve`, no lifecycle write is uncharged, and `n` retries
+     add no durable lifecycle bytes beyond the budget's bound. The
+     two-job walk above is unchanged by retries, because each job's
+     lifecycle reservation is fixed at admission.
 2. **Eviction is newest-first within source, oldest-first across sources.**
    When the quota is exceeded, eviction walks sources in oldest-cache-first
    order and within a source newest-first.
@@ -1353,6 +1445,7 @@ This contract fixes the following failure cases:
 | `OperationalLicence = Denied` or `Revoked` at admission | Job refused before network work. |
 | Source retired mid-download | Job cancels; lease revokes; cache row not promoted. |
 | Quota exceeded before publish (a declared total that exceeds the payload cap, a declared-length admission or unknown-length append whose payload plus its bounded segment metadata the free global quota cannot cover, or a verified payload size that exceeds the cap) | Job fails terminally with `QuotaExceeded`; temp cleaned, no rename, no row, and no published-but-uncommitted file. Any payload-and-segment reservation taken at admission or before an append but not made durable — payload and the journal/sidecar records that were never written — is released back to the global total exactly once before the job terminates; the job's single lifecycle reservation is released at terminal cleanup, when no remaining lifecycle transition needs it; metadata already made durable remains charged until the job's journal is removed at terminal cleanup. A response whose payload size exactly equals the cap is not a quota failure: the bounded read's end-of-stream signal, or a non-durable one-byte probe, shows no further payload, and the verified-size check passes at equality. |
+| Publish-attempt budget exhausted by repeated crashes in the rename window (including repeated intent-before-rename crashes with the free global quota at zero) | Terminal safe refusal `Failed(PublishRetriesExhausted)`: no further publish attempt begins, any pending intent is cleared, the exhaustion record is written from the already-charged bounded lifecycle reservation — never from a fresh or uncharged charge — and reservations are released at terminal cleanup. A subsequently requested download is a new job with its own admission and lifecycle reservation. |
 | Filesystem refuses temp reservation | `Failed(StorageUnavailable)`. |
 | User cancels a download | `Cancelled`. Temp unlinked. |
 | Two requests for the same `MediaKey` race | Newest waits for terminal state of predecessor; admission is one-at-a-time. |
@@ -1443,16 +1536,16 @@ Each slice lands with its own focused regression suite. The slices are:
 | --- | --- |
 | Identity | Same `SourceId` + `TrackId` semantics as live; no second identity kind minted. Derived cache keys: fixed hex charset and width, no separators or traversal, byte-exact identifier input. |
 | Capability | Default-deny behaviour for adapters that opt out; Subsonic/Jellyfin/Plex/DAAP opt in. |
-| Resumable job | Bounded, `If-Range`-validated range requests; `200`/`412` restarts from zero; journal survives crash (offset truncation, last-segment digest re-check); segment bytes durable before journal progress and bounded by the remaining quota allowance — payload plus the bounded journal/sidecar record that certifies it — reserved atomically from the same-process global total before each append (and, for a declared-length response, its whole not-yet-durable payload plus the bounded segment metadata it can grow reserved at admission), while the job's single lifecycle reservation is charged once before its first byte and held across appends, cancellation, and deferred cleanup — so concurrent jobs cannot both spend the same free global quota, journal/sidecar metadata is charged and is never an uncharged durable write, and any unused payload-and-segment reservation (payload not received and records never written) is released exactly once on a short, failed, or cancelled receive, with the lifecycle reservation released only at terminal cleanup — so durable payload never exceeds the per-track payload cap and durable payload plus its charged metadata never exceeds the global total; a bounded read that fills the reservation exactly is accepted as end-of-stream unless a non-durable probe finds further payload, so an exact-cap response is not misreported as `QuotaExceeded`; a short-file or digest-mismatch recovery restarts from zero without trusting the offset; no-validator jobs restart only. |
+| Resumable job | Bounded, `If-Range`-validated range requests; `200`/`412` restarts from zero; journal survives crash (offset truncation, last-segment digest re-check); segment bytes durable before journal progress and bounded by the remaining quota allowance — payload plus the bounded journal/sidecar record that certifies it — reserved atomically from the same-process global total before each append (and, for a declared-length response, its whole not-yet-durable payload plus the bounded segment metadata it can grow reserved at admission), while the job's single lifecycle reservation is charged once before its first byte and held across appends, cancellation, and deferred cleanup — so concurrent jobs cannot both spend the same free global quota, journal/sidecar metadata is charged and is never an uncharged durable write, and any unused payload-and-segment reservation (payload not received and records never written) is released exactly once on a short, failed, or cancelled receive, with the single lifecycle reservation sized to the whole bounded publish-attempt budget and released only at terminal cleanup, so repeated intent-before-rename crashes at the exact quota boundary cannot outgrow it or make an uncharged lifecycle write while an exhausted budget resolves as the `PublishRetriesExhausted` safe refusal — so durable payload never exceeds the per-track payload cap and durable payload plus its charged metadata never exceeds the global total; a bounded read that fills the reservation exactly is accepted as end-of-stream unless a non-durable probe finds further payload, so an exact-cap response is not misreported as `QuotaExceeded`; a short-file or digest-mismatch recovery restarts from zero without trusting the offset; no-validator jobs restart only. |
 | Restart authorization | Lease reacquisition, resumption, and publish-intent adoption all rebind by durable `SourceId` + `SourceIncarnationId`, never by a transient generation number, and both resumption and adoption revalidate current authority — capability, licence, and validator against the source's accepted generation — rather than trusting a durable identity and the absence of a persisted revocation. A valid restart on the same durable incarnation with a changed transient generation authorizes and resumes; a replaced incarnation, even one whose transient generation recycles the job's recorded `capability_epoch`, does not authorize and terminates; a backend-side revocation that left no durable record refuses adoption; an unestablishable current generation defers non-destructively. An adoption's playable insert acquires an exact session commit authority atomically after the platform publication barrier and retains it across the idempotent insert, and the ordinary step-6 commit uses that same authority boundary at the row insert; staleness before admission rejects non-destructively with no row and the pending intent retained, and replacement or shutdown after admission waits. Pre-existing saved sources receive one stable, persisted incarnation at first load and keep it across restart (no re-mint per load, no spurious replacement), and the saved-source format migrates from v1 to the v2 envelope by an atomic durable replacement — Unix temp-file `fsync`, same-directory `rename`, parent-directory `fsync`, with a `fsync` failure propagated rather than swallowed — that is idempotent across retry and concurrent load, returns an error before the rename with the original v1 file intact and no rows published, and after a successful rename with a failed parent-directory `fsync` leaves the destination naming the already-durable v2 file — reported, never described as rolled back — under the two-complete-states guarantee (original v1 if a power loss reverts the entry, otherwise v2) that preserves each row's deterministic incarnation, no re-mint and no data loss; it re-loads a v2 file without re-minting, re-replaces a v1 file, and lets a strict v1 loader quarantine an unknown-version envelope in place without data loss. No lease handle or credential is persisted. |
-| Atomic storage | Same-directory temp reservation (missing ancestors created at reservation); verify-before-publish ordering; same-filesystem rename; cross-filesystem publish refused. Unix validation lane: the complete ancestor chain is re-derived from the recorded final path and re-synced top-down, idempotently, before the rename on every attempt — including after a crash that happened before the previous process ran the pass — and the rename-to-commit chain is ordered behind it. Windows validation lane: the documented `FlushFileBuffers` + `MOVEFILE_WRITE_THROUGH` barrier on the published file, and missing-path recovery — never served, marked non-playable and recoverable, a fresh job may republish — including the combined pending-intent + committed-row + unresolvable-path case. Both lanes: publish-intent recovery across every kill point of the crash-point matrix, including the crash-before-directory-sync and power-loss rows, the verdict-first post-rename terminal transition, its adoption gates (including the current-authority revalidation of capability, licence, and validator against the source's accepted generation), the atomic commit-authority acquisition at the final admission after the publication barrier, and committed-row recognition with a revocation or incarnation replacement landing after the commit, before recovery. The ordinary step-6 commit acquires the same exact session commit authority immediately before the row insert and retains it through the idempotent insert and the intent clear, so a replacement, disconnect, retirement, shutdown, capability withdrawal, or licence revocation winning between admission and the commit refuses promotion — no row, no intent clear — instead of letting a stale job become playable. A pass blocked on current authority, the commit-authority admission, or a platform barrier defers non-destructively and leaves the durable owner in place, so an authority-blocked, durably owned file may survive multiple passes and is never resolved by destructive cleanup. |
+| Atomic storage | Same-directory temp reservation (missing ancestors created at reservation); verify-before-publish ordering; same-filesystem rename; cross-filesystem publish refused. Unix validation lane: the complete ancestor chain is re-derived from the recorded final path and re-synced top-down, idempotently, before the rename on every attempt — including after a crash that happened before the previous process ran the pass — and the rename-to-commit chain is ordered behind it. Windows validation lane: the documented `FlushFileBuffers` + `MOVEFILE_WRITE_THROUGH` barrier on the published file, and missing-path recovery — never served, marked non-playable and recoverable, a fresh job may republish — including the combined pending-intent + committed-row + unresolvable-path case. Both lanes: publish-intent recovery across every kill point of the crash-point matrix, including the crash-before-directory-sync and power-loss rows, repeated intent-before-rename crashes to the bounded publish-attempt budget and its `PublishRetriesExhausted` safe refusal, the verdict-first post-rename terminal transition, its adoption gates (including the current-authority revalidation of capability, licence, and validator against the source's accepted generation), the atomic commit-authority acquisition at the final admission after the publication barrier, and committed-row recognition with a revocation or incarnation replacement landing after the commit, before recovery. The ordinary step-6 commit acquires the same exact session commit authority immediately before the row insert and retains it through the idempotent insert and the intent clear, so a replacement, disconnect, retirement, shutdown, capability withdrawal, or licence revocation winning between admission and the commit refuses promotion — no row, no intent clear — instead of letting a stale job become playable. A pass blocked on current authority, the commit-authority admission, or a platform barrier defers non-destructively and leaves the durable owner in place, so an authority-blocked, durably owned file may survive multiple passes and is never resolved by destructive cleanup. |
 | Digest provenance | Advertised digest compared exactly; double-fetch fallback equality; no-tier backends fail `IntegrityUnverifiable` before publish. |
 | Credential boundary | No credential in metadata, file name, sidecar, log, or GTK row. Isolation scope per `task-remediation-2026-07.md` P1.6; redaction mechanics per P1.4. |
 | Redirect policy | Per `task-remediation-2026-07.md` P1.4 matrix; HTTPS-only, no `Referer`, no HTTPS→HTTP downgrade. |
 | Licensing | Default-deny; revocation retires rows but preserves files. |
 | Reconciliation | Refresh creates a sibling with its own snapshot-scoped path; no in-place mutation; staged-delete unlink with idempotent recovery. |
 | Cancellation | Lifecycle supersession cancels in-flight jobs; a cancel landing in the rename-to-commit window follows the verdict-first post-rename terminal rule and is never adopted as playable. |
-| Quota and eviction | Quota accounting covers committed bytes, in-flight temps, published-but-uncommitted pending-intent files, durable journal/sidecar metadata, and every reservation — declared-length and unknown-length alike — charged against the same same-process global total. The per-track cap is a payload limit: it is enforced at admission (a declared total that exceeds it fails) and on the verified payload size before the rename, so data crossing the cap fails before any further byte is durable and no published-but-uncommitted file ever exceeds the cap. Separately, the global total must cover every engine-owned byte. Before its first byte a job atomically charges its single lifecycle reservation from that global total, and at admission a declared-length job additionally reserves its not-yet-durable declared payload plus the bounded segment metadata it can grow — failing `QuotaExceeded` when the free global quota cannot cover the combined reservation — while an unknown-length response reserves, before each append, the largest payload `P` such that `P ≤ remaining per-track cap` and `P + metadata(P) ≤ free global quota` (the lifecycle reservation already held, so it is not re-charged), bounding that append to `P` — so two concurrent jobs cannot both reserve the same free global quota, metadata is charged rather than written uncharged, an unused payload-and-segment remainder is released exactly once on a short, failed, or cancelled receive, the lifecycle reservation is retained across appends and released only at terminal cleanup, durable payload never exceeds the cap, and durable payload plus its charged metadata never exceeds the global total. On restart the durable journal bytes are re-charged and the still-unwritten lifecycle obligation is reconstructed as a reservation before any competing job is admitted. A job that cannot cover the next fixed-size record fails `QuotaExceeded` before that record is written, and metadata already durable is released on terminal cleanup so admission and eviction accounting agree. A bounded read that fills the reservation exactly is accepted as end-of-stream when no further payload exists (the retained end-of-stream signal, or a non-durable one-byte probe), so an exact-cap response passes the verified-size check instead of failing `QuotaExceeded`. Eviction walks sources oldest-cache-first, newest-first within a source; staged tombstone-then-unlink; recovery completes interrupted deletes. |
+| Quota and eviction | Quota accounting covers committed bytes, in-flight temps, published-but-uncommitted pending-intent files, durable journal/sidecar metadata, and every reservation — declared-length and unknown-length alike — charged against the same same-process global total. The per-track cap is a payload limit: it is enforced at admission (a declared total that exceeds it fails) and on the verified payload size before the rename, so data crossing the cap fails before any further byte is durable and no published-but-uncommitted file ever exceeds the cap. Separately, the global total must cover every engine-owned byte. Before its first byte a job atomically charges its single lifecycle reservation, sized to the whole bounded publish-attempt budget, from that global total, and at admission a declared-length job additionally reserves its not-yet-durable declared payload plus the bounded segment metadata it can grow — failing `QuotaExceeded` when the free global quota cannot cover the combined reservation — while an unknown-length response reserves, before each append, the largest payload `P` such that `P ≤ remaining per-track cap` and `P + metadata(P) ≤ free global quota` (the lifecycle reservation already held, so it is not re-charged), bounding that append to `P` — so two concurrent jobs cannot both reserve the same free global quota, metadata is charged rather than written uncharged, an unused payload-and-segment remainder is released exactly once on a short, failed, or cancelled receive, the lifecycle reservation is sized to the bounded attempt budget, retained across appends and retries, and released only at terminal cleanup, durable payload never exceeds the cap, and durable payload plus its charged metadata never exceeds the global total. On restart the durable journal bytes are re-charged and the still-unwritten lifecycle obligation is reconstructed from the durable attempt counter, bounded by the same budget, as a reservation before any competing job is admitted. A job that cannot cover the next segment record fails `QuotaExceeded` before that record is written, while the budget-sized lifecycle reservation keeps every mandatory intent, clear, verdict, and exhaustion record writable, and metadata already durable is released on terminal cleanup so admission and eviction accounting agree. A bounded read that fills the reservation exactly is accepted as end-of-stream when no further payload exists (the retained end-of-stream signal, or a non-durable one-byte probe), so an exact-cap response passes the verified-size check instead of failing `QuotaExceeded`. Eviction walks sources oldest-cache-first, newest-first within a source; staged tombstone-then-unlink; recovery completes interrupted deletes. |
 | UI | Credential-free GTK rows; localised progress and failure. |
 
 The contract does not bless a single language binding or test framework; it
