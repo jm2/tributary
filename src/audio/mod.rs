@@ -927,7 +927,7 @@ fn slider_to_pipeline(slider: f64) -> f64 {
 
 /// Path to the volume state file: `<data_dir>/tributary/volume`
 fn volume_path() -> Option<std::path::PathBuf> {
-    dirs::data_dir().map(|d| d.join("tributary").join("volume"))
+    crate::paths::data_dir().map(|d| d.join("tributary").join("volume"))
 }
 
 fn load_saved_volume() -> Option<f64> {
@@ -1118,6 +1118,97 @@ mod tests {
             assert!(p.to_string_lossy().contains("tributary"));
             assert!(p.to_string_lossy().contains("volume"));
         }
+    }
+
+    // ── Cross-platform user-state isolation (tr-cy381) ──────────────
+
+    /// Child marker for [`production_state_resolution_ignores_an_external_user_state_file`].
+    const USER_STATE_ISOLATION_CHILD: &str = "TRIBUTARY_USER_STATE_ISOLATION_CHILD";
+    const USER_STATE_ISOLATION_CHILD_VALUE: &str = "tributary-user-state-isolation-child-v1";
+    const USER_STATE_ISOLATION_TEST: &str =
+        "audio::tests::production_state_resolution_ignores_an_external_user_state_file";
+
+    /// Seed `<root>/tributary/volume` with `value` and return its path.
+    fn seed_user_state_volume(root: &std::path::Path, value: &str) -> std::path::PathBuf {
+        let volume = root.join("tributary").join("volume");
+        std::fs::create_dir_all(volume.parent().expect("state parent")).expect("create state dir");
+        std::fs::write(&volume, value).expect("seed volume");
+        volume
+    }
+
+    /// Spawn this test executable as the isolated user-state child, pointing
+    /// the test-scoped sandbox redirect at `sandbox` and `HOME`/`XDG_*` at the
+    /// distinct `external` tree, then capture its output.
+    fn run_user_state_isolation_child(
+        sandbox: &std::path::Path,
+        external: &std::path::Path,
+    ) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                USER_STATE_ISOLATION_TEST,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(USER_STATE_ISOLATION_CHILD, USER_STATE_ISOLATION_CHILD_VALUE)
+            .env(crate::paths::TEST_USER_STATE_DIR_ENV, sandbox)
+            .env("HOME", external)
+            .env("XDG_DATA_HOME", external)
+            .env("XDG_CONFIG_HOME", external)
+            .env("XDG_CACHE_HOME", external)
+            .env("XDG_STATE_HOME", external)
+            .output()
+            .expect("run isolated user-state child")
+    }
+
+    /// Behavioral regression for tr-cy381: run the *production* user-state
+    /// resolution ([`volume_path`] + [`load_saved_volume`]) in a separate
+    /// test process and prove it reads the sandbox, not an external
+    /// user-state file seeded behind `HOME`/`XDG_*`.
+    ///
+    /// The redirect (`TRIBUTARY_TEST_USER_STATE_DIR`) is honored before
+    /// `dirs::data_dir()`, so the same assertion holds on Windows, where
+    /// `dirs` resolves known folders through `SHGetKnownFolderPath` and
+    /// ignores `HOME`/`XDG_*`. A `HOME`/`XDG`-only sandbox would fail this
+    /// test on Windows by reading the external seed.
+    #[test]
+    fn production_state_resolution_ignores_an_external_user_state_file() {
+        if std::env::var(USER_STATE_ISOLATION_CHILD).as_deref()
+            == Ok(USER_STATE_ISOLATION_CHILD_VALUE)
+        {
+            let path = volume_path().expect("production volume path");
+            let level = load_saved_volume().unwrap_or(1.0);
+            println!("USER_STATE_PROBE path={} level={level}", path.display());
+            return;
+        }
+
+        let sandbox = tempfile::tempdir().expect("sandbox root");
+        let sandbox_volume = seed_user_state_volume(sandbox.path(), "0.250");
+
+        // A distinct external tree the platform resolver would select if the
+        // test-scoped redirect were absent (Linux/macOS via XDG/HOME).
+        let external = tempfile::tempdir().expect("external root");
+        seed_user_state_volume(external.path(), "0.750");
+
+        let output = run_user_state_isolation_child(sandbox.path(), external.path());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "isolated user-state child failed: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(&format!("path={}", sandbox_volume.display())),
+            "child resolved production state outside the sandbox: stdout={stdout}"
+        );
+        assert!(
+            stdout.contains("level=0.25"),
+            "child did not read the sandbox persistence value: stdout={stdout}"
+        );
+        assert!(
+            !stdout.contains("0.75"),
+            "child read an external user-state file: stdout={stdout}"
+        );
     }
 
     #[test]

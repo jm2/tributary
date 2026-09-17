@@ -602,7 +602,7 @@ async fn prepare_preview(
 }
 
 async fn open_read_only_database() -> Result<DatabaseConnection, PreviewFailure> {
-    let data_dir = dirs::data_dir().ok_or(PreviewFailure::DatabaseUnavailable)?;
+    let data_dir = crate::paths::data_dir().ok_or(PreviewFailure::DatabaseUnavailable)?;
     let database_path = data_dir.join("tributary").join("library.db");
     if !database_path.is_file() {
         return Err(PreviewFailure::DatabaseUnavailable);

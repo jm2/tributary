@@ -100,6 +100,7 @@ where
         uuid::Uuid::new_v4()
     ));
     let _sentinel_guard = RemoveFileOnDrop(sentinel.clone());
+    let (_user_state_sandbox, child_user_state) = child_user_state_sandbox();
     let mut child = Command::new(std::env::current_exe().expect("current test executable"));
     child
         .args([
@@ -110,6 +111,7 @@ where
         ])
         .env(CHILD_MARKER, CHILD_MARKER_VALUE)
         .env(CHILD_SENTINEL, &sentinel)
+        .envs(child_user_state.iter().map(|(key, value)| (*key, value)))
         .env("NO_PROXY", "127.0.0.1,localhost,::1")
         .env("no_proxy", "127.0.0.1,localhost,::1")
         .env_remove("HTTP_PROXY")
@@ -155,6 +157,49 @@ impl Drop for RemoveFileOnDrop {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// Build the private user-state tree the protected-stream child must see.
+///
+/// The child re-runs the production [`Player`], whose constructor resolves
+/// `crate::paths::data_dir()`. Without this redirect the child reads the
+/// *real* invoking user's state (`<data_dir>/tributary/...`), so a file
+/// another run left behind changes the child's pipeline. Concretely, a stray
+/// `enabled = true` `equalizer.cfg` arms the equalizer install seam inside
+/// this child's playback-to-EOS pipeline and can error the stream before EOS
+/// (tr-cy381). The child contract is playback with in-memory defaults;
+/// on-disk persistence is the config modules' tested concern, not this
+/// harness's.
+///
+/// [`crate::paths::TEST_USER_STATE_DIR_ENV`] is the cross-platform mechanism:
+/// production resolves it ahead of the platform lookup, so it isolates the
+/// child even on Windows, where `dirs` resolves through
+/// `SHGetKnownFolderPath` and ignores `HOME`/`XDG_*`. The `HOME` and XDG
+/// variables remain as defense in depth for libraries that read them
+/// directly. Returns the sandbox root and the `(variable, value)` pairs to
+/// apply. The caller keeps the [`tempfile::TempDir`] alive for the child's
+/// lifetime; its `Drop` removes the tree, including anything the child wrote.
+fn child_user_state_sandbox() -> (tempfile::TempDir, Vec<(&'static str, std::path::PathBuf)>) {
+    let root = tempfile::tempdir().expect("protected-stream sandbox root");
+    let pairs = [
+        // The redirect production persistence actually honors, on every
+        // supported platform.
+        (
+            crate::paths::TEST_USER_STATE_DIR_ENV,
+            root.path().join("data"),
+        ),
+        // Defense in depth for libraries that read the platform variables
+        // directly. HOME covers the macOS fallback, where `dirs` ignores XDG.
+        ("HOME", root.path().join("home")),
+        ("XDG_DATA_HOME", root.path().join("data")),
+        ("XDG_CONFIG_HOME", root.path().join("config")),
+        ("XDG_CACHE_HOME", root.path().join("cache")),
+        ("XDG_STATE_HOME", root.path().join("state")),
+    ];
+    for (_, path) in &pairs {
+        std::fs::create_dir_all(path).expect("create child sandbox directory");
+    }
+    (root, pairs.to_vec())
 }
 
 struct ExpectedRequest {
@@ -611,4 +656,45 @@ fn parse_single_range(raw: &str, full_len: usize) -> Option<(usize, usize)> {
         end.parse::<usize>().ok()?.min(full_len - 1)
     };
     (start <= end).then_some((start, end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_user_state_sandbox_redirects_cross_platform_and_platform_roots() {
+        let (root, pairs) = child_user_state_sandbox();
+        let redirect = |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, path)| path.clone())
+                .unwrap_or_else(|| panic!("missing child sandbox override for {name}"))
+        };
+
+        // The redirect production persistence honors must be present and
+        // inside the sandbox; without it the child cannot be isolated on
+        // Windows, where `dirs` ignores HOME/XDG.
+        for name in [
+            crate::paths::TEST_USER_STATE_DIR_ENV,
+            "HOME",
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+        ] {
+            let path = redirect(name);
+            assert!(
+                path.starts_with(root.path()),
+                "{name} must resolve inside the sandbox root, got {}",
+                path.display()
+            );
+            assert!(path.is_dir(), "{name} sandbox directory must exist");
+        }
+
+        // A persisted file in one root must never masquerade as state in
+        // another, so the data and config roots stay distinct.
+        assert_ne!(redirect("XDG_DATA_HOME"), redirect("XDG_CONFIG_HOME"));
+    }
 }

@@ -10,7 +10,7 @@ use crate::ui::header_bar::RepeatMode;
 // ── Settings file helpers ───────────────────────────────────────────
 
 fn settings_path(name: &str) -> Option<std::path::PathBuf> {
-    dirs::data_dir().map(|d| d.join("tributary").join(name))
+    crate::paths::data_dir().map(|d| d.join("tributary").join(name))
 }
 
 /// Ensure the tributary data directory exists, then write a settings file.

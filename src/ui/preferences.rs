@@ -472,7 +472,7 @@ pub fn reject_root_reauthorization(
 
 /// Path to the config file: `<data_dir>/tributary/config.json`
 fn config_path() -> Option<std::path::PathBuf> {
-    dirs::data_dir().map(|d| d.join("tributary").join("config.json"))
+    crate::paths::data_dir().map(|d| d.join("tributary").join("config.json"))
 }
 
 /// Load the configuration from disk, falling back to defaults.
