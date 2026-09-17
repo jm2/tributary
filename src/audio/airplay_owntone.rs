@@ -885,7 +885,9 @@ fn quiesce_daemon(config: &OwnToneConfig) -> Result<(), SenderError> {
 /// `true` when this package target has a documented OwnTone acquisition path.
 /// Today that is the `.deb` target on Debian/Ubuntu amd64 only (design §8).
 fn platform_available() -> bool {
-    cfg!(all(target_os = "linux", target_arch = "x86_64"))
+    // Emitted by build.rs for x86_64 Linux; the daemon-backed regressions are
+    // gated on the same cfg.
+    cfg!(owntone_host)
 }
 
 /// Parse a daemon version string such as `29.3` into `(major, minor)`.
@@ -2207,6 +2209,43 @@ impl CompletionTracker {
     }
 }
 
+/// Poll the daemon — bounded by [`DRAIN_DEADLINE`] — until the item counts as
+/// completed per [`CompletionTracker`]. `Ok(None)` is completion,
+/// `Ok(Some(reason))` a terminal failure, and `Err(())` a cancellation
+/// observed while waiting.
+fn await_daemon_completion(inner: &SessionInner) -> Result<Option<&'static str>, ()> {
+    let cancelled = || {
+        inner.cancel.is_cancelled()
+            || inner.gate.is_stopped()
+            || !inner.running.load(Ordering::SeqCst)
+    };
+    let deadline = Instant::now() + DRAIN_DEADLINE;
+    let mut tracker = CompletionTracker::new(inner.autostart_lost.load(Ordering::SeqCst));
+    loop {
+        if cancelled() {
+            return Err(());
+        }
+        let observation = inner.client.player_progress();
+        // A bounded HTTP observation may have been in flight when Stop won.
+        // Its success, error or timeout is no longer a playback outcome.
+        if cancelled() {
+            return Err(());
+        }
+        match observation {
+            Ok((state, progress)) => {
+                if tracker.observe(&state, progress, Instant::now()) {
+                    return Ok(None);
+                }
+            }
+            Err(_) => return Ok(Some("AirPlay completion could not be confirmed")),
+        }
+        if Instant::now() >= deadline {
+            return Ok(Some("AirPlay completion timed out"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Natural EOS: close the write end so the daemon sees end-of-input, wait
 /// (bounded) for daemon-confirmed completion, restore, then publish exactly one
 /// generation-scoped `TrackEnded` (§4.3, §9 item 10). A drain deadline miss or
@@ -2221,43 +2260,16 @@ impl CompletionTracker {
 /// `play` as success reported a paused track as completed (review F4).
 fn natural_completion(inner: &SessionInner, pipeline: &gst::Pipeline) {
     pipeline.set_state(gst::State::Null).ok();
-    let cancelled = || {
-        inner.cancel.is_cancelled()
-            || inner.gate.is_stopped()
-            || !inner.running.load(Ordering::SeqCst)
-    };
     // The real finite-EOS path arms the fake daemon's next observation only
     // after decoder shutdown; this does not alter production ordering.
     #[cfg(test)]
     if inner.config.pipe_path.with_extension("park-drain").exists() {
         std::fs::write(inner.config.pipe_path.with_extension("drain-started"), "").unwrap();
     }
-    let deadline = Instant::now() + DRAIN_DEADLINE;
-    let mut tracker = CompletionTracker::new(inner.autostart_lost.load(Ordering::SeqCst));
-    let failure = loop {
-        if cancelled() {
-            // close() owns restoration/recovery after joining this pump. Keep
-            // its route and instance lock until that settlement completes.
-            return;
-        }
-        let observation = inner.client.player_progress();
-        // A bounded HTTP observation may have been in flight when Stop won.
-        // Its success, error or timeout is no longer a playback outcome.
-        if cancelled() {
-            return;
-        }
-        match observation {
-            Ok((state, progress)) => {
-                if tracker.observe(&state, progress, Instant::now()) {
-                    break None;
-                }
-            }
-            Err(_) => break Some("AirPlay completion could not be confirmed"),
-        }
-        if Instant::now() >= deadline {
-            break Some("AirPlay completion timed out");
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    // On cancellation, close() owns restoration/recovery after joining this
+    // pump. Keep its route and instance lock until that settlement completes.
+    let Ok(failure) = await_daemon_completion(inner) else {
+        return;
     };
     // Restoration may block, so it must remain outside the Stop gate. Failed
     // restoration retains custody for close()'s serialized recovery.
@@ -2586,122 +2598,20 @@ fn pre_mutation_failure(ctx: &SenderOpenContext, error: SenderError) -> OpenOutc
 /// F2, review F3).
 fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
     let deadline = Instant::now() + OPEN_DEADLINE;
-    let client = match OwnToneClient::new(&config.api_base) {
-        Ok(client) => Arc::new(client),
-        Err(error) => return pre_mutation_failure(ctx, error),
-    };
     // The route hand-off a recovery-pending outcome carries: the seat moves
     // this load's ticket into custody before constructing that outcome (review
     // S5).
     let custody = CustodyHandoff::from_ctx(ctx);
-    if let Err(error) = config.verify_owned() {
-        return pre_mutation_failure(ctx, error);
-    }
-    // Bind the FIFO's identity at the same verification step that proved the
-    // dedicated daemon scans this pathname. The writer acquired after the
-    // takeover mutations must resolve to this exact object (AM1).
-    let pipe_identity = match verify_pipe_identity(&config.pipe_path) {
-        Ok(identity) => identity,
-        Err(error) => return pre_mutation_failure(ctx, error),
+    let Preflight {
+        client,
+        lock,
+        pipe_identity,
+        outputs,
+        selected,
+    } = match open_preflight(&config, ctx, deadline) {
+        Ok(preflight) => preflight,
+        Err(outcome) => return outcome,
     };
-    if ctx.cancel.is_cancelled() {
-        return OpenOutcome::Cancelled;
-    }
-
-    // The blocking daemon handshake runs here, on the load worker, never on
-    // the GTK caller (review R1). Reachability and version are the network I/O
-    // the synchronous `probe` must not perform; running them before the lock
-    // and before any receiver state read preserves the fail-closed ordering.
-    if let Err(error) = check_daemon_health(&client) {
-        return pre_mutation_failure(ctx, error);
-    }
-    if ctx.cancel.is_cancelled() {
-        return OpenOutcome::Cancelled;
-    }
-
-    // Exclusivity is locked before the first state read.
-    let lock = match open_lock(&config.lock_path()) {
-        Ok(lock) => lock,
-        Err(error) => return pre_mutation_failure(ctx, error),
-    };
-    // The previous session on this same output releases its lock only after
-    // its own worker has restored the daemon, and the controller does not
-    // serialize that worker behind this open, so a sequential hand-over is
-    // waited for — bounded by the open deadline and raced against
-    // cancellation — while a genuinely concurrent holder is still refused at
-    // the deadline (§9 item 5: a replacement opens cleanly).
-    while rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).is_err() {
-        if ctx.cancel.is_cancelled() {
-            return OpenOutcome::Cancelled;
-        }
-        if Instant::now() >= deadline {
-            return pre_mutation_failure(
-                ctx,
-                unavailable("another Tributary session is already using the dedicated daemon"),
-            );
-        }
-        std::thread::sleep(FIFO_OPEN_POLL);
-    }
-
-    // A record left by a crashed holder means the daemon may be half-taken
-    // over. Under the freshly taken lock, recover it the way §4.3 requires of
-    // the next opener: quiesce the instance (dropping anything the dead holder
-    // left in flight), restore its recorded output set — which removes the
-    // record — and only then proceed. A recovery that cannot be completed
-    // refuses the open and leaves the record for the next attempt; the record
-    // is never adopted silently.
-    let record_path = config.takeover_record();
-    if record_path.exists() {
-        let Some(stale) = TakeoverRecord::read(&record_path) else {
-            return pre_mutation_failure(
-                ctx,
-                unavailable(
-                    "a previous takeover record is unreadable and must be recovered by hand",
-                ),
-            );
-        };
-        if ctx.cancel.is_cancelled() {
-            return OpenOutcome::Cancelled;
-        }
-        if quiesce_daemon(&config).is_err() || restore_daemon(&client, &config, &stale).is_err() {
-            return pre_mutation_failure(
-                ctx,
-                unavailable("a previous takeover is incomplete and could not be recovered"),
-            );
-        }
-        if ctx.cancel.is_cancelled() {
-            return OpenOutcome::Cancelled;
-        }
-    }
-    if ctx.cancel.is_cancelled() {
-        return OpenOutcome::Cancelled;
-    }
-
-    // Read phase: nothing has been mutated, so a failure or cancellation here
-    // has no takeover to unwind.
-    let outputs = match client.outputs() {
-        Ok(outputs) => outputs,
-        Err(error) => return pre_mutation_failure(ctx, error),
-    };
-    let selected = match map_receiver_to_output(&outputs, ctx.target.device_id.as_deref()) {
-        Ok(selected) => selected,
-        Err(failure) => return pre_mutation_failure(ctx, unavailable(&failure.to_string())),
-    };
-
-    // Never preempt audible playback on the dedicated instance.
-    match client.player_state() {
-        Ok(state) if state == "play" => {
-            return pre_mutation_failure(
-                ctx,
-                unavailable("the dedicated daemon is already playing"),
-            );
-        }
-        Ok(_) => {}
-        Err(error) => return pre_mutation_failure(ctx, error),
-    }
-    if ctx.cancel.is_cancelled() {
-        return OpenOutcome::Cancelled;
-    }
 
     // Mutation phase: every failure or cancellation from here unwinds.
     let recorded = TakeoverRecord {
@@ -2715,63 +2625,288 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
     if let Err(error) = recorded.write(&config.takeover_record()) {
         return OpenOutcome::Failed(error);
     }
-
-    let mut unsettled = false;
-    if ctx.cancel.is_cancelled() {
-        return cancel_outcome(client, config, recorded, lock, unsettled, &custody);
-    }
-    if let Err(error) = client.set_outputs(&[selected]) {
-        // A mutating RPC that returned an error may still have been applied
-        // server-side, so this is not a clean unwind (review F3).
-        unsettled = true;
-        return fail_outcome(client, config, recorded, lock, unsettled, error, &custody);
-    }
-    if ctx.cancel.is_cancelled() {
-        return cancel_outcome(client, config, recorded, lock, unsettled, &custody);
-    }
-    if let Err(error) = client.clear_queue() {
-        unsettled = true;
-        return fail_outcome(client, config, recorded, lock, unsettled, error, &custody);
-    }
-    if ctx.cancel.is_cancelled() {
-        return cancel_outcome(client, config, recorded, lock, unsettled, &custody);
-    }
-
-    // Apply the user's current volume **before any activation**, so a switch
-    // to OwnTone starts at the slider's level instead of the daemon's prior
-    // value until the user moves it again (review S7). A failed volume RPC is
-    // surfaced and unwound, never swallowed.
-    if let Err(error) = client.set_volume(volume_percent(ctx.volume)) {
-        // A failed (or timed-out) volume PUT may still be applied server-side,
-        // so this is not a clean unwind (review T1).
-        unsettled = true;
-        return fail_outcome(client, config, recorded, lock, unsettled, error, &custody);
-    }
-    if ctx.cancel.is_cancelled() {
-        return cancel_outcome(client, config, recorded, lock, unsettled, &custody);
+    if let Err((unwind, unsettled)) = take_over(&client, ctx, selected) {
+        return unwind_takeover(unwind, unsettled, client, config, recorded, lock, &custody);
     }
 
     let write_fd = match open_pipe_write(&config.pipe_path, pipe_identity, deadline, &ctx.cancel) {
         Ok(fd) => fd,
         Err(CancelOrError::Cancelled) => {
-            return cancel_outcome(client, config, recorded, lock, unsettled, &custody);
+            return unwind_takeover(
+                Unwind::Cancelled,
+                false,
+                client,
+                config,
+                recorded,
+                lock,
+                &custody,
+            );
         }
         Err(CancelOrError::Failed(error)) => {
-            return fail_outcome(client, config, recorded, lock, unsettled, error, &custody);
+            return unwind_takeover(
+                Unwind::Failed(error),
+                false,
+                client,
+                config,
+                recorded,
+                lock,
+                &custody,
+            );
         }
     };
     if ctx.cancel.is_cancelled() {
         drop(write_fd);
-        return cancel_outcome(client, config, recorded, lock, unsettled, &custody);
+        return unwind_takeover(
+            Unwind::Cancelled,
+            false,
+            client,
+            config,
+            recorded,
+            lock,
+            &custody,
+        );
     }
-
     let pipeline = match build_pipeline(&ctx.prepared_uri, &write_fd) {
         Ok(pipeline) => pipeline,
         Err(error) => {
-            return fail_outcome(client, config, recorded, lock, unsettled, error, &custody);
+            return unwind_takeover(
+                Unwind::Failed(error),
+                false,
+                client,
+                config,
+                recorded,
+                lock,
+                &custody,
+            );
         }
     };
+    start_session(
+        client, config, recorded, lock, ctx, pipeline, write_fd, &custody,
+    )
+}
 
+/// A cancellation checkpoint between two pre-mutation steps: a cancelled load
+/// is unwound silently, because nothing has been mutated yet.
+fn cancel_point(ctx: &SenderOpenContext) -> Result<(), OpenOutcome> {
+    if ctx.cancel.is_cancelled() {
+        Err(OpenOutcome::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+/// Everything [`open`] establishes before the first mutating RPC. A failure
+/// or cancellation on the way here has no takeover to unwind.
+struct Preflight {
+    client: Arc<OwnToneClient>,
+    lock: std::fs::File,
+    pipe_identity: PipeIdentity,
+    outputs: Vec<OwnToneOutput>,
+    selected: u64,
+}
+
+/// The pre-mutation phase of [`open`], in the fail-closed order the design
+/// requires: ownership and FIFO identity, the blocking daemon handshake, the
+/// instance lock, crash-record recovery, then the read phase.
+fn open_preflight(
+    config: &OwnToneConfig,
+    ctx: &SenderOpenContext,
+    deadline: Instant,
+) -> Result<Preflight, OpenOutcome> {
+    let client = OwnToneClient::new(&config.api_base)
+        .map(Arc::new)
+        .map_err(|error| pre_mutation_failure(ctx, error))?;
+    config
+        .verify_owned()
+        .map_err(|error| pre_mutation_failure(ctx, error))?;
+    // Bind the FIFO's identity at the same verification step that proved the
+    // dedicated daemon scans this pathname. The writer acquired after the
+    // takeover mutations must resolve to this exact object (AM1).
+    let pipe_identity = verify_pipe_identity(&config.pipe_path)
+        .map_err(|error| pre_mutation_failure(ctx, error))?;
+    cancel_point(ctx)?;
+
+    // The blocking daemon handshake runs here, on the load worker, never on
+    // the GTK caller (review R1). Reachability and version are the network I/O
+    // the synchronous `probe` must not perform; running them before the lock
+    // and before any receiver state read preserves the fail-closed ordering.
+    check_daemon_health(&client).map_err(|error| pre_mutation_failure(ctx, error))?;
+    cancel_point(ctx)?;
+
+    // Exclusivity is locked before the first state read.
+    let lock = acquire_instance_lock(config, ctx, deadline)?;
+    recover_stale_takeover(&client, config, ctx)?;
+    cancel_point(ctx)?;
+
+    let (outputs, selected) = observe_takeover_target(&client, ctx)?;
+    cancel_point(ctx)?;
+    Ok(Preflight {
+        client,
+        lock,
+        pipe_identity,
+        outputs,
+        selected,
+    })
+}
+
+/// Take the instance lock. The previous session on this same output releases
+/// its lock only after its own worker has restored the daemon, and the
+/// controller does not serialize that worker behind this open, so a
+/// sequential hand-over is waited for — bounded by the open deadline and raced
+/// against cancellation — while a genuinely concurrent holder is still refused
+/// at the deadline (§9 item 5: a replacement opens cleanly).
+fn acquire_instance_lock(
+    config: &OwnToneConfig,
+    ctx: &SenderOpenContext,
+    deadline: Instant,
+) -> Result<std::fs::File, OpenOutcome> {
+    let lock = open_lock(&config.lock_path()).map_err(|error| pre_mutation_failure(ctx, error))?;
+    while rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).is_err() {
+        cancel_point(ctx)?;
+        if Instant::now() >= deadline {
+            return Err(pre_mutation_failure(
+                ctx,
+                unavailable("another Tributary session is already using the dedicated daemon"),
+            ));
+        }
+        std::thread::sleep(FIFO_OPEN_POLL);
+    }
+    Ok(lock)
+}
+
+/// A record left by a crashed holder means the daemon may be half-taken over.
+/// Under the freshly taken lock, recover it the way §4.3 requires of the next
+/// opener: quiesce the instance (dropping anything the dead holder left in
+/// flight), restore its recorded output set — which removes the record — and
+/// only then proceed. A recovery that cannot be completed refuses the open and
+/// leaves the record for the next attempt; the record is never adopted
+/// silently.
+fn recover_stale_takeover(
+    client: &OwnToneClient,
+    config: &OwnToneConfig,
+    ctx: &SenderOpenContext,
+) -> Result<(), OpenOutcome> {
+    let record_path = config.takeover_record();
+    if !record_path.exists() {
+        return Ok(());
+    }
+    let Some(stale) = TakeoverRecord::read(&record_path) else {
+        return Err(pre_mutation_failure(
+            ctx,
+            unavailable("a previous takeover record is unreadable and must be recovered by hand"),
+        ));
+    };
+    cancel_point(ctx)?;
+    if quiesce_daemon(config).is_err() || restore_daemon(client, config, &stale).is_err() {
+        return Err(pre_mutation_failure(
+            ctx,
+            unavailable("a previous takeover is incomplete and could not be recovered"),
+        ));
+    }
+    cancel_point(ctx)
+}
+
+/// Read phase: the daemon's outputs, the receiver's mapping by its retained
+/// identifier, and the no-preemption check. Nothing has been mutated, so a
+/// failure here has no takeover to unwind.
+fn observe_takeover_target(
+    client: &OwnToneClient,
+    ctx: &SenderOpenContext,
+) -> Result<(Vec<OwnToneOutput>, u64), OpenOutcome> {
+    let outputs = client
+        .outputs()
+        .map_err(|error| pre_mutation_failure(ctx, error))?;
+    let selected = map_receiver_to_output(&outputs, ctx.target.device_id.as_deref())
+        .map_err(|failure| pre_mutation_failure(ctx, unavailable(&failure.to_string())))?;
+    // Never preempt audible playback on the dedicated instance.
+    match client.player_state() {
+        Ok(state) if state == "play" => Err(pre_mutation_failure(
+            ctx,
+            unavailable("the dedicated daemon is already playing"),
+        )),
+        Ok(_) => Ok((outputs, selected)),
+        Err(error) => Err(pre_mutation_failure(ctx, error)),
+    }
+}
+
+/// How a takeover that could not complete unwinds.
+enum Unwind {
+    Cancelled,
+    Failed(SenderError),
+}
+
+/// Mutation phase (§4.3): select the output, clear the queue and apply the
+/// user's current volume **before any activation** — so a switch to OwnTone
+/// starts at the slider's level instead of the daemon's prior value (review
+/// S7) — observing cancellation between the steps. A mutating RPC that
+/// returned an error (or timed out) may still have been applied server-side,
+/// so its unwind is not clean: `unsettled` is reported `true` (review F3,
+/// review T1). A cancellation between two successful steps unwinds cleanly.
+fn take_over(
+    client: &OwnToneClient,
+    ctx: &SenderOpenContext,
+    selected: u64,
+) -> Result<(), (Unwind, bool)> {
+    let cancelled = || (Unwind::Cancelled, false);
+    if ctx.cancel.is_cancelled() {
+        return Err(cancelled());
+    }
+    client
+        .set_outputs(&[selected])
+        .map_err(|error| (Unwind::Failed(error), true))?;
+    if ctx.cancel.is_cancelled() {
+        return Err(cancelled());
+    }
+    client
+        .clear_queue()
+        .map_err(|error| (Unwind::Failed(error), true))?;
+    if ctx.cancel.is_cancelled() {
+        return Err(cancelled());
+    }
+    client
+        .set_volume(volume_percent(ctx.volume))
+        .map_err(|error| (Unwind::Failed(error), true))?;
+    if ctx.cancel.is_cancelled() {
+        return Err(cancelled());
+    }
+    Ok(())
+}
+
+/// Unwind an open that failed or was cancelled after the takeover record was
+/// written: restore cleanly, or hand off to serialized recovery when a
+/// mutation is unsettled or restoration fails (review F2, review F3).
+#[allow(clippy::too_many_arguments)]
+fn unwind_takeover(
+    unwind: Unwind,
+    unsettled: bool,
+    client: Arc<OwnToneClient>,
+    config: OwnToneConfig,
+    recorded: TakeoverRecord,
+    lock: std::fs::File,
+    custody: &CustodyHandoff,
+) -> OpenOutcome {
+    match unwind {
+        Unwind::Cancelled => cancel_outcome(client, config, recorded, lock, unsettled, custody),
+        Unwind::Failed(error) => {
+            fail_outcome(client, config, recorded, lock, unsettled, error, custody)
+        }
+    }
+}
+
+/// Build the session and start its inert decode pump. A worker-spawn failure
+/// *after* takeover reclaims the session state and unwinds, so a
+/// half-taken-over daemon is never leaked (review F3).
+#[allow(clippy::too_many_arguments)]
+fn start_session(
+    client: Arc<OwnToneClient>,
+    config: OwnToneConfig,
+    recorded: TakeoverRecord,
+    lock: std::fs::File,
+    ctx: &SenderOpenContext,
+    pipeline: gst::Pipeline,
+    write_fd: OwnedFd,
+    custody: &CustodyHandoff,
+) -> OpenOutcome {
     let inner = Arc::new(SessionInner {
         client,
         config,
@@ -2801,8 +2936,6 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
         .name("airplay-owntone-pump".to_string())
         .spawn(move || run_pump(pump_inner, pipeline, write_fd));
     let Ok(pump) = pump else {
-        // Worker-spawn failure *after* takeover: reclaim the session state and
-        // unwind, so a half-taken-over daemon is never leaked (review F3).
         let error = unavailable("the decode pump could not be started");
         return match Arc::try_unwrap(inner) {
             Ok(session) => fail_outcome(
@@ -2810,9 +2943,9 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
                 session.config,
                 session.recorded,
                 lock,
-                unsettled,
+                false,
                 error,
-                &custody,
+                custody,
             ),
             Err(inner) => {
                 let _ = restore_daemon(&inner.client, &inner.config, &inner.recorded);
@@ -3511,7 +3644,7 @@ fn open_lock(path: &Path) -> Result<std::fs::File, SenderError> {
 /// Build a fully-owned [`OwnToneSender`] for controller-path regressions: a
 /// temp state directory carrying a matching ownership record, a created FIFO
 /// and a real (dummy) binary file, pointed at `api_base`.
-#[cfg(test)]
+#[cfg(all(test, owntone_host))]
 pub(super) fn test_owned_sender(api_base: &str, state_dir: &Path, binary: &Path) -> OwnToneSender {
     let config = OwnToneConfig {
         api_base: api_base.trim_end_matches('/').to_string(),
@@ -4070,7 +4203,7 @@ mod tests {
     /// R5: the listener bound to a port is resolved to its owning process out
     /// of band. The test binds its own loopback listener, so the owner must be
     /// this test process. Linux-only: resolution reads `/proc` (review T6).
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn listener_process_resolves_the_process_bound_to_a_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
@@ -4225,7 +4358,7 @@ mod tests {
     /// R5: a matching ownership record is not enough — a foreign process bound
     /// to the configured endpoint is refused. Linux-only: resolution reads
     /// `/proc` (review T6).
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn verify_daemon_process_refuses_a_foreign_listener() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
@@ -4245,7 +4378,7 @@ mod tests {
     /// R2/S3/T5: quiescence terminates the owned process (escalating to
     /// `SIGKILL`) and **confirms** exit before returning. Linux-only: the
     /// observation primitive reads `/proc` (review T6).
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn signal_and_wait_stops_a_child_process() {
         let mut child = std::process::Command::new("sleep")
@@ -4266,7 +4399,7 @@ mod tests {
 
     /// S3/T5: a pid that no longer exists is already quiesced (ESRCH), not an
     /// error that could mask a live process. Linux-only (review T6).
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn signal_and_wait_treats_a_gone_process_as_quiesced() {
         let mut child = std::process::Command::new("sleep")
@@ -4282,7 +4415,7 @@ mod tests {
 
     /// T5: a replaced identity (a pid whose start time no longer matches) is
     /// refused rather than signalled.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn signal_and_wait_refuses_a_replaced_identity() {
         let mut child = std::process::Command::new("sleep")
@@ -4650,6 +4783,109 @@ mod tests {
         }
     }
 
+    /// Drain events until a `Stopped` arrives, then assert the failed-load
+    /// shape: every event for `generation`, exactly one Error, no TrackEnded
+    /// and no Playing. Returns the drained events.
+    #[cfg(owntone_host)]
+    fn assert_failed_load_events(
+        rx: &async_channel::Receiver<PlayerEvent>,
+        generation: PlayerEventGeneration,
+    ) -> Vec<PlayerEvent> {
+        let mut events = Vec::new();
+        wait_until(|| {
+            events.extend(std::iter::from_fn(|| rx.try_recv().ok()));
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    PlayerEvent::StateChanged {
+                        state: PlayerState::Stopped,
+                        ..
+                    }
+                )
+            })
+        });
+        assert!(
+            events.iter().all(|event| event.generation() == generation),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PlayerEvent::Error { .. }))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::TrackEnded { .. }
+                    | PlayerEvent::StateChanged {
+                        state: PlayerState::Playing,
+                        ..
+                    }
+            )),
+            "{events:?}"
+        );
+        events
+    }
+
+    /// The daemon's outputs equal a prior snapshot, id and selection alike.
+    #[cfg(owntone_host)]
+    fn assert_outputs_match(client: &OwnToneClient, baseline: &[OwnToneOutput]) {
+        let restored = client.outputs().unwrap();
+        assert_eq!(
+            restored
+                .iter()
+                .map(|o| (o.id, o.selected))
+                .collect::<Vec<_>>(),
+            baseline
+                .iter()
+                .map(|o| (o.id, o.selected))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A fresh load on the same controller plays, stops and releases cleanly:
+    /// the daemon is usable again after whatever the test did to it.
+    #[cfg(owntone_host)]
+    fn assert_next_load_plays(
+        controller: &crate::audio::airplay_output::ControllerHarness,
+        daemon: &RecordingOwnedDaemon,
+        prepared: crate::audio::gstreamer_media::PreparedGstreamerMedia,
+        generation: PlayerEventGeneration,
+    ) {
+        let next_ticket = prepared.ticket().unwrap();
+        controller.set_generation(generation);
+        controller.load(generation, prepared);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        assert_eq!(next_ticket.route_count(), 1);
+        controller.stop();
+        wait_until(|| next_ticket.route_count() == 0);
+        wait_until(|| !daemon.config.takeover_record().exists());
+    }
+
+    /// Like [`assert_next_load_plays`], with a pause/resume cycle before the
+    /// stop, for fixtures whose earlier phase exercised live controls.
+    #[cfg(owntone_host)]
+    fn assert_next_load_plays_with_pause(
+        controller: &crate::audio::airplay_output::ControllerHarness,
+        prepared: crate::audio::gstreamer_media::PreparedGstreamerMedia,
+        generation: PlayerEventGeneration,
+    ) {
+        let next_ticket = prepared.ticket().unwrap();
+        controller.set_generation(generation);
+        controller.load(generation, prepared);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        assert_eq!(next_ticket.route_count(), 1);
+        controller.pause();
+        wait_until(|| controller.state() == PlayerState::Paused);
+        controller.play();
+        wait_until(|| controller.state() == PlayerState::Playing);
+        controller.stop();
+        wait_until(|| next_ticket.route_count() == 0);
+    }
+
     /// Bounded wait that names the waiting call site when it expires, so an
     /// intermittent expiry under suite concurrency identifies which predicate
     /// stalled (tr-9utsm) instead of an anonymous timeout.
@@ -4817,14 +5053,14 @@ mod tests {
     /// *parked*: the server records it and holds the response until the test
     /// releases it, so a concurrent operation can be deterministically placed
     /// behind an in-flight request (review W1, review W2).
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     struct FakeOwnToneServer {
         api_base: String,
         requests: Arc<Mutex<Vec<String>>>,
         park: Arc<ParkGate>,
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     struct ParkGate {
         marker: String,
         seen: Mutex<bool>,
@@ -4832,7 +5068,7 @@ mod tests {
         cv: Condvar,
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     impl ParkGate {
         fn new(marker: &str) -> Arc<Self> {
             Arc::new(Self {
@@ -4869,7 +5105,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     impl FakeOwnToneServer {
         /// A server that answers every request immediately and reports a
         /// finished item (`stop`) for `/api/player`.
@@ -4942,7 +5178,7 @@ mod tests {
 
     /// Serve one request on its own thread: record the request line, park the
     /// designated path, then answer.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     fn serve_fake_own_tone(
         stream: std::net::TcpStream,
         requests: &Mutex<Vec<String>>,
@@ -5005,7 +5241,7 @@ mod tests {
     }
 
     /// The JSON the adapter expects from each read endpoint.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     fn fake_own_tone_body(path: &str, player_state: &str) -> String {
         match path {
             "/api/config" => r#"{"version":"29.3"}"#.to_string(),
@@ -5021,7 +5257,7 @@ mod tests {
     /// even scheduled; when the control finally acquires the boundary it is
     /// refused, so no late request reaches the daemon and no post-restoration
     /// effect is left outstanding.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn a_control_parked_behind_terminal_restoration_transmits_nothing() {
         let server = FakeOwnToneServer::start_parking_stop();
@@ -5069,7 +5305,7 @@ mod tests {
     /// W1 (error path): once the decode-error restoration is terminal, a
     /// `resume` the worker may still service transmits no `player/play` and
     /// reports no `Playing` — the restored output selection is never re-driven.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn a_terminal_restoration_refuses_a_late_resume_and_sends_no_play() {
         let server = FakeOwnToneServer::start();
@@ -5112,7 +5348,7 @@ mod tests {
     /// mutation whose outcome never settled must still force a quiescence
     /// before ownership may be released; when that cannot be established the
     /// restore fails closed and the count is retained.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn a_terminal_restore_does_not_release_over_an_outstanding_mutation() {
         let server = FakeOwnToneServer::start();
@@ -5208,7 +5444,7 @@ mod tests {
     /// runs concurrently and must acquire the boundary only after the control
     /// publishes `Playing`. The final cached state is terminal and no
     /// `Playing`/`Paused` may follow the single `TrackEnded`.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn a_start_publication_cannot_follow_a_concurrent_terminal_restoration() {
         gst::init().expect("GStreamer init");
@@ -5354,7 +5590,7 @@ mod tests {
     /// boundary after the publication drains, so `Playing` precedes the single
     /// `TrackEnded` and the terminal state is final. The worker's own cache is
     /// asserted terminal after settlement — the state the UI reads.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn the_worker_start_publication_is_atomic_with_the_terminal_transition() {
         use crate::architecture::media::ResolvedHttpRequest;
@@ -5540,7 +5776,7 @@ mod tests {
     /// generation-scoped `TrackEnded` **after** `Stopped`, restores the daemon,
     /// and leaves the cached state terminal. A duplicate completion advances the
     /// queue twice; a missing one never advances it.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn natural_completion_publishes_exactly_one_track_ended() {
         gst::init().expect("GStreamer init");
@@ -5597,7 +5833,7 @@ mod tests {
 
     /// AE1: even a confirmed EOS must not publish if Stop wins while the
     /// restoring RPC is in flight, after the last drain cancellation check.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn natural_completion_stop_during_restore_suppresses_publication() {
         gst::init().unwrap();
@@ -5663,7 +5899,7 @@ mod tests {
 
     /// W2: a daemon that never reports completion is a bounded drain-deadline
     /// miss — a terminal failure, never a false `TrackEnded`.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn natural_completion_deadline_miss_is_terminal_and_never_track_ended() {
         gst::init().expect("GStreamer init");
@@ -5700,7 +5936,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn cancelled_pump_stops_an_already_activated_pipeline() {
         gst::init().expect("GStreamer init");
@@ -5730,7 +5966,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     fn exercise_oversized_fifo_write(cancel_write: bool) {
         use std::io::Read;
 
@@ -5850,13 +6086,13 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn oversized_fifo_write_is_interruptible_after_partial_progress() {
         exercise_oversized_fifo_write(true);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn oversized_fifo_write_resumes_without_losing_pcm() {
         exercise_oversized_fifo_write(false);
@@ -5866,7 +6102,7 @@ mod tests {
     /// is refused, the pump's activation gate stays closed, and the real decode
     /// pipeline is never started: the FIFO reader observes EOF with zero bytes
     /// and no `Playing`/`TrackEnded` is ever published.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn a_failed_start_leaves_the_pump_inert_and_writes_no_pcm() {
         use std::io::Read;
@@ -5947,6 +6183,107 @@ mod tests {
         );
     }
 
+    /// A daemon that reports `play` until the FIFO reader observes EOF, then
+    /// `stop` — the production completion contract.
+    #[cfg(owntone_host)]
+    fn serve_drain_aware_daemon(
+        listener: std::net::TcpListener,
+        server_drained: Arc<AtomicBool>,
+        server_received: Arc<AtomicBool>,
+    ) {
+        use std::io::Read;
+        for incoming in listener.incoming() {
+            let Ok(stream) = incoming else { continue };
+            let drained = Arc::clone(&server_drained);
+            let received = Arc::clone(&server_received);
+            std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader, Write};
+                let Ok(reader_stream) = stream.try_clone() else {
+                    return;
+                };
+                let mut reader = BufReader::new(reader_stream);
+                let mut request = String::new();
+                let _ = reader.read_line(&mut request);
+                let mut content_length = 0usize;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = header
+                        .to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::trim)
+                    {
+                        content_length = value.parse().unwrap_or(0);
+                    }
+                }
+                if content_length > 0 {
+                    let mut body = vec![0u8; content_length];
+                    let _ = reader.read_exact(&mut body);
+                }
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let body = match path.as_str() {
+                    "/api/config" => r#"{"version":"29.3"}"#.to_string(),
+                    "/api/outputs" => r#"{"outputs":[]}"#.to_string(),
+                    "/api/player" => {
+                        let state =
+                            if drained.load(Ordering::SeqCst) || !received.load(Ordering::SeqCst) {
+                                "stop"
+                            } else {
+                                "play"
+                            };
+                        format!(r#"{{"state":"{state}"}}"#)
+                    }
+                    _ => "{}".to_string(),
+                };
+                let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                let mut stream = stream;
+                let _ = stream.write_all(response.as_bytes());
+            });
+        }
+    }
+
+    /// Read the FIFO until the writer's EOF and only then flip the daemon's
+    /// completion state — a real drain barrier, not a sleep. Returns the
+    /// bytes read.
+    #[cfg(owntone_host)]
+    fn drain_fifo_until_eof(
+        reader_path: PathBuf,
+        received: Arc<AtomicBool>,
+        reader_drained: Arc<AtomicBool>,
+    ) -> usize {
+        use std::io::Read;
+
+        let mut fifo = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&reader_path)
+            .expect("open fifo reader");
+        let mut total = 0usize;
+        let mut buffer = [0u8; 4096];
+        loop {
+            match fifo.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    total += read;
+                    received.store(true, Ordering::SeqCst);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        reader_drained.store(true, Ordering::SeqCst);
+        total
+    }
+
     /// X2/W2: the **production** [`run_pump`] path drives a real decode
     /// pipeline into a real FIFO; the daemon observes the writer's EOF and
     /// reports completion, and exactly one `TrackEnded` is published after
@@ -5954,10 +6291,9 @@ mod tests {
     /// earlier fixtures called [`natural_completion`] directly with a pipeline
     /// already gone; this drives the real pump, the real pipe write end and the
     /// daemon drain.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn the_pump_publishes_completion_after_a_real_fifo_drain() {
-        use std::io::Read;
         use std::net::TcpListener;
 
         gst::init().expect("GStreamer init");
@@ -5978,92 +6314,15 @@ mod tests {
             listener.local_addr().expect("addr").port()
         );
         std::thread::spawn(move || {
-            for incoming in listener.incoming() {
-                let Ok(stream) = incoming else { continue };
-                let drained = Arc::clone(&server_drained);
-                let received = Arc::clone(&server_received);
-                std::thread::spawn(move || {
-                    use std::io::{BufRead, BufReader, Write};
-                    let Ok(reader_stream) = stream.try_clone() else {
-                        return;
-                    };
-                    let mut reader = BufReader::new(reader_stream);
-                    let mut request = String::new();
-                    let _ = reader.read_line(&mut request);
-                    let mut content_length = 0usize;
-                    loop {
-                        let mut header = String::new();
-                        if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
-                            break;
-                        }
-                        if let Some(value) = header
-                            .to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .map(str::trim)
-                        {
-                            content_length = value.parse().unwrap_or(0);
-                        }
-                    }
-                    if content_length > 0 {
-                        let mut body = vec![0u8; content_length];
-                        let _ = reader.read_exact(&mut body);
-                    }
-                    let path = request
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or_default()
-                        .to_string();
-                    let body = match path.as_str() {
-                        "/api/config" => r#"{"version":"29.3"}"#.to_string(),
-                        "/api/outputs" => r#"{"outputs":[]}"#.to_string(),
-                        "/api/player" => {
-                            let state = if drained.load(Ordering::SeqCst)
-                                || !received.load(Ordering::SeqCst)
-                            {
-                                "stop"
-                            } else {
-                                "play"
-                            };
-                            format!(r#"{{"state":"{state}"}}"#)
-                        }
-                        _ => "{}".to_string(),
-                    };
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let mut stream = stream;
-                    let _ = stream.write_all(response.as_bytes());
-                });
-            }
+            serve_drain_aware_daemon(listener, server_drained, server_received);
         });
 
         // The FIFO reader observes the drained writer and only then flips the
         // daemon's completion state — a real drain barrier, not a sleep.
         let reader_path = pipe_path.clone();
         let reader_drained = Arc::clone(&drained);
-        let reader = std::thread::spawn(move || {
-            let mut fifo = std::fs::OpenOptions::new()
-                .read(true)
-                .open(&reader_path)
-                .expect("open fifo reader");
-            let mut total = 0usize;
-            let mut buffer = [0u8; 4096];
-            loop {
-                match fifo.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(read) => {
-                        total += read;
-                        received.store(true, Ordering::SeqCst);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(_) => break,
-                }
-            }
-            reader_drained.store(true, Ordering::SeqCst);
-            total
-        });
+        let reader =
+            std::thread::spawn(move || drain_fifo_until_eof(reader_path, received, reader_drained));
 
         let (tx, rx) = async_channel::unbounded();
         let inner = Arc::new(test_session_inner_at_base(&api_base, state_dir, tx));
@@ -6146,7 +6405,7 @@ mod tests {
     /// the session's media route and the advisory instance lock are released
     /// only after that settlement. This drives the production close path rather
     /// than calling the gate directly.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn a_session_close_settles_a_stalled_play_and_releases_route_and_lock() {
         use crate::architecture::media::ResolvedHttpRequest;
@@ -6232,7 +6491,7 @@ mod tests {
     /// HTTP contract. Because it is a real process launched with
     /// `-c <state>/owntone.conf`, `process_is_owned` accepts it and
     /// `quiesce_daemon` can genuinely terminate and restart it.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     const FAKE_OWNED_DAEMON_SOURCE: &str = r##"
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -6289,14 +6548,14 @@ fn serve(stream: std::net::TcpStream) {
     /// A real, owned, restartable fake daemon plus the configuration that binds
     /// it. Kept alive for the duration of the test; `Drop` stops whichever
     /// instance currently holds the endpoint and reaps the initial child.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     struct FakeOwnedDaemon {
         _directory: tempfile::TempDir,
         config: OwnToneConfig,
         child: Option<std::process::Child>,
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     impl Drop for FakeOwnedDaemon {
         fn drop(&mut self) {
             if let Some(process) = listener_process(&self.config.api_base) {
@@ -6308,7 +6567,7 @@ fn serve(stream: std::net::TcpStream) {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     impl FakeOwnedDaemon {
         fn start() -> Self {
             use std::net::TcpListener;
@@ -6375,7 +6634,7 @@ fn serve(stream: std::net::TcpStream) {
 
     /// Launch the fake owned daemon bound to `port`, wait until it is listening,
     /// and return the child so it can be reaped on drop.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     fn launch_fake_owned(binary: &Path, config_path: &Path, port: u16) -> std::process::Child {
         let child = std::process::Command::new(binary)
             .arg("-c")
@@ -6394,7 +6653,7 @@ fn serve(stream: std::net::TcpStream) {
     }
 
     /// A real custodied media route for the retained-recovery fixtures.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     fn custodied_route() -> (Arc<GstreamerMediaProxy>, Arc<GstreamerMediaTicket>) {
         use crate::architecture::media::ResolvedHttpRequest;
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -6418,7 +6677,7 @@ fn serve(stream: std::net::TcpStream) {
     /// and only then are the custodied route (by identity) and the advisory
     /// lock released. This is the success path the previous leg never
     /// exercised.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn a_retained_recovery_releases_lock_and_custodied_route_on_settlement() {
         let daemon = FakeOwnedDaemon::start();
@@ -6465,7 +6724,7 @@ fn serve(stream: std::net::TcpStream) {
     /// supervisor, which starts a live owner, settles against the real daemon
     /// and releases the lock; the completion reports the terminal retained
     /// outcome.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn an_injected_inline_recovery_spawn_failure_hands_off_to_the_supervisor() {
         let daemon = FakeOwnedDaemon::start();
@@ -6505,7 +6764,7 @@ fn serve(stream: std::net::TcpStream) {
     /// the control endpoints, and records every request line to the file named
     /// by `TRIBUTARY_FAKE_REQUESTS`, so the adapter's real request ordering is
     /// observable.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     const RECORDING_DAEMON_SOURCE: &str = r##"
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -6770,7 +7029,7 @@ fn serve(stream: std::net::TcpStream) {
 "##;
 
     /// A real, owned, request-recording fake daemon for the full `open()` path.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     struct RecordingOwnedDaemon {
         _directory: tempfile::TempDir,
         config: OwnToneConfig,
@@ -6778,7 +7037,7 @@ fn serve(stream: std::net::TcpStream) {
         child: Option<std::process::Child>,
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     impl Drop for RecordingOwnedDaemon {
         fn drop(&mut self) {
             if let Some(process) = listener_process(&self.config.api_base) {
@@ -6790,7 +7049,7 @@ fn serve(stream: std::net::TcpStream) {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     impl RecordingOwnedDaemon {
         fn start() -> Self {
             use std::net::TcpListener;
@@ -6878,7 +7137,7 @@ fn serve(stream: std::net::TcpStream) {
 
     /// Run proxy configuration and the recovery capture in a private process;
     /// neither environment nor capture state is changed in the test runner.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn control_transport_stays_on_verified_daemon() {
         const CHILD: &str = "TRIBUTARY_CONTROL_TRANSPORT_CHILD";
@@ -6928,7 +7187,7 @@ fn serve(stream: std::net::TcpStream) {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     fn exercise_transport_refusal(path: &str, status: &str, location: &str, live: bool) {
         use crate::audio::airplay_output::ControllerHarness;
         use crate::local::resolver::ResolvedLocalMedia;
@@ -7037,67 +7296,14 @@ fn serve(stream: std::net::TcpStream) {
         assert!(!proxy.has_custody_entries());
         assert!(flock_is_acquirable(&daemon.config.lock_path()));
         if !live {
-            let mut events = Vec::new();
-            wait_until(|| {
-                events.extend(std::iter::from_fn(|| rx.try_recv().ok()));
-                events.iter().any(|e| {
-                    matches!(
-                        e,
-                        PlayerEvent::StateChanged {
-                            state: PlayerState::Stopped,
-                            ..
-                        }
-                    )
-                })
-            });
-            assert!(
-                events.iter().all(|e| e.generation() == generation),
-                "{events:?}"
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|e| matches!(e, PlayerEvent::Error { .. }))
-                    .count(),
-                1,
-                "{events:?}"
-            );
-            assert!(
-                !events.iter().any(|e| matches!(
-                    e,
-                    PlayerEvent::TrackEnded { .. }
-                        | PlayerEvent::StateChanged {
-                            state: PlayerState::Playing,
-                            ..
-                        }
-                )),
-                "{events:?}"
-            );
+            assert_failed_load_events(&rx, generation);
         }
-        let restored = client.outputs().unwrap();
-        assert_eq!(
-            restored
-                .iter()
-                .map(|o| (o.id, o.selected))
-                .collect::<Vec<_>>(),
-            baseline
-                .iter()
-                .map(|o| (o.id, o.selected))
-                .collect::<Vec<_>>()
-        );
-        let next = prepare();
-        let next_ticket = next.ticket().unwrap();
-        controller.set_generation(generation.next());
-        controller.load(generation.next(), next);
-        wait_until(|| controller.state() == PlayerState::Playing);
-        assert_eq!(next_ticket.route_count(), 1);
-        controller.stop();
-        wait_until(|| next_ticket.route_count() == 0);
-        wait_until(|| !daemon.config.takeover_record().exists());
+        assert_outputs_match(&client, &baseline);
+        assert_next_load_plays(&controller, &daemon, prepare(), generation.next());
     }
 
     /// AK1: malformed observations must fail before any takeover effect.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     fn exercise_takeover_observation(response: &str, outputs: bool, accepted: bool) {
         use crate::audio::airplay_output::ControllerHarness;
         use crate::local::resolver::ResolvedLocalMedia;
@@ -7176,42 +7382,7 @@ fn serve(stream: std::net::TcpStream) {
         assert!(!proxy.is_custodied(&ticket));
         assert!(!proxy.has_custody_entries());
         if !accepted {
-            let mut events = Vec::new();
-            wait_until(|| {
-                events.extend(std::iter::from_fn(|| rx.try_recv().ok()));
-                events.iter().any(|event| {
-                    matches!(
-                        event,
-                        PlayerEvent::StateChanged {
-                            state: PlayerState::Stopped,
-                            ..
-                        }
-                    )
-                })
-            });
-            assert!(
-                events.iter().all(|event| event.generation() == generation),
-                "{events:?}"
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| matches!(event, PlayerEvent::Error { .. }))
-                    .count(),
-                1,
-                "{events:?}"
-            );
-            assert!(
-                !events.iter().any(|event| matches!(
-                    event,
-                    PlayerEvent::TrackEnded { .. }
-                        | PlayerEvent::StateChanged {
-                            state: PlayerState::Playing,
-                            ..
-                        }
-                )),
-                "{events:?}"
-            );
+            assert_failed_load_events(&rx, generation);
             assert_eq!(controller.state(), PlayerState::Stopped);
             assert!(
                 !daemon
@@ -7230,32 +7401,16 @@ fn serve(stream: std::net::TcpStream) {
                 "queue and player unchanged"
             );
         }
-        let restored = client.outputs().unwrap();
-        assert_eq!(restored.len(), baseline_outputs.len());
-        for (actual, prior) in restored.iter().zip(&baseline_outputs) {
-            assert_eq!((actual.id, actual.selected), (prior.id, prior.selected));
-        }
+        assert_outputs_match(&client, &baseline_outputs);
         drop(competing);
         // A failure must release the prepared route and lock without a UI Stop,
         // and leave this same controller/daemon usable for the next generation.
         while rx.try_recv().is_ok() {}
-        let next = prepare();
-        let next_ticket = next.ticket().unwrap();
-        controller.set_generation(generation.next());
-        controller.load(generation.next(), next);
-        wait_until(|| controller.state() == PlayerState::Playing);
-        assert_eq!(next_ticket.route_count(), 1);
-        controller.stop();
-        wait_until(|| next_ticket.route_count() == 0);
-        wait_until(|| !daemon.config.takeover_record().exists());
-        let restored = client.outputs().unwrap();
-        assert_eq!(restored.len(), baseline_outputs.len());
-        for (actual, prior) in restored.iter().zip(&baseline_outputs) {
-            assert_eq!((actual.id, actual.selected), (prior.id, prior.selected));
-        }
+        assert_next_load_plays(&controller, &daemon, prepare(), generation.next());
+        assert_outputs_match(&client, &baseline_outputs);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn takeover_observation_rejects_malformed_player_states() {
         for response in [
@@ -7268,7 +7423,7 @@ fn serve(stream: std::net::TcpStream) {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn takeover_observation_rejects_incomplete_output_snapshots() {
         for second in [
@@ -7288,7 +7443,7 @@ fn serve(stream: std::net::TcpStream) {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn takeover_observation_preserves_recognized_state_policy() {
         for state in ["stop", "pause", "play"] {
@@ -7302,11 +7457,24 @@ fn serve(stream: std::net::TcpStream) {
 
     /// AM1: which foreign object is planted at the scanned pipe pathname
     /// between the adapter's ownership checks and its writer acquisition.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[derive(Clone, Copy)]
     enum PipeSubstitution {
         RegularFile,
         Symlink,
+    }
+
+    /// The planted object is still exactly what the test put at the pathname.
+    #[cfg(owntone_host)]
+    fn assert_planted(pipe: &Path, sentinel: &Path, substitution: PipeSubstitution) {
+        let planted = std::fs::symlink_metadata(pipe).unwrap().file_type();
+        match substitution {
+            PipeSubstitution::RegularFile => assert!(planted.is_file()),
+            PipeSubstitution::Symlink => {
+                assert!(planted.is_symlink());
+                assert_eq!(std::fs::read_link(pipe).unwrap(), sentinel);
+            }
+        }
     }
 
     /// AM1: the recording daemon substitutes the pipe pathname while it serves
@@ -7318,7 +7486,7 @@ fn serve(stream: std::net::TcpStream) {
     /// Playing, no TrackEnded), restore the daemon or retain every piece of
     /// ownership evidence until a refused restoration settles, leave the
     /// planted object exactly as it found it, and stay usable afterwards.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     fn exercise_pipe_substitution(substitution: PipeSubstitution, restore_fault: bool) {
         use crate::audio::airplay_output::ControllerHarness;
         use crate::local::resolver::ResolvedLocalMedia;
@@ -7373,16 +7541,7 @@ fn serve(stream: std::net::TcpStream) {
             PipeSubstitution::RegularFile => pipe.clone(),
             PipeSubstitution::Symlink => sentinel.clone(),
         };
-        let planted_as_expected = || {
-            let planted = std::fs::symlink_metadata(&pipe).unwrap().file_type();
-            match substitution {
-                PipeSubstitution::RegularFile => assert!(planted.is_file()),
-                PipeSubstitution::Symlink => {
-                    assert!(planted.is_symlink());
-                    assert_eq!(std::fs::read_link(&pipe).unwrap(), sentinel);
-                }
-            }
-        };
+        let planted_as_expected = || assert_planted(&pipe, &sentinel, substitution);
         std::fs::write(
             pipe.with_extension("substitute"),
             match substitution {
@@ -7446,42 +7605,7 @@ fn serve(stream: std::net::TcpStream) {
             assert!(!proxy.is_custodied(&ticket));
             assert!(!proxy.has_custody_entries());
         }
-        let mut events = Vec::new();
-        wait_until(|| {
-            events.extend(std::iter::from_fn(|| rx.try_recv().ok()));
-            events.iter().any(|event| {
-                matches!(
-                    event,
-                    PlayerEvent::StateChanged {
-                        state: PlayerState::Stopped,
-                        ..
-                    }
-                )
-            })
-        });
-        assert!(
-            events.iter().all(|event| event.generation() == generation),
-            "{events:?}"
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, PlayerEvent::Error { .. }))
-                .count(),
-            1,
-            "{events:?}"
-        );
-        assert!(
-            !events.iter().any(|event| matches!(
-                event,
-                PlayerEvent::TrackEnded { .. }
-                    | PlayerEvent::StateChanged {
-                        state: PlayerState::Playing,
-                        ..
-                    }
-            )),
-            "{events:?}"
-        );
+        assert_failed_load_events(&rx, generation);
         assert_eq!(controller.state(), PlayerState::Stopped);
 
         // Not one byte reached the foreign object, the daemon never observed
@@ -7515,11 +7639,7 @@ fn serve(stream: std::net::TcpStream) {
                 original_process
             );
         }
-        let restored = client.outputs().unwrap();
-        assert_eq!(restored.len(), baseline_outputs.len());
-        for (actual, prior) in restored.iter().zip(&baseline_outputs) {
-            assert_eq!((actual.id, actual.selected), (prior.id, prior.selected));
-        }
+        assert_outputs_match(&client, &baseline_outputs);
         assert_eq!(client.player_state().unwrap(), "stop");
         drop(competing);
 
@@ -7527,45 +7647,33 @@ fn serve(stream: std::net::TcpStream) {
         // play normally against the restored FIFO.
         client.player_control("stop").unwrap();
         while rx.try_recv().is_ok() {}
-        let next = prepare();
-        let next_ticket = next.ticket().unwrap();
-        controller.set_generation(generation.next());
-        controller.load(generation.next(), next);
-        wait_until(|| controller.state() == PlayerState::Playing);
+        assert_next_load_plays(&controller, &daemon, prepare(), generation.next());
         assert!(daemon.recorded().contains("PCM received"));
-        assert_eq!(next_ticket.route_count(), 1);
-        controller.stop();
-        wait_until(|| next_ticket.route_count() == 0);
-        wait_until(|| !daemon.config.takeover_record().exists());
-        let restored = client.outputs().unwrap();
-        assert_eq!(restored.len(), baseline_outputs.len());
-        for (actual, prior) in restored.iter().zip(&baseline_outputs) {
-            assert_eq!((actual.id, actual.selected), (prior.id, prior.selected));
-        }
+        assert_outputs_match(&client, &baseline_outputs);
         if matches!(substitution, PipeSubstitution::Symlink) {
             assert_eq!(std::fs::read(&sentinel).unwrap(), sentinel_bytes);
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn substituted_regular_file_at_the_pipe_path_is_refused_and_restored() {
         exercise_pipe_substitution(PipeSubstitution::RegularFile, false);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn substituted_symlink_at_the_pipe_path_is_refused_and_restored() {
         exercise_pipe_substitution(PipeSubstitution::Symlink, false);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn substituted_regular_file_retains_ownership_until_a_refused_restore_settles() {
         exercise_pipe_substitution(PipeSubstitution::RegularFile, true);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn substituted_symlink_retains_ownership_until_a_refused_restore_settles() {
         exercise_pipe_substitution(PipeSubstitution::Symlink, true);
@@ -7574,7 +7682,7 @@ fn serve(stream: std::net::TcpStream) {
     /// Shared production-controller setup against one owned recording daemon:
     /// a controller wired to the real OwnTone sender, an event channel, and a
     /// prepared protected local WAV of `seconds` seconds.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     struct DaemonControllerFixture {
         daemon: RecordingOwnedDaemon,
         client: OwnToneClient,
@@ -7586,7 +7694,7 @@ fn serve(stream: std::net::TcpStream) {
         media: PathBuf,
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     impl DaemonControllerFixture {
         fn start(seconds: u32) -> Self {
             use crate::audio::airplay_output::ControllerHarness;
@@ -7660,7 +7768,7 @@ fn serve(stream: std::net::TcpStream) {
     /// after the pipe drains — by observing the daemon's stalled progress under
     /// `play` and issuing the restoring stop itself — instead of timing out
     /// into an Error.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn a_resumed_pipe_completes_naturally_after_a_pause() {
         // Long enough that the pause lands mid-stream: the recording daemon
@@ -7745,7 +7853,7 @@ fn serve(stream: std::net::TcpStream) {
     /// the previous worker is still restoring the daemon and holding the
     /// instance lock. The replacement must wait for that sequential hand-over
     /// instead of failing as if a concurrent session held the lock.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn back_to_back_loads_hand_over_the_instance_lock() {
         let fixture = DaemonControllerFixture::start(30);
@@ -7809,7 +7917,7 @@ fn serve(stream: std::net::TcpStream) {
     /// opener under its own lock — quiesce, restore the recorded output set,
     /// remove the record — and only then admit the load. A recovery that
     /// cannot be completed refuses the load and leaves the record in place.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     fn exercise_stale_record_recovery(recoverable: bool) {
         let fixture = DaemonControllerFixture::start(30);
         let controller = &fixture.controller;
@@ -7908,13 +8016,13 @@ fn serve(stream: std::net::TcpStream) {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn a_stale_takeover_record_is_recovered_by_the_next_opener() {
         exercise_stale_record_recovery(true);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn an_unrecoverable_stale_takeover_record_refuses_the_load() {
         exercise_stale_record_recovery(false);
@@ -7922,14 +8030,14 @@ fn serve(stream: std::net::TcpStream) {
 
     /// Park after the real open, before the real worker activates the session.
     /// This allows Stop to win the shared first-effect gate deterministically.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     struct ParkedOwnedSender {
         sender: OwnToneSender,
         opened: std::sync::mpsc::Sender<()>,
         release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     impl AirplaySender for ParkedOwnedSender {
         fn name(&self) -> &'static str {
             "parked-owned"
@@ -7949,7 +8057,7 @@ fn serve(stream: std::net::TcpStream) {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     fn write_startup_wav(path: &Path, seconds: u32) {
         // Thirty seconds of valid stereo 44.1kHz s16 PCM, long enough to
         // observe live playback before driving Stop through the worker.
@@ -7970,7 +8078,7 @@ fn serve(stream: std::net::TcpStream) {
         std::fs::write(path, wav).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     enum StartupCase {
         Play,
         StopBeforePcm,
@@ -7982,29 +8090,142 @@ fn serve(stream: std::net::TcpStream) {
         StalledPlayingStop,
     }
 
-    #[cfg(target_os = "linux")]
+    /// Drive one startup case to its expected worker outcome: observe queued
+    /// PCM on a stalled reader, Stop during autostart, live playback, a
+    /// refused/failed start, or natural completion.
+    #[cfg(owntone_host)]
+    #[allow(clippy::too_many_arguments)]
+    fn await_startup_outcome(
+        flags: StartupFlags,
+        daemon: &RecordingOwnedDaemon,
+        client: &OwnToneClient,
+        gate: &Arc<SessionGate>,
+        worker: &crate::audio::airplay_output::TestSessionWorker,
+        ticket: &Arc<GstreamerMediaTicket>,
+        fifo_observer: Option<&OwnedFd>,
+        deadline: Instant,
+    ) {
+        let StartupFlags {
+            stop_first,
+            stop_during,
+            stalled,
+            fail_play,
+            natural_eos,
+        } = flags;
+        if stalled {
+            // The fixture has consumed only its first chunk and retains the
+            // reader. Observe queued PCM, then give the decoder time to fill
+            // the pipe. The independent oversized-buffer test proves the
+            // partial-write/cancellation behavior without relying on timing.
+            while rustix::io::ioctl_fionread(fifo_observer.unwrap()).unwrap() == 0
+                || !daemon.recorded().contains("PCM received")
+            {
+                assert!(Instant::now() < deadline, "FIFO never received PCM");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(client.get_json("/api/player").unwrap()["pcm_bytes"], 4096);
+        }
+        if stop_during {
+            while !daemon.recorded().contains("PCM received") {
+                assert!(
+                    Instant::now() < deadline,
+                    "first PCM never reached the daemon"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let started = Instant::now();
+            gate.stop();
+            assert!(
+                started.elapsed() < Duration::from_millis(100),
+                "Stop waited for activation"
+            );
+        }
+        if !stop_first && !fail_play {
+            loop {
+                let player = client.get_json("/api/player").unwrap();
+                if worker.cached_state() == PlayerState::Playing
+                    && player["state"] == "play"
+                    && player["pcm_bytes"].as_u64().unwrap() > 0
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "real worker never played usable PCM"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(ticket.route_count(), 1);
+        } else {
+            while worker.cached_state() != PlayerState::Stopped {
+                assert!(Instant::now() < deadline, "failed activation never stopped");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        if natural_eos {
+            while ticket.route_count() != 0 || worker.cached_state() != PlayerState::Stopped {
+                assert!(
+                    Instant::now() < deadline,
+                    "finite PCM never completed in the live worker"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// What each [`StartupCase`] arranges and expects (a flag set by nature).
+    #[cfg(owntone_host)]
+    #[derive(Clone, Copy)]
+    #[allow(clippy::struct_excessive_bools)]
+    struct StartupFlags {
+        stop_first: bool,
+        stop_during: bool,
+        stalled: bool,
+        fail_play: bool,
+        natural_eos: bool,
+    }
+
+    #[cfg(owntone_host)]
+    impl StartupFlags {
+        fn of(case: &StartupCase) -> Self {
+            let stop_during = matches!(
+                case,
+                StartupCase::StopDuringAutostart | StartupCase::StalledStartupStop
+            );
+            Self {
+                stop_first: matches!(case, StartupCase::StopBeforePcm),
+                stop_during,
+                stalled: matches!(
+                    case,
+                    StartupCase::StalledTimeout
+                        | StartupCase::StalledStartupStop
+                        | StartupCase::StalledPlayingStop
+                ),
+                fail_play: matches!(
+                    case,
+                    StartupCase::FailAutostart | StartupCase::StalledTimeout
+                ) || stop_during,
+                natural_eos: matches!(case, StartupCase::NaturalEos),
+            }
+        }
+    }
+
+    #[cfg(owntone_host)]
     fn exercise_empty_queue_start(case: StartupCase) {
         use crate::audio::airplay_output::spawn_test_session_worker;
         use crate::audio::airplay_sender::SenderTarget;
         use crate::local::resolver::ResolvedLocalMedia;
         use std::sync::atomic::{AtomicU64, AtomicU8};
 
-        let stop_first = matches!(case, StartupCase::StopBeforePcm);
-        let stop_during = matches!(
-            case,
-            StartupCase::StopDuringAutostart | StartupCase::StalledStartupStop
-        );
-        let stalled = matches!(
-            case,
-            StartupCase::StalledTimeout
-                | StartupCase::StalledStartupStop
-                | StartupCase::StalledPlayingStop
-        );
-        let fail_play = matches!(
-            case,
-            StartupCase::FailAutostart | StartupCase::StalledTimeout
-        ) || stop_during;
-        let natural_eos = matches!(case, StartupCase::NaturalEos);
+        let flags = StartupFlags::of(&case);
+        let StartupFlags {
+            stop_first,
+            stop_during: _,
+            stalled,
+            fail_play,
+            natural_eos,
+        } = flags;
         gst::init().expect("GStreamer");
         let daemon = RecordingOwnedDaemon::start();
         let client = OwnToneClient::new(&daemon.config.api_base).expect("client");
@@ -8114,66 +8335,16 @@ fn serve(stream: std::net::TcpStream) {
         }
         release_tx.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
-        if stalled {
-            // The fixture has consumed only its first chunk and retains the
-            // reader. Observe queued PCM, then give the decoder time to fill
-            // the pipe. The independent oversized-buffer test proves the
-            // partial-write/cancellation behavior without relying on timing.
-            while rustix::io::ioctl_fionread(fifo_observer.as_ref().unwrap()).unwrap() == 0
-                || !daemon.recorded().contains("PCM received")
-            {
-                assert!(Instant::now() < deadline, "FIFO never received PCM");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            std::thread::sleep(Duration::from_millis(200));
-            assert_eq!(client.get_json("/api/player").unwrap()["pcm_bytes"], 4096);
-        }
-        if stop_during {
-            while !daemon.recorded().contains("PCM received") {
-                assert!(
-                    Instant::now() < deadline,
-                    "first PCM never reached the daemon"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            let started = Instant::now();
-            gate.stop();
-            assert!(
-                started.elapsed() < Duration::from_millis(100),
-                "Stop waited for activation"
-            );
-        }
-        if !stop_first && !fail_play {
-            loop {
-                let player = client.get_json("/api/player").unwrap();
-                if worker.cached_state() == PlayerState::Playing
-                    && player["state"] == "play"
-                    && player["pcm_bytes"].as_u64().unwrap() > 0
-                {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "real worker never played usable PCM"
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            assert_eq!(ticket.route_count(), 1);
-        } else {
-            while worker.cached_state() != PlayerState::Stopped {
-                assert!(Instant::now() < deadline, "failed activation never stopped");
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
-        if natural_eos {
-            while ticket.route_count() != 0 || worker.cached_state() != PlayerState::Stopped {
-                assert!(
-                    Instant::now() < deadline,
-                    "finite PCM never completed in the live worker"
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
+        await_startup_outcome(
+            flags,
+            &daemon,
+            &client,
+            &gate,
+            &worker,
+            &ticket,
+            fifo_observer.as_ref(),
+            deadline,
+        );
         let (joined_tx, joined_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             worker.stop_and_join();
@@ -8202,6 +8373,25 @@ fn serve(stream: std::net::TcpStream) {
         assert!(recorded.contains("/api/player/stop"));
         assert!(recorded.matches("/api/outputs/set").count() >= 2);
         assert_eq!(recorded.contains("PCM received"), !stop_first);
+        assert_startup_events(&rx, generation, flags, &recorded, &client);
+    }
+
+    /// The startup fixture's event contract for one case (see the harness).
+    #[cfg(owntone_host)]
+    fn assert_startup_events(
+        rx: &async_channel::Receiver<PlayerEvent>,
+        generation: PlayerEventGeneration,
+        flags: StartupFlags,
+        recorded: &str,
+        client: &OwnToneClient,
+    ) {
+        let StartupFlags {
+            stop_first,
+            stop_during,
+            stalled: _,
+            fail_play,
+            natural_eos,
+        } = flags;
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(events.iter().all(|event| event.generation() == generation));
         let has_error = events
@@ -8274,49 +8464,49 @@ fn serve(stream: std::net::TcpStream) {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn empty_queue_start_plays_scanned_pipe_through_real_open_and_worker() {
         exercise_empty_queue_start(StartupCase::Play);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn empty_queue_start_stop_wins_first_effect_and_restores() {
         exercise_empty_queue_start(StartupCase::StopBeforePcm);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn empty_queue_start_autostart_failure_never_publishes_playing_and_restores() {
         exercise_empty_queue_start(StartupCase::FailAutostart);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn empty_queue_start_finite_pcm_completes_once_through_live_worker() {
         exercise_empty_queue_start(StartupCase::NaturalEos);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn empty_queue_start_stop_during_autostart_settles_pcm_without_playing() {
         exercise_empty_queue_start(StartupCase::StopDuringAutostart);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn stalled_fifo_startup_timeout_restores_without_hanging() {
         exercise_empty_queue_start(StartupCase::StalledTimeout);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn stalled_fifo_stop_during_startup_restores_without_hanging() {
         exercise_empty_queue_start(StartupCase::StalledStartupStop);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn stalled_fifo_stop_after_playing_restores_without_hanging() {
         exercise_empty_queue_start(StartupCase::StalledPlayingStop);
@@ -8325,7 +8515,7 @@ fn serve(stream: std::net::TcpStream) {
     /// AE1: real finite PCM enters the pump's EOS drain and parks its HTTP
     /// observation. Drive Stop/replacement through the production controller
     /// before releasing either completion or still-playing observations.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     fn exercise_cancelled_eos_drain(replace: bool, response: &str) {
         use crate::audio::airplay_output::ControllerHarness;
         use crate::local::resolver::ResolvedLocalMedia;
@@ -8452,7 +8642,7 @@ fn serve(stream: std::net::TcpStream) {
         assert!(events.iter().any(|event| matches!(event, PlayerEvent::StateChanged { generation: g, state: PlayerState::Playing } if *g == generation)));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     fn exercise_cancelled_activation(resume: bool, replace: bool, fail: bool) {
         use crate::audio::airplay_output::ControllerHarness;
         use crate::local::resolver::ResolvedLocalMedia;
@@ -8610,13 +8800,13 @@ fn serve(stream: std::net::TcpStream) {
 
     /// AI1: the actual decoder/pump and command worker must settle without
     /// Stop, replacement, controller drop, or UI handling of terminal events.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     fn exercise_pump_settlement(decode_error: bool, restore_fault: Option<bool>) {
         exercise_pump_settlement_with_control(decode_error, restore_fault, None);
     }
 
     #[derive(Clone, Copy)]
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     enum TerminalControl {
         Volume,
         Pause,
@@ -8624,7 +8814,7 @@ fn serve(stream: std::net::TcpStream) {
         StopAfterVolume,
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     fn exercise_pump_settlement_with_control(
         decode_error: bool,
         restore_fault: Option<bool>,
@@ -8702,10 +8892,72 @@ fn serve(stream: std::net::TcpStream) {
         assert!(daemon.config.takeover_record().exists());
         assert!(client.outputs().unwrap()[0].selected);
         while rx.try_recv().is_ok() {}
-        if terminal_control.is_some() {
+        arm_pump_fault(
+            pipe,
+            decode_error,
+            restore_fault,
+            terminal_control.is_some(),
+        );
+        if restore_fault.is_some() || terminal_control.is_some() {
+            wait_until(|| pipe.with_extension("restore-seen").exists());
+            assert_restoration_parked(&ticket, &daemon, &competing, &client);
+            if let Some(control) = terminal_control {
+                drive_terminal_control(&mut controller, control, pipe);
+            }
+            if restore_fault != Some(true) {
+                std::fs::write(pipe.with_extension("restore-release"), "").unwrap();
+            }
+            // Timeout is never released: only automatic worker quiescence can
+            // kill that request and make releasing the instance lock safe.
+        }
+        if let Some(control) = terminal_control {
+            release_parked_terminal(&controller, &daemon, &rx, &competing, control);
+        }
+        wait_until(|| ticket.route_count() == 0);
+        wait_until(|| {
+            rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_ok()
+        });
+        wait_until(|| controller.state() == PlayerState::Stopped);
+        assert!(!daemon.config.takeover_record().exists());
+        assert!(!controller.proxy().is_custodied(&ticket));
+        assert!(!controller.proxy().has_custody_entries());
+        assert!(!client.outputs().unwrap()[0].selected);
+        assert!(client.outputs().unwrap()[1].selected);
+        assert_eq!(client.player_state().unwrap(), "stop");
+        assert_quiescence(&daemon, original_process, restore_fault.is_some());
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().all(|event| event.generation() == generation));
+        assert!(
+            !playback.mark_resolved_load_failed(generation),
+            "direct-source UI does not send Stop"
+        );
+        assert!(playback.accepts_event_generation(generation));
+        let stopped = matches!(terminal_control, Some(TerminalControl::StopAfterVolume));
+        let failed = decode_error || restore_fault.is_some();
+        assert_settlement_events(&events, failed, stopped);
+        assert_late_controls_refused(&controller, &daemon, &rx);
+        drop(competing);
+        for suffix in ["park-drain", "drain-started", "park-terminal"] {
+            let _ = std::fs::remove_file(pipe.with_extension(suffix));
+        }
+        write_startup_wav(&path, 30);
+        assert_next_load_plays_with_pause(&controller, prepare(), generation.next());
+    }
+
+    /// Arrange the pump fault for one settlement case: park terminal
+    /// publication and/or the restoring stop as requested, then end the
+    /// stream (decoder error via a broken pipe, or a released finite drain).
+    #[cfg(owntone_host)]
+    fn arm_pump_fault(
+        pipe: &Path,
+        decode_error: bool,
+        restore_fault: Option<bool>,
+        park_terminal: bool,
+    ) {
+        if park_terminal {
             std::fs::write(pipe.with_extension("park-terminal"), "").unwrap();
         }
-        if restore_fault.is_some() || terminal_control.is_some() {
+        if restore_fault.is_some() || park_terminal {
             std::fs::write(
                 pipe.with_extension("park-restore"),
                 match restore_fault {
@@ -8722,69 +8974,35 @@ fn serve(stream: std::net::TcpStream) {
         } else {
             std::fs::write(pipe.with_extension("drain-release"), "stop").unwrap();
         }
-        if restore_fault.is_some() || terminal_control.is_some() {
-            wait_until(|| pipe.with_extension("restore-seen").exists());
-            assert_eq!(ticket.route_count(), 1, "restoring mutation retains media");
-            assert!(daemon.config.takeover_record().exists());
-            assert!(
-                rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err()
-            );
-            assert!(client.outputs().unwrap()[0].selected);
-            if let Some(control) = terminal_control {
-                let started = Instant::now();
-                match control {
-                    TerminalControl::Volume | TerminalControl::StopAfterVolume => {
-                        controller.set_volume(0.37);
-                    }
-                    TerminalControl::Pause => controller.pause(),
-                    TerminalControl::Resume => controller.play(),
-                }
-                assert!(started.elapsed() < Duration::from_millis(500));
-                // Pause/volume block on restore's mutation boundary. Resume
-                // observes running=false and is refused without an RPC.
-                if !matches!(control, TerminalControl::Resume) {
-                    wait_until(|| pipe.with_extension("terminal-control-waiting").exists());
-                }
-            }
-            if restore_fault != Some(true) {
-                std::fs::write(pipe.with_extension("restore-release"), "").unwrap();
-            }
-            // Timeout is never released: only automatic worker quiescence can
-            // kill that request and make releasing the instance lock safe.
-        }
-        if let Some(control) = terminal_control {
-            wait_until(|| pipe.with_extension("terminal-ready").exists());
-            wait_until(|| pipe.with_extension("terminal-close-joining").exists());
-            assert!(rx.try_recv().is_err(), "publication remains parked");
-            assert!(
-                rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err()
-            );
-            let requests = daemon.recorded();
-            assert!(!requests.contains("PUT /api/player/pause"));
-            assert!(!requests.contains("PUT /api/player/play"));
-            assert!(!requests.contains("volume=37"));
-            if matches!(control, TerminalControl::StopAfterVolume) {
-                let started = Instant::now();
-                controller.stop();
-                assert!(started.elapsed() < Duration::from_millis(500));
-            }
-            std::fs::write(pipe.with_extension("terminal-release"), "").unwrap();
-        }
-        wait_until(|| ticket.route_count() == 0);
-        wait_until(|| {
-            rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_ok()
-        });
-        wait_until(|| controller.state() == PlayerState::Stopped);
-        assert!(!daemon.config.takeover_record().exists());
-        assert!(!controller.proxy().is_custodied(&ticket));
-        assert!(!controller.proxy().has_custody_entries());
-        assert!(!client.outputs().unwrap()[0].selected);
-        assert!(client.outputs().unwrap()[1].selected);
-        assert_eq!(client.player_state().unwrap(), "stop");
+    }
+
+    /// While the restoring mutation is parked, every piece of ownership
+    /// evidence is retained: route, record, lock and the taken-over output.
+    #[cfg(owntone_host)]
+    fn assert_restoration_parked(
+        ticket: &Arc<GstreamerMediaTicket>,
+        daemon: &RecordingOwnedDaemon,
+        competing: &std::fs::File,
+        client: &OwnToneClient,
+    ) {
+        assert_eq!(ticket.route_count(), 1, "restoring mutation retains media");
+        assert!(daemon.config.takeover_record().exists());
+        assert!(rustix::fs::flock(competing, FlockOperation::NonBlockingLockExclusive).is_err());
+        assert!(client.outputs().unwrap()[0].selected);
+    }
+
+    /// An uncertain restore must have quiesced (restarted) the daemon; a clean
+    /// one must not have.
+    #[cfg(owntone_host)]
+    fn assert_quiescence(
+        daemon: &RecordingOwnedDaemon,
+        original_process: ProcessIdentity,
+        expect_restart: bool,
+    ) {
         let final_process = listener_process(&daemon.config.api_base)
             .unwrap()
             .identity();
-        if restore_fault.is_some() {
+        if expect_restart {
             assert_ne!(
                 final_process, original_process,
                 "uncertain restore requires quiescence"
@@ -8795,15 +9013,85 @@ fn serve(stream: std::net::TcpStream) {
                 "clean restore needs no restart"
             );
         }
-        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert!(events.iter().all(|event| event.generation() == generation));
-        assert!(
-            !playback.mark_resolved_load_failed(generation),
-            "direct-source UI does not send Stop"
+    }
+
+    /// A finished worker refuses late controls: nothing is transmitted and
+    /// nothing is published.
+    #[cfg(owntone_host)]
+    fn assert_late_controls_refused(
+        controller: &crate::audio::airplay_output::ControllerHarness,
+        daemon: &RecordingOwnedDaemon,
+        rx: &async_channel::Receiver<PlayerEvent>,
+    ) {
+        let before_controls = daemon.recorded();
+        controller.play();
+        controller.pause();
+        controller.play();
+        assert_eq!(controller.state(), PlayerState::Stopped);
+        assert_eq!(
+            daemon.recorded(),
+            before_controls,
+            "finished worker refuses late controls"
         );
-        assert!(playback.accepts_event_generation(generation));
-        let stopped = matches!(terminal_control, Some(TerminalControl::StopAfterVolume));
-        let failed = decode_error || restore_fault.is_some();
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Issue one live control while restoration is parked and, for controls
+    /// that transmit, wait until it is queued behind the settlement boundary.
+    #[cfg(owntone_host)]
+    fn drive_terminal_control(
+        controller: &mut crate::audio::airplay_output::ControllerHarness,
+        control: TerminalControl,
+        pipe: &Path,
+    ) {
+        let started = Instant::now();
+        match control {
+            TerminalControl::Volume | TerminalControl::StopAfterVolume => {
+                controller.set_volume(0.37);
+            }
+            TerminalControl::Pause => controller.pause(),
+            TerminalControl::Resume => controller.play(),
+        }
+        assert!(started.elapsed() < Duration::from_millis(500));
+        // Pause/volume block on restore's mutation boundary. Resume observes
+        // running=false and is refused without an RPC.
+        if !matches!(control, TerminalControl::Resume) {
+            wait_until(|| pipe.with_extension("terminal-control-waiting").exists());
+        }
+    }
+
+    /// With terminal publication parked: the refused control transmitted
+    /// nothing, the lock is still held, nothing was published; then release.
+    #[cfg(owntone_host)]
+    fn release_parked_terminal(
+        controller: &crate::audio::airplay_output::ControllerHarness,
+        daemon: &RecordingOwnedDaemon,
+        rx: &async_channel::Receiver<PlayerEvent>,
+        competing: &std::fs::File,
+        control: TerminalControl,
+    ) {
+        let pipe = &daemon.config.pipe_path;
+        wait_until(|| pipe.with_extension("terminal-ready").exists());
+        wait_until(|| pipe.with_extension("terminal-close-joining").exists());
+        assert!(rx.try_recv().is_err(), "publication remains parked");
+        assert!(rustix::fs::flock(competing, FlockOperation::NonBlockingLockExclusive).is_err());
+        let requests = daemon.recorded();
+        assert!(!requests.contains("PUT /api/player/pause"));
+        assert!(!requests.contains("PUT /api/player/play"));
+        assert!(!requests.contains("volume=37"));
+        if matches!(control, TerminalControl::StopAfterVolume) {
+            let started = Instant::now();
+            controller.stop();
+            assert!(started.elapsed() < Duration::from_millis(500));
+        }
+        std::fs::write(pipe.with_extension("terminal-release"), "").unwrap();
+    }
+
+    /// The settled session's events: an Error only for a genuine failure that
+    /// no Stop suppressed, exactly one TrackEnded only for a clean completion,
+    /// a terminal Stopped, and never a Playing/Paused.
+    #[cfg(owntone_host)]
+    fn assert_settlement_events(events: &[PlayerEvent], failed: bool, stopped: bool) {
         assert_eq!(
             events
                 .iter()
@@ -8839,109 +9127,81 @@ fn serve(stream: std::net::TcpStream) {
             )),
             "{events:?}"
         );
-        let before_controls = daemon.recorded();
-        controller.play();
-        controller.pause();
-        controller.play();
-        assert_eq!(controller.state(), PlayerState::Stopped);
-        assert_eq!(
-            daemon.recorded(),
-            before_controls,
-            "finished worker refuses late controls"
-        );
-        assert!(rx.try_recv().is_err());
-        drop(competing);
-        for suffix in ["park-drain", "drain-started", "park-terminal"] {
-            let _ = std::fs::remove_file(pipe.with_extension(suffix));
-        }
-        write_startup_wav(&path, 30);
-        let prepared = prepare();
-        let next_ticket = prepared.ticket().unwrap();
-        controller.set_generation(generation.next());
-        controller.load(generation.next(), prepared);
-        wait_until(|| controller.state() == PlayerState::Playing);
-        assert_eq!(next_ticket.route_count(), 1);
-        controller.pause();
-        wait_until(|| controller.state() == PlayerState::Paused);
-        controller.play();
-        wait_until(|| controller.state() == PlayerState::Playing);
-        controller.stop();
-        wait_until(|| next_ticket.route_count() == 0);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn pump_decoder_error_settles_without_stop() {
         exercise_pump_settlement(true, None);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn pump_decoder_error_failed_restore_settles_without_stop() {
         exercise_pump_settlement(true, Some(false));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn pump_decoder_error_timed_out_restore_settles_without_stop() {
         exercise_pump_settlement(true, Some(true));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn pump_finite_eos_releases_lock_without_stop() {
         exercise_pump_settlement(false, None);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn pump_finite_eos_failed_restore_settles_without_stop() {
         exercise_pump_settlement(false, Some(false));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn pump_finite_eos_timed_out_restore_settles_without_stop() {
         exercise_pump_settlement(false, Some(true));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn pump_terminal_control_volume_completion() {
         exercise_pump_settlement_with_control(false, None, Some(TerminalControl::Volume));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn pump_terminal_control_pause_completion() {
         exercise_pump_settlement_with_control(false, None, Some(TerminalControl::Pause));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn pump_terminal_control_resume_completion() {
         exercise_pump_settlement_with_control(false, None, Some(TerminalControl::Resume));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn pump_terminal_control_volume_restore_failure() {
         exercise_pump_settlement_with_control(false, Some(false), Some(TerminalControl::Volume));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn pump_terminal_control_pause_restore_failure() {
         exercise_pump_settlement_with_control(false, Some(false), Some(TerminalControl::Pause));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn pump_terminal_control_volume_stop_first() {
         exercise_pump_settlement_with_control(false, None, Some(TerminalControl::StopAfterVolume));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn pump_terminal_control_volume_failed_restore_stop_first() {
         exercise_pump_settlement_with_control(
@@ -8954,7 +9214,7 @@ fn serve(stream: std::net::TcpStream) {
     /// AG1: events are observed without any UI-generated Stop, matching direct
     /// radio's mark_resolved_load_failed=false semantics. Protected local PCM
     /// also lets us verify route custody through the actual controller.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     fn exercise_live_resume_failure(timeout: bool) {
         use crate::audio::airplay_output::ControllerHarness;
         use crate::local::resolver::ResolvedLocalMedia;
@@ -9113,7 +9373,7 @@ fn serve(stream: std::net::TcpStream) {
         wait_until(|| next_ticket.route_count() == 0);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     fn exercise_live_control_failure(volume: bool, timeout: bool, cancel: bool) {
         use crate::audio::airplay_output::ControllerHarness;
         use crate::local::resolver::ResolvedLocalMedia;
@@ -9292,129 +9552,118 @@ fn serve(stream: std::net::TcpStream) {
         for suffix in ["fail-control", "park-control"] {
             let _ = std::fs::remove_file(pipe.with_extension(suffix));
         }
-        let prepared = prepare(&controller);
-        let next_ticket = prepared.ticket().unwrap();
-        controller.set_generation(generation.next());
-        controller.load(generation.next(), prepared);
-        wait_until(|| controller.state() == PlayerState::Playing);
-        assert_eq!(next_ticket.route_count(), 1);
-        controller.pause();
-        wait_until(|| controller.state() == PlayerState::Paused);
-        controller.play();
-        wait_until(|| controller.state() == PlayerState::Playing);
-        controller.stop();
-        wait_until(|| next_ticket.route_count() == 0);
+        assert_next_load_plays_with_pause(&controller, prepare(&controller), generation.next());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn live_pause_http_failure_settles() {
         exercise_live_control_failure(false, false, false);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn live_pause_timeout_settles() {
         exercise_live_control_failure(false, true, false);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn live_pause_stop_before_failure_settles() {
         exercise_live_control_failure(false, false, true);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn live_pause_stop_before_timeout_settles() {
         exercise_live_control_failure(false, true, true);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn live_volume_http_failure_settles() {
         exercise_live_control_failure(true, false, false);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn live_volume_timeout_settles() {
         exercise_live_control_failure(true, true, false);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn live_volume_stop_before_failure_settles() {
         exercise_live_control_failure(true, false, true);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn live_volume_stop_before_timeout_settles() {
         exercise_live_control_failure(true, true, true);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn live_resume_http_failure_settles_without_ui_stop() {
         exercise_live_resume_failure(false);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn live_resume_timeout_settles_without_ui_stop() {
         exercise_live_resume_failure(true);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn cancelled_activation_autostart_stop_is_silent() {
         exercise_cancelled_activation(false, false, false);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn cancelled_activation_autostart_replacement_is_silent() {
         exercise_cancelled_activation(false, true, false);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn cancelled_activation_resume_stop_is_silent() {
         exercise_cancelled_activation(true, false, false);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn cancelled_activation_resume_replacement_is_silent() {
         exercise_cancelled_activation(true, true, false);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn cancelled_activation_resume_failure_stop_is_silent() {
         exercise_cancelled_activation(true, false, true);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn eos_drain_stop_suppresses_completed_observation() {
         exercise_cancelled_eos_drain(false, "stop");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn eos_drain_stop_suppresses_playing_observation() {
         exercise_cancelled_eos_drain(false, "play");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn eos_drain_replacement_suppresses_completed_observation() {
         exercise_cancelled_eos_drain(true, "stop");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn eos_drain_replacement_suppresses_playing_observation() {
         exercise_cancelled_eos_drain(true, "play");
@@ -9423,7 +9672,7 @@ fn serve(stream: std::net::TcpStream) {
     /// Y2: the initial volume is applied **before any activation** through the
     /// real `open()`, so a switch to OwnTone starts at the slider's level and
     /// the daemon never sees a `player/play` before the `player/volume` PUT.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn the_initial_volume_is_applied_before_the_first_play_through_open() {
         gst::init().expect("GStreamer init");
@@ -9531,7 +9780,7 @@ fn serve(stream: std::net::TcpStream) {
         session.close();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn volume_contract_rejects_body_only_and_propagates_http_failure() {
         let daemon = RecordingOwnedDaemon::start();
@@ -9556,7 +9805,7 @@ fn serve(stream: std::net::TcpStream) {
     /// instance opens, plays, and stays usable across the old instance's
     /// settlement. Settlement releases only the old route and the old lock, and
     /// UI Stop never blocks on the failing restoration.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn a_failed_live_close_is_replaced_on_a_separate_instance_without_losing_the_recovery_route() {
         use super::controller_regression::ControllerReplacementFixture;

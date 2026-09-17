@@ -899,9 +899,8 @@ fn run_session_worker(
     let _registration = registration;
 
     let generation = ctx.generation;
-    let outcome = sender.open_session(&ctx);
-    match outcome {
-        OpenOutcome::Opened(mut session) => {
+    match sender.open_session(&ctx) {
+        OpenOutcome::Opened(session) => {
             let still_current = event_generation.load(Ordering::SeqCst) == generation.as_raw()
                 && !ctx.cancel.is_cancelled();
             if !still_current {
@@ -909,98 +908,112 @@ fn run_session_worker(
                 session.close();
                 return;
             }
-            // `open_session` only prerolls; like every other output, a load
-            // must actually start playback. Report the real outcome: a failed
-            // or cancelled start is not `Playing` (review T3).
-            if !session.resume() {
-                state_cache.store(PlayerState::Stopped as u8, Ordering::SeqCst);
-                let _ = ctx
-                    .event_tx
-                    .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
-                session.close();
-                return;
-            }
-            // Run the worker's own cache/event publication *through* the
-            // session, so it is serialized with the session's terminal
-            // transition (review X1, review Y1). Publishing from here after
-            // `confirm_started` returned was the caller-side gap: the returned
-            // value outlived the session's boundary and a concurrent terminal
-            // restoration could publish `Stopped`/`TrackEnded` first. The
-            // closure runs under that boundary and is skipped entirely once the
-            // session is terminal, so no `Playing` can follow a terminal
-            // `Stopped`/`TrackEnded`.
-            let mut publish_started = |state: PlayerState| {
-                state_cache.store(state as u8, Ordering::SeqCst);
-                let _ = ctx.event_tx.try_send(PlayerEvent::state(generation, state));
-            };
-            session.confirm_started(&mut publish_started);
-            loop {
-                state_cache.store(session.state() as u8, Ordering::SeqCst);
-                *position_cache.lock().unwrap_or_else(|p| p.into_inner()) = session.observe();
-                if ctx.cancel.is_cancelled() || session.is_finished() {
-                    break;
-                }
-                match commands.recv_timeout(Duration::from_millis(200)) {
-                    Ok(SessionCommand::Pause) => {
-                        if !session.pause() {
-                            state_cache.store(PlayerState::Stopped as u8, Ordering::SeqCst);
-                            break;
-                        }
-                    }
-                    Ok(SessionCommand::Resume) => {
-                        if !session.resume() {
-                            // A failed live resume is terminal just like a
-                            // failed initial start. Settle on this worker even
-                            // when the UI (e.g. direct radio) sends no Stop.
-                            state_cache.store(PlayerState::Stopped as u8, Ordering::SeqCst);
-                            break;
-                        }
-                    }
-                    Ok(SessionCommand::SetVolume(level)) => {
-                        if !session.set_volume(level) {
-                            state_cache.store(PlayerState::Stopped as u8, Ordering::SeqCst);
-                            break;
-                        }
-                    }
-                    Ok(SessionCommand::Stop) => break,
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => break,
-                }
-            }
-            // The worker owns teardown, so the close's blocking restore/join
-            // never runs on the UI thread.
-            session.close();
-            state_cache.store(PlayerState::Stopped as u8, Ordering::SeqCst);
+            serve_session(session, &ctx, &commands, &state_cache, &position_cache);
         }
         OpenOutcome::Cancelled => {
             // Silent and fully unwound: release this load's ticket on receipt.
             release_ticket(&proxy, &ctx);
         }
         OpenOutcome::Failed(error) => {
-            state_cache.store(PlayerState::Stopped as u8, Ordering::SeqCst);
-            if let SenderError::RecoveryPending { completion, .. } = &error {
-                // Recovery is still outstanding: keep the route in keyed
-                // custody and release it only at the terminal recovery
-                // outcome (review F3). The seat already moved it to custody as
-                // part of producing this outcome (review S5); this idempotent
-                // call backstops a ticket that reached custody another way.
-                if let Some(ticket) = ctx.media_ticket.as_ref() {
-                    proxy.move_to_recovery_custody(ticket);
-                }
-                publish_load_failure(&ctx, &event_generation, generation, &error);
-                match completion.wait() {
-                    // Quiescence was never established, so the recovery retains
-                    // the lock and the route custody for the supervisor. Do not
-                    // release the route (review S3).
-                    RecoveryOutcome::Retained { .. } => {}
-                    _ => release_ticket(&proxy, &ctx),
-                }
-            } else {
-                // Restoration completed inside the seam; release on receipt.
-                release_ticket(&proxy, &ctx);
-                publish_load_failure(&ctx, &event_generation, generation, &error);
-            }
+            settle_failed_open(error, &ctx, &proxy, &state_cache, &event_generation);
         }
+    }
+}
+
+/// Start and then service one live session on the worker: publish coarse
+/// state/position into the UI caches, dispatch controls, and settle on this
+/// worker when the session finishes or a control fails — even when the UI
+/// (e.g. direct radio) sends no Stop.
+fn serve_session(
+    mut session: Box<dyn SenderSession>,
+    ctx: &SenderOpenContext,
+    commands: &std::sync::mpsc::Receiver<SessionCommand>,
+    state_cache: &AtomicU8,
+    position_cache: &Mutex<SenderPosition>,
+) {
+    let generation = ctx.generation;
+    // `open_session` only prerolls; like every other output, a load must
+    // actually start playback. Report the real outcome: a failed or cancelled
+    // start is not `Playing` (review T3).
+    if !session.resume() {
+        state_cache.store(PlayerState::Stopped as u8, Ordering::SeqCst);
+        let _ = ctx
+            .event_tx
+            .try_send(PlayerEvent::state(generation, PlayerState::Stopped));
+        session.close();
+        return;
+    }
+    // Run the worker's own cache/event publication *through* the session, so
+    // it is serialized with the session's terminal transition (review X1,
+    // review Y1). Publishing from here after `confirm_started` returned was the
+    // caller-side gap: the returned value outlived the session's boundary and
+    // a concurrent terminal restoration could publish `Stopped`/`TrackEnded`
+    // first. The closure runs under that boundary and is skipped entirely once
+    // the session is terminal, so no `Playing` can follow a terminal
+    // `Stopped`/`TrackEnded`.
+    let mut publish_started = |state: PlayerState| {
+        state_cache.store(state as u8, Ordering::SeqCst);
+        let _ = ctx.event_tx.try_send(PlayerEvent::state(generation, state));
+    };
+    session.confirm_started(&mut publish_started);
+    loop {
+        state_cache.store(session.state() as u8, Ordering::SeqCst);
+        *position_cache.lock().unwrap_or_else(|p| p.into_inner()) = session.observe();
+        if ctx.cancel.is_cancelled() || session.is_finished() {
+            break;
+        }
+        let control = match commands.recv_timeout(Duration::from_millis(200)) {
+            Ok(SessionCommand::Pause) => session.pause(),
+            // A failed live resume is terminal just like a failed initial
+            // start (review AG1); a failed pause/volume likewise (review AH1).
+            // Settle on this worker even when the UI sends no Stop.
+            Ok(SessionCommand::Resume) => session.resume(),
+            Ok(SessionCommand::SetVolume(level)) => session.set_volume(level),
+            Ok(SessionCommand::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => continue,
+        };
+        if !control {
+            state_cache.store(PlayerState::Stopped as u8, Ordering::SeqCst);
+            break;
+        }
+    }
+    // The worker owns teardown, so the close's blocking restore/join never
+    // runs on the UI thread.
+    session.close();
+    state_cache.store(PlayerState::Stopped as u8, Ordering::SeqCst);
+}
+
+/// Settle a failed open on the worker: a recovery-pending failure keeps the
+/// route in keyed custody until the recovery's terminal outcome (review F3,
+/// review S3); any other failure restored inside the seam and releases on
+/// receipt. Publication respects the Stop boundary either way.
+fn settle_failed_open(
+    error: SenderError,
+    ctx: &SenderOpenContext,
+    proxy: &Arc<GstreamerMediaProxy>,
+    state_cache: &AtomicU8,
+    event_generation: &AtomicU64,
+) {
+    let generation = ctx.generation;
+    state_cache.store(PlayerState::Stopped as u8, Ordering::SeqCst);
+    if let SenderError::RecoveryPending { completion, .. } = &error {
+        // The seat already moved the ticket to custody as part of producing
+        // this outcome (review S5); this idempotent call backstops a ticket
+        // that reached custody another way.
+        if let Some(ticket) = ctx.media_ticket.as_ref() {
+            proxy.move_to_recovery_custody(ticket);
+        }
+        publish_load_failure(ctx, event_generation, generation, &error);
+        match completion.wait() {
+            // Quiescence was never established, so the recovery retains the
+            // lock and the route custody for the supervisor. Do not release
+            // the route (review S3).
+            RecoveryOutcome::Retained { .. } => {}
+            _ => release_ticket(proxy, ctx),
+        }
+    } else {
+        release_ticket(proxy, ctx);
+        publish_load_failure(ctx, event_generation, generation, &error);
     }
 }
 
@@ -1015,7 +1028,11 @@ fn release_ticket(proxy: &Arc<GstreamerMediaProxy>, ctx: &SenderOpenContext) {
 /// caller-supplied sender/session, so a regression can exercise the production
 /// worker path (its own cache/event publication, command loop and teardown)
 /// rather than a session in isolation (review Z2).
+// The test-support harnesses below are exercised by the Linux-only OwnTone
+// fixtures as well as by the portable GStreamer tests; on targets that compile
+// only the latter, parts of them are unreferenced.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(super) struct TestSessionWorker {
     state_cache: Arc<AtomicU8>,
     commands: Option<std::sync::mpsc::Sender<SessionCommand>>,
@@ -1023,6 +1040,7 @@ pub(super) struct TestSessionWorker {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 impl TestSessionWorker {
     /// The worker's own coarse state cache, exactly as the UI reads it.
     pub(super) fn cached_state(&self) -> PlayerState {
@@ -1081,11 +1099,13 @@ pub(super) fn spawn_test_session_worker(
 /// so a cross-module regression can drive the controller/replacement path
 /// without reaching into private fields.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(super) struct ControllerHarness {
     output: AirPlayOutput,
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 impl ControllerHarness {
     pub(super) fn new(
         runtime: tokio::runtime::Handle,
@@ -1596,7 +1616,7 @@ mod tests {
     /// `verify_owned` passes and the load genuinely reaches the `/api/config`
     /// handshake before the endpoint stalls. `load_uri` and `stop` must both
     /// return promptly because the blocking handshake runs on the load worker.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     #[test]
     fn a_stalled_owntone_endpoint_does_not_block_load_or_stop() {
         use std::net::{TcpListener, TcpStream};
@@ -1759,7 +1779,7 @@ mod tests {
     /// reached the server), then holds the connection without ever writing a
     /// response — a blocking `/api/config` handshake stalls until its client
     /// timeout.
-    #[cfg(target_os = "linux")]
+    #[cfg(owntone_host)]
     const FAKE_DAEMON_SOURCE: &str = r#"
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -2543,6 +2563,7 @@ fn main() {
     /// Wait until the shared gate reports an authorized start effect in-flight
     /// (running its real transition). Polls the gate's own drain condvar so it
     /// observes real arrival rather than sleeping as evidence.
+    #[allow(dead_code)]
     fn wait_for_start_effect_in_flight(gate: &SessionGate) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while gate.wait_effects_drained(Duration::from_millis(1)) {

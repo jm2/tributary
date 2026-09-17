@@ -527,22 +527,7 @@ fn process_mdns_event(
                     strip_avahi_name_suffix(&raw_name)
                 });
 
-            // Retain the receiver's stable identity before the display-name
-            // normalization consumes the raw instance name below.
-            let device_id = if service_type == "airplay" || service_type == "airplay2" {
-                airplay_device_identifier(&info, &raw_name)
-            } else {
-                None
-            };
-
-            // AirPlay / RAOP devices often use "MAC@DeviceName" as
-            // their mDNS instance name (e.g. "8EE58A500A56@Rear Lounge TV").
-            // Strip the MAC prefix for a cleaner display name.
-            let name = if service_type == "airplay" || service_type == "airplay2" {
-                strip_airplay_mac_prefix(&raw_name)
-            } else {
-                raw_name
-            };
+            let (device_id, name) = airplay_identity(service_type, &info, raw_name);
 
             let scheme = if port == 443
                 || info
@@ -971,6 +956,27 @@ fn strip_airplay_mac_prefix(name: &str) -> String {
         }
     }
     name.to_string()
+}
+
+/// For AirPlay/RAOP publications, the receiver's retained stable identity
+/// (taken before the display-name normalization consumes the raw instance
+/// name) and its display name with the `MAC@` prefix stripped: AirPlay / RAOP
+/// devices often use "MAC@DeviceName" as their mDNS instance name (e.g.
+/// "8EE58A500A56@Rear Lounge TV"). Other services keep their raw name and
+/// carry no identifier.
+fn airplay_identity(
+    service_type: &str,
+    info: &mdns_sd::ResolvedService,
+    raw_name: String,
+) -> (Option<String>, String) {
+    if service_type == "airplay" || service_type == "airplay2" {
+        (
+            airplay_device_identifier(info, &raw_name),
+            strip_airplay_mac_prefix(&raw_name),
+        )
+    } else {
+        (None, raw_name)
+    }
 }
 
 /// Retain the normalized AirPlay device identifier a receiver advertises.

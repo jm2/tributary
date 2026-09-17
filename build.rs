@@ -1,4 +1,15 @@
 fn main() {
+    // The OwnTone process adapter's supported host (design §8: the Debian/
+    // Ubuntu amd64 package). `platform_available()` and the daemon-backed
+    // regressions key on this one cfg, so the tests mirror the product gate
+    // instead of restating it per target.
+    println!("cargo::rustc-check-cfg=cfg(owntone_host)");
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if target_os == "linux" && target_arch == "x86_64" {
+        println!("cargo::rustc-cfg=owntone_host");
+    }
+
     // Generate the Windows icon and version resource, then attach it
     // specifically to the application binary. `winresource::compile()` emits
     // `rustc-link-lib`, which Cargo routes only to this package's library now

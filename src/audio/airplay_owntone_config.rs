@@ -17,6 +17,33 @@ enum Token {
     Symbol(char),
 }
 
+type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
+
+/// A quoted value up to the closing `quote`. libconfuse escape/expansion
+/// semantics are refused rather than interpreted.
+fn quoted(chars: &mut Chars<'_>, quote: char) -> Option<String> {
+    let mut value = String::new();
+    loop {
+        let next = chars.next()?;
+        if next == quote {
+            return Some(value);
+        }
+        if matches!(next, '\\' | '$' | '\n' | '\r') {
+            return None;
+        }
+        value.push(next);
+    }
+}
+
+/// A bare word (section or option name, or an unquoted scalar).
+fn word(chars: &mut Chars<'_>, first: char) -> String {
+    let mut word = String::from(first);
+    while let Some(c) = chars.next_if(|c| c.is_ascii_alphanumeric() || *c == '_') {
+        word.push(c);
+    }
+    word
+}
+
 fn tokens(text: &str) -> Option<Vec<Token>> {
     let mut chars = text.chars().peekable();
     let mut result = Vec::new();
@@ -24,37 +51,12 @@ fn tokens(text: &str) -> Option<Vec<Token>> {
         match c {
             c if c.is_whitespace() => {}
             '#' => {
-                for c in chars.by_ref() {
-                    if c == '\n' {
-                        break;
-                    }
-                }
+                chars.by_ref().find(|c| *c == '\n');
             }
             '{' | '}' | '=' | ',' => result.push(Token::Symbol(c)),
-            '\'' | '"' => {
-                let mut value = String::new();
-                loop {
-                    let next = chars.next()?;
-                    if next == c {
-                        break;
-                    }
-                    // Do not interpret libconfuse escape/expansion semantics.
-                    if matches!(next, '\\' | '$' | '\n' | '\r') {
-                        return None;
-                    }
-                    value.push(next);
-                }
-                result.push(Token::Quoted(value));
-            }
+            '\'' | '"' => result.push(Token::Quoted(quoted(&mut chars, c)?)),
             c if c.is_ascii_alphanumeric() || c == '_' || c == '-' => {
-                let mut word = String::from(c);
-                while chars
-                    .peek()
-                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
-                {
-                    word.push(chars.next()?);
-                }
-                result.push(Token::Word(word));
+                result.push(Token::Word(word(&mut chars, c)));
             }
             _ => return None,
         }
@@ -70,68 +72,83 @@ enum Value {
 
 type Section = BTreeMap<String, Value>;
 
+type Tokens = std::iter::Peekable<std::vec::IntoIter<Token>>;
+
+/// The section names pinned OwnTone's `conffile.c` declares.
+fn known_section(name: &str) -> bool {
+    matches!(
+        name,
+        "general"
+            | "library"
+            | "audio"
+            | "airplay_shared"
+            | "fifo"
+            | "spotify"
+            | "sqlite"
+            | "mpd"
+            | "streaming"
+    )
+}
+
+/// A quoted list after its opening `{`: `{ }` or `{ "a", "b" }`.
+fn parse_list(it: &mut Tokens) -> Option<Vec<String>> {
+    let mut list = Vec::new();
+    if it.next_if_eq(&Token::Symbol('}')).is_some() {
+        return Some(list);
+    }
+    loop {
+        let Token::Quoted(value) = it.next()? else {
+            return None;
+        };
+        list.push(value);
+        match it.next()? {
+            Token::Symbol('}') => return Some(list),
+            Token::Symbol(',') => {}
+            _ => return None,
+        }
+    }
+}
+
+/// One option value: a scalar or a quoted list.
+fn parse_value(it: &mut Tokens) -> Option<Value> {
+    match it.next()? {
+        Token::Word(value) | Token::Quoted(value) => Some(Value::Scalar(value)),
+        Token::Symbol('{') => parse_list(it).map(Value::List),
+        Token::Symbol(_) => None,
+    }
+}
+
+/// One section body after its opening `{`, up to and including its `}`.
+/// Duplicate options are refused rather than resolved.
+fn parse_section(it: &mut Tokens) -> Option<Section> {
+    let mut options = BTreeMap::new();
+    loop {
+        let key = match it.next()? {
+            Token::Symbol('}') => return Some(options),
+            Token::Word(key) => key,
+            _ => return None,
+        };
+        if it.next()? != Token::Symbol('=') {
+            return None;
+        }
+        let value = parse_value(it)?;
+        if options.insert(key, value).is_some() {
+            return None;
+        }
+    }
+}
+
 fn parse(text: &str) -> Option<BTreeMap<String, Section>> {
-    let tokens = tokens(text)?;
-    let mut it = tokens.into_iter().peekable();
+    let mut it = tokens(text)?.into_iter().peekable();
     let mut sections = BTreeMap::new();
     while let Some(token) = it.next() {
         let Token::Word(section) = token else {
             return None;
         };
-        if !matches!(
-            section.as_str(),
-            "general"
-                | "library"
-                | "audio"
-                | "airplay_shared"
-                | "fifo"
-                | "spotify"
-                | "sqlite"
-                | "mpd"
-                | "streaming"
-        ) {
+        if !known_section(&section) || it.next()? != Token::Symbol('{') {
             return None;
         }
-        if it.next()? != Token::Symbol('{') {
-            return None;
-        }
-        let mut options = BTreeMap::new();
-        loop {
-            let key = match it.next()? {
-                Token::Symbol('}') => break,
-                Token::Word(key) => key,
-                _ => return None,
-            };
-            if it.next()? != Token::Symbol('=') {
-                return None;
-            }
-            let value = match it.next()? {
-                Token::Word(value) | Token::Quoted(value) => Value::Scalar(value),
-                Token::Symbol('{') => {
-                    let mut list = Vec::new();
-                    if it.peek() == Some(&Token::Symbol('}')) {
-                        it.next();
-                    } else {
-                        loop {
-                            let Token::Quoted(value) = it.next()? else {
-                                return None;
-                            };
-                            list.push(value);
-                            match it.next()? {
-                                Token::Symbol('}') => break,
-                                Token::Symbol(',') => {}
-                                _ => return None,
-                            }
-                        }
-                    }
-                    Value::List(list)
-                }
-                Token::Symbol(_) => return None,
-            };
-            if options.insert(key, value).is_some() {
-                return None;
-            }
-        }
+        let options = parse_section(&mut it)?;
         if sections.insert(section, options).is_some() {
             return None;
         }
@@ -149,6 +166,12 @@ pub(super) fn binds_pipe(config: &Path, pipe: &Path) -> bool {
     let Some(library) = sections.get("library") else {
         return false;
     };
+    library_options_acceptable(library) && pipe_is_the_scanned_input(library, pipe)
+}
+
+/// The `library` section binds only options whose input semantics we verify,
+/// with the pipe/scanner values the adapter relies on.
+fn library_options_acceptable(library: &Section) -> bool {
     // Restrict input-affecting options to ones whose semantics we verify.
     if library.keys().any(|key| {
         !matches!(
@@ -196,6 +219,12 @@ pub(super) fn binds_pipe(config: &Path, pipe: &Path) -> bool {
             return false;
         }
     }
+    true
+}
+
+/// The configured pipe is exactly the FIFO the scanner will find: a direct,
+/// non-hidden `.pcm` child of the single absolute scanned directory.
+fn pipe_is_the_scanned_input(library: &Section, pipe: &Path) -> bool {
     // Direct-child .pcm inputs avoid recursive scan, symlink and file-type
     // special cases (playlists/artwork/control files/hidden files).
     let Some(name) = pipe.file_name().and_then(|s| s.to_str()) else {
