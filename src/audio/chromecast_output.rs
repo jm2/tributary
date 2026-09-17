@@ -173,10 +173,13 @@ impl WorkerCommandSender {
     /// Admission is finite and explicit:
     /// - a newer intent epoch atomically purges the obsolete backlog;
     /// - below capacity the deque stays an exact FIFO;
-    /// - at capacity, transient seek/volume runs collapse to their newest
-    ///   instance and an oldest transient is evicted to make room;
-    /// - a non-transient command that cannot be compacted is reported
-    ///   `Saturated` rather than silently dropped.
+    /// - at capacity, adjacent transient seek/volume runs collapse to their
+    ///   newest instance, and a queued transient is evicted only when a later
+    ///   same-kind instance supersedes it without crossing a lifecycle
+    ///   barrier — so the latest seek and the latest volume are never silently
+    ///   lost;
+    /// - a command that cannot be admitted without discarding final intent is
+    ///   reported `Saturated` rather than reported `Enqueued` and dropped.
     ///
     /// Stop and Shutdown use reserved admission: they evict queued intent if
     /// necessary so termination never waits on the receiver.
@@ -201,10 +204,13 @@ impl WorkerCommandSender {
             Some(_) => {}
         }
 
+        // Compaction is only safe under pressure: below capacity the deque must
+        // stay an exact FIFO so no queued intent is reordered.
+        if pending.commands.len() >= pending.capacity {
+            compact_saturated_controls(&mut pending.commands);
+        }
+
         if command.kind.is_reserved_admission() {
-            if pending.commands.len() >= pending.capacity {
-                compact_saturated_controls(&mut pending.commands);
-            }
             while pending.commands.len() >= pending.capacity {
                 let evicted = pending
                     .commands
@@ -214,37 +220,26 @@ impl WorkerCommandSender {
                 let _ = pending.commands.remove(evicted);
             }
             pending.commands.push_back(command);
-        } else if pending.commands.len() >= pending.capacity {
-            if command.kind.is_transient_control() {
-                pending.commands.push_back(command);
-                compact_saturated_controls(&mut pending.commands);
-                while pending.commands.len() > pending.capacity {
-                    let Some(oldest_transient) = pending
-                        .commands
-                        .iter()
-                        .position(|queued| queued.kind.is_transient_control())
-                    else {
-                        break;
-                    };
-                    let _ = pending.commands.remove(oldest_transient);
-                }
-            } else {
-                compact_saturated_controls(&mut pending.commands);
-                if pending.commands.len() >= pending.capacity {
-                    if let Some(oldest_transient) = pending
-                        .commands
-                        .iter()
-                        .position(|queued| queued.kind.is_transient_control())
-                    {
-                        let _ = pending.commands.remove(oldest_transient);
-                    } else {
-                        return WorkerEnqueueOutcome::Saturated;
-                    }
-                }
-                pending.commands.push_back(command);
-            }
-        } else {
+        } else if pending.commands.len() < pending.capacity {
             pending.commands.push_back(command);
+        } else if command.kind.is_transient_control() {
+            // The incoming transient is the newest intent of its kind. Admit it
+            // only when a queued same-kind instance it supersedes releases a
+            // slot. Evicting the only final seek or volume — or letting the
+            // incoming command evict itself — would silently lose intent while
+            // still reporting success.
+            pending.commands.push_back(command);
+            if let Some(superseded) = superseded_transient_index(&pending.commands) {
+                let _ = pending.commands.remove(superseded);
+            } else {
+                let _ = pending.commands.pop_back();
+                return WorkerEnqueueOutcome::Saturated;
+            }
+        } else if let Some(superseded) = superseded_transient_index(&pending.commands) {
+            let _ = pending.commands.remove(superseded);
+            pending.commands.push_back(command);
+        } else {
+            return WorkerEnqueueOutcome::Saturated;
         }
         debug_assert!(pending.commands.len() <= pending.capacity);
         // Publish the nonblocking wake while insertion still owns the deque
@@ -360,6 +355,48 @@ fn compact_saturated_controls(commands: &mut VecDeque<WorkerCommand>) {
         }
     }
     *commands = compacted;
+}
+
+/// A lifecycle barrier establishes a new media/session context, so a seek or
+/// volume queued before it cannot be superseded by an instance queued after.
+/// `Play`/`Pause`/`Toggle` do not move media, so they are not barriers for the
+/// absolute targets carried by transient controls.
+fn is_transient_barrier(kind: &CommandKind) -> bool {
+    matches!(
+        kind,
+        CommandKind::Load { .. }
+            | CommandKind::RejectLoad { .. }
+            | CommandKind::Stop
+            | CommandKind::Shutdown
+    )
+}
+
+/// Two transient controls of the same kind carry absolute targets, so the
+/// later one fully supersedes the earlier one.
+fn same_transient_kind(earlier: &CommandKind, later: &CommandKind) -> bool {
+    matches!(
+        (earlier, later),
+        (CommandKind::Seek(_), CommandKind::Seek(_))
+            | (CommandKind::Volume(_), CommandKind::Volume(_))
+    )
+}
+
+/// Index of the oldest queued transient control that a later same-kind
+/// instance supersedes without crossing a lifecycle barrier. Removing it
+/// preserves the exact final seek/volume intent while releasing one slot, so
+/// saturation never has to discard the only final value of a control kind.
+fn superseded_transient_index(commands: &VecDeque<WorkerCommand>) -> Option<usize> {
+    commands.iter().enumerate().find_map(|(index, command)| {
+        if !command.kind.is_transient_control() {
+            return None;
+        }
+        let superseded = commands
+            .iter()
+            .skip(index + 1)
+            .take_while(|later| !is_transient_barrier(&later.kind))
+            .any(|later| same_transient_kind(&command.kind, &later.kind));
+        superseded.then_some(index)
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -2125,7 +2162,7 @@ impl ChromecastOutput {
             WorkerEnqueueOutcome::Saturated => {
                 error!(
                     operation = "worker ingress",
-                    "Chromecast worker command ingress is saturated; dropping a non-transient command"
+                    "Chromecast worker command ingress is saturated; dropping a command with no safe superseding intent"
                 );
                 false
             }
@@ -4717,6 +4754,274 @@ mod tests {
             WorkerEnqueueOutcome::Enqueued
         );
         assert!(tx.pending_len() <= 3);
+    }
+
+    /// Refinement reproduction: the saturated path previously evicted the
+    /// oldest transient without proving that a later same-kind intent
+    /// superseded it. A lone final Volume could be silently dropped for an
+    /// unrelated Seek, and an incoming Volume could evict itself while still
+    /// reporting `Enqueued`.
+    #[test]
+    fn saturated_ingress_keeps_sole_final_intent_and_reports_overload() {
+        let owner = queue_test_owner(1);
+        let capacity = MAX_PENDING_WORKER_COMMANDS;
+
+        // Trace 1: a lone Volume behind a full run of non-transient Pause
+        // commands must survive an incoming Seek, which is truthfully refused.
+        let (tx, rx) = worker_command_channel(capacity);
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Volume(0.25),
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        for _ in 0..capacity - 1 {
+            assert_eq!(
+                tx.enqueue(WorkerCommand {
+                    owner,
+                    kind: CommandKind::Pause,
+                }),
+                WorkerEnqueueOutcome::Enqueued
+            );
+        }
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Seek(9_000),
+            }),
+            WorkerEnqueueOutcome::Saturated
+        );
+        assert_eq!(tx.pending_len(), capacity);
+
+        let mut retained_volume = 0;
+        let mut retained_seek = 0;
+        while let Some(command) = rx.pop_pending() {
+            match command.kind {
+                CommandKind::Volume(_) => retained_volume += 1,
+                CommandKind::Seek(_) => retained_seek += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(retained_volume, 1, "the only final volume intent was lost");
+        assert_eq!(retained_seek, 0, "the refused seek must not be queued");
+
+        // Trace 2: an incoming Volume with no same-kind intent to supersede is
+        // refused instead of evicting itself and reporting `Enqueued`.
+        let (tx, rx) = worker_command_channel(capacity);
+        for _ in 0..capacity {
+            assert_eq!(
+                tx.enqueue(WorkerCommand {
+                    owner,
+                    kind: CommandKind::Pause,
+                }),
+                WorkerEnqueueOutcome::Enqueued
+            );
+        }
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Volume(0.75),
+            }),
+            WorkerEnqueueOutcome::Saturated
+        );
+        assert_eq!(tx.pending_len(), capacity);
+        while let Some(command) = rx.pop_pending() {
+            assert!(matches!(command.kind, CommandKind::Pause));
+        }
+    }
+
+    /// Mixed seek/volume saturation: each new control may only evict an older
+    /// same-kind instance, so the latest seek AND the latest volume both
+    /// survive a full queue. Neither the incoming command nor the sole final
+    /// value of the other kind may be discarded.
+    #[test]
+    fn saturated_ingress_preserves_latest_seek_and_volume_together() {
+        let (tx, rx) = worker_command_channel(4);
+        let owner = queue_test_owner(1);
+        for kind in [
+            CommandKind::Volume(0.25),
+            CommandKind::Pause,
+            CommandKind::Seek(1_000),
+            CommandKind::Play,
+        ] {
+            assert_eq!(
+                tx.enqueue(WorkerCommand { owner, kind }),
+                WorkerEnqueueOutcome::Enqueued
+            );
+        }
+
+        // Both incoming controls replace their older same-kind instance
+        // without crossing a barrier, so both are admitted.
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Volume(0.90),
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Seek(2_000),
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        assert_eq!(tx.pending_len(), 4);
+
+        let mut drained = Vec::new();
+        while let Some(command) = rx.pop_pending() {
+            drained.push(command.kind);
+        }
+        let volumes: Vec<f64> = drained
+            .iter()
+            .filter_map(|kind| match kind {
+                CommandKind::Volume(level) => Some(*level),
+                _ => None,
+            })
+            .collect();
+        let seeks: Vec<u64> = drained
+            .iter()
+            .filter_map(|kind| match kind {
+                CommandKind::Seek(position) => Some(*position),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(volumes, vec![0.90], "latest volume intent was lost");
+        assert_eq!(seeks, vec![2_000], "latest seek intent was lost");
+    }
+
+    /// End-to-end saturation on the real Cast worker held inside the fake
+    /// transport. New same-kind intents supersede queued ones and are
+    /// admitted, while a control with no safe superseding intent is reported
+    /// `Saturated` instead of being reported `Enqueued` and dropped. The
+    /// receiver must settle on the latest seek and volume intent.
+    #[test]
+    fn slow_receiver_keeps_final_seek_and_volume_intent_under_saturation() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(owner);
+        shared.clear_actions();
+        let _ = harness.events();
+
+        // Hold the worker on its first seek so the rest of the ingress backs up.
+        let (entered, release) = shared.install_gate(Point::Seek);
+        assert_eq!(
+            harness.tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Seek(0),
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fake Cast transport held the first seek");
+
+        // Queue one seek and one volume, then fill the remaining capacity with
+        // non-transient Pause commands.
+        assert_eq!(
+            harness.tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Volume(0.25),
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        assert_eq!(
+            harness.tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Seek(1_000),
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        for _ in 0..MAX_PENDING_WORKER_COMMANDS - 2 {
+            assert_eq!(
+                harness.tx.enqueue(WorkerCommand {
+                    owner,
+                    kind: CommandKind::Pause,
+                }),
+                WorkerEnqueueOutcome::Enqueued
+            );
+        }
+        assert_eq!(
+            harness.tx.pending_len(),
+            MAX_PENDING_WORKER_COMMANDS,
+            "the retained Cast control ingress must stay bounded"
+        );
+
+        // A newer same-kind volume supersedes the queued volume and is admitted.
+        assert_eq!(
+            harness.tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Volume(0.90),
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        // A newer same-kind seek supersedes the queued seek and is admitted.
+        assert_eq!(
+            harness.tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Seek(9_000),
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        // A non-transient control with no safe superseding intent is refused
+        // truthfully rather than reporting a false `Enqueued`.
+        assert_eq!(
+            harness.tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Toggle,
+            }),
+            WorkerEnqueueOutcome::Saturated
+        );
+        assert!(
+            harness.tx.pending_len() <= MAX_PENDING_WORKER_COMMANDS,
+            "retained Cast control ingress exceeded its bound"
+        );
+
+        release.send(()).expect("release held seek");
+        // Let the unbounded flood drain before fencing: a fence enqueued while
+        // the queue is still full would itself be legitimately refused.
+        let drain_deadline = Instant::now() + Duration::from_secs(5);
+        while harness.tx.pending_len() > 0 && Instant::now() < drain_deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(harness.tx.pending_len(), 0, "held ingress did not drain");
+        harness.fence(owner);
+
+        let actions = shared.actions();
+        let volumes: Vec<f64> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Volume(level) => Some(*level),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            volumes,
+            vec![0.90],
+            "the worker must settle at the latest volume intent"
+        );
+        let seeks: Vec<u64> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Seek(position) => Some(*position),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            seeks,
+            vec![0, 9_000],
+            "the worker must settle at the latest seek intent"
+        );
+        harness.shutdown();
     }
 
     #[test]
