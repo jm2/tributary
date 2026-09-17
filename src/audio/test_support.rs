@@ -162,7 +162,7 @@ impl Drop for RemoveFileOnDrop {
 /// Build the private user-state tree the protected-stream child must see.
 ///
 /// The child re-runs the production [`Player`], whose constructor resolves
-/// `dirs::data_dir()` and friends. Without this override the child reads the
+/// `crate::paths::data_dir()`. Without this redirect the child reads the
 /// *real* invoking user's state (`<data_dir>/tributary/...`), so a file
 /// another run left behind changes the child's pipeline. Concretely, a stray
 /// `enabled = true` `equalizer.cfg` arms the equalizer install seam inside
@@ -171,14 +171,25 @@ impl Drop for RemoveFileOnDrop {
 /// on-disk persistence is the config modules' tested concern, not this
 /// harness's.
 ///
-/// `HOME` covers the platform fallback (including macOS, where `dirs`
-/// ignores the XDG variables); the XDG roots cover Linux. Returns the
-/// sandbox root and the `(variable, value)` pairs to apply. The caller keeps
-/// the [`tempfile::TempDir`] alive for the child's lifetime; its `Drop`
-/// removes the tree, including anything the child wrote.
+/// [`crate::paths::TEST_USER_STATE_DIR_ENV`] is the cross-platform mechanism:
+/// production resolves it ahead of the platform lookup, so it isolates the
+/// child even on Windows, where `dirs` resolves through
+/// `SHGetKnownFolderPath` and ignores `HOME`/`XDG_*`. The `HOME` and XDG
+/// variables remain as defense in depth for libraries that read them
+/// directly. Returns the sandbox root and the `(variable, value)` pairs to
+/// apply. The caller keeps the [`tempfile::TempDir`] alive for the child's
+/// lifetime; its `Drop` removes the tree, including anything the child wrote.
 fn child_user_state_sandbox() -> (tempfile::TempDir, Vec<(&'static str, std::path::PathBuf)>) {
     let root = tempfile::tempdir().expect("protected-stream sandbox root");
     let pairs = [
+        // The redirect production persistence actually honors, on every
+        // supported platform.
+        (
+            crate::paths::TEST_USER_STATE_DIR_ENV,
+            root.path().join("data"),
+        ),
+        // Defense in depth for libraries that read the platform variables
+        // directly. HOME covers the macOS fallback, where `dirs` ignores XDG.
         ("HOME", root.path().join("home")),
         ("XDG_DATA_HOME", root.path().join("data")),
         ("XDG_CONFIG_HOME", root.path().join("config")),
@@ -652,7 +663,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn child_user_state_sandbox_redirects_home_and_xdg_roots() {
+    fn child_user_state_sandbox_redirects_cross_platform_and_platform_roots() {
         let (root, pairs) = child_user_state_sandbox();
         let redirect = |name: &str| {
             pairs
@@ -662,7 +673,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing child sandbox override for {name}"))
         };
 
+        // The redirect production persistence honors must be present and
+        // inside the sandbox; without it the child cannot be isolated on
+        // Windows, where `dirs` ignores HOME/XDG.
         for name in [
+            crate::paths::TEST_USER_STATE_DIR_ENV,
             "HOME",
             "XDG_DATA_HOME",
             "XDG_CONFIG_HOME",

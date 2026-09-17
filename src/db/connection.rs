@@ -72,7 +72,7 @@ pub async fn get_or_init_db() -> Result<DatabaseConnection, DbErr> {
             // graceful `match init_db() { Err(e) => … }` handling, and a
             // panic inside this spawned task would be swallowed by tokio,
             // silently killing the library engine with no user feedback.
-            let data_dir = dirs::data_dir()
+            let data_dir = crate::paths::data_dir()
                 .ok_or_else(|| DbErr::Custom("Could not determine data directory".into()))?
                 .join("tributary");
 

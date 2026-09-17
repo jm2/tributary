@@ -42,7 +42,7 @@ pub enum SavedOutputUpsert {
 
 /// Path to `outputs.json`: `<data_dir>/tributary/outputs.json`.
 fn outputs_json_path() -> Option<std::path::PathBuf> {
-    dirs::data_dir().map(|d| d.join("tributary").join("outputs.json"))
+    crate::paths::data_dir().map(|d| d.join("tributary").join("outputs.json"))
 }
 
 /// Load saved outputs from `outputs.json`, returning an empty vec on error.
