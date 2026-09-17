@@ -1469,6 +1469,11 @@ struct SessionInner {
     /// the same lock (refinery R11: an accepted pause must never turn an
     /// older `play` sample into a completed, restored item).
     control_epoch: AtomicU64,
+    /// The control epoch at which the most recent `Playing` was published
+    /// under the boundary. The pump's startup publication (refinery R13) is
+    /// admitted only while `control_epoch` still equals it: any control
+    /// accepted since — a pause, above all — has made that start history.
+    playing_epoch: AtomicU64,
     /// The session's **terminal** flag. Set under [`Self::mutation_lock`] at
     /// the start of [`Self::restore`], i.e. *before* the daemon is restored, so
     /// the terminal transition and any concurrent control transmission are one
@@ -1614,7 +1619,10 @@ impl SessionInner {
                         // (see `Self::autostart_lost`).
                         self.autostart_lost.store(true, Ordering::SeqCst);
                     }
-                    self.control_epoch.fetch_add(1, Ordering::SeqCst);
+                    let epoch = self.control_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                    if state == PlayerState::Playing {
+                        self.playing_epoch.store(epoch, Ordering::SeqCst);
+                    }
                 }
                 Ok(())
             }
@@ -1649,6 +1657,14 @@ impl SessionInner {
     fn publish_start_if_live(&self) -> Option<PlayerState> {
         let _boundary = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
         if self.terminal.load(Ordering::SeqCst) {
+            return None;
+        }
+        // The start this republishes was accepted at `playing_epoch`. A
+        // control accepted since then (a pause the command worker took while
+        // the pump was descheduled, refinery R13) wins permanently: republish
+        // nothing rather than overwrite `Paused` with a `Playing` the daemon
+        // is no longer in.
+        if self.control_epoch.load(Ordering::SeqCst) != self.playing_epoch.load(Ordering::SeqCst) {
             return None;
         }
         self.gate
@@ -2133,6 +2149,8 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
     // Activation started the pipeline and confirmed daemon playback while
     // holding the shared first-effect boundary. Never restart it here: Stop
     // may already have won after activation released that boundary.
+    #[cfg(test)]
+    park_at_sentinel(&inner, "park-startup", "startup-parked", "startup-release");
     let _ = inner.publish_start_if_live();
 
     let mut last_position = Instant::now();
@@ -2198,6 +2216,11 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
 /// Publish the current daemon position into the observation cache. Position is
 /// sampled from the daemon; duration is the decode pipeline's (§7).
 fn sample_position(inner: &SessionInner) {
+    // The observation is bound to the control epoch it was sampled under
+    // (refinery R13): a control accepted while the request was in flight
+    // makes the sampled state history, and the state write below must not
+    // undo that control's own publication.
+    let epoch = inner.control_epoch.load(Ordering::SeqCst);
     let Ok((state, progress)) = inner.client.player_progress() else {
         let mut snapshot = inner.position.lock().unwrap_or_else(|p| p.into_inner());
         snapshot.stale = true;
@@ -2225,6 +2248,17 @@ fn sample_position(inner: &SessionInner) {
             position_ms,
             duration_ms.unwrap_or(0),
         ));
+    }
+    // Publish the observed state under the settlement boundary, and only if
+    // no control was accepted since the sample was taken; a terminal
+    // session's state is owned by its terminal publication.
+    let _boundary = inner
+        .mutation_lock
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if inner.terminal.load(Ordering::SeqCst) || inner.control_epoch.load(Ordering::SeqCst) != epoch
+    {
+        return;
     }
     *inner.state.lock().unwrap_or_else(|p| p.into_inner()) = state;
 }
@@ -2397,6 +2431,26 @@ fn await_daemon_completion(inner: &SessionInner, deadline: Instant) -> Result<Dr
             return Ok(DrainOutcome::Failed("AirPlay completion timed out"));
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Test-only park at a named point: while `<pipe>.<arm>` exists, announce
+/// `<pipe>.<parked>`, wait for `<pipe>.<release>`, then consume all three so
+/// later passes run freely.
+#[cfg(test)]
+fn park_at_sentinel(inner: &SessionInner, arm: &str, parked: &str, release: &str) {
+    let pipe = &inner.config.pipe_path;
+    if !pipe.with_extension(arm).exists() {
+        return;
+    }
+    std::fs::write(pipe.with_extension(parked), "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !pipe.with_extension(release).exists() {
+        assert!(Instant::now() < deadline, "the {arm} park was not released");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for suffix in [arm, parked, release] {
+        let _ = std::fs::remove_file(pipe.with_extension(suffix));
     }
 }
 
@@ -3115,6 +3169,7 @@ fn start_session(
         restored: AtomicBool::new(false),
         autostart_lost: AtomicBool::new(false),
         control_epoch: AtomicU64::new(0),
+        playing_epoch: AtomicU64::new(0),
         terminal: AtomicBool::new(false),
         mutation_lock: Mutex::new(()),
         unsettled: AtomicUsize::new(0),
@@ -4745,6 +4800,7 @@ mod tests {
             restored: AtomicBool::new(false),
             autostart_lost: AtomicBool::new(false),
             control_epoch: AtomicU64::new(0),
+            playing_epoch: AtomicU64::new(0),
             terminal: AtomicBool::new(false),
             mutation_lock: Mutex::new(()),
             unsettled: AtomicUsize::new(0),
@@ -4787,6 +4843,7 @@ mod tests {
             restored: AtomicBool::new(false),
             autostart_lost: AtomicBool::new(false),
             control_epoch: AtomicU64::new(0),
+            playing_epoch: AtomicU64::new(0),
             terminal: AtomicBool::new(false),
             mutation_lock: Mutex::new(()),
             unsettled: AtomicUsize::new(0),
@@ -4864,6 +4921,7 @@ mod tests {
             restored: AtomicBool::new(false),
             autostart_lost: AtomicBool::new(false),
             control_epoch: AtomicU64::new(0),
+            playing_epoch: AtomicU64::new(0),
             terminal: AtomicBool::new(false),
             mutation_lock: Mutex::new(()),
             unsettled: AtomicUsize::new(0),
@@ -8366,6 +8424,199 @@ fn serve(stream: std::net::TcpStream) {
         exercise_control_transition_between_polls(true);
     }
 
+    /// R13 (pump path): activation confirmed daemon playback and published
+    /// `Playing`; the pump is parked before its own startup publication; the
+    /// command worker accepts a pause meanwhile. Releasing the pump must not
+    /// republish `Playing` over the accepted `Paused`: the daemon stays paused,
+    /// the controller cache stays paused, resume still works, and Stop settles
+    /// with generation-correct events and no duplicate terminal event.
+    #[cfg(owntone_host)]
+    #[test]
+    fn a_pause_accepted_before_the_pump_start_publication_wins() {
+        let fixture = DaemonControllerFixture::start(30);
+        let controller = &fixture.controller;
+        let client = &fixture.client;
+        let pipe = &fixture.daemon.config.pipe_path;
+        let baseline = client.outputs().unwrap();
+        std::fs::write(pipe.with_extension("park-startup"), b"").unwrap();
+        let prepared = fixture.prepare();
+        let ticket = prepared.ticket().unwrap();
+        let generation = PlayerEventGeneration::from_raw(51);
+        controller.set_generation(generation);
+        controller.load(generation, prepared);
+        // Activation published Playing; the pump is now parked before its
+        // startup republication.
+        wait_until(|| controller.state() == PlayerState::Playing);
+        wait_until(|| pipe.with_extension("startup-parked").exists());
+        controller.pause();
+        wait_until(|| controller.state() == PlayerState::Paused);
+        assert_eq!(client.player_state().unwrap(), "pause");
+        let _ = fixture.drain_events();
+
+        std::fs::write(pipe.with_extension("startup-release"), b"").unwrap();
+        wait_until(|| !pipe.with_extension("startup-parked").exists());
+        std::thread::sleep(Duration::from_millis(400));
+        let events = fixture.drain_events();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Playing,
+                    ..
+                }
+            )),
+            "the pump's late startup publication overwrote an accepted pause: {events:?}"
+        );
+        assert_eq!(controller.state(), PlayerState::Paused);
+        assert_eq!(client.player_state().unwrap(), "pause");
+
+        // Resume is still the user's, and the pipe resumes.
+        controller.play();
+        wait_until(|| controller.state() == PlayerState::Playing);
+        assert_eq!(client.player_state().unwrap(), "play");
+        controller.stop();
+        wait_until(|| ticket.route_count() == 0);
+        wait_until(|| controller.state() == PlayerState::Stopped);
+        wait_until(|| !fixture.daemon.config.takeover_record().exists());
+        wait_until(|| fixture.lock_is_free());
+        let events = fixture.drain_events();
+        assert!(
+            events.iter().all(|event| event.generation() == generation),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    PlayerEvent::StateChanged {
+                        state: PlayerState::Stopped,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::TrackEnded { .. } | PlayerEvent::Error { .. }
+            )),
+            "{events:?}"
+        );
+        assert_outputs_match(client, &baseline);
+    }
+
+    /// R13 (sampler path): a position observation is parked in the daemon,
+    /// a control is accepted while it is parked, and the stale reply is then
+    /// released. The controller cache must never regress to the sampled
+    /// state, so the next control the UI derives from the cache is right.
+    /// `pause_then_stale_play`: parked under play, pause accepted, stale
+    /// `play` released → still Paused, and a play then really resumes.
+    /// Otherwise: parked under pause, resume accepted, stale `pause`
+    /// released → still Playing, and a pause then really pauses.
+    #[cfg(owntone_host)]
+    fn exercise_stale_position_observation(pause_then_stale_play: bool) {
+        let fixture = DaemonControllerFixture::start(30);
+        let controller = &fixture.controller;
+        let client = &fixture.client;
+        let pipe = &fixture.daemon.config.pipe_path;
+        let prepared = fixture.prepare();
+        let ticket = prepared.ticket().unwrap();
+        let generation = PlayerEventGeneration::from_raw(52);
+        controller.set_generation(generation);
+        controller.load(generation, prepared);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        if !pause_then_stale_play {
+            controller.pause();
+            wait_until(|| controller.state() == PlayerState::Paused);
+            assert_eq!(client.player_state().unwrap(), "pause");
+        }
+        // Park the pump's next position sample inside the daemon. No test
+        // request may touch /api/player while the park is armed.
+        std::fs::write(pipe.with_extension("drain-started"), b"").unwrap();
+        wait_until(|| pipe.with_extension("drain-seen").exists());
+        if pause_then_stale_play {
+            controller.pause();
+            wait_until(|| controller.state() == PlayerState::Paused);
+        } else {
+            controller.play();
+            wait_until(|| controller.state() == PlayerState::Playing);
+        }
+        let _ = fixture.drain_events();
+        let stale = if pause_then_stale_play {
+            "play"
+        } else {
+            "pause"
+        };
+        std::fs::write(
+            pipe.with_extension("drain-release"),
+            format!(r#"{{"state":"{stale}","item_progress_ms":1200}}"#),
+        )
+        .unwrap();
+        wait_until(|| pipe.with_extension("drain-replied").exists());
+        std::thread::sleep(Duration::from_millis(400));
+        for suffix in [
+            "drain-started",
+            "drain-seen",
+            "drain-release",
+            "drain-replied",
+        ] {
+            let _ = std::fs::remove_file(pipe.with_extension(suffix));
+        }
+        let expected = if pause_then_stale_play {
+            PlayerState::Paused
+        } else {
+            PlayerState::Playing
+        };
+        assert_eq!(
+            controller.state(),
+            expected,
+            "a stale position observation overwrote the accepted control"
+        );
+        let events = fixture.drain_events();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::StateChanged { .. })),
+            "no state event may follow the stale observation: {events:?}"
+        );
+        // The next control the UI derives from the cache is the right one.
+        let before = fixture.daemon.recorded();
+        if pause_then_stale_play {
+            controller.play();
+            wait_until(|| controller.state() == PlayerState::Playing);
+            assert_eq!(client.player_state().unwrap(), "play");
+            let after = fixture.daemon.recorded();
+            assert!(
+                after.matches("PUT /api/player/play ").count()
+                    > before.matches("PUT /api/player/play ").count(),
+                "resume must transmit play"
+            );
+        } else {
+            controller.pause();
+            wait_until(|| controller.state() == PlayerState::Paused);
+            assert_eq!(client.player_state().unwrap(), "pause");
+        }
+        controller.stop();
+        wait_until(|| ticket.route_count() == 0);
+        wait_until(|| controller.state() == PlayerState::Stopped);
+        wait_until(|| fixture.lock_is_free());
+    }
+
+    #[cfg(owntone_host)]
+    #[test]
+    fn a_stale_playing_observation_never_undoes_an_accepted_pause() {
+        exercise_stale_position_observation(true);
+    }
+
+    #[cfg(owntone_host)]
+    #[test]
+    fn a_stale_paused_observation_never_undoes_an_accepted_resume() {
+        exercise_stale_position_observation(false);
+    }
+
     /// R11: a playing sample taken before a pause is history once the pause
     /// is accepted. The recording daemon parks the drain wait's next
     /// observation; the controller pauses while it is parked; the parked
@@ -11059,6 +11310,7 @@ fn serve(stream: std::net::TcpStream, fail: Option<String>) {
                 restored: AtomicBool::new(false),
                 autostart_lost: AtomicBool::new(false),
                 control_epoch: AtomicU64::new(0),
+                playing_epoch: AtomicU64::new(0),
                 terminal: AtomicBool::new(false),
                 mutation_lock: Mutex::new(()),
                 unsettled: AtomicUsize::new(0),
