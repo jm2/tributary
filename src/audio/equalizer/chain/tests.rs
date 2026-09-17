@@ -599,12 +599,11 @@ fn async_probe_edit_crossing_the_engagement_window_retains_a_valid_rollback() {
         return;
     };
     assert!(live.chain.clip_protection_installed());
-    let eq_src = live
-        .chain
-        .eq
-        .static_pad("src")
-        .expect("eq src pad");
-    assert!(!eq_src.is_blocked(), "no probe is installed before the edit");
+    let eq_src = live.chain.eq.static_pad("src").expect("eq src pad");
+    assert!(
+        !eq_src.is_blocked(),
+        "no probe is installed before the edit"
+    );
 
     live.chain
         .inject_limiter_remove_fault(LimiterRemoveFault::DirectRelinkBlocked);
@@ -673,11 +672,7 @@ fn async_probe_edit_crossing_the_engagement_window_keeps_an_unlinked_rollback_we
         return;
     };
     assert!(live.chain.clip_protection_installed());
-    let eq_src = live
-        .chain
-        .eq
-        .static_pad("src")
-        .expect("eq src pad");
+    let eq_src = live.chain.eq.static_pad("src").expect("eq src pad");
 
     live.chain
         .inject_limiter_remove_fault(LimiterRemoveFault::EveryLinkBlocked);
