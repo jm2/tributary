@@ -385,12 +385,21 @@ impl EqChain {
         let slot = Arc::new(Mutex::new(self.clipper.take()));
         let (tx, rx) = std::sync::mpsc::sync_channel::<LimiterEditOutcome>(1);
         let signal = Mutex::new(tx);
-        let slot_cb = Arc::clone(&slot);
+        // The callback runs on the streaming thread, so it owns everything it
+        // needs (a clone of the shared slot, the outcome channel, the graph
+        // handles, and the resolved test-fault decisions) rather than borrowing
+        // the chain. Grouping the inputs also keeps the callback's own
+        // parameter count within the file's budget.
+        let ctx = LimiterProbeContext {
+            slot: Arc::clone(&slot),
+            signal,
+            graph,
+            soft,
+            faults: decisions,
+        };
         let probe_id = eq_src.add_probe(
             gst::PadProbeType::BLOCK_DOWNSTREAM | gst::PadProbeType::IDLE,
-            move |_pad, _info| {
-                limiter_edit_probe_callback(&slot_cb, &signal, &graph, soft, decisions)
-            },
+            move |_pad, _info| limiter_edit_probe_callback(&ctx),
         );
         // A pad that reports idle synchronously runs the callback before
         // `add_probe` returns and reports no id; either way the outcome
@@ -528,6 +537,21 @@ fn post_wedged_topology_error(graph: &LimiterGraph) {
     );
 }
 
+/// Everything one blocking-probe limiter edit owns. The callback runs on the
+/// streaming thread and must not borrow the chain, so the shared limiter slot,
+/// the outcome channel, the graph handles, the target clip protection, and the
+/// resolved test-fault decisions all live here and are moved into the probe
+/// closure. Grouping the inputs keeps the callback's parameter count within
+/// the file's budget.
+struct LimiterProbeContext {
+    slot: Arc<Mutex<Option<gst::Element>>>,
+    signal: Mutex<std::sync::mpsc::SyncSender<LimiterEditOutcome>>,
+    graph: LimiterGraph,
+    soft: ClipProtection,
+    /// Test-only removal-surgery fault decisions; production passes all `false`.
+    faults: (bool, bool, bool),
+}
+
 /// Run one limiter edit inside the blocking-probe callback and choose the
 /// probe's fate. Returns `gst::PadProbeReturn::Remove` only once a linked
 /// topology is validated (so blocked flow resumes across a valid chain), or
@@ -535,34 +559,32 @@ fn post_wedged_topology_error(graph: &LimiterGraph) {
 /// and its rollback left the `equalizer-10bands` src pad unlinked, with the
 /// contract's error diagnostic posted so the ordinary eq-bin bus seam retires
 /// the wedged pipeline instead of resuming it. The outcome reaches the
-/// waiting caller over `signal`. Extracted from the public seam to keep that
-/// method within the file's method-length budget.
-fn limiter_edit_probe_callback(
-    slot: &Mutex<Option<gst::Element>>,
-    signal: &Mutex<std::sync::mpsc::SyncSender<LimiterEditOutcome>>,
-    graph: &LimiterGraph,
-    soft: ClipProtection,
-    (direct_blocked, restore_blocked, forced_blocked): (bool, bool, bool),
-) -> gst::PadProbeReturn {
+/// waiting caller over `ctx.signal`. Extracted from the public seam to keep
+/// that method within the file's method-length budget.
+fn limiter_edit_probe_callback(ctx: &LimiterProbeContext) -> gst::PadProbeReturn {
+    let (direct_blocked, restore_blocked, forced_blocked) = ctx.faults;
     let outcome = {
-        let mut current = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut current = ctx
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         edit_limiter_topology(
-            graph,
-            soft,
+            &ctx.graph,
+            ctx.soft,
             &mut current,
             direct_blocked,
             restore_blocked,
             forced_blocked,
         )
     };
-    if let Ok(tx) = signal.lock() {
+    if let Ok(tx) = ctx.signal.lock() {
         let _ = tx.try_send(outcome);
     }
     if outcome == LimiterEditOutcome::Unlinked {
         // No linked topology exists: keep the probe installed so no buffer is
         // pushed across the unlinked pad, and post the contract's explicit
         // error so the eq-bin bus seam retires the wedged pipeline.
-        post_wedged_topology_error(graph);
+        post_wedged_topology_error(&ctx.graph);
         gst::PadProbeReturn::Ok
     } else {
         gst::PadProbeReturn::Remove
