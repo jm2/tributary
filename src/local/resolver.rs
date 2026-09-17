@@ -623,6 +623,7 @@ async fn verify_unchanged(
 mod probe_park {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
 
     struct Park {
         enabled: AtomicBool,
@@ -631,6 +632,25 @@ mod probe_park {
         watcher: Mutex<Option<String>>,
         waiting: Mutex<()>,
         release: Condvar,
+        /// Deterministic lost-wakeup regression control: when armed, the
+        /// first waiter that reads `enabled == true` under `waiting` pauses
+        /// inside that window -- still holding `waiting` -- until poked,
+        /// simulating preemption between the predicate read and the condvar
+        /// registration where an unsynchronized [`release`](fn.release)
+        /// used to be lost (2026-09-17 audit rejection).
+        gap: Mutex<Gap>,
+        gap_signal: Condvar,
+    }
+
+    /// State of the predicate-to-wait interleaving window.
+    #[derive(Default)]
+    struct Gap {
+        /// Arm the window for the next waiter.
+        armed: bool,
+        /// A waiter currently sits in the window, holding `waiting`.
+        occupied: bool,
+        /// The tester poked: the waiter must leave the window.
+        poke: bool,
     }
 
     fn park() -> &'static Park {
@@ -642,6 +662,8 @@ mod probe_park {
             watcher: Mutex::new(None),
             waiting: Mutex::new(()),
             release: Condvar::new(),
+            gap: Mutex::new(Gap::default()),
+            gap_signal: Condvar::new(),
         })
     }
 
@@ -651,14 +673,64 @@ mod probe_park {
         *state.watcher.lock().expect("probe park watcher") = Some(track_id.to_string());
         state.in_flight.store(0, Ordering::SeqCst);
         state.peak.store(0, Ordering::SeqCst);
+        // Arm under the same mutex `release` disarms under, so the two
+        // transitions can never interleave with a waiter's predicate loop.
+        let wait_lock = state.waiting.lock().expect("probe park watch");
         state.enabled.store(true, Ordering::SeqCst);
+        drop(wait_lock);
     }
 
     /// Disarm the park and wake every parked closure.
     pub(super) fn release() {
         let state = park();
+        // Flip `enabled` while holding the waiter mutex. A waiter that has
+        // read `enabled == true` under that mutex either sees the flip when
+        // it re-checks, or has already registered on the condvar (its
+        // `wait` released the mutex to us), so the trailing notification
+        // can never be lost. Without this lock the flip lands between the
+        // waiter's last true predicate read and its wait registration: the
+        // parked probe never wakes, and the test runtime waiting on it
+        // hangs forever (2026-09-17 audit rejection).
+        let wait_lock = state.waiting.lock().expect("probe park release");
         state.enabled.store(false, Ordering::SeqCst);
+        drop(wait_lock);
         state.release.notify_all();
+    }
+
+    /// Arm the predicate-to-wait window for the next waiter (regression
+    /// control; inert for every other test).
+    pub(super) fn arm_gap() {
+        let state = park();
+        *state.gap.lock().expect("probe park gap") = Gap {
+            armed: true,
+            occupied: false,
+            poke: false,
+        };
+    }
+
+    /// Wait (bounded) until a waiter sits inside the predicate-to-wait
+    /// window. Returns `false` when the deadline passes without occupation.
+    pub(super) fn wait_for_gap_occupation(budget: Duration) -> bool {
+        let state = park();
+        let deadline = Instant::now() + budget;
+        loop {
+            if state.gap.lock().expect("probe park gap").occupied {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Free whichever waiter occupies the window and disarm it. Safe to
+    /// call when the window was never entered.
+    pub(super) fn poke_gap() {
+        let state = park();
+        let mut gap = state.gap.lock().expect("probe park gap");
+        gap.poke = true;
+        state.gap_signal.notify_all();
     }
 
     pub(super) fn in_flight() -> usize {
@@ -701,12 +773,31 @@ mod probe_park {
             }
             let mut guard = self.state.waiting.lock().expect("probe park wait");
             while self.state.enabled.load(Ordering::SeqCst) {
+                self.state.stall_in_gap_window();
                 guard = self
                     .state
                     .release
                     .wait(guard)
                     .expect("probe park wait poisoned");
             }
+        }
+    }
+
+    impl Park {
+        /// Pause inside the predicate-to-wait window -- `waiting` is held
+        /// for the whole call -- until the tester pokes the window. No-op
+        /// unless the window was armed for this waiter.
+        fn stall_in_gap_window(&self) {
+            let mut gap = self.gap.lock().expect("probe park gap");
+            if !gap.armed {
+                return;
+            }
+            gap.occupied = true;
+            self.gap_signal.notify_all();
+            while !gap.poke {
+                gap = self.gap_signal.wait(gap).expect("probe park gap poisoned");
+            }
+            *gap = Gap::default();
         }
     }
 
@@ -1297,5 +1388,87 @@ mod tests {
             );
         }
         wait_for_probe_count(0, "parked pane probes did not finish after release").await;
+    }
+
+    /// The 2026-09-17 audit rejection: `release()` used to flip `enabled`
+    /// and notify without acquiring the waiter mutex, so a release landing
+    /// between the waiter's last true predicate read and its
+    /// `Condvar::wait` registration was lost and the parked probe -- plus
+    /// the test runtime joining it -- hung forever. Force that exact
+    /// interleaving deterministically: the waiter pauses inside the
+    /// predicate-to-wait window while holding the wait mutex, and release
+    /// must block behind it, complete once the waiter registers, and wake
+    /// it. Bounded even on failure: the poke guard drops before the park
+    /// guard, so a failing assertion can never strand `release()` behind a
+    /// held wait mutex.
+    #[tokio::test]
+    async fn release_landing_in_the_predicate_to_wait_gap_wakes_the_parked_probe() {
+        let _serial = PROBE_PARK_TEST_LOCK.lock().await;
+        const TRACK: &str = "probe-park-lost-wakeup-track";
+        probe_park::watch(TRACK);
+        let _park = ParkGuard;
+        /// Declared after `_park` so it drops first and frees the waiter
+        /// from the gap window even when an assertion below panics.
+        struct GapPokeGuard;
+        impl Drop for GapPokeGuard {
+            fn drop(&mut self) {
+                probe_park::poke_gap();
+            }
+        }
+        let _poke = GapPokeGuard;
+
+        probe_park::arm_gap();
+        let (waiter_done_tx, waiter_done_rx) = mpsc::channel();
+        // The join handle is deliberately unused: completion is observed
+        // through the bounded channel below so a stuck waiter fails the
+        // test instead of hanging `join`.
+        let _waiter = thread::spawn(move || {
+            if let Some(guard) = probe_park::enter_if_watched(TRACK) {
+                guard.wait_for_release();
+            }
+            waiter_done_tx.send(()).expect("report waiter completion");
+        });
+
+        // The waiter is now parked inside the predicate-to-wait window,
+        // holding the wait mutex.
+        assert!(
+            probe_park::wait_for_gap_occupation(Duration::from_secs(2)),
+            "the armed waiter never reached the predicate-to-wait window"
+        );
+
+        // Release from a separate thread. With the synchronization fix it
+        // may only complete after the waiter has registered on the condvar.
+        let (releaser_entered_tx, releaser_entered_rx) = mpsc::channel();
+        let (releaser_done_tx, releaser_done_rx) = mpsc::channel();
+        let releaser = thread::spawn(move || {
+            releaser_entered_tx.send(()).expect("report release entry");
+            probe_park::release();
+            releaser_done_tx
+                .send(())
+                .expect("report release completion");
+        });
+        releaser_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the releaser never reached release()");
+        assert!(
+            releaser_done_rx.try_recv().is_err(),
+            "release() completed while a waiter still held the predicate-to-wait window"
+        );
+
+        // Let the waiter leave the window and register on the condvar. The
+        // blocked release must then complete and wake the parked probe.
+        probe_park::poke_gap();
+        waiter_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the parked probe must wake after the gap release");
+        releaser_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the blocked release never completed after the waiter registered");
+        releaser.join().expect("releaser thread panicked");
+        assert_eq!(
+            probe_park::in_flight(),
+            0,
+            "the released probe must leave the gate"
+        );
     }
 }
