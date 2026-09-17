@@ -7,7 +7,6 @@
 //! load/control/poll enters that worker's FIFO command stream.
 
 use std::cell::Cell;
-#[cfg(test)]
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -38,6 +37,14 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
 /// advertised length before `rust_cast` can allocate from it. The upstream
 /// manager otherwise accepts the complete unsigned 32-bit range.
 const MAX_CAST_FRAME_BYTES: u32 = 1024 * 1024;
+/// Bound the Cast worker's pending command ingress.
+///
+/// A slow but responsive receiver can otherwise retain unbounded seek/volume
+/// intent queued by the UI faster than the device drains it. The worker keeps
+/// its own serialized command stream; this ceiling bounds only what the
+/// nonblocking submission path may retain. Mirrors the MPD worker ingress
+/// ceiling in `mpd_output.rs`.
+const MAX_PENDING_WORKER_COMMANDS: usize = 64;
 
 const CAST_SENDER_ID: &str = "sender-0";
 const CAST_RECEIVER_ID: &str = "receiver-0";
@@ -59,7 +66,7 @@ pub struct ChromecastOutput {
     cast_server: Arc<Mutex<Option<CastHttpServer>>>,
     rt_handle: Option<tokio::runtime::Handle>,
     intent_epoch: Arc<AtomicU64>,
-    worker_tx: mpsc::Sender<WorkerCommand>,
+    worker_tx: WorkerCommandSender,
 }
 
 #[derive(Clone, Copy)]
@@ -98,6 +105,261 @@ enum CommandKind {
         entered: mpsc::Sender<()>,
         release: mpsc::Receiver<()>,
     },
+}
+
+impl CommandKind {
+    /// Transient controls carry an absolute target, so an obsolete queued
+    /// instance is superseded by the newest one and can be coalesced away
+    /// under saturation without changing the final intent.
+    fn is_transient_control(&self) -> bool {
+        matches!(self, Self::Seek(_) | Self::Volume(_))
+    }
+
+    /// Stop and Shutdown must always be admitted, even while a slow receiver
+    /// holds the worker busy: without a reserved path a full ingress could
+    /// otherwise refuse the very commands that terminate playback or the
+    /// worker itself.
+    fn is_reserved_admission(&self) -> bool {
+        matches!(self, Self::Stop | Self::Shutdown)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerEnqueueOutcome {
+    Enqueued,
+    Superseded,
+    Saturated,
+    Disconnected,
+}
+
+struct PendingWorkerCommands {
+    commands: VecDeque<WorkerCommand>,
+    newest_epoch: Option<u64>,
+    capacity: usize,
+    receiver_alive: bool,
+}
+
+struct WorkerCommandSender {
+    pending: Arc<Mutex<PendingWorkerCommands>>,
+    wake_tx: mpsc::SyncSender<()>,
+}
+
+struct WorkerCommandReceiver {
+    pending: Arc<Mutex<PendingWorkerCommands>>,
+    wake_rx: mpsc::Receiver<()>,
+}
+
+fn worker_command_channel(capacity: usize) -> (WorkerCommandSender, WorkerCommandReceiver) {
+    assert!(capacity > 0, "worker command capacity must be positive");
+    let pending = Arc::new(Mutex::new(PendingWorkerCommands {
+        commands: VecDeque::with_capacity(capacity),
+        newest_epoch: None,
+        capacity,
+        receiver_alive: true,
+    }));
+    let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+    (
+        WorkerCommandSender {
+            pending: Arc::clone(&pending),
+            wake_tx,
+        },
+        WorkerCommandReceiver { pending, wake_rx },
+    )
+}
+
+impl WorkerCommandSender {
+    /// Submit a command without ever blocking the caller.
+    ///
+    /// Admission is finite and explicit:
+    /// - a newer intent epoch atomically purges the obsolete backlog;
+    /// - below capacity the deque stays an exact FIFO;
+    /// - at capacity, transient seek/volume runs collapse to their newest
+    ///   instance and an oldest transient is evicted to make room;
+    /// - a non-transient command that cannot be compacted is reported
+    ///   `Saturated` rather than silently dropped.
+    ///
+    /// Stop and Shutdown use reserved admission: they evict queued intent if
+    /// necessary so termination never waits on the receiver.
+    fn enqueue(&self, command: WorkerCommand) -> WorkerEnqueueOutcome {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !pending.receiver_alive {
+            return WorkerEnqueueOutcome::Disconnected;
+        }
+
+        match pending.newest_epoch {
+            Some(newest_epoch) if command.owner.epoch < newest_epoch => {
+                return WorkerEnqueueOutcome::Superseded;
+            }
+            Some(newest_epoch) if command.owner.epoch > newest_epoch => {
+                pending.commands.clear();
+                pending.newest_epoch = Some(command.owner.epoch);
+            }
+            None => pending.newest_epoch = Some(command.owner.epoch),
+            Some(_) => {}
+        }
+
+        if command.kind.is_reserved_admission() {
+            if pending.commands.len() >= pending.capacity {
+                compact_saturated_controls(&mut pending.commands);
+            }
+            while pending.commands.len() >= pending.capacity {
+                let evicted = pending
+                    .commands
+                    .iter()
+                    .position(|queued| !queued.kind.is_reserved_admission())
+                    .unwrap_or(0);
+                let _ = pending.commands.remove(evicted);
+            }
+            pending.commands.push_back(command);
+        } else if pending.commands.len() >= pending.capacity {
+            if command.kind.is_transient_control() {
+                pending.commands.push_back(command);
+                compact_saturated_controls(&mut pending.commands);
+                while pending.commands.len() > pending.capacity {
+                    let Some(oldest_transient) = pending
+                        .commands
+                        .iter()
+                        .position(|queued| queued.kind.is_transient_control())
+                    else {
+                        break;
+                    };
+                    let _ = pending.commands.remove(oldest_transient);
+                }
+            } else {
+                compact_saturated_controls(&mut pending.commands);
+                if pending.commands.len() >= pending.capacity {
+                    if let Some(oldest_transient) = pending
+                        .commands
+                        .iter()
+                        .position(|queued| queued.kind.is_transient_control())
+                    {
+                        let _ = pending.commands.remove(oldest_transient);
+                    } else {
+                        return WorkerEnqueueOutcome::Saturated;
+                    }
+                }
+                pending.commands.push_back(command);
+            }
+        } else {
+            pending.commands.push_back(command);
+        }
+        debug_assert!(pending.commands.len() <= pending.capacity);
+        // Publish the nonblocking wake while insertion still owns the deque
+        // lock, so an accepted command cannot race a worker that consumes the
+        // final Shutdown and exits between insertion and wake publication.
+        let outcome = match self.wake_tx.try_send(()) {
+            Ok(()) | Err(mpsc::TrySendError::Full(())) => WorkerEnqueueOutcome::Enqueued,
+            Err(mpsc::TrySendError::Disconnected(())) => {
+                pending.receiver_alive = false;
+                pending.commands.clear();
+                WorkerEnqueueOutcome::Disconnected
+            }
+        };
+        drop(pending);
+        outcome
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .commands
+            .len()
+    }
+}
+
+impl WorkerCommandReceiver {
+    fn pop_pending(&self) -> Option<WorkerCommand> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .commands
+            .pop_front()
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<WorkerCommand, mpsc::RecvTimeoutError> {
+        // A capacity-one wake can remain after the deque has been drained.
+        // Keep one absolute timeout so a stale token cannot postpone the
+        // worker's periodic status poll.
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .expect("worker receive deadline representable");
+        loop {
+            if let Some(command) = self.pop_pending() {
+                return Ok(command);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(mpsc::RecvTimeoutError::Timeout);
+            }
+            match self
+                .wake_rx
+                .recv_timeout(deadline.saturating_duration_since(now))
+            {
+                Ok(()) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(mpsc::RecvTimeoutError::Timeout);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if let Some(command) = self.pop_pending() {
+                        return Ok(command);
+                    }
+                    return Err(mpsc::RecvTimeoutError::Disconnected);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for WorkerCommandReceiver {
+    fn drop(&mut self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        pending.receiver_alive = false;
+        pending.commands.clear();
+    }
+}
+
+/// Collapse only adjacent transient runs, so a coalesced seek or volume can
+/// never jump across a lifecycle barrier such as Load, Stop, or Shutdown.
+/// Adjacent same-kind controls carry an absolute target, so keeping the last
+/// one preserves the exact final intent while releasing queue capacity.
+fn compact_saturated_controls(commands: &mut VecDeque<WorkerCommand>) {
+    let mut input = std::mem::take(commands);
+    let mut compacted = VecDeque::with_capacity(input.len());
+    while let Some(command) = input.pop_front() {
+        match command.kind {
+            CommandKind::Seek(_) => {
+                let mut latest = command;
+                while input
+                    .front()
+                    .is_some_and(|next| matches!(next.kind, CommandKind::Seek(_)))
+                {
+                    latest = input.pop_front().expect("front seek exists");
+                }
+                compacted.push_back(latest);
+            }
+            CommandKind::Volume(_) => {
+                let mut latest = command;
+                while input
+                    .front()
+                    .is_some_and(|next| matches!(next.kind, CommandKind::Volume(_)))
+                {
+                    latest = input.pop_front().expect("front volume exists");
+                }
+                compacted.push_back(latest);
+            }
+            _ => compacted.push_back(command),
+        }
+    }
+    *commands = compacted;
 }
 
 #[derive(Clone, Copy)]
@@ -767,11 +1029,11 @@ fn spawn_cast_worker<C>(
     current_state: Arc<Mutex<PlayerState>>,
     event_tx: async_channel::Sender<PlayerEvent>,
     timing: WorkerTiming,
-) -> mpsc::Sender<WorkerCommand>
+) -> WorkerCommandSender
 where
     C: CastConnector,
 {
-    let (worker_tx, worker_rx) = mpsc::channel();
+    let (worker_tx, worker_rx) = worker_command_channel(MAX_PENDING_WORKER_COMMANDS);
     let spawn = std::thread::Builder::new()
         .name("chromecast-worker".to_string())
         .spawn(move || {
@@ -792,7 +1054,7 @@ where
 
 fn run_cast_worker<C>(
     mut connector: C,
-    worker_rx: mpsc::Receiver<WorkerCommand>,
+    worker_rx: WorkerCommandReceiver,
     intent_epoch: Arc<AtomicU64>,
     current_state: Arc<Mutex<PlayerState>>,
     event_tx: async_channel::Sender<PlayerEvent>,
@@ -1858,25 +2120,34 @@ impl ChromecastOutput {
     }
 
     fn enqueue(&self, owner: CommandOwner, kind: CommandKind) -> bool {
-        if self.worker_tx.send(WorkerCommand { owner, kind }).is_ok() {
-            return true;
+        match self.worker_tx.enqueue(WorkerCommand { owner, kind }) {
+            WorkerEnqueueOutcome::Enqueued | WorkerEnqueueOutcome::Superseded => true,
+            WorkerEnqueueOutcome::Saturated => {
+                error!(
+                    operation = "worker ingress",
+                    "Chromecast worker command ingress is saturated; dropping a non-transient command"
+                );
+                false
+            }
+            WorkerEnqueueOutcome::Disconnected => {
+                if is_current(owner, &self.intent_epoch) {
+                    let _ = set_state_and_emit(
+                        owner,
+                        PlayerState::Stopped,
+                        &self.intent_epoch,
+                        &self.current_state,
+                        &self.event_tx,
+                    );
+                    emit_if_current(
+                        owner,
+                        PlayerEvent::error(owner.event_generation, "Chromecast worker unavailable"),
+                        &self.intent_epoch,
+                        &self.event_tx,
+                    );
+                }
+                false
+            }
         }
-        if is_current(owner, &self.intent_epoch) {
-            let _ = set_state_and_emit(
-                owner,
-                PlayerState::Stopped,
-                &self.intent_epoch,
-                &self.current_state,
-                &self.event_tx,
-            );
-            emit_if_current(
-                owner,
-                PlayerEvent::error(owner.event_generation, "Chromecast worker unavailable"),
-                &self.intent_epoch,
-                &self.event_tx,
-            );
-        }
-        false
     }
 
     /// Resolve a track URI into something it is safe to hand to a Cast device.
@@ -2105,7 +2376,7 @@ impl AudioOutput for ChromecastOutput {
 impl Drop for ChromecastOutput {
     fn drop(&mut self) {
         let owner = self.next_owner();
-        let _ = self.worker_tx.send(WorkerCommand {
+        let _ = self.worker_tx.enqueue(WorkerCommand {
             owner,
             kind: CommandKind::Shutdown,
         });
@@ -2629,7 +2900,7 @@ mod tests {
     }
 
     struct Harness {
-        tx: mpsc::Sender<WorkerCommand>,
+        tx: WorkerCommandSender,
         epoch: Arc<AtomicU64>,
         events: async_channel::Receiver<PlayerEvent>,
         worker: Option<std::thread::JoinHandle<()>>,
@@ -2656,7 +2927,7 @@ mod tests {
         where
             C: CastConnector,
         {
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = worker_command_channel(MAX_PENDING_WORKER_COMMANDS);
             let epoch = Arc::new(AtomicU64::new(0));
             let state = Arc::new(Mutex::new(PlayerState::Stopped));
             let (event_tx, events) = async_channel::unbounded();
@@ -2688,9 +2959,11 @@ mod tests {
         }
 
         fn send(&self, owner: CommandOwner, kind: CommandKind) {
-            self.tx
-                .send(WorkerCommand { owner, kind })
-                .expect("worker command accepted");
+            assert_eq!(
+                self.tx.enqueue(WorkerCommand { owner, kind }),
+                WorkerEnqueueOutcome::Enqueued,
+                "worker command accepted"
+            );
         }
 
         fn fence(&self, owner: CommandOwner) {
@@ -4243,5 +4516,402 @@ mod tests {
                 "{uri} must be rejected, not passed to the device"
             );
         }
+    }
+
+    fn queue_test_owner(epoch: u64) -> CommandOwner {
+        CommandOwner {
+            epoch,
+            event_generation: PlayerEventGeneration::from_raw(epoch),
+        }
+    }
+
+    #[test]
+    fn worker_ingress_preserves_exact_fifo_below_capacity() {
+        let (tx, rx) = worker_command_channel(8);
+        let owner = queue_test_owner(1);
+        for kind in [
+            CommandKind::Seek(1_000),
+            CommandKind::Seek(2_000),
+            CommandKind::Volume(0.25),
+            CommandKind::Pause,
+        ] {
+            assert_eq!(
+                tx.enqueue(WorkerCommand { owner, kind }),
+                WorkerEnqueueOutcome::Enqueued
+            );
+        }
+        assert_eq!(tx.pending_len(), 4);
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("first seek")
+                .kind,
+            CommandKind::Seek(1_000)
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("second seek")
+                .kind,
+            CommandKind::Seek(2_000)
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("volume")
+                .kind,
+            CommandKind::Volume(0.25)
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).expect("pause").kind,
+            CommandKind::Pause
+        ));
+    }
+
+    #[test]
+    fn saturated_worker_ingress_coalesces_transient_runs_without_crossing_barriers() {
+        let (tx, rx) = worker_command_channel(6);
+        let owner = queue_test_owner(1);
+        for kind in [
+            CommandKind::Pause,
+            CommandKind::Seek(1_000),
+            CommandKind::Seek(2_000),
+            CommandKind::Volume(0.10),
+            CommandKind::Volume(0.90),
+            CommandKind::Play,
+        ] {
+            assert_eq!(
+                tx.enqueue(WorkerCommand { owner, kind }),
+                WorkerEnqueueOutcome::Enqueued
+            );
+        }
+        assert_eq!(tx.pending_len(), 6);
+
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Seek(3_000),
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        assert!(tx.pending_len() <= 6);
+
+        // Only the newest member of each adjacent run survives; the barrier
+        // controls keep their position and a trailing seek is retained.
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("pause barrier")
+                .kind,
+            CommandKind::Pause
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("coalesced seek run")
+                .kind,
+            CommandKind::Seek(2_000)
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("coalesced volume run")
+                .kind,
+            CommandKind::Volume(0.90)
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("play barrier")
+                .kind,
+            CommandKind::Play
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("newest trailing seek")
+                .kind,
+            CommandKind::Seek(3_000)
+        ));
+    }
+
+    #[test]
+    fn saturated_worker_ingress_evicts_oldest_transient_for_latest_intent() {
+        let (tx, rx) = worker_command_channel(4);
+        let owner = queue_test_owner(1);
+        for kind in [
+            CommandKind::Pause,
+            CommandKind::Seek(1_000),
+            CommandKind::Volume(0.10),
+            CommandKind::Play,
+        ] {
+            assert_eq!(
+                tx.enqueue(WorkerCommand { owner, kind }),
+                WorkerEnqueueOutcome::Enqueued
+            );
+        }
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Seek(2_000),
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        assert_eq!(tx.pending_len(), 4);
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("pause retained")
+                .kind,
+            CommandKind::Pause
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("volume retained")
+                .kind,
+            CommandKind::Volume(0.10)
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("play retained")
+                .kind,
+            CommandKind::Play
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("latest seek retained")
+                .kind,
+            CommandKind::Seek(2_000)
+        ));
+    }
+
+    #[test]
+    fn saturated_ingress_refuses_non_transient_yet_reserves_stop_and_shutdown() {
+        let (tx, _rx) = worker_command_channel(3);
+        let owner = queue_test_owner(1);
+        for kind in [CommandKind::Pause, CommandKind::Toggle, CommandKind::Play] {
+            assert_eq!(
+                tx.enqueue(WorkerCommand { owner, kind }),
+                WorkerEnqueueOutcome::Enqueued
+            );
+        }
+
+        // With no transient to evict, a saturated non-transient command is
+        // reported explicitly rather than silently discarded.
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Toggle,
+            }),
+            WorkerEnqueueOutcome::Saturated
+        );
+
+        // Reserved lifecycle controls share the epoch with the backlog, so
+        // only reserved admission can make room for them.
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Stop,
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        assert!(tx.pending_len() <= 3);
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Shutdown,
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        assert!(tx.pending_len() <= 3);
+    }
+
+    #[test]
+    fn newer_epoch_purges_backlog_and_late_old_work_cannot_reenter() {
+        let (tx, rx) = worker_command_channel(4);
+        let old = queue_test_owner(1);
+        for kind in [
+            CommandKind::Load {
+                uri: "https://music.test/old".to_string(),
+                volume: 0.5,
+            },
+            CommandKind::Seek(1_000),
+            CommandKind::Pause,
+        ] {
+            assert_eq!(
+                tx.enqueue(WorkerCommand { owner: old, kind }),
+                WorkerEnqueueOutcome::Enqueued
+            );
+        }
+
+        let replacement = queue_test_owner(2);
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner: replacement,
+                kind: CommandKind::Stop,
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        assert_eq!(tx.pending_len(), 1);
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner: old,
+                kind: CommandKind::Toggle,
+            }),
+            WorkerEnqueueOutcome::Superseded
+        );
+        assert_eq!(tx.pending_len(), 1);
+
+        let command = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("replacement stop");
+        assert_eq!(command.owner.epoch, replacement.epoch);
+        assert!(matches!(command.kind, CommandKind::Stop));
+    }
+
+    #[test]
+    fn worker_ingress_reports_a_dropped_receiver_without_buffering() {
+        let (tx, rx) = worker_command_channel(4);
+        drop(rx);
+        assert_eq!(
+            tx.enqueue(WorkerCommand {
+                owner: queue_test_owner(1),
+                kind: CommandKind::Pause,
+            }),
+            WorkerEnqueueOutcome::Disconnected
+        );
+        assert_eq!(tx.pending_len(), 0);
+    }
+
+    /// End-to-end bound on the real Cast worker: hold a command in the fake
+    /// Cast transport so seek/volume intent accumulates, flood far past
+    /// capacity, and confirm the retained backlog stays within the ceiling
+    /// while the newest intent and the reserved stop/replacement/shutdown
+    /// paths still settle.
+    #[test]
+    fn slow_receiver_bounds_flooded_control_queue_and_still_settles() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let owner = harness.next_owner(1);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(owner);
+        shared.clear_actions();
+        let _ = harness.events();
+
+        // Phase 1: block the worker inside the fake transport on the first
+        // seek, flood seeks behind it, and prove the newest intent survives
+        // inside the bound.
+        let (entered, release) = shared.install_gate(Point::Seek);
+        assert_eq!(
+            harness.tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Seek(0),
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fake Cast transport held the first seek");
+        for position in 1..500_u64 {
+            assert_eq!(
+                harness.tx.enqueue(WorkerCommand {
+                    owner,
+                    kind: CommandKind::Seek(position),
+                }),
+                WorkerEnqueueOutcome::Enqueued
+            );
+        }
+        assert!(
+            harness.tx.pending_len() <= MAX_PENDING_WORKER_COMMANDS,
+            "retained Cast control ingress exceeded its bound"
+        );
+
+        release.send(()).expect("release held seek");
+        harness.fence(owner);
+        let seeks: Vec<u64> = shared
+            .actions()
+            .iter()
+            .filter_map(|action| match action {
+                Action::Seek(position) => Some(*position),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            seeks.len() <= MAX_PENDING_WORKER_COMMANDS + 1,
+            "the worker applied more than the retention bound plus the in-flight command"
+        );
+        assert_eq!(seeks.last().copied(), Some(499));
+
+        // Phase 2: a held receiver cannot pin Stop — a newer epoch purges the
+        // obsolete backlog immediately and the stop still settles.
+        shared.clear_actions();
+        let (entered, release) = shared.install_gate(Point::Volume);
+        assert_eq!(
+            harness.tx.enqueue(WorkerCommand {
+                owner,
+                kind: CommandKind::Volume(0.5),
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fake Cast transport held the first volume");
+        for _ in 0..500_u64 {
+            assert_eq!(
+                harness.tx.enqueue(WorkerCommand {
+                    owner,
+                    kind: CommandKind::Volume(0.6),
+                }),
+                WorkerEnqueueOutcome::Enqueued
+            );
+        }
+        let stop = harness.next_owner(2);
+        assert_eq!(
+            harness.tx.enqueue(WorkerCommand {
+                owner: stop,
+                kind: CommandKind::Stop,
+            }),
+            WorkerEnqueueOutcome::Enqueued
+        );
+        assert_eq!(
+            harness.tx.pending_len(),
+            1,
+            "replacement epoch must purge the obsolete backlog"
+        );
+        release.send(()).expect("release held volume");
+        harness.fence(stop);
+        assert!(harness.events().iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged {
+                generation,
+                state: PlayerState::Stopped
+            } if *generation == PlayerEventGeneration::from_raw(2)
+        )));
+
+        // Phase 3: a replacement load still settles after the flood.
+        let replacement = harness.next_owner(3);
+        harness.send(
+            replacement,
+            CommandKind::Load {
+                uri: "https://music.test/b".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(replacement);
+        assert!(harness.events().iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged {
+                generation,
+                state: PlayerState::Playing
+            } if *generation == PlayerEventGeneration::from_raw(3)
+        )));
+
+        // Phase 4: shutdown drains and joins even with intent still queued.
+        for _ in 0..500_u64 {
+            let _ = harness.tx.enqueue(WorkerCommand {
+                owner: replacement,
+                kind: CommandKind::Seek(0),
+            });
+        }
+        harness.shutdown();
     }
 }
