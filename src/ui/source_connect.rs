@@ -1660,8 +1660,7 @@ mod tests {
             "Failed to parse remote JSON",
             body.as_bytes(),
         )
-        .err()
-        .expect("wrong-type body must fail");
+        .expect_err("wrong-type body must fail");
 
         // The fixed categories consumers rely on are preserved...
         assert_eq!(

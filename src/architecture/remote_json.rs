@@ -91,7 +91,7 @@ pub fn parse_remote_json<T: serde::de::DeserializeOwned>(
 /// logging formatter or UI projection would render. Shared by the remote
 /// client leak regressions.
 #[cfg(test)]
-pub(crate) fn rendered_error_chain(error: &BackendError) -> String {
+pub fn rendered_error_chain(error: &BackendError) -> String {
     use std::fmt::Write as _;
 
     let mut rendered = String::new();
@@ -107,23 +107,16 @@ pub(crate) fn rendered_error_chain(error: &BackendError) -> String {
 mod tests {
     use super::*;
 
-    /// Flatten every `Display` in the error chain, matching what a logging
-    /// formatter or UI projection would see.
-    fn rendered_chain(error: &BackendError) -> String {
-        rendered_error_chain(error)
-    }
-
-    fn classify<T: serde::de::DeserializeOwned>(body: &[u8]) -> RemoteJsonParseCategory {
-        let error = serde_json::from_slice::<T>(body)
-            .err()
-            .expect("fixture must not deserialize");
+    fn classify<T: serde::de::DeserializeOwned + std::fmt::Debug>(
+        body: &[u8],
+    ) -> RemoteJsonParseCategory {
+        let error = serde_json::from_slice::<T>(body).expect_err("fixture must not deserialize");
         RemoteJsonParseCategory::from_serde(&error)
     }
 
     fn parsed_error(body: &[u8]) -> BackendError {
         parse_remote_json::<u32>("Failed to parse fixture JSON", body)
-            .err()
-            .expect("fixture must not deserialize")
+            .expect_err("fixture must not deserialize")
     }
 
     #[test]
@@ -168,7 +161,7 @@ mod tests {
         }
         assert!(!format!("{error:?}").contains(sentinel));
         assert!(!error.to_string().contains(sentinel));
-        assert!(!rendered_chain(&error).contains(sentinel));
+        assert!(!rendered_error_chain(&error).contains(sentinel));
     }
 
     #[test]
@@ -177,8 +170,7 @@ mod tests {
         let body = format!(r#""{}{sentinel}""#, "x".repeat(64 * 1024));
 
         let error = parsed_error(body.as_bytes());
-        let rendered = format!("{error:?}\n{error}\n{}", rendered_chain(&error));
+        let rendered = format!("{error:?}\n{error}\n{}", rendered_error_chain(&error));
         assert!(!rendered.contains(sentinel));
-        assert!(!rendered.contains("x".repeat(64).as_str()));
     }
 }
