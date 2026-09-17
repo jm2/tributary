@@ -46,6 +46,13 @@ jobs:
           python3 scripts/test_audit_lockfiles.py
           python3 scripts/sync_rust_toolchain.py --check
 
+      - name: Check backlog consistency
+        # Read-only: unique record IDs, literal completion counters, internal
+        # links/anchors. Never closes a parent record or assigns a worker.
+        run: |
+          python3 scripts/check_backlog_consistency.py
+          python3 scripts/test_check_backlog_consistency.py
+
       - name: Verify root and fuzz lock update coherence
         if: github.event_name == 'pull_request'
         env:
