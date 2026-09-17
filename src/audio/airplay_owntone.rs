@@ -2163,38 +2163,47 @@ fn daemon_completion_reached(state: &str) -> bool {
 /// [`COMPLETION_PROGRESS_STALL`] is a rendered item: the caller then issues
 /// the restoring `player/stop` itself. `pause` never completes.
 struct CompletionTracker {
-    /// Whether stalled progress may complete the item: true only once the
-    /// daemon's autostart binding was lost (a pause was accepted). An
-    /// autostarted pipe is expected to autostop; a `play` that merely
-    /// stalls is then a fault and falls to the drain deadline.
-    stall_completes: bool,
     last_state: String,
     last_progress: Option<u64>,
     unchanged_since: Option<Instant>,
 }
 
 impl CompletionTracker {
-    fn new(stall_completes: bool) -> Self {
+    fn new() -> Self {
         Self {
-            stall_completes,
             last_state: String::new(),
             last_progress: None,
             unchanged_since: None,
         }
     }
 
+    /// `stall_completes` is whether stalled progress may complete the item:
+    /// true only once the daemon's autostart binding was lost (a pause was
+    /// accepted). It is read afresh on every observation because a pause can
+    /// be accepted after the writer closed, while this wait is already
+    /// running (refinery R10): a value captured when the wait began would
+    /// leave a resumed, drained pipe to time out as a failure. An autostarted
+    /// pipe is expected to autostop; a `play` that merely stalls is then a
+    /// fault and falls to the drain deadline.
+    ///
     /// The stall is measured under continuous `play`: a state change (a
     /// resume after a pause that outlived the drain) restarts the clock, so a
     /// tail the daemon is about to read is never cut off as "already stalled".
     /// A `play` that reports no progress at all is not evidence of a drained
     /// pipe: it keeps waiting and falls to the drain deadline.
-    fn observe(&mut self, state: &str, progress: Option<u64>, now: Instant) -> bool {
+    fn observe(
+        &mut self,
+        state: &str,
+        progress: Option<u64>,
+        now: Instant,
+        stall_completes: bool,
+    ) -> bool {
         if daemon_completion_reached(state) {
             return true;
         }
         match self.unchanged_since {
             Some(since) if progress == self.last_progress && state == self.last_state => {
-                self.stall_completes
+                stall_completes
                     && state == "play"
                     && progress.is_some()
                     && now.duration_since(since) >= COMPLETION_PROGRESS_STALL
@@ -2220,7 +2229,7 @@ fn await_daemon_completion(inner: &SessionInner) -> Result<Option<&'static str>,
             || !inner.running.load(Ordering::SeqCst)
     };
     let deadline = Instant::now() + DRAIN_DEADLINE;
-    let mut tracker = CompletionTracker::new(inner.autostart_lost.load(Ordering::SeqCst));
+    let mut tracker = CompletionTracker::new();
     loop {
         if cancelled() {
             return Err(());
@@ -2233,7 +2242,12 @@ fn await_daemon_completion(inner: &SessionInner) -> Result<Option<&'static str>,
         }
         match observation {
             Ok((state, progress)) => {
-                if tracker.observe(&state, progress, Instant::now()) {
+                // Read after the observation: a pause accepted while it was in
+                // flight is then visible for this very observation, and a
+                // resume (which serialises behind that pause on the command
+                // worker) can never be observed under a stale flag.
+                let stall_completes = inner.autostart_lost.load(Ordering::SeqCst);
+                if tracker.observe(&state, progress, Instant::now(), stall_completes) {
                     return Ok(None);
                 }
             }
@@ -4098,45 +4112,80 @@ mod tests {
     fn completion_tracker_completes_on_stop_or_stalled_play_never_pause() {
         let t0 = Instant::now();
         let stall = COMPLETION_PROGRESS_STALL;
-        let mut tracker = CompletionTracker::new(false);
+        let mut tracker = CompletionTracker::new();
         assert!(
-            tracker.observe("stop", None, t0),
+            tracker.observe("stop", None, t0, false),
             "autostop completes at once"
         );
 
         // An autostarted pipe never completes on stalled progress alone.
-        let mut tracker = CompletionTracker::new(false);
-        assert!(!tracker.observe("play", Some(100), t0));
-        assert!(!tracker.observe("play", Some(100), t0 + stall * 3));
+        let mut tracker = CompletionTracker::new();
+        assert!(!tracker.observe("play", Some(100), t0, false));
+        assert!(!tracker.observe("play", Some(100), t0 + stall * 3, false));
 
-        let mut tracker = CompletionTracker::new(true);
-        assert!(!tracker.observe("play", Some(100), t0));
-        assert!(!tracker.observe("play", Some(200), t0 + stall), "advancing");
-        assert!(!tracker.observe("play", Some(200), t0 + stall + stall / 2));
+        let mut tracker = CompletionTracker::new();
+        assert!(!tracker.observe("play", Some(100), t0, true));
         assert!(
-            tracker.observe("play", Some(200), t0 + stall * 2),
+            !tracker.observe("play", Some(200), t0 + stall, true),
+            "advancing"
+        );
+        assert!(!tracker.observe("play", Some(200), t0 + stall + stall / 2, true));
+        assert!(
+            tracker.observe("play", Some(200), t0 + stall * 2, true),
             "drained"
         );
 
-        let mut tracker = CompletionTracker::new(true);
-        assert!(!tracker.observe("play", None, t0));
+        let mut tracker = CompletionTracker::new();
+        assert!(!tracker.observe("play", None, t0, true));
         assert!(
-            !tracker.observe("play", None, t0 + stall * 3),
+            !tracker.observe("play", None, t0 + stall * 3, true),
             "no progress evidence never counts as drained"
         );
 
-        let mut tracker = CompletionTracker::new(true);
-        assert!(!tracker.observe("pause", Some(300), t0));
+        let mut tracker = CompletionTracker::new();
+        assert!(!tracker.observe("pause", Some(300), t0, true));
         assert!(
-            !tracker.observe("pause", Some(300), t0 + stall * 3),
+            !tracker.observe("pause", Some(300), t0 + stall * 3, true),
             "a paused item is never complete"
         );
         assert!(
-            !tracker.observe("play", Some(300), t0 + stall * 3),
+            !tracker.observe("play", Some(300), t0 + stall * 3, true),
             "a resume restarts the stall clock"
         );
-        assert!(!tracker.observe("play", Some(300), t0 + stall * 3 + stall / 2));
-        assert!(tracker.observe("play", Some(300), t0 + stall * 4));
+        assert!(!tracker.observe("play", Some(300), t0 + stall * 3 + stall / 2, true));
+        assert!(tracker.observe("play", Some(300), t0 + stall * 4, true));
+    }
+
+    /// R10: the autostart binding can be lost while the drain wait is already
+    /// running (a pause accepted after the writer closed). The tracker must
+    /// act on the flag as it is now, not as it was when the wait began: the
+    /// same stalled `play` that was a fault under an autostarted item is the
+    /// rendered item once the pause/resume cycle has happened.
+    #[test]
+    fn completion_tracker_honours_an_autostart_loss_during_the_wait() {
+        let t0 = Instant::now();
+        let stall = COMPLETION_PROGRESS_STALL;
+        let mut tracker = CompletionTracker::new();
+        // Autostarted: stalled progress is not completion.
+        assert!(!tracker.observe("play", Some(500), t0, false));
+        assert!(!tracker.observe("play", Some(500), t0 + stall * 2, false));
+        // A pause is accepted mid-wait, then a resume.
+        assert!(!tracker.observe("pause", Some(500), t0 + stall * 3, true));
+        assert!(!tracker.observe("play", Some(500), t0 + stall * 4, true));
+        assert!(
+            !tracker.observe("play", Some(500), t0 + stall * 4 + stall / 2, true),
+            "the resume restarted the stall clock"
+        );
+        assert!(
+            tracker.observe("play", Some(500), t0 + stall * 5, true),
+            "the drained, no-longer-autostarted item completes"
+        );
+        // The flag is consulted per observation: without it the same stall is
+        // still a fault.
+        let mut tracker = CompletionTracker::new();
+        assert!(!tracker.observe("play", Some(500), t0, false));
+        assert!(!tracker.observe("play", Some(500), t0 + stall * 2, false));
+        assert!(tracker.observe("play", Some(500), t0 + stall * 2, true));
     }
 
     #[test]
@@ -7763,6 +7812,29 @@ fn serve(stream: std::net::TcpStream) {
             .unwrap();
             let media = root.path().join("fixture.wav");
             write_startup_wav(&media, seconds);
+            Self::with_media(daemon, client, runtime, controller, rx, root, marker, media)
+        }
+
+        /// A fixture whose media is `pcm_bytes` of PCM — small enough to sit
+        /// entirely in the FIFO's buffer, so the pump reaches EOS and closes
+        /// the writer whether or not the daemon is reading.
+        fn start_brief(pcm_bytes: u32) -> Self {
+            let fixture = Self::start(1);
+            write_pcm_wav(&fixture.media, pcm_bytes);
+            fixture
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn with_media(
+            daemon: RecordingOwnedDaemon,
+            client: OwnToneClient,
+            runtime: tokio::runtime::Runtime,
+            controller: crate::audio::airplay_output::ControllerHarness,
+            rx: async_channel::Receiver<PlayerEvent>,
+            root: tempfile::TempDir,
+            marker: String,
+            media: PathBuf,
+        ) -> Self {
             Self {
                 daemon,
                 client,
@@ -7798,6 +7870,95 @@ fn serve(stream: std::net::TcpStream) {
             let competing = open_lock(&self.daemon.config.lock_path()).unwrap();
             rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_ok()
         }
+    }
+
+    /// R10: a pause accepted after the writer already closed. The item was
+    /// autostarted when the drain wait began, so a stalled `play` was a
+    /// fault; the pause/resume cycle loses the autostart binding while that
+    /// wait is running, and the pinned daemon then never reports `stop`. The
+    /// wait must notice the lost binding as it happens and complete the
+    /// rendered item instead of timing out into an Error.
+    #[cfg(owntone_host)]
+    #[test]
+    fn a_pause_after_the_writer_closed_still_completes_naturally() {
+        // 40 KB of PCM fits the FIFO's buffer: the pump reaches EOS and closes
+        // the writer even though the daemon is only reading its first chunk.
+        let fixture = DaemonControllerFixture::start_brief(40 * 1024);
+        let controller = &fixture.controller;
+        let client = &fixture.client;
+        let stall = fixture.daemon.config.pipe_path.with_extension("stall");
+        let baseline = client.outputs().unwrap();
+        // The recording daemon reads one chunk (it must observe PCM to report
+        // `play`), then holds off reading while the sentinel exists.
+        std::fs::write(&stall, b"").unwrap();
+        let prepared = fixture.prepare();
+        let ticket = prepared.ticket().unwrap();
+        let generation = PlayerEventGeneration::from_raw(48);
+        controller.set_generation(generation);
+        controller.load(generation, prepared);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        wait_until(
+            || matches!(client.player_progress(), Ok((ref s, Some(p))) if s == "play" && p > 0),
+        );
+        // Everything the pump had is now buffered in the FIFO and the writer
+        // is closed; the drain wait is running against an autostarted item.
+        std::thread::sleep(Duration::from_millis(500));
+
+        controller.pause();
+        wait_until(|| controller.state() == PlayerState::Paused);
+        assert_eq!(client.player_state().unwrap(), "pause");
+        controller.play();
+        wait_until(|| controller.state() == PlayerState::Playing);
+        assert_eq!(client.player_state().unwrap(), "play");
+        // Let the daemon read again: the pipe is dry and no longer
+        // autostarted, so its progress stalls under `play`.
+        std::fs::remove_file(&stall).unwrap();
+
+        let mut events = Vec::new();
+        wait_until_within(Duration::from_secs(20), || {
+            events.extend(fixture.drain_events());
+            events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
+        });
+        wait_until(|| ticket.route_count() == 0);
+        wait_until(|| controller.state() == PlayerState::Stopped);
+        events.extend(fixture.drain_events());
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::Error { .. })),
+            "a pause after the writer closed must not fail the item: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert!(
+            events.iter().all(|event| event.generation() == generation),
+            "{events:?}"
+        );
+        let ended = events
+            .iter()
+            .position(|event| matches!(event, PlayerEvent::TrackEnded { .. }))
+            .unwrap();
+        assert!(
+            !events[ended..].iter().any(|event| matches!(
+                event,
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Playing | PlayerState::Paused,
+                    ..
+                }
+            )),
+            "no play/pause may follow the terminal TrackEnded: {events:?}"
+        );
+        assert_outputs_match(client, &baseline);
+        assert!(!fixture.daemon.config.takeover_record().exists());
+        assert!(fixture.lock_is_free());
     }
 
     /// Pinned OwnTone autostops a pipe only while it is *autostarted*: a
@@ -8100,7 +8261,11 @@ fn serve(stream: std::net::TcpStream) {
     fn write_startup_wav(path: &Path, seconds: u32) {
         // Thirty seconds of valid stereo 44.1kHz s16 PCM, long enough to
         // observe live playback before driving Stop through the worker.
-        let size = 44_100_u32 * 4 * seconds;
+        write_pcm_wav(path, 44_100_u32 * 4 * seconds);
+    }
+
+    /// Valid stereo 44.1kHz s16 PCM of exactly `size` data bytes.
+    fn write_pcm_wav(path: &Path, size: u32) {
         let mut wav = b"RIFF".to_vec();
         wav.extend((size + 36).to_le_bytes());
         wav.extend(b"WAVEfmt ");
