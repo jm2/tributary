@@ -87,7 +87,19 @@ pub mod widget_test_session {
     ///
     /// `label` names the calling test so the printed skip reason stays
     /// attributable to the test that produced it.
+    ///
+    /// Positive display-backed acceptance runs (see
+    /// `docs/acceptance-p2.3-c.md`) set `TRIBUTARY_WIDGET_TESTS_FAIL_CLOSED`:
+    /// both skip paths below then panic instead of returning `None`, so a
+    /// green suite can only mean the widget contracts actually executed. A
+    /// misconfigured display setup (e.g. a Broadway daemon GTK 4 cannot
+    /// initialize against) then fails the run loudly instead of silently
+    /// skipping every widget assertion behind an otherwise-green suite.
+    /// Leave the variable unset for the default headless behavior, where
+    /// skipping is the intended, reported outcome.
     pub fn acquire(label: &str) -> Option<MutexGuard<'static, ()>> {
+        let fail_closed = std::env::var_os("TRIBUTARY_WIDGET_TESTS_FAIL_CLOSED").is_some();
+
         // A panicked earlier test must not cascade into every later widget
         // test: the data the guard protects is stateless (just ordering),
         // so a poisoned lock is safe to carry on from.
@@ -95,7 +107,17 @@ pub mod widget_test_session {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
+        let has_display_session =
+            std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
+        if !has_display_session {
+            assert!(
+                !fail_closed,
+                "{label}: FAIL-CLOSED positive run: no display session \
+                 ($WAYLAND_DISPLAY/$DISPLAY unset); refusing to skip. \
+                 Start the matching GTK 4 Broadway daemon \
+                 (gtk4-broadwayd) and export DISPLAY/BROADWAY_DISPLAY \
+                 before re-running."
+            );
             eprintln!(
                 "{label}: no display session ($WAYLAND_DISPLAY/$DISPLAY \
                  unset); skipping. Re-run inside a desktop session to \
@@ -106,6 +128,13 @@ pub mod widget_test_session {
 
         if !gtk::is_initialized() {
             if let Err(e) = gtk::init() {
+                assert!(
+                    !fail_closed,
+                    "{label}: FAIL-CLOSED positive run: GTK unavailable \
+                     ({e}); refusing to skip. Verify the display session \
+                     belongs to a GTK 4-compatible server (gtk4-broadwayd, \
+                     not the GTK 3 broadwayd) before re-running."
+                );
                 eprintln!(
                     "{label}: GTK unavailable ({e}); skipping. Re-run on a \
                      box with a display session (or under a Broadway \
