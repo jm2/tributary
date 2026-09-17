@@ -419,8 +419,14 @@ def run_checks(
     problems.extend(check_counters(text, records))
     problems.extend(check_links(root, markdown_files))
     if ledger is not None:
-        snapshot = json.loads(ledger.read_text(encoding="utf-8"))
-        problems.extend(check_ledger(snapshot, records, task_index))
+        try:
+            snapshot = json.loads(ledger.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            # A missing or malformed snapshot is a reportable failure, not an
+            # uncaught traceback: the checker's contract is a `[FAIL]` line.
+            problems.append(f"ledger: cannot read snapshot {ledger} ({error})")
+        else:
+            problems.extend(check_ledger(snapshot, records, task_index))
     return records, markdown_files, problems
 
 

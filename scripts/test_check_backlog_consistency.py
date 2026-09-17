@@ -329,6 +329,15 @@ class BacklogConsistencyTests(unittest.TestCase):
             checker.main(["--root", str(root), "--ledger", str(snapshot), "--quiet"]), 0
         )
 
+    def test_main_rejects_malformed_ledger_snapshot(self):
+        root = self.make_root()
+        self.write(root, "docs/task.md", counter_paragraph() + sample_records())
+        malformed = self.write(root, "docs/ledger.json", "{not valid json")
+        self.assertEqual(
+            checker.main(["--root", str(root), "--ledger", str(malformed), "--quiet"]),
+            1,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
