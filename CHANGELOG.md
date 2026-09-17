@@ -61,6 +61,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bundle build instead of once per plugin that links it, and apply each binary's equivalent
   `install_name_tool -change` edits in a single invocation. Forbidden-component policy is
   unchanged: a rejected source still aborts before any copy or edit is applied.
+- **Browser and tracklist presentation** (`src/ui/browser.rs`, `src/ui/tracklist.rs`,
+  `src/ui/preferences.rs`, `src/ui/style.css`) — Align the library browser and tracklist
+  with the GNOME HIG. Tracklist rows drop the per-row separator lines in favor of Adwaita's
+  dense-list vertical rhythm, so the list no longer reads as a grid. Browser panes are
+  divided by a 1px low-opacity gutter that reads as a gutter rather than a hard divider;
+  when a pane is disabled, the panes on either side keep exactly one gutter between them
+  and no gutter dangles at a window edge. Item counts in the browser panes render as dimmed
+  secondary caption text with a raised legibility floor so they stay readable at small
+  sizes, and rows without a count render no "(0)". The tracklist status bar aligns to the
+  column gutter via the `.statusbar-box` rule instead of custom per-widget margins. Screen
+  readers announce each browser row as a single utterance ("Artist Name, (12)") at the
+  list-row boundary, and recycled rows never announce a stale label.
 
 ### Fixed
 
