@@ -131,53 +131,17 @@ pub async fn resolve_kind(
 ) -> ResolvedArtKind {
     match classify_pane_authority(source_registry.is_some(), source_id, source_epoch) {
         PaneAuthority::Registry => {
-            let (registry, id, epoch) = (
+            resolve_registry_art(
                 source_registry
                     .as_ref()
                     .expect("registry authority requires a handle"),
                 source_id.expect("registry authority requires a source id"),
                 source_epoch.expect("registry authority requires a session epoch"),
-            );
-            // Retained local-media authority first, chosen by the live
-            // adapter's authoritative capability — NOT by the row's raw
-            // locator: production registry rows are pathless (their URI
-            // is empty), yet a mounted removable album still resolves to a
-            // retained file beneath its mount authority. The capability
-            // check is cheap and synchronous, so it mints no stream
-            // credential and reopens no pathname merely to discover the
-            // source kind (2026-09-14 review finding).
-            if registry.retains_file_streams(id, epoch) {
-                // The retained route reaches adapter code that polls Tokio
-                // time/blocking APIs (`acquire_retained_probe_permit`
-                // constructs a `tokio::time::timeout_at`), which panics on
-                // the runtime-less GTK main context this fetch is driven on.
-                // Dispatch it onto the application runtime and abort it if
-                // the row is revoked mid-flight; a revoked or
-                // missing-runtime row fails closed (2026-09-17 review
-                // finding). Only a genuine remote/refused result may fall
-                // through to the lease-isolated remote resolver below.
-                let owned_registry = registry.clone();
-                let owned_candidate = candidate.clone();
-                match resolve_on_application_runtime(rt_handle.clone(), liveness, async move {
-                    resolve_retained_file_art(&owned_registry, &id, epoch, &owned_candidate).await
-                })
-                .await
-                {
-                    RuntimeResolution::Completed(Some(resolved)) => return resolved,
-                    // `Ok(Http)` or an error means the retained local route
-                    // did not produce a file capability; fall through to the
-                    // lease-isolated remote resolver for this registry-backed
-                    // row. Never a raw pathname.
-                    RuntimeResolution::Completed(None) => {}
-                    RuntimeResolution::Aborted => return ResolvedArtKind::NoArtwork,
-                }
-            }
-            // Lease-isolated remote resolver. For a registry-backed row
-            // this is TERMINAL: an explicit no-artwork or a refused
-            // resolution leaves the placeholder rather than falling
-            // through to the row's stale snapshot URL (2026-09-12 review
-            // finding).
-            resolve_remote_artwork(registry, &id, epoch, candidate).await
+                rt_handle,
+                candidate,
+                liveness,
+            )
+            .await
         }
         PaneAuthority::BuiltinLocal => {
             resolve_builtin_local_art_on_runtime(
@@ -204,6 +168,66 @@ pub async fn resolve_kind(
         // OS-opened external files) keep the transitional direct path.
         PaneAuthority::External => resolve_external_art(candidate),
     }
+}
+
+/// The registry-backed arm of the pane resolver: the retained
+/// local-media authority first, then the lease-isolated remote artwork
+/// resolution as the terminal fallback.
+///
+/// Extracted verbatim from [`resolve_kind`] so the authority dispatch
+/// stays inside the per-method size budget (2026-09-17 refinery audit,
+/// Codacy 105307205459); every boundary moves with it unchanged — the
+/// retained route is chosen by the live adapter's authoritative
+/// capability, runs on the application runtime with mid-flight
+/// revocation aborting it, and the remote resolution is terminal.
+async fn resolve_registry_art(
+    registry: &crate::source_registry::SourceRegistry,
+    id: SourceId,
+    epoch: u64,
+    rt_handle: Option<tokio::runtime::Handle>,
+    candidate: &AlbumArtCandidate,
+    liveness: &album_art::ScopedArtFetch,
+) -> ResolvedArtKind {
+    // Retained local-media authority first, chosen by the live
+    // adapter's authoritative capability — NOT by the row's raw
+    // locator: production registry rows are pathless (their URI
+    // is empty), yet a mounted removable album still resolves to a
+    // retained file beneath its mount authority. The capability
+    // check is cheap and synchronous, so it mints no stream
+    // credential and reopens no pathname merely to discover the
+    // source kind (2026-09-14 review finding).
+    if registry.retains_file_streams(id, epoch) {
+        // The retained route reaches adapter code that polls Tokio
+        // time/blocking APIs (`acquire_retained_probe_permit`
+        // constructs a `tokio::time::timeout_at`), which panics on
+        // the runtime-less GTK main context this fetch is driven on.
+        // Dispatch it onto the application runtime and abort it if
+        // the row is revoked mid-flight; a revoked or
+        // missing-runtime row fails closed (2026-09-17 review
+        // finding). Only a genuine remote/refused result may fall
+        // through to the lease-isolated remote resolver below.
+        let owned_registry = registry.clone();
+        let owned_candidate = candidate.clone();
+        match resolve_on_application_runtime(rt_handle, liveness, async move {
+            resolve_retained_file_art(&owned_registry, &id, epoch, &owned_candidate).await
+        })
+        .await
+        {
+            RuntimeResolution::Completed(Some(resolved)) => return resolved,
+            // `Ok(Http)` or an error means the retained local route
+            // did not produce a file capability; fall through to the
+            // lease-isolated remote resolver for this registry-backed
+            // row. Never a raw pathname.
+            RuntimeResolution::Completed(None) => {}
+            RuntimeResolution::Aborted => return ResolvedArtKind::NoArtwork,
+        }
+    }
+    // Lease-isolated remote resolver. For a registry-backed row
+    // this is TERMINAL: an explicit no-artwork or a refused
+    // resolution leaves the placeholder rather than falling
+    // through to the row's stale snapshot URL (2026-09-12 review
+    // finding).
+    resolve_remote_artwork(registry, &id, epoch, candidate).await
 }
 
 /// Resolve a truly external row (no authority chain) through the
