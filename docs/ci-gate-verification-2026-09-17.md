@@ -20,9 +20,18 @@ pack configuration was changed by this verification.
   (`sha:aab8030d397c211be6a4d460e9ce8de39e867a09`, "pr-pipeline: refuse an
   oversized PR review before spending", pinned in `city.toml` imports).
 - `.gc/operations/reconcile.py` — the guarded reconciler that is the live
-  completion gate (735 lines, read in full).
+  completion gate (769 lines at review SHA
+  d49cbfeebfb10b367657247819b3bab2933b2a26297cf1cfbe01c8cb772b0177, read in
+  full).
 - `.gc/operations/orders/tributary-reconcile.toml` — the order that executes
   the gate.
+- Direct probes of the live `reconcile.py` functions (`decide`,
+  `rejection_rounds`, `exhausted_rounds`, `notify_rounds`), run against
+  fixtures under `${TMPDIR:-/var/tmp}` with no production mutation and no
+  `--apply` side effects. Probe inputs and outputs are quoted where a
+  behavioral claim depends on them. The behavioral regression suite
+  `.gc/operations/test_reconcile.py` (83 tests) is cited by test name where
+  it pins the probed behavior.
 - `python3 .gc/operations/reconcile.py` executed **without `--apply`** on
   2026-09-17: a dry run of the live gate against real beads and open PRs.
 - GitHub API (read-only): the default-branch ruleset and the open-PR rollup
@@ -69,22 +78,51 @@ The live completion gate is `.gc/operations/reconcile.py`, executed by the
 - The GitHub `statusCheckRollup` is observed for every open PR head.
 - An empty or missing rollup parks the bead as `pending` — "an empty set is
   not a passing gate".
-- Any check result outside the known conclusion set parks as `pending`
-  (unknown results never read as green).
-- Any check whose conclusion is not COMPLETED parks as `pending`
-  (`{name}: not completed`).
-- Only after every check is COMPLETED are conclusions evaluated: any
-  failure-class conclusion (FAILURE, ERROR, CANCELLED, TIMED_OUT,
-  ACTION_REQUIRED, STARTUP_FAILURE) routes the bead back to the polecat pool
-  as `rework` with the failing check named in `rejection_reason`; otherwise
-  the bead is merge-candidate only if at least one check is SUCCESS.
+- **Failure-first scan.** Before any incompleteness is considered, every
+  check in the rollup is scanned for a failure-class conclusion (FAILURE,
+  ERROR, CANCELLED, TIMED_OUT, ACTION_REQUIRED, STARTUP_FAILURE). The first
+  one found routes the bead back to the polecat pool as `rework` with the
+  failing check named in `rejection_reason` — regardless of its position in
+  the rollup and regardless of how many other checks are still queued or
+  unknown. GitHub's rollup order is not a priority order: a queued job must
+  not hide a completed failure and strand its corrective work. Direct probe
+  of the live `decide()` — rollup `[Security Audit: IN_PROGRESS/queued,
+  Windows: COMPLETED/FAILURE]` returns `('rework', 'Windows: FAILURE')`;
+  reversing the rollup order returns the same. Regression test:
+  `test_pending_check_never_masks_failed_job_in_either_rollup_order`.
+- **Pending/unknown scan, gating checks.** Only after the failure scan finds
+  nothing are unfinished results considered, and only for *gating* checks —
+  the live ruleset-required contexts plus the city gates (`Codacy Static
+  Code Analysis`, `Coverage (Linux x86_64)`). A gating check whose
+  **status** is not COMPLETED parks as `pending` (`<name>: not completed`);
+  a gating check whose **conclusion** is outside the pass set (SUCCESS,
+  NEUTRAL, SKIPPED) parks as `pending` (`<name>: unknown or pending result
+  …`). An unfinished *optional* check is skipped: the ruleset would not
+  block the merge on it either, and a failed optional check was already
+  caught by the failure-first scan. If no gating check concluded SUCCESS,
+  the bead parks as `pending` ("no successful checks (all skipped/neutral)").
+- **Status vs conclusion.** `COMPLETED` is the check *status* field;
+  SUCCESS/FAILURE/etc. are *conclusions*. A conclusion value is never
+  "COMPLETED" — probe: a gating check with status `COMPLETED` and an empty
+  conclusion is pending, not passed:
+  `('pending', "Security Audit: unknown or pending result ''")`.
+- **Pending is a remainder, not a blanket state.** `decide()` evaluates,
+  before checks are even observed: scope and PR-identity guards, exact-head
+  and branch/base match, review holds and draft disposition (→ `hold`),
+  operator audit reject at this head (→ `hold`), unresolved
+  changes-requested reviews (→ `rework`), and independent approval evidence
+  (→ `review`). A held, draft, changes-requested, or failure-flagged PR
+  never reads as merely pending, whatever its checks are doing.
 
 Because there is no timer, the failure mode tr-3h7 documented — a green
 branch rejected as "pending at deadline" while slow checks were still
 in flight — is structurally eliminated: a slow branch simply stays pending
-until the checks conclude. Pending state is parked with
-`merge_result = pull_request_pending` and `gc.routed_to = human`; the next
-reconciliation pass re-examines it with no operator action required.
+until the checks conclude, provided no earlier condition (hold, draft,
+changes-requested, review evidence, a failure conclusion) applies — pending
+is what remains when nothing worse was observed. Pending state is parked
+with `merge_result = pull_request_pending` and `gc.routed_to = human`
+(`reconcile_one`); the next reconciliation pass re-examines it with no
+operator action required.
 
 The only timeouts in the live gate are the 90-second bound on each `gh`/`gc`
 subprocess call and the four-minute ceiling of the order itself — both are
@@ -140,33 +178,115 @@ adjacent path:
   invalidates readiness and skips the action.
 - Any observation error (API failure, subprocess timeout) invalidates stored
   readiness evidence repo-wide for that pass rather than implying a verdict.
-- A draft PR parks (`pending`) with a human-disposition reason.
-- Unknown check conclusions park; they are never treated as passing.
+- A draft PR is a **hold**, not a pending. The direct live probe returns
+  `('hold', 'draft or unknown draft status; human disposition required')`,
+  and `reconcile_one` stores that disposition as `merge_result = blocked`
+  with `gc.routed_to = human` while preserving `status = open` — the bead is
+  parked for human disposition; it is not recorded as waiting on CI and the
+  PR itself is never touched.
+- Unknown check conclusions on gating checks park; they are never treated as
+  passing (see Finding 2 for the gating/optional distinction).
+- **Corrective review alongside a hold is an explicit opt-in, not a hold
+  bypass.** For an open bead with `review.corrections_while_held = "true"`,
+  a merge hold coexists with corrective-review routing:
+  - a new unresolved code-finding thread at the current head yields action
+    `review` — `unresolved review thread at <path>:<line>; merge hold
+    remains`;
+  - an unreviewed corrective handoff (`merge_result = review_required` with
+    no current-head approval) yields `review` — "corrective handoff needs
+    independent review; merge hold remains";
+  - missing, incomplete, or stale-head review evidence yields `pending`
+    ("complete current-head review evidence is missing") until current-head
+    evidence exists;
+  - clean current-head evidence yields `hold` again — the underlying hold
+    was never cleared.
+  Probed I/O (live `decide()`, held + opted-in draft bead): missing evidence
+  → `pending`; stale head `cccc…` → `pending`; clean current evidence →
+  `('hold', 'unresolved review hold; corrective work does not authorize
+  completion')`; unresolved thread at `preflight.sh:114` → `review`,
+  reason ending `; merge hold remains`. Behavioral pins:
+  `test_opted_in_draft_gets_new_findings_reviewed_without_clearing_hold`
+  (draft stays draft, `review_hold` untouched, refinery assigned with
+  `merge_result = review_required`) and
+  `test_held_review_poll_fetches_current_evidence_and_returns_to_hold_when_clean`.
+  A `review` action assigns the refinery to adjudicate the finding; it never
+  authorizes merging a held or draft PR.
 
-## Finding 5 — finite correction routing (verified in source and live)
+## Finding 5 — correction routing: counters, acknowledgement, and a live coverage gap
 
-Correction rounds are finite and bounded by `reconcile.py` constants:
+Correction routing is bounded by `reconcile.py` constants and directory
+counting. Three things are verified here: what a "round" actually counts,
+what the acknowledgement metadata actually does, and a deployment gap in
+which most live rejection directories never advance any counter.
 
-- A "round" is one refinery rejection directory
-  (`.gc/operations/reviews/refinery-<bead>-<date>`); routing state advances
-  per source bead.
-- `NOTIFY_ROUNDS = 6`: after six rounds the operator receives a single
-  informational mail; routing to the polecat pool continues.
-- `PARK_AFTER_ROUNDS = 12`: after twelve rounds the bead is parked for the
-  human — `review_hold` set, rework authorization off, no further
-  automatic rework routing. This is the spend valve.
-- `recovery.rounds_acknowledged = <n>` metadata on a bead raises both
-  thresholds by `n`, recording operator acknowledgement of progress.
-- The hard pool rerouting mechanism is disabled (`HARD_POOL = None` since
-  2026-09-16); only the standard polecat pool is used for rework.
+**What a round counts.** `rejection_rounds(bead_id)` counts directories
+matching the glob `refinery-*-<bead-id>` under
+`.gc/operations/reviews/` — the bead id must be the **last**
+dash-separated field. A directory named with the bead id *first*
+(`refinery-<bead>-<date>`) does **not** count. Direct probe of the live
+function against a temporary root containing four directories —
+`refinery-tr-probe-20260917`, `refinery-20260917-tr-probe`,
+`refinery-20260917T1430-tr-probe`, `refinery-20260917-tr-other` — returns:
+
+- `rejection_rounds('tr-probe') = 2` — only the two bead-last names
+  (`refinery-20260917-tr-probe`, `refinery-20260917T1430-tr-probe`) count;
+  the bead-first name `refinery-tr-probe-20260917` does not;
+- `rejection_rounds('tr-other') = 1`;
+- `rejection_rounds('tr-absent') = 0` — a bead with no bead-last directory
+  has zero recorded rounds regardless of what else the root contains.
+
+**Operator finding (live coverage gap).** In the live reviews root, 127
+`refinery-*` directories exist, and 81 of them do **not** match the counted
+glob — timestamp-only names such as `refinery-20260911T045659Z` match no
+bead at all, and bead-first names count for nothing. Directories that do
+count for a bead include `refinery-20260915-tr-xaj` and the
+`refinery-<date>-tr-t3a` family. Consequence: these directories prove that
+reviews happened, but most of them advanced no round counter, so per-bead
+round counts can undercount actual rejection history. Finite routing is
+verified as implemented (below); the claim "all live rounds are bounded and
+counted" is **not** supported by the directory evidence. Recording the
+mismatch here is the operator finding; renaming directories or changing the
+glob is a live-policy change outside this verification's scope.
+
+**Nominal constants (source-verified).**
+
+- `NOTIFY_ROUNDS = 6`, `PARK_AFTER_ROUNDS = 12`, `HARD_POOL = None` (with
+  the hard-pool threshold constant `HARD_POOL_AFTER = 3` inert while
+  `HARD_POOL` is None); only the standard polecat pool is used for rework.
+- Park: `exhausted_rounds()` returns the round count only when
+  `count >= 12` **and** `count > acknowledged`; otherwise 0. When it fires,
+  `park_exhausted` sets a `review_hold` (prefix "Parked by
+  tributary-reconcile"), turns `recovery.rework_authorized` off, routes the
+  bead to the human, and records `recovery.rounds_parked`. This is the
+  spend valve; the park is itself a hold, so later ticks keep it at `hold`.
+- `recovery.rounds_acknowledged = <n>` metadata does **not** raise both
+  thresholds by `n`. It changes the comparison: the park requires strictly
+  more unacknowledged rounds, and the recorded park count is the full
+  count, not `12 + n`. Probed I/O of the live function (acknowledged = 12):
+  count 12 → `0` (not parked), count 13 → `13`, count 23 → `23`;
+  acknowledged = 0: count 11 → `0`, count 12 → `12`.
+- Notify: `notify_rounds()` emits the single informational mail when
+  `count >= 6` **and** `count > acknowledged` **and**
+  `recovery.rounds_notified < 6`, then records `recovery.rounds_notified`.
+  Counts at or below the acknowledged count notify nothing; once notified,
+  a source is never re-notified. Routing to the polecat pool continues
+  throughout — this is visibility, not a gate. Probed I/O (live function,
+  `--apply`-less): acknowledged = 6 at count 6 → no notification; already
+  notified at 6 → no re-notification; first crossing of 6 → exactly one
+  `notify_rounds` event.
 - Foreign or operator-owned holds are never overwritten by the routing
-  machinery; release paths are explicit (operator acknowledgement, or a
-  refinery hold whose reason is superseded by a later head).
+  machinery (`park_exhausted` keeps a foreign hold as `keep_foreign_hold`);
+  release paths are explicit (operator acknowledgement covering the round
+  count, or a refinery hold whose reason is superseded by a later head).
 
-Live review directories for 2026-09-17 (`refinery-tr-xaj-…`,
-`refinery-tr-47yad-…`, `refinery-20260917T1430-tr-dkk`, …) and the
-`polecat-tr-3asjp-rework-20260917` directory show the round machinery
-operating on real work.
+The earlier draft of this report cited directory names such as
+`refinery-tr-xaj-…` and `refinery-tr-47yad-…` as evidence that "the round
+machinery [is] operating"; per the counting rule above, bead-first names
+like those are not counted rounds, and a `polecat-*-rework-*` directory was
+never a refinery rejection round at all. The corrected claim is the scoped
+one: the counter, park, and acknowledgement logic is verified at the
+function level with the probes above; live directory coverage is partial
+(operator finding), so directory counts understate rejection history.
 
 ## Finding 6 — preserved holds (verified live)
 
@@ -176,12 +296,18 @@ Hold semantics in the live gate, unchanged and enforced:
   discipline) or a `hold:` label parks the bead as `blocked`, routed to the
   human. The gate never infers clearance from a successful check, a later
   commit, or the words "hold cleared" in notes.
-- An operator audit verdict of `reject` at the current head parks the bead.
+- An operator audit verdict of `reject` at the current head parks the bead
+  (`hold`, "operator self-review found unresolved defects at this head; see
+  audit.report").
 - A repair authorization allows corrective coding; it never clears a hold —
   "corrective work does not authorize completion" is the exact live
   decision string.
 - Holds are evaluated before checks, so a held bead stays held regardless
-  of CI color.
+  of CI color. The one exception-shaped path is the explicit
+  `review.corrections_while_held` opt-in described in Finding 4, which can
+  raise a `review` action for new findings or an unreviewed corrective
+  handoff *while the merge hold remains* — it never clears the hold,
+  undrafts the PR, or authorizes a merge.
 
 ## Fresh execution evidence (2026-09-17, dry run)
 
@@ -208,11 +334,48 @@ play.
   concept) by the deterministic reconciler. The stale claim in
   `docs/refinery-config.md` is corrected by the commit that adds this
   report.
-- The live gate has **no CI timeout**: pending checks park a PR
-  indefinitely and fail-closed until the checks conclude.
+- The live gate has **no CI timeout**: a failure conclusion routes rework
+  immediately — even while other checks are still pending, in either rollup
+  order — and pending is the fail-closed remainder: a slow PR parks
+  indefinitely until its gating checks conclude, unless an earlier
+  condition (hold, draft, changes-requested, review evidence) applies
+  first.
 - Exact check contexts: seven ruleset-required contexts (listed above),
   while the completion gate enforces the operator's stricter all-green
   policy over every observed check on the exact head.
-- Pending non-green behavior, finite correction routing (6 → notify,
-  12 → park), and preserved holds are all implemented as documented and
-  were observed live.
+- Failure-first non-green behavior is implemented as documented and probed
+  against the live functions. Correction routing constants (6 → notify,
+  12 → park) are verified at the function level, with the acknowledgement
+  semantics corrected above; live directory counting undercounts rejection
+  history (operator finding), so directory evidence alone does not bound
+  live rounds. Preserved holds — including the ordinary draft/hold
+  disposition and the corrective-review opt-in — are implemented and probed
+  as described.
+
+## Corrections in this revision (audit R1/R2/R3 mapping)
+
+- **R1 → Finding 2 (and the Conclusion's pending bullet).** Replaced the
+  "only after every check is COMPLETED are conclusions evaluated" claim
+  with the live failure-first scan (probe:
+  `('rework', 'Windows: FAILURE')` in both rollup orders; regression test
+  `test_pending_check_never_masks_failed_job_in_either_rollup_order`);
+  corrected status (`COMPLETED`) vs conclusion (`SUCCESS`/`FAILURE`/…)
+  terminology; qualified every blanket "stays pending" claim with the
+  earlier hold/review/changes-requested/failure conditions that win first.
+- **R2 → Finding 5 (and the Conclusion's routing bullet).** Documented the
+  real counted naming pattern (`refinery-*-<bead>`, bead id last) with
+  probed input/output; corrected the acknowledgement claim
+  (`count >= 12 and count > acknowledged`, not "thresholds raised by n";
+  probed 0/13/23 at acknowledged = 12); documented `notify_rounds`
+  suppression; recorded the 81-of-127 uncounted live review directories as
+  an operator finding instead of claiming all live rounds are bounded.
+- **R3 → Finding 4 (and Finding 6's hold bullet).** Corrected the draft
+  disposition from `pending` to `hold` with the exact live reason string
+  and `reconcile_one` storage (`merge_result = blocked`,
+  `gc.routed_to = human`, `status = open` preserved); documented the
+  `review.corrections_while_held` corrective-review opt-in (new findings →
+  `review`, unreviewed handoff → `review`, missing evidence → `pending`,
+  clean evidence → back to `hold`) with probed I/O and the behavioral
+  tests `test_opted_in_draft_gets_new_findings_reviewed_without_clearing_hold`
+  and `test_held_review_poll_fetches_current_evidence_and_returns_to_hold_when_clean`,
+  without implying it authorizes merging or weakens holds.
