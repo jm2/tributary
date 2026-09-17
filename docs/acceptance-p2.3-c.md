@@ -149,6 +149,49 @@ c31eba1f27a3619f15db773eb7348ae13574af21e8dd9442f55feeac225bc1ce  suite-positive
 3b395db9057cae180120827db29be24747a138ade84c853012dbb4a2f399fd8c  variant-r2-GTK_THEME-Raleigh.log
 ```
 
+## Harness validation (revision 3)
+
+The refinery repeat review rejected the revision-2 harness block itself
+(R1): the reproduction extracted the exact published text, injected a
+`cargo` function returning 101, and the block still exited 0 — `SUITE=$?`
+after `cargo | tee` reports tee's status, and nothing required the
+contract ok-line. The block above was rewritten (direct log redirect so
+nothing sits between cargo and the status, required contract ok-line,
+explicit readiness-timeout failure, EXIT-trap daemon cleanup) and then
+validated against the published text exactly as the reviewer probed it:
+extracted verbatim from this document, with only a prepended shell
+function or environment for each injection. Run on this host 2026-09-17,
+`gtk4-broadwayd :6`, shared isolated runtime dir, fail-closed set.
+
+| Run | Outcome |
+|-----|---------|
+| Success: published block as written, full suite | **exit 0** in 164 s; contract ok-line present; **0** skip diagnostics; top-level totals 20 + 1871 + 30 = 1921 passed / 0 failed — same profile as the r2 display-backed row above. |
+| Injection: `cargo` returns 101 with a compilation-error line (the R1 repro) | **exit 1** (the r2 block returned 0 here); suite log contains only the injected failure, no contract, no suite. |
+| Injection: `cargo` exits 0 with a green-suite log missing the contract ok-line | **exit 1** — the required-contract check fails a green-but-unexercised run even with cargo at 0 and no skip diagnostics. |
+| Injection: `cargo` exits 0 with the `GTK unavailable` skip diagnostic (plus contract ok-line, to isolate this layer) | **exit 1** — the zero-skip-diagnostic greps still catch a green suite that never exercised the contract. |
+| Injection: `gtk4-broadwayd` replaced by a process that never creates the socket | **exit 1 after ~10 s** (readiness loop exhausts instead of falling through); the injected daemon process is reaped by the EXIT trap — no stray daemon or socket remains. |
+
+Raw harness-validation logs retained off-repo under
+`${TMPDIR:-/var/tmp}/tr3asjp-harness-r3/`, sha256-fingerprinted
+(`published-block.sh` is the verbatim extraction of the fenced block
+above at the time of the runs):
+
+```
+82a0bb9b4a220cc9345787287e64e62241a3b0e0422df7ee290f0cf586b1d69b  published-block.sh
+24f74795b160f186dbbde2c5180ba87d6bda2032c1fb88aa80e0ef76c70849ea  v1-suite.log
+b553eb1cedf8be53aab7f0ef85915d13c17f5c5412b7637c4c7cfe84a92297fa  v1-daemon.log
+7488fc28f4f208e6e3256d6135f12798896fb92f4ade51f19bb40d8e5a1996b9  v2-suite.log
+4346ae6acd7100b4f077871d9ad0e878d50b715a3bb7b94e1306aaf2989f472b  v3-suite.log
+0439df4823e159c3c27fc50de5f1420a5e316a40880d2b7e033f65ea40706d72  v4-suite.log
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  v5-runner.out
+```
+
+The V5 daemon-timeout run leaves no suite log by design (it exits before
+cargo starts); its runner transcript (`v5-runner.out`) and the generated
+injection scripts are retained alongside the logs. Physical/Orca/
+high-contrast validation remains operator-owned and is not claimed by any
+of these runs.
+
 What the consolidated contract (`ui::browser::tests::
 gtk_widget_contracts_hold_on_one_session`) actually asserts while a GTK session
 is up: combined accessible label "Label, (Count)" published on the
