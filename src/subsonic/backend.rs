@@ -23,8 +23,8 @@ use crate::architecture::{
 };
 
 use super::api::{AlbumEntry, ArtistEntry, SongEntry};
-use crate::source_registry::PlaybackAttributionProfile;
 use super::client::SubsonicClient;
+use crate::source_registry::PlaybackAttributionProfile;
 
 /// Maximum number of per-artist / per-album metadata fetches kept in
 /// flight at once while loading the full library.  Bounds concurrency so a

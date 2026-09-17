@@ -539,7 +539,11 @@ impl ApplicationOwner {
 
     async fn activate(
         &mut self,
-        activation: LastFmApplicationActivation,
+        // Consumed as the move-only proof of explicit consent only: its
+        // frozen source set is deliberately never read, because dispatch
+        // authority is re-derived from the live policy generation at every
+        // dispatch below. Receiving and dropping this value is the gate.
+        _activation: LastFmApplicationActivation,
         completion: oneshot::Sender<Result<(), LastFmApplicationCommandError>>,
     ) -> Result<(), LastFmApplicationShutdownError> {
         let Some(database) = self.database.take() else {
@@ -1353,6 +1357,7 @@ mod tests {
             Arc::new(UnusedCredentials),
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
         );
         let database = Database::connect("sqlite::memory:")
             .await
@@ -1457,13 +1462,12 @@ mod tests {
         let first_binding = first_coordinator_owner
             .bind_window(first_registry.clone())
             .expect("first window binding");
-        let (_handle, shutdown) =
-            spawn_lastfm_application_owner(
+        let (_handle, shutdown) = spawn_lastfm_application_owner(
             first_binding,
             tokio::runtime::Handle::current(),
             live_policy_for_test(),
         )
-                .expect("first production owner claim");
+        .expect("first production owner claim");
 
         let second_registry = SourceRegistry::new(tokio::runtime::Handle::current());
         let mut second_coordinator_owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
@@ -1472,11 +1476,11 @@ mod tests {
             .expect("second window binding");
         assert_eq!(
             spawn_lastfm_application_owner(
-            second_binding,
-            tokio::runtime::Handle::current(),
-            live_policy_for_test(),
-        )
-                .unwrap_err(),
+                second_binding,
+                tokio::runtime::Handle::current(),
+                live_policy_for_test(),
+            )
+            .unwrap_err(),
             LastFmApplicationOwnerClaimError
         );
 
@@ -1511,6 +1515,7 @@ mod tests {
             credentials.clone(),
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
         );
         handle
             .try_attach_database(database)
@@ -1575,6 +1580,7 @@ mod tests {
             credentials.clone(),
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
         );
         handle
             .try_attach_database(database)
@@ -1726,6 +1732,7 @@ mod tests {
             credentials,
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
         );
         handle
             .try_attach_database(database)
@@ -1885,6 +1892,7 @@ mod tests {
             credentials.clone(),
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
         );
         let _current_binding = coordinator_owner
             .bind_window(source_registry.clone())
@@ -2049,6 +2057,7 @@ mod tests {
             credentials.clone(),
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
         );
 
         // Current-thread scheduling makes both commands cross admission

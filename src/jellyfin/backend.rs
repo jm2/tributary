@@ -241,8 +241,7 @@ impl JellyfinBackend {
 
                 stream_locator_by_track_id.insert(track_id.clone(), item.id.clone());
                 if let Some(album_id) = &item.album_id {
-                    track_artwork_locator_by_track_id
-                        .insert(track_id.clone(), album_id.clone());
+                    track_artwork_locator_by_track_id.insert(track_id.clone(), album_id.clone());
                 }
                 // Attribution provenance is frozen from the raw accepted row
                 // with the same field precedence as the display converter,

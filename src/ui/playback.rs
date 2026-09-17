@@ -290,6 +290,7 @@ impl QueueItem {
         occurrence: usize,
         regular_playlist_guard: Option<RegularPlaylistCatalogueGuard>,
         playback_source: Option<PlaybackSourceReference>,
+        policy_generation: u64,
     ) -> Self {
         let is_library = is_library_source(identity.media_key.source_id);
         let raw_duration_secs = track.duration_secs();
@@ -300,7 +301,12 @@ impl QueueItem {
         let lastfm_profile = playback_source
             .as_ref()
             .map(|reference| reference.profile().clone());
-        let lastfm_source = playback_source.map(LastFmPlaybackSource::managed);
+        // The captured authority carries the exact live generation that
+        // authorized its mint. Dispatch refuses the occurrence once the live
+        // generation moves past it, so a source opted in under one
+        // generation cannot be dispatched under a later one.
+        let lastfm_source = playback_source
+            .map(|reference| LastFmPlaybackSource::managed(reference, policy_generation));
         Self {
             identity,
             occurrence,
@@ -336,11 +342,14 @@ impl QueueItem {
         }
     }
 
-    pub(crate) fn external(session: &crate::source_registry::ExternalFileSession) -> Self {
+    pub(crate) fn external(
+        session: &crate::source_registry::ExternalFileSession,
+        policy_generation: u64,
+    ) -> Self {
         let track = session.track();
         let attribution = session.playback_source().map(|reference| {
             (
-                LastFmPlaybackSource::managed(reference.clone()),
+                LastFmPlaybackSource::managed(reference.clone(), policy_generation),
                 reference.profile().clone(),
             )
         });
@@ -1673,7 +1682,7 @@ fn capture_visible_queue(
     source_key: &str,
     selected_position: u32,
     source_registry: &SourceRegistry,
-    enabled_remote_sources: &HashSet<SourceId>,
+    policy_generation: &crate::lastfm::policy::LastFmPolicyGeneration,
 ) -> Option<CapturedQueue> {
     let view = queue_view(source_key)?;
     let mut selected_index = None;
@@ -1682,6 +1691,10 @@ fn capture_visible_queue(
     // The caller supplies the exact remote-source opt-in set from the current
     // immutable Last.fm policy generation. The registry's closed policy still
     // admits only intrinsically eligible managed sources on top of that set.
+    // Every minted authority is frozen to this exact generation identity so a
+    // successor generation refuses the captured occurrence at dispatch.
+    let enabled_remote_sources = policy_generation.queue_capture_remote_sources();
+    let policy_generation = policy_generation.generation();
 
     for model_index in 0..model.n_items() {
         let Some(track) = model.item(model_index).and_downcast::<TrackObject>() else {
@@ -1714,6 +1727,7 @@ fn capture_visible_queue(
             *occurrence,
             regular_playlist_guard,
             playback_source,
+            policy_generation,
         ));
         *occurrence += 1;
     }
@@ -1884,7 +1898,7 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
         &source_key,
         position,
         &ctx.source_registry,
-        policy.queue_capture_remote_sources(),
+        &policy,
     ) else {
         return false;
     };
@@ -2768,7 +2782,10 @@ pub fn play_external_session(
     // Consume the delivery generation before replacing terminal ownership.
     // Any duplicate/late completion from the same delivery is now stale.
     super::open_files::invalidate_admission();
-    let item = QueueItem::external(external);
+    // The external occurrence freezes the exact live generation that was
+    // current when the queue was captured, exactly like visible-track capture.
+    let policy_generation = ctx.lastfm_policy.lock().unwrap().generation();
+    let item = QueueItem::external(external, policy_generation);
     let previous_external = ctx.session.borrow().current_external_source_id();
     if !ctx.session.borrow_mut().replace_queue(vec![item], 0) {
         return false;
@@ -2815,6 +2832,16 @@ mod tests {
 
     use super::*;
 
+    /// Authority the direct owner-call tests admit through. Generation 1
+    /// matches the lowest live identity (`for_test` clamps to >= 1); local
+    /// sources bypass the authority entirely, and remote sources in these
+    /// tests are intentionally denied by the empty enablement set.
+    fn dispatch_authority(
+        enabled_remote_sources: &HashSet<SourceId>,
+    ) -> crate::lastfm::policy::LastFmDispatchAuthority {
+        crate::lastfm::policy::LastFmDispatchAuthority::for_test(1, enabled_remote_sources.clone())
+    }
+
     #[derive(Debug, Default)]
     struct RecordingOutputState {
         generations: Vec<PlayerEventGeneration>,
@@ -2855,7 +2882,10 @@ mod tests {
                 source_key,
                 selected_position,
                 &self.registry,
-                &HashSet::new(),
+                // The closed default generation: no consent, no enablement,
+                // so managed capture mints nothing — matching the old empty
+                // capture set this fixture always used.
+                &crate::lastfm::policy::LastFmPolicyGeneration::default(),
             )
         }
 
@@ -3064,10 +3094,17 @@ mod tests {
         let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
 
         assert!(owner
-            .accept_output_load(newer, &registry, &enabled_remote_sources)
+            .accept_output_load(
+                newer,
+                &registry,
+                &dispatch_authority(&enabled_remote_sources)
+            )
             .admitted());
-        let stale =
-            owner.accept_output_load(delayed_predecessor, &registry, &enabled_remote_sources);
+        let stale = owner.accept_output_load(
+            delayed_predecessor,
+            &registry,
+            &dispatch_authority(&enabled_remote_sources),
+        );
         assert!(stale.stale());
         let (handoff, error) = stale.into_update().into_parts();
         assert!(handoff.is_none());
@@ -3240,7 +3277,7 @@ mod tests {
             row.source_id().unwrap_or(view.source_id),
             TrackId::new(row.track_id()).expect("test track identity"),
         );
-        QueueItem::from_track(identity, row, occurrence, None, None)
+        QueueItem::from_track(identity, row, occurrence, None, None, 0)
     }
 
     fn refreshed_metadata() -> QueueTrackRefresh {
@@ -3857,7 +3894,11 @@ mod tests {
             "the already-captured metadata snapshot remains immutable"
         );
         let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
-        let rejected = owner.accept_output_load(accepted, &registry.registry, &HashSet::new());
+        let rejected = owner.accept_output_load(
+            accepted,
+            &registry.registry,
+            &dispatch_authority(&HashSet::new()),
+        );
         assert!(!rejected.admitted());
         assert!(!rejected.stale());
         assert!(registry.registry.release_provenance(source_id, provenance));
@@ -4556,7 +4597,8 @@ mod tests {
         let registry = crate::source_registry::SourceRegistry::new(runtime.handle().clone());
         let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
         for delayed in [delayed_navigation, delayed_replay] {
-            let admission = owner.accept_output_load(delayed, &registry, &HashSet::new());
+            let admission =
+                owner.accept_output_load(delayed, &registry, &dispatch_authority(&HashSet::new()));
             assert!(admission.stale());
             let (handoff, error) = admission.into_update().into_parts();
             assert!(handoff.is_none());
@@ -5281,7 +5323,11 @@ mod tests {
         let registry = SourceRegistry::new(runtime.handle().clone());
         let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
         assert!(owner
-            .accept_output_load(delayed_predecessor, &registry, &HashSet::new())
+            .accept_output_load(
+                delayed_predecessor,
+                &registry,
+                &dispatch_authority(&HashSet::new())
+            )
             .stale());
 
         let (mut output, _) = RecordingOutput::new(1);
@@ -5340,9 +5386,17 @@ mod tests {
 
         let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
         assert!(owner
-            .accept_output_load(newer, &registry, &enabled_remote_sources)
+            .accept_output_load(
+                newer,
+                &registry,
+                &dispatch_authority(&enabled_remote_sources)
+            )
             .admitted());
-        let stale = owner.accept_output_load(older, &registry, &enabled_remote_sources);
+        let stale = owner.accept_output_load(
+            older,
+            &registry,
+            &dispatch_authority(&enabled_remote_sources),
+        );
         assert!(matches!(
             &stale,
             crate::lastfm::playback_owner::LastFmPlaybackLoadAdmission::Stale(_)
@@ -5368,9 +5422,17 @@ mod tests {
 
         let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
         assert!(owner
-            .accept_output_load(newer, &registry, &enabled_remote_sources)
+            .accept_output_load(
+                newer,
+                &registry,
+                &dispatch_authority(&enabled_remote_sources)
+            )
             .admitted());
-        let stale = owner.accept_output_load(older, &registry, &enabled_remote_sources);
+        let stale = owner.accept_output_load(
+            older,
+            &registry,
+            &dispatch_authority(&enabled_remote_sources),
+        );
         assert!(matches!(
             &stale,
             crate::lastfm::playback_owner::LastFmPlaybackLoadAdmission::Stale(_)
@@ -5401,7 +5463,8 @@ mod tests {
             .expect("test runtime");
         let registry = crate::source_registry::SourceRegistry::new(runtime.handle().clone());
         let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
-        let admission = owner.accept_output_load(delayed, &registry, &HashSet::new());
+        let admission =
+            owner.accept_output_load(delayed, &registry, &dispatch_authority(&HashSet::new()));
         assert!(admission.stale());
         let (handoff, error) = admission.into_update().into_parts();
         assert!(handoff.is_none());
@@ -5430,7 +5493,11 @@ mod tests {
         let enabled_remote_sources = HashSet::new();
         let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
         assert!(owner
-            .accept_output_load(accepted, &registry, &enabled_remote_sources)
+            .accept_output_load(
+                accepted,
+                &registry,
+                &dispatch_authority(&enabled_remote_sources)
+            )
             .into_update()
             .into_parts()
             .1
@@ -5456,7 +5523,11 @@ mod tests {
             .take_accepted_lastfm_output_load(retry_generation)
             .expect("a genuinely new accepted generation receives one fresh handoff");
         assert!(owner
-            .accept_output_load(retry, &registry, &enabled_remote_sources)
+            .accept_output_load(
+                retry,
+                &registry,
+                &dispatch_authority(&enabled_remote_sources)
+            )
             .into_update()
             .into_parts()
             .1
@@ -5540,11 +5611,19 @@ mod tests {
         let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
         let enabled_remote_sources = HashSet::new();
         let first_update = owner
-            .accept_output_load(first, &registry, &enabled_remote_sources)
+            .accept_output_load(
+                first,
+                &registry,
+                &dispatch_authority(&enabled_remote_sources),
+            )
             .into_update();
         assert!(first_update.into_parts().1.is_none());
         let retry_update = owner
-            .accept_output_load(retry, &registry, &enabled_remote_sources)
+            .accept_output_load(
+                retry,
+                &registry,
+                &dispatch_authority(&enabled_remote_sources),
+            )
             .into_update();
         assert!(
             retry_update.into_parts().1.is_none(),
@@ -5630,7 +5709,7 @@ mod tests {
         );
 
         let mut session = PlaybackSession::default();
-        assert!(session.replace_queue(vec![QueueItem::external(&missing_album)], 0));
+        assert!(session.replace_queue(vec![QueueItem::external(&missing_album, 1)], 0));
         let candidate = session
             .lastfm_occurrence_candidate
             .as_ref()
@@ -5652,7 +5731,7 @@ mod tests {
             Some("Tagged Album")
         );
         assert_eq!(tagged_album.track().album_title, "Tagged Album");
-        assert!(session.replace_queue(vec![QueueItem::external(&tagged_album)], 0));
+        assert!(session.replace_queue(vec![QueueItem::external(&tagged_album, 1)], 0));
         assert_eq!(
             session
                 .lastfm_occurrence_candidate
@@ -5673,7 +5752,11 @@ mod tests {
         );
         let enabled_remote_sources = HashSet::new();
         let mut owner = crate::lastfm::playback_owner::LastFmPlaybackOwner::new();
-        let admission = owner.accept_output_load(matching, &registry, &enabled_remote_sources);
+        let admission = owner.accept_output_load(
+            matching,
+            &registry,
+            &dispatch_authority(&enabled_remote_sources),
+        );
         assert!(admission.admitted());
         let (handoff, error) = admission.into_update().into_parts();
         assert!(handoff.is_none());
@@ -5691,7 +5774,7 @@ mod tests {
         let callback_calls = Cell::new(0);
         let admitted = now_playing.try_admit_with_callbacks_for_test(
             &registry,
-            &enabled_remote_sources,
+            &dispatch_authority(&enabled_remote_sources),
             |_| {
                 callback_calls.set(callback_calls.get() + 1);
                 crate::lastfm::playback_owner::LastFmPlaybackHandoffKind::NowPlaying
@@ -5711,7 +5794,7 @@ mod tests {
         );
         assert_eq!(callback_calls.get(), 1);
 
-        let mut mismatched = QueueItem::external(&tagged_album);
+        let mut mismatched = QueueItem::external(&tagged_album, 1);
         mismatched.lastfm_profile = Some(PlaybackAttributionProfile::for_test(
             "Different Title",
             "Tagged Artist",
@@ -5731,7 +5814,11 @@ mod tests {
             "LastFmAcceptedOutputLoad::Ineligible",
             "a profile cannot be paired with metadata different from its registry-minted reference"
         );
-        let rejected = owner.accept_output_load(ineligible, &registry, &enabled_remote_sources);
+        let rejected = owner.accept_output_load(
+            ineligible,
+            &registry,
+            &dispatch_authority(&enabled_remote_sources),
+        );
         assert!(!rejected.admitted());
         assert!(!rejected.stale());
         let (handoff, error) = rejected.into_update().into_parts();

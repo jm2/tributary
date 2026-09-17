@@ -8,6 +8,7 @@
 //! uncloneable owner used for terminal shutdown.
 #![allow(clippy::redundant_pub_crate)] // Explicit crate-internal authority boundary.
 
+#[cfg(test)]
 use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
@@ -15,6 +16,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
+#[cfg(test)]
 use crate::architecture::SourceId;
 use crate::audio::{PlayerEvent, PlayerEventGeneration};
 use crate::source_registry::SourceRegistry;
@@ -23,8 +25,8 @@ use super::policy::{LastFmDispatchAuthority, LastFmLivePolicy};
 
 use super::playback_owner::{
     LastFmAcceptedOutputLoad, LastFmOutputIntent, LastFmPlaybackHandoff, LastFmPlaybackHandoffKind,
-    LastFmPlaybackOwner, LastFmPlaybackOwnerError, LastFmPlaybackOwnerUpdate,
-    LastFmPlaybackRuntimeOperation,
+    LastFmPlaybackLoadAdmission, LastFmPlaybackOwner, LastFmPlaybackOwnerError,
+    LastFmPlaybackOwnerUpdate, LastFmPlaybackRuntimeOperation,
 };
 use super::runtime::{
     LastFmPlaybackRuntimeIngress, LastFmRuntimeAdmissionError, LastFmRuntimeCommandError,
@@ -178,7 +180,10 @@ trait LastFmPlaybackRuntimePort: Send + Sync {
         &self,
         handoff: LastFmPlaybackHandoff,
         registry: &SourceRegistry,
-        enabled_remote_sources: &HashSet<SourceId>,
+        // The CURRENT live generation's authority, derived by the caller at
+        // the moment of dispatch. The ingress admits only through it, so a
+        // stale or dormant generation refuses before any runtime ingress.
+        authority: &LastFmDispatchAuthority,
     ) -> LastFmPlaybackRuntimeDispatch;
 }
 
@@ -187,9 +192,9 @@ impl LastFmPlaybackRuntimePort for LastFmPlaybackRuntimeIngress {
         &self,
         handoff: LastFmPlaybackHandoff,
         registry: &SourceRegistry,
-        enabled_remote_sources: &HashSet<SourceId>,
+        authority: &LastFmDispatchAuthority,
     ) -> LastFmPlaybackRuntimeDispatch {
-        match handoff.try_admit(self, registry, enabled_remote_sources) {
+        match handoff.try_admit(self, registry, authority) {
             None => LastFmPlaybackRuntimeDispatch::Immediate(
                 LastFmPlaybackCoordinatorOutcome::SourceRejected,
             ),
@@ -609,10 +614,7 @@ impl LastFmActivePlaybackEnvironment {
             drop(handoff);
             return LastFmPlaybackCoordinatorOutcome::SourceRejected;
         };
-        match self
-            .runtime
-            .dispatch(handoff, &self.registry, authority.enabled_remote_sources())
-        {
+        match self.runtime.dispatch(handoff, &self.registry, &authority) {
             LastFmPlaybackRuntimeDispatch::Immediate(outcome) => {
                 if let Some((lease, slot)) = completion_reservation {
                     lease.complete_without_outcome();
@@ -661,10 +663,7 @@ impl LastFmActivePlaybackEnvironment {
             drop(handoff);
             return LastFmPlaybackCoordinatorOutcome::SourceRejected;
         };
-        match self
-            .runtime
-            .dispatch(handoff, &self.registry, authority.enabled_remote_sources())
-        {
+        match self.runtime.dispatch(handoff, &self.registry, &authority) {
             LastFmPlaybackRuntimeDispatch::Immediate(outcome) => outcome,
             LastFmPlaybackRuntimeDispatch::PendingEnqueue(completion) => {
                 drop(completion);
@@ -743,12 +742,12 @@ impl LastFmActivePlaybackEnvironment {
             // dormant generation rejects the load exactly like refused
             // source policy.
             match self.live_policy.dispatch_authority() {
-                Some(authority) => {
-                    owner.accept_output_load(load, &self.registry, &authority)
-                }
+                Some(authority) => owner.accept_output_load(load, &self.registry, &authority),
                 None => {
                     load.revoke();
-                    LastFmPlaybackLoadAdmission::Rejected(LastFmPlaybackOwnerUpdate::none())
+                    LastFmPlaybackLoadAdmission::Rejected(
+                        LastFmPlaybackOwnerUpdate::retire_handoff(None),
+                    )
                 }
             }
         };
@@ -812,15 +811,10 @@ impl LastFmActivePlaybackEnvironment {
                 Err(outcome) => return operation.complete(outcome),
             };
             match self.live_policy.dispatch_authority() {
-                Some(authority) => {
-                    owner.revalidate_active_source(&self.registry, &authority)
-                }
+                Some(authority) => owner.revalidate_active_source(&self.registry, &authority),
                 // A dormant generation cannot keep revalidating an active
                 // occurrence: refuse and retire the active source.
-                None => owner.retire().map_or_else(
-                    LastFmPlaybackOwnerUpdate::none,
-                    LastFmPlaybackOwnerUpdate::handoff,
-                ),
+                None => LastFmPlaybackOwnerUpdate::retire_handoff(owner.retire()),
             }
         };
         let outcome = self.finish_update(
@@ -1800,7 +1794,6 @@ mod tests {
 
     use crate::architecture::{MediaKey, TrackId};
     use crate::audio::PlayerState;
-    use crate::lastfm::policy::LastFmPolicyGeneration;
     use crate::db::migration::Migrator;
     use crate::external_file::ExternalFileHint;
     use crate::lastfm::client::{
@@ -1814,6 +1807,7 @@ mod tests {
         LastFmAcceptedOutputFreshness, LastFmAcceptedPlayback, LastFmPlaybackHandoffKind,
         LastFmPlaybackOccurrenceIdentity, LastFmPlaybackSource,
     };
+    use crate::lastfm::policy::LastFmPolicyGeneration;
     use crate::lastfm::runtime::{
         spawn_lastfm_runtime, LastFmRuntimeActivation, LastFmRuntimeShutdownReason,
     };
@@ -1976,9 +1970,9 @@ mod tests {
             &self,
             handoff: LastFmPlaybackHandoff,
             registry: &SourceRegistry,
-            enabled_remote_sources: &HashSet<SourceId>,
+            authority: &LastFmDispatchAuthority,
         ) -> LastFmPlaybackRuntimeDispatch {
-            let _ = enabled_remote_sources;
+            let _ = authority;
             let kind = handoff.kind();
             let rejected = {
                 let mut rejected_kind = self.rejected_kind.lock().expect("lock scripted rejection");
@@ -1995,10 +1989,9 @@ mod tests {
                     LastFmPlaybackCoordinatorOutcome::SourceRejected,
                 );
             }
-            let authority = LastFmDispatchAuthority::for_test(1, HashSet::new());
             let admitted = handoff.try_admit_with_callbacks_for_test(
                 registry,
-                &authority,
+                authority,
                 |_| LastFmPlaybackHandoffKind::NowPlaying,
                 |_| LastFmPlaybackHandoffKind::Enqueue,
                 || LastFmPlaybackHandoffKind::ClearNowPlaying,
@@ -2110,6 +2103,7 @@ mod tests {
                 7,
             )
             .expect("test managed reference"),
+            1,
         );
         let accepted = LastFmAcceptedPlayback::try_new(
             LastFmPlaybackOccurrenceIdentity::fresh(),
@@ -2143,7 +2137,7 @@ mod tests {
         let duration_secs = profile.duration_secs();
         let accepted = LastFmAcceptedPlayback::try_new(
             LastFmPlaybackOccurrenceIdentity::fresh(),
-            LastFmPlaybackSource::managed(reference),
+            LastFmPlaybackSource::managed(reference, 1),
             artist,
             title,
             album,
@@ -2206,20 +2200,17 @@ mod tests {
     }
 
     /// Activate with a live policy whose current generation matches the
-    /// capture generation (0) stamped by the test source mints.
+    /// capture generation (1) stamped by the test source mints. `for_test`
+    /// clamps generations to >= 1, so 1 is the lowest live identity.
     fn activate_for_test(
         binding: &LastFmPlaybackCoordinatorBinding,
         port: &RecordingRuntimePort,
         enabled_remote_sources: HashSet<SourceId>,
     ) -> LastFmPlaybackCoordinatorActivation {
         let live = LastFmLivePolicy::default();
-        live.publish(LastFmPolicyGeneration::for_test(0, enabled_remote_sources));
+        live.publish(LastFmPolicyGeneration::for_test(1, enabled_remote_sources));
         binding
-            .activate_with_runtime_port(
-                Box::new(port.clone()),
-                test_completion_runtime(),
-                live,
-            )
+            .activate_with_runtime_port(Box::new(port.clone()), test_completion_runtime(), live)
             .expect("activate test playback bridge")
     }
 
@@ -2400,7 +2391,7 @@ mod tests {
             binding.activate_with_runtime_port(
                 Box::new(RecordingRuntimePort::default()),
                 test_completion_runtime(),
-                HashSet::new(),
+                LastFmLivePolicy::default(),
             ),
             Err(LastFmPlaybackCoordinatorActivationError::AlreadyActive)
         ));
@@ -2424,7 +2415,7 @@ mod tests {
             binding.activate_with_runtime_port(
                 Box::new(port.clone()),
                 test_completion_runtime(),
-                HashSet::new(),
+                LastFmLivePolicy::default(),
             ),
             Err(LastFmPlaybackCoordinatorActivationError::StaleWindow)
         ));
@@ -2553,7 +2544,10 @@ mod tests {
             LastFmPlaybackCoordinatorOutcome::Applied
         );
         assert_eq!(extracted.get(), 1);
-        assert_eq!(discarded.get(), 1);
+        // Losing the activation revokes the lazily built load without
+        // dispatch AND without the discard lane: the occurrence never became
+        // durable evidence, so neither path may fire.
+        assert_eq!(discarded.get(), 0);
         assert!(port.calls().is_empty());
     }
 
@@ -2891,11 +2885,16 @@ mod tests {
         let mut owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
         let binding = owner.bind_window(registry).expect("bind window");
         let port = RecordingRuntimePort::default();
+        // Live generation 1 with an empty remote set: local loads bypass the
+        // enablement check, but dispatch still requires a non-dormant
+        // generation before any runtime ingress.
+        let live = LastFmLivePolicy::default();
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
         let activation = binding
             .activate_with_runtime_port(
                 Box::new(port.clone()),
                 completion_runtime.handle().clone(),
-                HashSet::new(),
+                live,
             )
             .expect("activate with cancellable completion runtime");
         let generation = PlayerEventGeneration::from_raw(51);
@@ -3465,8 +3464,17 @@ mod tests {
         let binding = owner
             .bind_window(source_registry.clone())
             .expect("bind coordinator window");
+        // Live generation 1 with an empty remote set: the local load bypasses
+        // the enablement check, but dispatch still requires a non-dormant
+        // generation before any runtime ingress.
+        let live = LastFmLivePolicy::default();
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
         let activation = binding
-            .activate(ingress, tokio::runtime::Handle::current(), HashSet::new())
+            .activate(
+                ingress,
+                tokio::runtime::Handle::current(),
+                live,
+            )
             .expect("activate with genuine claimed runtime ingress");
         let generation = PlayerEventGeneration::from_raw(80);
         assert_eq!(

@@ -261,8 +261,7 @@ impl PlexBackend {
 
                 stream_locator_by_track_id.insert(track_id.clone(), part_key);
                 if let Some(thumb_path) = &plex_track.thumb {
-                    track_artwork_locator_by_track_id
-                        .insert(track_id.clone(), thumb_path.clone());
+                    track_artwork_locator_by_track_id.insert(track_id.clone(), thumb_path.clone());
                 }
                 if let Some(profile) = attribution_profile {
                     attribution_profiles.insert(track_id, profile);
@@ -653,7 +652,12 @@ fn cacheable_plex_track(
         plex.index,
         plex.duration.map(|d| d / 1000),
     );
-    Some((track_id, track, stream_locator.to_string(), attribution_profile))
+    Some((
+        track_id,
+        track,
+        stream_locator.to_string(),
+        attribution_profile,
+    ))
 }
 
 fn plex_track_to_track(

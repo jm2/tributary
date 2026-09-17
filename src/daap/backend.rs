@@ -162,8 +162,7 @@ impl DaapBackend {
 
             let duration_secs = duration_ms.map(|ms| u64::from(ms) / 1000);
 
-            let native_track_id =
-                crate::architecture::TrackId::remote(daap_id.to_string()).ok();
+            let native_track_id = crate::architecture::TrackId::remote(daap_id.to_string()).ok();
             let track = Track {
                 id: track_uuid,
                 native_track_id: native_track_id.clone(),
