@@ -21,6 +21,7 @@ use super::api::{
     PlexMedia, PlexSectionsResponse, PlexTrack, PlexTracksResponse,
 };
 use super::client::PlexClient;
+use crate::source_registry::PlaybackAttributionProfile;
 
 /// Page size requested via `X-Plex-Container-Size`.  Plex caps the number
 /// of items returned per request, so a full `library/sections/{key}/all`
@@ -56,6 +57,9 @@ struct LibraryCache {
     stream_locator_by_track_id: HashMap<TrackId, String>,
     /// Exact Plex rating key → thumbnail path.
     track_artwork_locator_by_track_id: HashMap<TrackId, String>,
+    /// Exact Plex rating key → Last.fm attribution profile derived from the
+    /// raw accepted protocol row before display fallbacks were substituted.
+    attribution_profiles: HashMap<TrackId, PlaybackAttributionProfile>,
 }
 
 impl LibraryCache {
@@ -66,6 +70,7 @@ impl LibraryCache {
             artists: Vec::new(),
             stream_locator_by_track_id: HashMap::new(),
             track_artwork_locator_by_track_id: HashMap::new(),
+            attribution_profiles: HashMap::new(),
         }
     }
 }
@@ -176,6 +181,7 @@ impl PlexBackend {
         let mut skipped_unplayable_tracks = 0usize;
         let mut stream_locator_by_track_id = HashMap::new();
         let mut track_artwork_locator_by_track_id = HashMap::new();
+        let mut attribution_profiles = HashMap::new();
 
         for lib in &self.music_libraries {
             let section_endpoint = format!("library/sections/{}/all", lib.key);
@@ -246,14 +252,20 @@ impl PlexBackend {
 
             // ── Accumulate tracks (type=10) ─────────────────────────
             for plex_track in &tracks {
-                let Some((track_id, track, part_key)) = cacheable_plex_track(plex_track) else {
+                let Some((track_id, track, part_key, attribution_profile)) =
+                    cacheable_plex_track(plex_track)
+                else {
                     skipped_unplayable_tracks += 1;
                     continue;
                 };
 
                 stream_locator_by_track_id.insert(track_id.clone(), part_key);
                 if let Some(thumb_path) = &plex_track.thumb {
-                    track_artwork_locator_by_track_id.insert(track_id, thumb_path.clone());
+                    track_artwork_locator_by_track_id
+                        .insert(track_id.clone(), thumb_path.clone());
+                }
+                if let Some(profile) = attribution_profile {
+                    attribution_profiles.insert(track_id, profile);
                 }
                 all_tracks.push(track);
             }
@@ -320,6 +332,7 @@ impl PlexBackend {
             artists: all_artists,
             stream_locator_by_track_id,
             track_artwork_locator_by_track_id,
+            attribution_profiles,
         };
 
         Ok(())
@@ -402,18 +415,21 @@ impl PlexBackend {
         &self.music_libraries
     }
 
-    /// Return one accepted catalogue row by its exact native identity.
+    /// Return the exact Last.fm attribution profile retained for one accepted
+    /// catalogue row by its native identity.
     ///
-    /// The lookup is deliberately non-blocking: a contended refresh returns
-    /// `None`, so Last.fm attribution fails closed instead of waiting on the
-    /// lifecycle state lock that the registry holds while minting.
-    pub(crate) fn catalogue_track(&self, track_id: &TrackId) -> Option<Track> {
+    /// Profiles are derived from the raw protocol row during refresh, before
+    /// display fallbacks are substituted, so a synthesized `"Unknown"` can
+    /// never become attribution authority. The lookup is deliberately
+    /// non-blocking: a contended refresh returns `None`, so Last.fm
+    /// attribution fails closed instead of waiting on the lifecycle state
+    /// lock that the registry holds while minting.
+    pub(crate) fn catalogue_attribution_profile(
+        &self,
+        track_id: &TrackId,
+    ) -> Option<PlaybackAttributionProfile> {
         let cache = self.cache.try_read().ok()?;
-        cache
-            .tracks
-            .iter()
-            .find(|track| track.native_track_id.as_ref() == Some(track_id))
-            .cloned()
+        cache.attribution_profiles.get(track_id).cloned()
     }
 }
 
@@ -602,7 +618,14 @@ fn plex_stream_source(plex: &PlexTrack) -> Option<(&PlexMedia, &str)> {
     })
 }
 
-fn cacheable_plex_track(plex: &PlexTrack) -> Option<(TrackId, Track, String)> {
+fn cacheable_plex_track(
+    plex: &PlexTrack,
+) -> Option<(
+    TrackId,
+    Track,
+    String,
+    Option<crate::source_registry::PlaybackAttributionProfile>,
+)> {
     let (media, stream_locator) = plex_stream_source(plex)?;
     let track_id = TrackId::remote(plex.rating_key.clone()).ok()?;
     let track_uuid = deterministic_uuid(&plex.rating_key);
@@ -619,7 +642,18 @@ fn cacheable_plex_track(plex: &PlexTrack) -> Option<(TrackId, Track, String)> {
         artist_id,
         album_id,
     );
-    Some((track_id, track, stream_locator.to_string()))
+    // Attribution provenance is frozen from the raw accepted row before the
+    // display converter substitutes any "Unknown" fallback, so a synthesized
+    // fallback can never become Last.fm attribution authority.
+    let attribution_profile = crate::source_registry::PlaybackAttributionProfile::from_remote_row(
+        plex.title.clone(),
+        plex.grandparent_title.clone(),
+        plex.parent_title.clone(),
+        None,
+        plex.index,
+        plex.duration.map(|d| d / 1000),
+    );
+    Some((track_id, track, stream_locator.to_string(), attribution_profile))
 }
 
 fn plex_track_to_track(
@@ -747,7 +781,7 @@ mod tests {
             plex_stream_locator(&track),
             Some("/library/parts/2/file.flac")
         );
-        let (track_id, published, stream_locator) =
+        let (track_id, published, stream_locator, attribution_profile) =
             cacheable_plex_track(&track).expect("track should be published");
         assert_eq!(track_id.as_str(), "track-id");
         assert_eq!(published.id, deterministic_uuid("track-id"));
@@ -755,6 +789,11 @@ mod tests {
         assert_eq!(published.bitrate_kbps, Some(1411));
         assert_eq!(published.format.as_deref(), Some("flac"));
         assert_eq!(stream_locator, "/library/parts/2/file.flac");
+        // The accepted row omits the required title, so no attribution
+        // authority may exist even though the display Track synthesizes
+        // an "Unknown" title fallback.
+        assert_eq!(published.title, "Unknown");
+        assert!(attribution_profile.is_none());
     }
 
     #[tokio::test]
@@ -1024,11 +1063,9 @@ mod tests {
             .expect("fixture track retains its native ID");
         assert_eq!(first_id.as_str(), "track-0");
         drop(cache);
-        let track = backend
-            .catalogue_track(&first_id)
-            .expect("exact remote catalogue row is retained");
-        let profile = crate::source_registry::PlaybackAttributionProfile::from_remote_track(&track)
-            .expect("structured remote metadata yields a Last.fm profile");
+        let profile = backend
+            .catalogue_attribution_profile(&first_id)
+            .expect("provenance-derived profile is retained for the accepted row");
         assert!(!profile.title().is_empty());
         assert_eq!(
             backend

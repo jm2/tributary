@@ -23,6 +23,7 @@ use crate::architecture::{
 };
 
 use super::api::{AlbumEntry, ArtistEntry, SongEntry};
+use crate::source_registry::PlaybackAttributionProfile;
 use super::client::SubsonicClient;
 
 /// Maximum number of per-artist / per-album metadata fetches kept in
@@ -51,6 +52,9 @@ struct LibraryCache {
     stream_locator_by_track_id: HashMap<TrackId, String>,
     /// Exact Subsonic song ID → cover-art ID.
     track_artwork_locator_by_track_id: HashMap<TrackId, String>,
+    /// Exact Subsonic song ID → Last.fm attribution profile derived from the
+    /// raw accepted protocol row before display fallbacks were substituted.
+    attribution_profiles: HashMap<TrackId, PlaybackAttributionProfile>,
 }
 
 impl LibraryCache {
@@ -61,6 +65,7 @@ impl LibraryCache {
             artists: Vec::new(),
             stream_locator_by_track_id: HashMap::new(),
             track_artwork_locator_by_track_id: HashMap::new(),
+            attribution_profiles: HashMap::new(),
         }
     }
 }
@@ -393,6 +398,7 @@ impl SubsonicBackend {
         let mut all_artists = Vec::new();
         let mut stream_locator_by_track_id = HashMap::new();
         let mut track_artwork_locator_by_track_id = HashMap::new();
+        let mut attribution_profiles = HashMap::new();
         let mut skipped_invalid_track_ids = 0usize;
 
         for (ai, (_, albums)) in artist_albums.iter().enumerate() {
@@ -428,7 +434,22 @@ impl SubsonicBackend {
 
                     stream_locator_by_track_id.insert(track_id.clone(), song.id.clone());
                     if let Some(cover_art_id) = &song.cover_art {
-                        track_artwork_locator_by_track_id.insert(track_id, cover_art_id.clone());
+                        track_artwork_locator_by_track_id
+                            .insert(track_id.clone(), cover_art_id.clone());
+                    }
+                    // Attribution provenance is frozen from the raw accepted
+                    // row before the display converter substitutes any
+                    // "Unknown" fallback, so a synthesized fallback can never
+                    // become Last.fm attribution authority.
+                    if let Some(profile) = PlaybackAttributionProfile::from_remote_row(
+                        song.title.clone(),
+                        song.artist.clone(),
+                        song.album.clone(),
+                        None,
+                        song.track,
+                        song.duration,
+                    ) {
+                        attribution_profiles.insert(track_id, profile);
                     }
                     all_tracks.push(track);
                     artist_track_count += 1;
@@ -465,23 +486,27 @@ impl SubsonicBackend {
             artists: all_artists,
             stream_locator_by_track_id,
             track_artwork_locator_by_track_id,
+            attribution_profiles,
         };
 
         Ok(())
     }
 
-    /// Return one accepted catalogue row by its exact native identity.
+    /// Return the exact Last.fm attribution profile retained for one accepted
+    /// catalogue row by its native identity.
     ///
-    /// The lookup is deliberately non-blocking: a contended refresh returns
-    /// `None`, so Last.fm attribution fails closed instead of waiting on the
-    /// lifecycle state lock that the registry holds while minting.
-    pub(crate) fn catalogue_track(&self, track_id: &TrackId) -> Option<Track> {
+    /// Profiles are derived from the raw protocol row during refresh, before
+    /// display fallbacks are substituted, so a synthesized `"Unknown"` can
+    /// never become attribution authority. The lookup is deliberately
+    /// non-blocking: a contended refresh returns `None`, so Last.fm
+    /// attribution fails closed instead of waiting on the lifecycle state
+    /// lock that the registry holds while minting.
+    pub(crate) fn catalogue_attribution_profile(
+        &self,
+        track_id: &TrackId,
+    ) -> Option<PlaybackAttributionProfile> {
         let cache = self.cache.try_read().ok()?;
-        cache
-            .tracks
-            .iter()
-            .find(|track| track.native_track_id.as_ref() == Some(track_id))
-            .cloned()
+        cache.attribution_profiles.get(track_id).cloned()
     }
 }
 
@@ -1126,16 +1151,16 @@ mod tests {
             .expect("fixture track retains its native ID");
         assert_eq!(track_id.as_str(), "healthy-track");
         drop(cache);
-        let track = backend
-            .catalogue_track(&track_id)
-            .expect("exact remote catalogue row is retained");
-        let profile = crate::source_registry::PlaybackAttributionProfile::from_remote_track(&track)
-            .expect("structured remote metadata yields a Last.fm profile");
+        let profile = backend
+            .catalogue_attribution_profile(&track_id)
+            .expect("provenance-derived profile is retained for the accepted row");
         assert_eq!(profile.title(), "Healthy Track");
         assert_eq!(profile.artist(), "Healthy Artist");
         assert_eq!(profile.album(), Some("Healthy Album"));
         assert!(backend
-            .catalogue_track(&TrackId::remote("missing-track").expect("bounded fixture track ID"))
+            .catalogue_attribution_profile(
+                &TrackId::remote("missing-track").expect("bounded fixture track ID")
+            )
             .is_none());
         assert_eq!(
             backend

@@ -288,22 +288,34 @@ impl PlaybackAttributionProfile {
         )
     }
 
-    /// Build a profile from one accepted authenticated-remote catalogue track.
+    /// Build a profile from the raw accepted protocol row of one
+    /// authenticated-remote catalogue track, before any display fallback is
+    /// substituted.
     ///
-    /// Authenticated remote adapters publish structured metadata straight from
-    /// their server protocol, so unlike tag provenance they have no filename
-    /// or synthetic-display fallback to exclude. The value is still bounded:
-    /// an empty required title or artist, or oversized text, yields `None` so
-    /// an incomplete remote row can never become attribution authority.
-    pub(crate) fn from_remote_track(track: &Track) -> Option<Self> {
-        let album = (!track.album_title.is_empty()).then(|| track.album_title.clone());
+    /// Adapter display converters synthesize `"Unknown"` titles and artists
+    /// when a server omits those fields, so a display [`Track`] can never be
+    /// the attribution source. The required title and artist must be present
+    /// on the accepted protocol row itself; a literal server-supplied
+    /// `"Unknown"` passes verbatim and stays distinguishable from a
+    /// synthesized fallback because synthesis never reaches this constructor.
+    /// A missing optional album stays absent. The value is still bounded: an
+    /// empty required title or artist, or oversized text, yields `None` so an
+    /// incomplete remote row can never become attribution authority.
+    pub(crate) fn from_remote_row(
+        title: Option<String>,
+        artist: Option<String>,
+        album: Option<String>,
+        album_artist: Option<String>,
+        track_number: Option<u32>,
+        duration_secs: Option<u64>,
+    ) -> Option<Self> {
         Self::bounded(
-            track.title.clone(),
-            track.artist_name.clone(),
+            title?,
+            artist?,
             album,
-            track.album_artist_name.clone(),
-            track.track_number,
-            track.duration_secs,
+            album_artist,
+            track_number,
+            duration_secs,
         )
     }
 
@@ -1253,7 +1265,7 @@ macro_rules! standard_remote_adapter {
                 &self,
                 track_id: &TrackId,
             ) -> Option<PlaybackAttributionProfile> {
-                PlaybackAttributionProfile::from_remote_track(&self.catalogue_track(track_id)?)
+                self.catalogue_attribution_profile(track_id)
             }
 
             fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
@@ -1304,7 +1316,7 @@ impl ManagedSourceAdapter for crate::subsonic::SubsonicBackend {
         &self,
         track_id: &TrackId,
     ) -> Option<PlaybackAttributionProfile> {
-        PlaybackAttributionProfile::from_remote_track(&self.catalogue_track(track_id)?)
+        self.catalogue_attribution_profile(track_id)
     }
 
     fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
@@ -1373,7 +1385,7 @@ impl ManagedSourceAdapter for crate::jellyfin::JellyfinBackend {
         &self,
         track_id: &TrackId,
     ) -> Option<PlaybackAttributionProfile> {
-        PlaybackAttributionProfile::from_remote_track(&self.catalogue_track(track_id)?)
+        self.catalogue_attribution_profile(track_id)
     }
 
     fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
@@ -1443,7 +1455,7 @@ impl ManagedSourceAdapter for crate::daap::DaapBackend {
         &self,
         track_id: &TrackId,
     ) -> Option<PlaybackAttributionProfile> {
-        PlaybackAttributionProfile::from_remote_track(&self.catalogue_track(track_id)?)
+        self.catalogue_attribution_profile(track_id)
     }
 
     fn regular_playlist_capability(&self) -> RegularPlaylistCapability {

@@ -19,6 +19,8 @@ use crate::architecture::SourceId;
 use crate::audio::{PlayerEvent, PlayerEventGeneration};
 use crate::source_registry::SourceRegistry;
 
+use super::policy::{LastFmDispatchAuthority, LastFmLivePolicy};
+
 use super::playback_owner::{
     LastFmAcceptedOutputLoad, LastFmOutputIntent, LastFmPlaybackHandoff, LastFmPlaybackHandoffKind,
     LastFmPlaybackOwner, LastFmPlaybackOwnerError, LastFmPlaybackOwnerUpdate,
@@ -223,7 +225,7 @@ struct LastFmActivePlaybackEnvironment {
     completion_runtime: tokio::runtime::Handle,
     enqueue_completion_slots: Arc<tokio::sync::Semaphore>,
     registry: SourceRegistry,
-    enabled_remote_sources: HashSet<SourceId>,
+    live_policy: LastFmLivePolicy,
 }
 
 struct LastFmActivePlaybackGate {
@@ -392,7 +394,7 @@ impl LastFmActivePlaybackEnvironment {
         runtime: Box<dyn LastFmPlaybackRuntimePort>,
         completion_runtime: tokio::runtime::Handle,
         registry: SourceRegistry,
-        enabled_remote_sources: HashSet<SourceId>,
+        live_policy: LastFmLivePolicy,
     ) -> Self {
         Self {
             operation_gate: Arc::new(Mutex::new(LastFmActivePlaybackGate {
@@ -413,7 +415,7 @@ impl LastFmActivePlaybackEnvironment {
                 ENQUEUE_COMPLETION_CAPACITY,
             )),
             registry,
-            enabled_remote_sources,
+            live_policy,
         }
     }
 
@@ -596,9 +598,20 @@ impl LastFmActivePlaybackEnvironment {
         } else {
             None
         };
+        // Dispatch consumes the CURRENT live generation's authority, not a
+        // retained activation-time set: a stale or dormant generation refuses
+        // here before any runtime ingress.
+        let Some(authority) = self.live_policy.dispatch_authority() else {
+            if let Some((lease, slot)) = completion_reservation {
+                lease.complete_without_outcome();
+                drop(slot);
+            }
+            drop(handoff);
+            return LastFmPlaybackCoordinatorOutcome::SourceRejected;
+        };
         match self
             .runtime
-            .dispatch(handoff, &self.registry, &self.enabled_remote_sources)
+            .dispatch(handoff, &self.registry, authority.enabled_remote_sources())
         {
             LastFmPlaybackRuntimeDispatch::Immediate(outcome) => {
                 if let Some((lease, slot)) = completion_reservation {
@@ -642,9 +655,15 @@ impl LastFmActivePlaybackEnvironment {
         &self,
         handoff: LastFmPlaybackHandoff,
     ) -> LastFmPlaybackCoordinatorOutcome {
+        // Same live-generation authority as fresh dispatch: a retirement-era
+        // clear scrobble cannot outlive its capture generation either.
+        let Some(authority) = self.live_policy.dispatch_authority() else {
+            drop(handoff);
+            return LastFmPlaybackCoordinatorOutcome::SourceRejected;
+        };
         match self
             .runtime
-            .dispatch(handoff, &self.registry, &self.enabled_remote_sources)
+            .dispatch(handoff, &self.registry, authority.enabled_remote_sources())
         {
             LastFmPlaybackRuntimeDispatch::Immediate(outcome) => outcome,
             LastFmPlaybackRuntimeDispatch::PendingEnqueue(completion) => {
@@ -720,7 +739,18 @@ impl LastFmActivePlaybackEnvironment {
                     return outcome;
                 }
             };
-            owner.accept_output_load(load, &self.registry, &self.enabled_remote_sources)
+            // Admission consults the CURRENT live generation; a stale or
+            // dormant generation rejects the load exactly like refused
+            // source policy.
+            match self.live_policy.dispatch_authority() {
+                Some(authority) => {
+                    owner.accept_output_load(load, &self.registry, &authority)
+                }
+                None => {
+                    load.revoke();
+                    LastFmPlaybackLoadAdmission::Rejected(LastFmPlaybackOwnerUpdate::none())
+                }
+            }
         };
         let base = if admission.admitted() {
             LastFmPlaybackCoordinatorOutcome::Applied
@@ -781,7 +811,17 @@ impl LastFmActivePlaybackEnvironment {
                 Ok(owner) => owner,
                 Err(outcome) => return operation.complete(outcome),
             };
-            owner.revalidate_active_source(&self.registry, &self.enabled_remote_sources)
+            match self.live_policy.dispatch_authority() {
+                Some(authority) => {
+                    owner.revalidate_active_source(&self.registry, &authority)
+                }
+                // A dormant generation cannot keep revalidating an active
+                // occurrence: refuse and retire the active source.
+                None => owner.retire().map_or_else(
+                    LastFmPlaybackOwnerUpdate::none,
+                    LastFmPlaybackOwnerUpdate::handoff,
+                ),
+            }
         };
         let outcome = self.finish_update(
             update,
@@ -1503,26 +1543,22 @@ impl LastFmPlaybackCoordinatorBinding {
         &self,
         runtime: LastFmPlaybackRuntimeIngress,
         completion_runtime: tokio::runtime::Handle,
-        enabled_remote_sources: HashSet<SourceId>,
+        live_policy: LastFmLivePolicy,
     ) -> Result<LastFmPlaybackCoordinatorActivation, LastFmPlaybackCoordinatorActivationError> {
-        self.activate_with_runtime_port(
-            Box::new(runtime),
-            completion_runtime,
-            enabled_remote_sources,
-        )
+        self.activate_with_runtime_port(Box::new(runtime), completion_runtime, live_policy)
     }
 
     fn activate_with_runtime_port(
         &self,
         runtime: Box<dyn LastFmPlaybackRuntimePort>,
         completion_runtime: tokio::runtime::Handle,
-        enabled_remote_sources: HashSet<SourceId>,
+        live_policy: LastFmLivePolicy,
     ) -> Result<LastFmPlaybackCoordinatorActivation, LastFmPlaybackCoordinatorActivationError> {
         let environment = Arc::new(LastFmActivePlaybackEnvironment::new(
             runtime,
             completion_runtime,
             self.source_registry.clone(),
-            enabled_remote_sources,
+            live_policy,
         ));
         let mut state = self
             .core
@@ -1764,6 +1800,7 @@ mod tests {
 
     use crate::architecture::{MediaKey, TrackId};
     use crate::audio::PlayerState;
+    use crate::lastfm::policy::LastFmPolicyGeneration;
     use crate::db::migration::Migrator;
     use crate::external_file::ExternalFileHint;
     use crate::lastfm::client::{
@@ -1941,6 +1978,7 @@ mod tests {
             registry: &SourceRegistry,
             enabled_remote_sources: &HashSet<SourceId>,
         ) -> LastFmPlaybackRuntimeDispatch {
+            let _ = enabled_remote_sources;
             let kind = handoff.kind();
             let rejected = {
                 let mut rejected_kind = self.rejected_kind.lock().expect("lock scripted rejection");
@@ -1957,9 +1995,10 @@ mod tests {
                     LastFmPlaybackCoordinatorOutcome::SourceRejected,
                 );
             }
+            let authority = LastFmDispatchAuthority::for_test(1, HashSet::new());
             let admitted = handoff.try_admit_with_callbacks_for_test(
                 registry,
-                enabled_remote_sources,
+                &authority,
                 |_| LastFmPlaybackHandoffKind::NowPlaying,
                 |_| LastFmPlaybackHandoffKind::Enqueue,
                 || LastFmPlaybackHandoffKind::ClearNowPlaying,
@@ -2166,16 +2205,20 @@ mod tests {
         bytes
     }
 
+    /// Activate with a live policy whose current generation matches the
+    /// capture generation (0) stamped by the test source mints.
     fn activate_for_test(
         binding: &LastFmPlaybackCoordinatorBinding,
         port: &RecordingRuntimePort,
         enabled_remote_sources: HashSet<SourceId>,
     ) -> LastFmPlaybackCoordinatorActivation {
+        let live = LastFmLivePolicy::default();
+        live.publish(LastFmPolicyGeneration::for_test(0, enabled_remote_sources));
         binding
             .activate_with_runtime_port(
                 Box::new(port.clone()),
                 test_completion_runtime(),
-                enabled_remote_sources,
+                live,
             )
             .expect("activate test playback bridge")
     }
@@ -2510,7 +2553,7 @@ mod tests {
             LastFmPlaybackCoordinatorOutcome::Applied
         );
         assert_eq!(extracted.get(), 1);
-        assert_eq!(discarded.get(), 0);
+        assert_eq!(discarded.get(), 1);
         assert!(port.calls().is_empty());
     }
 

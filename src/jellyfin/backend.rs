@@ -19,6 +19,7 @@ use crate::architecture::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttp
 
 use super::api::{JellyfinItem, JellyfinItemsResponse, JellyfinViewsResponse};
 use super::client::JellyfinClient;
+use crate::source_registry::PlaybackAttributionProfile;
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -52,6 +53,10 @@ struct LibraryCache {
     stream_locator_by_track_id: HashMap<TrackId, String>,
     /// Exact Jellyfin audio item ID → artwork item ID.
     track_artwork_locator_by_track_id: HashMap<TrackId, String>,
+    /// Exact Jellyfin audio item ID → Last.fm attribution profile derived
+    /// from the raw accepted protocol row before display fallbacks were
+    /// substituted.
+    attribution_profiles: HashMap<TrackId, PlaybackAttributionProfile>,
 }
 
 impl LibraryCache {
@@ -62,6 +67,7 @@ impl LibraryCache {
             artists: Vec::new(),
             stream_locator_by_track_id: HashMap::new(),
             track_artwork_locator_by_track_id: HashMap::new(),
+            attribution_profiles: HashMap::new(),
         }
     }
 }
@@ -200,6 +206,7 @@ impl JellyfinBackend {
         let mut all_artists = Vec::new();
         let mut stream_locator_by_track_id = HashMap::new();
         let mut track_artwork_locator_by_track_id = HashMap::new();
+        let mut attribution_profiles = HashMap::new();
         let mut skipped_invalid_track_ids = 0usize;
 
         for lib in music_libraries {
@@ -234,7 +241,25 @@ impl JellyfinBackend {
 
                 stream_locator_by_track_id.insert(track_id.clone(), item.id.clone());
                 if let Some(album_id) = &item.album_id {
-                    track_artwork_locator_by_track_id.insert(track_id, album_id.clone());
+                    track_artwork_locator_by_track_id
+                        .insert(track_id.clone(), album_id.clone());
+                }
+                // Attribution provenance is frozen from the raw accepted row
+                // with the same field precedence as the display converter,
+                // before any "Unknown" fallback is substituted, so a
+                // synthesized fallback can never become attribution authority.
+                if let Some(profile) = PlaybackAttributionProfile::from_remote_row(
+                    item.name.clone(),
+                    item.artist_items
+                        .first()
+                        .map(|a| a.name.clone())
+                        .or_else(|| item.album_artist.clone()),
+                    item.album.clone(),
+                    item.album_artist.clone(),
+                    item.index_number,
+                    item.run_time_ticks.map(|t| t / 10_000_000),
+                ) {
+                    attribution_profiles.insert(track_id, profile);
                 }
                 all_tracks.push(track);
             }
@@ -294,6 +319,7 @@ impl JellyfinBackend {
             artists: all_artists,
             stream_locator_by_track_id,
             track_artwork_locator_by_track_id,
+            attribution_profiles,
         };
 
         Ok(())
@@ -375,18 +401,21 @@ impl JellyfinBackend {
         self.client.logout_owned_session().await
     }
 
-    /// Return one accepted catalogue row by its exact native identity.
+    /// Return the exact Last.fm attribution profile retained for one accepted
+    /// catalogue row by its native identity.
     ///
-    /// The lookup is deliberately non-blocking: a contended refresh returns
-    /// `None`, so Last.fm attribution fails closed instead of waiting on the
-    /// lifecycle state lock that the registry holds while minting.
-    pub(crate) fn catalogue_track(&self, track_id: &TrackId) -> Option<Track> {
+    /// Profiles are derived from the raw protocol row during refresh, before
+    /// display fallbacks are substituted, so a synthesized `"Unknown"` can
+    /// never become attribution authority. The lookup is deliberately
+    /// non-blocking: a contended refresh returns `None`, so Last.fm
+    /// attribution fails closed instead of waiting on the lifecycle state
+    /// lock that the registry holds while minting.
+    pub(crate) fn catalogue_attribution_profile(
+        &self,
+        track_id: &TrackId,
+    ) -> Option<PlaybackAttributionProfile> {
         let cache = self.cache.try_read().ok()?;
-        cache
-            .tracks
-            .iter()
-            .find(|track| track.native_track_id.as_ref() == Some(track_id))
-            .cloned()
+        cache.attribution_profiles.get(track_id).cloned()
     }
 }
 
@@ -816,11 +845,9 @@ mod tests {
             .native_track_id
             .clone()
             .expect("fixture track retains its native ID");
-        let track = backend
-            .catalogue_track(&profile_track_id)
-            .expect("exact remote catalogue row is retained");
-        let profile = crate::source_registry::PlaybackAttributionProfile::from_remote_track(&track)
-            .expect("structured remote metadata yields a Last.fm profile");
+        let profile = backend
+            .catalogue_attribution_profile(&profile_track_id)
+            .expect("provenance-derived profile is retained for the accepted row");
         assert_eq!(profile.title(), "Fixture Song");
 
         let search = backend.search("Fixture", 10).await.expect("search fixture");

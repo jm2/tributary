@@ -213,6 +213,102 @@ fn empty_remote_sources() -> &'static HashSet<SourceId> {
     EMPTY_REMOTE_SOURCES.get_or_init(HashSet::new)
 }
 
+/// Shared live handle to the current policy generation.
+///
+/// The UI owns one `Arc<Mutex<LastFmPolicyGeneration>>` slot, replaces its
+/// content wholesale after the migrated database loads the persisted policy,
+/// and clones the same `Arc` into every consumer. Queue capture and dispatch
+/// therefore observe one shared live generation source: capture freezes its
+/// exact identity into each minted source authority, and dispatch re-derives
+/// its authority from the same slot at the moment of use.
+#[derive(Clone, Default)]
+pub(crate) struct LastFmLivePolicy(std::sync::Arc<std::sync::Mutex<LastFmPolicyGeneration>>);
+
+impl LastFmLivePolicy {
+    /// Wrap an already-shared UI policy slot.
+    pub(crate) fn from_shared(
+        shared: std::sync::Arc<std::sync::Mutex<LastFmPolicyGeneration>>,
+    ) -> Self {
+        Self(shared)
+    }
+
+    /// Freeze one exact observation of the live generation.
+    pub(crate) fn snapshot(&self) -> LastFmPolicyGeneration {
+        self.0
+            .lock()
+            .expect("lastfm policy mutex must not be poisoned")
+            .clone()
+    }
+
+    /// Publish a successor generation from the database-init path.
+    pub(crate) fn publish(&self, generation: LastFmPolicyGeneration) {
+        *self
+            .0
+            .lock()
+            .expect("lastfm policy mutex must not be poisoned") = generation;
+    }
+
+    /// The dispatch authority of the current live generation.
+    ///
+    /// `None` means the live generation grants no activation authority (the
+    /// closed default or a disabled policy), so dispatch refuses instead of
+    /// consulting an empty source set.
+    pub(crate) fn dispatch_authority(&self) -> Option<LastFmDispatchAuthority> {
+        LastFmDispatchAuthority::from_generation(&self.snapshot())
+    }
+}
+
+/// One frozen dispatch authority derived from the live policy generation.
+///
+/// Dispatch admission consumes this snapshot instead of a retained
+/// activation-time source set, so a queue occurrence captured under one
+/// generation is refused the moment the live generation moves past it, even
+/// when its source remains opted in.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct LastFmDispatchAuthority {
+    generation: u64,
+    enabled_remote_sources: HashSet<SourceId>,
+}
+
+impl LastFmDispatchAuthority {
+    /// Derive the dispatch authority from one generation observation.
+    ///
+    /// `None` when the generation carries no activation authority (no current
+    /// consent or enablement).
+    pub(crate) fn from_generation(generation: &LastFmPolicyGeneration) -> Option<Self> {
+        Some(Self {
+            generation: generation.generation(),
+            enabled_remote_sources: generation.activation_remote_sources()?.clone(),
+        })
+    }
+
+    /// The exact generation identity this authority was derived from.
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The current generation's remote-source opt-in set.
+    pub(crate) fn enabled_remote_sources(&self) -> &HashSet<SourceId> {
+        &self.enabled_remote_sources
+    }
+
+    /// Construct one authority for downstream tests that must not spin up a
+    /// database. The live slot remains the only production path.
+    #[cfg(test)]
+    pub(crate) fn for_test(generation: u64, enabled_remote_sources: HashSet<SourceId>) -> Self {
+        Self {
+            generation,
+            enabled_remote_sources,
+        }
+    }
+}
+
+impl fmt::Debug for LastFmDispatchAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LastFmDispatchAuthority(<redacted>)")
+    }
+}
+
 /// One complete, validated desired policy state.
 ///
 /// Updates are whole-snapshot: the caller describes the exact desired next

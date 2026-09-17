@@ -28,7 +28,7 @@ use super::playback_coordinator::{
     LastFmPlaybackCoordinatorActivation, LastFmPlaybackCoordinatorBinding,
     LastFmPlaybackCoordinatorOutcome,
 };
-use super::policy::LastFmPolicyGeneration;
+use super::policy::{LastFmLivePolicy, LastFmPolicyGeneration};
 use super::runtime::{
     spawn_lastfm_runtime, LastFmRuntimeActivation, LastFmRuntimeBarrier, LastFmRuntimeHandle,
     LastFmRuntimeShutdown,
@@ -352,6 +352,7 @@ struct ApplicationOwner {
     credentials: Arc<dyn SessionCredentialStore>,
     transport: Option<Arc<dyn LastFmTransport>>,
     clock: Arc<dyn LastFmClock>,
+    live_policy: LastFmLivePolicy,
     database: Option<DatabaseConnection>,
     generation: Option<ActiveGeneration>,
     #[cfg(test)]
@@ -635,10 +636,13 @@ impl ApplicationOwner {
             };
         }
 
+        // Dispatch authority stays LIVE: the coordinator re-derives the
+        // current generation's source set at every dispatch instead of
+        // freezing this activation's set.
         let Ok(coordinator) = self.coordinator.activate(
             runtime_ingress,
             self.completion_runtime.clone(),
-            activation.enabled_remote_sources,
+            self.live_policy.clone(),
         ) else {
             let drained = runtime_shutdown.shutdown().await.is_ok();
             let failure = if drained {
@@ -973,6 +977,7 @@ impl fmt::Debug for LastFmApplicationBarrier {
 pub(crate) fn spawn_lastfm_application_owner(
     coordinator: LastFmPlaybackCoordinatorBinding,
     completion_runtime: tokio::runtime::Handle,
+    live_policy: LastFmLivePolicy,
 ) -> Result<(LastFmApplicationHandle, LastFmApplicationShutdown), LastFmApplicationOwnerClaimError>
 {
     APPLICATION_OWNER_CLAIMED
@@ -988,6 +993,7 @@ pub(crate) fn spawn_lastfm_application_owner(
         Arc::new(OsSessionCredentialStore),
         transport,
         Arc::new(SystemLastFmClock),
+        live_policy,
     ))
 }
 
@@ -997,6 +1003,7 @@ fn spawn_with_dependencies(
     credentials: Arc<dyn SessionCredentialStore>,
     transport: Option<Arc<dyn LastFmTransport>>,
     clock: Arc<dyn LastFmClock>,
+    live_policy: LastFmLivePolicy,
 ) -> (LastFmApplicationHandle, LastFmApplicationShutdown) {
     spawn_with_options(
         coordinator,
@@ -1004,6 +1011,7 @@ fn spawn_with_dependencies(
         credentials,
         transport,
         clock,
+        live_policy,
         ApplicationSpawnOptions {
             #[cfg(test)]
             attachment_publish_gate: None,
@@ -1035,6 +1043,7 @@ fn spawn_with_options(
     credentials: Arc<dyn SessionCredentialStore>,
     transport: Option<Arc<dyn LastFmTransport>>,
     clock: Arc<dyn LastFmClock>,
+    live_policy: LastFmLivePolicy,
     options: ApplicationSpawnOptions,
 ) -> (LastFmApplicationHandle, LastFmApplicationShutdown) {
     let build_available = transport.is_some();
@@ -1062,6 +1071,7 @@ fn spawn_with_options(
         credentials,
         transport,
         clock,
+        live_policy,
         database: None,
         generation: None,
         #[cfg(test)]
@@ -1121,6 +1131,14 @@ mod tests {
     use crate::lastfm::delivery::LastFmDeliveryPrimitiveError;
     use crate::lastfm::playback_coordinator::LastFmPlaybackCoordinatorOwner;
     use crate::lastfm::policy::LastFmPolicyGeneration;
+
+    /// One live policy slot publishing generation 1 with the same empty
+    /// opt-in set the test activations carry.
+    fn live_policy_for_test() -> LastFmLivePolicy {
+        let live = LastFmLivePolicy::default();
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
+        live
+    }
     use crate::source_registry::SourceRegistry;
 
     use super::*;
@@ -1304,6 +1322,7 @@ mod tests {
             Arc::new(UnusedCredentials),
             None,
             Arc::new(FixedClock),
+            live_policy_for_test(),
         );
         assert_eq!(
             handle.subscribe_status().borrow().phase,
@@ -1373,6 +1392,7 @@ mod tests {
             Arc::new(UnusedCredentials),
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
             ApplicationSpawnOptions {
                 attachment_publish_gate: Some(AttachmentPublishGate {
                     reached: attachment_reached,
@@ -1438,7 +1458,11 @@ mod tests {
             .bind_window(first_registry.clone())
             .expect("first window binding");
         let (_handle, shutdown) =
-            spawn_lastfm_application_owner(first_binding, tokio::runtime::Handle::current())
+            spawn_lastfm_application_owner(
+            first_binding,
+            tokio::runtime::Handle::current(),
+            live_policy_for_test(),
+        )
                 .expect("first production owner claim");
 
         let second_registry = SourceRegistry::new(tokio::runtime::Handle::current());
@@ -1447,7 +1471,11 @@ mod tests {
             .bind_window(second_registry.clone())
             .expect("second window binding");
         assert_eq!(
-            spawn_lastfm_application_owner(second_binding, tokio::runtime::Handle::current(),)
+            spawn_lastfm_application_owner(
+            second_binding,
+            tokio::runtime::Handle::current(),
+            live_policy_for_test(),
+        )
                 .unwrap_err(),
             LastFmApplicationOwnerClaimError
         );
@@ -1617,6 +1645,7 @@ mod tests {
             credentials.clone(),
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
             ApplicationSpawnOptions {
                 attachment_publish_gate: None,
                 activation_start_gate: Some(ActivationStartGate {
@@ -1774,6 +1803,7 @@ mod tests {
             credentials,
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
             ApplicationSpawnOptions {
                 attachment_publish_gate: None,
                 activation_start_gate: None,
@@ -1921,6 +1951,7 @@ mod tests {
             credentials.clone(),
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
             ApplicationSpawnOptions {
                 attachment_publish_gate: None,
                 activation_start_gate: None,
