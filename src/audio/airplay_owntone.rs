@@ -2252,6 +2252,12 @@ fn daemon_completion_reached(state: &str) -> bool {
 /// [`COMPLETION_PROGRESS_STALL`] is a rendered item: the caller then issues
 /// the restoring `player/stop` itself. `pause` never completes.
 struct CompletionTracker {
+    /// The control epoch every retained sample was taken under. A sample
+    /// from any other epoch starts the history over: a pause/resume pair
+    /// that happened entirely between two polls (refinery R12) is a control
+    /// transition exactly like one observed mid-request, and the interval
+    /// spent paused must never count as continuous play.
+    history_epoch: Option<u64>,
     last_state: String,
     last_progress: Option<u64>,
     unchanged_since: Option<Instant>,
@@ -2260,6 +2266,7 @@ struct CompletionTracker {
 impl CompletionTracker {
     fn new() -> Self {
         Self {
+            history_epoch: None,
             last_state: String::new(),
             last_progress: None,
             unchanged_since: None,
@@ -2269,6 +2276,7 @@ impl CompletionTracker {
     /// Forget every sample: a control transition was accepted, so no stall
     /// interval measured before it may carry over.
     fn reset(&mut self) {
+        self.history_epoch = None;
         self.last_state.clear();
         self.last_progress = None;
         self.unchanged_since = None;
@@ -2294,9 +2302,16 @@ impl CompletionTracker {
         progress: Option<u64>,
         now: Instant,
         stall_completes: bool,
+        epoch: u64,
     ) -> bool {
         if daemon_completion_reached(state) {
             return true;
+        }
+        if self.history_epoch != Some(epoch) {
+            // First sample under this epoch: whatever was measured before it
+            // belongs to a control state the user has left.
+            self.reset();
+            self.history_epoch = Some(epoch);
         }
         match self.unchanged_since {
             Some(since) if progress == self.last_progress && state == self.last_state => {
@@ -2339,10 +2354,17 @@ fn await_daemon_completion(inner: &SessionInner, deadline: Instant) -> Result<Dr
             || !inner.running.load(Ordering::SeqCst)
     };
     let mut tracker = CompletionTracker::new();
+    #[cfg(test)]
+    let mut processed = 0_u32;
     loop {
         if cancelled() {
             return Err(());
         }
+        // Test-only: park here — after a processed sample, before this
+        // request's epoch is captured — so a regression can accept controls
+        // entirely between two polls (refinery R12).
+        #[cfg(test)]
+        park_between_requests(inner, processed);
         let epoch = inner.control_epoch.load(Ordering::SeqCst);
         let stall_completes = inner.autostart_lost.load(Ordering::SeqCst);
         let observation = inner.client.player_progress();
@@ -2356,7 +2378,11 @@ fn await_daemon_completion(inner: &SessionInner, deadline: Instant) -> Result<Dr
         } else {
             match observation {
                 Ok((state, progress)) => {
-                    if tracker.observe(&state, progress, Instant::now(), stall_completes) {
+                    #[cfg(test)]
+                    {
+                        processed += 1;
+                    }
+                    if tracker.observe(&state, progress, Instant::now(), stall_completes, epoch) {
                         return Ok(DrainOutcome::Completed { epoch });
                     }
                 }
@@ -2372,6 +2398,28 @@ fn await_daemon_completion(inner: &SessionInner, deadline: Instant) -> Result<Dr
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Test-only between-request park: once the `park-between` sentinel exists
+/// and at least one sample was processed, announce `between-parked`, wait for
+/// `between-release`, then consume both so later polls run freely.
+#[cfg(test)]
+fn park_between_requests(inner: &SessionInner, processed: u32) {
+    let pipe = &inner.config.pipe_path;
+    if processed == 0 || !pipe.with_extension("park-between").exists() {
+        return;
+    }
+    std::fs::write(pipe.with_extension("between-parked"), "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !pipe.with_extension("between-release").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the between-request park was not released"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _ = std::fs::remove_file(pipe.with_extension("park-between"));
+    let _ = std::fs::remove_file(pipe.with_extension("between-release"));
 }
 
 /// Wait for the item to complete and restore the daemon. `Err(())` is a
@@ -4246,46 +4294,46 @@ mod tests {
         let stall = COMPLETION_PROGRESS_STALL;
         let mut tracker = CompletionTracker::new();
         assert!(
-            tracker.observe("stop", None, t0, false),
+            tracker.observe("stop", None, t0, false, 0),
             "autostop completes at once"
         );
 
         // An autostarted pipe never completes on stalled progress alone.
         let mut tracker = CompletionTracker::new();
-        assert!(!tracker.observe("play", Some(100), t0, false));
-        assert!(!tracker.observe("play", Some(100), t0 + stall * 3, false));
+        assert!(!tracker.observe("play", Some(100), t0, false, 0));
+        assert!(!tracker.observe("play", Some(100), t0 + stall * 3, false, 0));
 
         let mut tracker = CompletionTracker::new();
-        assert!(!tracker.observe("play", Some(100), t0, true));
+        assert!(!tracker.observe("play", Some(100), t0, true, 0));
         assert!(
-            !tracker.observe("play", Some(200), t0 + stall, true),
+            !tracker.observe("play", Some(200), t0 + stall, true, 0),
             "advancing"
         );
-        assert!(!tracker.observe("play", Some(200), t0 + stall + stall / 2, true));
+        assert!(!tracker.observe("play", Some(200), t0 + stall + stall / 2, true, 0));
         assert!(
-            tracker.observe("play", Some(200), t0 + stall * 2, true),
+            tracker.observe("play", Some(200), t0 + stall * 2, true, 0),
             "drained"
         );
 
         let mut tracker = CompletionTracker::new();
-        assert!(!tracker.observe("play", None, t0, true));
+        assert!(!tracker.observe("play", None, t0, true, 0));
         assert!(
-            !tracker.observe("play", None, t0 + stall * 3, true),
+            !tracker.observe("play", None, t0 + stall * 3, true, 0),
             "no progress evidence never counts as drained"
         );
 
         let mut tracker = CompletionTracker::new();
-        assert!(!tracker.observe("pause", Some(300), t0, true));
+        assert!(!tracker.observe("pause", Some(300), t0, true, 0));
         assert!(
-            !tracker.observe("pause", Some(300), t0 + stall * 3, true),
+            !tracker.observe("pause", Some(300), t0 + stall * 3, true, 0),
             "a paused item is never complete"
         );
         assert!(
-            !tracker.observe("play", Some(300), t0 + stall * 3, true),
+            !tracker.observe("play", Some(300), t0 + stall * 3, true, 0),
             "a resume restarts the stall clock"
         );
-        assert!(!tracker.observe("play", Some(300), t0 + stall * 3 + stall / 2, true));
-        assert!(tracker.observe("play", Some(300), t0 + stall * 4, true));
+        assert!(!tracker.observe("play", Some(300), t0 + stall * 3 + stall / 2, true, 0));
+        assert!(tracker.observe("play", Some(300), t0 + stall * 4, true, 0));
     }
 
     /// A reset forgets the stall clock: the next stalled sample starts over.
@@ -4294,13 +4342,39 @@ mod tests {
         let t0 = Instant::now();
         let stall = COMPLETION_PROGRESS_STALL;
         let mut tracker = CompletionTracker::new();
-        assert!(!tracker.observe("play", Some(500), t0, true));
+        assert!(!tracker.observe("play", Some(500), t0, true, 0));
         tracker.reset();
         assert!(
-            !tracker.observe("play", Some(500), t0 + stall * 2, true),
+            !tracker.observe("play", Some(500), t0 + stall * 2, true, 0),
             "a pre-reset sample must not count towards the stall"
         );
-        assert!(tracker.observe("play", Some(500), t0 + stall * 3, true));
+        assert!(tracker.observe("play", Some(500), t0 + stall * 3, true, 0));
+    }
+
+    /// R12: the history is bound to the epoch it was built under. Samples
+    /// taken under a new epoch start over even when nothing was observed
+    /// in between (a pause/resume pair between two polls).
+    #[test]
+    fn completion_tracker_starts_over_when_the_epoch_moves_between_samples() {
+        let t0 = Instant::now();
+        let stall = COMPLETION_PROGRESS_STALL;
+        let mut tracker = CompletionTracker::new();
+        assert!(!tracker.observe("play", Some(500), t0, false, 1));
+        // 1.1 s later, same progress, but two controls were accepted meanwhile
+        // (pause, resume): epoch 3, now eligible. Not completion.
+        assert!(
+            !tracker.observe("play", Some(500), t0 + stall + stall / 10, true, 3),
+            "the paused interval must not count as continuous play"
+        );
+        assert!(!tracker.observe("play", Some(500), t0 + stall + stall / 2, true, 3));
+        assert!(
+            tracker.observe("play", Some(500), t0 + stall * 2 + stall / 10, true, 3),
+            "a fresh continuous-playing interval under epoch 3 completes"
+        );
+        // Same epoch throughout: the stall accumulates as before.
+        let mut tracker = CompletionTracker::new();
+        assert!(!tracker.observe("play", Some(500), t0, true, 7));
+        assert!(tracker.observe("play", Some(500), t0 + stall, true, 7));
     }
 
     /// R10: the autostart binding can be lost while the drain wait is already
@@ -4314,25 +4388,25 @@ mod tests {
         let stall = COMPLETION_PROGRESS_STALL;
         let mut tracker = CompletionTracker::new();
         // Autostarted: stalled progress is not completion.
-        assert!(!tracker.observe("play", Some(500), t0, false));
-        assert!(!tracker.observe("play", Some(500), t0 + stall * 2, false));
+        assert!(!tracker.observe("play", Some(500), t0, false, 0));
+        assert!(!tracker.observe("play", Some(500), t0 + stall * 2, false, 0));
         // A pause is accepted mid-wait, then a resume.
-        assert!(!tracker.observe("pause", Some(500), t0 + stall * 3, true));
-        assert!(!tracker.observe("play", Some(500), t0 + stall * 4, true));
+        assert!(!tracker.observe("pause", Some(500), t0 + stall * 3, true, 0));
+        assert!(!tracker.observe("play", Some(500), t0 + stall * 4, true, 0));
         assert!(
-            !tracker.observe("play", Some(500), t0 + stall * 4 + stall / 2, true),
+            !tracker.observe("play", Some(500), t0 + stall * 4 + stall / 2, true, 0),
             "the resume restarted the stall clock"
         );
         assert!(
-            tracker.observe("play", Some(500), t0 + stall * 5, true),
+            tracker.observe("play", Some(500), t0 + stall * 5, true, 0),
             "the drained, no-longer-autostarted item completes"
         );
         // The flag is consulted per observation: without it the same stall is
         // still a fault.
         let mut tracker = CompletionTracker::new();
-        assert!(!tracker.observe("play", Some(500), t0, false));
-        assert!(!tracker.observe("play", Some(500), t0 + stall * 2, false));
-        assert!(tracker.observe("play", Some(500), t0 + stall * 2, true));
+        assert!(!tracker.observe("play", Some(500), t0, false, 0));
+        assert!(!tracker.observe("play", Some(500), t0 + stall * 2, false, 0));
+        assert!(tracker.observe("play", Some(500), t0 + stall * 2, true, 0));
     }
 
     #[test]
@@ -5091,6 +5165,23 @@ mod tests {
     #[track_caller]
     fn wait_until(predicate: impl FnMut() -> bool) {
         wait_until_within(Duration::from_secs(10), predicate);
+    }
+
+    /// Drain the event channel through the publication of `state`. The
+    /// controller's state cache is written before its event is sent
+    /// (`publish_state`), so a fixture that waits on the cache and then drains
+    /// can leave that very event behind and trip a later "no play/pause"
+    /// assertion (seen once in release mode under a full-suite load).
+    fn drain_through(rx: &async_channel::Receiver<PlayerEvent>, state: PlayerState) {
+        let mut seen = false;
+        wait_until(|| {
+            while let Ok(event) = rx.try_recv() {
+                if matches!(event, PlayerEvent::StateChanged { state: s, .. } if s == state) {
+                    seen = true;
+                }
+            }
+            seen
+        });
     }
 
     /// [`wait_until`] with an explicit bound, for phases that legitimately
@@ -7524,7 +7615,7 @@ fn serve(stream: std::net::TcpStream) {
         controller.load(generation, prepared);
         if live {
             wait_until(|| controller.state() == PlayerState::Playing);
-            while rx.try_recv().is_ok() {}
+            drain_through(&rx, PlayerState::Playing);
             refuse();
             controller.stop();
         }
@@ -8194,6 +8285,85 @@ fn serve(stream: std::net::TcpStream) {
         assert_outputs_match(&fixture.client, baseline);
         assert!(!fixture.daemon.config.takeover_record().exists());
         assert!(fixture.lock_is_free());
+    }
+
+    /// R12: a pause/resume pair accepted entirely between two drain polls. The
+    /// drain worker is parked after it processed one playing sample and before
+    /// it captures the next request's epoch; the controller pauses (longer than
+    /// the stall interval) and resumes while it is parked, with the daemon's
+    /// progress unchanged; the park is released. The first fresh sample must
+    /// not complete the item (no pre-pause or paused interval may count), and
+    /// a fresh continuous-playing interval must then complete it exactly once.
+    #[cfg(owntone_host)]
+    fn exercise_control_transition_between_polls(already_eligible: bool) {
+        let fixture = DaemonControllerFixture::start_brief(40 * 1024);
+        let controller = &fixture.controller;
+        let client = &fixture.client;
+        let pipe = &fixture.daemon.config.pipe_path;
+        let baseline = client.outputs().unwrap();
+        std::fs::write(pipe.with_extension("stall"), b"").unwrap();
+        let prepared = fixture.prepare();
+        let ticket = prepared.ticket().unwrap();
+        let generation = PlayerEventGeneration::from_raw(50);
+        controller.set_generation(generation);
+        controller.load(generation, prepared);
+        wait_until(|| controller.state() == PlayerState::Playing);
+        wait_until(
+            || matches!(client.player_progress(), Ok((ref s, Some(p))) if s == "play" && p > 0),
+        );
+        if already_eligible {
+            // A prior pause/resume: the item is already no longer autostarted.
+            controller.pause();
+            wait_until(|| controller.state() == PlayerState::Paused);
+            controller.play();
+            wait_until(|| controller.state() == PlayerState::Playing);
+        }
+        // The writer closes once the pump reaches EOS; the drain wait then
+        // processes at least one playing sample before parking.
+        std::fs::write(pipe.with_extension("park-between"), b"").unwrap();
+        wait_until(|| pipe.with_extension("between-parked").exists());
+
+        // Two controls entirely between polls; the pause outlives the stall.
+        controller.pause();
+        wait_until(|| controller.state() == PlayerState::Paused);
+        std::thread::sleep(COMPLETION_PROGRESS_STALL + Duration::from_millis(200));
+        controller.play();
+        wait_until(|| controller.state() == PlayerState::Playing);
+        assert_eq!(client.player_state().unwrap(), "play");
+        let _ = fixture.drain_events();
+
+        std::fs::write(pipe.with_extension("between-release"), b"").unwrap();
+        std::thread::sleep(COMPLETION_PROGRESS_STALL / 2);
+        let events = fixture.drain_events();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                PlayerEvent::TrackEnded { .. }
+                    | PlayerEvent::Error { .. }
+                    | PlayerEvent::StateChanged {
+                        state: PlayerState::Stopped,
+                        ..
+                    }
+            )),
+            "the first sample after a between-poll pause/resume completed the item: {events:?}"
+        );
+        assert_eq!(controller.state(), PlayerState::Playing);
+        assert!(fixture.daemon.config.takeover_record().exists());
+        assert_eq!(ticket.route_count(), 1);
+        // A fresh continuous-playing interval at unchanged progress completes.
+        assert_single_natural_completion(&fixture, &ticket, generation, &baseline);
+    }
+
+    #[cfg(owntone_host)]
+    #[test]
+    fn a_first_pause_between_polls_never_borrows_the_pre_pause_stall() {
+        exercise_control_transition_between_polls(false);
+    }
+
+    #[cfg(owntone_host)]
+    #[test]
+    fn a_later_pause_between_polls_never_borrows_the_pre_pause_stall() {
+        exercise_control_transition_between_polls(true);
     }
 
     /// R11: a playing sample taken before a pause is history once the pause
@@ -9782,7 +9952,7 @@ fn serve(stream: std::net::TcpStream) {
         wait_until(|| controller.state() == PlayerState::Playing);
         controller.pause();
         wait_until(|| controller.state() == PlayerState::Paused);
-        while rx.try_recv().is_ok() {}
+        drain_through(&rx, PlayerState::Paused);
         let pipe = &daemon.config.pipe_path;
         std::fs::write(pipe.with_extension("park-activation"), "resume").unwrap();
         if !timeout {
@@ -9939,7 +10109,7 @@ fn serve(stream: std::net::TcpStream) {
         controller.set_generation(generation);
         controller.load(generation, prepared);
         wait_until(|| controller.state() == PlayerState::Playing);
-        while rx.try_recv().is_ok() {}
+        drain_through(&rx, PlayerState::Playing);
         let pipe = &daemon.config.pipe_path;
         std::fs::write(
             pipe.with_extension("park-control"),
