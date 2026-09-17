@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Read-only consistency checks for the Tributary implementation backlog.
+"""
+Read-only consistency checks for the Tributary implementation backlog.
 
 ``docs/task.md`` is the repository's countable execution index.  Several of its
 invariants are maintained by hand and were previously unenforced:
@@ -34,7 +35,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
+import shutil
+# The single subprocess use below is a fixed, read-only ``git ls-files``
+# invocation whose arguments never include untrusted input (Bandit B404).
+import subprocess  # nosec B404
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -123,7 +127,8 @@ def relative_display(root: Path, path: Path) -> str:
 
 
 def iter_content_lines(text: str) -> Iterable[tuple[int, str]]:
-    """Yield ``(line_number, line)`` outside fenced code blocks.
+    """
+    Yield ``(line_number, line)`` outside fenced code blocks.
 
     Fenced code blocks frequently contain shell snippets whose ``#`` comment
     lines would otherwise be mistaken for headings and whose bracketed text
@@ -183,21 +188,27 @@ def document_anchors(path: Path) -> set[str]:
 
 
 def collect_markdown_files(root: Path) -> list[Path]:
-    """Return the tracked Markdown files to link-check.
+    """
+    Return the tracked Markdown files to link-check.
 
     Tracked files are preferred because they exclude build output and scratch
     trees; a plain recursive walk is the fallback for a tarball or a synthetic
     test tree that is not a Git checkout.
     """
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(root), "ls-files", "*.md"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        result = None
+    git = shutil.which("git")
+    result = None
+    if git is not None:
+        # The executable is fully resolved above and every argument is fixed;
+        # nothing user-controlled reaches the command line (Bandit B603/B607).
+        try:
+            result = subprocess.run(  # nosec B603
+                [git, "-C", str(root), "ls-files", "*.md"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            result = None
     if result is not None and result.returncode == 0:
         tracked = [root / name for name in result.stdout.split("\n") if name]
         if tracked:
@@ -220,7 +231,8 @@ def iter_link_targets(line: str) -> Iterable[str]:
 
 
 def split_target(target: str) -> tuple[str | None, str]:
-    """Split a link target into ``(path, fragment)``.
+    """
+    Split a link target into ``(path, fragment)``.
 
     ``None`` means the target is external and must be skipped.  An empty path
     means the fragment points inside the containing file.
@@ -316,8 +328,62 @@ def check_counters(text: str, records: Sequence[Record]) -> list[str]:
     return problems
 
 
+def _archived_section_flags(title: str) -> tuple[bool, bool]:
+    """Return ``(in_summary, in_gate)`` for one archived-document heading."""
+    lowered = title.lower()
+    return lowered.startswith("how to use"), "global validation" in lowered
+
+
+def _is_excluded_archived_box(line: str, in_summary: bool, in_gate: bool) -> bool:
+    """
+    Return whether an archived checkbox is one of the documented exclusions.
+
+    Status-summary boxes, global-validation gate boxes and withdrawn false
+    findings are all documented in the archive as non-task boxes.
+    """
+    if in_summary or in_gate:
+        return True
+    return "~~" in line and "withdrawn" in line.lower()
+
+
+def _collect_archived_boxes(text: str) -> tuple[int, int, dict[str, int]]:
+    """
+    Count the in-scope archived checkboxes.
+
+    Returns ``(complete, total, unclassified)`` where *unclassified* maps each
+    section title that holds boxes outside the P0-P3 task sections and the
+    documented exclusions to its box count.
+    """
+    complete = 0
+    total = 0
+    unclassified: dict[str, int] = {}
+    in_summary = False
+    in_gate = False
+    section: str | None = None
+    for _, line in iter_content_lines(text):
+        heading = HEADING.match(line)
+        if heading:
+            section = heading.group("title").strip()
+            in_summary, in_gate = _archived_section_flags(section)
+            continue
+        match = ARCHIVED_BOX_PATTERN.match(line)
+        if match is None:
+            continue
+        if _is_excluded_archived_box(line, in_summary, in_gate):
+            continue
+        if section is None or not re.match(r"^P[0-3]\b", section):
+            key = section or "<top>"
+            unclassified[key] = unclassified.get(key, 0) + 1
+            continue
+        total += 1
+        if match.group("mark").lower() == "x":
+            complete += 1
+    return complete, total, unclassified
+
+
 def derive_archived_counts(path: Path) -> tuple[int, int, list[str]]:
-    """Mechanically recount the archived remediation checkboxes.
+    """
+    Mechanically recount the archived remediation checkboxes.
 
     The archived counter describes the in-scope task checkboxes of the
     archived remediation document.  That document's own prose documents the
@@ -342,34 +408,8 @@ def derive_archived_counts(path: Path) -> tuple[int, int, list[str]]:
         return 0, 0, [
             f"counter: archived remediation source {display} is unreadable ({error})"
         ]
-    complete = 0
-    total = 0
+    complete, total, unclassified = _collect_archived_boxes(text)
     problems: list[str] = []
-    unclassified: dict[str, int] = {}
-    in_summary = False
-    in_gate = False
-    section: str | None = None
-    for _, line in iter_content_lines(text):
-        heading = HEADING.match(line)
-        if heading:
-            title = heading.group("title").strip()
-            lowered = title.lower()
-            in_summary = lowered.startswith("how to use")
-            in_gate = "global validation" in lowered
-            section = title
-            continue
-        match = ARCHIVED_BOX_PATTERN.match(line)
-        if match is None:
-            continue
-        if in_summary or in_gate or ("~~" in line and "withdrawn" in line.lower()):
-            continue
-        if section is None or not re.match(r"^P[0-3]\b", section):
-            key = section or "<top>"
-            unclassified[key] = unclassified.get(key, 0) + 1
-            continue
-        total += 1
-        if match.group("mark").lower() == "x":
-            complete += 1
     for title, count in sorted(unclassified.items()):
         problems.append(
             f"counter: {display} has {count} checkbox(es) under section "
@@ -383,10 +423,11 @@ def check_archived_counter(text: str, root: Path) -> list[str]:
     """Report drift between the archived counter prose and its source boxes."""
     match = ARCHIVED_COUNTER_PATTERN.search(text)
     if match is None:
-        return [
+        missing = (
             "counter: could not find the archived remediation counter; "
             "if the wording changed, update ARCHIVED_COUNTER_PATTERN"
-        ]
+        )
+        return [missing]
     source = root / ARCHIVED_INDEX_NAME
     if not source.is_file():
         return [f"counter: archived remediation source {ARCHIVED_INDEX_NAME} is missing"]
@@ -410,39 +451,52 @@ def check_archived_counter(text: str, root: Path) -> list[str]:
     return problems
 
 
+def _check_link_target(
+    root: Path,
+    source: Path,
+    number: int,
+    target: str,
+    anchor_cache: dict[Path, set[str]],
+) -> list[str]:
+    """Report one relative link target (and ``#anchor``) that does not resolve."""
+    problems: list[str] = []
+    path_part, fragment = split_target(target)
+    if path_part is None:
+        return problems
+    relative = relative_display(root, source)
+    target_path = (source if not path_part else source.parent / path_part).resolve()
+    if not target_path.exists():
+        problems.append(f"link: {relative}:{number}: broken link target '{target}'")
+        return problems
+    if fragment and target_path.suffix.lower() == ".md":
+        anchors = anchor_cache.get(target_path)
+        if anchors is None:
+            anchors = document_anchors(target_path)
+            anchor_cache[target_path] = anchors
+        if fragment not in anchors:
+            problems.append(
+                f"link: {relative}:{number}: missing anchor '#{fragment}' in "
+                f"{relative_display(root, target_path)}"
+            )
+    return problems
+
+
 def check_links(root: Path, markdown_files: Sequence[Path]) -> list[str]:
     """Report relative link targets and ``#anchors`` that do not resolve."""
     problems: list[str] = []
     anchor_cache: dict[Path, set[str]] = {}
 
     for path in markdown_files:
-        relative = relative_display(root, path)
         try:
             text = path.read_text(encoding="utf-8")
         except OSError as error:  # pragma: no cover - unreadable checkout file
-            problems.append(f"link: {relative} is unreadable ({error})")
+            problems.append(f"link: {relative_display(root, path)} is unreadable ({error})")
             continue
         for number, line in iter_content_lines(text):
             for target in iter_link_targets(line):
-                path_part, fragment = split_target(target)
-                if path_part is None:
-                    continue
-                target_path = (path if not path_part else path.parent / path_part).resolve()
-                if not target_path.exists():
-                    problems.append(
-                        f"link: {relative}:{number}: broken link target '{target}'"
-                    )
-                    continue
-                if fragment and target_path.suffix.lower() == ".md":
-                    anchors = anchor_cache.get(target_path)
-                    if anchors is None:
-                        anchors = document_anchors(target_path)
-                        anchor_cache[target_path] = anchors
-                    if fragment not in anchors:
-                        problems.append(
-                            f"link: {relative}:{number}: missing anchor '#{fragment}' in "
-                            f"{relative_display(root, target_path)}"
-                        )
+                problems.extend(
+                    _check_link_target(root, path, number, target, anchor_cache)
+                )
     return problems
 
 
@@ -452,7 +506,8 @@ def _short(sha: str) -> str:
 
 
 def _pr_evidence(entry: dict) -> tuple[str, object]:
-    """Classify the ``pr`` mapping of a ledger entry.
+    """
+    Classify the ``pr`` mapping of a ledger entry.
 
     Returns a ``(state, value)`` pair where *state* is one of:
 
@@ -477,10 +532,88 @@ def _pr_evidence(entry: dict) -> tuple[str, object]:
     return "invalid", value
 
 
+def _check_active_flag(identifier: str, entry: dict, active: bool) -> list[str]:
+    """Report a snapshot ``active`` flag that disagrees with the index state."""
+    if "active" not in entry or bool(entry["active"]) == active:
+        return []
+    state_word = "active" if active else "complete"
+    drift = (
+        f"ledger: record '{identifier}' snapshot flag "
+        f"active={entry['active']} disagrees with the index state "
+        f"({state_word}); the index decides"
+    )
+    return [drift]
+
+
+def _check_active_mapping(identifier: str, entry: dict) -> list[str]:
+    """
+    Report missing bead, issue and pull-request mapping fields of one record.
+
+    The record is index-derived active.  ``"pr": null`` is the documented
+    not-yet-published representation; a published ``pr`` (a positive integer
+    or digit string) must carry ``head_sha`` evidence for the stale-review
+    check in :func:`_check_entry_state`.
+    """
+    problems: list[str] = []
+    if not entry.get("bead"):
+        problems.append(f"ledger: active record '{identifier}' has no bead mapping")
+    if not entry.get("issue"):
+        problems.append(f"ledger: active record '{identifier}' has no issue mapping")
+    state, value = _pr_evidence(entry)
+    if state == "missing":
+        problems.append(
+            f"ledger: active record '{identifier}' has no pr mapping "
+            "(use null for 'not yet published')"
+        )
+    elif state == "invalid":
+        problems.append(
+            f"ledger: active record '{identifier}' has an invalid pr "
+            f"mapping ({value!r})"
+        )
+    elif state == "published" and not entry.get("head_sha"):
+        problems.append(
+            f"ledger: active record '{identifier}' references PR {value} "
+            "without head_sha evidence"
+        )
+    return problems
+
+
+def _check_entry_state(
+    identifier: str, entry: dict, record: Record, task_index: Path
+) -> list[str]:
+    """Report a stale review head and merged-but-unreconciled record state."""
+    problems: list[str] = []
+    head = entry.get("head_sha")
+    reviewed = entry.get("reviewed_sha")
+    if head and reviewed and head != reviewed:
+        problems.append(
+            f"ledger: record '{identifier}' has a stale review head "
+            f"(reviewed {_short(str(reviewed))} != head {_short(str(head))})"
+        )
+    if entry.get("merged") and not record.complete:
+        problems.append(
+            f"ledger: record '{identifier}' is merged but still unchecked in "
+            f"{task_index.name} (merged-but-unreconciled)"
+        )
+    return problems
+
+
+def _check_unmapped_records(
+    records: Sequence[Record], entries: dict[str, object]
+) -> list[str]:
+    """Report index-active records that have no snapshot entry at all."""
+    return [
+        f"ledger: active record '{record.identifier}' has no mapping entry"
+        for record in records
+        if not record.complete and record.identifier not in entries
+    ]
+
+
 def check_ledger(
     snapshot: object, records: Sequence[Record], task_index: Path
 ) -> list[str]:
-    """Report mapping problems from an optional read-only ledger snapshot.
+    """
+    Report mapping problems from an optional read-only ledger snapshot.
 
     The snapshot is a JSON object::
 
@@ -500,8 +633,8 @@ def check_ledger(
     Every active (unchecked) record must appear with an issue, a bead, and a
     pull-request mapping.  ``"pr": null`` is the explicit not-yet-published
     representation; omitting the ``pr`` key is reported as a missing mapping.
-    A published ``pr`` (a positive integer or digit string) must carry
-    ``head_sha`` evidence, which the stale-review check below validates.
+    A published ``pr`` must carry ``head_sha`` evidence, which the
+    stale-review check validates.
 
     The task index is authoritative for checked state: an ``active`` snapshot
     flag that disagrees with the index is reported and never downgrades the
@@ -528,52 +661,12 @@ def check_ledger(
         # checks below always run on the index-derived state, and a flag that
         # contradicts the index is itself reportable drift.
         active = not record.complete
-        if "active" in entry and bool(entry["active"]) != active:
-            state_word = "active" if active else "complete"
-            problems.append(
-                f"ledger: record '{identifier}' snapshot flag "
-                f"active={entry['active']} disagrees with the index state "
-                f"({state_word}); the index decides"
-            )
+        problems.extend(_check_active_flag(identifier, entry, active))
         if active:
-            if not entry.get("bead"):
-                problems.append(f"ledger: active record '{identifier}' has no bead mapping")
-            if not entry.get("issue"):
-                problems.append(f"ledger: active record '{identifier}' has no issue mapping")
-            state, value = _pr_evidence(entry)
-            if state == "missing":
-                problems.append(
-                    f"ledger: active record '{identifier}' has no pr mapping "
-                    "(use null for 'not yet published')"
-                )
-            elif state == "invalid":
-                problems.append(
-                    f"ledger: active record '{identifier}' has an invalid pr "
-                    f"mapping ({value!r})"
-                )
-            elif state == "published" and not entry.get("head_sha"):
-                problems.append(
-                    f"ledger: active record '{identifier}' references PR {value} "
-                    "without head_sha evidence"
-                )
-        head = entry.get("head_sha")
-        reviewed = entry.get("reviewed_sha")
-        if head and reviewed and head != reviewed:
-            problems.append(
-                f"ledger: record '{identifier}' has a stale review head "
-                f"(reviewed {_short(str(reviewed))} != head {_short(str(head))})"
-            )
-        if entry.get("merged") and not record.complete:
-            problems.append(
-                f"ledger: record '{identifier}' is merged but still unchecked in "
-                f"{task_index.name} (merged-but-unreconciled)"
-            )
+            problems.extend(_check_active_mapping(identifier, entry))
+        problems.extend(_check_entry_state(identifier, entry, record, task_index))
 
-    for record in records:
-        if not record.complete and record.identifier not in entries:
-            problems.append(
-                f"ledger: active record '{record.identifier}' has no mapping entry"
-            )
+    problems.extend(_check_unmapped_records(records, entries))
     return problems
 
 
@@ -633,6 +726,11 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_ledger_path(args: argparse.Namespace) -> Path | None:
+    """Resolve the optional ledger snapshot path from parsed CLI arguments."""
+    return args.ledger.resolve() if args.ledger else None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the checker; return a process exit status."""
     args = parse_args(argv)
@@ -641,7 +739,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not task_index.is_file():
         print(f"backlog consistency: missing task index {task_index}", file=sys.stderr)
         return 2
-    ledger = args.ledger.resolve() if args.ledger else None
+    ledger = _resolve_ledger_path(args)
     if ledger is not None and not ledger.is_file():
         print(f"backlog consistency: missing ledger snapshot {ledger}", file=sys.stderr)
         return 2

@@ -55,7 +55,8 @@ def sample_records():
 
 
 def archived_remediation_doc(*, complete=223, open_boxes=3):
-    """Build an archived remediation source matching the default counter.
+    """
+    Build an archived remediation source matching the default counter.
 
     The structural classes the checker applies — status-summary boxes, the
     global-validation gate, a withdrawn false finding, and P0-P3 task boxes —
@@ -431,9 +432,7 @@ class BacklogConsistencyTests(unittest.TestCase):
         self.write(root, "docs/task.md", text)
         problems = checker.check_archived_counter(text, root)
         self.assertEqual(len(problems), 1, problems)
-        self.assertIn(
-            f"source {checker.ARCHIVED_INDEX_NAME} is missing", problems[0]
-        )
+        self.assertIn(f"source {checker.ARCHIVED_INDEX_NAME} is missing", problems[0])
 
     def test_archived_derivation_excludes_documented_boxes(self):
         root = self.make_root()
@@ -455,7 +454,8 @@ class BacklogConsistencyTests(unittest.TestCase):
 
     # ── integration ──────────────────────────────────────────────────────────
     def assert_repository_consistency(self, root):
-        """Validate a repository root's index consistency without frozen totals.
+        """
+        Validate a repository root's index consistency without frozen totals.
 
         The real repository's record, completion and archived totals
         legitimately advance as backlog work lands.  Hard-coding them here
@@ -485,9 +485,7 @@ class BacklogConsistencyTests(unittest.TestCase):
         self.assertGreaterEqual(complete, 0)
         self.assertLessEqual(complete, len(records))
         archived = root / checker.ARCHIVED_INDEX_NAME
-        archived_complete, archived_total, structural = checker.derive_archived_counts(
-            archived
-        )
+        archived_complete, archived_total, structural = checker.derive_archived_counts(archived)
         self.assertEqual(structural, [])
         self.assertGreater(archived_total, 0)
         self.assertLessEqual(archived_complete, archived_total)
@@ -507,10 +505,7 @@ class BacklogConsistencyTests(unittest.TestCase):
         text = counter_paragraph() + sample_records()
         progressed = text.replace(
             "- [ ] **Q1** — engineering\n", "- [x] **Q1** — engineering\n"
-        ).replace(
-            "Current status: **1/4 (25.0%)**",
-            "Current status: **2/4 (50.0%)**",
-        ).replace(
+        ).replace("Current status: **1/4 (25.0%)**", "Current status: **2/4 (50.0%)**").replace(
             "with **0/1** new corrective and **0/1** engineering",
             "with **0/1** new corrective and **1/1** engineering",
         )
@@ -525,9 +520,7 @@ class BacklogConsistencyTests(unittest.TestCase):
     def test_completion_change_without_counter_update_fails(self):
         root = self.make_root()
         text = counter_paragraph() + sample_records()
-        stale = text.replace(
-            "- [ ] **Q1** — engineering\n", "- [x] **Q1** — engineering\n"
-        )
+        stale = text.replace("- [ ] **Q1** — engineering\n", "- [x] **Q1** — engineering\n")
         self.write(root, "docs/task.md", stale)
         self.write_archived_fixture(root)
         _, _, problems = checker.run_checks(root, root / checker.TASK_INDEX_NAME)
