@@ -4761,6 +4761,8 @@ async fn initial_scan_with_control(
 
             let p = path.clone();
             let parse_job = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                apply_test_only_parse_delay();
                 tag_parser::parse_audio_file_from_file(parse_file, &p)
             });
             let parse_result = await_readonly_blocking(cancellation, parse_job).await;
@@ -15827,5 +15829,192 @@ mod tests {
         // never comes.
         drop(command_tx);
         engine_task.abort();
+    }
+
+    /// Opt-in Q4 responsiveness measurement over a fixed synthetic library.
+    ///
+    /// Ignored because it generates a 10k/100k-track on-disk fixture. Run it
+    /// against a named reference runner with:
+    ///
+    /// ```text
+    /// TRIBUTARY_Q4_TRACKS=100000 \
+    ///   cargo test --bin tributary --release -- --ignored --nocapture \
+    ///   q4_measured_large_library_responsiveness
+    /// ```
+    ///
+    /// `TRIBUTARY_Q4_PARSE_DELAY_MICROS=<n>` additionally runs a second scan
+    /// with `n` microseconds of deterministic per-file parse delay to model a
+    /// slow filesystem/parser fixture (the seam R9 #256 also needs).
+    #[tokio::test]
+    #[ignore = "opt-in Q4 large-library measurement; generates a large fixture"]
+    async fn q4_measured_large_library_responsiveness() {
+        use std::time::Instant;
+
+        use crate::architecture::models::{Rating, SortField, SortOrder};
+
+        use super::super::perf_fixtures::{
+            catalogue_bytes, track_count_from_env, DelayedBackend, ResponsivenessReport,
+            SyntheticLibrary,
+        };
+
+        struct ParseDelayGuard;
+
+        impl ParseDelayGuard {
+            fn set(micros: u64) -> Self {
+                super::TEST_ONLY_PARSE_DELAY_MICROS.store(micros, Ordering::Relaxed);
+                Self
+            }
+        }
+
+        impl Drop for ParseDelayGuard {
+            fn drop(&mut self) {
+                super::TEST_ONLY_PARSE_DELAY_MICROS.store(0, Ordering::Relaxed);
+            }
+        }
+
+        let track_count = track_count_from_env();
+        let library =
+            SyntheticLibrary::generate(track_count).expect("generate synthetic library fixture");
+        let db = rename_test_database().await;
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+
+        let scan_started = Instant::now();
+        initial_scan(&db, &[library.root().to_path_buf()], &event_tx, &refresh)
+            .await
+            .expect("measured initial scan");
+        let scan_elapsed = scan_started.elapsed();
+        let persisted = track::Entity::find()
+            .all(&db)
+            .await
+            .expect("count persisted tracks")
+            .len();
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).count();
+
+        let runner = std::env::var("TRIBUTARY_Q4_RUNNER")
+            .unwrap_or_else(|_| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH));
+        let mut report = ResponsivenessReport::new(runner);
+        report.record(
+            "scan_tracks_persisted",
+            track_count,
+            persisted as f64,
+            "tracks",
+        );
+        report.record_ms("scan_elapsed", track_count, scan_elapsed);
+        report.record("scan_events", track_count, events as f64, "events");
+        if scan_elapsed.as_secs_f64() > 0.0 {
+            report.record(
+                "scan_throughput",
+                track_count,
+                persisted as f64 / scan_elapsed.as_secs_f64(),
+                "tracks_per_second",
+            );
+        }
+
+        // Source/filter/rebuild latency and retained bytes through the real
+        // backend seam, measured over the freshly scanned catalogue.
+        let backend = LocalBackend::new(db.clone());
+        let tracks_started = Instant::now();
+        let catalogue = backend.list_tracks().await.expect("list tracks");
+        report.record_ms("backend_list_tracks", track_count, tracks_started.elapsed());
+        report.record(
+            "catalogue_retained_bytes",
+            track_count,
+            catalogue_bytes(&catalogue) as f64,
+            "bytes",
+        );
+
+        let albums_started = Instant::now();
+        backend
+            .list_albums(SortField::Title, SortOrder::Ascending)
+            .await
+            .expect("list albums");
+        report.record_ms("backend_list_albums", track_count, albums_started.elapsed());
+
+        let artists_started = Instant::now();
+        backend.list_artists().await.expect("list artists");
+        report.record_ms(
+            "backend_list_artists",
+            track_count,
+            artists_started.elapsed(),
+        );
+
+        let search_started = Instant::now();
+        backend
+            .search("Track0001", 50)
+            .await
+            .expect("search catalogue");
+        report.record_ms("backend_search", track_count, search_started.elapsed());
+
+        let stats_started = Instant::now();
+        backend.get_stats().await.expect("read library stats");
+        report.record_ms("backend_get_stats", track_count, stats_started.elapsed());
+
+        // Update bursts: repeated rating mutations over the same catalogue.
+        if let Some(track_id) = catalogue
+            .iter()
+            .find_map(|track| track.native_track_id.clone())
+        {
+            let updates = 100_usize.min(track_count);
+            let rating = Rating::new(80).expect("valid rating");
+            let burst_started = Instant::now();
+            for _ in 0..updates {
+                backend
+                    .set_track_rating(&track_id, Some(rating))
+                    .await
+                    .expect("update rating");
+            }
+            let burst = burst_started.elapsed();
+            report.record("update_burst_count", track_count, updates as f64, "updates");
+            report.record_ms("update_burst_total", track_count, burst);
+            report.record(
+                "update_burst_per_update",
+                track_count,
+                burst.as_secs_f64() * 1_000.0 / updates as f64,
+                "ms",
+            );
+        }
+
+        // Prove the delayed-backend fixture adds deterministic latency.
+        let delayed = DelayedBackend::new(LocalBackend::new(db.clone()), Duration::from_millis(5));
+        let delayed_started = Instant::now();
+        delayed
+            .list_tracks()
+            .await
+            .expect("list tracks through delay");
+        let delayed_elapsed = delayed_started.elapsed();
+        report.record_ms("delayed_backend_list_tracks", track_count, delayed_elapsed);
+        report.record(
+            "delayed_backend_calls",
+            track_count,
+            delayed.calls() as f64,
+            "calls",
+        );
+
+        // Optional delayed-filesystem/parser pass over the same fixture.
+        if let Ok(micros) = std::env::var("TRIBUTARY_Q4_PARSE_DELAY_MICROS") {
+            if let Ok(micros) = micros.parse::<u64>() {
+                if micros > 0 {
+                    let _guard = ParseDelayGuard::set(micros);
+                    let delayed_scan_started = Instant::now();
+                    initial_scan(&db, &[library.root().to_path_buf()], &event_tx, &refresh)
+                        .await
+                        .expect("delayed initial scan");
+                    report.record_ms(
+                        "delayed_parse_scan_elapsed",
+                        track_count,
+                        delayed_scan_started.elapsed(),
+                    );
+                    report.record(
+                        "delayed_parse_micros_per_file",
+                        track_count,
+                        micros as f64,
+                        "microseconds",
+                    );
+                }
+            }
+        }
+
+        println!("{}", report.render());
     }
 }
