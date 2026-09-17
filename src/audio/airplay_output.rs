@@ -695,36 +695,9 @@ impl AirPlayOutput {
         let state_cache = Arc::new(AtomicU8::new(PlayerState::Buffering as u8));
         let position_cache = Arc::new(Mutex::new(SenderPosition::unknown(generation)));
         let (commands, command_rx) = mpsc::channel();
-
-        let ctx = SenderOpenContext {
-            target: self.target(),
-            prepared_uri: prepared.uri().to_string(),
-            event_tx: self.event_tx.clone(),
-            generation,
-            media_proxy: Arc::clone(&self.media_proxy),
-            media_ticket: prepared.ticket(),
-            volume: self.volume,
-            cancel: cancel.clone(),
-            session_gate: Arc::clone(&gate),
-            open_id,
-        };
-        let sender = Arc::clone(&self.sender);
-        let event_generation = Arc::clone(&self.event_generation);
-        let worker_state = Arc::clone(&state_cache);
-        let worker_position = Arc::clone(&position_cache);
-        let spawned = std::thread::Builder::new()
-            .name("airplay-load".to_string())
-            .spawn(move || {
-                run_session_worker(
-                    sender,
-                    ctx,
-                    registration,
-                    command_rx,
-                    worker_state,
-                    worker_position,
-                    event_generation,
-                );
-            });
+        let ctx = self.open_context(generation, &prepared, &cancel, &gate, open_id);
+        let spawned =
+            self.spawn_load_worker(ctx, registration, command_rx, &state_cache, &position_cache);
 
         let Ok(handle) = spawned else {
             if let Some(ticket) = failure_ticket.as_ref() {
@@ -742,6 +715,57 @@ impl AirPlayOutput {
             state: state_cache,
             position: position_cache,
         });
+    }
+
+    /// The worker's open context for one load.
+    fn open_context(
+        &self,
+        generation: PlayerEventGeneration,
+        prepared: &PreparedGstreamerMedia,
+        cancel: &OpenCancel,
+        gate: &Arc<SessionGate>,
+        open_id: u64,
+    ) -> SenderOpenContext {
+        SenderOpenContext {
+            target: self.target(),
+            prepared_uri: prepared.uri().to_string(),
+            event_tx: self.event_tx.clone(),
+            generation,
+            media_proxy: Arc::clone(&self.media_proxy),
+            media_ticket: prepared.ticket(),
+            volume: self.volume,
+            cancel: cancel.clone(),
+            session_gate: Arc::clone(gate),
+            open_id,
+        }
+    }
+
+    /// Schedule the load worker; the caller owns the failure path.
+    fn spawn_load_worker(
+        &self,
+        ctx: SenderOpenContext,
+        registration: InFlightCancelRegistration,
+        commands: mpsc::Receiver<SessionCommand>,
+        state_cache: &Arc<AtomicU8>,
+        position_cache: &Arc<Mutex<SenderPosition>>,
+    ) -> std::io::Result<std::thread::JoinHandle<()>> {
+        let sender = Arc::clone(&self.sender);
+        let event_generation = Arc::clone(&self.event_generation);
+        let state_cache = Arc::clone(state_cache);
+        let position_cache = Arc::clone(position_cache);
+        std::thread::Builder::new()
+            .name("airplay-load".to_string())
+            .spawn(move || {
+                run_session_worker(
+                    sender,
+                    ctx,
+                    registration,
+                    commands,
+                    state_cache,
+                    position_cache,
+                    event_generation,
+                );
+            })
     }
 
     /// Report a synchronous load failure (probe or media preparation) on the
@@ -1619,65 +1643,14 @@ mod tests {
     #[cfg(owntone_host)]
     #[test]
     fn a_stalled_owntone_endpoint_does_not_block_load_or_stop() {
-        use std::net::{TcpListener, TcpStream};
-
         let directory = tempfile::tempdir().expect("tempdir");
-        let state_dir = directory.path().join("state");
-        std::fs::create_dir_all(&state_dir).expect("state dir");
-        let config = state_dir.join("owntone.conf");
-        std::fs::write(
-            &config,
-            include_str!("../../tests/fixtures/owntone-29.3-library.conf").replace(
-                "@PIPE_DIRECTORY@",
-                state_dir.to_str().expect("UTF-8 state path"),
-            ),
-        )
-        .expect("write config");
-
-        // Compile the hermetic fake daemon: it binds the endpoint and never
-        // answers, and its argv binds the canonical config so it is genuinely
-        // the owned process the adapter verifies.
-        let source = directory.path().join("fake_owntone.rs");
-        std::fs::write(&source, FAKE_DAEMON_SOURCE).expect("write daemon source");
-        let binary = directory.path().join("fake_owntone");
-        let compiled = std::process::Command::new("rustc")
-            .arg("-O")
-            .arg(&source)
-            .arg("-o")
-            .arg(&binary)
-            .status()
-            .expect("invoke rustc");
-        assert!(compiled.success(), "the fake daemon must compile");
-
-        let probe = TcpListener::bind("127.0.0.1:0").expect("reserve port");
-        let port = probe.local_addr().expect("addr").port();
-        drop(probe);
-        // The production boundary this fixture asserts: the load's own request
-        // must reach the daemon (and be observed there) before Stop is
-        // measured. Without this barrier the test could pass merely because
-        // cancellation prevented the worker from issuing `/api/config` at all
-        // (review V3).
-        let observed = directory.path().join("observed.txt");
-        let mut child = std::process::Command::new(&binary)
-            .arg("-c")
-            .arg(&config)
-            .env("TRIBUTARY_FAKE_LISTEN", format!("127.0.0.1:{port}"))
-            .env("TRIBUTARY_FAKE_OBSERVED", &observed)
-            .spawn()
-            .expect("spawn fake daemon");
-        // Wait for the fake daemon to bind before the load verifies ownership.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(
-                Instant::now() < deadline,
-                "the fake daemon did not start listening"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        let api_base = format!("http://127.0.0.1:{port}");
-        let sender =
-            crate::audio::airplay_owntone::test_owned_sender(&api_base, &state_dir, &binary);
+        let daemon = StalledDaemon::build(directory.path());
+        let mut child = daemon.spawn();
+        let sender = crate::audio::airplay_owntone::test_owned_sender(
+            &daemon.api_base(),
+            &daemon.state_dir,
+            &daemon.binary,
+        );
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -1692,18 +1665,7 @@ mod tests {
         output.set_event_generation(generation);
         // Protected local media mints a loopback route, so the worker's
         // eventual release of that route is the observable end of the load.
-        let root = tempfile::tempdir().expect("media root");
-        let marker = format!("marker:v1:{}", uuid::Uuid::new_v4());
-        std::fs::write(
-            root.path().join(".tributary-root-id"),
-            format!("{marker}\n"),
-        )
-        .expect("root marker");
-        let media_path = root.path().join("stalled.wav");
-        std::fs::write(&media_path, b"RIFF").expect("media file");
-        let media =
-            ResolvedLocalMedia::from_authorized_path_for_test(root.path(), &marker, &media_path)
-                .expect("authorized media");
+        let (_root, media) = authorized_stub_media();
 
         let started = Instant::now();
         assert!(output.load_local(media));
@@ -1716,18 +1678,7 @@ mod tests {
         // Barrier: wait until the daemon has read the blocking handshake
         // request, proving the load worker genuinely reached `/api/config` and
         // is stalled there (not merely cancelled before it started).
-        let barrier_deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let text = std::fs::read_to_string(&observed).unwrap_or_default();
-            if text.contains("/api/config") {
-                break;
-            }
-            assert!(
-                Instant::now() < barrier_deadline,
-                "the load never reached /api/config (observed: {text:?})"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        daemon.wait_until_observed("/api/config");
 
         let stopped = Instant::now();
         output.stop();
@@ -1743,6 +1694,126 @@ mod tests {
         // nor a Playing is published for the stopped generation.
         let _ = child.kill();
         let _ = child.wait();
+        wait_for_route_release(&output);
+        assert_stop_interrupted_open_events(&rx);
+    }
+
+    /// The hermetic fake daemon of the stalled-endpoint fixture: it binds the
+    /// endpoint and never answers, and its argv binds the canonical config so
+    /// it is genuinely the owned process the adapter verifies.
+    #[cfg(owntone_host)]
+    struct StalledDaemon {
+        state_dir: std::path::PathBuf,
+        config: std::path::PathBuf,
+        binary: std::path::PathBuf,
+        observed: std::path::PathBuf,
+        port: u16,
+    }
+
+    #[cfg(owntone_host)]
+    impl StalledDaemon {
+        fn build(directory: &std::path::Path) -> Self {
+            let state_dir = directory.join("state");
+            std::fs::create_dir_all(&state_dir).expect("state dir");
+            let config = state_dir.join("owntone.conf");
+            std::fs::write(
+                &config,
+                include_str!("../../tests/fixtures/owntone-29.3-library.conf").replace(
+                    "@PIPE_DIRECTORY@",
+                    state_dir.to_str().expect("UTF-8 state path"),
+                ),
+            )
+            .expect("write config");
+            let source = directory.join("fake_owntone.rs");
+            std::fs::write(&source, FAKE_DAEMON_SOURCE).expect("write daemon source");
+            let binary = directory.join("fake_owntone");
+            let compiled = std::process::Command::new("rustc")
+                .arg("-O")
+                .arg(&source)
+                .arg("-o")
+                .arg(&binary)
+                .status()
+                .expect("invoke rustc");
+            assert!(compiled.success(), "the fake daemon must compile");
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+            let port = probe.local_addr().expect("addr").port();
+            drop(probe);
+            Self {
+                state_dir,
+                config,
+                binary,
+                observed: directory.join("observed.txt"),
+                port,
+            }
+        }
+
+        fn api_base(&self) -> String {
+            format!("http://127.0.0.1:{}", self.port)
+        }
+
+        /// Start the daemon and wait for it to bind before the load verifies
+        /// ownership.
+        fn spawn(&self) -> std::process::Child {
+            let child = std::process::Command::new(&self.binary)
+                .arg("-c")
+                .arg(&self.config)
+                .env("TRIBUTARY_FAKE_LISTEN", format!("127.0.0.1:{}", self.port))
+                .env("TRIBUTARY_FAKE_OBSERVED", &self.observed)
+                .spawn()
+                .expect("spawn fake daemon");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while std::net::TcpStream::connect(("127.0.0.1", self.port)).is_err() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the fake daemon did not start listening"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            child
+        }
+
+        /// The production boundary this fixture asserts: the load's own request
+        /// must reach the daemon (and be observed there) before Stop is
+        /// measured. Without this barrier the test could pass merely because
+        /// cancellation prevented the worker from issuing the request at all
+        /// (review V3).
+        fn wait_until_observed(&self, request: &str) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let text = std::fs::read_to_string(&self.observed).unwrap_or_default();
+                if text.contains(request) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the load never reached {request} (observed: {text:?})"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// Protected local media under a fresh authorized root.
+    #[cfg(owntone_host)]
+    fn authorized_stub_media() -> (tempfile::TempDir, ResolvedLocalMedia) {
+        let root = tempfile::tempdir().expect("media root");
+        let marker = format!("marker:v1:{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            root.path().join(".tributary-root-id"),
+            format!("{marker}\n"),
+        )
+        .expect("root marker");
+        let media_path = root.path().join("stalled.wav");
+        std::fs::write(&media_path, b"RIFF").expect("media file");
+        let media =
+            ResolvedLocalMedia::from_authorized_path_for_test(root.path(), &marker, &media_path)
+                .expect("authorized media");
+        (root, media)
+    }
+
+    /// The cancelled load's worker releases its route within the deadline.
+    #[cfg(owntone_host)]
+    fn wait_for_route_release(output: &AirPlayOutput) {
         let release_deadline = Instant::now() + Duration::from_secs(10);
         while output.media_proxy.has_active_lease() {
             assert!(
@@ -1751,6 +1822,12 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// A Stop-interrupted open publishes `Stopped` and neither an `Error` nor
+    /// a `Playing`.
+    #[cfg(owntone_host)]
+    fn assert_stop_interrupted_open_events(rx: &async_channel::Receiver<PlayerEvent>) {
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
             !events.iter().any(|event| matches!(
@@ -1995,12 +2072,13 @@ fn main() {
         }
     }
 
-    /// Drive the real `run_session_worker` for one `BoundarySession` and return
-    /// the events it published, its final state cache, and whether the session
-    /// was closed. A `Stop` command ends the control loop deterministically.
-    fn drive_boundary_worker(
-        live: bool,
-    ) -> (Vec<PlayerEvent>, PlayerState, bool, PlayerEventGeneration) {
+    /// A prepared protected HTTP stream and its proxy. The runtime is returned
+    /// so callers keep it alive for exactly as long as they did inline.
+    fn prepared_http_media() -> (
+        tokio::runtime::Runtime,
+        Arc<GstreamerMediaProxy>,
+        PreparedGstreamerMedia,
+    ) {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -2012,23 +2090,44 @@ fn main() {
         )
         .expect("resolved request");
         let prepared = proxy.prepare_resolved(request).expect("prepared media");
-        let generation = PlayerEventGeneration::from_raw(5);
-        let cancel = OpenCancel::new();
-        let registration = proxy.register_in_flight_cancel(77, prepared.generation(), &cancel);
-        let (tx, rx) = async_channel::unbounded();
+        (runtime, proxy, prepared)
+    }
 
-        let ctx = SenderOpenContext {
+    /// The worker's open context for a prepared stream.
+    fn worker_ctx(
+        proxy: &Arc<GstreamerMediaProxy>,
+        prepared: &PreparedGstreamerMedia,
+        generation: PlayerEventGeneration,
+        cancel: &OpenCancel,
+        open_id: u64,
+        event_tx: async_channel::Sender<PlayerEvent>,
+    ) -> SenderOpenContext {
+        SenderOpenContext {
             target: SenderTarget::new("Test", "127.0.0.1", 7000, None),
             prepared_uri: prepared.uri().to_string(),
-            event_tx: tx,
+            event_tx,
             generation,
-            media_proxy: Arc::clone(&proxy),
+            media_proxy: Arc::clone(proxy),
             media_ticket: prepared.ticket(),
             volume: 1.0,
             cancel: cancel.clone(),
             session_gate: Arc::new(SessionGate::new()),
-            open_id: 77,
-        };
+            open_id,
+        }
+    }
+
+    /// Drive the real `run_session_worker` for one `BoundarySession` and return
+    /// the events it published, its final state cache, and whether the session
+    /// was closed. A `Stop` command ends the control loop deterministically.
+    fn drive_boundary_worker(
+        live: bool,
+    ) -> (Vec<PlayerEvent>, PlayerState, bool, PlayerEventGeneration) {
+        let (_runtime, proxy, prepared) = prepared_http_media();
+        let generation = PlayerEventGeneration::from_raw(5);
+        let cancel = OpenCancel::new();
+        let registration = proxy.register_in_flight_cancel(77, prepared.generation(), &cancel);
+        let (tx, rx) = async_channel::unbounded();
+        let ctx = worker_ctx(&proxy, &prepared, generation, &cancel, 77, tx);
         let sender = Arc::new(BoundarySender {
             live: Arc::new(AtomicBool::new(live)),
             closed: Arc::new(AtomicBool::new(false)),
@@ -2064,12 +2163,12 @@ fn main() {
         let cache = state_from_u8(state_cache.load(Ordering::SeqCst));
         commands.send(SessionCommand::Stop).expect("stop");
         handle.join().expect("worker");
-
-        let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
-        }
-        (events, cache, closed.load(Ordering::SeqCst), generation)
+        (
+            drain_events(&rx),
+            cache,
+            closed.load(Ordering::SeqCst),
+            generation,
+        )
     }
 
     /// Y1: the worker's coarse start publication is routed *through* the session
@@ -2175,17 +2274,7 @@ fn main() {
 
     #[test]
     fn a_stale_opened_session_releases_its_route_through_the_worker() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
-        let request = ResolvedHttpRequest::new(
-            url::Url::parse("https://music.test/stream.flac").expect("url"),
-        )
-        .expect("resolved request");
-        let prepared = proxy.prepare_resolved(request).expect("prepared media");
+        let (_runtime, proxy, prepared) = prepared_http_media();
         let ticket = prepared.ticket().expect("protected media ticket");
         assert!(proxy.has_active_lease());
         assert_eq!(ticket.route_count(), 1);
@@ -2196,43 +2285,53 @@ fn main() {
         let (tx, _rx) = async_channel::unbounded();
         // The generation moved on before the worker ran, so the open is stale.
         let event_generation = Arc::new(AtomicU64::new(generation.as_raw() + 1));
-        let ctx = SenderOpenContext {
-            target: SenderTarget::new("Test", "127.0.0.1", 7000, None),
-            prepared_uri: prepared.uri().to_string(),
-            event_tx: tx,
-            generation,
-            media_proxy: Arc::clone(&proxy),
-            media_ticket: prepared.ticket(),
-            volume: 1.0,
-            cancel: cancel.clone(),
-            session_gate: Arc::new(SessionGate::new()),
-            open_id: 91,
-        };
+        let ctx = worker_ctx(&proxy, &prepared, generation, &cancel, 91, tx);
         let sender = Arc::new(StaleSender {
             proxy: Arc::clone(&proxy),
         });
+        run_worker_to_completion(sender, ctx, registration, event_generation);
+
+        assert_route_released(&proxy, &ticket, "a stale opened session");
+    }
+
+    /// Run the real worker inline with fresh caches and no controller commands;
+    /// returns its final state cache.
+    fn run_worker_to_completion(
+        sender: Arc<dyn AirplaySender>,
+        ctx: SenderOpenContext,
+        registration: InFlightCancelRegistration,
+        event_generation: Arc<AtomicU64>,
+    ) -> Arc<AtomicU8> {
+        let generation = ctx.generation;
         let state_cache = Arc::new(AtomicU8::new(PlayerState::Buffering as u8));
         let position_cache = Arc::new(Mutex::new(SenderPosition::unknown(generation)));
         let (_commands, command_rx) = mpsc::channel();
-
         run_session_worker(
             sender,
             ctx,
             registration,
             command_rx,
-            state_cache,
+            Arc::clone(&state_cache),
             position_cache,
             event_generation,
         );
+        state_cache
+    }
 
+    /// The worker released the protected route by identity and shut it down.
+    fn assert_route_released(
+        proxy: &GstreamerMediaProxy,
+        ticket: &GstreamerMediaTicket,
+        context: &str,
+    ) {
         assert!(
             !proxy.has_active_lease() && !proxy.has_custody_entries(),
-            "a stale opened session must release its route by identity"
+            "{context} must release the route by identity"
         );
         assert_eq!(
             ticket.route_count(),
             0,
-            "the released route must be shut down"
+            "{context}: the released route must be shut down"
         );
     }
 
@@ -2689,17 +2788,7 @@ fn main() {
     fn a_stop_before_start_refuses_the_gstreamer_start_and_consumes_no_buffers() {
         gst::init().expect("GStreamer init");
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("test runtime");
-        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
-        let request = ResolvedHttpRequest::new(
-            url::Url::parse("https://music.test/stream.flac").expect("url"),
-        )
-        .expect("resolved request");
-        let prepared = proxy.prepare_resolved(request).expect("prepared media");
+        let (_runtime, proxy, prepared) = prepared_http_media();
         let ticket = prepared.ticket().expect("protected media ticket");
 
         let (tx, rx) = async_channel::unbounded();
@@ -2739,11 +2828,7 @@ fn main() {
         );
 
         session.close();
-        assert!(
-            !proxy.has_active_lease() && !proxy.has_custody_entries(),
-            "close must release the session's route by identity"
-        );
-        assert_eq!(ticket.route_count(), 0);
+        assert_route_released(&proxy, &ticket, "close");
     }
 
     /// Z1: a **real** failed GStreamer state transition, driven through the
@@ -2775,30 +2860,10 @@ fn main() {
         let (pipeline, counter) = failing_transition_pipeline();
         let recorder = TransitionRecorder::install(&pipeline);
         let sender = Arc::new(InjectedPipelineSender::new(pipeline));
-
-        let state_cache = Arc::new(AtomicU8::new(PlayerState::Buffering as u8));
-        let position_cache = Arc::new(Mutex::new(SenderPosition::unknown(generation)));
         let event_generation = Arc::new(AtomicU64::new(generation.as_raw()));
-        let (_commands, command_rx) = mpsc::channel();
+        let state_cache = run_worker_to_completion(sender, ctx, registration, event_generation);
 
-        run_session_worker(
-            sender,
-            ctx,
-            registration,
-            command_rx,
-            Arc::clone(&state_cache),
-            position_cache,
-            event_generation,
-        );
-
-        assert!(
-            recorder.state_changes() > 0,
-            "the real start must be attempted on the injected pipeline"
-        );
-        assert!(
-            recorder.errors() > 0,
-            "the attempted transition must post a real failure"
-        );
+        assert_transition_attempted_and_failed(&recorder);
         assert_eq!(
             buffer_count(&counter),
             0,
@@ -2811,6 +2876,36 @@ fn main() {
         );
 
         let events = drain_events(&events);
+        assert_stopped_published(&events, generation, "the failed start");
+        assert_no_start_outcome(&events, "a failed start");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::TrackEnded { .. })),
+            "a failed start must not publish completion: {events:?}"
+        );
+        assert_route_released(&proxy, &ticket, "a failed start");
+    }
+
+    /// The injected pipeline's bus proves the transition was attempted and
+    /// that it failed.
+    fn assert_transition_attempted_and_failed(recorder: &TransitionRecorder) {
+        assert!(
+            recorder.state_changes() > 0,
+            "the real start must be attempted on the injected pipeline"
+        );
+        assert!(
+            recorder.errors() > 0,
+            "the attempted transition must post a real failure"
+        );
+    }
+
+    /// `Stopped` was published for the generation.
+    fn assert_stopped_published(
+        events: &[PlayerEvent],
+        generation: PlayerEventGeneration,
+        context: &str,
+    ) {
         assert!(
             events.iter().any(|event| matches!(
                 event,
@@ -2819,8 +2914,12 @@ fn main() {
                     state: PlayerState::Stopped,
                 } if *g == generation
             )),
-            "the failed start must publish Stopped: {events:?}"
+            "{context} must publish Stopped: {events:?}"
         );
+    }
+
+    /// Neither `Playing` nor `Paused` was published.
+    fn assert_no_start_outcome(events: &[PlayerEvent], context: &str) {
         assert!(
             !events.iter().any(|event| matches!(
                 event,
@@ -2829,22 +2928,7 @@ fn main() {
                     ..
                 }
             )),
-            "a failed start must not publish Playing/Paused: {events:?}"
-        );
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, PlayerEvent::TrackEnded { .. })),
-            "a failed start must not publish completion: {events:?}"
-        );
-        assert!(
-            !proxy.has_active_lease() && !proxy.has_custody_entries(),
-            "a failed start must release the protected route by identity"
-        );
-        assert_eq!(
-            ticket.route_count(),
-            0,
-            "the released route must be shut down"
+            "{context} must not publish Playing/Paused: {events:?}"
         );
     }
 
@@ -2940,17 +3024,7 @@ fn main() {
         let (pipeline, counter) = parked_transition_pipeline(&fifo);
         let recorder = TransitionRecorder::install(&pipeline);
         let sender = Arc::new(InjectedPipelineSender::new(pipeline));
-        let state_cache = Arc::new(AtomicU8::new(PlayerState::Buffering as u8));
-        let position_cache = Arc::new(Mutex::new(SenderPosition::unknown(generation)));
-        let event_generation = Arc::new(AtomicU64::new(generation.as_raw()));
-        let mut worker = spawn_test_session_worker(
-            sender,
-            ctx,
-            registration,
-            Arc::clone(&state_cache),
-            position_cache,
-            event_generation,
-        );
+        let (mut worker, state_cache) = spawn_worker_with_caches(sender, ctx, registration);
 
         // The real `set_state(Playing)` is now parked inside the FIFO open; the
         // gate reports the authorized effect in-flight.
@@ -2979,31 +3053,31 @@ fn main() {
             "no PCM may be consumed after a Stop won the boundary"
         );
         let events = drain_events(&events);
-        assert!(
-            !events.iter().any(|event| matches!(
-                event,
-                PlayerEvent::StateChanged {
-                    state: PlayerState::Playing | PlayerState::Paused,
-                    ..
-                }
-            )),
-            "a suppressed start must publish no Playing/Paused: {events:?}"
+        assert_no_start_outcome(&events, "a suppressed start");
+        assert_stopped_published(&events, generation, "the suppressed start");
+        assert_route_released(&proxy, &ticket, "the refused start");
+    }
+
+    /// Spawn the real worker with fresh caches for the context's generation.
+    #[cfg(unix)]
+    fn spawn_worker_with_caches(
+        sender: Arc<dyn AirplaySender>,
+        ctx: SenderOpenContext,
+        registration: InFlightCancelRegistration,
+    ) -> (TestSessionWorker, Arc<AtomicU8>) {
+        let generation = ctx.generation;
+        let state_cache = Arc::new(AtomicU8::new(PlayerState::Buffering as u8));
+        let position_cache = Arc::new(Mutex::new(SenderPosition::unknown(generation)));
+        let event_generation = Arc::new(AtomicU64::new(generation.as_raw()));
+        let worker = spawn_test_session_worker(
+            sender,
+            ctx,
+            registration,
+            Arc::clone(&state_cache),
+            position_cache,
+            event_generation,
         );
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                PlayerEvent::StateChanged {
-                    generation: g,
-                    state: PlayerState::Stopped,
-                } if *g == generation
-            )),
-            "the suppressed start must publish Stopped: {events:?}"
-        );
-        assert!(
-            !proxy.has_active_lease() && !proxy.has_custody_entries(),
-            "the refused start must release the route by identity"
-        );
-        assert_eq!(ticket.route_count(), 0);
+        (worker, state_cache)
     }
 
     fn rx_has_playing(rx: &async_channel::Receiver<PlayerEvent>) -> bool {

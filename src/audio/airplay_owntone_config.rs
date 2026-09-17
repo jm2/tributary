@@ -172,9 +172,15 @@ pub(super) fn binds_pipe(config: &Path, pipe: &Path) -> bool {
 /// The `library` section binds only options whose input semantics we verify,
 /// with the pipe/scanner values the adapter relies on.
 fn library_options_acceptable(library: &Section) -> bool {
-    // Restrict input-affecting options to ones whose semantics we verify.
-    if library.keys().any(|key| {
-        !matches!(
+    library_keys_verified(library)
+        && library_scalars_pinned(library)
+        && library_filters_empty(library)
+}
+
+/// Restrict input-affecting options to ones whose semantics we verify.
+fn library_keys_verified(library: &Section) -> bool {
+    library.keys().all(|key| {
+        matches!(
             key.as_str(),
             "name"
                 | "port"
@@ -188,9 +194,12 @@ fn library_options_acceptable(library: &Section) -> bool {
                 | "filetypes_ignore"
                 | "filepath_ignore"
         )
-    }) {
-        return false;
-    }
+    })
+}
+
+/// The pipe/scanner scalars carry the values the adapter relies on (or their
+/// defaults) and `follow_symlinks` is a plain boolean.
+fn library_scalars_pinned(library: &Section) -> bool {
     for (key, expected) in [
         ("pipe_autostart", "true"),
         ("pipe_sample_rate", "44100"),
@@ -204,13 +213,13 @@ fn library_options_acceptable(library: &Section) -> bool {
             return false;
         }
     }
-    if library
+    library
         .get("follow_symlinks")
-        .is_some_and(|v| !matches!(v, Value::Scalar(s) if s == "true" || s == "false"))
-    {
-        return false;
-    }
-    // Reject filters rather than reimplement POSIX regex/libconfuse matching.
+        .is_none_or(|v| matches!(v, Value::Scalar(s) if s == "true" || s == "false"))
+}
+
+/// Reject filters rather than reimplement POSIX regex/libconfuse matching.
+fn library_filters_empty(library: &Section) -> bool {
     for key in ["filetypes_ignore", "filepath_ignore"] {
         if library
             .get(key)
@@ -286,7 +295,20 @@ mod tests {
         assert!(check(
             &valid.replace("pipe_autostart = true", "# use the true default")
         ));
-        for invalid in [
+        for invalid in rejected_variants(&valid, directory.path(), &pipe) {
+            assert!(!check(&invalid), "must reject {invalid}");
+        }
+        assert!(check(&valid));
+        let hidden = directory.path().join("_hidden.pcm");
+        super::super::ensure_pipe(&hidden).unwrap();
+        assert!(!binds_pipe(&config, &hidden));
+        assert!(!binds_pipe(&config, &directory.path().join("playlist.m3u")));
+    }
+
+    /// Every single-edit corruption of the pinned fixture that must be refused.
+    fn rejected_variants(valid: &str, directory: &Path, pipe: &Path) -> Vec<String> {
+        let dir = directory.to_str().unwrap();
+        vec![
             valid.replace("library {", "general {"),
             valid.replace("pipe_autostart = true", "pipe_autostart = false"),
             valid.replace("44100", "48000"),
@@ -312,22 +334,25 @@ mod tests {
                 "pipe_autostart = true include(\"foreign.conf\")",
             ),
             valid.replace("directories =", "unknown ="),
-            valid.replace(directory.path().to_str().unwrap(), "/nonexistent/other"),
-            valid.replace(directory.path().to_str().unwrap(), "."),
+            valid.replace(dir, "/nonexistent/other"),
+            valid.replace(dir, "."),
             format!("{valid} {valid}"),
             format!("{valid} }}"),
             format!("# {}", valid.replace('\n', "\n# ")),
             format!("pipe_path = \"{}\"", pipe.display()),
-        ] {
-            assert!(!check(&invalid), "must reject {invalid}");
-        }
-        assert!(check(&valid));
-        let hidden = directory.path().join("_hidden.pcm");
-        super::super::ensure_pipe(&hidden).unwrap();
-        assert!(!binds_pipe(&config, &hidden));
-        assert!(!binds_pipe(&config, &directory.path().join("playlist.m3u")));
-        // Only the FIFO itself binds: a missing pathname, a regular file and
-        // a symlink (even one pointing at a FIFO) are refused.
+        ]
+    }
+
+    /// Only the FIFO itself binds: a missing pathname, a regular file and a
+    /// symlink (even one pointing at a FIFO) are refused.
+    #[test]
+    fn only_the_fifo_itself_binds() {
+        let directory = tempfile::tempdir().unwrap();
+        let pipe = directory.path().join("airplay.pcm");
+        super::super::ensure_pipe(&pipe).unwrap();
+        let config = directory.path().join("owntone.conf");
+        std::fs::write(&config, fixture(&pipe)).unwrap();
+        assert!(binds_pipe(&config, &pipe));
         std::fs::remove_file(&pipe).unwrap();
         assert!(!binds_pipe(&config, &pipe));
         std::fs::write(&pipe, b"not a fifo").unwrap();
