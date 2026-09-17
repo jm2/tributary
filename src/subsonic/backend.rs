@@ -2376,6 +2376,41 @@ mod tests {
         captured
     }
 
+    /// A catalogue whose single artist reports `songCount` as a string — a
+    /// server-controlled wrong type — carrying `sentinel` as that value.
+    async fn catalogue_with_wrong_type_song_count(sentinel: &str) -> MockHttpService {
+        MockHttpService::start(vec![
+            MockRoute::get("/rest/ping.view").reply(MockResponse::json(
+                serde_json::json!({"subsonic-response": {"status": "ok"}}),
+            )),
+            MockRoute::get("/rest/getArtists.view").reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "artists": {"index": [
+                        {"artist": [{"id": "artist-id", "name": "Fixture Artist"}]}
+                    ]}
+                }
+            }))),
+            MockRoute::get("/rest/getArtist.view")
+                .with_query("id", "artist-id")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "artist": {
+                            "id": "artist-id",
+                            "name": "Fixture Artist",
+                            "album": [{
+                                "id": "album-id",
+                                "name": "Fixture Album",
+                                "songCount": sentinel
+                            }]
+                        }
+                    }
+                }))),
+        ])
+        .await
+    }
+
     /// The catalogue refresh logs per-artist failures at WARN with the error
     /// rendered through its `Display`. That diagnostic must carry the fixed
     /// parse category without the server-controlled wrong-type value.
@@ -2388,40 +2423,11 @@ mod tests {
             .expect("fixture runtime");
         let captured = capture_diagnostics(|| {
             runtime.block_on(async {
-                let service = MockHttpService::start(vec![
-                    MockRoute::get("/rest/ping.view").reply(MockResponse::json(
-                        serde_json::json!({"subsonic-response": {"status": "ok"}}),
-                    )),
-                    MockRoute::get("/rest/getArtists.view").reply(MockResponse::json(
-                        serde_json::json!({
-                            "subsonic-response": {
-                                "status": "ok",
-                                "artists": {"index": [
-                                    {"artist": [{"id": "artist-id", "name": "Fixture Artist"}]}
-                                ]}
-                            }
-                        }),
-                    )),
-                    MockRoute::get("/rest/getArtist.view")
-                        .with_query("id", "artist-id")
-                        .reply(MockResponse::json(serde_json::json!({
-                            "subsonic-response": {
-                                "status": "ok",
-                                "artist": {
-                                    "id": "artist-id",
-                                    "name": "Fixture Artist",
-                                    "album": [{
-                                        "id": "album-id",
-                                        "name": "Fixture Album",
-                                        "songCount": sentinel
-                                    }]
-                                }
-                            }
-                        }))),
-                ])
-                .await;
+                let service = catalogue_with_wrong_type_song_count(sentinel).await;
+                let password = Uuid::new_v4().to_string();
                 let backend =
-                    SubsonicBackend::connect("fixture", &service.base_url(), "user", "pw").await;
+                    SubsonicBackend::connect("fixture", &service.base_url(), "user", &password)
+                        .await;
                 assert!(backend.is_ok(), "per-artist parse failure is skipped");
                 service.finish().await;
             });
