@@ -62,6 +62,8 @@ mod executor_rollback_directory_tests;
 #[cfg(test)]
 mod executor_rollback_tests;
 #[cfg(test)]
+mod executor_source_lease_tests;
+#[cfg(test)]
 mod executor_tests;
 #[cfg(test)]
 mod planner_boundary_tests;
