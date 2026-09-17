@@ -28,6 +28,7 @@ use super::playback_coordinator::{
     LastFmPlaybackCoordinatorActivation, LastFmPlaybackCoordinatorBinding,
     LastFmPlaybackCoordinatorOutcome,
 };
+use super::policy::LastFmPolicyGeneration;
 use super::runtime::{
     spawn_lastfm_runtime, LastFmRuntimeActivation, LastFmRuntimeBarrier, LastFmRuntimeHandle,
     LastFmRuntimeShutdown,
@@ -126,6 +127,29 @@ impl LastFmApplicationActivation {
     pub(in crate::lastfm) fn issue_after_explicit_consent_and_enablement(
         enabled_remote_sources: HashSet<SourceId>,
     ) -> Result<Self, LastFmApplicationAdmissionError> {
+        Self::validated(enabled_remote_sources)
+    }
+
+    /// Consume the current live policy generation as one activation authority.
+    ///
+    /// The exact remote-source set is taken from the generation's immutable
+    /// `activation_remote_sources` view, so the same generation that gates
+    /// queue capture also issues dispatch authority. A generation without
+    /// current consent and enablement grants no activation authority and is
+    /// refused here rather than inferring consent from a build credential,
+    /// vault record, queued row, or discoverable account.
+    pub(in crate::lastfm) fn issue_from_policy_generation(
+        generation: &LastFmPolicyGeneration,
+    ) -> Result<Self, LastFmApplicationAdmissionError> {
+        let Some(enabled_remote_sources) = generation.activation_remote_sources() else {
+            return Err(LastFmApplicationAdmissionError::InvalidSourcePolicy);
+        };
+        Self::validated(enabled_remote_sources.clone())
+    }
+
+    fn validated(
+        enabled_remote_sources: HashSet<SourceId>,
+    ) -> Result<Self, LastFmApplicationAdmissionError> {
         if enabled_remote_sources.len() > MAX_ENABLED_REMOTE_SOURCES
             || enabled_remote_sources
                 .iter()
@@ -136,6 +160,13 @@ impl LastFmApplicationActivation {
         Ok(Self {
             enabled_remote_sources,
         })
+    }
+
+    /// The exact remote-source set this authority freezes. Test-only so the
+    /// activation remains a move-only, content-free authority in production.
+    #[cfg(test)]
+    pub(in crate::lastfm) fn enabled_remote_sources_for_test(&self) -> &HashSet<SourceId> {
+        &self.enabled_remote_sources
     }
 }
 
@@ -1089,6 +1120,7 @@ mod tests {
     use crate::lastfm::credentials::{CredentialError, ProtectedString, StoredSession};
     use crate::lastfm::delivery::LastFmDeliveryPrimitiveError;
     use crate::lastfm::playback_coordinator::LastFmPlaybackCoordinatorOwner;
+    use crate::lastfm::policy::LastFmPolicyGeneration;
     use crate::source_registry::SourceRegistry;
 
     use super::*;
@@ -2059,6 +2091,35 @@ mod tests {
         assert_eq!(
             format!("{activation:?}"),
             "LastFmApplicationActivation(<redacted>)"
+        );
+    }
+
+    /// The activation authority must freeze exactly the source set the live
+    /// policy generation exposes to queue capture, so dispatch cannot admit a
+    /// source that capture never observed.
+    #[test]
+    fn activation_from_policy_generation_freezes_the_capture_set() {
+        let enabled_source = SourceId::random();
+        let generation = LastFmPolicyGeneration::for_test(4, HashSet::from([enabled_source]));
+        let activation = LastFmApplicationActivation::issue_from_policy_generation(&generation)
+            .expect("consented generation grants activation authority");
+        assert_eq!(
+            activation.enabled_remote_sources_for_test(),
+            generation.queue_capture_remote_sources()
+        );
+    }
+
+    /// A generation without current consent and enablement has no activation
+    /// basis. Issuance must refuse rather than silently produce a local-only
+    /// activation from a closed or disabled policy.
+    #[test]
+    fn activation_refuses_a_generation_without_current_consent() {
+        assert_eq!(
+            LastFmApplicationActivation::issue_from_policy_generation(
+                &LastFmPolicyGeneration::default()
+            )
+            .unwrap_err(),
+            LastFmApplicationAdmissionError::InvalidSourcePolicy
         );
     }
 }

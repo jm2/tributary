@@ -288,6 +288,25 @@ impl PlaybackAttributionProfile {
         )
     }
 
+    /// Build a profile from one accepted authenticated-remote catalogue track.
+    ///
+    /// Authenticated remote adapters publish structured metadata straight from
+    /// their server protocol, so unlike tag provenance they have no filename
+    /// or synthetic-display fallback to exclude. The value is still bounded:
+    /// an empty required title or artist, or oversized text, yields `None` so
+    /// an incomplete remote row can never become attribution authority.
+    pub(crate) fn from_remote_track(track: &Track) -> Option<Self> {
+        let album = (!track.album_title.is_empty()).then(|| track.album_title.clone());
+        Self::bounded(
+            track.title.clone(),
+            track.artist_name.clone(),
+            album,
+            track.album_artist_name.clone(),
+            track.track_number,
+            track.duration_secs,
+        )
+    }
+
     fn bounded(
         title: String,
         artist: String,
@@ -1079,11 +1098,13 @@ pub trait ManagedSourceAdapter: LifecycleAdapter + Send + Sync {
     /// Return the exact bounded structured attribution authorized for one
     /// track by this live adapter.
     ///
-    /// Coarse source capability is deliberately insufficient. The default and
-    /// all currently shipped authenticated-remote adapters return no
-    /// per-track profile and therefore fail closed. External-file and retained
-    /// removable-media adapters are the current production overrides, both
-    /// deriving profiles only from exact real-tag provenance.
+    /// Coarse source capability is deliberately insufficient. The default
+    /// returns no per-track profile and therefore fails closed; every shipping
+    /// override derives its profile from exact source-owned provenance.
+    /// External-file and retained removable-media adapters build from real
+    /// audio tags, while the four authenticated-remote adapters build from
+    /// their own accepted server catalogue rows and remain gated by the
+    /// current policy generation's remote opt-in.
     fn playback_attribution_profile(
         &self,
         _track_id: &TrackId,
@@ -1228,6 +1249,13 @@ macro_rules! standard_remote_adapter {
                 PlaybackAttributionCapability::AuthenticatedRemote
             }
 
+            fn playback_attribution_profile(
+                &self,
+                track_id: &TrackId,
+            ) -> Option<PlaybackAttributionProfile> {
+                PlaybackAttributionProfile::from_remote_track(&self.catalogue_track(track_id)?)
+            }
+
             fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
                 $regular_playlist_capability
             }
@@ -1270,6 +1298,13 @@ impl LifecycleAdapter for crate::subsonic::SubsonicBackend {
 impl ManagedSourceAdapter for crate::subsonic::SubsonicBackend {
     fn playback_attribution_capability(&self) -> PlaybackAttributionCapability {
         PlaybackAttributionCapability::AuthenticatedRemote
+    }
+
+    fn playback_attribution_profile(
+        &self,
+        track_id: &TrackId,
+    ) -> Option<PlaybackAttributionProfile> {
+        PlaybackAttributionProfile::from_remote_track(&self.catalogue_track(track_id)?)
     }
 
     fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
@@ -1334,6 +1369,13 @@ impl ManagedSourceAdapter for crate::jellyfin::JellyfinBackend {
         PlaybackAttributionCapability::AuthenticatedRemote
     }
 
+    fn playback_attribution_profile(
+        &self,
+        track_id: &TrackId,
+    ) -> Option<PlaybackAttributionProfile> {
+        PlaybackAttributionProfile::from_remote_track(&self.catalogue_track(track_id)?)
+    }
+
     fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
         source_scoped_playlist_capability::<Self>()
     }
@@ -1395,6 +1437,13 @@ fn validate_daap_initial_catalogue(
 impl ManagedSourceAdapter for crate::daap::DaapBackend {
     fn playback_attribution_capability(&self) -> PlaybackAttributionCapability {
         PlaybackAttributionCapability::AuthenticatedRemote
+    }
+
+    fn playback_attribution_profile(
+        &self,
+        track_id: &TrackId,
+    ) -> Option<PlaybackAttributionProfile> {
+        PlaybackAttributionProfile::from_remote_track(&self.catalogue_track(track_id)?)
     }
 
     fn regular_playlist_capability(&self) -> RegularPlaylistCapability {

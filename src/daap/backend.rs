@@ -312,6 +312,20 @@ impl DaapBackend {
         let scope = cache.scope.ok_or_else(unavailable_catalogue)?;
         self.client.stream_request(scope, *song_id, format)
     }
+
+    /// Return one accepted catalogue row by its exact native identity.
+    ///
+    /// The lookup is deliberately non-blocking: a contended refresh returns
+    /// `None`, so Last.fm attribution fails closed instead of waiting on the
+    /// lifecycle state lock that the registry holds while minting.
+    pub(crate) fn catalogue_track(&self, track_id: &TrackId) -> Option<Track> {
+        let cache = self.cache.try_read().ok()?;
+        cache
+            .tracks
+            .iter()
+            .find(|track| track.native_track_id.as_ref() == Some(track_id))
+            .cloned()
+    }
 }
 
 fn parse_daap_track_id(track_id: &TrackId) -> BackendResult<u32> {

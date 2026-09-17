@@ -374,6 +374,20 @@ impl JellyfinBackend {
     pub(crate) async fn logout_owned_session(&self) -> BackendResult<()> {
         self.client.logout_owned_session().await
     }
+
+    /// Return one accepted catalogue row by its exact native identity.
+    ///
+    /// The lookup is deliberately non-blocking: a contended refresh returns
+    /// `None`, so Last.fm attribution fails closed instead of waiting on the
+    /// lifecycle state lock that the registry holds while minting.
+    pub(crate) fn catalogue_track(&self, track_id: &TrackId) -> Option<Track> {
+        let cache = self.cache.try_read().ok()?;
+        cache
+            .tracks
+            .iter()
+            .find(|track| track.native_track_id.as_ref() == Some(track_id))
+            .cloned()
+    }
 }
 
 // ── MediaBackend trait implementation ────────────────────────────────────
@@ -797,6 +811,17 @@ mod tests {
         assert_eq!(cache.albums.len(), 1);
         assert_eq!(cache.artists.len(), 1);
         drop(cache);
+
+        let profile_track_id = published[0]
+            .native_track_id
+            .clone()
+            .expect("fixture track retains its native ID");
+        let track = backend
+            .catalogue_track(&profile_track_id)
+            .expect("exact remote catalogue row is retained");
+        let profile = crate::source_registry::PlaybackAttributionProfile::from_remote_track(&track)
+            .expect("structured remote metadata yields a Last.fm profile");
+        assert_eq!(profile.title(), "Fixture Song");
 
         let search = backend.search("Fixture", 10).await.expect("search fixture");
         assert_eq!(search.tracks.len(), 1);

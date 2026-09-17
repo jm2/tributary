@@ -183,6 +183,22 @@ impl LastFmPolicyGeneration {
             None
         }
     }
+
+    /// Construct one consented, enabled generation for downstream tests that
+    /// must not spin up a database. The persisted store remains the only
+    /// production path; this mirrors a generation already committed at
+    /// `generation`.
+    #[cfg(test)]
+    pub(crate) fn for_test(generation: u64, enabled_remote_sources: HashSet<SourceId>) -> Self {
+        Self {
+            generation: generation.max(1),
+            consent: Some(
+                LastFmConsentRecord::try_new("en", 1).expect("valid test consent record"),
+            ),
+            enabled: true,
+            enabled_remote_sources,
+        }
+    }
 }
 
 impl fmt::Debug for LastFmPolicyGeneration {
@@ -713,5 +729,67 @@ mod tests {
             enabled_remote_sources: sources,
         };
         assert_eq!(format!("{policy:?}"), "LastFmPolicyGeneration(<redacted>)");
+    }
+
+    /// A queue captured under one generation cannot keep that source once a
+    /// successor generation removes it: the live capture basis and the
+    /// activation basis are both re-derived from the successor, so a disabled
+    /// source stays fail-closed at dispatch.
+    #[tokio::test]
+    async fn successor_generation_refuses_a_stale_captured_source() {
+        let db = database().await;
+        let stale_source = sample_source(11);
+        let first = commit_policy_update(
+            &db,
+            0,
+            update(Some(consent("en")), true, HashSet::from([stale_source])),
+        )
+        .await
+        .unwrap();
+        let captured = first.queue_capture_remote_sources().clone();
+        assert!(captured.contains(&stale_source));
+        assert!(first
+            .activation_remote_sources()
+            .is_some_and(|sources| sources.contains(&stale_source)));
+
+        let successor = commit_policy_update(
+            &db,
+            first.generation(),
+            update(first.consent().cloned(), true, HashSet::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(successor.generation(), first.generation() + 1);
+        assert!(!successor
+            .queue_capture_remote_sources()
+            .contains(&stale_source));
+        assert!(successor
+            .activation_remote_sources()
+            .is_some_and(|sources| !sources.contains(&stale_source)));
+    }
+
+    /// The closed default and a disabled generation carry no activation
+    /// authority, so a dispatch caller cannot infer enablement from the mere
+    /// presence of a stored generation.
+    #[tokio::test]
+    async fn disabled_generation_grants_no_capture_or_activation_authority() {
+        let db = database().await;
+        let closed = LastFmPolicyGeneration::default();
+        assert!(closed.activation_remote_sources().is_none());
+        assert!(closed.queue_capture_remote_sources().is_empty());
+
+        let disabled = commit_policy_update(
+            &db,
+            0,
+            update(
+                Some(consent("en")),
+                false,
+                HashSet::from([sample_source(12)]),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(disabled.activation_remote_sources().is_none());
+        assert!(disabled.queue_capture_remote_sources().is_empty());
     }
 }

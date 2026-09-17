@@ -401,6 +401,20 @@ impl PlexBackend {
     pub fn music_libraries(&self) -> &[MusicLibrary] {
         &self.music_libraries
     }
+
+    /// Return one accepted catalogue row by its exact native identity.
+    ///
+    /// The lookup is deliberately non-blocking: a contended refresh returns
+    /// `None`, so Last.fm attribution fails closed instead of waiting on the
+    /// lifecycle state lock that the registry holds while minting.
+    pub(crate) fn catalogue_track(&self, track_id: &TrackId) -> Option<Track> {
+        let cache = self.cache.try_read().ok()?;
+        cache
+            .tracks
+            .iter()
+            .find(|track| track.native_track_id.as_ref() == Some(track_id))
+            .cloned()
+    }
 }
 
 // ── MediaBackend trait implementation ────────────────────────────────────
@@ -1010,6 +1024,12 @@ mod tests {
             .expect("fixture track retains its native ID");
         assert_eq!(first_id.as_str(), "track-0");
         drop(cache);
+        let track = backend
+            .catalogue_track(&first_id)
+            .expect("exact remote catalogue row is retained");
+        let profile = crate::source_registry::PlaybackAttributionProfile::from_remote_track(&track)
+            .expect("structured remote metadata yields a Last.fm profile");
+        assert!(!profile.title().is_empty());
         assert_eq!(
             backend
                 .resolve_stream(&first_id)
