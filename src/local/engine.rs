@@ -4170,6 +4170,43 @@ where
     }
 }
 
+/// Test-only per-file parse delay for the Q4 held/delayed filesystem fixtures.
+///
+/// The opt-in large-library measurement test sets this to model a slow disk or
+/// parser without depending on real storage timing, and R9 (#256) consumes the
+/// same seam to hold a scan while exercising command admission and
+/// cancellation. It is compiled out of production builds.
+#[cfg(test)]
+static TEST_ONLY_PARSE_DELAY_MICROS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Counts the parses that pass through this seam, so a measurement can assert
+/// the parse path was really exercised per file instead of inferring it from
+/// elapsed wall time. When [`TEST_ONLY_PARSE_DELAY_MICROS`] is nonzero, every
+/// counted parse also slept for that delay.
+#[cfg(test)]
+static TEST_ONLY_PARSE_DELAY_INVOCATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn apply_test_only_parse_delay() {
+    TEST_ONLY_PARSE_DELAY_INVOCATIONS.fetch_add(1, Ordering::Relaxed);
+    let micros = TEST_ONLY_PARSE_DELAY_MICROS.load(Ordering::Relaxed);
+    if micros > 0 {
+        std::thread::sleep(Duration::from_micros(micros));
+    }
+}
+
+#[cfg(test)]
+fn reset_test_only_parse_delay_invocations() {
+    TEST_ONLY_PARSE_DELAY_INVOCATIONS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn test_only_parse_delay_invocations() -> u64 {
+    TEST_ONLY_PARSE_DELAY_INVOCATIONS.load(Ordering::Relaxed)
+}
+
 async fn initial_scan(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
@@ -15843,11 +15880,16 @@ mod tests {
     /// ```
     ///
     /// `TRIBUTARY_Q4_PARSE_DELAY_MICROS=<n>` additionally runs a second scan
-    /// with `n` microseconds of deterministic per-file parse delay to model a
-    /// slow filesystem/parser fixture (the seam R9 #256 also needs).
+    /// against a FRESH second database with `n` microseconds of deterministic
+    /// per-file parse delay. The fresh database makes every row `needs_update`,
+    /// so every measured file really enters the delayed `spawn_blocking` parse
+    /// branch; the test asserts the recorded parse-delay invocation count and
+    /// the persisted row cardinality instead of inferring anything from wall
+    /// time alone.
     #[tokio::test]
     #[ignore = "opt-in Q4 large-library measurement; generates a large fixture"]
     async fn q4_measured_large_library_responsiveness() {
+        use std::collections::HashMap;
         use std::time::Instant;
 
         use crate::architecture::models::{Rating, SortField, SortOrder};
@@ -15861,6 +15903,7 @@ mod tests {
 
         impl ParseDelayGuard {
             fn set(micros: u64) -> Self {
+                super::reset_test_only_parse_delay_invocations();
                 super::TEST_ONLY_PARSE_DELAY_MICROS.store(micros, Ordering::Relaxed);
                 Self
             }
@@ -15879,16 +15922,30 @@ mod tests {
         let (event_tx, event_rx) = async_channel::unbounded();
         let refresh = test_playlist_sidebar_refresh();
 
+        // Baseline scan. The database is fresh, so every file must actually be
+        // parsed: assert the parse invocations and the persisted cardinality
+        // instead of trusting elapsed wall time.
         let scan_started = Instant::now();
+        let baseline_guard = ParseDelayGuard::set(0);
         initial_scan(&db, &[library.root().to_path_buf()], &event_tx, &refresh)
             .await
             .expect("measured initial scan");
         let scan_elapsed = scan_started.elapsed();
+        let baseline_parses = super::test_only_parse_delay_invocations();
+        drop(baseline_guard);
         let persisted = track::Entity::find()
             .all(&db)
             .await
             .expect("count persisted tracks")
             .len();
+        assert_eq!(
+            baseline_parses, track_count as u64,
+            "baseline scan must parse every fixture file exactly once"
+        );
+        assert_eq!(
+            persisted, track_count,
+            "baseline scan must persist one row per fixture file"
+        );
         let events = std::iter::from_fn(|| event_rx.try_recv().ok()).count();
 
         let runner = std::env::var("TRIBUTARY_Q4_RUNNER")
@@ -15899,6 +15956,12 @@ mod tests {
             track_count,
             persisted as f64,
             "tracks",
+        );
+        report.record(
+            "scan_parse_invocations",
+            track_count,
+            baseline_parses as f64,
+            "parses",
         );
         report.record_ms("scan_elapsed", track_count, scan_elapsed);
         report.record("scan_events", track_count, events as f64, "events");
@@ -15950,30 +16013,93 @@ mod tests {
         backend.get_stats().await.expect("read library stats");
         report.record_ms("backend_get_stats", track_count, stats_started.elapsed());
 
-        // Update bursts: repeated rating mutations over the same catalogue.
-        if let Some(track_id) = catalogue
+        // Rating mutations over the same catalogue: first directly through the
+        // backend seam, then through the production engine command FIFO with a
+        // Flush barrier, which is the admission/settlement path the app
+        // actually uses for app-owned writes.
+        let updates = 100_usize.min(track_count);
+        let rating = Rating::new(80).expect("valid rating");
+        let track_id = catalogue
             .iter()
             .find_map(|track| track.native_track_id.clone())
-        {
-            let updates = 100_usize.min(track_count);
-            let rating = Rating::new(80).expect("valid rating");
-            let burst_started = Instant::now();
-            for _ in 0..updates {
-                backend
-                    .set_track_rating(&track_id, Some(rating))
-                    .await
-                    .expect("update rating");
-            }
-            let burst = burst_started.elapsed();
-            report.record("update_burst_count", track_count, updates as f64, "updates");
-            report.record_ms("update_burst_total", track_count, burst);
-            report.record(
-                "update_burst_per_update",
-                track_count,
-                burst.as_secs_f64() * 1_000.0 / updates as f64,
-                "ms",
-            );
+            .expect("catalogue exposes a native track id");
+
+        let burst_started = Instant::now();
+        for _ in 0..updates {
+            backend
+                .set_track_rating(&track_id, Some(rating))
+                .await
+                .expect("update rating");
         }
+        let burst = burst_started.elapsed();
+        report.record("update_burst_count", track_count, updates as f64, "updates");
+        report.record_ms("update_burst_total", track_count, burst);
+        report.record(
+            "update_burst_per_update",
+            track_count,
+            burst.as_secs_f64() * 1_000.0 / updates as f64,
+            "ms",
+        );
+
+        // Command admission + settlement through the production FIFO loop:
+        // enqueue `updates` rating commands plus a Flush barrier while the
+        // engine command loop is running, and measure the time until the
+        // barrier is acknowledged (the production shutdown-settlement
+        // observable). The barrier must always settle.
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let loop_db = db.clone();
+        let loop_tx = event_tx.clone();
+        let loop_dirs = vec![library.root().to_path_buf()];
+        let loop_refresh = test_playlist_sidebar_refresh();
+        let loop_task = tokio::spawn(async move {
+            let mut completed = HashMap::new();
+            process_library_commands_without_watcher(
+                &loop_db,
+                &loop_dirs,
+                &loop_tx,
+                &command_rx,
+                &mut completed,
+                &loop_refresh,
+            )
+            .await;
+        });
+
+        let fifo_started = Instant::now();
+        for _ in 0..updates {
+            command_tx
+                .send(LibraryCommand::SetTrackRating {
+                    track_id: track_id.clone(),
+                    rating: Some(rating),
+                })
+                .await
+                .expect("send rating command");
+        }
+        let (flush_tx, flush_rx) = async_channel::unbounded();
+        command_tx
+            .send(LibraryCommand::Flush {
+                completion: flush_tx,
+            })
+            .await
+            .expect("send flush barrier");
+        drop(command_tx);
+        flush_rx
+            .recv()
+            .await
+            .expect("flush barrier must be acknowledged");
+        let fifo_settlement = fifo_started.elapsed();
+        loop_task.await.expect("engine command loop task finishes");
+
+        report.record(
+            "command_fifo_commands",
+            track_count,
+            updates as f64,
+            "commands",
+        );
+        report.record_ms(
+            "command_fifo_flush_settlement",
+            track_count,
+            fifo_settlement,
+        );
 
         // Prove the delayed-backend fixture adds deterministic latency.
         let delayed = DelayedBackend::new(LocalBackend::new(db.clone()), Duration::from_millis(5));
@@ -15991,25 +16117,64 @@ mod tests {
             "calls",
         );
 
-        // Optional delayed-filesystem/parser pass over the same fixture.
+        // Optional delayed-filesystem/parser pass. It scans the SAME fixture
+        // into a FRESH second database so every row is new and every file
+        // really goes through the delayed parse branch, then asserts the
+        // recorded parse-delay invocation count and persisted cardinality.
         if let Ok(micros) = std::env::var("TRIBUTARY_Q4_PARSE_DELAY_MICROS") {
             if let Ok(micros) = micros.parse::<u64>() {
                 if micros > 0 {
-                    let _guard = ParseDelayGuard::set(micros);
+                    let delayed_db = rename_test_database().await;
+                    let delay_guard = ParseDelayGuard::set(micros);
                     let delayed_scan_started = Instant::now();
-                    initial_scan(&db, &[library.root().to_path_buf()], &event_tx, &refresh)
+                    initial_scan(
+                        &delayed_db,
+                        &[library.root().to_path_buf()],
+                        &event_tx,
+                        &refresh,
+                    )
+                    .await
+                    .expect("delayed initial scan");
+                    let delayed_scan_elapsed = delayed_scan_started.elapsed();
+                    let delayed_parses = super::test_only_parse_delay_invocations();
+                    drop(delay_guard);
+                    let delayed_persisted = track::Entity::find()
+                        .all(&delayed_db)
                         .await
-                        .expect("delayed initial scan");
+                        .expect("count delayed-scan tracks")
+                        .len();
+
+                    assert_eq!(
+                        delayed_parses, track_count as u64,
+                        "delayed scan must apply the parse delay to every fixture file"
+                    );
+                    assert_eq!(
+                        delayed_persisted, track_count,
+                        "delayed scan must persist one row per fixture file"
+                    );
+
                     report.record_ms(
                         "delayed_parse_scan_elapsed",
                         track_count,
-                        delayed_scan_started.elapsed(),
+                        delayed_scan_elapsed,
+                    );
+                    report.record(
+                        "delayed_parse_files_parsed",
+                        track_count,
+                        delayed_parses as f64,
+                        "parses",
                     );
                     report.record(
                         "delayed_parse_micros_per_file",
                         track_count,
                         micros as f64,
                         "microseconds",
+                    );
+                    report.record(
+                        "delayed_parse_estimated_delay_total_ms",
+                        track_count,
+                        delayed_parses as f64 * micros as f64 / 1_000.0,
+                        "ms",
                     );
                 }
             }
