@@ -46,7 +46,7 @@ env -u DISPLAY -u WAYLAND_DISPLAY \
 | Run | Result |
 |-----|--------|
 | Headless negative control (`env -u DISPLAY -u WAYLAND_DISPLAY`) | Prints `gtk widget contracts test: no display session ($WAYLAND_DISPLAY/$DISPLAY unset); skipping.` — contract **not** exercised (test still reports `ok`; this is why the display-backed runs matter). |
-| Display-backed, default theme, full suite | **1890 passed / 0 failed / 0 ignored** (lib 1869 incl. consolidated widget contract; 20 unit; 30 packaging). Widget contract executed (not skipped). |
+| Display-backed, default theme, full suite | **1920 passed / 0 failed / 0 ignored** (lib 1869 + 20 unit; main binary incl. the consolidated widget contract: 1; packaging 30). Widget contract executed (not skipped). |
 | Display-backed, `GTK_THEME=Adwaita-dark` | Widget contract passes. |
 | Display-backed, `GTK_THEME=Raleigh` (non-Adwaita legacy theme) | Widget contract passes — the a11y contracts are property-level, not theme-dependent. |
 | Display-backed, `GDK_SCALE=2` (200% scaling) | Widget contract passes. |

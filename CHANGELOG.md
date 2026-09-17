@@ -73,6 +73,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column gutter via the `.statusbar-box` rule instead of custom per-widget margins. Screen
   readers announce each browser row as a single utterance ("Artist Name, (12)") at the
   list-row boundary, and recycled rows never announce a stale label.
+- **Acceptance evidence for the presentation refinements** (`docs/acceptance-p2.3-c.md`) —
+  Record the display-backed acceptance evidence for the #29 presentation work:
+  a negative control proving the widget-contract skip gate, broadway-backed
+  runs where the consolidated GTK contract genuinely executes (full suite
+  included, plus dark/legacy-theme and 200%-scale variants), the disposition of
+  each original issue ask, and the operator manual matrix for checks that
+  require a physical desktop session.
 
 ### Fixed
 
