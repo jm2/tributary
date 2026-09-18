@@ -6,9 +6,10 @@ representation plus an explicit unsupported-input boundary, for review before
 any behavior changes. It authorizes follow-up implementation beads; it does not
 ship them.
 
-Revision 4 (this head) continues the corrective chain over the independently
-rejected heads `16140be0d03d17c1f299cf7690adea6648722160` (Revision 2) and
-`bc49dbe514334e94c081e3156ab97a12df11f066` (Revision 3). Revision 2 withdrew the size/mtime
+Revision 5 (this head) continues the corrective chain over the independently
+rejected heads `16140be0d03d17c1f299cf7690adea6648722160` (Revision 2),
+`bc49dbe514334e94c081e3156ab97a12df11f066` (Revision 3), and
+`8f1a784f3973b92c05ac72fbca2bc9d7c3af56e4` (Revision 4). Revision 2 withdrew the size/mtime
 legacy-adoption rule (F1), made the rollout fail-closed-first so no authority
 consumer is ever exposed to a row it cannot prove (F2), and removed the
 older-binary compatibility claim in favor of an enforced version guard plus a
@@ -23,6 +24,14 @@ entry-to-track binding pairs (R2-F2), the §4.4 diagram matches the backfill
 states the migration actually writes (R2-F3), the older-binary containment
 claim is narrowed to what its two mechanisms actually deliver (R2-F4), and
 XSPF export fails closed with an `Err` instead of omitting rows (R2-F5).
+Revision 5 answers the two round-3 review findings verified at `8f1a784f`
+(§13.3): the reopening sentence no longer promises a blanket older-binary
+rejection the version guard cannot deliver — an older contract-aware binary is
+refused by the guard, an arbitrary pre-R11 binary only by the
+statement-preparation barrier when its statements name `file_path` (N1) — and
+a successful `down()` must revert both authority markers atomically with the
+table rebuild, so a downgraded database presents as pre-R11 to every
+contract-aware binary (N2).
 §13 is the finding-to-revision map. No behavior changes: every
 revision makes the contract stricter, not more permissive.
 
@@ -1042,6 +1051,60 @@ findings.
 
 Nothing in this revision expands product behavior; every change makes the
 contract stricter. Threads stay unresolved until this head lands and the five
+fixes are independently re-verified.
+
+### 13.3 Revision 5 mapping (round-3 review of `8f1a784f`)
+
+Revision 5 answers the two valid unresolved review threads verified in
+`refinery-20260918-8f1a784f-tr-ldhwt/corrective-round3-findings.md` (PR #283
+at head `8f1a784f3973b92c05ac72fbca2bc9d7c3af56e4`). All corrections are
+doc-only; labeled N1–N2 to match the findings report.
+
+#### N1 — blanket older-binary rejection guarantee contradicted the corrected containment
+
+- **Finding:** the §4.5 downgrade paragraph stated that reopening the upgraded
+  database with an older binary "is refused by the guard," while the R2-F4
+  corrected scope directly above it states the version guard is read by
+  contract-aware binaries only — an arbitrary pre-R11 binary is exactly the
+  case the guard does not stop. The sentence promised an executable open-time
+  barrier the design does not provide, and release/downgrade planning relying
+  on it would be wrong.
+- **Required correction:** qualify the sentence — reopening with an older
+  contract-aware binary is refused by the supported-version startup guard; an
+  arbitrary pre-R11 binary is contained only by the statement-preparation
+  failure when its statements name `file_path`, and is otherwise
+  unsupported-but-not-mechanically-rejected.
+- **Where changed:** rewrote the §4.5 reopening sentence into the explicit
+  contract-aware/pre-R11 split, tied to the scoped items 1–2 above it.
+- **Validation added:** none beyond consistency; the sentence now restates
+  the §4.5 items 1–2 scope, and §8.11 already asserts the barrier and its
+  boundary symmetrically.
+
+#### N2 — `down()` never reverted the authority markers
+
+- **Finding:** §4.5 required `down()` to restore the `file_path` column name,
+  refuse ambiguous rows, and be transactional/idempotent, but never required
+  deleting or resetting the `schema_capabilities` authority singleton row and
+  the mirrored `PRAGMA user_version` that `up()` writes last (§4.2 step 6). A
+  successful lossless downgrade would leave an authority-v1 marker on a
+  pre-R11 schema with no native-path columns; a contract-aware open would
+  then see authority declared where the contract's columns do not exist.
+- **Required correction:** require `down()` to delete/reset both markers
+  atomically with the table rebuild in the same transaction; state that a
+  downgraded database presents as pre-R11 (authority marker absent) to
+  contract-aware binaries; add a §8 validation note asserting both markers
+  are absent after a successful `down()`.
+- **Where changed:** extended the §4.5 `down()` paragraph with the atomic
+  marker-reversion requirement and the pre-R11 presentation statement; added
+  the marker assertions to §8's `down()` validation note.
+- **Validation added:** §8 now asserts that after a successful `down()` the
+  `schema_capabilities` authority row is absent and `PRAGMA user_version`
+  equals the captured pre-R11 value — the numeric mirror is restored, not
+  absent, so the downgraded database presents as pre-R11 to every
+  contract-aware binary.
+
+Nothing in this revision expands product behavior; every change makes the
+contract stricter. Threads stay unresolved until this head lands and the two
 fixes are independently re-verified.
 
 ## Appendix A — Lossy conversion inventory (`src/local/`)
