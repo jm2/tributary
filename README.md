@@ -701,6 +701,35 @@ OwnTone 29.x daemon as its transport when explicitly configured
 `TRIBUTARY_OWNTONE_API`, `TRIBUTARY_OWNTONE_PIPE`, and `TRIBUTARY_OWNTONE_STATE_DIR`). The
 adapter maps the selected receiver to the daemon by its retained device identifier — never
 by display name — and restores the daemon's pre-takeover output set when the session ends.
+
+The dedicated instance must carry an **ownership record** before the adapter will touch
+it: `probe()` refuses every load until `<TRIBUTARY_OWNTONE_STATE_DIR>/.tributary-owner`
+exists and binds the instance to exactly the endpoint, pipe, state directory and binary
+Tributary is configured with. The installation step that provisions the dedicated
+instance writes it once as JSON:
+
+```json
+{
+  "token": "tributary-airplay-owntone-v1",
+  "api_base": "http://127.0.0.1:3690",
+  "pipe_path": "/run/user/1000/tributary-owntone/pcm.fifo",
+  "state_dir": "/home/user/.local/state/tributary-owntone",
+  "binary": "/usr/sbin/owntone",
+  "restart_command": "systemctl --user restart tributary-owntone.service"
+}
+```
+
+`token` is the literal string above (a foreign or hand-edited value is refused, and a
+matching token cannot authorize an instance whose `api_base`, `pipe_path`, `state_dir`
+or `binary` differ from the configured ones — `TRIBUTARY_OWNTONE_API`,
+`TRIBUTARY_OWNTONE_PIPE`, `TRIBUTARY_OWNTONE_STATE_DIR` and the resolved daemon
+binary must match the record byte for byte). `restart_command` is optional: when the
+instance runs under a supervisor, put its restart invocation here so the adapter can
+bring the daemon back after it terminates a stuck instance; when absent, the adapter
+waits for the environment to restart the instance on its own. The adapter also keeps a
+runtime file next to it, `.tributary-takeover.json`, which records the daemon's
+pre-takeover output set for restoration; it is managed by Tributary and must not be
+created or edited by hand.
 When `TRIBUTARY_AIRPLAY_SENDER` is unset, the default is the GStreamer `raopsink` adapter,
 which is probe-gated: AirPlay 1 is offered only when a usable `raopsink` element is found.
 When the variable selects `owntone` on a target with no supported OwnTone acquisition path

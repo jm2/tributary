@@ -502,7 +502,10 @@ fn is_airplay_identity_in_output_list(output_list: &gtk::ListBox, identity: &str
     let mut child = output_list.first_child();
     while let Some(c) = child {
         if let Some(list_row) = c.downcast_ref::<gtk::ListBoxRow>() {
-            if list_row.widget_name() == identity {
+            // Only AirPlay rows can be duplicates: a receiver without a
+            // retained device id is keyed by its bare `host:port`, which a
+            // Chromecast row at the same endpoint also carries.
+            if row_has_icon(list_row, AIRPLAY_ROW_ICON) && list_row.widget_name() == identity {
                 return true;
             }
         }
@@ -666,6 +669,31 @@ pub mod widget_tests {
             ),
         );
         output_list
+    }
+
+    /// An AirPlay receiver with no retained device id is keyed by its bare
+    /// endpoint; a Chromecast row at that endpoint must neither hide it nor
+    /// be hidden by it, while a second AirPlay publication of the same
+    /// receiver is still deduplicated.
+    pub fn airplay_found_is_not_deduplicated_against_a_chromecast_row() {
+        let output_list = gtk::ListBox::new();
+        handle_chromecast_found(
+            &output_list,
+            &server("Den", "cast://10.0.0.9:8009", "chromecast", None),
+        );
+        handle_airplay_found(
+            &output_list,
+            &server("Den Speaker", "http://10.0.0.9:8009", "airplay", None),
+        );
+        handle_airplay_found(
+            &output_list,
+            &server("Den Speaker", "http://10.0.0.9:8009", "airplay", None),
+        );
+        assert_eq!(
+            row_names(&output_list),
+            vec!["10.0.0.9:8009".to_string(), "10.0.0.9:8009".to_string()],
+            "one Chromecast row and one AirPlay row must share the endpoint"
+        );
     }
 
     /// An AirPlay loss removes exactly the AirPlay rows at that endpoint: a

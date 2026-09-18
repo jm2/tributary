@@ -94,7 +94,10 @@ const QUIESCE_RESTART_DEADLINE: Duration = Duration::from_secs(15);
 /// binary.
 const OWNER_TOKEN: &str = "tributary-airplay-owntone-v1";
 
-/// The localized, actionable message every refusal is built from.
+/// The localized, actionable message every refusal is built from. `reason`
+/// names a key under `errors.playback.airplay_owntone_reason`, so the reason
+/// is rendered from the same catalog as the wrapper and a translated sentence
+/// never carries an English clause (PR #270 review).
 fn unavailable(reason: &str) -> SenderError {
     unavailable_in(rust_i18n::locale().as_ref(), reason)
 }
@@ -103,6 +106,25 @@ fn unavailable(reason: &str) -> SenderError {
 /// every-catalog localization contract is unit-testable without mutating the
 /// process locale.
 fn unavailable_in(locale: &str, reason: &str) -> SenderError {
+    let key = format!("{REASON_CATALOG}.{reason}");
+    let reason_text = rust_i18n::t!(key.as_str(), locale = locale);
+    debug_assert!(
+        !reason_text.contains(REASON_CATALOG),
+        "missing catalog entry for OwnTone refusal reason {reason}"
+    );
+    unavailable_raw_in(locale, reason_text.as_ref())
+}
+
+/// The catalog map holding every refusal reason.
+const REASON_CATALOG: &str = "errors.playback.airplay_owntone_reason";
+
+/// A refusal whose reason is already user-facing text (an error produced by
+/// another stage, itself localized).
+fn unavailable_raw(reason: &str) -> SenderError {
+    unavailable_raw_in(rust_i18n::locale().as_ref(), reason)
+}
+
+fn unavailable_raw_in(locale: &str, reason: &str) -> SenderError {
     SenderError::Dependency(
         rust_i18n::t!(
             "errors.playback.airplay_owntone_unavailable",
@@ -143,9 +165,9 @@ struct OwnToneConfig {
 
 impl OwnToneConfig {
     fn from_env() -> Result<Self, SenderError> {
-        let api = env_nonempty(ENV_API).ok_or_else(|| unavailable("not configured"))?;
-        let pipe = env_nonempty(ENV_PIPE).ok_or_else(|| unavailable("not configured"))?;
-        let state = env_nonempty(ENV_STATE_DIR).ok_or_else(|| unavailable("not configured"))?;
+        let api = env_nonempty(ENV_API).ok_or_else(|| unavailable("not_configured"))?;
+        let pipe = env_nonempty(ENV_PIPE).ok_or_else(|| unavailable("not_configured"))?;
+        let state = env_nonempty(ENV_STATE_DIR).ok_or_else(|| unavailable("not_configured"))?;
         let binary = env_nonempty(ENV_BIN).unwrap_or_else(|| DEFAULT_BIN.to_string());
         let config = Self {
             api_base: api.trim_end_matches('/').to_string(),
@@ -162,7 +184,7 @@ impl OwnToneConfig {
     /// instance this adapter is allowed to drive.
     fn verify_loopback(&self) -> Result<(), SenderError> {
         let url = url::Url::parse(&self.api_base)
-            .map_err(|_| unavailable("the configured API URL is invalid"))?;
+            .map_err(|_| unavailable("configured_api_url_is_invalid"))?;
         let host = url.host_str().unwrap_or_default();
         if is_loopback_host(host) && !is_literal_loopback_host(host) {
             // "localhost" resolves to *both* loopback families, so the process
@@ -171,11 +193,11 @@ impl OwnToneConfig {
             // address the client will use, so the observed family is the
             // endpoint's family by construction.
             return Err(unavailable(
-                "the JSON API loopback host must be a literal address (127.0.0.1 or ::1), not an ambiguous name",
+                "json_api_loopback_host_must_be_a_literal_address",
             ));
         }
         if !is_loopback_host(host) {
-            return Err(unavailable("the JSON API must be bound to loopback"));
+            return Err(unavailable("json_api_must_be_bound_to_loopback"));
         }
         Ok(())
     }
@@ -198,12 +220,12 @@ impl OwnToneConfig {
     /// of the ownership gate, safe to run synchronously on the GTK caller.
     fn verify_owned_record(&self) -> Result<(), SenderError> {
         let body = std::fs::read_to_string(self.owner_marker())
-            .map_err(|_| unavailable("the dedicated-instance ownership record is missing"))?;
+            .map_err(|_| unavailable("dedicated_instance_ownership_record_is_missing"))?;
         let record: OwnershipRecord = serde_json::from_str(&body)
-            .map_err(|_| unavailable("the dedicated-instance ownership record is malformed"))?;
+            .map_err(|_| unavailable("dedicated_instance_ownership_record_is_malformed"))?;
         if record.token != OWNER_TOKEN {
             return Err(unavailable(
-                "the configured state directory is not a Tributary-owned instance",
+                "configured_state_directory_is_not_a_tributary_owned_instance",
             ));
         }
         let matches = record.api_base == self.api_base
@@ -212,7 +234,7 @@ impl OwnToneConfig {
             && record.binary == self.binary.to_string_lossy();
         if !matches {
             return Err(unavailable(
-                "the configured endpoint, pipe, state directory or binary does not match the dedicated Tributary-owned instance",
+                "configured_instance_does_not_match_owned_record",
             ));
         }
         Ok(())
@@ -501,7 +523,7 @@ fn wait_for_endpoint_release(api_base: &str, deadline: Instant) -> Result<(), Se
     while endpoint_is_bound(api_base) {
         if Instant::now() >= deadline {
             return Err(unavailable(
-                "the dedicated daemon did not release its endpoint after terminating",
+                "dedicated_daemon_did_not_release_its_endpoint_after_terminating",
             ));
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -658,18 +680,14 @@ fn process_is_owned(process: &ListenerProcess, config: &OwnToneConfig) -> bool {
 fn verify_daemon_process(config: &OwnToneConfig) -> Result<(), SenderError> {
     let Some(process) = listener_process(&config.api_base) else {
         return Err(unavailable(
-            "no process is bound to the configured dedicated-instance endpoint",
+            "no_process_is_bound_to_the_configured_dedicated_instance_endpoint",
         ));
     };
     if !same_binary(&process.exe, &config.binary) {
-        return Err(unavailable(
-            "the process bound to the configured endpoint is not the dedicated owntone binary",
-        ));
+        return Err(unavailable("endpoint_process_is_not_the_owntone_binary"));
     }
     if !cmdline_binds_instance(&process.argv, &config.state_dir, &config.pipe_path) {
-        return Err(unavailable(
-            "the process bound to the configured endpoint is not the dedicated Tributary-owned instance",
-        ));
+        return Err(unavailable("endpoint_process_is_not_the_owned_instance"));
     }
     Ok(())
 }
@@ -684,17 +702,13 @@ fn verify_signal_target(
     config: &OwnToneConfig,
 ) -> Result<(), SenderError> {
     let Some(current) = read_process(process.pid) else {
-        return Err(unavailable("the dedicated daemon is no longer running"));
+        return Err(unavailable("dedicated_daemon_is_no_longer_running"));
     };
     if current.identity() != process.identity() {
-        return Err(unavailable(
-            "the dedicated daemon process identity changed before it could be signalled",
-        ));
+        return Err(unavailable("daemon_process_identity_changed"));
     }
     if !process_is_owned(&current, config) {
-        return Err(unavailable(
-            "the process bound to the configured endpoint is not the dedicated Tributary-owned instance",
-        ));
+        return Err(unavailable("endpoint_process_is_not_the_owned_instance"));
     }
     Ok(())
 }
@@ -707,15 +721,13 @@ fn identity_still_ours(identity: ProcessIdentity) -> Result<bool, SenderError> {
     match observe_process(identity.pid) {
         ProcessObservation::Gone => Ok(false),
         ProcessObservation::Unobserved => Err(unavailable(
-            "the dedicated daemon process state could not be observed",
+            "dedicated_daemon_process_state_could_not_be_observed",
         )),
         ProcessObservation::Live(_) => {
             if process_start_time(identity.pid) == Some(identity.start_time) {
                 Ok(true)
             } else {
-                Err(unavailable(
-                    "the dedicated daemon process identity changed before it could be signalled",
-                ))
+                Err(unavailable("daemon_process_identity_changed"))
             }
         }
     }
@@ -740,22 +752,20 @@ impl SignalHandle {
         {
             use rustix::process::{pidfd_open, Pid, PidfdFlags};
             let Some(pid) = Pid::from_raw(identity.pid as i32) else {
-                return Err(unavailable("the dedicated daemon process id is invalid"));
+                return Err(unavailable("dedicated_daemon_process_id_is_invalid"));
             };
             match pidfd_open(pid, PidfdFlags::empty()) {
                 Ok(pidfd) => {
                     // Prove the handle names the observed process, not a
                     // successor that reused the pid in the interval.
                     if process_start_time(identity.pid) != Some(identity.start_time) {
-                        return Err(unavailable(
-                            "the dedicated daemon process identity changed before it could be signalled",
-                        ));
+                        return Err(unavailable("daemon_process_identity_changed"));
                     }
                     Ok(Some(Self { identity, pidfd }))
                 }
                 Err(rustix::io::Errno::SRCH) => Ok(None),
                 Err(_) => Err(unavailable(
-                    "a stable handle to the dedicated daemon could not be opened",
+                    "a_stable_handle_to_the_dedicated_daemon_could_not_be_opened",
                 )),
             }
         }
@@ -769,7 +779,7 @@ impl SignalHandle {
             match rustix::process::pidfd_send_signal(&self.pidfd, signal) {
                 Ok(()) => Ok(true),
                 Err(rustix::io::Errno::SRCH) => Ok(false),
-                Err(_) => Err(unavailable("the dedicated daemon could not be signalled")),
+                Err(_) => Err(unavailable("dedicated_daemon_could_not_be_signalled")),
             }
         }
     }
@@ -797,7 +807,7 @@ fn signal_and_wait(identity: ProcessIdentity, deadline: Duration) -> Result<(), 
             ProcessObservation::Live(_) => {}
             ProcessObservation::Unobserved => {
                 return Err(unavailable(
-                    "the dedicated daemon process state could not be observed",
+                    "dedicated_daemon_process_state_could_not_be_observed",
                 ));
             }
         }
@@ -818,13 +828,13 @@ fn signal_and_wait(identity: ProcessIdentity, deadline: Duration) -> Result<(), 
             ProcessObservation::Live(_) => {}
             ProcessObservation::Unobserved => {
                 return Err(unavailable(
-                    "the dedicated daemon process state could not be observed",
+                    "dedicated_daemon_process_state_could_not_be_observed",
                 ));
             }
         }
         if Instant::now() >= kill_end {
             return Err(unavailable(
-                "the dedicated daemon did not terminate after SIGKILL",
+                "dedicated_daemon_did_not_terminate_after_sigkill",
             ));
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -862,7 +872,7 @@ fn spawn_restart_command(command: &str) -> Result<(), SenderError> {
                     let _ = child.wait();
                 });
         })
-        .map_err(|_| unavailable("the dedicated daemon could not be restarted"))
+        .map_err(|_| unavailable("dedicated_daemon_could_not_be_restarted"))
 }
 
 /// Wait (bounded) until the configured endpoint is again served by an owned
@@ -882,7 +892,7 @@ fn wait_for_owned_listener(
         }
         if Instant::now() >= deadline {
             return Err(unavailable(
-                "the dedicated daemon did not come back after quiescence",
+                "dedicated_daemon_did_not_come_back_after_quiescence",
             ));
         }
         std::thread::sleep(RECOVERY_POLL);
@@ -897,16 +907,12 @@ fn wait_for_owned_listener(
 /// against a daemon that cannot replay an old generation's mutation.
 fn quiesce_daemon(config: &OwnToneConfig) -> Result<(), SenderError> {
     let Some(process) = listener_process(&config.api_base) else {
-        return Err(unavailable(
-            "the dedicated daemon is not running to quiesce",
-        ));
+        return Err(unavailable("dedicated_daemon_is_not_running_to_quiesce"));
     };
     // Full authority, not just the binary: a same-binary shared instance that
     // happens to hold the endpoint must never be terminated (review S2).
     if !process_is_owned(&process, config) {
-        return Err(unavailable(
-            "the process bound to the configured endpoint is not the dedicated Tributary-owned instance",
-        ));
+        return Err(unavailable("endpoint_process_is_not_the_owned_instance"));
     }
     let previous = process.identity();
     terminate_process(&process, config, QUIESCE_TERMINATE_DEADLINE)?;
@@ -1024,7 +1030,7 @@ impl OwnToneClient {
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|_| unavailable("the local HTTP client could not be created"))?;
+            .map_err(|_| unavailable("local_http_client_could_not_be_created"))?;
         Ok(Self {
             http,
             base: base.to_string(),
@@ -1037,7 +1043,7 @@ impl OwnToneClient {
         } else {
             // error_for_status accepts redirects; those cannot confirm an
             // observation or mutation, especially a recovery restoration.
-            Err(unavailable("the dedicated daemon rejected the request"))
+            Err(unavailable("dedicated_daemon_rejected_the_request"))
         }
     }
 
@@ -1046,11 +1052,11 @@ impl OwnToneClient {
             .http
             .get(format!("{}{}", self.base, path))
             .send()
-            .map_err(|_| unavailable("the dedicated daemon is unreachable"))?;
+            .map_err(|_| unavailable("dedicated_daemon_is_unreachable"))?;
         Self::require_success(&response)?;
         response
             .json()
-            .map_err(|_| unavailable("the dedicated daemon sent a malformed response"))
+            .map_err(|_| unavailable("dedicated_daemon_sent_a_malformed_response"))
     }
 
     fn put(&self, path: &str) -> Result<(), SenderError> {
@@ -1058,7 +1064,7 @@ impl OwnToneClient {
             .http
             .put(format!("{}{}", self.base, path))
             .send()
-            .map_err(|_| unavailable("the dedicated daemon is unreachable"))?;
+            .map_err(|_| unavailable("dedicated_daemon_is_unreachable"))?;
         Self::require_success(&response)?;
         Ok(())
     }
@@ -1069,7 +1075,7 @@ impl OwnToneClient {
             .put(format!("{}{}", self.base, path))
             .json(body)
             .send()
-            .map_err(|_| unavailable("the dedicated daemon is unreachable"))?;
+            .map_err(|_| unavailable("dedicated_daemon_is_unreachable"))?;
         Self::require_success(&response)?;
         Ok(())
     }
@@ -1079,8 +1085,8 @@ impl OwnToneClient {
         let raw = value
             .get("version")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| unavailable("the dedicated daemon reported no version"))?;
-        parse_version(raw).ok_or_else(|| unavailable("the dedicated daemon version is unparseable"))
+            .ok_or_else(|| unavailable("dedicated_daemon_reported_no_version"))?;
+        parse_version(raw).ok_or_else(|| unavailable("dedicated_daemon_version_is_unparseable"))
     }
 
     fn outputs(&self) -> Result<Vec<OwnToneOutput>, SenderError> {
@@ -1088,17 +1094,17 @@ impl OwnToneClient {
         let array = value
             .get("outputs")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| unavailable("the dedicated daemon reported no output list"))?;
+            .ok_or_else(|| unavailable("dedicated_daemon_reported_no_output_list"))?;
         let mut outputs = Vec::with_capacity(array.len());
         for entry in array {
             let id = entry
                 .get("id")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<u64>().ok())
-                .ok_or_else(|| unavailable("the dedicated daemon reported an invalid output id"))?;
+                .ok_or_else(|| unavailable("dedicated_daemon_reported_an_invalid_output_id"))?;
             if outputs.iter().any(|output: &OwnToneOutput| output.id == id) {
                 return Err(unavailable(
-                    "the dedicated daemon reported duplicate output ids",
+                    "dedicated_daemon_reported_duplicate_output_ids",
                 ));
             }
             let name = entry
@@ -1109,9 +1115,7 @@ impl OwnToneClient {
             let selected = entry
                 .get("selected")
                 .and_then(|v| v.as_bool())
-                .ok_or_else(|| {
-                    unavailable("the dedicated daemon reported invalid output selection")
-                })?;
+                .ok_or_else(|| unavailable("dedicated_daemon_reported_invalid_output_selection"))?;
             outputs.push(OwnToneOutput { id, name, selected });
         }
         Ok(outputs)
@@ -1135,7 +1139,7 @@ impl OwnToneClient {
         match value.get("state").and_then(|v| v.as_str()) {
             Some(state @ ("play" | "pause" | "stop")) => Ok(state.to_string()),
             _ => Err(unavailable(
-                "the dedicated daemon reported an invalid player state",
+                "dedicated_daemon_reported_an_invalid_player_state",
             )),
         }
     }
@@ -1175,9 +1179,9 @@ struct TakeoverRecord {
 impl TakeoverRecord {
     fn write(&self, path: &Path) -> Result<(), SenderError> {
         let body = serde_json::to_vec(self)
-            .map_err(|_| unavailable("the takeover record could not be serialized"))?;
+            .map_err(|_| unavailable("takeover_record_could_not_be_serialized"))?;
         std::fs::write(path, body)
-            .map_err(|_| unavailable("the takeover record could not be persisted"))
+            .map_err(|_| unavailable("takeover_record_could_not_be_persisted"))
     }
 
     fn read(path: &Path) -> Option<Self> {
@@ -1192,19 +1196,19 @@ fn ensure_pipe(path: &Path) -> Result<(), SenderError> {
     use std::os::unix::fs::FileTypeExt;
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_fifo() => Ok(()),
-        Ok(_) => Err(unavailable("the configured pipe path is not a FIFO")),
+        Ok(_) => Err(unavailable("configured_pipe_path_is_not_a_fifo")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let parent = path
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
-                .ok_or_else(|| unavailable("the configured pipe has no parent directory"))?;
+                .ok_or_else(|| unavailable("configured_pipe_has_no_parent_directory"))?;
             std::fs::create_dir_all(parent)
-                .map_err(|_| unavailable("the pipe directory could not be created"))?;
+                .map_err(|_| unavailable("pipe_directory_could_not_be_created"))?;
             rustix::fs::mkfifoat(rustix::fs::CWD, path, Mode::RUSR | Mode::WUSR)
-                .map_err(|_| unavailable("the configured pipe could not be created"))?;
+                .map_err(|_| unavailable("configured_pipe_could_not_be_created"))?;
             Ok(())
         }
-        Err(_) => Err(unavailable("the configured pipe could not be inspected")),
+        Err(_) => Err(unavailable("configured_pipe_could_not_be_inspected")),
     }
 }
 
@@ -1225,9 +1229,9 @@ struct PipeIdentity {
 fn verify_pipe_identity(path: &Path) -> Result<PipeIdentity, SenderError> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let metadata = std::fs::symlink_metadata(path)
-        .map_err(|_| unavailable("the configured pipe could not be inspected"))?;
+        .map_err(|_| unavailable("configured_pipe_could_not_be_inspected"))?;
     if !metadata.file_type().is_fifo() {
-        return Err(unavailable("the configured pipe path is not a FIFO"));
+        return Err(unavailable("configured_pipe_path_is_not_a_fifo"));
     }
     Ok(PipeIdentity {
         device: metadata.dev(),
@@ -1245,12 +1249,12 @@ fn bind_pipe_writer(fd: OwnedFd, expected: PipeIdentity) -> Result<OwnedFd, Send
     let file = std::fs::File::from(fd);
     let metadata = file
         .metadata()
-        .map_err(|_| unavailable("the pipe write end could not be inspected"))?;
+        .map_err(|_| unavailable("pipe_write_end_could_not_be_inspected"))?;
     if !metadata.file_type().is_fifo() {
-        return Err(unavailable("the configured pipe path is not a FIFO"));
+        return Err(unavailable("configured_pipe_path_is_not_a_fifo"));
     }
     if (metadata.dev(), metadata.ino()) != (expected.device, expected.inode) {
-        return Err(unavailable("the configured pipe was replaced"));
+        return Err(unavailable("configured_pipe_was_replaced"));
     }
     Ok(OwnedFd::from(file))
 }
@@ -1294,20 +1298,20 @@ fn open_pipe_write(
             Ok(fd) => return bind_pipe_writer(fd, expected).map_err(CancelOrError::Failed),
             Err(rustix::io::Errno::LOOP) => {
                 return Err(CancelOrError::Failed(unavailable(
-                    "the configured pipe path is a symlink",
+                    "configured_pipe_path_is_a_symlink",
                 )))
             }
             Err(rustix::io::Errno::NXIO) => {
                 if Instant::now() >= deadline {
                     return Err(CancelOrError::Failed(unavailable(
-                        "the dedicated daemon is not reading the pipe",
+                        "dedicated_daemon_is_not_reading_the_pipe",
                     )));
                 }
                 std::thread::sleep(FIFO_OPEN_POLL);
             }
             Err(_) => {
                 return Err(CancelOrError::Failed(unavailable(
-                    "the pipe write end could not be opened",
+                    "pipe_write_end_could_not_be_opened",
                 )))
             }
         }
@@ -1589,11 +1593,11 @@ impl SessionInner {
         let _boundary = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
         if self.terminal.load(Ordering::SeqCst) {
             return Err(unavailable(
-                "the AirPlay session is no longer accepting control",
+                "airplay_session_is_no_longer_accepting_control",
             ));
         }
         if terminal_on_failure && (self.cancel.is_cancelled() || self.gate.is_stopped()) {
-            return Err(unavailable("the AirPlay session was stopped"));
+            return Err(unavailable("airplay_session_was_stopped"));
         }
         self.unsettled.fetch_add(1, Ordering::SeqCst);
         match effect() {
@@ -1604,7 +1608,7 @@ impl SessionInner {
                     // under this same lock, so it cannot have interleaved
                     // between the transmission and here (review X1).
                     if !self.gate.publish_if_live(|| self.publish_state(state)) {
-                        return Err(unavailable("the AirPlay session was stopped"));
+                        return Err(unavailable("airplay_session_was_stopped"));
                     }
                     // The accepted transition and everything the drain wait
                     // derives from it are one decision under this boundary.
@@ -1840,7 +1844,7 @@ fn restore_daemon(
     if let Err(error) = std::fs::remove_file(config.takeover_record()) {
         if error.kind() != std::io::ErrorKind::NotFound {
             warn!("OwnTone restore: takeover record removal failed");
-            return Err(unavailable("the takeover record could not be cleared"));
+            return Err(unavailable("takeover_record_could_not_be_cleared"));
         }
     }
     Ok(())
@@ -1978,19 +1982,17 @@ impl SessionInner {
     fn start_pipe(&self, pipeline: &gst::Pipeline) -> Result<(), SenderError> {
         pipeline
             .set_state(gst::State::Playing)
-            .map_err(|_| unavailable("the decode pipeline failed to start"))?;
+            .map_err(|_| unavailable("decode_pipeline_failed_to_start"))?;
         let deadline = Instant::now() + OPEN_DEADLINE;
         loop {
             if self.cancel.is_cancelled() || self.gate.is_stopped() {
-                return Err(unavailable("pipe activation was cancelled"));
+                return Err(unavailable("pipe_activation_was_cancelled"));
             }
             if self.client.player_state()? == "play" {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                return Err(unavailable(
-                    "the dedicated daemon did not autostart the pipe",
-                ));
+                return Err(unavailable("dedicated_daemon_did_not_autostart_the_pipe"));
             }
             std::thread::sleep(FIFO_OPEN_POLL);
         }
@@ -2809,19 +2811,19 @@ impl AirplaySender for OwnToneSender {
     fn probe(&self) -> Result<(), SenderError> {
         if !platform_available() {
             return Err(unavailable(
-                "this platform has no supported OwnTone acquisition path",
+                "this_platform_has_no_supported_owntone_acquisition_path",
             ));
         }
         let config = self
             .config
             .as_ref()
-            .ok_or_else(|| unavailable("not configured"))?;
+            .ok_or_else(|| unavailable("not_configured"))?;
         // Record-only here: the kernel-verified process binding (review R5)
         // walks `/proc`, so it stays on the worker with the rest of the
         // non-local gate.
         config.verify_owned_record()?;
         if !config.binary.is_file() {
-            return Err(unavailable("the owntone binary was not found"));
+            return Err(unavailable("owntone_binary_was_not_found"));
         }
         ensure_pipe(&config.pipe_path)?;
         Ok(())
@@ -2832,7 +2834,7 @@ impl AirplaySender for OwnToneSender {
             return OpenOutcome::Cancelled;
         }
         let Some(config) = self.config.clone() else {
-            return OpenOutcome::Failed(unavailable("not configured"));
+            return OpenOutcome::Failed(unavailable("not_configured"));
         };
         open(config, ctx)
     }
@@ -2846,7 +2848,7 @@ impl AirplaySender for OwnToneSender {
 fn check_daemon_health(client: &OwnToneClient) -> Result<(), SenderError> {
     let (major, _minor) = client.version()?;
     if major < OWNTONE_MIN_MAJOR {
-        return Err(unavailable("the dedicated daemon is older than 29.x"));
+        return Err(unavailable("dedicated_daemon_is_older_than_29_x"));
     }
     Ok(())
 }
@@ -3041,7 +3043,7 @@ fn acquire_instance_lock(
         if Instant::now() >= deadline {
             return Err(pre_mutation_failure(
                 ctx,
-                unavailable("another Tributary session is already using the dedicated daemon"),
+                unavailable("another_tributary_session_is_already_using_the_dedicated_daemon"),
             ));
         }
         std::thread::sleep(FIFO_OPEN_POLL);
@@ -3068,14 +3070,14 @@ fn recover_stale_takeover(
     let Some(stale) = TakeoverRecord::read(&record_path) else {
         return Err(pre_mutation_failure(
             ctx,
-            unavailable("a previous takeover record is unreadable and must be recovered by hand"),
+            unavailable("previous_takeover_record_unreadable"),
         ));
     };
     cancel_point(ctx)?;
     if quiesce_daemon(config).is_err() || restore_daemon(client, config, &stale).is_err() {
         return Err(pre_mutation_failure(
             ctx,
-            unavailable("a previous takeover is incomplete and could not be recovered"),
+            unavailable("previous_takeover_incomplete"),
         ));
     }
     cancel_point(ctx)
@@ -3092,12 +3094,12 @@ fn observe_takeover_target(
         .outputs()
         .map_err(|error| pre_mutation_failure(ctx, error))?;
     let selected = map_receiver_to_output(&outputs, ctx.target.device_id.as_deref())
-        .map_err(|failure| pre_mutation_failure(ctx, unavailable(&failure.to_string())))?;
+        .map_err(|failure| pre_mutation_failure(ctx, unavailable_raw(&failure.to_string())))?;
     // Never preempt audible playback on the dedicated instance.
     match client.player_state() {
         Ok(state) if state == "play" => Err(pre_mutation_failure(
             ctx,
-            unavailable("the dedicated daemon is already playing"),
+            unavailable("dedicated_daemon_is_already_playing"),
         )),
         Ok(_) => Ok((outputs, selected)),
         Err(error) => Err(pre_mutation_failure(ctx, error)),
@@ -3212,7 +3214,7 @@ fn start_session(
         .name("airplay-owntone-pump".to_string())
         .spawn(move || run_pump(pump_inner, pipeline, write_fd));
     let Ok(pump) = pump else {
-        let error = unavailable("the decode pump could not be started");
+        let error = unavailable("decode_pump_could_not_be_started");
         return match Arc::try_unwrap(inner) {
             Ok(session) => fail_outcome(
                 session.client,
@@ -3867,7 +3869,7 @@ fn recovery_pending(
     lock: std::fs::File,
     custody: &CustodyHandoff,
 ) -> SenderError {
-    let message = unavailable("recovery is pending for the dedicated daemon")
+    let message = unavailable("recovery_is_pending_for_the_dedicated_daemon")
         .message()
         .to_string();
     custody.move_to_custody();
@@ -3890,10 +3892,10 @@ fn build_pipeline(uri: &str, write_fd: &OwnedFd) -> Result<gst::Pipeline, Sender
         write_fd.as_raw_fd(),
     );
     let element = gst::parse::launch(&description)
-        .map_err(|_| unavailable("the decode pipeline could not be constructed"))?;
+        .map_err(|_| unavailable("decode_pipeline_could_not_be_constructed"))?;
     let pipeline = element
         .downcast::<gst::Pipeline>()
-        .map_err(|_| unavailable("the decode pipeline is not a pipeline"))?;
+        .map_err(|_| unavailable("decode_pipeline_is_not_a_pipeline"))?;
     if let Some(decoder) = pipeline.by_name("decoder") {
         super::Player::install_loopback_http_source_policy(&decoder);
     }
@@ -3906,7 +3908,7 @@ fn build_pipeline(uri: &str, write_fd: &OwnedFd) -> Result<gst::Pipeline, Sender
 fn open_lock(path: &Path) -> Result<std::fs::File, SenderError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|_| unavailable("the instance state directory could not be created"))?;
+            .map_err(|_| unavailable("instance_state_directory_could_not_be_created"))?;
     }
     std::fs::OpenOptions::new()
         .create(true)
@@ -3914,7 +3916,7 @@ fn open_lock(path: &Path) -> Result<std::fs::File, SenderError> {
         .write(true)
         .truncate(false)
         .open(path)
-        .map_err(|_| unavailable("the instance lock file could not be opened"))
+        .map_err(|_| unavailable("instance_lock_file_could_not_be_opened"))
 }
 
 /// Build a fully-owned [`OwnToneSender`] for controller-path regressions: a
@@ -4138,17 +4140,71 @@ mod tests {
 
     #[test]
     fn unavailable_message_names_the_reason_in_every_catalog() {
-        let english = unavailable_in("en", "not configured").message().to_string();
+        let english = unavailable_in("en", "not_configured").message().to_string();
         assert!(english.contains("not configured"), "{english}");
         assert!(english.contains("OwnTone"), "{english}");
 
         for locale in rust_i18n::available_locales!() {
-            let message = unavailable_in(&locale, "not configured");
+            let message = unavailable_in(&locale, "not_configured");
             let message = message.message();
+            let reason = rust_i18n::t!(
+                "errors.playback.airplay_owntone_reason.not_configured",
+                locale = locale
+            );
             assert!(!message.is_empty(), "{locale} is empty");
-            assert!(message.contains("not configured"), "{locale}: {message}");
+            // The reason comes from the selected catalog — never the key path,
+            // never an English clause inside a translated sentence.
+            assert!(
+                !reason.contains("airplay_owntone_reason"),
+                "{locale}: {reason}"
+            );
+            assert!(message.contains(reason.as_ref()), "{locale}: {message}");
             if locale != "en" {
                 assert_ne!(message, english, "{locale} must not fall back to English");
+                assert!(
+                    !message.contains("not configured"),
+                    "{locale} carries English: {message}"
+                );
+            }
+        }
+    }
+
+    /// Every reason key this module refuses with exists in every catalog, so
+    /// no locale can fall back to English for a runtime refusal.
+    #[test]
+    fn every_refusal_reason_exists_in_every_catalog() {
+        // rustfmt may break `unavailable(` and its key across lines, so skip
+        // whitespace between the paren and the opening quote.
+        let source = include_str!("airplay_owntone.rs");
+        let mut keys: Vec<&str> = source
+            .match_indices("unavailable(")
+            .filter_map(|(at, _)| {
+                let rest = source[at + "unavailable(".len()..].trim_start();
+                let body = rest.strip_prefix('"')?;
+                Some(&body[..body.find('"')?])
+            })
+            // Only real keys: the scan also sees this test's own string literals.
+            .filter(|key| {
+                !key.is_empty()
+                    && key
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert!(
+            keys.len() > 50,
+            "expected the refusal reasons, found {keys:?}"
+        );
+        for locale in rust_i18n::available_locales!() {
+            let path = format!("{}/locales/{locale}.yml", env!("CARGO_MANIFEST_DIR"));
+            let catalog = std::fs::read_to_string(&path).expect("catalog readable");
+            for key in &keys {
+                assert!(
+                    catalog.contains(&format!("\n      {key}: ")),
+                    "{locale}.yml lacks airplay_owntone_reason.{key}"
+                );
             }
         }
     }
@@ -6002,7 +6058,7 @@ mod tests {
                 .take();
             match session {
                 Some(session) => OpenOutcome::Opened(session),
-                None => OpenOutcome::Failed(unavailable("no prepared test session")),
+                None => OpenOutcome::Failed(unavailable("no_prepared_test_session")),
             }
         }
     }
@@ -11522,7 +11578,7 @@ fn serve(stream: std::net::TcpStream, fail: Option<String>) {
             };
             if rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).is_err() {
                 return OpenOutcome::Failed(unavailable(
-                    "another Tributary session is already using the dedicated daemon",
+                    "another_tributary_session_is_already_using_the_dedicated_daemon",
                 ));
             }
             self.lock_paths
