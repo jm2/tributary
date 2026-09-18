@@ -22,8 +22,10 @@
 # Every read is complete and structural: list endpoints are paginated to
 # exhaustion, every page must parse to the expected JSON shape, and a required
 # read that fails — a non-404 error, a malformed document, a referenced
-# ruleset that cannot be read, or an inventory that terminates short of its
-# declared total — fails the validation closed. Inventory records are
+# ruleset that cannot be read, an inventory that terminates short of its
+# declared total, or a first-page 404 on the branch-rules inventory (a failed
+# resolution of the endpoint, not an observed absence of rules) — fails the
+# validation closed. Inventory records are
 # validated before any recognized-shape filtering: a branch-rules reference
 # without a numeric ruleset id, or a ruleset rule entry without a type
 # discriminator, is an incomplete observation that fails closed — never a
@@ -192,8 +194,12 @@ gather_doc() {
 
 # Read a paginated endpoint whose pages are top-level JSON arrays, then
 # normalize the combined inventory into one array. A page that is not an array,
-# or a read failure on any page, fails closed; pagination stops on an empty
-# page and is bounded so a hostile stub cannot spin forever.
+# or a read failure on any page — including a first-page 404 — fails closed.
+# Unlike the single-document reads (a clean 404 records absence), the
+# branch-rules inventory is a required observation: a first-page 404 means the
+# endpoint, ref, or access resolution failed, not that no rules apply, so only
+# a successfully-read empty page may mean "no rules apply". Pagination stops on
+# an empty page and is bounded so a hostile stub cannot spin forever.
 gather_array() {
   local out="$1" endpoint="$2"
   local page=1 n page_out combined
@@ -202,10 +208,6 @@ gather_array() {
   while [ "$page" -le 200 ]; do
     page_out="$(mktemp "$scratch/page.XXXXXX")"
     if ! gh api "${endpoint}?per_page=100&page=${page}" > "$page_out" 2>"$gh_err"; then
-      if [ "$page" -eq 1 ] && grep -Eq 'HTTP 404|Not Found' "$gh_err"; then
-        rm -f "$page_out"
-        return 0
-      fi
       read_failed "gh api ${endpoint} page ${page}: $(sed -n '1p' "$gh_err")"
       rm -f "$page_out"
       : > "$out.failed"

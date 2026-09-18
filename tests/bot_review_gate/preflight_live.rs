@@ -81,6 +81,51 @@ fn live_referenced_ruleset_that_cannot_be_read_fails_closed() {
 }
 
 #[test]
+fn live_branch_rules_first_page_404_fails_closed() {
+    // A first-page 404 on the branch-rules inventory is a failed resolution
+    // of the endpoint — the page output is removed and nothing is observed —
+    // not an observed absence of rules. Recording it as an empty inventory
+    // would let the staged-inactive phase report consistency without ever
+    // having looked at the rules that apply to main.
+    let fixture = LiveFixture::new("live-branch-rules-404");
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "a first-page 404 on the branch-rules inventory must fail the preflight:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("READ-FAILED") && stderr.contains("rules/branches/main"),
+        "the branch-rules read failure must be reported:\n{stderr}"
+    );
+    assert!(
+        !stdout_of(&output).contains("configuration is consistent"),
+        "an unobserved inventory must never read as consistent:\n{}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
+fn live_empty_branch_rules_inventory_remains_consistent() {
+    // Control: a successfully-read empty page is a genuine observation that
+    // no branch rules apply to main, so the staged-inactive preflight stays
+    // consistent. The first-page-404 rejection is targeted at failed reads,
+    // not at inventories without rules.
+    let fixture = LiveFixture::new("live-branch-rules-empty");
+    fixture.page("rules_branches_main.page.1.json", "[]");
+    let output = fixture.run();
+    assert!(
+        output.status.success(),
+        "a genuinely observed empty branch-rules inventory must stay valid:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(stdout_of(&output).contains("configuration is consistent"));
+}
+
+#[test]
 fn live_nested_ruleset_read_error_fails_closed() {
     let fixture = LiveFixture::new("live-nested-read-error");
     fixture
