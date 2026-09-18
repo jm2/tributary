@@ -1812,9 +1812,7 @@ mod tests {
         LastFmPlaybackOccurrenceIdentity, LastFmPlaybackSource,
     };
     use crate::lastfm::policy::LastFmPolicyGeneration;
-    use crate::lastfm::runtime::{
-        spawn_lastfm_runtime, LastFmRuntimeActivation, LastFmRuntimeShutdownReason,
-    };
+    use crate::lastfm::runtime::{spawn_lastfm_runtime_for_test, LastFmRuntimeShutdownReason};
     use crate::lastfm::storage;
     use crate::source_registry::playback_attribution_fixture;
     use crate::source_registry::PlaybackAttributionProfile;
@@ -3474,8 +3472,7 @@ mod tests {
         .expect("valid coordinator runtime session");
         let credentials: Arc<dyn SessionCredentialStore> =
             Arc::new(RuntimeCredentialStore(Mutex::new(Some(session))));
-        let (handle, shutdown) = spawn_lastfm_runtime(
-            LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+        let (handle, shutdown) = spawn_lastfm_runtime_for_test(
             database.clone(),
             credentials,
             Arc::new(PendingRuntimeTransport),

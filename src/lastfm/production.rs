@@ -578,8 +578,22 @@ impl ApplicationOwner {
             return Ok(());
         }
 
+        let Some(activation) =
+            LastFmRuntimeActivation::issue_after_consent_and_enablement(&self.live_policy)
+        else {
+            // The live policy stopped granting activation authority between
+            // command acceptance and processing (revoked consent, disabled
+            // integration, or a replaced policy). Refuse before any runtime
+            // start, exactly as a superseded generation would at spawn time.
+            self.fail_terminal_before_completion(
+                LastFmApplicationCommandError::RuntimeStart,
+                completion,
+            )?;
+            return Ok(());
+        };
         let started = spawn_lastfm_runtime(
-            LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+            activation,
+            &self.live_policy,
             database,
             Arc::clone(&self.credentials),
             transport,

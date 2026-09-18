@@ -29,6 +29,11 @@ use super::delivery::{
     LastFmDeliveryDisposition, LastFmTransport,
 };
 use super::lifecycle::{acquire_vault_lifecycle, LastFmVaultLifecycleLease};
+#[cfg(test)]
+use std::collections::HashSet;
+use super::policy::LastFmLivePolicy;
+#[cfg(test)]
+use super::policy::LastFmPolicyGeneration;
 use super::storage::{
     self, LastFmEnqueueOutcome, LastFmQueueError, PendingLastFmScrobble, UnboundLastFmScrobble,
 };
@@ -3251,6 +3256,8 @@ fn stop_delivery_event(event: LastFmDeliveryEvent) {
 pub enum LastFmRuntimeStartError {
     #[error("Last.fm protected credential store is unavailable")]
     CredentialStore,
+    #[error("Last.fm policy generation was superseded before the runtime could start")]
+    PolicySuperseded,
     #[error("Last.fm protected credential store has no matching account")]
     CredentialMismatch,
     #[error("Last.fm credential cleanup was already complete")]
@@ -3406,14 +3413,48 @@ impl Drop for CompletionGuard {
 /// wiring must issue it only after enforcing the accepted privacy contract;
 /// unrelated application code cannot start the delivery runtime from the mere
 /// presence of a vault record.
+///
+/// The token freezes the exact policy generation that minted it. Because the
+/// spawn path is async, the live policy can move past that generation (the
+/// user revokes consent, disables the integration, or a replacement policy is
+/// published) between issuance and processing; the spawn path therefore
+/// re-derives the live generation at the moment of use and refuses a
+/// superseded token before any vault interaction or runtime start.
 pub struct LastFmRuntimeActivation {
     _private: (),
+    policy_generation: u64,
 }
 
 impl LastFmRuntimeActivation {
+    /// Issue the runtime activation only from a live generation that
+    /// currently carries consent and enablement, freezing its exact
+    /// identity.
+    ///
+    /// `None` means the live generation grants no activation authority (the
+    /// closed default or a policy disabled in any dimension), so no runtime
+    /// may start from this call.
     #[must_use]
-    pub(in crate::lastfm) const fn issue_after_consent_and_enablement() -> Self {
-        Self { _private: () }
+    pub(in crate::lastfm) fn issue_after_consent_and_enablement(
+        live: &LastFmLivePolicy,
+    ) -> Option<Self> {
+        let generation = live.snapshot();
+        generation
+            .activation_remote_sources()
+            .is_some()
+            .then_some(Self {
+                _private: (),
+                policy_generation: generation.generation(),
+            })
+    }
+
+    /// Construct one activation from an already-consented, enabled
+    /// generation for downstream tests that must not run a live policy slot.
+    #[cfg(test)]
+    pub(in crate::lastfm) fn for_test() -> Self {
+        let live = LastFmLivePolicy::default();
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
+        Self::issue_after_consent_and_enablement(&live)
+            .expect("enabled test generation issues an activation")
     }
 }
 
@@ -3421,6 +3462,29 @@ impl fmt::Debug for LastFmRuntimeActivation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("LastFmRuntimeActivation")
     }
+}
+
+/// Spawn a runtime from an already-consented, enabled test generation, for
+/// downstream tests that must not run a live policy slot of their own.
+#[cfg(test)]
+pub(in crate::lastfm) async fn spawn_lastfm_runtime_for_test(
+    database: DatabaseConnection,
+    credentials: Arc<dyn SessionCredentialStore>,
+    transport: Arc<dyn LastFmTransport>,
+    clock: Arc<dyn LastFmClock>,
+) -> Result<(LastFmRuntimeHandle, LastFmRuntimeShutdown), LastFmRuntimeStartError> {
+    let live = LastFmLivePolicy::default();
+    live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
+    spawn_lastfm_runtime(
+        LastFmRuntimeActivation::issue_after_consent_and_enablement(&live)
+            .expect("enabled test generation issues an activation"),
+        &live,
+        database,
+        credentials,
+        transport,
+        clock,
+    )
+    .await
 }
 
 /// Opaque authority for one explicit, category-bound manual retry of a durable
@@ -3441,13 +3505,27 @@ impl fmt::Debug for LastFmManualPauseRecovery {
 
 /// Load the exact vault authority and validate every retained row before
 /// exposing an active handle.
+///
+/// The activation token is validated against the live policy first: if the
+/// issuing generation was superseded (disabled, replaced, or closed) between
+/// issuance and this async call, the start is refused before any vault lease,
+/// credential load, queue validation, or delivery worker can come into play.
 pub async fn spawn_lastfm_runtime(
-    _activation: LastFmRuntimeActivation,
+    activation: LastFmRuntimeActivation,
+    live_policy: &LastFmLivePolicy,
     database: DatabaseConnection,
     credentials: Arc<dyn SessionCredentialStore>,
     transport: Arc<dyn LastFmTransport>,
     clock: Arc<dyn LastFmClock>,
 ) -> Result<(LastFmRuntimeHandle, LastFmRuntimeShutdown), LastFmRuntimeStartError> {
+    // First operation, before the vault lease: the policy check must observe
+    // the live slot at the moment of use, not the policy state at issuance.
+    let live_generation = live_policy.snapshot();
+    if !live_generation.consented_and_enabled()
+        || live_generation.generation() != activation.policy_generation
+    {
+        return Err(LastFmRuntimeStartError::PolicySuperseded);
+    }
     let vault_lease = acquire_vault_lifecycle().await;
     let empty_cleanup_tombstone = storage::has_empty_cleanup_tombstone(&database)
         .await
@@ -3836,6 +3914,7 @@ mod tests {
 
     struct TestCredentialStore {
         session: Mutex<Option<StoredSession>>,
+        load_attempts: AtomicUsize,
         delete_failures: AtomicUsize,
         delete_attempts: AtomicUsize,
     }
@@ -3844,9 +3923,14 @@ mod tests {
         fn new(session: StoredSession) -> Self {
             Self {
                 session: Mutex::new(Some(session)),
+                load_attempts: AtomicUsize::new(0),
                 delete_failures: AtomicUsize::new(0),
                 delete_attempts: AtomicUsize::new(0),
             }
+        }
+
+        fn load_attempts(&self) -> usize {
+            self.load_attempts.load(Ordering::SeqCst)
         }
 
         fn fail_next_deletes(&self, count: usize) {
@@ -3864,6 +3948,7 @@ mod tests {
 
     impl SessionCredentialStore for TestCredentialStore {
         fn load(&self) -> Result<Option<StoredSession>, CredentialError> {
+            self.load_attempts.fetch_add(1, Ordering::SeqCst);
             self.session
                 .lock()
                 .map(|session| session.clone())
@@ -3943,15 +4028,60 @@ mod tests {
         _initial_session: StoredSession,
         store: Arc<TestCredentialStore>,
     ) -> (LastFmRuntimeHandle, LastFmRuntimeShutdown) {
-        spawn_lastfm_runtime(
-            LastFmRuntimeActivation::issue_after_consent_and_enablement(),
-            database,
-            store,
+        spawn_lastfm_runtime_for_test(database, store, pending_transport(), fixed_clock())
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn closed_or_disabled_policy_issues_no_runtime_activation() {
+        let live = LastFmLivePolicy::default();
+        assert!(
+            LastFmRuntimeActivation::issue_after_consent_and_enablement(&live).is_none(),
+            "the closed default generation must not mint a runtime activation"
+        );
+        live.publish(LastFmPolicyGeneration::default());
+        assert!(
+            LastFmRuntimeActivation::issue_after_consent_and_enablement(&live).is_none(),
+            "an explicitly disabled policy must not mint a runtime activation"
+        );
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
+        assert!(
+            LastFmRuntimeActivation::issue_after_consent_and_enablement(&live).is_some(),
+            "a consented, enabled policy mints a runtime activation"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_disabled_after_issuance_never_starts_the_runtime() {
+        let live = LastFmLivePolicy::default();
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
+        let Some(activation) = LastFmRuntimeActivation::issue_after_consent_and_enablement(&live)
+        else {
+            panic!("an enabled generation issues the runtime activation");
+        };
+        // The policy is disabled after issuance, before the async spawn
+        // processes the token: the frozen generation is no longer the live
+        // one, so the runtime must refuse to start.
+        live.publish(LastFmPolicyGeneration::default());
+
+        let store = Arc::new(TestCredentialStore::new(session("superseded-listener")));
+        let error = spawn_lastfm_runtime(
+            activation,
+            &live,
+            database().await,
+            store.clone(),
             pending_transport(),
             fixed_clock(),
         )
         .await
-        .unwrap()
+        .expect_err("a superseded policy must refuse the runtime start");
+        assert_eq!(error, LastFmRuntimeStartError::PolicySuperseded);
+        assert_eq!(
+            store.load_attempts(),
+            0,
+            "no vault load may happen once the policy check refuses"
+        );
     }
 
     fn idle_runtime_handle() -> (LastFmRuntimeHandle, async_channel::Receiver<Command>) {
@@ -4441,8 +4571,7 @@ mod tests {
         .await
         .unwrap();
         let store = Arc::new(TestCredentialStore::new(stored_session));
-        let (handle, shutdown) = spawn_lastfm_runtime(
-            LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+        let (handle, shutdown) = spawn_lastfm_runtime_for_test(
             database.clone(),
             store,
             pending_transport(),
@@ -4511,8 +4640,7 @@ mod tests {
         .await
         .unwrap();
         let store = Arc::new(TestCredentialStore::new(stored_session));
-        let (handle, shutdown) = spawn_lastfm_runtime(
-            LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+        let (handle, shutdown) = spawn_lastfm_runtime_for_test(
             database.clone(),
             store,
             pending_transport(),
@@ -4905,8 +5033,7 @@ mod tests {
             dropping,
             release: Arc::clone(&release),
         });
-        let (handle, shutdown) = spawn_lastfm_runtime(
-            LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+        let (handle, shutdown) = spawn_lastfm_runtime_for_test(
             database.clone(),
             store.clone(),
             transport,
@@ -4926,8 +5053,7 @@ mod tests {
         let successor_database = database.clone();
         let successor_store = store.clone();
         let successor = tokio::spawn(async move {
-            spawn_lastfm_runtime(
-                LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+            spawn_lastfm_runtime_for_test(
                 successor_database,
                 successor_store,
                 pending_transport(),
@@ -5069,8 +5195,7 @@ mod tests {
         );
         shutdown.shutdown().await.unwrap();
 
-        let (successor, successor_shutdown) = spawn_lastfm_runtime(
-            LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+        let (successor, successor_shutdown) = spawn_lastfm_runtime_for_test(
             database.clone(),
             store.clone(),
             pending_transport(),
@@ -5106,8 +5231,7 @@ mod tests {
 
         storage::purge_account(&database, binding).await.unwrap();
         assert_eq!(
-            spawn_lastfm_runtime(
-                LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+            spawn_lastfm_runtime_for_test(
                 database.clone(),
                 store,
                 pending_transport(),
@@ -5211,8 +5335,7 @@ mod tests {
             .unwrap();
         let store = Arc::new(TestCredentialStore::new(session("successor")));
         assert_eq!(
-            spawn_lastfm_runtime(
-                LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+            spawn_lastfm_runtime_for_test(
                 database.clone(),
                 store.clone(),
                 pending_transport(),
@@ -5261,8 +5384,7 @@ mod tests {
         let successor_database = database.clone();
         let successor_store = store.clone();
         let successor = tokio::spawn(async move {
-            spawn_lastfm_runtime(
-                LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+            spawn_lastfm_runtime_for_test(
                 successor_database,
                 successor_store,
                 pending_transport(),
@@ -5322,8 +5444,7 @@ mod tests {
         .unwrap();
         let store = Arc::new(TestCredentialStore::new(expected.clone()));
         assert!(matches!(
-            spawn_lastfm_runtime(
-                LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+            spawn_lastfm_runtime_for_test(
                 mismatched_database,
                 store,
                 pending_transport(),
@@ -5351,8 +5472,7 @@ mod tests {
             .unwrap();
         let store = Arc::new(TestCredentialStore::new(expected.clone()));
         assert!(matches!(
-            spawn_lastfm_runtime(
-                LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+            spawn_lastfm_runtime_for_test(
                 corrupt_database,
                 store,
                 pending_transport(),
