@@ -86,6 +86,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Chromecast control saturation** (`src/audio/chromecast_output.rs`) — A slow
+  but responsive Cast receiver could previously lose the final seek or volume
+  intent when the bounded worker ingress saturated: the oldest transient
+  command was evicted without proving that a later same-kind intent superseded
+  it, and an incoming volume could evict itself while still reporting
+  `Enqueued`. The ingress now reserves two final-intent slots at the back of
+  the bounded deque, so the newest seek and volume stay admissible — and the
+  cached volume stays truthful — even while a flood of non-transient
+  play/pause/toggle commands fills the ordinary admission line. A queued
+  transient is evicted only when a later same-kind instance supersedes it
+  without crossing a lifecycle barrier, and a command that cannot be admitted
+  without discarding final intent is reported `Saturated` and logged instead
+  of being published as a terminal player error — an overload can no longer
+  tear down stable external playback. Stop/Shutdown reserved admission, epoch
+  purge, and the exact FIFO below capacity are unchanged.
 - **Supervised MPD control TOCTOU** (`src/audio/mpd_output.rs`) — A playback
   control (play/pause/toggle/seek) whose own pre-control `status` observed
   partition-option drift or a foreign current song lapsed the supervisor yet was
