@@ -847,7 +847,10 @@ mod tests {
             MediaContainer::from_suffix("aif"),
             Some(MediaContainer::Aiff)
         );
-        assert_eq!(MediaContainer::from_suffix("m4b"), Some(MediaContainer::M4a));
+        assert_eq!(
+            MediaContainer::from_suffix("m4b"),
+            Some(MediaContainer::M4a)
+        );
         assert_eq!(MediaContainer::from_suffix("exe"), None);
         assert_eq!(MediaContainer::from_suffix(""), None);
         assert_eq!(MediaContainer::from_suffix("m3u"), None);

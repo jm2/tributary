@@ -754,7 +754,9 @@ mod tests {
                 .expect("routed client");
 
         for request in [
-            client.resolved_stream_request("song-id", MediaRepresentation::buffered_unknown()).unwrap(),
+            client
+                .resolved_stream_request("song-id", MediaRepresentation::buffered_unknown())
+                .unwrap(),
             client.resolved_artwork_request("cover-id").unwrap(),
         ] {
             assert_eq!(request.advertised_route(), Some(&route));

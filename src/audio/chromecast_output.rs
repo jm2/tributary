@@ -104,7 +104,7 @@ struct WorkerCommand {
 /// transport sends it verbatim instead of re-guessing from the URI at send
 /// time. Extensionless protected media therefore reaches the receiver labeled
 /// with its real container instead of a default guess.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct CastLoadMedia {
     content_type: &'static str,
     live: bool,
@@ -1216,11 +1216,7 @@ fn run_cast_worker<C>(
         match worker_rx.recv_timeout(wait) {
             Ok(command) => {
                 let poll_after_command = match command.kind {
-                    CommandKind::Load {
-                        uri,
-                        media,
-                        volume,
-                    } => {
+                    CommandKind::Load { uri, media, volume } => {
                         handle_load(
                             &mut connector,
                             &mut active,
@@ -2608,6 +2604,8 @@ mod tests {
 
     use rust_cast::message_manager::{CastMessage, CastMessagePayload, MessageManager};
 
+    use crate::architecture::media::MediaContainer;
+
     use super::*;
 
     const TEST_CAST_NAMESPACE: &str = "urn:x-cast:tributary.test";
@@ -2860,6 +2858,14 @@ mod tests {
         notification: Mutex<Option<(Point, mpsc::Sender<()>)>>,
         load_statuses: Mutex<VecDeque<CastStatusSnapshot>>,
         statuses: Mutex<VecDeque<CastStatusSnapshot>>,
+        loads: Mutex<Vec<OutboundLoad>>,
+    }
+
+    /// What the transport was actually asked to send in a LOAD request.
+    #[derive(Clone, PartialEq, Eq)]
+    struct OutboundLoad {
+        uri: String,
+        media: CastLoadMedia,
     }
 
     impl FakeShared {
@@ -2873,7 +2879,12 @@ mod tests {
                 notification: Mutex::new(None),
                 load_statuses: Mutex::new(VecDeque::new()),
                 statuses: Mutex::new(VecDeque::new()),
+                loads: Mutex::new(Vec::new()),
             })
+        }
+
+        fn loads(&self) -> Vec<OutboundLoad> {
+            self.loads.lock().expect("loads lock").clone()
         }
 
         fn install_gate(self: &Arc<Self>, point: Point) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
@@ -3031,9 +3042,17 @@ mod tests {
         fn load(
             &mut self,
             _app: &AppSession,
-            _uri: &str,
-            _media: CastLoadMedia,
+            uri: &str,
+            media: CastLoadMedia,
         ) -> CastResult<CastStatusSnapshot> {
+            self.shared
+                .loads
+                .lock()
+                .expect("loads lock")
+                .push(OutboundLoad {
+                    uri: uri.to_string(),
+                    media,
+                });
             self.shared
                 .record(Point::Load, Action::Point(Point::Load))?;
             Ok(self
@@ -4565,6 +4584,111 @@ mod tests {
         assert!((output.volume() - 1.0).abs() < f64::EPSILON);
         output.set_volume(-0.5);
         assert!(output.volume().abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn resolved_representation_drives_the_outbound_load_descriptor() {
+        let cases = [
+            (MediaContainer::Mp3, "audio/mpeg"),
+            (MediaContainer::Flac, "audio/flac"),
+            (MediaContainer::Ogg, "audio/ogg"),
+            (MediaContainer::Aac, "audio/mp4"),
+        ];
+        for (generation, (container, expected_type)) in cases.iter().enumerate() {
+            let shared = FakeShared::new();
+            let harness = Harness::new(Arc::clone(&shared));
+            let owner = harness.next_owner(generation as u64 + 1);
+            // Extensionless URL: only the descriptor can label this stream.
+            let uri = format!("https://music.test/stream/{generation}");
+            let load_recorded = shared.notify_on(Point::Load);
+            harness.send(
+                owner,
+                CommandKind::Load {
+                    media: CastLoadMedia::from_representation(MediaRepresentation::buffered(
+                        *container,
+                    )),
+                    uri: uri.clone(),
+                    volume: 0.5,
+                },
+            );
+            load_recorded
+                .recv_timeout(Duration::from_secs(2))
+                .expect("worker recorded the outbound load");
+
+            let loads = shared.loads();
+            assert_eq!(loads.len(), 1);
+            assert_eq!(loads[0].uri, uri);
+            assert_eq!(loads[0].media.content_type, *expected_type);
+            assert!(!loads[0].media.live);
+            harness.shutdown();
+        }
+    }
+
+    #[test]
+    fn load_descriptor_wins_over_uri_sniffing_when_they_disagree() {
+        // Transcode targets are built at the resolution site: the descriptor
+        // states what the server was asked to return, even when the URL looks
+        // like a different container.
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let load_recorded = shared.notify_on(Point::Load);
+        harness.send(
+            harness.next_owner(1),
+            CommandKind::Load {
+                media: CastLoadMedia::from_representation(MediaRepresentation::buffered(
+                    MediaContainer::Flac,
+                )),
+                uri: "https://music.test/transcode/track.mp3".to_string(),
+                volume: 0.5,
+            },
+        );
+        load_recorded
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker recorded the outbound load");
+
+        let loads = shared.loads();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].media.content_type, "audio/flac");
+        assert!(!loads[0].media.live);
+        harness.shutdown();
+    }
+
+    #[test]
+    fn unknown_container_loads_fall_back_to_the_receiver_default() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+
+        let load_recorded = shared.notify_on(Point::Load);
+        harness.send(
+            harness.next_owner(1),
+            CommandKind::Load {
+                media: CastLoadMedia::from_representation(MediaRepresentation::buffered_unknown()),
+                uri: "https://music.test/stream/unknown".to_string(),
+                volume: 0.5,
+            },
+        );
+        load_recorded
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker recorded the first outbound load");
+        harness.send(
+            harness.next_owner(2),
+            CommandKind::Load {
+                media: CastLoadMedia::from_representation(MediaRepresentation::live_unknown()),
+                uri: "http://radio.example/live".to_string(),
+                volume: 0.5,
+            },
+        );
+        load_recorded
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker recorded the second outbound load");
+
+        let loads = shared.loads();
+        assert_eq!(loads.len(), 2);
+        assert_eq!(loads[0].media.content_type, RECEIVER_FALLBACK_CONTENT_TYPE);
+        assert!(!loads[0].media.live);
+        assert_eq!(loads[1].media.content_type, RECEIVER_FALLBACK_CONTENT_TYPE);
+        assert!(loads[1].media.live);
+        harness.shutdown();
     }
 
     #[test]

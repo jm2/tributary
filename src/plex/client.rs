@@ -552,7 +552,10 @@ mod tests {
 
         for request in [
             client
-                .resolved_stream_request("/library/parts/1/file.flac", MediaRepresentation::buffered_unknown())
+                .resolved_stream_request(
+                    "/library/parts/1/file.flac",
+                    MediaRepresentation::buffered_unknown(),
+                )
                 .unwrap(),
             client
                 .resolved_artwork_request("/library/metadata/1/thumb/2")
@@ -590,7 +593,10 @@ mod tests {
             );
             assert_eq!(
                 client
-                    .resolved_stream_request("/library/parts/file%2Fname.flac", MediaRepresentation::buffered_unknown())
+                    .resolved_stream_request(
+                        "/library/parts/file%2Fname.flac",
+                        MediaRepresentation::buffered_unknown()
+                    )
                     .expect("stream request")
                     .endpoint()
                     .as_str(),
@@ -664,7 +670,10 @@ mod tests {
 
         for request in [
             client
-                .resolved_stream_request("/library/parts/1/file.flac", MediaRepresentation::buffered_unknown())
+                .resolved_stream_request(
+                    "/library/parts/1/file.flac",
+                    MediaRepresentation::buffered_unknown(),
+                )
                 .unwrap(),
             client
                 .resolved_artwork_request("/library/metadata/1/thumb/2")
@@ -676,7 +685,10 @@ mod tests {
 
         let ordinary = PlexClient::new(origin, "token").expect("ordinary client");
         assert!(ordinary
-            .resolved_stream_request("/library/parts/1/file.flac", MediaRepresentation::buffered_unknown())
+            .resolved_stream_request(
+                "/library/parts/1/file.flac",
+                MediaRepresentation::buffered_unknown()
+            )
             .unwrap()
             .advertised_route()
             .is_none());
