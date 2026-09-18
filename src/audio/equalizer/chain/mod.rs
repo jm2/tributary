@@ -14,7 +14,7 @@ mod limiter;
 
 use limiter::{
     await_limiter_edit_outcome, edit_limiter_topology, limiter_edit_probe_callback,
-    LimiterEditGate, LimiterEditOutcome, LimiterGraph, LimiterProbeEdit,
+    LimiterEditGate, LimiterEditOutcome, LimiterEditWait, LimiterGraph, LimiterProbeEdit,
 };
 
 /// How long the dynamic limiter edit waits, after installing its blocking
@@ -22,9 +22,52 @@ use limiter::{
 /// engage. This is the *engagement* window: a pad that never reports idle
 /// can never stall the UI thread, and an edit that has not started when
 /// the window closes is cancelled. Once the callback has engaged, the
-/// caller waits for its published outcome instead of cancelling, because
-/// the edit already owns the graph mutation and the `rglimiter` handle.
+/// caller parks the transaction ([`PendingLimiterEdit`]) instead of
+/// waiting: the completion is adopted on the main context, so a slow or
+/// stuck surgery can never block the (GTK) caller thread.
 const LIMITER_PROBE_ENGAGE_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// An engaged limiter edit parked by its caller instead of being awaited
+/// (refinery R1, PR 220 audit). The blocking-probe callback engaged — it
+/// owns the graph mutation and the `rglimiter` handle in its shared slot —
+/// but had not published its outcome within the bounded engagement window,
+/// so the caller stored the whole transaction here and returned without
+/// blocking its (UI) thread.
+///
+/// While a transaction is parked, the edit is *in flight on an unvalidated
+/// graph*: no second topology edit and no pause/relink fallback may run
+/// ([`EqChain::has_pending_limiter_edit`] gates both), and
+/// [`EqChain::clip_protection_installed`] reports the pre-edit truth the
+/// transaction recorded, because the callback holds the real handle in its
+/// slot. The receiver side of the outcome channel is adopted on the main
+/// context by [`EqChain::poll_pending_limiter_edit`], which never blocks.
+struct PendingLimiterEdit {
+    /// The callback publishes exactly one outcome here; polled
+    /// non-blockingly from the main context.
+    rx: std::sync::mpsc::Receiver<LimiterEditOutcome>,
+    /// The `rglimiter` handle slot shared with the callback: the surgery
+    /// moves the owned handle through it, and adoption takes it back.
+    slot: Arc<Mutex<Option<gst::Element>>>,
+    /// The blocking probe, still installed while the edit is in flight.
+    /// Removed at adoption only when the outcome validated a linked
+    /// topology; a wedged outcome keeps it installed over the unlinked
+    /// pad.
+    probe_id: Option<gst::PadProbeId>,
+    /// The pad the probe is installed on (retained so the id stays
+    /// removable at adoption).
+    eq_src: gst::Pad,
+    /// The protection the edit was asked to install.
+    requested: ClipProtection,
+    /// Whether the limiter was routed when the edit started. The callback
+    /// owns the handle in `slot` while in flight, so the caller-side
+    /// field cannot answer truthfully until adoption.
+    pre_edit_installed: bool,
+    /// Test-only retained sender so a regression can decide when (or
+    /// whether) the parked outcome publishes. Never present in
+    /// production.
+    #[cfg(test)]
+    test_tx: Option<std::sync::mpsc::SyncSender<LimiterEditOutcome>>,
+}
 
 // ── Bin construction ────────────────────────────────────────────────────
 
@@ -212,6 +255,15 @@ impl ProbeEditHold {
             .thread
     }
 
+    /// Whether the hold has been released (the surgery is free to
+    /// finish).
+    fn is_released(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .released
+    }
+
     /// Let the held callback run to completion.
     fn release(&self) {
         let mut state = self
@@ -244,6 +296,9 @@ pub struct EqChain {
     /// topology edit is attempted; the pipeline is retired by the
     /// eq-bin-originated bus error seam instead of resumed.
     wedged: bool,
+    /// An engaged limiter edit parked instead of awaited: the callback
+    /// owns the graph until its outcome is adopted on the main context.
+    pending_edit: Option<PendingLimiterEdit>,
     /// Test-only armed surgery fault; production builds never carry it.
     #[cfg(test)]
     remove_fault: Option<LimiterRemoveFault>,
@@ -283,6 +338,7 @@ impl EqChain {
                 .find(|element| element.name() == "clipper")
                 .cloned(),
             wedged: false,
+            pending_edit: None,
             #[cfg(test)]
             remove_fault: None,
             #[cfg(test)]
@@ -461,21 +517,42 @@ impl EqChain {
     /// A pipeline that never reports the pad idle within the bounded
     /// engagement window is left untouched and the caller falls back to the
     /// pause/relink seam. The window only ever cancels an edit that has
-    /// **demonstrably not started**: once the callback publishes its
-    /// engagement, the caller waits for its outcome instead, because the
-    /// edit already owns the graph mutation and the `rglimiter` handle and
-    /// cancelling it would strand both.
+    /// **demonstrably not started**. Once the callback engages, the edit
+    /// already owns the graph mutation and the `rglimiter` handle —
+    /// cancelling it would strand both, and waiting for it on this
+    /// (synchronous, UI-reachable) call path would stall the UI for the
+    /// callback's whole duration. The engaged edit is therefore parked as
+    /// a pending transaction and its outcome is adopted on the main
+    /// context (refinery R1); until adoption, no second edit and no
+    /// pause/relink fallback may run over the in-flight, unvalidated
+    /// graph.
     ///
     /// Returns `Some(true)` when the requested toggle is installed,
     /// `Some(false)` when the dynamic re-link failed and the pre-edit
     /// layout was restored or the graph was left wedged (the caller retries
     /// via the pause/relink seam, which refuses a wedged chain), and `None`
-    /// when the probe could not engage or no EQ src pad exists.
+    /// when the probe could not engage, no EQ src pad exists, **or the edit
+    /// engaged and outlived the engagement window** — the caller then
+    /// distinguishes the parked case with
+    /// [`EqChain::has_pending_limiter_edit`] and must run no fallback:
+    /// the outcome is adopted on the main context (refinery R1).
     pub fn swap_clip_protection_under_block_probe(&mut self, soft: ClipProtection) -> Option<bool> {
         if self.wedged {
             return Some(false);
         }
+        if self.pending_edit.is_some() {
+            // An engaged edit is still in flight: it owns the graph
+            // mutation and the limiter handle, so a second edit must not
+            // install another probe over the unvalidated graph
+            // (refinery R1: no conflicting edit over an in-flight edit).
+            return None;
+        }
         let eq_src = self.eq.static_pad("src")?;
+        // The truth the caller must record if the edit outlives the
+        // engagement window: while the transaction is parked the callback
+        // owns the handle, so `clip_protection_installed` answers from
+        // this recorded value.
+        let pre_edit_installed = self.clipper.is_some();
         let graph = self.limiter_graph();
         // The probe callback runs on the streaming thread, so it cannot
         // borrow the chain: the owned `rglimiter` handle is threaded
@@ -516,10 +593,32 @@ impl EqChain {
         // `add_probe` returns and reports no id; either way the outcome
         // arrives over the channel. A missing outcome within the bounded
         // window means the callback either never engaged (cancel it) or
-        // already started and is merely slow to publish (await it).
-        let (outcome, engagement_confirmed, probe_id) =
-            await_limiter_edit_outcome(&eq_src, probe_id, &gate, &rx);
-        self.adopt_limiter_edit_outcome(&eq_src, &slot, outcome, engagement_confirmed, probe_id)
+        // already started (park the transaction and adopt its outcome on
+        // the main context — never block this caller for it).
+        match await_limiter_edit_outcome(&eq_src, probe_id, &gate, &rx) {
+            LimiterEditWait::Completed(outcome, probe_id) => {
+                self.adopt_limiter_edit_outcome(&eq_src, &slot, Some(outcome), false, probe_id)
+            }
+            LimiterEditWait::NotEngagedCancelled => None,
+            LimiterEditWait::Engaged(probe_id) => {
+                // Park the whole transaction: the probe stays installed,
+                // the handle stays owned by the callback's slot, and the
+                // outcome receiver moves into the chain for main-context
+                // adoption. The caller observes `None` +
+                // `has_pending_limiter_edit()` and runs no fallback.
+                self.pending_edit = Some(PendingLimiterEdit {
+                    rx,
+                    slot,
+                    probe_id,
+                    eq_src: eq_src.clone(),
+                    requested: soft,
+                    pre_edit_installed,
+                    #[cfg(test)]
+                    test_tx: None,
+                });
+                None
+            }
+        }
     }
 
     /// Retire the blocking probe over a validated topology, adopt the
@@ -602,9 +701,129 @@ impl EqChain {
     }
 
     /// True when the `rglimiter` element is currently inside the bin.
+    ///
+    /// Pending-edit aware: while a parked transaction is in flight the
+    /// callback owns the handle in its shared slot, so the caller-side
+    /// field would wrongly report "off"; the transaction's recorded
+    /// pre-edit truth answers instead (refinery R1).
     #[allow(dead_code)] // inspection helper; exercised by the contract tests
     pub fn clip_protection_installed(&self) -> bool {
-        self.clipper.is_some()
+        match &self.pending_edit {
+            Some(pending) => pending.pre_edit_installed,
+            None => self.clipper.is_some(),
+        }
+    }
+
+    /// True while a limiter edit is in flight under a parked transaction:
+    /// the callback engaged on the streaming thread, and its outcome has
+    /// not been adopted yet. While this is `true` the graph is
+    /// unvalidated mid-surgery, so no second topology edit and no
+    /// pause/relink fallback may run (refinery R1).
+    #[allow(dead_code)] // inspection helper; exercised by the contract tests
+    pub fn has_pending_limiter_edit(&self) -> bool {
+        self.pending_edit.is_some()
+    }
+
+    /// The protection the in-flight edit was asked to install, or `None`
+    /// when no transaction is parked.
+    pub fn pending_limiter_edit_request(&self) -> Option<ClipProtection> {
+        self.pending_edit.as_ref().map(|pending| pending.requested)
+    }
+
+    /// Adopt a parked edit's completion without blocking: `None` while the
+    /// callback has not published yet, `Some(installed)` once an outcome
+    /// arrived and the transaction settled. This is the *main-context*
+    /// completion path (refinery R1) — the synchronous caller never waits
+    /// for it.
+    ///
+    /// Adoption mirrors the synchronous path's semantics: the handle the
+    /// callback left in the slot is taken back, the probe is retired when
+    /// the outcome validated a linked topology and kept when the edit
+    /// wedged, and the wedge flag records an unvalidated final topology.
+    /// A channel disconnected *without* an outcome — the callback can
+    /// never publish — is treated exactly like the synchronous path's
+    /// engagement-confirmed missing outcome: conservatively wedged.
+    pub fn poll_pending_limiter_edit(&mut self) -> Option<bool> {
+        let outcome = {
+            let pending = self.pending_edit.as_mut()?;
+            match pending.rx.try_recv() {
+                Ok(outcome) => outcome,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                // The callback can never publish (its signal sender is
+                // gone without a send): conservatively wedged.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => LimiterEditOutcome::Unlinked,
+            }
+        };
+        let pending = self.pending_edit.take()?;
+        let wedged = outcome == LimiterEditOutcome::Unlinked;
+        if !wedged {
+            // Harmless when the callback already uninstalled itself over a
+            // validated topology. A wedged callback returned `Ok`, so the
+            // probe must stay installed and is deliberately not removed.
+            if let Some(probe_id) = pending.probe_id {
+                pending.eq_src.remove_probe(probe_id);
+            }
+        }
+        // Adopt the handle the callback left in the slot.
+        self.clipper = pending
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if wedged {
+            self.wedged = true;
+        }
+        Some(outcome == LimiterEditOutcome::Installed)
+    }
+
+    /// Park a test-controlled transaction as if an edit had engaged and
+    /// outlived the engagement window. Production builds never carry it.
+    /// The transaction keeps the sender, so
+    /// [`EqChain::complete_pending_limiter_edit`] decides when the
+    /// outcome publishes.
+    #[cfg(test)]
+    pub(crate) fn inject_pending_limiter_edit(&mut self, requested: ClipProtection) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let pre_edit_installed = self.clipper.is_some();
+        self.pending_edit = Some(PendingLimiterEdit {
+            rx,
+            slot: Arc::new(Mutex::new(self.clipper.take())),
+            probe_id: None,
+            eq_src: self.eq.static_pad("src").expect("eq src pad"),
+            requested,
+            pre_edit_installed,
+            test_tx: Some(tx),
+        });
+    }
+
+    /// Complete a test-parked transaction as if the callback had
+    /// published: `true` publishes `Installed`, `false` publishes
+    /// `Restored` (a valid rollback). Returns whether the publication
+    /// succeeded.
+    #[cfg(test)]
+    pub(crate) fn complete_pending_limiter_edit(&mut self, installed: bool) -> bool {
+        let outcome = if installed {
+            LimiterEditOutcome::Installed
+        } else {
+            LimiterEditOutcome::Restored
+        };
+        let tx = self
+            .pending_edit
+            .as_mut()
+            .and_then(|pending| pending.test_tx.take());
+        if installed {
+            // Keep the shortcut faithful to the real callback: after a
+            // validated removal the callback has dropped the original
+            // limiter handle, so adoption must find the slot empty and
+            // record no limiter. (`Restored` publications leave the
+            // original handle in the slot, as the real rollback does.)
+            if let Some(pending) = self.pending_edit.as_ref() {
+                if let Ok(mut slot) = pending.slot.lock() {
+                    slot.take();
+                }
+            }
+        }
+        tx.map(|tx| tx.send(outcome).is_ok()).unwrap_or(false)
     }
 
     /// True when a limiter edit and its rollback could not validate a linked

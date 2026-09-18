@@ -75,6 +75,12 @@ const PROTECTED_LOOPBACK_TIMEOUT_SECONDS: u32 = 30;
 /// machine for this one validated Tributary ticket.
 const DIRECT_PROXY_SENTINEL: &str = "direct://";
 
+/// How often the main-context poll re-checks a parked limiter edit for
+/// its published outcome (refinery R1). Each tick is one non-blocking
+/// receive; the interval trades adoption latency for idle wakeups and
+/// must stay far below any human-noticeable UI lag.
+const PENDING_CLIP_SWAP_POLL_MS: u64 = 10;
+
 // ── Events ──────────────────────────────────────────────────────────────
 
 /// Monotonic identity of the playback load that owns a [`PlayerEvent`].
@@ -191,6 +197,11 @@ struct EqEngineState {
     save_generation: u64,
     persistence_suppressed: bool,
     retired: bool,
+    /// Whether the main-context poll adopting a parked limiter edit's
+    /// completion is armed (refinery R1). Arming is idempotent: the
+    /// repeating timer clears the flag when the transaction settles or
+    /// dies with the chain.
+    clip_swap_poll_armed: bool,
 }
 
 /// Whether an equalizer state change may reach disk right now. The only
@@ -296,6 +307,13 @@ pub struct Player {
     /// probe path can be exercised on a bare test pipeline.
     #[cfg(test)]
     playing_override: RefCell<Option<bool>>,
+    /// Test-only sink for the shutdown flush: when set, the flush
+    /// records the settings it would persist here instead of touching
+    /// the real user config path, so the close-drain behavior is
+    /// observable without a test ever writing the user's equalizer.cfg
+    /// (test discipline: tests never persist).
+    #[cfg(test)]
+    eq_flush_sink: RefCell<Option<Rc<RefCell<Vec<EqSettings>>>>>,
 }
 
 impl Player {
@@ -359,6 +377,7 @@ impl Player {
             save_generation: 0,
             persistence_suppressed: eq_load_status == equalizer::EqLoadStatus::TransientReadFailure,
             retired: false,
+            clip_swap_poll_armed: false,
         }));
 
         #[cfg(target_os = "windows")]
@@ -395,6 +414,8 @@ impl Player {
             dynamic_seam_override: RefCell::new(None),
             #[cfg(test)]
             playing_override: RefCell::new(None),
+            #[cfg(test)]
+            eq_flush_sink: RefCell::new(None),
         };
 
         Ok((player, event_rx))
@@ -703,6 +724,21 @@ impl Player {
                 // the removal, stranding an audio-processing bin until
                 // restart — so the next apply retries the removal.
                 effective.enabled = current.enabled;
+                // The retained chain also still carries its limiter, so
+                // a compound disable that also requested a clip change
+                // must reconcile this field too. Recording the requested
+                // value would persist a topology the graph never adopted
+                // (or falsely promise protection that is absent), and
+                // the retry — an `enabled_changed` apply, with
+                // `clip_changed` forced false by the disabled request —
+                // would land the requested state without ever touching
+                // the limiter. Recording what the retained chain
+                // actually carries keeps the persisted and user-visible
+                // state truthful in both clip directions and lets the
+                // retry complete the compound operation cleanly.
+                if let Some(installed) = self.installed_clip_protection() {
+                    effective.clip_protection = installed;
+                }
             }
         } else if clip_changed && !self.toggle_clip_protection(next.clip_protection) {
             // The toggle was deferred (the edit never ran, so the chain
@@ -770,6 +806,30 @@ impl Player {
                 }
                 // The dynamic re-link failed and the surgery restored the
                 // pre-edit layout: retry through the pause/relink seam.
+            } else if self
+                .eq_state
+                .borrow()
+                .chain
+                .as_ref()
+                .is_some_and(|chain| chain.has_pending_limiter_edit())
+            {
+                // The edit engaged under its blocking probe and outlived
+                // the engagement window (refinery R1): the caller-side
+                // wait returned within the bounded window instead of
+                // blocking, the transaction is parked, and the outcome is
+                // adopted on the main context. No fallback may run — the
+                // pause/relink seam would pause and edit a graph whose
+                // topology is mid-surgery and unvalidated. The recorded
+                // state reflects the pre-edit truth (the parked
+                // transaction reports it), and the completion reconciles
+                // the settled truth and persists it.
+                info!(
+                    clip_protection = ?protection,
+                    "Clip protection edit engaged under its blocking probe; \
+                     the completion is adopted asynchronously on the main context"
+                );
+                self.arm_pending_clip_swap_completion();
+                return false;
             }
         }
         self.with_pipeline_suspended(|| {
@@ -785,6 +845,97 @@ impl Player {
             );
             installed
         })
+    }
+
+    /// Arm the main-context poll that adopts a parked limiter edit's
+    /// completion (refinery R1). The poll never blocks: every tick does
+    /// one non-blocking receive and otherwise yields, so the UI keeps
+    /// running for the callback's whole — possibly unbounded — surgery.
+    /// On adoption the recorded clip protection is reconciled to the
+    /// settled truth and persisted through the ordinary trailing-edge
+    /// debounce, exactly like a user-driven apply.
+    fn arm_pending_clip_swap_completion(&self) {
+        {
+            let mut state = self.eq_state.borrow_mut();
+            if state.clip_swap_poll_armed {
+                return;
+            }
+            state.clip_swap_poll_armed = true;
+        }
+        let state_rc = Rc::clone(&self.eq_state);
+        glib::timeout_add_local(
+            Duration::from_millis(PENDING_CLIP_SWAP_POLL_MS),
+            move || {
+                // Non-blocking poll: `None` keeps the transaction parked
+                // and the UI running; a settled transaction falls through
+                // to reconciliation.
+                let (installed, requested) = {
+                    let mut state = state_rc.borrow_mut();
+                    let Some(chain) = state.chain.as_mut() else {
+                        // The chain is gone (the bin was retired while the
+                        // edit was in flight): the transaction died with
+                        // it, and so does the poll.
+                        state.clip_swap_poll_armed = false;
+                        return glib::ControlFlow::Break;
+                    };
+                    let requested = chain.pending_limiter_edit_request();
+                    match chain.poll_pending_limiter_edit() {
+                        None => return glib::ControlFlow::Continue,
+                        Some(installed) => (installed, requested),
+                    }
+                };
+                let mut state = state_rc.borrow_mut();
+                state.clip_swap_poll_armed = false;
+                // Reconcile the topology-dependent recorded field against
+                // the settled graph (the same recorded-vs-installed
+                // discipline the synchronous path applies): a successful
+                // edit records the requested protection; a rollback or
+                // wedge records what the adopted chain actually carries.
+                let chain_truth = state.chain.as_ref().map(|chain| {
+                    if chain.clip_protection_installed() {
+                        equalizer::ClipProtection::Soft
+                    } else {
+                        equalizer::ClipProtection::Off
+                    }
+                });
+                let Some(chain_truth) = chain_truth else {
+                    // The chain vanished between adoption and
+                    // reconciliation (an error retirement ran first on
+                    // this main context): the retire path owns the
+                    // recorded state now — nothing to reconcile.
+                    return glib::ControlFlow::Break;
+                };
+                state.settings.clip_protection = if installed {
+                    // The requested toggle is installed; the request was
+                    // peeked from the parked transaction before adoption,
+                    // so it is present here.
+                    requested.unwrap_or(chain_truth)
+                } else {
+                    // Rollback or wedge: what the chain carries is truth.
+                    chain_truth
+                };
+                // Persist the reconciled truth through the trailing-edge
+                // debounce (the same schedule the apply path uses).
+                let next_generation = state.save_generation.wrapping_add(1);
+                state.save_generation = next_generation;
+                drop(state);
+                let state_rc = Rc::clone(&state_rc);
+                glib::timeout_add_local_once(
+                    Duration::from_millis(equalizer::SAVE_DEBOUNCE_MS),
+                    move || {
+                        let state = state_rc.borrow_mut();
+                        if state.save_generation != next_generation {
+                            return;
+                        }
+                        if !equalizer_persistence_allowed(&state) {
+                            return;
+                        }
+                        let _ = equalizer::save_equalizer_settings_to_disk(&state.settings);
+                    },
+                );
+                glib::ControlFlow::Break
+            },
+        );
     }
 
     /// Attempt the clip-protection toggle through the dynamic blocking
@@ -882,6 +1033,25 @@ impl Player {
             // Nothing recorded as installed: the pipeline is already in
             // the passthrough layout, so there is nothing to confirm.
             return true;
+        }
+        if self
+            .eq_state
+            .borrow()
+            .chain
+            .as_ref()
+            .is_some_and(|chain| chain.has_pending_limiter_edit())
+        {
+            // A limiter edit is still in flight under its blocking probe
+            // (refinery R1): pausing the pipeline and detaching the bin
+            // now would be a conflicting edit over an in-flight,
+            // unvalidated graph. Defer under the same discipline as any
+            // other deferred uninstall — the recorded state keeps
+            // `enabled`, and the next apply retries the removal.
+            warn!(
+                "Clip protection edit still in flight under its blocking probe; \
+                 equalizer uninstall deferred"
+            );
+            return false;
         }
         let preset = Preset::key(self.eq_state.borrow().settings.preset);
         self.with_pipeline_suspended(|| {
@@ -1012,9 +1182,21 @@ impl Player {
     /// pipeline is retired, so quitting with a pending debounce never
     /// loses the last change. Suppressed while the on-disk file is
     /// unreadable, for the same reason the debounced writer is.
-    fn flush_equalizer_for_shutdown(&self) {
+    ///
+    /// Called from two places: the `Player::drop` fallback and — the
+    /// authoritative path — the UI's normal close-request drain, via
+    /// [`crate::audio::output::AudioOutput::flush_equalizer_for_shutdown`],
+    /// while the output is still alive. The drain call matters because
+    /// the process exits through `std::process::exit` after the GTK main
+    /// loop unwinds, so `Drop` is not guaranteed to run at all.
+    pub fn flush_equalizer_for_shutdown(&self) {
         let state = self.eq_state.borrow_mut();
         if !equalizer_persistence_allowed(&state) {
+            return;
+        }
+        #[cfg(test)]
+        if let Some(sink) = self.eq_flush_sink.borrow_mut().as_ref() {
+            sink.borrow_mut().push(state.settings);
             return;
         }
         let _ = equalizer::save_equalizer_settings_to_disk(&state.settings);
@@ -2068,6 +2250,7 @@ mod tests {
             seam_override: RefCell::new(None),
             dynamic_seam_override: RefCell::new(None),
             playing_override: RefCell::new(None),
+            eq_flush_sink: RefCell::new(None),
         }
     }
 
@@ -2086,6 +2269,7 @@ mod tests {
             // on-disk persistence is the config module's tested concern.
             persistence_suppressed: true,
             retired: false,
+            clip_swap_poll_armed: false,
         }
     }
 
@@ -2129,6 +2313,13 @@ mod tests {
         playbin.property::<Option<gst::Element>>("audio-filter")
     }
 
+    /// Serializes every caller-discipline test that arms glib timers on
+    /// the global default main context (`apply_serialized`) or drives
+    /// its dispatch loop (the pending-completion adoption test): the
+    /// context can be owned by only one thread at a time, and parallel
+    /// acquire/attach otherwise races.
+    static CONTEXT_DRIVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Apply serialized across the test threads: the trailing-edge
     /// save attaches a glib timeout source to the *global* default main
     /// context (production does this once on the main GTK thread),
@@ -2136,8 +2327,7 @@ mod tests {
     /// caller-discipline tests touch the context, so one test-local
     /// mutex around `apply` is enough to keep them deterministic.
     fn apply_serialized(player: &Player, next: EqSettings) {
-        static APPLY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = APPLY_LOCK
+        let _guard = CONTEXT_DRIVE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         player.apply_equalizer_settings(next);
@@ -2198,6 +2388,342 @@ mod tests {
         assert!(
             installed_audio_filter(&playbin).is_none(),
             "the retried removal must detach the bin"
+        );
+    }
+
+    /// Regression (refinery R2, PR 220 audit): a compound reload that
+    /// disables the equalizer AND requests a clip change while the pause
+    /// seam defers must reconcile every topology-dependent field against
+    /// the retained chain, not only `enabled`. With an installed Soft
+    /// limiter, recording the requested Off persisted a topology the
+    /// retained graph never adopted; the retry is an `enabled_changed`
+    /// apply (`clip_changed` is forced false by the disabled request),
+    /// so nothing but the recorded truth can drive the limiter back onto
+    /// the removal path.
+    #[test]
+    fn compound_deferred_disable_records_the_retained_soft_limiter_and_retries() {
+        if !eq_engine_plugins_available() {
+            return;
+        }
+        let playbin = eq_test_playbin();
+        let settings = eq_enabled_settings(equalizer::ClipProtection::Soft);
+        let chain = equalizer::EqChain::build(&settings).expect("chain builds");
+        playbin.set_property("audio-filter", Some(&chain.bin));
+        let player = eq_test_player(playbin.clone(), eq_state_with(Some(chain), settings));
+
+        let next = EqSettings {
+            enabled: false,
+            clip_protection: equalizer::ClipProtection::Off,
+            ..settings
+        };
+        *player.seam_override.borrow_mut() = Some(Box::new(|_edit| false));
+        apply_serialized(&player, next);
+
+        {
+            let state = player.eq_state.borrow();
+            assert!(
+                state.settings.enabled,
+                "a deferred uninstall must keep `enabled` recorded"
+            );
+            assert_eq!(
+                state.settings.clip_protection,
+                equalizer::ClipProtection::Soft,
+                "the compound defer must record the retained Soft limiter, not the requested Off"
+            );
+            let chain = state.chain.as_ref().expect("chain retained on defer");
+            assert!(chain.clip_protection_installed());
+        }
+        assert!(installed_audio_filter(&playbin).is_some());
+
+        // The retry (real seam) completes the compound operation: the bin
+        // is removed and the requested Disabled/Off state is recorded.
+        apply_serialized(&player, next);
+        {
+            let state = player.eq_state.borrow();
+            assert!(!state.settings.enabled);
+            assert_eq!(
+                state.settings.clip_protection,
+                equalizer::ClipProtection::Off
+            );
+            assert!(state.chain.is_none());
+        }
+        assert!(installed_audio_filter(&playbin).is_none());
+    }
+
+    /// Regression (refinery R2, inverse clip direction): with a retained
+    /// chain carrying no limiter, a compound deferred disable must record
+    /// Off rather than the requested Soft — the requested value would
+    /// falsely promise clip protection the installed graph does not
+    /// provide.
+    #[test]
+    fn compound_deferred_disable_records_the_retained_off_layout_and_retries() {
+        if !eq_engine_plugins_available() {
+            return;
+        }
+        let playbin = eq_test_playbin();
+        let settings = eq_enabled_settings(equalizer::ClipProtection::Off);
+        let chain = equalizer::EqChain::build(&settings).expect("chain builds");
+        playbin.set_property("audio-filter", Some(&chain.bin));
+        let player = eq_test_player(playbin.clone(), eq_state_with(Some(chain), settings));
+
+        let next = EqSettings {
+            enabled: false,
+            clip_protection: equalizer::ClipProtection::Soft,
+            ..settings
+        };
+        *player.seam_override.borrow_mut() = Some(Box::new(|_edit| false));
+        apply_serialized(&player, next);
+
+        {
+            let state = player.eq_state.borrow();
+            assert!(state.settings.enabled);
+            assert_eq!(
+                state.settings.clip_protection,
+                equalizer::ClipProtection::Off,
+                "the compound defer must record the retained no-limiter layout, not the requested Soft"
+            );
+            let chain = state.chain.as_ref().expect("chain retained on defer");
+            assert!(!chain.clip_protection_installed());
+        }
+        assert!(installed_audio_filter(&playbin).is_some());
+
+        apply_serialized(&player, next);
+        {
+            let state = player.eq_state.borrow();
+            assert!(!state.settings.enabled);
+            assert_eq!(
+                state.settings.clip_protection,
+                equalizer::ClipProtection::Soft
+            );
+            assert!(state.chain.is_none());
+        }
+        assert!(installed_audio_filter(&playbin).is_none());
+    }
+
+    /// Regression (refinery R1, PR 220 audit): a clip edit that engaged
+    /// under its blocking probe and outlived the engagement window is
+    /// parked — the caller (the GTK thread) never waits for the surgery.
+    /// While the transaction is in flight the recorded clip protection
+    /// stays at the **pre-edit** truth (the parked transaction owns the
+    /// handle in its slot), and once the callback publishes, the
+    /// main-context poll adopts the outcome, reconciles the recorded
+    /// state to the settled graph, and persists it through the ordinary
+    /// debounce. No pause/relink fallback may run over the in-flight
+    /// graph.
+    #[test]
+    fn pending_clip_swap_records_pre_edit_truth_then_reconciles_on_completion() {
+        use std::time::{Duration, Instant};
+
+        if !eq_engine_plugins_available() {
+            return;
+        }
+        let playbin = eq_test_playbin();
+        let settings = eq_enabled_settings(equalizer::ClipProtection::Soft);
+        let chain = equalizer::EqChain::build(&settings).expect("chain builds");
+        playbin.set_property("audio-filter", Some(&chain.bin));
+        let player = eq_test_player(playbin.clone(), eq_state_with(Some(chain), settings));
+        *player.playing_override.borrow_mut() = Some(true);
+
+        // Park a removal transaction as if its surgery had engaged and
+        // outlived the caller's engagement window.
+        player
+            .eq_state
+            .borrow_mut()
+            .chain
+            .as_mut()
+            .expect("chain installed")
+            .inject_pending_limiter_edit(equalizer::ClipProtection::Off);
+
+        // The user requests the same toggle. The pending guard must
+        // refuse the dynamic edit, skip the pause/relink fallback
+        // entirely, and record the pre-edit truth while in flight.
+        apply_serialized(&player, eq_enabled_settings(equalizer::ClipProtection::Off));
+        {
+            let state = player.eq_state.borrow();
+            assert!(state.settings.enabled);
+            assert_eq!(
+                state.settings.clip_protection,
+                equalizer::ClipProtection::Soft,
+                "the recorded protection must stay at the pre-edit truth while the edit is parked"
+            );
+            let chain = state.chain.as_ref().expect("chain retained");
+            assert!(chain.has_pending_limiter_edit());
+            assert!(
+                chain.clip_protection_installed(),
+                "the parked transaction reports the pre-edit truth: the limiter is still routed"
+            );
+            assert!(!chain.topology_wedged());
+        }
+
+        // The callback finishes its surgery and publishes the outcome;
+        // the main-context poll adopts it and reconciles the recorded
+        // state. Drive the context exactly as the UI's loop would —
+        // under the same lock the apply path uses, because the poll
+        // timer is attached to the global default main context.
+        assert!(
+            player
+                .eq_state
+                .borrow_mut()
+                .chain
+                .as_mut()
+                .expect("chain retained")
+                .complete_pending_limiter_edit(true),
+            "the parked transaction accepted its publication"
+        );
+        let context = glib::MainContext::default();
+        let adopted = {
+            let _guard = CONTEXT_DRIVE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            context
+                .with_thread_default(|| {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while Instant::now() < deadline {
+                        context.iteration(false);
+                        if player.eq_state.borrow().settings.clip_protection
+                            == equalizer::ClipProtection::Off
+                        {
+                            return true;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    false
+                })
+                .unwrap_or(false)
+        };
+        assert!(adopted, "the parked completion was never adopted");
+        {
+            let state = player.eq_state.borrow();
+            assert_eq!(
+                state.settings.clip_protection,
+                equalizer::ClipProtection::Off,
+                "the settled truth is reconciled on the main context"
+            );
+            let chain = state.chain.as_ref().expect("chain retained");
+            assert!(!chain.has_pending_limiter_edit());
+            assert!(
+                !chain.clip_protection_installed(),
+                "the adopted removal left the graph without the limiter"
+            );
+            assert!(!chain.topology_wedged());
+        }
+    }
+
+    /// Regression (refinery R1, PR 220 audit): while a limiter edit is
+    /// parked under its blocking probe, disabling the equalizer must
+    /// DEFER the uninstall — pausing the pipeline and detaching the bin
+    /// now would be a conflicting edit over an in-flight, unvalidated
+    /// graph. The bin stays recorded as installed at the pre-edit truth,
+    /// and a later apply retries the removal.
+    #[test]
+    fn pending_clip_swap_defers_the_equalizer_uninstall() {
+        if !eq_engine_plugins_available() {
+            return;
+        }
+        let playbin = eq_test_playbin();
+        let settings = eq_enabled_settings(equalizer::ClipProtection::Soft);
+        let chain = equalizer::EqChain::build(&settings).expect("chain builds");
+        playbin.set_property("audio-filter", Some(&chain.bin));
+        let player = eq_test_player(playbin.clone(), eq_state_with(Some(chain), settings));
+        *player.playing_override.borrow_mut() = Some(true);
+
+        player
+            .eq_state
+            .borrow_mut()
+            .chain
+            .as_mut()
+            .expect("chain installed")
+            .inject_pending_limiter_edit(equalizer::ClipProtection::Off);
+
+        let next = EqSettings {
+            enabled: false,
+            clip_protection: equalizer::ClipProtection::Off,
+            ..settings
+        };
+        apply_serialized(&player, next);
+
+        let state = player.eq_state.borrow();
+        assert!(
+            state.settings.enabled,
+            "the uninstall is deferred: the bin stays recorded as installed"
+        );
+        assert_eq!(
+            state.settings.clip_protection,
+            equalizer::ClipProtection::Soft,
+            "the deferred uninstall records the pre-edit truth, not the requested Off"
+        );
+        let chain = state.chain.as_ref().expect("chain retained on defer");
+        assert!(chain.has_pending_limiter_edit());
+        assert!(chain.clip_protection_installed());
+        assert!(installed_audio_filter(&playbin).is_some());
+    }
+
+    /// Regression (refinery R3, PR 220 audit): the normal close-request
+    /// drain flushes the pending equalizer persistence through the
+    /// [`AudioOutput`](crate::audio::output::AudioOutput) trait while the
+    /// output is still alive — never relying on `Drop`, which
+    /// `std::process::exit` after the GTK main loop unwinds does not run.
+    /// The flush sink records what would hit the real user config path,
+    /// so no test ever writes the user's `equalizer.cfg`.
+    #[test]
+    fn local_output_shutdown_flush_persists_pending_state_while_alive() {
+        use crate::audio::output::AudioOutput;
+
+        if !eq_engine_plugins_available() {
+            return;
+        }
+        let settings = eq_enabled_settings(equalizer::ClipProtection::Off);
+        // `eq_state_with` suppresses persistence for caller-discipline
+        // tests; the flush must pass the latch to reach the sink.
+        let mut state = eq_state_with(None, settings);
+        state.persistence_suppressed = false;
+        let player = eq_test_player(eq_test_playbin(), state);
+        let sink = Rc::new(RefCell::new(Vec::new()));
+        *player.eq_flush_sink.borrow_mut() = Some(Rc::clone(&sink));
+
+        // A user edit whose debounced write is still armed: the flush must
+        // persist exactly the current in-memory state.
+        player.eq_state.borrow_mut().settings.preamp_db = -6.0;
+
+        let output = local_output::LocalOutput::new(player);
+        AudioOutput::flush_equalizer_for_shutdown(&output);
+
+        let flushed = sink.borrow();
+        assert_eq!(
+            flushed.len(),
+            1,
+            "the drain flush must persist the pending state exactly once"
+        );
+        assert!(
+            (flushed[0].preamp_db - -6.0).abs() < f64::EPSILON,
+            "the flush must persist the current in-memory preamp, got {}",
+            flushed[0].preamp_db
+        );
+    }
+
+    /// The shutdown flush honors the transient-read-failure latch, exactly
+    /// like the debounced writer: a suppressed output must never overwrite
+    /// the on-disk bytes (contract: *Persistence*, transient read failure).
+    #[test]
+    fn local_output_shutdown_flush_is_suppressed_after_a_transient_read_failure() {
+        use crate::audio::output::AudioOutput;
+
+        if !eq_engine_plugins_available() {
+            return;
+        }
+        let settings = eq_enabled_settings(equalizer::ClipProtection::Off);
+        let mut state = eq_state_with(None, settings);
+        state.persistence_suppressed = true;
+        let player = eq_test_player(eq_test_playbin(), state);
+        let sink = Rc::new(RefCell::new(Vec::new()));
+        *player.eq_flush_sink.borrow_mut() = Some(Rc::clone(&sink));
+
+        let output = local_output::LocalOutput::new(player);
+        AudioOutput::flush_equalizer_for_shutdown(&output);
+
+        assert!(
+            sink.borrow().is_empty(),
+            "a persistence-suppressed output must not flush"
         );
     }
 

@@ -1688,6 +1688,12 @@ pub(crate) fn build_window(
     // deterministically once the output/UI are installed later in this build.
     let active_output_slot: Rc<RefCell<Option<SharedAudioOutput>>> = Rc::new(RefCell::new(None));
     let playback_ui_reset_slot: Rc<RefCell<Option<PlaybackUiReset>>> = Rc::new(RefCell::new(None));
+    // Parking slot for the local output when an MPD output is active.
+    // When switching to MPD we move the LocalOutput out of active_output
+    // into this slot; when switching back we move it back. Declared beside
+    // the other indirection slots because the close-request shutdown drain
+    // (wired below) must flush it (refinery R3, PR 220 audit).
+    let parked_local: Rc<RefCell<Option<Box<dyn AudioOutput>>>> = Rc::new(RefCell::new(None));
     let invalidate_source_playback: SourcePlaybackInvalidator = {
         let playback_session = playback_session.clone();
         let active_output_slot = active_output_slot.clone();
@@ -1941,6 +1947,7 @@ pub(crate) fn build_window(
     let shutdown_sources = source_registry.clone();
     let shutdown_playback = playback_session.clone();
     let shutdown_output_slot = active_output_slot.clone();
+    let shutdown_parked_local = parked_local.clone();
     let shutdown_library_commands = library_commands.clone();
     let shutdown_library_events = engine_rx.clone();
     let shutdown_playlist_actions = playlist_action_rx.clone();
@@ -1961,6 +1968,15 @@ pub(crate) fn build_window(
 
         if !shutdown_started_for_close.replace(true) {
             super::rhythmbox_migration::cancel_pending();
+            // Equalizer persistence: the debounced save can still be armed
+            // here, and the process exits through `std::process::exit`
+            // after the main loop unwinds — `Drop` would never run. Flush
+            // every live local output now (active + parked), while they
+            // are still alive and before any output teardown below.
+            flush_equalizer_outputs_for_shutdown(
+                shutdown_output_slot.borrow().as_ref(),
+                &shutdown_parked_local,
+            );
             // Close product activation and database ingress synchronously.
             // The unique join side is awaited below without blocking GTK;
             // an Active generation retires its bridge before its runtime.
@@ -2525,11 +2541,6 @@ pub(crate) fn build_window(
     let active_output: SharedAudioOutput = Rc::new(RefCell::new(Box::new(local_output)));
     *active_output_slot.borrow_mut() = Some(active_output.clone());
     let active_output_target = Rc::new(RefCell::new(super::output_switch::OutputTarget::Local));
-
-    // Parking slot for the local output when an MPD output is active.
-    // When switching to MPD we move the LocalOutput out of active_output
-    // into this slot; when switching back we move it back.
-    let parked_local: Rc<RefCell<Option<Box<dyn AudioOutput>>>> = Rc::new(RefCell::new(None));
 
     // Sync the volume slider to the output's persisted volume.
     hb.volume_adj.set_value(active_output.borrow().volume());
@@ -4580,9 +4591,27 @@ fn accept_remote_publication(
     None
 }
 
+/// Shutdown-drain step: synchronously flush the equalizer persistence of
+/// every live local output — the active one, plus any local output
+/// parked while a remote renderer is active — while the outputs are
+/// still alive. The process exits via `std::process::exit` after the
+/// GTK main loop unwinds, so `Drop` cannot be relied on to run a
+/// still-armed debounced save (contract: *Persistence*). Outputs
+/// without an equalizer engine no-op through the trait default.
+fn flush_equalizer_outputs_for_shutdown(
+    active_output: Option<&SharedAudioOutput>,
+    parked_local: &Rc<RefCell<Option<Box<dyn AudioOutput>>>>,
+) {
+    if let Some(output) = active_output {
+        output.borrow().flush_equalizer_for_shutdown();
+    }
+    if let Some(parked) = parked_local.borrow().as_ref() {
+        parked.flush_equalizer_for_shutdown();
+    }
+}
+
 /// Retire the transient spinner for the exact environment-configured owner
 /// whose newest connection attempt failed.
-///
 /// The background task emits this transition only after its registry attempt
 /// proves it is still latest. Keeping the lookup source-scoped prevents one
 /// failed endpoint from disturbing another row or its retained session.
@@ -6215,5 +6244,175 @@ mod identity_tests {
             RemotePublicationSelection::Inactive,
             "the reactivation superseded the deferred request exactly once"
         );
+    }
+}
+
+/// Close-drain equalizer flush: the drain step must flush the **active**
+/// output and every **parked** local output while they are still alive,
+/// because the process exits through `std::process::exit` after the GTK
+/// main loop unwinds and `Drop` never runs (refinery R3, PR 220 audit).
+#[cfg(test)]
+mod shutdown_flush_tests {
+    use super::*;
+    use crate::architecture::media::ResolvedHttpRequest;
+    use crate::audio::equalizer::EqSettings;
+    use crate::audio::output::OutputType;
+    use crate::local::resolver::ResolvedLocalMedia;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Records every flush in call order, reproducing at the drain level
+    /// the persistence-suppression latch the `Player` applies for a
+    /// transient unreadable state file.
+    struct RecordingOutput {
+        log: Rc<RefCell<Vec<&'static str>>>,
+        tag: &'static str,
+        suppress_flush: bool,
+    }
+
+    impl RecordingOutput {
+        fn output(
+            log: &Rc<RefCell<Vec<&'static str>>>,
+            tag: &'static str,
+            suppress_flush: bool,
+        ) -> SharedAudioOutput {
+            Rc::new(RefCell::new(Box::new(Self {
+                log: Rc::clone(log),
+                tag,
+                suppress_flush,
+            })))
+        }
+
+        /// A boxed output for the parked slot, which owns
+        /// `Option<Box<dyn AudioOutput>>` directly.
+        fn boxed(
+            log: &Rc<RefCell<Vec<&'static str>>>,
+            tag: &'static str,
+            suppress_flush: bool,
+        ) -> Box<dyn AudioOutput> {
+            Box::new(Self {
+                log: Rc::clone(log),
+                tag,
+                suppress_flush,
+            })
+        }
+    }
+
+    impl AudioOutput for RecordingOutput {
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        fn output_type(&self) -> OutputType {
+            OutputType::Local
+        }
+
+        fn supports_volume(&self) -> bool {
+            true
+        }
+
+        fn supports_equalizer(&self) -> bool {
+            true
+        }
+
+        fn apply_equalizer_settings(&self, _settings: EqSettings) {}
+
+        fn flush_equalizer_for_shutdown(&self) {
+            if !self.suppress_flush {
+                self.log.borrow_mut().push(self.tag);
+            }
+        }
+
+        fn load_uri(&self, _uri: &str) -> bool {
+            false
+        }
+
+        fn load_resolved(&self, _request: ResolvedHttpRequest) -> bool {
+            false
+        }
+
+        fn load_local(&self, _media: ResolvedLocalMedia) -> bool {
+            false
+        }
+
+        fn set_event_generation(&self, _generation: PlayerEventGeneration) {}
+
+        fn play(&self) {}
+
+        fn pause(&self) {}
+
+        fn stop(&self) {}
+
+        fn toggle_play_pause(&self) {}
+
+        fn seek_to(&self, _position_ms: u64) {}
+
+        fn set_volume(&mut self, _level: f64) {}
+
+        fn volume(&self) -> f64 {
+            1.0
+        }
+
+        fn state(&self) -> PlayerState {
+            PlayerState::Stopped
+        }
+
+        fn position_ms(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    /// A remote renderer as the active output must not prevent the flush:
+    /// the parked local output still owes a debounced save, and the drain
+    /// must reach into the parking slot for it.
+    #[test]
+    fn drain_flushes_active_and_parked_outputs() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let active = RecordingOutput::output(&log, "active", false);
+        let parked: Rc<RefCell<Option<Box<dyn AudioOutput>>>> = Rc::new(RefCell::new(Some(
+            RecordingOutput::boxed(&log, "parked", false),
+        )));
+
+        flush_equalizer_outputs_for_shutdown(Some(&active), &parked);
+
+        assert_eq!(
+            *log.borrow(),
+            vec!["active", "parked"],
+            "the drain must flush the active output and then the parked local output"
+        );
+    }
+
+    /// The key R3 scenario: a remote renderer is active, so the local
+    /// pipeline is parked — exactly the output the drain must not forget.
+    /// A remote output without an equalizer engine no-ops through the
+    /// trait default (nothing logged for it), and the parked local output
+    /// is flushed.
+    #[test]
+    fn drain_flushes_the_parked_local_output_while_a_remote_output_is_active() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let active = RecordingOutput::output(&log, "remote-active", true);
+        let parked: Rc<RefCell<Option<Box<dyn AudioOutput>>>> = Rc::new(RefCell::new(Some(
+            RecordingOutput::boxed(&log, "parked", false),
+        )));
+
+        flush_equalizer_outputs_for_shutdown(Some(&active), &parked);
+
+        assert_eq!(
+            *log.borrow(),
+            vec!["parked"],
+            "the parked local output must be flushed even though it is not active"
+        );
+    }
+
+    /// Both slots empty (no output constructed yet, or already moved out):
+    /// the drain step must be a safe no-op.
+    #[test]
+    fn drain_flush_is_a_noop_with_no_outputs() {
+        let log = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let parked: Rc<RefCell<Option<Box<dyn AudioOutput>>>> = Rc::new(RefCell::new(None));
+
+        flush_equalizer_outputs_for_shutdown(None, &parked);
+
+        assert!(log.borrow().is_empty());
     }
 }

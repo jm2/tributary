@@ -17,6 +17,17 @@
 //! guard, so the programmatic widget updates are never re-interpreted as
 //! manual edits (no recursive callback loop), and a later user retry
 //! applies.
+//!
+//! **Echo safety across notification delivery.** The re-entrancy guard
+//! alone is not sufficient on a real display: GTK can deliver the
+//! `notify` of a programmatic applied-state reflection *after* the
+//! editing handler has unwound (the guard is already cleared again), so
+//! the echo would be re-interpreted as a user edit and re-applied. Every
+//! reflected control therefore also refuses to apply a request that
+//! already equals the recorded state — an echo of our own reflection is
+//! a structural no-op no matter when GTK delivers it, while a genuine
+//! user edit always differs from the recorded state and still applies
+//! exactly once.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -64,6 +75,10 @@ pub(super) fn wire_equalizer_controls(
 /// active. The widget sync runs under the shared re-entrancy guard, so
 /// the programmatic `set_active` cannot be re-interpreted as a manual
 /// edit (no recursive callback loop), and a later user retry applies.
+/// Because GTK can deliver the reflection's `notify` *after* the guard
+/// is cleared (real-display delivery), the handler additionally skips
+/// any request that already equals the recorded state — see the module
+/// header's echo-safety contract.
 fn wire_enable_switch(
     active_output: &SharedAudioOutput,
     enable_row: &adw::SwitchRow,
@@ -75,8 +90,18 @@ fn wire_enable_switch(
         if updating.get() {
             return;
         }
+        // Echo safety: GTK may deliver the notify of our own applied-state
+        // reflection after this handler has unwound (guard already
+        // cleared). A request that already equals the recorded state is
+        // that echo — never a user edit — so applying it would double-apply
+        // and schedule a spurious save. Skip it; a genuine retry always
+        // differs from the recorded state.
+        let wanted = row.is_active();
+        if active_output.borrow().equalizer_settings().enabled == wanted {
+            return;
+        }
         let mut settings = active_output.borrow().equalizer_settings();
-        settings.enabled = row.is_active();
+        settings.enabled = wanted;
         active_output.borrow().apply_equalizer_settings(settings);
         // The apply is the authority: a deferred install/uninstall keeps
         // the installed `enabled`, and the switch must show that, not the
@@ -197,7 +222,9 @@ fn wire_gain_sliders(
 /// limiter is still in the bin). The widget sync runs under the shared
 /// re-entrancy guard, so the programmatic `set_selected` cannot be
 /// re-interpreted as a manual choice (no recursive callback loop), and a
-/// later user retry applies.
+/// later user retry applies. The echo-safety skip (module header) also
+/// guards this control: a `selected` notify matching the recorded policy
+/// is never a user edit.
 fn wire_clip_dropdown(
     active_output: &SharedAudioOutput,
     clip_dropdown: &gtk::DropDown,
@@ -209,11 +236,18 @@ fn wire_clip_dropdown(
         if updating.get() {
             return;
         }
-        let mut settings = active_output.borrow().equalizer_settings();
-        settings.clip_protection = match dropdown.selected() {
+        // Echo safety (see the module header): the notify of our own
+        // applied-state reflection can arrive after the guard is cleared,
+        // so a request matching the recorded state must never re-apply.
+        let wanted = match dropdown.selected() {
             1 => ClipProtection::Soft,
             _ => ClipProtection::Off,
         };
+        if active_output.borrow().equalizer_settings().clip_protection == wanted {
+            return;
+        }
+        let mut settings = active_output.borrow().equalizer_settings();
+        settings.clip_protection = wanted;
         active_output.borrow().apply_equalizer_settings(settings);
         let applied = active_output.borrow().equalizer_settings();
         updating.set(true);
