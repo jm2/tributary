@@ -359,14 +359,14 @@ class FuzzLockPolicyTests(unittest.TestCase):
                 {"dependencies": {"kept": "1"}},
             )
 
-    def _patch_main_fixtures(self, *, mode: str) -> tuple[dict, list[bytes]]:
-        """Patch main()'s file/IO surface with a stale-removal fixture.
+    def _build_stale_removal_fixtures(self) -> tuple[dict, dict, dict, dict, dict]:
+        """
+        Locks mirroring the audited local-ip-address removal shape.
 
-        The fixture mirrors the audited local-ip-address removal shape: the
-        submitted fuzz lock still carries the removed direct edge. Returns
-        (calls, writes) where calls counts graph-refresh and lock-metadata
-        validations and writes records any FUZZ_LOCK rollback payload. Every
-        patched module global is restored via addCleanup.
+        Returns (base, current, base_fuzz, stale_fuzz, repaired_fuzz): the
+        base root and fuzz still declare local-ip-address, the current root
+        and the repaired fuzz have dropped it, and the stale fuzz still
+        carries the removed direct edge awaiting its write-mode repair.
         """
         base = lock(
             ["local-ip-address 1.0.0", "kept 1.0.0"],
@@ -386,6 +386,20 @@ class FuzzLockPolicyTests(unittest.TestCase):
         )
         stale_fuzz["package"][1]["dependencies"] = ["edge 1.0.0"]
         repaired_fuzz = lock(["kept 1.0.0"], {"kept": ["1.0.0"], "edge": ["1.0.0"]})
+        return base, current, base_fuzz, stale_fuzz, repaired_fuzz
+
+    def _patch_main_fixtures(self, *, mode: str) -> tuple[dict, list[bytes]]:
+        """
+        Patch main()'s file/IO surface with a stale-removal fixture.
+
+        The submitted fuzz lock still carries the removed direct edge.
+        Returns (calls, writes) where calls counts graph-refresh and
+        lock-metadata validations and writes records any FUZZ_LOCK rollback
+        payload. Every patched module global is restored via addCleanup.
+        """
+        base, current, base_fuzz, stale_fuzz, repaired_fuzz = (
+            self._build_stale_removal_fixtures()
+        )
 
         views = {"fuzz": stale_fuzz}
         calls = {"refresh": 0, "metadata": 0}
