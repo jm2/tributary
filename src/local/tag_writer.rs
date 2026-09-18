@@ -1265,12 +1265,10 @@ impl LocalMutationTarget {
                 LocalTagWriteConflict::ParentChanged,
             ));
         }
-        if reprove_ancestor_chain(
-            self.path.parent().unwrap_or_else(|| Path::new("")),
-            &evidence,
-        )
-        .is_err()
-        {
+        // The chain is re-proved above the RESOLVED containing directory —
+        // the same path capture recorded the chain from — so the comparison
+        // stays exact for a selection reached through a symlink.
+        if reprove_ancestor_chain(authority.root(), &evidence).is_err() {
             return Err(LocalTagPreflightError::Conflict(
                 LocalTagWriteConflict::ParentChanged,
             ));
@@ -1351,12 +1349,10 @@ impl LocalMutationTarget {
         if authority.root_identity() != evidence.parent_identity {
             return Err(conflict_error(LocalTagWriteConflict::ParentChanged));
         }
-        if reprove_ancestor_chain(
-            self.path.parent().unwrap_or_else(|| Path::new("")),
-            &evidence,
-        )
-        .is_err()
-        {
+        // Same resolved-directory discipline as the preflight: the chain is
+        // re-proved above the authority's root, the path capture recorded it
+        // from.
+        if reprove_ancestor_chain(authority.root(), &evidence).is_err() {
             return Err(conflict_error(LocalTagWriteConflict::ParentChanged));
         }
         if target.admitted_identity().map_err(|error| {
@@ -1400,7 +1396,11 @@ impl LocalMutationTarget {
                 "the selected file has no name",
             )
         })?;
-        let authority = std::sync::Arc::new(MountedRootAuthority::acquire(parent)?);
+        // Re-admit through the same resolved containing directory capture
+        // bound, so the identity comparisons below prove the same object on
+        // every save — including a selection reached through a symlink.
+        let resolved_parent = resolve_authority_parent(parent)?;
+        let authority = std::sync::Arc::new(MountedRootAuthority::acquire(&resolved_parent)?);
         let target = authority.open_mutation_target(Path::new(leaf))?;
         Ok((authority, target))
     }
@@ -1413,6 +1413,39 @@ impl PartialEq for LocalMutationTarget {
 }
 
 impl Eq for LocalMutationTarget {}
+
+/// Resolve a selection's containing directory to the directory object the
+/// authority must bind.
+///
+/// The authority binds directories with the final component never followed
+/// (`O_NOFOLLOW`), so acquiring directly over a symlinked containing
+/// directory — a common music-library layout with top-level tracks — would
+/// refuse a selection the pathname-based addressing used to write. When the
+/// final component is a symlink, resolution follows the complete chain exactly
+/// as the old pathname addressing did and returns the RESOLVED directory: the
+/// authority root, the captured parent identity, and the recorded ancestor
+/// chain are then all defined on the same resolved object, so a symlink
+/// retargeted after admission or a resolved directory replaced in place still
+/// refuses through the identity comparisons. A path whose final component is
+/// not a symlink is returned unchanged — byte-identical to the
+/// pre-resolution behavior. On Windows the no-follow reparse refusal for a
+/// symlinked containing directory is unchanged; resolution there would pass a
+/// verbatim path through untested prefix machinery.
+#[cfg(unix)]
+fn resolve_authority_parent(parent: &Path) -> std::io::Result<PathBuf> {
+    match std::fs::symlink_metadata(parent).map(|metadata| metadata.file_type().is_symlink()) {
+        Ok(false) => Ok(parent.to_path_buf()),
+        // A symlinked final component resolves through its chain. A vanished
+        // or unreadable parent fails closed through canonicalize's error,
+        // exactly as the direct acquire would have.
+        _ => std::fs::canonicalize(parent),
+    }
+}
+
+#[cfg(not(unix))]
+fn resolve_authority_parent(parent: &Path) -> std::io::Result<PathBuf> {
+    Ok(parent.to_path_buf())
+}
 
 /// Snapshot the exact directory, object, and content revision named by `path`.
 ///
@@ -1432,10 +1465,14 @@ fn capture_local_selection_evidence(path: &Path) -> std::io::Result<LocalSelecti
             "the selected file has no name",
         )
     })?;
-    let authority = std::sync::Arc::new(MountedRootAuthority::acquire(parent)?);
+    // The authority binds the RESOLVED containing directory, so the recorded
+    // parent identity and ancestor chain describe the same object the write
+    // will re-admit — even when the user's path reaches it through a symlink.
+    let resolved_parent = resolve_authority_parent(parent)?;
+    let authority = std::sync::Arc::new(MountedRootAuthority::acquire(&resolved_parent)?);
     let target = authority.open_mutation_target(Path::new(leaf))?;
     let parent_identity = authority.root_identity();
-    let ancestor_identities = ancestor_identities(parent)?;
+    let ancestor_identities = ancestor_identities(&resolved_parent)?;
     let file_identity = target.admitted_identity()?;
     let revision = target.content_revision()?;
     Ok(LocalSelectionEvidence {
@@ -2926,6 +2963,97 @@ mod tests {
             std::fs::read(&displaced).expect("read the displaced original"),
             original,
             "the admitted file must be byte-for-byte untouched"
+        );
+        assert!(
+            directory.temp_files().is_empty(),
+            "a refused save leaves no private sibling behind"
+        );
+    }
+
+    /// A selection reached through a symlinked containing directory — a
+    /// common library layout with top-level tracks — is admitted by the
+    /// preflight and written to the exact file behind the link. The authority
+    /// binds the RESOLVED directory, so the identity evidence and the write
+    /// agree on the same object the pathname addressing used to reach.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_containing_directory_is_admitted_and_writable() {
+        let directory = TestDirectory::new("local-symlinked-parent");
+        let real = directory.path.join("real-music");
+        std::fs::create_dir(&real).expect("create the real music directory");
+        let track = real.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write the fixture");
+        let link = directory.path.join("music");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink the containing directory");
+        let selected = link.join("silence.flac");
+
+        let target = LocalMutationTarget::capture(&selected);
+        target
+            .preflight_write_capability()
+            .expect("a symlinked containing directory must be admitted");
+
+        target
+            .write_tags(&year("2026"))
+            .expect("a write through the symlinked containing directory must commit");
+
+        let tagged_file = lofty::read_from_path(&track).expect("reopen the real file");
+        let tag = tagged_file
+            .primary_tag()
+            .expect("tagged FLAC must have a primary tag");
+        assert_eq!(
+            tag.get_string(ItemKey::Year),
+            Some("2026"),
+            "the write must land on the exact file behind the link"
+        );
+        assert!(
+            directory.temp_files().is_empty(),
+            "a committed save leaves no private sibling behind"
+        );
+    }
+
+    /// Replacing the RESOLVED containing directory between selection and save
+    /// — same resolved path, different directory object — must refuse with
+    /// the changed-on-disk conflict. Resolving symlinked containing
+    /// directories must not weaken the identity comparison the authority is
+    /// for.
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_resolved_parent_directory_refuses_the_save() {
+        let directory = TestDirectory::new("local-replaced-resolved-parent");
+        let real = directory.path.join("real-music");
+        std::fs::create_dir(&real).expect("create the real music directory");
+        let track = real.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write the fixture");
+        let link = directory.path.join("music");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink the containing directory");
+        let selected = link.join("silence.flac");
+        let target = LocalMutationTarget::capture(&selected);
+
+        // Same resolved pathname, entirely different directory object, with
+        // a fresh lookalike file at the same leaf name.
+        std::fs::remove_dir_all(&real).expect("remove the resolved directory");
+        std::fs::create_dir(&real).expect("install a replacement directory");
+        let impostor = b"a lookalike in a replaced directory".to_vec();
+        std::fs::write(&track, &impostor).expect("install a lookalike file");
+
+        let preflight = target
+            .preflight_write_capability()
+            .expect_err("a replaced resolved directory must refuse the preflight");
+        assert_eq!(
+            preflight,
+            LocalTagPreflightError::Conflict(LocalTagWriteConflict::ParentChanged),
+            "the replaced directory is a changed-on-disk condition, not an availability one"
+        );
+
+        let error = target
+            .write_tags(&year("2026"))
+            .expect_err("a replaced resolved directory must refuse the save");
+        assert_eq!(conflict_of(&error), LocalTagWriteConflict::ParentChanged);
+
+        assert_eq!(
+            std::fs::read(&track).expect("read the lookalike back"),
+            impostor,
+            "the refused save must not touch the lookalike"
         );
         assert!(
             directory.temp_files().is_empty(),
