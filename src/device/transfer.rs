@@ -68,6 +68,8 @@ mod executor_tests;
 #[cfg(test)]
 mod planner_boundary_tests;
 #[cfg(test)]
+mod planner_source_boundary_tests;
+#[cfg(test)]
 mod planner_tests;
 #[cfg(test)]
 mod test_support;
