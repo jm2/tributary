@@ -174,10 +174,12 @@ fn reconcile_preset_truth(mut settings: EqSettings) -> EqSettings {
 /// malformed line, a bad schema version, or an unparseable mandatory
 /// key. The locator is a key-or-line locator: the offending key when
 /// one is parseable, otherwise the failing line number and a failure
-/// category — a line the grammar cannot split has no key to report, and
-/// the diagnostic must never carry file content.
+/// category — a line the grammar cannot split has no key to report,
+/// and a file that is not even valid UTF-8 has no lines to split at
+/// all, so it is reported with a categorized input locator. The
+/// diagnostic must never carry file content.
 pub(super) fn parse_equalizer_file(bytes: &[u8]) -> Result<EqSettings, String> {
-    let text = std::str::from_utf8(bytes).map_err(|_| "schema_version".to_string())?;
+    let text = std::str::from_utf8(bytes).map_err(|_| "input: not valid UTF-8".to_string())?;
     let mut config = RawEqConfig::default();
     for (index, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
@@ -207,10 +209,25 @@ fn line_locator(line_number: usize, line: &str) -> String {
     }
 }
 
+/// Band index of a canonical `band<N>_db` key: `N` is a single digit,
+/// `0..=9`. The exact-key grammar has exactly ten canonical spellings —
+/// `band0_db` through `band9_db` — so leading-zero (`band01_db`) and
+/// multi-digit (`band10_db`) spellings are not keys of this schema
+/// version. They fall through to the ignored unknown-key path (schema
+/// forward-compatibility), which keeps the grammar strict without
+/// aliasing: a file relying on `band01_db` reports its first missing
+/// canonical key (`band1_db`) instead of silently merging with
+/// `band1_db` into a duplicate-key diagnostic, and `band1_db` followed
+/// by `band01_db` stays the single clean occurrence it is.
 fn band_index(key: &str) -> Option<usize> {
     let rest = key.strip_prefix("band")?;
     let index = rest.strip_suffix("_db")?;
-    index.parse::<usize>().ok().filter(|i| *i < 10)
+    let mut chars = index.chars();
+    let digit = chars.next()?;
+    if chars.next().is_some() || !digit.is_ascii_digit() {
+        return None;
+    }
+    digit.to_digit(10).map(|value| value as usize)
 }
 
 /// Parse one gain value: finite float, clamped by the caller.
@@ -568,5 +585,37 @@ band5_db=\"6.0\"
         let content = render_equalizer_file(&EqSettings::default())
             .replace("band0_db=\"0.0\"", "band0_db=\"nan\"");
         assert!(parse_equalizer_file(content.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn non_utf8_input_reports_a_categorized_input_locator() {
+        // A file that is not valid UTF-8 has no parseable key and no
+        // splittable line, so naming `schema_version` would send triage
+        // to the wrong key. The locator names the failure category
+        // instead, and never carries the file's bytes.
+        let error = parse_equalizer_file(&[0xff, 0xfe, b'a', 0x00])
+            .expect_err("non-UTF-8 input is malformed");
+        assert_eq!(error, "input: not valid UTF-8");
+    }
+
+    #[test]
+    fn leading_zero_band_keys_are_not_schema_keys() {
+        // The exact-key grammar has ten canonical spellings,
+        // `band0_db`..`band9_db`. `band01_db` is an unknown key (ignored
+        // for forward compatibility), so a file relying on the alias is
+        // malformed with its first missing canonical key instead of
+        // silently aliasing `band1_db` — and the alias can no longer
+        // degrade the duplicate-key diagnostic by merging with
+        // `band1_db` into one index.
+        let content = render_equalizer_file(&EqSettings::default())
+            .replace("band1_db=\"0.0\"", "band01_db=\"1.5\"");
+        let error = parse_equalizer_file(content.as_bytes()).expect_err("alias key");
+        assert_eq!(error, "band1_db");
+
+        // Multi-digit spellings are equally off-grammar.
+        let content = render_equalizer_file(&EqSettings::default())
+            .replace("band1_db=\"0.0\"", "band10_db=\"1.5\"");
+        let error = parse_equalizer_file(content.as_bytes()).expect_err("out-of-range key");
+        assert_eq!(error, "band1_db");
     }
 }
