@@ -72,6 +72,32 @@ names. Likewise, when the exact base fuzz lock already needs no direct repair,
 an ordinary fuzz-only Dependabot update remains in that independent lane and
 is not forced through a root-transition closure.
 
+## Security audit boundaries
+
+`cargo audit` at the repository root sees only the production lock. The fuzz
+crate is a separate workspace with its own `fuzz/Cargo.lock`, and its resolver
+may legitimately select different transitive versions, so lock coherence proves
+nothing about whether that graph was security-audited. CI audits both graphs
+explicitly with `scripts/audit_lockfiles.py`:
+
+- each graph is scanned with its own lockfile passed via `--file`, from its own
+  directory, so cargo-audit cannot silently fall back to the root lock;
+- each graph takes only its own `[advisories].ignore` list — the root
+  `.cargo/audit.toml` for the production lock and `fuzz/.cargo/audit.toml` for
+  the fuzz lock — so an exception justified for one graph never suppresses a
+  finding in the other;
+- the JSON report is validated before it is trusted: the scanned dependency
+  count must match the requested lockfile, the applied ignore set must match
+  that graph's scoped exceptions, and no vulnerabilities may remain.
+
+`scripts/test_audit_lockfiles.py` keeps this honest with fixture tests proving
+the fuzz lock is actually selected and that a fuzz-only finding fails the audit
+even while the root audit stays green.
+
+A security advisory affecting both graphs must still be reviewed and repaired
+for each independently: an exception (or a fix) in one lock does not carry to
+the other.
+
 ## Rust toolchain and MSRV repair
 
 `.github/rust-toolchain.toml` is Dependabot's authoritative signal for a Rust
