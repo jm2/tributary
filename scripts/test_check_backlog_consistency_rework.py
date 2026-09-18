@@ -268,5 +268,134 @@ class BacklogConsistencyReworkTests(unittest.TestCase):
         )
 
 
+class InlineSyntaxTests(unittest.TestCase):
+    """Regressions for the 2026-09-18 refinery rework (threads jroR8/jroR-/jroSB).
+
+    Three current-head defects made the every-tracked-file audit report false
+    results: inline-code and escaped-bracket link examples were validated as
+    real links (jroR8), plain destinations were truncated at the first ``)``
+    so balanced-paren targets were falsely broken (jroR-), and heading
+    anchors were slugged from raw markup instead of rendered text (jroSB).
+    """
+
+    def make_root(self):
+        temporary = tempfile.TemporaryDirectory(prefix="tributary-backlog-")
+        self.addCleanup(temporary.cleanup)
+        return Path(temporary.name).resolve()
+
+    def write(self, root, name, text):
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    # ── code spans and escaped brackets (jroR8) ──────────────────────────────
+    def test_code_span_link_example_is_not_validated(self):
+        # A link shown as inline code is documentation, not a reference:
+        # validating it failed CI on ordinary examples.
+        root = self.make_root()
+        page = self.write(
+            root, "docs/guide.md", "Write `` `[example](missing.md)` `` inline.\n"
+        )
+        self.assertEqual(checker.check_links(root, [page]), [])
+
+    def test_escaped_bracket_example_is_not_validated(self):
+        root = self.make_root()
+        page = self.write(root, "docs/guide.md", "Literal \\[example\\](missing.md).\n")
+        self.assertEqual(checker.check_links(root, [page]), [])
+
+    def test_real_link_on_code_span_line_is_still_validated(self):
+        # Masking must not over-match: only the code-span example is
+        # exempted, the genuine broken link beside it is still reported.
+        root = self.make_root()
+        page = self.write(
+            root,
+            "docs/guide.md",
+            "`[example](absent-one.md)` but [real](absent-two.md)\n",
+        )
+        problems = checker.check_links(root, [page])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'absent-two.md'", problems[0])
+        self.assertNotIn("absent-one.md", problems[0])
+
+    def test_double_backslash_bracket_is_a_real_link(self):
+        # ``\\[label](target.md)`` escapes the backslash, so the bracket is
+        # active and the link must be checked.
+        root = self.make_root()
+        page = self.write(root, "docs/guide.md", "\\\\[label](missing.md)\n")
+        problems = checker.check_links(root, [page])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'missing.md'", problems[0])
+
+    # ── balanced plain destinations (jroR-) ──────────────────────────────────
+    def test_balanced_paren_destination_that_exists_passes(self):
+        # ``[^)\s]+`` used to truncate the destination at the first ``)``,
+        # checking ``ADR_(draft`` and falsely reporting the file broken.
+        root = self.make_root()
+        self.write(root, "docs/ADR_(draft).md", "# Draft\n")
+        page = self.write(root, "docs/guide.md", "[design](ADR_(draft).md)\n")
+        self.assertEqual(checker.check_links(root, [page]), [])
+
+    def test_broken_balanced_paren_destination_reports_full_target(self):
+        # No lost detections: a genuinely missing target is still reported,
+        # now under its full balanced name rather than the truncated one.
+        root = self.make_root()
+        page = self.write(root, "docs/guide.md", "[broken](missing_(part).md)\n")
+        problems = checker.check_links(root, [page])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'missing_(part).md'", problems[0])
+
+    def test_escaped_paren_destination_resolves(self):
+        root = self.make_root()
+        self.write(root, "docs/file(1).md", "# One\n")
+        page = self.write(root, "docs/guide.md", "[one](file\\(1\\).md)\n")
+        self.assertEqual(checker.check_links(root, [page]), [])
+
+    def test_escaped_paren_broken_target_is_reported(self):
+        root = self.make_root()
+        page = self.write(root, "docs/guide.md", "[nope](no\\(pe\\).md)\n")
+        problems = checker.check_links(root, [page])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'no(pe).md'", problems[0])
+
+    def test_unclosed_destination_stays_literal(self):
+        # A destination without a closing parenthesis is not linkified by
+        # GitHub, so it must neither pass nor be reported as a broken link.
+        root = self.make_root()
+        page = self.write(root, "docs/guide.md", "text [x](no-close\n")
+        self.assertEqual(checker.check_links(root, [page]), [])
+
+    # ── rendered-text heading anchors (jroSB) ────────────────────────────────
+    def test_link_heading_anchor_uses_rendered_text(self):
+        # GitHub exposes ``#api`` for ``## [API](guide.md)``; the anchor from
+        # raw markup (``apiguidemd``) is no longer accepted.
+        root = self.make_root()
+        target = self.write(root, "docs/target.md", "## [API](guide.md)\n")
+        guide = self.write(root, "docs/guide.md", "[jump](target.md#api)\n")
+        self.assertEqual(checker.check_links(root, [guide, target]), [])
+
+    def test_raw_markup_heading_anchor_is_rejected(self):
+        root = self.make_root()
+        target = self.write(root, "docs/target.md", "## [API](guide.md)\n")
+        guide = self.write(root, "docs/guide.md", "[jump](target.md#apiguidemd)\n")
+        problems = checker.check_links(root, [guide, target])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("missing anchor '#apiguidemd'", problems[0])
+
+    def test_code_span_heading_keeps_content_anchor(self):
+        # ``## `API` usage`` renders as ``API usage``: the backticks go, the
+        # words stay, and the anchor is ``api-usage``.
+        root = self.make_root()
+        target = self.write(root, "docs/target.md", "## `API` usage\n")
+        guide = self.write(root, "docs/guide.md", "[jump](target.md#api-usage)\n")
+        self.assertEqual(checker.check_links(root, [guide, target]), [])
+
+    def test_emphasis_heading_anchor_ignores_markers(self):
+        root = self.make_root()
+        target = self.write(root, "docs/target.md", "## **Bold** move\n")
+        guide = self.write(root, "docs/guide.md", "[jump](target.md#bold-move)\n")
+        self.assertEqual(checker.check_links(root, [guide, target]), [])
+
+
 if __name__ == "__main__":
     unittest.main()

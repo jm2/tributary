@@ -54,17 +54,30 @@ CHECKBOX_PATTERN = re.compile(r"^- \[(?P<mark>[ xX])\]")
 
 # Inline Markdown links, images and link reference definitions.  Reference-style
 # *inline* links (`[text][label]`) are not used in this repository; definitions
-# are validated so a future relative definition cannot rot silently.  A
-# destination may be wrapped in angle brackets, which is the Markdown escape
-# for destinations containing spaces (``[text](<my file.md>)``).
-INLINE_LINK = re.compile(
-    r"(?P<bang>!?)\[(?P<text>[^\]]*)\]\(\s*"
-    r"(?:<(?P<angled>[^<>]*)>|(?P<plain>[^)\s]+))"
-    r"(?:\s+\"[^\"]*\")?\s*\)"
-)
+# are validated so a future relative definition cannot rot silently.
+#
+# Inline links are parsed in two stages: INLINE_LINK_OPEN matches the
+# ``[text](`` head, then _parse_inline_destination scans the destination with
+# GitHub's destination rules.  A plain destination may hold balanced
+# parentheses or backslash-escaped ones, so ``[design](ADR_(draft).md)``
+# resolves to the file ``ADR_(draft).md`` rather than the first-``)``
+# truncation ``ADR_(draft``; a destination must still be followed by an
+# optional quoted title and the closing parenthesis, so ``[x](file.md``
+# stays literal text exactly as GitHub renders it.
+INLINE_LINK_OPEN = re.compile(r"(?P<bang>!?)\[(?P<text>[^\]]*)\]\(\s*")
+LINK_TAIL = re.compile(r"\s*(?:\"[^\"]*\"\s*)?\)")
 DEFINITION_LINK = re.compile(r"^\[(?P<label>[^\]]+)\]:\s*(?P<target><[^<>]*>|\S+)")
 HEADING = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<title>.*?)\s*#*\s*$")
+# A link inside a heading title.  GitHub generates heading anchors from the
+# RENDERED heading text, so ``## [API](guide.md)`` exposes ``#api``; the link
+# is replaced by its text before the slug rules apply.  The destination may
+# hold one level of balanced parentheses; deeper nesting stays raw markup.
+HEADING_LINK = re.compile(
+    r"!?\[(?P<text>[^\]]*)\]\(\s*(?P<dest>(?:[^()\s]|\([^()\s]*\))+)"
+    r"(?:\s+\"[^\"]*\")?\s*\)"
+)
 ABSOLUTE_TARGET = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
+_CODE_RUN = re.compile(r"`+")
 
 # One fenced code block opening line.  CommonMark fences are three or more
 # backticks or tildes; the closing fence must use the same character and be
@@ -188,9 +201,66 @@ def check_record_shapes(text: str, task_index: Path) -> list[str]:
     return problems
 
 
+def _code_span_closing(line: str, index: int) -> re.Match[str] | None:
+    """Return the closing-run match of the code span opening at *index*.
+
+    A code span opens at a backtick run and closes at the next run of exactly
+    the same length; an opening run with no equal-length closing run is
+    literal text (CommonMark), so ``None`` is returned for it.
+    """
+    opening = _CODE_RUN.match(line, index)
+    run = opening.end() - opening.start()
+    cursor = opening.end()
+    while True:
+        closing = _CODE_RUN.search(line, cursor)
+        if closing is None:
+            return None
+        if closing.end() - closing.start() == run:
+            return closing
+        cursor = closing.end()
+
+
+def _rendered_heading_text(heading: str) -> str:
+    """Return a heading title's rendered text with inline links removed."""
+    # GitHub generates heading anchors from the rendered text: the title
+    # ``[API](guide.md)`` renders as ``API`` and exposes the anchor ``api``,
+    # not the raw-markup slug ``apiguidemd``.  Code-span delimiters are
+    # dropped but their content is kept (`` `API` `` renders as ``API``),
+    # and a backslash-escaped character is literal text, never markup.
+    # Emphasis markers survive here; the slug's punctuation strip removes
+    # them exactly as it did before.
+    pieces: list[str] = []
+    index = 0
+    total = len(heading)
+    while index < total:
+        char = heading[index]
+        if char == "\\":
+            pieces.append(heading[index : index + 2])
+            index += 2
+            continue
+        if char == "`":
+            closing = _code_span_closing(heading, index)
+            if closing is None:
+                pieces.append(char)
+                index += 1
+                continue
+            run = _CODE_RUN.match(heading, index)
+            pieces.append(heading[run.end() : closing.start()])
+            index = closing.end()
+            continue
+        opening = HEADING_LINK.match(heading, index)
+        if opening is None:
+            pieces.append(char)
+            index += 1
+            continue
+        pieces.append(opening.group("text"))
+        index = opening.end()
+    return "".join(pieces)
+
+
 def slugify(heading: str) -> str:
     """Approximate GitHub's heading anchor slug for a Markdown heading."""
-    text = heading.strip().lower()
+    text = _rendered_heading_text(heading).strip().lower()
     text = re.sub(r"[`*_]", "", text)
     text = re.sub(r"[^\w\- ]", "", text, flags=re.UNICODE)
     return text.replace(" ", "-")
@@ -254,14 +324,96 @@ def collect_markdown_files(root: Path) -> list[Path]:
     return _walked_markdown_files(root)
 
 
+def _parse_inline_destination(line: str, cursor: int) -> tuple[str | None, int]:
+    """Parse one inline link destination starting just past its ``(``.
+
+    Returns ``(target, end)`` where *end* is the index just past the link's
+    closing parenthesis, or ``(None, cursor)`` when GitHub would not linkify
+    here.  A plain destination keeps balanced parentheses intact and honours
+    backslash-escaped ones, so ``ADR_(draft).md`` and ``file\\(1\\).md`` both
+    arrive whole instead of truncated at the first ``)``.
+    """
+    total = len(line)
+    if cursor < total and line[cursor] == "<":
+        # An angle-bracket destination may contain spaces and parentheses;
+        # the brackets are Markdown syntax, not part of the path.
+        close = line.find(">", cursor + 1)
+        if close == -1:
+            return None, cursor
+        tail = LINK_TAIL.match(line, close + 1)
+        if tail is None:
+            return None, cursor
+        return line[cursor + 1 : close], tail.end()
+    characters: list[str] = []
+    depth = 0
+    index = cursor
+    while index < total:
+        char = line[index]
+        if char == "\\" and index + 1 < total and line[index + 1] in "()":
+            # A backslash-escaped parenthesis belongs to the destination.
+            characters.append(line[index + 1])
+            index += 2
+            continue
+        if char.isspace():
+            break
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        characters.append(char)
+        index += 1
+    if depth != 0 or not characters:
+        # Unbalanced or empty: GitHub renders this as literal text.
+        return None, cursor
+    tail = LINK_TAIL.match(line, index)
+    if tail is None:
+        return None, cursor
+    return "".join(characters), tail.end()
+
+
+def _iter_inline_link_targets(line: str) -> Iterable[str]:
+    """Yield every inline ``(...)`` link target written on one content line."""
+    # Inline code spans and backslash-escaped characters are never link
+    # syntax: a documentation example like ``[example](missing.md)`` inside
+    # backticks, or an escaped ``\\[label\\](target.md)``, must not be
+    # validated as a real link, while a genuine link on the same line still
+    # is.  Escaped parentheses *inside* a destination are the exception —
+    # they belong to the target itself, so the destination scanner honours
+    # them instead of this walk masking them.
+    index = 0
+    total = len(line)
+    while index < total:
+        char = line[index]
+        if char == "\\":
+            # Escaped character pair: neither character is link syntax.
+            index += 2
+            continue
+        if char == "`":
+            closing = _code_span_closing(line, index)
+            if closing is None:
+                index += 1  # unmatched backtick run: literal text
+            else:
+                index = closing.end()  # skip the whole code span
+            continue
+        opening = INLINE_LINK_OPEN.match(line, index)
+        if opening is None:
+            index += 1
+            continue
+        target, end = _parse_inline_destination(line, opening.end())
+        if target is None:
+            index = opening.end()
+            continue
+        if not opening.group("bang"):
+            # Images are skipped: a missing picture must not fail the audit.
+            yield target
+        index = end
+
+
 def iter_link_targets(line: str) -> Iterable[str]:
     """Yield every link target written on one content line."""
-    for match in INLINE_LINK.finditer(line):
-        if not match.group("bang"):
-            # An angle-bracket destination (``<my file.md>``) and a plain
-            # destination are mutually exclusive; exactly one group matches.
-            target = match.group("angled")
-            yield target if target is not None else match.group("plain")
+    yield from _iter_inline_link_targets(line)
     definition = DEFINITION_LINK.match(line)
     if definition:
         target = definition.group("target")
