@@ -630,25 +630,49 @@ mod tests {
         service.finish().await;
     }
 
+    /// The deadline gap must survive full-suite parallelism: under heavy CPU
+    /// contention a current-thread tokio runtime can be starved for tens of
+    /// milliseconds, which previously let the 25 ms request deadline abort the
+    /// request before the mock dispatched it, failing `finish()` with an
+    /// unmet route. Warm the connection pool with an immediate reply so the
+    /// timed request reuses an established connection (no connect handshake
+    /// inside its race window), then apply a 250 ms deadline against a
+    /// 1500 ms body delay: the deadline still fires while the body is
+    /// streaming, the oversized reply still caps out, and the route observes
+    /// both of its expected calls.
     #[tokio::test]
     async fn deadline_and_streaming_body_cap_have_distinct_categories() {
         let policy = RequestPolicy {
-            timeout: Duration::from_millis(25),
+            timeout: Duration::from_millis(250),
             max_station_body_bytes: 128,
             max_geolocation_body_bytes: 128,
         };
+        let http = fixture_client();
         let delayed = MockHttpService::start(vec![MockRoute::get("/json/stations/topclick")
             .with_query("limit", "1")
-            .reply(
+            .replies([
+                MockResponse::json(serde_json::json!([station(
+                    "warm",
+                    "https://stream.example.test/live"
+                )])),
                 MockResponse::json(serde_json::json!([station(
                     "late",
                     "https://stream.example.test/live"
                 )]))
-                .with_delay(Duration::from_millis(100)),
-            )])
+                .with_delay(Duration::from_millis(1500)),
+            ])])
         .await;
-        let client =
-            RadioBrowserClient::with_test_policy(delayed.base_url(), fixture_client(), policy);
+        let base_url = delayed.base_url();
+        let warm = RadioBrowserClient::with_test_policy(
+            base_url.clone(),
+            http.clone(),
+            RequestPolicy::PRODUCTION,
+        );
+        assert!(
+            warm.fetch_top_click(Some(1)).await.is_ok(),
+            "pool warm-up request must succeed"
+        );
+        let client = RadioBrowserClient::with_test_policy(base_url, http, policy);
         assert!(matches!(
             client.fetch_top_click(Some(1)).await,
             Err(RadioClientError::Timeout)
