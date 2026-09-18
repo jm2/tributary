@@ -14,6 +14,9 @@ is a read-only, dependency-free checker for those invariants. It runs in the CI
 
 1. **Unique stable IDs.** Every top-level checkbox carries one stable ID
    (`R1`, `P1.5-A`, `Q7`, ...). A duplicate is a failure that names both lines.
+   A top-level checkbox *without* a bold stable ID is reported as malformed
+   rather than silently skipped, with its source line, before the counters
+   and mappings are derived.
 2. **Literal counters.** The completion counters written in prose must equal the
    mechanically derived checkbox counts: the overall `N/M`, the retained
    baseline, the corrective `R` family, the engineering `Q` family, and the
@@ -25,7 +28,15 @@ is a read-only, dependency-free checker for those invariants. It runs in the CI
    silently ignored. Every explicit percentage in the file must also be
    arithmetically consistent.
 3. **Internal links and anchors.** Every relative Markdown link target must
-   exist, and every `#anchor` into another Markdown file must match a heading.
+   exist inside the repository root — a target that resolves outside the root
+   (including through a symlink) is reported — and every `#anchor` into
+   another Markdown file must match a heading. Anchors are matched exactly:
+   GitHub renders heading anchors lowercased, and browsers match fragments to
+   element IDs case-sensitively, so a case-mismatched fragment is broken on
+   GitHub even though a case-insensitive reader might resolve it. Only
+   *tracked* Markdown files are enumerated in a Git checkout
+   (`git ls-files`); in a non-Git root the checker falls back to a recursive
+   walk, where untracked scratch files are part of the tree by definition.
 4. **Issue/bead/PR mappings** (optional, see below). Active records must map to
    a GitHub issue, a Gas City bead, and a pull request; merged-but-unreconciled
    records and stale review heads are surfaced.
@@ -38,7 +49,10 @@ python3 scripts/test_check_backlog_consistency.py
 ```
 
 The checker exits `0` when everything passes and `1` when any check fails; each
-failure prints a `[FAIL]` line naming the rule and the location.
+failure prints a `[FAIL]` line naming the rule and the location. Exit `2` is a
+usage error raised before any check runs: the task index (`--task-index`, or
+`<root>/docs/task.md` by default) does not exist, or the `--ledger` snapshot
+path does not exist. Each usage error prints a single diagnostic on stderr.
 
 ## Optional ledger snapshot
 
