@@ -347,6 +347,7 @@ errors:
       completion_unconfirmed: "AirPlay completion could not be confirmed"
       completion_timed_out: "AirPlay completion timed out"
       restoration_failed: "AirPlay restoration failed"
+      worker_unavailable: "AirPlay session worker could not be started"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "the selected receiver published no retained device identifier"
       receiver_not_in_daemon_output_list: "the selected receiver (%{id}) is not present in the daemon's output list"

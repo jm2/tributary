@@ -314,6 +314,7 @@ errors:
       completion_unconfirmed: "AirPlay 재생 완료를 확인할 수 없습니다"
       completion_timed_out: "AirPlay 재생 완료 대기 시간이 초과되었습니다"
       restoration_failed: "AirPlay 재생 후 복원에 실패했습니다"
+      worker_unavailable: "AirPlay 세션 작업자를 시작할 수 없습니다"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "선택한 수신기가 보존된 장치 식별자를 게시하지 않았습니다"
       receiver_not_in_daemon_output_list: "선택한 수신기(%{id})가 데몬의 출력 목록에 없습니다"

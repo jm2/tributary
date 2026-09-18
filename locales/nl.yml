@@ -314,6 +314,7 @@ errors:
       completion_unconfirmed: "De voltooiing van het afspelen via AirPlay kon niet worden bevestigd"
       completion_timed_out: "Time-out bij het voltooien van het afspelen via AirPlay"
       restoration_failed: "Het herstel na het afspelen via AirPlay is mislukt"
+      worker_unavailable: "De AirPlay-sessiewerker kon niet worden gestart"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "de geselecteerde ontvanger heeft geen bewaarde apparaat-id gepubliceerd"
       receiver_not_in_daemon_output_list: "de geselecteerde ontvanger (%{id}) staat niet in de uitvoerlijst van de daemon"

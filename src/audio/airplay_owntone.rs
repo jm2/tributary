@@ -58,6 +58,8 @@ const OWNTONE_VERIFIED_MAJOR: u32 = 29;
 const API_TIMEOUT: Duration = Duration::from_secs(2);
 const OPEN_DEADLINE: Duration = Duration::from_secs(10);
 const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+/// Cadence of the post-EOF drain's daemon observations.
+const DRAIN_POLL: Duration = Duration::from_millis(100);
 /// How long the daemon's reported item progress must stand still — while it
 /// still reports `play` after end-of-input — before a finite item counts as
 /// rendered. Pinned OwnTone 29.3 advances `pos_ms` only for samples it read
@@ -200,7 +202,7 @@ impl RuntimeFailure {
 /// process environment.
 fn selection_is_owntone(value: Option<&str>) -> bool {
     match value {
-        Some(value) => value.eq_ignore_ascii_case("owntone"),
+        Some(value) => value.trim().eq_ignore_ascii_case("owntone"),
         None => false,
     }
 }
@@ -321,7 +323,10 @@ impl OwnToneConfig {
                 "configured_state_directory_is_not_a_tributary_owned_instance",
             ));
         }
-        let matches = record.api_base == self.api_base
+        // The configured endpoint is normalized without its trailing slash;
+        // the record is compared the same way, so an installation that writes
+        // the URL exactly as it exports it is not refused.
+        let matches = record.api_base.trim_end_matches('/') == self.api_base
             && record.pipe_path == self.pipe_path.to_string_lossy()
             && record.state_dir == self.state_dir.to_string_lossy()
             && record.binary == self.binary.to_string_lossy();
@@ -1271,6 +1276,20 @@ impl OwnToneClient {
         self.guard.as_ref().map_or(Ok(()), ProcessGuard::authorize)
     }
 
+    /// Run one takeover mutation and say whether its failure left a request
+    /// unsettled. A refusal by the process guard precedes transmission: the
+    /// daemon holds nothing of ours to replay, so it unwinds cleanly with its
+    /// own reason. Counting it as unsettled terminated and restarted a healthy
+    /// daemon to settle a request that was never sent, and hid the reason
+    /// behind "recovery is pending" (pre-review audit, round 11).
+    fn takeover_step(
+        &self,
+        step: impl FnOnce(&Self) -> Result<(), SenderError>,
+    ) -> Result<(), (SenderError, bool)> {
+        self.authorize_mutation().map_err(|error| (error, false))?;
+        step(self).map_err(|error| (error, true))
+    }
+
     fn require_success(response: &reqwest::blocking::Response) -> Result<(), SenderError> {
         if response.status().is_success() {
             Ok(())
@@ -1416,8 +1435,27 @@ impl TakeoverRecord {
     fn write(&self, path: &Path) -> Result<(), SenderError> {
         let body = serde_json::to_vec(self)
             .map_err(|_| unavailable("takeover_record_could_not_be_serialized"))?;
-        std::fs::write(path, body)
-            .map_err(|_| unavailable("takeover_record_could_not_be_persisted"))
+        // A truncating write that fails part-way (ENOSPC, EIO, a crash) leaves
+        // an unreadable record, and an unreadable record refuses every later
+        // load until someone removes it by hand. Nothing has been sent to the
+        // daemon when this runs, so the record is staged beside its final
+        // name, synced and renamed into place; a failure removes the stage and
+        // leaves no record at all (pre-review audit, round 11).
+        let stage = path.with_extension("json.partial");
+        let staged = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&stage)?;
+            std::io::Write::write_all(&mut file, &body)?;
+            file.sync_all()?;
+            std::fs::rename(&stage, path)?;
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if staged.is_err() {
+            let _ = std::fs::remove_file(&stage);
+        }
+        staged.map_err(|_| unavailable("takeover_record_could_not_be_persisted"))
     }
 
     fn read(path: &Path) -> Option<Self> {
@@ -2693,7 +2731,7 @@ fn await_daemon_completion(
         if budget.tick(Instant::now()) {
             return Ok(DrainOutcome::Failed(RuntimeFailure::CompletionTimedOut));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(DRAIN_POLL);
     }
 }
 
@@ -2757,7 +2795,16 @@ fn drain_and_restore(inner: &SessionInner) -> Result<Option<RuntimeFailure>, ()>
             }
             DrainOutcome::Completed { epoch } => match inner.restore_completion(epoch) {
                 Ok(()) => return Ok(None),
-                Err(CompletionRestore::Superseded) => {}
+                Err(CompletionRestore::Superseded) => {
+                    // A voided completion is observed again on the poll
+                    // cadence. While the session is paused and the daemon
+                    // already reports `stop` (its own pause timeout, its web
+                    // UI, a lost receiver), every observation completes at
+                    // once and is voided at once; re-polling without a pause
+                    // spun both processes on `GET /api/player` until the user
+                    // resumed or stopped (pre-review audit, round 11).
+                    std::thread::sleep(DRAIN_POLL);
+                }
                 Err(CompletionRestore::Failed(_)) => {
                     return Ok(Some(RuntimeFailure::RestorationFailed));
                 }
@@ -3013,7 +3060,21 @@ impl OwnToneSender {
 
     /// `true` when the process is configured to select this adapter.
     pub(super) fn selected() -> bool {
-        selection_is_owntone(std::env::var(ENV_SELECT).ok().as_deref())
+        let value = std::env::var(ENV_SELECT).ok();
+        let selected = selection_is_owntone(value.as_deref());
+        if let Some(value) = value.as_deref().map(str::trim) {
+            if !selected && !value.is_empty() && !value.eq_ignore_ascii_case("raopsink") {
+                // A typo must not look like a deliberate choice of the default.
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    warn!(
+                        value,
+                        "unrecognized TRIBUTARY_AIRPLAY_SENDER value; the raopsink adapter is used"
+                    );
+                });
+            }
+        }
+        selected
     }
 }
 
@@ -3140,6 +3201,12 @@ fn open(config: OwnToneConfig, ctx: &SenderOpenContext) -> OpenOutcome {
             .collect(),
         selected_output: selected,
     };
+    // Nothing is recorded or sent yet: a listener that stopped being the
+    // dedicated instance since the preflight is a pre-mutation refusal with its
+    // own reason, not a takeover to recover from.
+    if let Err(error) = client.authorize_mutation() {
+        return pre_mutation_failure(ctx, error);
+    }
     if let Err(error) = recorded.write(&config.takeover_record()) {
         return OpenOutcome::Failed(error);
     }
@@ -3369,21 +3436,22 @@ fn take_over(
     if ctx.cancel.is_cancelled() {
         return Err(cancelled());
     }
+    let failed = |(error, unsettled)| (Unwind::Failed(error), unsettled);
     client
-        .set_outputs(&[selected])
-        .map_err(|error| (Unwind::Failed(error), true))?;
+        .takeover_step(|client| client.set_outputs(&[selected]))
+        .map_err(failed)?;
     if ctx.cancel.is_cancelled() {
         return Err(cancelled());
     }
     client
-        .clear_queue()
-        .map_err(|error| (Unwind::Failed(error), true))?;
+        .takeover_step(OwnToneClient::clear_queue)
+        .map_err(failed)?;
     if ctx.cancel.is_cancelled() {
         return Err(cancelled());
     }
     client
-        .set_volume(volume_percent(ctx.volume))
-        .map_err(|error| (Unwind::Failed(error), true))?;
+        .takeover_step(|client| client.set_volume(volume_percent(ctx.volume)))
+        .map_err(failed)?;
     if ctx.cancel.is_cancelled() {
         return Err(cancelled());
     }
@@ -3542,6 +3610,13 @@ fn fail_outcome(
             return OpenOutcome::Failed(original);
         }
     }
+    // The pending-recovery refusal replaces the failure that caused it; keep
+    // the cause in the log.
+    warn!(
+        unsettled,
+        reason = %original.message(),
+        "OwnTone takeover failed and could not be unwound; recovery is serialized"
+    );
     OpenOutcome::Failed(recovery_pending(client, config, recorded, lock, custody))
 }
 
@@ -4572,6 +4647,7 @@ mod tests {
         assert!(selection_is_owntone(Some("owntone")));
         assert!(selection_is_owntone(Some("OwnTone")));
         assert!(selection_is_owntone(Some("OWNTONE")));
+        assert!(selection_is_owntone(Some(" owntone ")));
         assert!(!selection_is_owntone(Some("raopsink")));
         assert!(!selection_is_owntone(Some("")));
         assert!(!selection_is_owntone(None));
@@ -4589,6 +4665,66 @@ mod tests {
             "no supported OwnTone acquisition path"
         };
         assert!(error.message().contains(expected), "{}", error.message());
+    }
+
+    /// The takeover record is staged and renamed, so a failed write can never
+    /// leave the unreadable record that refuses every later load.
+    #[test]
+    fn takeover_record_write_is_atomic_and_leaves_no_stage_behind() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join(".tributary-takeover.json");
+        let stage = path.with_extension("json.partial");
+        let record = TakeoverRecord {
+            enabled_outputs: vec![3, 5],
+            selected_output: 5,
+        };
+        // A damaged record from an earlier crash is replaced, not appended to.
+        std::fs::write(&path, b"{\"enabled_out").unwrap();
+        record.write(&path).expect("the record is persisted");
+        assert_eq!(TakeoverRecord::read(&path), Some(record.clone()));
+        assert!(!stage.exists(), "the stage is renamed away");
+
+        let missing = directory
+            .path()
+            .join("absent")
+            .join(".tributary-takeover.json");
+        assert!(record.write(&missing).is_err());
+        assert!(!missing.exists());
+        assert!(!missing.with_extension("json.partial").exists());
+    }
+
+    /// The ownership record binds the endpoint as the adapter normalizes it:
+    /// a record written with the exported URL's trailing slash still matches.
+    #[test]
+    fn ownership_record_matches_an_endpoint_written_with_a_trailing_slash() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = OwnToneConfig::from_values(
+            Some("http://127.0.0.1:3689/".to_string()),
+            Some(
+                directory
+                    .path()
+                    .join("airplay.pcm")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            Some(directory.path().to_string_lossy().into_owned()),
+            None,
+        )
+        .expect("a loopback endpoint");
+        for api_base in ["http://127.0.0.1:3689/", "http://127.0.0.1:3689"] {
+            let record = OwnershipRecord {
+                token: OWNER_TOKEN.to_string(),
+                api_base: api_base.to_string(),
+                pipe_path: config.pipe_path.to_string_lossy().into_owned(),
+                state_dir: config.state_dir.to_string_lossy().into_owned(),
+                binary: config.binary.to_string_lossy().into_owned(),
+                restart_command: None,
+            };
+            std::fs::write(config.owner_marker(), serde_json::to_vec(&record).unwrap()).unwrap();
+            config
+                .verify_owned_record()
+                .expect("the record binds this endpoint");
+        }
     }
 
     /// A refused configuration reports the operator's actual mistake. The
@@ -5914,7 +6050,13 @@ mod tests {
         // The job is serviced by a live owner; its attempt against the
         // unreachable daemon fails and it stays queued with the lock held.
         wait_until(|| supervisor.worker_is_live());
-        wait_until(|| supervisor.pending_jobs() >= 1);
+        // The job leaves the queue for the length of its attempt, and an
+        // attempt against an absent daemon now waits out the restart window
+        // before it fails (an exited instance is restarted, not refused), so
+        // the requeue is observed on that bound rather than the default one.
+        wait_until_within(QUIESCE_RESTART_DEADLINE + Duration::from_secs(10), || {
+            supervisor.pending_jobs() >= 1
+        });
         assert!(
             rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_err(),
             "a failed settlement attempt must not release the advisory lock"
@@ -8055,6 +8197,76 @@ fn serve(stream: std::net::TcpStream) {
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
             "no connection may reach the foreign listener"
         );
+    }
+
+    /// A takeover mutation the process guard refuses was never transmitted, so
+    /// it is a settled failure; one that fails in flight is not.
+    #[cfg(owntone_host)]
+    #[test]
+    fn a_guard_refusal_is_a_settled_takeover_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let config = OwnToneConfig {
+            api_base: format!("http://{}", listener.local_addr().unwrap()),
+            pipe_path: directory.path().join("airplay.pcm"),
+            state_dir: directory.path().to_path_buf(),
+            binary: PathBuf::from("/usr/bin/owntone"),
+        };
+        let guarded = OwnToneClient::for_owned_instance(&config).unwrap();
+        let (_, unsettled) = guarded
+            .takeover_step(OwnToneClient::clear_queue)
+            .expect_err("a foreign listener is refused");
+        assert!(!unsettled, "nothing was transmitted");
+
+        let unreachable = OwnToneClient::new("http://127.0.0.1:1").unwrap();
+        let (_, unsettled) = unreachable
+            .takeover_step(OwnToneClient::clear_queue)
+            .expect_err("an unreachable daemon fails in flight");
+        assert!(unsettled, "a request that failed in flight may still apply");
+    }
+
+    /// A daemon that stops on its own while the session is paused makes every
+    /// drain observation complete and be voided at once. The wait must keep
+    /// its poll cadence instead of spinning on `GET /api/player`.
+    #[cfg(owntone_host)]
+    #[test]
+    fn a_daemon_side_stop_while_paused_does_not_spin_the_drain_wait() {
+        let generation = PlayerEventGeneration::from_raw(55);
+        let (fixture, ticket, _baseline) = exercise_healthy_pause_beyond_the_drain_deadline(
+            Duration::from_millis(500),
+            generation,
+        );
+        let polls = |fixture: &DaemonControllerFixture| {
+            fixture
+                .daemon
+                .recorded()
+                .lines()
+                .filter(|line| line.starts_with("GET /api/player"))
+                .count()
+        };
+        fixture
+            .client
+            .player_control("stop")
+            .expect("daemon-side stop");
+        wait_until(|| {
+            fixture
+                .client
+                .player_state()
+                .is_ok_and(|state| state == "stop")
+        });
+        let before = polls(&fixture);
+        std::thread::sleep(Duration::from_secs(1));
+        let observed = polls(&fixture) - before;
+        assert!(
+            observed <= 30,
+            "{observed} player polls in one second: the voided completion is re-polled without a pause"
+        );
+        assert_eq!(fixture.controller.state(), PlayerState::Paused);
+
+        fixture.controller.stop();
+        wait_until(|| ticket.route_count() == 0);
+        wait_until(|| fixture.controller.state() == PlayerState::Stopped);
+        wait_until(|| fixture.lock_is_free());
     }
 
     /// The session client follows the owned instance across a legitimate

@@ -316,6 +316,7 @@ errors:
       completion_unconfirmed: "Не удалось подтвердить завершение воспроизведения через AirPlay"
       completion_timed_out: "Истекло время ожидания завершения воспроизведения через AirPlay"
       restoration_failed: "Сбой восстановления после воспроизведения через AirPlay"
+      worker_unavailable: "Не удалось запустить рабочий поток сеанса AirPlay"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "выбранный приёмник не опубликовал сохраняемый идентификатор устройства"
       receiver_not_in_daemon_output_list: "выбранный приёмник (%{id}) отсутствует в списке выходов демона"

@@ -706,7 +706,10 @@ impl AirPlayOutput {
             if let Some(ticket) = failure_ticket.as_ref() {
                 self.media_proxy.take_and_release(ticket);
             }
-            self.report_load_failure(generation, "AirPlay session worker could not be started");
+            self.report_load_failure(
+                generation,
+                &rust_i18n::t!("errors.playback.airplay_runtime.worker_unavailable"),
+            );
             return;
         };
 
@@ -1573,6 +1576,25 @@ mod tests {
             "an unavailable sender must not mint a loopback route (S6)"
         );
         assert!(!output.media_proxy.has_custody_entries());
+    }
+
+    /// A load worker that cannot be started is reported from the selected
+    /// catalog like every other AirPlay failure.
+    #[test]
+    fn worker_failure_is_localized_for_every_catalog() {
+        let key = "errors.playback.airplay_runtime.worker_unavailable";
+        let english = rust_i18n::t!(key, locale = "en").into_owned();
+        assert!(!english.contains("airplay_runtime"), "{english}");
+        for locale in rust_i18n::available_locales!() {
+            let localized = rust_i18n::t!(key, locale = &locale).into_owned();
+            assert!(
+                !localized.contains("airplay_runtime"),
+                "{locale}: {localized}"
+            );
+            if locale != "en" {
+                assert_ne!(localized, english, "{locale} must not fall back to English");
+            }
+        }
     }
 
     /// The guidance must be real in every catalog — present, mentioning the

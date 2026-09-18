@@ -314,6 +314,7 @@ errors:
       completion_unconfirmed: "Der Abschluss der AirPlay-Wiedergabe konnte nicht bestätigt werden"
       completion_timed_out: "Zeitüberschreitung beim Abschluss der AirPlay-Wiedergabe"
       restoration_failed: "Die Wiederherstellung nach der AirPlay-Wiedergabe ist fehlgeschlagen"
+      worker_unavailable: "Der AirPlay-Sitzungsprozess konnte nicht gestartet werden"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "der ausgewählte Empfänger hat keine dauerhafte Gerätekennung veröffentlicht"
       receiver_not_in_daemon_output_list: "der ausgewählte Empfänger (%{id}) ist nicht in der Ausgabeliste des Daemons enthalten"

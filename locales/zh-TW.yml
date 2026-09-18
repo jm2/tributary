@@ -314,6 +314,7 @@ errors:
       completion_unconfirmed: "無法確認 AirPlay 播放已完成"
       completion_timed_out: "等待 AirPlay 播放完成逾時"
       restoration_failed: "AirPlay 播放後的還原失敗"
+      worker_unavailable: "無法啟動 AirPlay 工作階段的工作執行緒"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "所選接收器未發布保留的裝置識別碼"
       receiver_not_in_daemon_output_list: "所選接收器（%{id}）不在常駐程式的輸出清單中"

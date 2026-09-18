@@ -316,6 +316,7 @@ errors:
       completion_unconfirmed: "Nie udało się potwierdzić zakończenia odtwarzania przez AirPlay"
       completion_timed_out: "Upłynął limit czasu zakończenia odtwarzania przez AirPlay"
       restoration_failed: "Przywracanie po odtwarzaniu przez AirPlay nie powiodło się"
+      worker_unavailable: "Nie udało się uruchomić procesu sesji AirPlay"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "wybrany odbiornik nie opublikował zachowanego identyfikatora urządzenia"
       receiver_not_in_daemon_output_list: "wybranego odbiornika (%{id}) nie ma na liście wyjść demona"

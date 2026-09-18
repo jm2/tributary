@@ -314,6 +314,7 @@ errors:
       completion_unconfirmed: "No se pudo confirmar la finalización de la reproducción por AirPlay"
       completion_timed_out: "Se agotó el tiempo de espera para finalizar la reproducción por AirPlay"
       restoration_failed: "Falló la restauración tras la reproducción por AirPlay"
+      worker_unavailable: "No se pudo iniciar el proceso de la sesión de AirPlay"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "el receptor seleccionado no publicó ningún identificador de dispositivo retenido"
       receiver_not_in_daemon_output_list: "el receptor seleccionado (%{id}) no está en la lista de salidas del demonio"

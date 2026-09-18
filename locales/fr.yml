@@ -314,6 +314,7 @@ errors:
       completion_unconfirmed: "La fin de la lecture AirPlay n'a pas pu être confirmée"
       completion_timed_out: "Le délai de fin de lecture AirPlay a expiré"
       restoration_failed: "La restauration après la lecture AirPlay a échoué"
+      worker_unavailable: "Le processus de session AirPlay n'a pas pu être démarré"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "le récepteur sélectionné n'a publié aucun identifiant d'appareil retenu"
       receiver_not_in_daemon_output_list: "le récepteur sélectionné (%{id}) est absent de la liste des sorties du démon"

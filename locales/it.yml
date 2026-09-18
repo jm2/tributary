@@ -314,6 +314,7 @@ errors:
       completion_unconfirmed: "Impossibile confermare il completamento della riproduzione AirPlay"
       completion_timed_out: "Tempo scaduto in attesa del completamento della riproduzione AirPlay"
       restoration_failed: "Il ripristino dopo la riproduzione AirPlay non è riuscito"
+      worker_unavailable: "Impossibile avviare il processo della sessione AirPlay"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "il ricevitore selezionato non ha pubblicato alcun identificatore di dispositivo conservato"
       receiver_not_in_daemon_output_list: "il ricevitore selezionato (%{id}) non è presente nell'elenco delle uscite del daemon"
