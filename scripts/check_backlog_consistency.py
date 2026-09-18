@@ -447,9 +447,11 @@ def check_archived_counter(text: str, root: Path) -> list[str]:
     """Report drift between the archived counter prose and its source boxes."""
     match = ARCHIVED_COUNTER_PATTERN.search(text)
     if match is None:
-        return [
+        missing = (
             "counter: could not find the archived remediation counter; "
-            "if the wording changed, update ARCHIVED_COUNTER_PATTERN"]
+            "if the wording changed, update ARCHIVED_COUNTER_PATTERN"
+        )
+        return [missing]
     source = root / ARCHIVED_INDEX_NAME
     if not source.is_file():
         return [f"counter: archived remediation source {ARCHIVED_INDEX_NAME} is missing"]

@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-"""Rework regressions for the backlog consistency checker (findings F1-F6).
-
-The corrective rework added enough regression coverage that a single test
-module would exceed the 500-line limit enforced by static analysis, so the
-findings F1-F6 cases live here: record shapes (F1), link destinations (F2),
-fence tracking (F3), root containment (F4), tracked enumeration (F5), and
-the CLI exit-status contract (F6).  Shared fixture builders are imported
-from the main suite module.
-"""
+"""Rework regressions for the backlog consistency checker (findings F1-F6)."""
+# The corrective rework added enough regression coverage that a single test
+# module would exceed the 500-line limit enforced by static analysis, so the
+# findings F1-F6 cases live here: record shapes (F1), link destinations (F2),
+# fence tracking (F3), root containment (F4), tracked enumeration (F5), and
+# the CLI exit-status contract (F6).  Shared fixture builders are imported
+# from the main suite module.
 
 import os
-import shutil
 import subprocess  # nosec B404 - index-authoritative git fixtures, fixed argv
 import sys
 import tempfile
@@ -45,12 +42,9 @@ class BacklogConsistencyReworkTests(unittest.TestCase):
         return self.write(root, checker.ARCHIVED_INDEX_NAME, archived_remediation_doc(**kwargs))
 
     def _git(self, *argv):
-        """Run git with a resolved executable and a fixed argument vector."""
-        git = shutil.which("git")
-        if git is None:  # pragma: no cover - git is a suite prerequisite
-            self.fail("git is not available on PATH")
-        return subprocess.run(  # nosec B603 - fixed argv, git resolved via which
-            [git, *argv], capture_output=True, text=True, check=True, timeout=60
+        """Run git with a fixed argument vector inside the test tree."""
+        return subprocess.run(  # nosec B603, B607 - fixed argv, no shell
+            ["git", *argv], capture_output=True, text=True, check=True, timeout=60
         )
 
     # ── record shapes (rework finding F1) ───────────────────────────────────
@@ -215,12 +209,6 @@ class BacklogConsistencyReworkTests(unittest.TestCase):
         self.assertEqual(checker.check_links(root, [target, page]), [])
 
     # ── tracked enumeration (rework finding F5) ──────────────────────────────
-    def _git(self, *argv):
-        """Run git with a fixed argument vector inside the test tree."""
-        return subprocess.run(
-            ["git", *argv], capture_output=True, text=True, check=True, timeout=60
-        )
-
     def _staged_git_root(self):
         """Return a Git root where scratch.md and ignored.md stay untracked."""
         root = self.make_root()
