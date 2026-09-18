@@ -2858,7 +2858,10 @@ pub mod tests {
         let device_a = SourceId::from_uuid(uuid::Uuid::new_v4());
         let device_b = SourceId::from_uuid(uuid::Uuid::new_v4());
         let device_key = |source: &SourceId| {
-            MediaKey::new(*source, TrackId::remote("track-9").expect("device track id"))
+            MediaKey::new(
+                *source,
+                TrackId::remote("track-9").expect("device track id"),
+            )
         };
         let pending_path = PathBuf::from("/definitely/not/here.flac");
 
