@@ -401,7 +401,10 @@ fn attach_bus_watch(
                     elapsed_ms,
                     "AirPlay pipeline error"
                 );
-                let _ = tx.try_send(PlayerEvent::error(generation, "AirPlay playback failed"));
+                let _ = tx.try_send(PlayerEvent::error(
+                    generation,
+                    rust_i18n::t!("errors.playback.airplay_runtime.playback_failed"),
+                ));
                 return glib::ControlFlow::Break;
             }
             MessageView::StateChanged(s) => {

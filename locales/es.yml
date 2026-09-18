@@ -309,6 +309,11 @@ errors:
     airplay_raopsink_missing: "La reproducción mediante AirPlay 1 no está disponible: esta compilación no incluye un emisor raopsink de GStreamer compatible"
     airplay_owntone_unavailable: "AirPlay mediante el emisor OwnTone no está disponible: %{reason}"
     airplay_owntone_no_acquisition_path: "esta plataforma no tiene una ruta de adquisición de OwnTone compatible"
+    airplay_runtime:
+      playback_failed: "Falló la reproducción por AirPlay"
+      completion_unconfirmed: "No se pudo confirmar la finalización de la reproducción por AirPlay"
+      completion_timed_out: "Se agotó el tiempo de espera para finalizar la reproducción por AirPlay"
+      restoration_failed: "Falló la restauración tras la reproducción por AirPlay"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "el receptor seleccionado no publicó ningún identificador de dispositivo retenido"
       receiver_not_in_daemon_output_list: "el receptor seleccionado (%{id}) no está en la lista de salidas del demonio"
@@ -366,7 +371,8 @@ errors:
       dedicated_daemon_did_not_autostart_the_pipe: "el demonio dedicado no inició automáticamente la tubería"
       this_platform_has_no_supported_owntone_acquisition_path: "esta plataforma no tiene una ruta de adquisición de OwnTone compatible"
       owntone_binary_was_not_found: "no se encontró el binario owntone"
-      dedicated_daemon_is_older_than_29_x: "el demonio dedicado es anterior a la versión 29.x"
+      dedicated_daemon_is_older_than_29_3: "el demonio dedicado es anterior a la versión 29.3"
+      dedicated_daemon_is_newer_than_the_verified_29_x_series: "el demonio dedicado es posterior a la serie 29.x verificada"
       another_tributary_session_is_already_using_the_dedicated_daemon: "otra sesión de Tributary ya está usando el demonio dedicado"
       previous_takeover_record_unreadable: "un registro de toma de control anterior es ilegible y debe recuperarse a mano"
       previous_takeover_incomplete: "una toma de control anterior está incompleta y no se pudo recuperar"

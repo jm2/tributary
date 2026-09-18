@@ -309,6 +309,11 @@ errors:
     airplay_raopsink_missing: "AirPlay 1 再生は利用できません。このビルドには互換性のある GStreamer raopsink 送信機が含まれていません"
     airplay_owntone_unavailable: "OwnTone 送信機による AirPlay は利用できません: %{reason}"
     airplay_owntone_no_acquisition_path: "このプラットフォームには対応する OwnTone 取得経路がありません"
+    airplay_runtime:
+      playback_failed: "AirPlay の再生に失敗しました"
+      completion_unconfirmed: "AirPlay の再生完了を確認できませんでした"
+      completion_timed_out: "AirPlay の再生完了待ちがタイムアウトしました"
+      restoration_failed: "AirPlay 再生後の復元に失敗しました"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "選択したレシーバーは保持されるデバイス識別子を公開していません"
       receiver_not_in_daemon_output_list: "選択したレシーバー（%{id}）はデーモンの出力一覧にありません"
@@ -366,7 +371,8 @@ errors:
       dedicated_daemon_did_not_autostart_the_pipe: "専用デーモンがパイプを自動開始しませんでした"
       this_platform_has_no_supported_owntone_acquisition_path: "このプラットフォームには対応する OwnTone 取得経路がありません"
       owntone_binary_was_not_found: "owntone バイナリが見つかりませんでした"
-      dedicated_daemon_is_older_than_29_x: "専用デーモンのバージョンが 29.x より古いです"
+      dedicated_daemon_is_older_than_29_3: "専用デーモンのバージョンが 29.3 より古いです"
+      dedicated_daemon_is_newer_than_the_verified_29_x_series: "専用デーモンのバージョンが検証済みの 29.x 系より新しいです"
       another_tributary_session_is_already_using_the_dedicated_daemon: "別の Tributary セッションが既に専用デーモンを使用しています"
       previous_takeover_record_unreadable: "以前の引き継ぎレコードが読み取れないため、手動で復旧する必要があります"
       previous_takeover_incomplete: "以前の引き継ぎが未完了で、復旧できませんでした"

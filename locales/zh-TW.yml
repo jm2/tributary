@@ -309,6 +309,11 @@ errors:
     airplay_raopsink_missing: "AirPlay 1 播放無法使用：此版本未包含相容的 GStreamer raopsink 傳送器"
     airplay_owntone_unavailable: "透過 OwnTone 傳送器的 AirPlay 無法使用：%{reason}"
     airplay_owntone_no_acquisition_path: "此平台沒有受支援的 OwnTone 取得路徑"
+    airplay_runtime:
+      playback_failed: "AirPlay 播放失敗"
+      completion_unconfirmed: "無法確認 AirPlay 播放已完成"
+      completion_timed_out: "等待 AirPlay 播放完成逾時"
+      restoration_failed: "AirPlay 播放後的還原失敗"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "所選接收器未發布保留的裝置識別碼"
       receiver_not_in_daemon_output_list: "所選接收器（%{id}）不在常駐程式的輸出清單中"
@@ -366,7 +371,8 @@ errors:
       dedicated_daemon_did_not_autostart_the_pipe: "專用常駐程式沒有自動啟動管線"
       this_platform_has_no_supported_owntone_acquisition_path: "此平台沒有受支援的 OwnTone 取得路徑"
       owntone_binary_was_not_found: "找不到 owntone 二進位檔"
-      dedicated_daemon_is_older_than_29_x: "專用常駐程式的版本早於 29.x"
+      dedicated_daemon_is_older_than_29_3: "專用常駐程式的版本早於 29.3"
+      dedicated_daemon_is_newer_than_the_verified_29_x_series: "專用常駐程式的版本高於已驗證的 29.x 系列"
       another_tributary_session_is_already_using_the_dedicated_daemon: "另一個 Tributary 工作階段已在使用專用常駐程式"
       previous_takeover_record_unreadable: "先前的接管記錄無法讀取，必須手動復原"
       previous_takeover_incomplete: "先前的接管未完成且無法復原"

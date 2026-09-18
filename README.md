@@ -696,9 +696,13 @@ Open **Preferences** from the hamburger menu (☰) to:
 ## AirPlay roadmap
 
 AirPlay sending runs behind a GStreamer-independent sender seam and can use a maintained
-OwnTone 29.x daemon as its transport when explicitly configured
+OwnTone 29.x daemon (29.3 or newer; older releases and later major versions are refused
+as unverified) as its transport when explicitly configured
 (`TRIBUTARY_AIRPLAY_SENDER=owntone`, alongside the dedicated instance's
-`TRIBUTARY_OWNTONE_API`, `TRIBUTARY_OWNTONE_PIPE`, and `TRIBUTARY_OWNTONE_STATE_DIR`). The
+`TRIBUTARY_OWNTONE_API`, `TRIBUTARY_OWNTONE_PIPE`, and `TRIBUTARY_OWNTONE_STATE_DIR`).
+`TRIBUTARY_OWNTONE_BIN` names the daemon binary and defaults to `/usr/bin/owntone`; set it
+whenever OwnTone is installed elsewhere (for example `/usr/sbin/owntone`), because the
+ownership record below must name the same binary. The
 adapter maps the selected receiver to the daemon by its retained device identifier — never
 by display name — and restores the daemon's pre-takeover output set when the session ends.
 
@@ -712,7 +716,7 @@ instance writes it once as JSON:
 {
   "token": "tributary-airplay-owntone-v1",
   "api_base": "http://127.0.0.1:3690",
-  "pipe_path": "/run/user/1000/tributary-owntone/pcm.fifo",
+  "pipe_path": "/absolute/path/to/dedicated-input/airplay.pcm",
   "state_dir": "/home/user/.local/state/tributary-owntone",
   "binary": "/usr/sbin/owntone",
   "restart_command": "systemctl --user restart tributary-owntone.service"
@@ -722,8 +726,11 @@ instance writes it once as JSON:
 `token` is the literal string above (a foreign or hand-edited value is refused, and a
 matching token cannot authorize an instance whose `api_base`, `pipe_path`, `state_dir`
 or `binary` differ from the configured ones — `TRIBUTARY_OWNTONE_API`,
-`TRIBUTARY_OWNTONE_PIPE`, `TRIBUTARY_OWNTONE_STATE_DIR` and the resolved daemon
-binary must match the record byte for byte). `restart_command` is optional: when the
+`TRIBUTARY_OWNTONE_PIPE`, `TRIBUTARY_OWNTONE_STATE_DIR` and the daemon binary
+(`TRIBUTARY_OWNTONE_BIN`, or `/usr/bin/owntone` when unset) must match the record byte
+for byte; the example above therefore needs `TRIBUTARY_OWNTONE_BIN=/usr/sbin/owntone`).
+`pipe_path` is the FIFO described under the library configuration below: a non-hidden
+`.pcm` file that is a direct child of the scanned directory. `restart_command` is optional: when the
 instance runs under a supervisor, put its restart invocation here so the adapter can
 bring the daemon back after it terminates a stuck instance; when absent, the adapter
 waits for the environment to restart the instance on its own. The adapter also keeps a

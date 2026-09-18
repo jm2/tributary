@@ -309,6 +309,11 @@ errors:
     airplay_raopsink_missing: "AirPlay-1-Wiedergabe ist nicht verfügbar: Dieser Build enthält keinen kompatiblen GStreamer-raopsink-Sender"
     airplay_owntone_unavailable: "AirPlay über den OwnTone-Sender ist nicht verfügbar: %{reason}"
     airplay_owntone_no_acquisition_path: "diese Plattform hat keinen unterstützten OwnTone-Erfassungspfad"
+    airplay_runtime:
+      playback_failed: "AirPlay-Wiedergabe ist fehlgeschlagen"
+      completion_unconfirmed: "Der Abschluss der AirPlay-Wiedergabe konnte nicht bestätigt werden"
+      completion_timed_out: "Zeitüberschreitung beim Abschluss der AirPlay-Wiedergabe"
+      restoration_failed: "Die Wiederherstellung nach der AirPlay-Wiedergabe ist fehlgeschlagen"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "der ausgewählte Empfänger hat keine dauerhafte Gerätekennung veröffentlicht"
       receiver_not_in_daemon_output_list: "der ausgewählte Empfänger (%{id}) ist nicht in der Ausgabeliste des Daemons enthalten"
@@ -366,7 +371,8 @@ errors:
       dedicated_daemon_did_not_autostart_the_pipe: "der dedizierte Daemon hat die Pipe nicht automatisch gestartet"
       this_platform_has_no_supported_owntone_acquisition_path: "diese Plattform hat keinen unterstützten OwnTone-Erfassungspfad"
       owntone_binary_was_not_found: "die owntone-Binärdatei wurde nicht gefunden"
-      dedicated_daemon_is_older_than_29_x: "der dedizierte Daemon ist älter als 29.x"
+      dedicated_daemon_is_older_than_29_3: "der dedizierte Daemon ist älter als 29.3"
+      dedicated_daemon_is_newer_than_the_verified_29_x_series: "der dedizierte Daemon ist neuer als die geprüfte 29.x-Reihe"
       another_tributary_session_is_already_using_the_dedicated_daemon: "eine andere Tributary-Sitzung verwendet den dedizierten Daemon bereits"
       previous_takeover_record_unreadable: "ein früherer Übernahmedatensatz ist unlesbar und muss von Hand wiederhergestellt werden"
       previous_takeover_incomplete: "eine frühere Übernahme ist unvollständig und konnte nicht wiederhergestellt werden"

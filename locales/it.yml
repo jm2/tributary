@@ -309,6 +309,11 @@ errors:
     airplay_raopsink_missing: "La riproduzione AirPlay 1 non è disponibile: questa build non include un trasmettitore raopsink GStreamer compatibile"
     airplay_owntone_unavailable: "AirPlay tramite il trasmettitore OwnTone non è disponibile: %{reason}"
     airplay_owntone_no_acquisition_path: "questa piattaforma non ha alcun percorso di acquisizione OwnTone supportato"
+    airplay_runtime:
+      playback_failed: "La riproduzione AirPlay non è riuscita"
+      completion_unconfirmed: "Impossibile confermare il completamento della riproduzione AirPlay"
+      completion_timed_out: "Tempo scaduto in attesa del completamento della riproduzione AirPlay"
+      restoration_failed: "Il ripristino dopo la riproduzione AirPlay non è riuscito"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "il ricevitore selezionato non ha pubblicato alcun identificatore di dispositivo conservato"
       receiver_not_in_daemon_output_list: "il ricevitore selezionato (%{id}) non è presente nell'elenco delle uscite del daemon"
@@ -366,7 +371,8 @@ errors:
       dedicated_daemon_did_not_autostart_the_pipe: "il daemon dedicato non ha avviato automaticamente la pipe"
       this_platform_has_no_supported_owntone_acquisition_path: "questa piattaforma non ha alcun percorso di acquisizione OwnTone supportato"
       owntone_binary_was_not_found: "il binario owntone non è stato trovato"
-      dedicated_daemon_is_older_than_29_x: "il daemon dedicato è precedente alla versione 29.x"
+      dedicated_daemon_is_older_than_29_3: "il daemon dedicato è precedente alla versione 29.3"
+      dedicated_daemon_is_newer_than_the_verified_29_x_series: "il daemon dedicato è successivo alla serie 29.x verificata"
       another_tributary_session_is_already_using_the_dedicated_daemon: "un'altra sessione Tributary sta già usando il daemon dedicato"
       previous_takeover_record_unreadable: "un record di acquisizione precedente è illeggibile e deve essere ripristinato a mano"
       previous_takeover_incomplete: "un'acquisizione precedente è incompleta e non è stato possibile ripristinarla"

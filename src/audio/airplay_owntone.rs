@@ -48,8 +48,12 @@ const ENV_STATE_DIR: &str = "TRIBUTARY_OWNTONE_STATE_DIR";
 const ENV_BIN: &str = "TRIBUTARY_OWNTONE_BIN";
 const DEFAULT_BIN: &str = "/usr/bin/owntone";
 
-/// Minimum supported daemon major version (design pins 29.3).
-const OWNTONE_MIN_MAJOR: u32 = 29;
+/// Oldest daemon release the adapter's pinned behaviour was verified against
+/// (design pins 29.3: pipe autostart/autostop and completion semantics).
+const OWNTONE_MIN_VERSION: (u32, u32) = (29, 3);
+/// The only verified major series. A later major is unverified, so it is
+/// refused before any daemon mutation rather than assumed compatible.
+const OWNTONE_VERIFIED_MAJOR: u32 = 29;
 
 const API_TIMEOUT: Duration = Duration::from_secs(2);
 const OPEN_DEADLINE: Duration = Duration::from_secs(10);
@@ -143,6 +147,50 @@ fn unavailable_raw_in(locale: &str, reason: &str) -> SenderError {
         )
         .into_owned(),
     )
+}
+
+/// The catalog map holding the terminal failures a live session publishes.
+const RUNTIME_CATALOG: &str = "errors.playback.airplay_runtime";
+
+/// A terminal failure published through `PlayerEvent::error` after a session
+/// opened. It is rendered from the selected catalog at publication and never
+/// carried as an English literal (PR #270 review, round 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeFailure {
+    /// The decode pipeline failed or could not be driven.
+    PlaybackFailed,
+    /// The daemon stopped answering while the item drained.
+    CompletionUnconfirmed,
+    /// The active-drain budget ran out before the daemon reported completion.
+    CompletionTimedOut,
+    /// The item completed but the daemon could not be restored.
+    RestorationFailed,
+}
+
+impl RuntimeFailure {
+    const fn key(self) -> &'static str {
+        match self {
+            Self::PlaybackFailed => "playback_failed",
+            Self::CompletionUnconfirmed => "completion_unconfirmed",
+            Self::CompletionTimedOut => "completion_timed_out",
+            Self::RestorationFailed => "restoration_failed",
+        }
+    }
+
+    fn message(self) -> String {
+        self.message_in(rust_i18n::locale().as_ref())
+    }
+
+    fn message_in(self, locale: &str) -> String {
+        let key = format!("{RUNTIME_CATALOG}.{}", self.key());
+        let text = rust_i18n::t!(key.as_str(), locale = locale);
+        debug_assert!(
+            !text.contains(RUNTIME_CATALOG),
+            "missing catalog entry for OwnTone runtime failure {}",
+            self.key()
+        );
+        text.into_owned()
+    }
 }
 
 /// Whether an explicit `TRIBUTARY_AIRPLAY_SENDER` value selects the OwnTone
@@ -1697,7 +1745,7 @@ impl SessionInner {
     /// before the `Stopped`) or after it (and is refused by
     /// `transmit_mutation`). Idempotent with [`Self::restore`], which latches
     /// the same flag under the same lock.
-    fn publish_terminal(&self, message: &str) {
+    fn publish_terminal(&self, failure: RuntimeFailure) {
         let _boundary = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
         self.terminal.store(true, Ordering::SeqCst);
         self.running.store(false, Ordering::SeqCst);
@@ -1705,7 +1753,7 @@ impl SessionInner {
             if !self.cancel.is_cancelled() {
                 let _ = self
                     .event_tx
-                    .try_send(PlayerEvent::error(self.generation, message.to_string()));
+                    .try_send(PlayerEvent::error(self.generation, failure.message()));
                 self.publish_state(PlayerState::Stopped);
             }
         });
@@ -2135,7 +2183,8 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
         // and publish `Stopped` together, so no control can publish after it
         // (review Y1).
         let _ = pipeline.set_state(gst::State::Null);
-        inner.publish_terminal("the decode pipeline has no bus");
+        error!("OwnTone decode pipeline has no bus");
+        inner.publish_terminal(RuntimeFailure::PlaybackFailed);
         return;
     };
 
@@ -2188,7 +2237,7 @@ fn run_pump(inner: Arc<SessionInner>, pipeline: gst::Pipeline, write_fd: OwnedFd
                     // watcher must never find this writer still attached.
                     drop(write_fd.take());
                     // Terminal failure and publication share the Stop gate.
-                    inner.publish_terminal("AirPlay playback failed");
+                    inner.publish_terminal(RuntimeFailure::PlaybackFailed);
                     // A failed restore is not a clean teardown; the session
                     // close path installs serialized recovery and retains the
                     // record (review R3).
@@ -2420,7 +2469,7 @@ enum DrainOutcome {
     Completed {
         epoch: u64,
     },
-    Failed(&'static str),
+    Failed(RuntimeFailure),
 }
 
 /// Poll the daemon — while `budget` has active drain time left — until the
@@ -2473,15 +2522,11 @@ fn await_daemon_completion(
                         return Ok(DrainOutcome::Completed { epoch });
                     }
                 }
-                Err(_) => {
-                    return Ok(DrainOutcome::Failed(
-                        "AirPlay completion could not be confirmed",
-                    ))
-                }
+                Err(_) => return Ok(DrainOutcome::Failed(RuntimeFailure::CompletionUnconfirmed)),
             }
         }
         if budget.tick(Instant::now()) {
-            return Ok(DrainOutcome::Failed("AirPlay completion timed out"));
+            return Ok(DrainOutcome::Failed(RuntimeFailure::CompletionTimedOut));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -2534,7 +2579,7 @@ fn park_between_requests(inner: &SessionInner, processed: u32) {
 /// `Ok(None)` a completed and restored item; `Ok(Some(reason))` a terminal
 /// failure. A completion whose epoch restoration finds superseded is void:
 /// the wait resumes on the same active-drain budget ([`DrainBudget`]).
-fn drain_and_restore(inner: &SessionInner) -> Result<Option<&'static str>, ()> {
+fn drain_and_restore(inner: &SessionInner) -> Result<Option<RuntimeFailure>, ()> {
     let mut budget = DrainBudget::new();
     loop {
         match await_daemon_completion(inner, &mut budget)? {
@@ -2549,7 +2594,7 @@ fn drain_and_restore(inner: &SessionInner) -> Result<Option<&'static str>, ()> {
                 Ok(()) => return Ok(None),
                 Err(CompletionRestore::Superseded) => {}
                 Err(CompletionRestore::Failed(_)) => {
-                    return Ok(Some("AirPlay restoration failed"));
+                    return Ok(Some(RuntimeFailure::RestorationFailed));
                 }
             },
         }
@@ -2616,10 +2661,10 @@ fn natural_completion(inner: &SessionInner, pipeline: &gst::Pipeline) {
         if inner.cancel.is_cancelled() {
             return;
         }
-        if let Some(message) = failure {
+        if let Some(failure) = failure {
             let _ = inner
                 .event_tx
-                .try_send(PlayerEvent::error(inner.generation, message.to_string()));
+                .try_send(PlayerEvent::error(inner.generation, failure.message()));
         }
         inner.publish_state(PlayerState::Stopped);
         if failure.is_none() {
@@ -2863,15 +2908,28 @@ impl AirplaySender for OwnToneSender {
     }
 }
 
-/// Confirm the dedicated daemon answers and is new enough. This is the
+/// Confirm the dedicated daemon answers and runs a verified release. This is the
 /// blocking half of the old availability gate, deliberately executed on the
 /// load worker's [`open`] rather than in the synchronous, GTK-thread `probe`
 /// (review R1). It is the first daemon RPC the worker performs and it never
 /// reads or mutates receiver state.
 fn check_daemon_health(client: &OwnToneClient) -> Result<(), SenderError> {
-    let (major, _minor) = client.version()?;
-    if major < OWNTONE_MIN_MAJOR {
-        return Err(unavailable("dedicated_daemon_is_older_than_29_x"));
+    check_daemon_version(client.version()?)
+}
+
+/// The version window the adapter accepts: 29.3 or newer inside the verified
+/// 29.x series. The pinned behaviour (pipe autostart, autostop and completion
+/// semantics) was read from the 29.3 sources, so neither an older 29.x release
+/// nor an unverified later major may proceed into daemon mutations (PR #270
+/// review, round 10).
+fn check_daemon_version(version: (u32, u32)) -> Result<(), SenderError> {
+    if version < OWNTONE_MIN_VERSION {
+        return Err(unavailable("dedicated_daemon_is_older_than_29_3"));
+    }
+    if version.0 > OWNTONE_VERIFIED_MAJOR {
+        return Err(unavailable(
+            "dedicated_daemon_is_newer_than_the_verified_29_x_series",
+        ));
     }
     Ok(())
 }
@@ -4188,6 +4246,61 @@ mod tests {
                     !message.contains("not configured"),
                     "{locale} carries English: {message}"
                 );
+            }
+        }
+    }
+
+    /// The version window is 29.3 or newer inside the verified 29.x series:
+    /// an older 29.x release lacks the pinned pipe semantics and a later major
+    /// is unverified, so both are refused before any daemon mutation (PR #270
+    /// review, round 10).
+    #[test]
+    fn daemon_version_gate_accepts_only_the_verified_series() {
+        for accepted in [(29, 3), (29, 4), (29, 10)] {
+            assert!(check_daemon_version(accepted).is_ok(), "{accepted:?}");
+        }
+        let older = unavailable_in("en", "dedicated_daemon_is_older_than_29_3");
+        for refused in [(0, 0), (28, 9), (29, 0), (29, 2)] {
+            let error = check_daemon_version(refused).expect_err("an older daemon is refused");
+            assert_eq!(error.message(), older.message(), "{refused:?}");
+        }
+        let newer = unavailable_in(
+            "en",
+            "dedicated_daemon_is_newer_than_the_verified_29_x_series",
+        );
+        for refused in [(30, 0), (31, 2)] {
+            let error = check_daemon_version(refused).expect_err("a later major is refused");
+            assert_eq!(error.message(), newer.message(), "{refused:?}");
+        }
+    }
+
+    /// Every terminal failure a live session publishes renders from the
+    /// selected catalog — no English literal reaches `PlayerEvent::error`
+    /// (PR #270 review, round 10).
+    #[test]
+    fn runtime_failures_are_localized_in_every_catalog() {
+        let failures = [
+            RuntimeFailure::PlaybackFailed,
+            RuntimeFailure::CompletionUnconfirmed,
+            RuntimeFailure::CompletionTimedOut,
+            RuntimeFailure::RestorationFailed,
+        ];
+        for locale in rust_i18n::available_locales!() {
+            for failure in failures {
+                let message = failure.message_in(&locale);
+                assert!(
+                    !message.contains(RUNTIME_CATALOG),
+                    "{locale} lacks {RUNTIME_CATALOG}.{}",
+                    failure.key()
+                );
+                assert!(!message.trim().is_empty(), "{locale}: {failure:?}");
+                if locale != "en" {
+                    assert_ne!(
+                        message,
+                        failure.message_in("en"),
+                        "{locale} carries the English text for {failure:?}"
+                    );
+                }
             }
         }
     }

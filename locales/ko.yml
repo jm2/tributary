@@ -309,6 +309,11 @@ errors:
     airplay_raopsink_missing: "AirPlay 1 재생을 사용할 수 없습니다. 이 빌드에는 호환되는 GStreamer raopsink 송신기가 없습니다"
     airplay_owntone_unavailable: "OwnTone 송신기를 통한 AirPlay를 사용할 수 없습니다: %{reason}"
     airplay_owntone_no_acquisition_path: "이 플랫폼에는 지원되는 OwnTone 획득 경로가 없습니다"
+    airplay_runtime:
+      playback_failed: "AirPlay 재생에 실패했습니다"
+      completion_unconfirmed: "AirPlay 재생 완료를 확인할 수 없습니다"
+      completion_timed_out: "AirPlay 재생 완료 대기 시간이 초과되었습니다"
+      restoration_failed: "AirPlay 재생 후 복원에 실패했습니다"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "선택한 수신기가 보존된 장치 식별자를 게시하지 않았습니다"
       receiver_not_in_daemon_output_list: "선택한 수신기(%{id})가 데몬의 출력 목록에 없습니다"
@@ -366,7 +371,8 @@ errors:
       dedicated_daemon_did_not_autostart_the_pipe: "전용 데몬이 파이프를 자동으로 시작하지 않았습니다"
       this_platform_has_no_supported_owntone_acquisition_path: "이 플랫폼에는 지원되는 OwnTone 획득 경로가 없습니다"
       owntone_binary_was_not_found: "owntone 바이너리를 찾을 수 없습니다"
-      dedicated_daemon_is_older_than_29_x: "전용 데몬이 29.x보다 오래된 버전입니다"
+      dedicated_daemon_is_older_than_29_3: "전용 데몬이 29.3보다 오래된 버전입니다"
+      dedicated_daemon_is_newer_than_the_verified_29_x_series: "전용 데몬이 검증된 29.x 계열보다 최신 버전입니다"
       another_tributary_session_is_already_using_the_dedicated_daemon: "다른 Tributary 세션이 이미 전용 데몬을 사용하고 있습니다"
       previous_takeover_record_unreadable: "이전 인계 기록을 읽을 수 없어 수동으로 복구해야 합니다"
       previous_takeover_incomplete: "이전 인계가 완료되지 않았고 복구할 수 없습니다"

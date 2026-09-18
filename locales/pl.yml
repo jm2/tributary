@@ -311,6 +311,11 @@ errors:
     airplay_raopsink_missing: "Odtwarzanie AirPlay 1 jest niedostępne: ta kompilacja nie zawiera zgodnego nadajnika GStreamer raopsink"
     airplay_owntone_unavailable: "AirPlay przez nadajnik OwnTone jest niedostępne: %{reason}"
     airplay_owntone_no_acquisition_path: "ta platforma nie ma obsługiwanej ścieżki pozyskania OwnTone"
+    airplay_runtime:
+      playback_failed: "Odtwarzanie przez AirPlay nie powiodło się"
+      completion_unconfirmed: "Nie udało się potwierdzić zakończenia odtwarzania przez AirPlay"
+      completion_timed_out: "Upłynął limit czasu zakończenia odtwarzania przez AirPlay"
+      restoration_failed: "Przywracanie po odtwarzaniu przez AirPlay nie powiodło się"
     airplay_owntone_reason:
       receiver_published_no_retained_identifier: "wybrany odbiornik nie opublikował zachowanego identyfikatora urządzenia"
       receiver_not_in_daemon_output_list: "wybranego odbiornika (%{id}) nie ma na liście wyjść demona"
@@ -368,7 +373,8 @@ errors:
       dedicated_daemon_did_not_autostart_the_pipe: "dedykowany demon nie uruchomił potoku automatycznie"
       this_platform_has_no_supported_owntone_acquisition_path: "ta platforma nie ma obsługiwanej ścieżki pozyskania OwnTone"
       owntone_binary_was_not_found: "nie znaleziono pliku binarnego owntone"
-      dedicated_daemon_is_older_than_29_x: "dedykowany demon jest starszy niż 29.x"
+      dedicated_daemon_is_older_than_29_3: "dedykowany demon jest starszy niż 29.3"
+      dedicated_daemon_is_newer_than_the_verified_29_x_series: "dedykowany demon jest nowszy niż zweryfikowana seria 29.x"
       another_tributary_session_is_already_using_the_dedicated_daemon: "inna sesja Tributary już używa dedykowanego demona"
       previous_takeover_record_unreadable: "poprzedni rekord przejęcia jest nieczytelny i musi zostać odtworzony ręcznie"
       previous_takeover_incomplete: "poprzednie przejęcie jest niekompletne i nie można go było odtworzyć"
