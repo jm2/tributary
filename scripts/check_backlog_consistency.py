@@ -31,7 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
+import subprocess  # nosec B404 - index-authoritative git ls-files, fixed argv
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -80,27 +80,15 @@ PERCENT_COUNTER = re.compile(
 # Prose counters, anchored on stable phrasing so a wording change fails loudly
 # instead of silently skipping the check.
 COUNTER_PATTERNS = (
-    (
-        "overall",
-        re.compile(
-            r"Current status:\s*\*\*(?P<complete>\d+)/(?P<total>\d+)\s*"
-            r"\((?P<percent>\d+(?:\.\d+)?)%\)\*\*"
-        ),
-    ),
-    (
-        "baseline",
-        re.compile(r"retained baseline is\s*\*\*(?P<complete>\d+)/(?P<total>\d+)\*\*"),
-    ),
-    (
-        "corrective",
-        re.compile(r"with\s*\*\*(?P<complete>\d+)/(?P<total>\d+)\*\*\s+new corrective"),
-    ),
-    (
-        "engineering",
-        re.compile(
-            r"and\s*\*\*(?P<complete>\d+)/(?P<total>\d+)\*\*\s+engineering records complete"
-        ),
-    ),
+    ("overall", re.compile(
+        r"Current status:\s*\*\*(?P<complete>\d+)/(?P<total>\d+)\s*"
+        r"\((?P<percent>\d+(?:\.\d+)?)%\)\*\*")),
+    ("baseline", re.compile(
+        r"retained baseline is\s*\*\*(?P<complete>\d+)/(?P<total>\d+)\*\*")),
+    ("corrective", re.compile(
+        r"with\s*\*\*(?P<complete>\d+)/(?P<total>\d+)\*\*\s+new corrective")),
+    ("engineering", re.compile(
+        r"and\s*\*\*(?P<complete>\d+)/(?P<total>\d+)\*\*\s+engineering records complete")),
 )
 
 # The archived remediation counter is anchored on its own stable phrasing.
@@ -164,8 +152,7 @@ def iter_content_lines(text: str) -> Iterable[tuple[int, str]]:
             fence_len = len(opening.group("fence"))
             continue
         closing = re.fullmatch(
-            r" {0,3}" + re.escape(fence_char) + r"{" + str(fence_len) + r",}[ \t]*",
-            line,
+            r" {0,3}" + re.escape(fence_char) + "{%d,}[ \t]*" % fence_len, line
         )
         if closing is not None:
             fence_char = None
@@ -177,13 +164,11 @@ def parse_records(text: str) -> list[Record]:
     for number, line in iter_content_lines(text):
         match = RECORD_PATTERN.match(line)
         if match:
-            records.append(
-                Record(
-                    identifier=match.group("id"),
-                    complete=match.group("mark").lower() == "x",
-                    line=number,
-                )
-            )
+            records.append(Record(
+                identifier=match.group("id"),
+                complete=match.group("mark").lower() == "x",
+                line=number,
+            ))
     return records
 
 
@@ -199,8 +184,7 @@ def check_record_shapes(text: str, task_index: Path) -> list[str]:
         if CHECKBOX_PATTERN.match(line) and not RECORD_PATTERN.match(line):
             problems.append(
                 f"record: {display}:{number}: top-level checkbox has no bold "
-                f"stable ID and is not a countable record: {line.strip()!r}"
-            )
+                f"stable ID and is not a countable record: {line.strip()!r}")
     return problems
 
 
@@ -223,8 +207,7 @@ def document_anchors(path: Path) -> set[str]:
             counts[slug] = counts.get(slug, 0) + 1
     anchors: set[str] = set()
     for slug, count in counts.items():
-        for index in range(count):
-            anchors.add(slug if index == 0 else f"{slug}-{index}")
+        anchors.update(slug if index == 0 else f"{slug}-{index}" for index in range(count))
     return anchors
 
 
@@ -253,9 +236,7 @@ def _tracked_markdown_files(root: Path) -> list[Path] | None:
     try:
         completed = subprocess.run(  # nosec B603, B607 - fixed argv, no shell
             ["git", "-C", str(root), "ls-files", "-z", "--", "*.md"],
-            capture_output=True,
-            check=False,
-            timeout=60,
+            capture_output=True, check=False, timeout=60,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -280,9 +261,7 @@ def iter_link_targets(line: str) -> Iterable[str]:
             # An angle-bracket destination (``<my file.md>``) and a plain
             # destination are mutually exclusive; exactly one group matches.
             target = match.group("angled")
-            if target is None:
-                target = match.group("plain")
-            yield target
+            yield target if target is not None else match.group("plain")
     definition = DEFINITION_LINK.match(line)
     if definition:
         target = definition.group("target")
@@ -319,8 +298,8 @@ def check_unique_ids(records: Sequence[Record], root: Path, task_index: Path) ->
         if len(lines) > 1:
             rendered = ", ".join(f"{display}:{line}" for line in lines)
             problems.append(
-                f"unique-id: record ID '{identifier}' is defined {len(lines)} times ({rendered})"
-            )
+                f"unique-id: record ID '{identifier}' is defined "
+                f"{len(lines)} times ({rendered})")
     return problems
 
 
@@ -352,25 +331,22 @@ def check_counters(text: str, records: Sequence[Record]) -> list[str]:
         if match is None:
             problems.append(
                 f"counter: could not find the {label} completion counter; "
-                "if the wording changed, update COUNTER_PATTERNS"
-            )
+                "if the wording changed, update COUNTER_PATTERNS")
             continue
         complete = int(match.group("complete"))
         total = int(match.group("total"))
         want_complete, want_total = expected[label]
         if (complete, total) != (want_complete, want_total):
             problems.append(
-                f"counter: {label} says {complete}/{total} but the index contains "
-                f"{want_complete}/{want_total} completed records"
-            )
+                f"counter: {label} says {complete}/{total} but the index "
+                f"contains {want_complete}/{want_total} completed records")
         stated = match.groupdict().get("percent")
         if stated is not None:
             computed = round(want_complete / want_total * 100, 1) if want_total else 0.0
             if abs(float(stated) - computed) > 0.05:
                 problems.append(
-                    f"counter: {label} states {stated}% but {want_complete}/{want_total} "
-                    f"rounds to {computed}%"
-                )
+                    f"counter: {label} states {stated}% but "
+                    f"{want_complete}/{want_total} rounds to {computed}%")
 
     # Every explicit percentage must at least be arithmetically consistent.
     # The archived remediation counter additionally gets a mechanical recount
@@ -383,8 +359,7 @@ def check_counters(text: str, records: Sequence[Record]) -> list[str]:
         if abs(stated - computed) > 0.05:
             problems.append(
                 f"counter: '{complete}/{total} ({stated}%)' is arithmetically "
-                f"inconsistent (rounds to {computed}%)"
-            )
+                f"inconsistent (rounds to {computed}%)")
     return problems
 
 
@@ -457,16 +432,14 @@ def derive_archived_counts(path: Path) -> tuple[int, int, list[str]]:
         text = path.read_text(encoding="utf-8")
     except OSError as error:  # pragma: no cover - unreadable checkout file
         return 0, 0, [
-            f"counter: archived remediation source {display} is unreadable ({error})"
-        ]
+            f"counter: archived remediation source {display} is unreadable ({error})"]
     complete, total, unclassified = _collect_archived_boxes(text)
     problems: list[str] = []
     for title, count in sorted(unclassified.items()):
         problems.append(
             f"counter: {display} has {count} checkbox(es) under section "
             f"'{title}', which is neither a P0-P3 task section nor a documented "
-            "exclusion; the archived recount cannot classify them"
-        )
+            "exclusion; the archived recount cannot classify them")
     return complete, total, problems
 
 
@@ -474,11 +447,9 @@ def check_archived_counter(text: str, root: Path) -> list[str]:
     """Report drift between the archived counter prose and its source boxes."""
     match = ARCHIVED_COUNTER_PATTERN.search(text)
     if match is None:
-        missing = (
+        return [
             "counter: could not find the archived remediation counter; "
-            "if the wording changed, update ARCHIVED_COUNTER_PATTERN"
-        )
-        return [missing]
+            "if the wording changed, update ARCHIVED_COUNTER_PATTERN"]
     source = root / ARCHIVED_INDEX_NAME
     if not source.is_file():
         return [f"counter: archived remediation source {ARCHIVED_INDEX_NAME} is missing"]
@@ -489,16 +460,15 @@ def check_archived_counter(text: str, root: Path) -> list[str]:
     stated_total = int(match.group("total"))
     if (stated_complete, stated_total) != (complete, total):
         problems.append(
-            f"counter: archived remediation says {stated_complete}/{stated_total} but "
-            f"{ARCHIVED_INDEX_NAME} contains {complete}/{total} in-scope task checkboxes"
-        )
+            f"counter: archived remediation says {stated_complete}/{stated_total} "
+            f"but {ARCHIVED_INDEX_NAME} contains {complete}/{total} in-scope "
+            "task checkboxes")
     stated = float(match.group("percent"))
     computed = round(complete / total * 100, 1) if total else 0.0
     if abs(stated - computed) > 0.05:
         problems.append(
-            f"counter: archived remediation states {stated}% but {complete}/{total} "
-            f"rounds to {computed}%"
-        )
+            f"counter: archived remediation states {stated}% but "
+            f"{complete}/{total} rounds to {computed}%")
     return problems
 
 
@@ -524,8 +494,7 @@ def _check_link_target(
         # that points out of the checkout), not a valid in-tree reference.
         problems.append(
             f"link: {relative}:{number}: link target '{target}' resolves outside "
-            f"the repository root ({relative_display(root, target_path)})"
-        )
+            f"the repository root ({relative_display(root, target_path)})")
         return problems
     if not target_path.exists():
         problems.append(f"link: {relative}:{number}: broken link target '{target}'")
@@ -538,8 +507,7 @@ def _check_link_target(
         if fragment not in anchors:
             problems.append(
                 f"link: {relative}:{number}: missing anchor '#{fragment}' in "
-                f"{relative_display(root, target_path)}"
-            )
+                f"{relative_display(root, target_path)}")
     return problems
 
 
@@ -557,8 +525,7 @@ def check_links(root: Path, markdown_files: Sequence[Path]) -> list[str]:
         for number, line in iter_content_lines(text):
             for target in iter_link_targets(line):
                 problems.extend(
-                    _check_link_target(root, path, number, target, anchor_cache)
-                )
+                    _check_link_target(root, path, number, target, anchor_cache))
     return problems
 
 
@@ -599,8 +566,7 @@ def _check_active_flag(identifier: str, entry: dict, active: bool) -> list[str]:
     drift = (
         f"ledger: record '{identifier}' snapshot flag "
         f"active={entry['active']} disagrees with the index state "
-        f"({state_word}); the index decides"
-    )
+        f"({state_word}); the index decides")
     return [drift]
 
 
@@ -619,18 +585,15 @@ def _check_active_mapping(identifier: str, entry: dict) -> list[str]:
     if state == "missing":
         problems.append(
             f"ledger: active record '{identifier}' has no pr mapping "
-            "(use null for 'not yet published')"
-        )
+            "(use null for 'not yet published')")
     elif state == "invalid":
         problems.append(
             f"ledger: active record '{identifier}' has an invalid pr "
-            f"mapping ({value!r})"
-        )
+            f"mapping ({value!r})")
     elif state == "published" and not entry.get("head_sha"):
         problems.append(
             f"ledger: active record '{identifier}' references PR {value} "
-            "without head_sha evidence"
-        )
+            "without head_sha evidence")
     return problems
 
 
@@ -644,13 +607,11 @@ def _check_entry_state(
     if head and reviewed and head != reviewed:
         problems.append(
             f"ledger: record '{identifier}' has a stale review head "
-            f"(reviewed {_short(str(reviewed))} != head {_short(str(head))})"
-        )
+            f"(reviewed {_short(str(reviewed))} != head {_short(str(head))})")
     if entry.get("merged") and not record.complete:
         problems.append(
             f"ledger: record '{identifier}' is merged but still unchecked in "
-            f"{task_index.name} (merged-but-unreconciled)"
-        )
+            f"{task_index.name} (merged-but-unreconciled)")
     return problems
 
 
@@ -758,29 +719,14 @@ def run_checks(
 def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--root",
-        type=Path,
-        default=REPOSITORY,
-        help="repository root (default: the checkout containing this script)",
-    )
-    parser.add_argument(
-        "--task-index",
-        type=Path,
-        default=None,
-        help=f"task index to check (default: <root>/{TASK_INDEX_NAME})",
-    )
-    parser.add_argument(
-        "--ledger",
-        type=Path,
-        default=None,
-        help="optional read-only ledger snapshot JSON for mapping checks",
-    )
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="suppress the passing summary line",
-    )
+    parser.add_argument("--root", type=Path, default=REPOSITORY,
+                        help="repository root (default: the checkout containing this script)")
+    parser.add_argument("--task-index", type=Path, default=None,
+                        help=f"task index to check (default: <root>/{TASK_INDEX_NAME})")
+    parser.add_argument("--ledger", type=Path, default=None,
+                        help="optional read-only ledger snapshot JSON for mapping checks")
+    parser.add_argument("--quiet", action="store_true",
+                        help="suppress the passing summary line")
     return parser.parse_args(argv)
 
 
@@ -812,8 +758,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         complete = sum(1 for record in records if record.complete)
         print(
             f"backlog consistency: {len(records)} records ({complete} complete), "
-            f"{len(markdown_files)} markdown files, 0 problems"
-        )
+            f"{len(markdown_files)} markdown files, 0 problems")
     return 0
 
 

@@ -46,6 +46,7 @@ is a read-only, dependency-free checker for those invariants. It runs in the CI
 ```sh
 python3 scripts/check_backlog_consistency.py
 python3 scripts/test_check_backlog_consistency.py
+python3 scripts/test_check_backlog_consistency_rework.py
 ```
 
 The checker exits `0` when everything passes and `1` when any check fails; each
@@ -53,6 +54,9 @@ failure prints a `[FAIL]` line naming the rule and the location. Exit `2` is a
 usage error raised before any check runs: the task index (`--task-index`, or
 `<root>/docs/task.md` by default) does not exist, or the `--ledger` snapshot
 path does not exist. Each usage error prints a single diagnostic on stderr.
+The two test modules split the suite so each stays under the 500-line limit
+enforced by static analysis: the main module covers the checker invariants and
+the pass paths, and the rework module covers the corrective findings F1-F6.
 
 ## Optional ledger snapshot
 
