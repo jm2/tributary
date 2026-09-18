@@ -846,6 +846,7 @@ mod tests {
     use axum::http::StatusCode;
     use md5::{Digest as _, Md5};
 
+    use crate::architecture::media::MediaContainer;
     use crate::architecture::MediaBackend as _;
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
     use crate::source_registry::MAX_SEARCH_ATTRIBUTION_PROFILES;
@@ -1395,6 +1396,108 @@ mod tests {
         )
         .await;
 
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_stream_carries_the_library_container_descriptor() {
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/gateway/rest/ping.view").reply(MockResponse::json(
+                serde_json::json!({"subsonic-response": {"status": "ok"}}),
+            )),
+            MockRoute::get("/gateway/rest/getArtists.view").reply(MockResponse::json(
+                serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "artists": {"index": [{"artist": [
+                            {"id": "descriptor-artist", "name": "Descriptor Artist"}
+                        ]}]}
+                    }
+                }),
+            )),
+            MockRoute::get("/gateway/rest/getArtist.view")
+                .with_query("id", "descriptor-artist")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "artist": {
+                            "id": "descriptor-artist",
+                            "name": "Descriptor Artist",
+                            "album": [
+                                {"id": "descriptor-album", "name": "Descriptor Album"}
+                            ]
+                        }
+                    }
+                }))),
+            MockRoute::get("/gateway/rest/getAlbum.view")
+                .with_query("id", "descriptor-album")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "album": {
+                            "id": "descriptor-album",
+                            "name": "Descriptor Album",
+                            "song": [
+                                {
+                                    "id": "flac-track",
+                                    "title": "Lossless",
+                                    "suffix": "flac"
+                                },
+                                {
+                                    "id": "opaque-track",
+                                    "title": "Opaque",
+                                    "suffix": "ape"
+                                }
+                            ]
+                        }
+                    }
+                }))),
+        ])
+        .await;
+        let password = Uuid::new_v4().to_string();
+        let backend = SubsonicBackend::connect(
+            "fixture",
+            &format!("{}/gateway/", service.base_url()),
+            "user",
+            &password,
+        )
+        .await
+        .expect("descriptor fixture catalogue");
+
+        let cache = backend.cache.read().await;
+        let native_ids: Vec<(TrackId, String)> = cache
+            .tracks
+            .iter()
+            .filter_map(|track| {
+                track
+                    .native_track_id
+                    .as_ref()
+                    .map(|native| (native.clone(), track.title.clone()))
+            })
+            .collect();
+        drop(cache);
+        assert_eq!(native_ids.len(), 2);
+
+        for (track_id, title) in native_ids {
+            let resolved = backend
+                .resolve_stream(&track_id)
+                .await
+                .expect("descriptor resolution");
+            if title == "Lossless" {
+                assert_eq!(
+                    resolved.representation(),
+                    MediaRepresentation::buffered(MediaContainer::Flac),
+                    "library suffix flac must label the resolved stream"
+                );
+            } else {
+                assert_eq!(title, "Opaque");
+                assert_eq!(
+                    resolved.representation(),
+                    MediaRepresentation::buffered_unknown(),
+                    "an unrecognized suffix must stay explicitly unknown"
+                );
+            }
+        }
         service.finish().await;
     }
 

@@ -647,7 +647,9 @@ mod tests {
         let client =
             JellyfinClient::new("https://media.example.test", &api_key, "user-id").expect("client");
 
-        let stream = client.resolved_stream_request("track-id", MediaRepresentation::buffered_unknown()).unwrap();
+        let stream = client
+            .resolved_stream_request("track-id", MediaRepresentation::buffered_unknown())
+            .unwrap();
         let artwork = client.resolved_artwork_request("album-id").unwrap();
         assert_eq!(stream.endpoint().query(), Some("static=true"));
         assert!(artwork.endpoint().query().is_none());
@@ -888,7 +890,9 @@ mod tests {
         .expect("routed client");
 
         for request in [
-            client.resolved_stream_request("track-id", MediaRepresentation::buffered_unknown()).unwrap(),
+            client
+                .resolved_stream_request("track-id", MediaRepresentation::buffered_unknown())
+                .unwrap(),
             client.resolved_artwork_request("album-id").unwrap(),
         ] {
             assert_eq!(request.advertised_route(), Some(&route));
