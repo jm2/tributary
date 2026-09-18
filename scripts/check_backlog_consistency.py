@@ -23,13 +23,15 @@
 #     python3 scripts/check_backlog_consistency.py
 #     python3 scripts/check_backlog_consistency.py --ledger path/to/snapshot.json
 #
-# Exit status is 0 when every check passes and 1 when any check fails.
+# Exit status is 0 when every check passes, 1 when any check fails, and 2
+# when a supplied file (the task index or the ledger snapshot) is missing.
 
 from __future__ import annotations
 
 import argparse
 import json
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,15 +47,32 @@ ARCHIVED_INDEX_NAME = "docs/task-remediation-2026-07.md"
 # stable ID (for example ``- [x] **P1.5-A** — ...`` or ``- [ ] **R1 — ...**``).
 RECORD_PATTERN = re.compile(r"^- \[(?P<mark>[ xX])\] \*\*(?P<id>[^*\s]+)")
 
+# Any top-level checkbox, regardless of title shape.  A checkbox that does
+# not also match RECORD_PATTERN is not a countable record and must be
+# reported instead of silently omitted.
+CHECKBOX_PATTERN = re.compile(r"^- \[(?P<mark>[ xX])\]")
+
 # Inline Markdown links, images and link reference definitions.  Reference-style
 # *inline* links (`[text][label]`) are not used in this repository; definitions
-# are validated so a future relative definition cannot rot silently.
+# are validated so a future relative definition cannot rot silently.  A
+# destination may be wrapped in angle brackets, which is the Markdown escape
+# for destinations containing spaces (``[text](<my file.md>)``).
 INLINE_LINK = re.compile(
-    r"(?P<bang>!?)\[(?P<text>[^\]]*)\]\((?P<target>[^)\s]+)(?:\s+\"[^\"]*\")?\)"
+    r"(?P<bang>!?)\[(?P<text>[^\]]*)\]\(\s*"
+    r"(?:<(?P<angled>[^<>]*)>|(?P<plain>[^)\s]+))"
+    r"(?:\s+\"[^\"]*\")?\s*\)"
 )
 DEFINITION_LINK = re.compile(r"^\[(?P<label>[^\]]+)\]:\s*(?P<target>\S+)")
 HEADING = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<title>.*?)\s*#*\s*$")
 ABSOLUTE_TARGET = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
+
+# One fenced code block opening line.  CommonMark fences are three or more
+# backticks or tildes; the closing fence must use the same character and be
+# at least as long as the opening run, so a fence must be tracked by its
+# full delimiter run, not merely its first three characters.
+FENCE_PATTERN = re.compile(
+    r"^(?P<indent> {0,3})(?P<fence>(?P<char>[`~])(?P=char){2,})(?P<info>.*)$"
+)
 PERCENT_COUNTER = re.compile(
     r"\*\*(?P<complete>\d+)/(?P<total>\d+)\s*\((?P<percent>\d+(?:\.\d+)?)%\)\*\*"
 )
@@ -122,18 +141,33 @@ def iter_content_lines(text: str) -> Iterable[tuple[int, str]]:
     """Yield ``(line_number, line)`` pairs outside fenced code blocks."""
     # Fenced code blocks frequently contain shell snippets whose ``#`` comment
     # lines would otherwise be mistaken for headings and whose bracketed text
-    # would be mistaken for links.
-    fence: str | None = None
+    # would be mistaken for links.  Fences are tracked by their delimiter
+    # character and full opening run: a four-backtick fence is closed only by
+    # a run of four or more backticks, so a triple-backtick line inside it
+    # stays literal content, and a tilde fence is never closed by backticks.
+    fence_char: str | None = None
+    fence_len = 0
     for number, line in enumerate(text.splitlines(), start=1):
-        stripped = line.lstrip()
-        if fence is None:
-            if stripped.startswith("```") or stripped.startswith("~~~"):
-                fence = stripped[:3]
-            else:
+        if fence_char is None:
+            opening = FENCE_PATTERN.match(line)
+            if opening is None:
                 yield number, line
+                continue
+            char = opening.group("char")
+            info = opening.group("info")
+            if char == "`" and "`" in info:
+                # CommonMark: a backtick run whose info string contains a
+                # backtick is literal text, not a fence opener.
+                yield number, line
+                continue
+            fence_char = char
+            fence_len = len(opening.group("fence"))
             continue
-        if stripped.startswith(fence):
-            fence = None
+        closing = re.fullmatch(
+            r" {0,3}" + re.escape(fence_char) + r"{" + str(fence_len) + r",} *", line
+        )
+        if closing is not None:
+            fence_char = None
 
 
 def parse_records(text: str) -> list[Record]:
@@ -150,6 +184,23 @@ def parse_records(text: str) -> list[Record]:
                 )
             )
     return records
+
+
+def check_record_shapes(text: str, task_index: Path) -> list[str]:
+    """Report top-level checkboxes that are not countable stable-ID records."""
+    # A top-level checkbox without the bold stable-ID prefix is silently
+    # skipped by parse_records (it is not a countable record), which would
+    # let a malformed or missing ID hide from the counters and the mappings.
+    # Report it with its source line so the omission is loud.
+    display = task_index.name
+    problems: list[str] = []
+    for number, line in iter_content_lines(text):
+        if CHECKBOX_PATTERN.match(line) and not RECORD_PATTERN.match(line):
+            problems.append(
+                f"record: {display}:{number}: top-level checkbox has no bold "
+                f"stable ID and is not a countable record: {line.strip()!r}"
+            )
+    return problems
 
 
 def slugify(heading: str) -> str:
@@ -176,12 +227,13 @@ def document_anchors(path: Path) -> set[str]:
     return anchors
 
 
-def collect_markdown_files(root: Path) -> list[Path]:
-    """Return every Markdown file below *root* that is worth link-checking."""
+def _walked_markdown_files(root: Path) -> list[Path]:
+    """Walk *root* and return every Markdown file worth link-checking."""
     # A recursive walk with a fixed skip list keeps this a pure-Python, static
     # operation: no subprocess, no shell, no PATH dependence.  The skip list
-    # covers VCS metadata, build output and scratch/operations trees, so the
-    # result matches the tracked file set for a normal checkout.
+    # covers VCS metadata, build output and scratch/operations trees.  This is
+    # the documented fallback for non-Git synthetic/tarball roots, where no
+    # index exists to define the tracked file set.
     return sorted(
         path
         for path in root.rglob("*.md")
@@ -189,11 +241,47 @@ def collect_markdown_files(root: Path) -> list[Path]:
     )
 
 
+def _tracked_markdown_files(root: Path) -> list[Path] | None:
+    """Return index-authoritative Markdown files, or ``None`` outside a Git checkout."""
+    # In a Git checkout the index decides which files are tracked; an
+    # untracked scratch file must not fail validation.  The Git invocation is
+    # safe and statically defined: a fixed argument-vector command, no shell,
+    # no user-supplied input beyond the checkout root.
+    if not (root / ".git").exists():
+        return None
+    try:
+        completed = subprocess.run(  # nosec B603, B607 - fixed argv, no shell
+            ["git", "-C", str(root), "ls-files", "-z", "--", "*.md"],
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    listing = completed.stdout.decode("utf-8", errors="surrogateescape")
+    return sorted(root / relative for relative in listing.split("\0") if relative)
+
+
+def collect_markdown_files(root: Path) -> list[Path]:
+    """Return every Markdown file below *root* that is worth link-checking."""
+    tracked = _tracked_markdown_files(root)
+    if tracked is not None:
+        return tracked
+    return _walked_markdown_files(root)
+
+
 def iter_link_targets(line: str) -> Iterable[str]:
     """Yield every link target written on one content line."""
     for match in INLINE_LINK.finditer(line):
         if not match.group("bang"):
-            yield match.group("target")
+            # An angle-bracket destination (``<my file.md>``) and a plain
+            # destination are mutually exclusive; exactly one group matches.
+            target = match.group("angled")
+            if target is None:
+                target = match.group("plain")
+            yield target
     definition = DEFINITION_LINK.match(line)
     if definition:
         yield definition.group("target")
@@ -422,6 +510,17 @@ def _check_link_target(
         return problems
     relative = relative_display(root, source)
     target_path = (source if not path_part else source.parent / path_part).resolve()
+    try:
+        target_path.relative_to(root)
+    except ValueError:
+        # ``resolve`` fully normalizes ``..`` segments and symlinks, so a
+        # target that lands outside *root* is an escape (including a symlink
+        # that points out of the checkout), not a valid in-tree reference.
+        problems.append(
+            f"link: {relative}:{number}: link target '{target}' resolves outside "
+            f"the repository root ({relative_display(root, target_path)})"
+        )
+        return problems
     if not target_path.exists():
         problems.append(f"link: {relative}:{number}: broken link target '{target}'")
         return problems
@@ -630,6 +729,10 @@ def run_checks(
     markdown_files = collect_markdown_files(root)
 
     problems: list[str] = []
+    # Malformed records are reported before the counters and mappings they
+    # would silently skew: a checkbox that parse_records skips still has to
+    # surface as a finding.
+    problems.extend(check_record_shapes(text, task_index))
     problems.extend(check_unique_ids(records, root, task_index))
     problems.extend(check_counters(text, records))
     problems.extend(check_archived_counter(text, root))
