@@ -276,9 +276,19 @@ pub mod widget_test_session {
             // GTK is already up. Refuse to hand the session to a second
             // thread: gtk-rs asserts GTK is used from its initializing
             // thread, and the crate deliberately keeps one GTK test so this
-            // never trips in practice. Recording the observing thread when
-            // no owner was captured keeps externally-initialized GTK from
-            // being falsely attributed to a later caller.
+            // never trips in practice. Reject an externally initialized
+            // session observed from a foreign thread BEFORE recording
+            // ownership — otherwise get_or_init would capture this thread
+            // as the owner and the check below would pass vacuously while
+            // every widget call here runs off GTK's actual main thread.
+            assert!(
+                gtk::is_initialized_main_thread(),
+                "GTK widget gate ({label}): GTK was initialized on another \
+                 thread but {label} is running on {current:?}. GTK must be \
+                 exercised from the single thread that initialized it; fold \
+                 this contract into that session instead of starting a \
+                 second GTK test."
+            );
             let owner = *gtk_owner().get_or_init(|| current);
             assert!(
                 owner == current,
