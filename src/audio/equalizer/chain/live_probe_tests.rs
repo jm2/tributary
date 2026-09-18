@@ -106,33 +106,63 @@ fn wait_for_live_buffers(delivered: &AtomicUsize) {
     );
 }
 
-/// Arm a held callback, run one clip-protection swap on the caller's
-/// thread, and return the *adopted* outcome plus the thread the held
-/// callback ran on. The swap must **return while the callback is still
-/// held** — a parked transaction, never an awaited one (refinery R1) —
-/// so the helper asserts the parked invariants and the main context's
-/// progress at that moment, then releases, adopts the completion with a
-/// bounded poll, and reports it.
-fn swap_across_engagement_window(
+/// Fresh-chain attempts the live fixtures get to produce the
+/// asynchronous-dispatch scenario. The dispatch is asynchronous only
+/// while the eq src pad is mid-push at `add_probe` time; an install
+/// landing in the inter-buffer gap instead runs the callback
+/// synchronously on the caller's thread — a legitimate production path
+/// with its own immediate-outcome handling that the parked-transaction
+/// regressions do not exercise — and a pre-engagement timeout cancels
+/// the edit outright. A discarded attempt is retried on a fresh chain;
+/// only exhaustion of all attempts fails the test.
+const ASYNC_DISPATCH_ATTEMPTS: usize = 4;
+
+/// A parked edit whose surgery is still held on the streaming thread,
+/// plus the handles needed to let it finish.
+struct HeldParkedEdit {
+    hold: Arc<ProbeEditHold>,
+    releaser: std::thread::JoinHandle<bool>,
+}
+
+/// Arm a held callback and run one clip-protection swap on the caller's
+/// thread, parking the transaction **while the callback is still held**
+/// — a parked transaction, never an awaited one (refinery R1) — so the
+/// helper asserts the parked invariants and the main context's progress
+/// at that moment. Returns `None` — with the attempt unwound — when the
+/// scenario did not materialize: the pad was idle at install time, so
+/// the callback ran synchronously inside `add_probe` on the caller's
+/// thread (or a late dispatch was cancelled pre-engagement), no
+/// transaction parked, and the caller retries on a fresh chain.
+fn park_edit_across_the_engagement_window(
     live: &mut LiveEqChain,
-    hold: &Arc<ProbeEditHold>,
     target: ClipProtection,
-) -> (Option<bool>, Option<std::thread::ThreadId>) {
-    live.chain.inject_probe_edit_hold(Arc::clone(hold));
+) -> Option<HeldParkedEdit> {
+    let hold = Arc::new(ProbeEditHold::new());
+    live.chain.inject_probe_edit_hold(Arc::clone(&hold));
     let releaser = std::thread::spawn({
-        let hold = Arc::clone(hold);
+        let hold = Arc::clone(&hold);
         move || {
-            assert!(
-                hold.wait_until_entered(Duration::from_secs(5)),
-                "the async probe callback never engaged"
-            );
+            // No assert: an abandoned attempt must unwind cleanly.
+            if !hold.wait_until_entered(Duration::from_secs(5)) {
+                return false;
+            }
             // Hold the executing edit across the caller's engagement
             // window: an unconditional cancel would remove the probe here.
             std::thread::sleep(LIMITER_PROBE_ENGAGE_TIMEOUT + Duration::from_millis(100));
             hold.release();
+            true
         }
     });
     let result = live.chain.swap_clip_protection_under_block_probe(target);
+    if !live.chain.has_pending_limiter_edit() {
+        // Not the regression scenario: the swap completed (or was
+        // cancelled) without parking a transaction. Abandon the hold so
+        // the releaser never waits out its entry timeout on a callback
+        // that already ran or will never run, and let the caller retry.
+        hold.abandon();
+        let _ = releaser.join();
+        return None;
+    }
     assert!(
         hold.wait_until_entered(Duration::from_secs(5)),
         "the async probe callback never engaged"
@@ -150,9 +180,60 @@ fn swap_across_engagement_window(
         "the engaged edit must be parked as a pending transaction"
     );
     assert_main_context_progresses_while_held();
-    releaser.join().expect("releaser thread");
+    Some(HeldParkedEdit { hold, releaser })
+}
+
+/// Let the parked surgery finish, adopt its outcome with a bounded
+/// poll, and report the adoption plus the thread the held callback ran
+/// on.
+fn release_and_adopt_parked_edit(
+    live: &mut LiveEqChain,
+    parked: HeldParkedEdit,
+) -> (Option<bool>, Option<std::thread::ThreadId>) {
+    let engaged = parked.releaser.join().expect("releaser thread");
+    assert!(engaged, "the held edit released without engaging the hold");
     let adopted = adopt_pending_with_deadline(live);
-    (adopted, hold.callback_thread())
+    (adopted, parked.hold.callback_thread())
+}
+
+/// Run `scenario` on fresh live chains until the blocking probe
+/// dispatches asynchronously (the scenario the parked-transaction
+/// regressions exercise), returning the surviving chain plus the
+/// scenario's value. A scenario that reports the edit did not park
+/// (`None` from the scenario) is discarded and retried on a fresh
+/// chain — synchronous dispatch is a legitimate production path these
+/// regressions do not cover. Fails the test only after every attempt
+/// came back non-materialized. Returns `None` when the gstreamer
+/// plugins are unavailable and the caller must skip the regression.
+fn retry_until_async_dispatch<T>(
+    clip_protection: ClipProtection,
+    mut scenario: impl FnMut(&mut LiveEqChain) -> Option<T>,
+) -> Option<(LiveEqChain, T)> {
+    for _ in 0..ASYNC_DISPATCH_ATTEMPTS {
+        let mut live = LiveEqChain::start(clip_protection)?;
+        if let Some(value) = scenario(&mut live) {
+            return Some((live, value));
+        }
+        live.stop();
+    }
+    panic!(
+        "the live eq pipeline never dispatched an edit asynchronously \
+         in {ASYNC_DISPATCH_ATTEMPTS} fresh-chain attempts"
+    );
+}
+
+/// Assert the eq src pad is unprobed: the pre-edit state the fixtures
+/// start from.
+fn assert_no_probe_installed_yet(live: &LiveEqChain) {
+    assert!(
+        !live
+            .chain
+            .eq
+            .static_pad("src")
+            .expect("eq src pad")
+            .is_blocked(),
+        "no probe is installed before the edit"
+    );
 }
 
 /// While the surgery is held on the streaming thread, the caller's main
@@ -210,22 +291,20 @@ fn adopt_pending_with_deadline(live: &mut LiveEqChain) -> Option<bool> {
 /// cancelling the edit and reporting an unconfirmed `None`.
 #[test]
 fn async_probe_edit_crossing_the_engagement_window_retains_a_valid_rollback() {
-    let Some(mut live) = LiveEqChain::start(ClipProtection::Soft) else {
+    let caller_thread = std::thread::current().id();
+    let Some((mut live, (result, callback_thread))) =
+        retry_until_async_dispatch(ClipProtection::Soft, |live| {
+            assert!(live.chain.clip_protection_installed());
+            assert_no_probe_installed_yet(live);
+            live.chain
+                .inject_limiter_remove_fault(LimiterRemoveFault::DirectRelinkBlocked);
+            let parked = park_edit_across_the_engagement_window(live, ClipProtection::Off)?;
+            Some(release_and_adopt_parked_edit(live, parked))
+        })
+    else {
         return;
     };
-    assert!(live.chain.clip_protection_installed());
     let eq_src = live.chain.eq.static_pad("src").expect("eq src pad");
-    assert!(
-        !eq_src.is_blocked(),
-        "no probe is installed before the edit"
-    );
-    live.chain
-        .inject_limiter_remove_fault(LimiterRemoveFault::DirectRelinkBlocked);
-
-    let hold = Arc::new(ProbeEditHold::new());
-    let caller_thread = std::thread::current().id();
-    let (result, callback_thread) =
-        swap_across_engagement_window(&mut live, &hold, ClipProtection::Off);
 
     assert_ne!(
         callback_thread,
@@ -266,18 +345,19 @@ fn async_probe_edit_crossing_the_engagement_window_retains_a_valid_rollback() {
 /// the fallback can never resume an unlinked graph.
 #[test]
 fn async_probe_edit_crossing_the_engagement_window_keeps_an_unlinked_rollback_wedged() {
-    let Some(mut live) = LiveEqChain::start(ClipProtection::Soft) else {
+    let caller_thread = std::thread::current().id();
+    let Some((mut live, (result, callback_thread))) =
+        retry_until_async_dispatch(ClipProtection::Soft, |live| {
+            assert!(live.chain.clip_protection_installed());
+            live.chain
+                .inject_limiter_remove_fault(LimiterRemoveFault::EveryLinkBlocked);
+            let parked = park_edit_across_the_engagement_window(live, ClipProtection::Off)?;
+            Some(release_and_adopt_parked_edit(live, parked))
+        })
+    else {
         return;
     };
-    assert!(live.chain.clip_protection_installed());
     let eq_src = live.chain.eq.static_pad("src").expect("eq src pad");
-    live.chain
-        .inject_limiter_remove_fault(LimiterRemoveFault::EveryLinkBlocked);
-
-    let hold = Arc::new(ProbeEditHold::new());
-    let caller_thread = std::thread::current().id();
-    let (result, callback_thread) =
-        swap_across_engagement_window(&mut live, &hold, ClipProtection::Off);
 
     assert_ne!(
         callback_thread,
@@ -317,16 +397,16 @@ fn async_probe_edit_crossing_the_engagement_window_keeps_an_unlinked_rollback_we
 /// a failure.
 #[test]
 fn pending_edit_across_the_engagement_window_adopts_a_clean_insertion() {
-    let Some(mut live) = LiveEqChain::start(ClipProtection::Off) else {
+    let Some((mut live, result)) = retry_until_async_dispatch(ClipProtection::Off, |live| {
+        assert!(!live.chain.clip_protection_installed());
+        assert_no_probe_installed_yet(live);
+        let parked = park_edit_across_the_engagement_window(live, ClipProtection::Soft)?;
+        let (adopted, _) = release_and_adopt_parked_edit(live, parked);
+        Some(adopted)
+    }) else {
         return;
     };
-    assert!(!live.chain.clip_protection_installed());
     let eq_src = live.chain.eq.static_pad("src").expect("eq src pad");
-    assert!(!eq_src.is_blocked());
-
-    let hold = Arc::new(ProbeEditHold::new());
-    let (result, _callback_thread) =
-        swap_across_engagement_window(&mut live, &hold, ClipProtection::Soft);
 
     assert_eq!(
         result,
@@ -353,15 +433,15 @@ fn pending_edit_across_the_engagement_window_adopts_a_clean_insertion() {
 /// leaves the direct post-convert link routed.
 #[test]
 fn pending_edit_across_the_engagement_window_adopts_a_clean_removal() {
-    let Some(mut live) = LiveEqChain::start(ClipProtection::Soft) else {
+    let Some((mut live, result)) = retry_until_async_dispatch(ClipProtection::Soft, |live| {
+        assert!(live.chain.clip_protection_installed());
+        let parked = park_edit_across_the_engagement_window(live, ClipProtection::Off)?;
+        let (adopted, _) = release_and_adopt_parked_edit(live, parked);
+        Some(adopted)
+    }) else {
         return;
     };
-    assert!(live.chain.clip_protection_installed());
     let eq_src = live.chain.eq.static_pad("src").expect("eq src pad");
-
-    let hold = Arc::new(ProbeEditHold::new());
-    let (result, _callback_thread) =
-        swap_across_engagement_window(&mut live, &hold, ClipProtection::Off);
 
     assert_eq!(
         result,
@@ -383,43 +463,29 @@ fn pending_edit_across_the_engagement_window_adopts_a_clean_removal() {
 /// the adopted topology is the *first* edit's request.
 #[test]
 fn a_second_edit_is_refused_while_a_transaction_is_parked() {
-    let Some(mut live) = LiveEqChain::start(ClipProtection::Soft) else {
+    let Some((mut live, adopted)) = retry_until_async_dispatch(ClipProtection::Soft, |live| {
+        // First edit: removal (Off) — parks once the callback engages.
+        let parked = park_edit_across_the_engagement_window(live, ClipProtection::Off)?;
+
+        // Second edit over the in-flight graph: refused outright.
+        let second = live
+            .chain
+            .swap_clip_protection_under_block_probe(ClipProtection::Soft);
+        assert_eq!(
+            second, None,
+            "a conflicting edit over a parked transaction reports no outcome"
+        );
+        assert!(
+            live.chain.has_pending_limiter_edit(),
+            "the second edit must not replace or disturb the parked transaction"
+        );
+        assert_main_context_progresses_while_held();
+
+        let (adopted, _) = release_and_adopt_parked_edit(live, parked);
+        Some(adopted)
+    }) else {
         return;
     };
-    let hold = Arc::new(ProbeEditHold::new());
-    live.chain.inject_probe_edit_hold(Arc::clone(&hold));
-    let releaser = std::thread::spawn({
-        let hold = Arc::clone(&hold);
-        move || {
-            assert!(hold.wait_until_entered(Duration::from_secs(5)));
-            std::thread::sleep(LIMITER_PROBE_ENGAGE_TIMEOUT + Duration::from_millis(100));
-            hold.release();
-        }
-    });
-
-    // First edit: removal (Off) — parks once the callback engages.
-    let first = live
-        .chain
-        .swap_clip_protection_under_block_probe(ClipProtection::Off);
-    assert_eq!(first, None, "the engaged edit parks instead of waiting");
-    assert!(live.chain.has_pending_limiter_edit());
-
-    // Second edit over the in-flight graph: refused outright.
-    let second = live
-        .chain
-        .swap_clip_protection_under_block_probe(ClipProtection::Soft);
-    assert_eq!(
-        second, None,
-        "a conflicting edit over a parked transaction reports no outcome"
-    );
-    assert!(
-        live.chain.has_pending_limiter_edit(),
-        "the second edit must not replace or disturb the parked transaction"
-    );
-    assert_main_context_progresses_while_held();
-
-    releaser.join().expect("releaser thread");
-    let adopted = adopt_pending_with_deadline(&mut live);
     assert_eq!(adopted, Some(true), "the first edit's removal is adopted");
     assert!(
         !live.chain.clip_protection_installed(),
@@ -496,33 +562,35 @@ fn a_pending_edit_that_never_publishes_wedges_conservatively() {
 /// stranded handle visible to the caller.
 #[test]
 fn a_pending_edit_torn_down_before_completion_makes_a_late_publication_harmless() {
-    let Some(mut live) = LiveEqChain::start(ClipProtection::Soft) else {
+    for _ in 0..ASYNC_DISPATCH_ATTEMPTS {
+        let Some(mut live) = LiveEqChain::start(ClipProtection::Soft) else {
+            return;
+        };
+        let Some(parked) = park_edit_across_the_engagement_window(&mut live, ClipProtection::Off)
+        else {
+            live.stop();
+            continue;
+        };
+
+        // Tear the pipeline down and drop the chain — transaction
+        // included — while the surgery is still executing on the
+        // streaming thread.
+        live.stop();
+        let LiveEqChain { chain, .. } = live;
+        drop(chain);
+
+        // The callback finishes after teardown and its publication finds
+        // the receiver gone; joining proves the streaming thread unwound
+        // cleanly.
+        let engaged = parked
+            .releaser
+            .join()
+            .expect("the callback must survive teardown");
+        assert!(engaged, "the held edit released without engaging the hold");
         return;
-    };
-    let hold = Arc::new(ProbeEditHold::new());
-    live.chain.inject_probe_edit_hold(Arc::clone(&hold));
-    let releaser = std::thread::spawn({
-        let hold = Arc::clone(&hold);
-        move || {
-            assert!(hold.wait_until_entered(Duration::from_secs(5)));
-            std::thread::sleep(LIMITER_PROBE_ENGAGE_TIMEOUT + Duration::from_millis(100));
-            hold.release();
-        }
-    });
-
-    let parked = live
-        .chain
-        .swap_clip_protection_under_block_probe(ClipProtection::Off);
-    assert_eq!(parked, None);
-    assert!(live.chain.has_pending_limiter_edit());
-
-    // Tear the pipeline down and drop the chain — transaction included —
-    // while the surgery is still executing on the streaming thread.
-    live.stop();
-    let LiveEqChain { chain, .. } = live;
-    drop(chain);
-
-    // The callback finishes after teardown and its publication finds the
-    // receiver gone; joining proves the streaming thread unwound cleanly.
-    releaser.join().expect("the callback must survive teardown");
+    }
+    panic!(
+        "the live eq pipeline never dispatched an edit asynchronously \
+         in {ASYNC_DISPATCH_ATTEMPTS} fresh-chain attempts"
+    );
 }
