@@ -85,23 +85,34 @@ GDK_BACKEND=broadway BROADWAY_DISPLAY=:97 DISPLAY=:97 \
 
 ## Recorded baselines and budgets
 
-Runner: **gastown.furiosa dev worktree (tr-am6qr), linux, debug
-profile, GTK via `gtk4-broadwayd`** — 2026-09-18, pre-optimization.
-Debug-profile numbers are upper bounds by nature; an optimized build
-only gets faster, so budgets below carry that slack deliberately.
+Budgets agreed 2026-09-18 pre-optimization. Debug-profile numbers are
+upper bounds by nature; an optimized build only gets faster, so budgets
+below carry that slack deliberately.
+
+Engine numbers were **re-measured with the corrected arrival-time
+sampler** (PR #291 review Correction 1: the first sampler revision
+stamped each event before the `select!` wait, underreporting the
+startup endpoints — most visibly `startup_server_ready_ms`, which had
+been recorded as ~0.1 ms but is really ~2.3 ms on comparable runners).
+The corrected engine table below is from runner **gastown.rictus dev
+worktree (tr-am6qr), linux, debug profile** — 2026-09-18, 3 runs. The
+GTK table keeps the original **gastown.furiosa** numbers: the sampler
+defect touched only the engine timeline, not the `display_tracks`
+measurement path. Re-run the harnesses on a different runner before
+trusting the numbers elsewhere.
 
 ### Engine (400-row fixture unless noted)
 
 | Metric | Measured (3 runs) | Budget |
 | --- | --- | --- |
-| `startup_server_ready_ms` | 0.09 – 0.20 | < 5 |
-| `startup_fullsync_ms` | 404 – 470 | < 800 |
-| `startup_scan_settle_ms` | 428 – 494 | < 900 |
-| `post_scan_drain_ms` | 0.7 – 0.9 | < 5 |
-| `cancellation_flush_settle_ms` | 429 – 495 | < 900 |
+| `startup_server_ready_ms` | 2.25 – 2.33 | < 5 |
+| `startup_fullsync_ms` | 366 – 415 | < 800 |
+| `startup_scan_settle_ms` | 369 – 417 | < 900 |
+| `post_scan_drain_ms` | 0.65 – 0.75 | < 5 |
+| `cancellation_flush_settle_ms` | 369 – 418 | < 900 |
 
 Scaling point (`TRIBUTARY_Q4_TRACKS=4000`): `startup_fullsync_ms`
-≈ 4061, `startup_scan_settle_ms` ≈ 4225 (~1 ms/row in debug) — scan
+≈ 4362, `startup_scan_settle_ms` ≈ 4370 (~1.1 ms/row in debug) — scan
 cost is linear in file count, so large-library behaviour is owned by
 the parse-side lane's budgets, not doubled here.
 `scan_progress_events` ≈ 8 at 400 rows / 80 at 4000 rows.
@@ -122,9 +133,11 @@ the parse-side lane's budgets, not doubled here.
 - Scan publication (`startup_fullsync_ms`) dominates startup on the
   engine side at every fixture size; GTK publication adds only tens of
   ms at 10k rows (single-digit ms at 1k) in debug.
-- The during-scan settlement contract holds with margin: the `Flush`
-  ack lands within ~2 ms of `ScanComplete` across all runs, and the
-  admitted command publishes strictly after the scan settles.
-- No endpoint above misses its budget on this runner today; the
-  harnesses exist so the next regression or optimization is measured
-  against an agreed budget instead of vibes.
+- The during-scan settlement contract holds with margin: with the
+  corrected sampler the `Flush` ack lands ~0.7 ms after `ScanComplete`
+  on the engine-table runner, and the admitted command publishes
+  strictly after the scan settles.
+- No endpoint above misses its budget on its recorded runner today;
+  the harnesses exist so the next regression or optimization is
+  measured against an agreed budget instead of vibes. All budgets
+  still hold with the corrected sampler — none had to move.
