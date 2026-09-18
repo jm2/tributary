@@ -3310,6 +3310,143 @@ impl ProvenanceClaims {
     }
 }
 
+/// Cross-module test fixture for admission seams that must exercise the real
+/// registry mint path with an authenticated-remote adapter.
+///
+/// Lives beside the registry machinery (not inside `mod tests`) so other
+/// modules' test suites can drive genuine
+/// [`SourceRegistry::mint_session_playback_source`] and
+/// [`SourceRegistry::try_admit_playback_action`] flows without duplicating
+/// the in-module fake probe. Compiled only under `cfg(test)`.
+#[cfg(test)]
+pub(crate) mod playback_attribution_fixture {
+    use super::sealed::AbortableSourceAdapter as SealedAbortable;
+    use super::{
+        AdapterCloseFuture, CatalogueFuture, CloseAuthority, ManagedSourceAdapter,
+        PlaybackAttributionCapability, PlaybackAttributionProfile, SourceProvenance,
+        SourceRegistry, Track, TrackId, lock,
+    };
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// Minimal authenticated-remote adapter: publishes one fixed initial
+    /// catalogue and serves per-track attribution profiles from a private
+    /// map. Every other adapter capability stays at its deny-by-default.
+    pub(crate) struct FixtureRemoteAdapter {
+        catalogue: Vec<Track>,
+        profiles: Mutex<HashMap<TrackId, PlaybackAttributionProfile>>,
+    }
+
+    impl FixtureRemoteAdapter {
+        pub(crate) fn new(catalogue: Vec<Track>) -> Self {
+            Self {
+                catalogue,
+                profiles: Mutex::new(HashMap::new()),
+            }
+        }
+
+        pub(crate) fn with_profile(
+            self,
+            track_id: TrackId,
+            profile: PlaybackAttributionProfile,
+        ) -> Self {
+            lock(&self.profiles).insert(track_id, profile);
+            self
+        }
+    }
+
+    impl super::LifecycleAdapter for FixtureRemoteAdapter {
+        fn close(self: Arc<Self>, _authority: CloseAuthority) -> AdapterCloseFuture {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl ManagedSourceAdapter for FixtureRemoteAdapter {
+        fn playback_attribution_capability(&self) -> PlaybackAttributionCapability {
+            PlaybackAttributionCapability::AuthenticatedRemote
+        }
+
+        fn playback_attribution_profile(
+            &self,
+            track_id: &TrackId,
+        ) -> Option<PlaybackAttributionProfile> {
+            lock(&self.profiles).get(track_id).cloned()
+        }
+
+        fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
+            Box::pin(async move { Ok(self.catalogue.clone()) })
+        }
+    }
+
+    impl SealedAbortable for FixtureRemoteAdapter {}
+    impl super::AbortableSourceAdapter for FixtureRemoteAdapter {}
+
+    /// Catalogue row for one exact native track ID with fixed fixture
+    /// metadata, suitable for [`FixtureRemoteAdapter::new`].
+    pub(crate) fn fixture_track(track_id: TrackId) -> Track {
+        Track {
+            id: uuid::Uuid::new_v4(),
+            native_track_id: Some(track_id),
+            title: "Fixture Row Title".to_string(),
+            artist_name: "Fixture Row Artist".to_string(),
+            album_artist_name: None,
+            artist_id: None,
+            album_title: "Fixture Row Album".to_string(),
+            album_id: None,
+            track_number: None,
+            disc_number: None,
+            duration_secs: Some(181),
+            composer: None,
+            genre: None,
+            year: None,
+            file_path: None,
+            stream_url: None,
+            cover_art_url: None,
+            date_added: None,
+            date_modified: None,
+            bitrate_kbps: None,
+            sample_rate_hz: None,
+            format: None,
+            play_count: None,
+            rating: crate::architecture::models::TrackRating::unsupported(),
+            last_played: None,
+        }
+    }
+
+    /// Claim Saved provenance, connect the fixture adapter, and resolve once
+    /// the initial catalogue is accepted. Returns the live session epoch the
+    /// caller must pass to [`SourceRegistry::mint_session_playback_source`].
+    pub(crate) async fn connect_saved_remote(
+        registry: &SourceRegistry,
+        source_id: crate::architecture::SourceId,
+        adapter: FixtureRemoteAdapter,
+    ) -> u64 {
+        registry
+            .claim_provenance(source_id, SourceProvenance::Saved)
+            .expect("fixture remote provenance claim");
+        registry
+            .connect_standard::<FixtureRemoteAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(adapter) },
+            )
+            .expect("fixture remote connection admitted");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(catalogue) = registry
+                    .snapshot(source_id)
+                    .and_then(|snapshot| snapshot.catalogue)
+                {
+                    return catalogue.session_epoch;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture remote catalogue accepted")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
