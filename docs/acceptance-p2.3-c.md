@@ -28,13 +28,32 @@ require a physical desktop session.
 
 ## Disposition of the original #29 asks
 
-| Issue ask | Merged disposition |
-|-----------|--------------------|
-| Remove track separation lines | `show_row_separators(false)` on the tracklist; Adwaita's dense-list vertical rhythm (`.data-table .cell { min-height: 24px }`) replaces the grid look (`src/ui/tracklist.rs`, `src/ui/style.css`). |
-| Drop section separators, differentiate by colour (GNOME file browser style) | Browser panes keep a single 1px gutter whose contrast is toned to `opacity: 0.15` so it reads as a gutter, not a divider (`style.css` documents the HIG rationale and the standard-CSS constraint). Disabled panes hand their gutter to the next surviving pane; no gutter dangles at a window edge (`src/ui/preferences.rs`). |
-| Item counts darker / lower opacity | Counts render as a dedicated dimmed caption label (`.browser-count { opacity: 0.75 }` on top of `dim-label caption numeric`), scoped so the header-bar scrubber is unaffected; zero-count rows render no "(0)" (`src/ui/browser.rs`). |
-| Left align all columns (especially time) | Text columns (Title, Artist, Album, Genre, Composer, Date Modified) are left-aligned. Numeric columns (`#`, Time, Year, Bitrate, Sample Rate, Plays) remain right-aligned (`src/ui/tracklist.rs` `add_sorted_column` call sites), the standard treatment for numeric magnitude comparison; the literal "left align all" ask is therefore only partially adopted, and column-level visual judgment on that divergence belongs to the operator's physical review. |
-| (not asked, part of the same merge) | Status bar aligns via `.statusbar-box` (4px/12px padding, centered content) instead of per-widget margins; screen readers announce each browser row as one utterance ("Artist Name, (12)") at the `GtkListItem` boundary. |
+- **Remove track separation lines** — `show_row_separators(false)` on the
+  tracklist; Adwaita's dense-list vertical rhythm
+  (`.data-table .cell { min-height: 24px }`) replaces the grid look
+  (`src/ui/tracklist.rs`, `src/ui/style.css`).
+- **Drop section separators, differentiate by colour (GNOME file browser
+  style)** — Browser panes keep a single 1px gutter whose contrast is toned
+  to `opacity: 0.15` so it reads as a gutter, not a divider (`style.css`
+  documents the HIG rationale and the standard-CSS constraint). Disabled
+  panes hand their gutter to the next surviving pane; no gutter dangles at a
+  window edge (`src/ui/preferences.rs`).
+- **Item counts darker / lower opacity** — Counts render as a dedicated
+  dimmed caption label (`.browser-count { opacity: 0.75 }` on top of
+  `dim-label caption numeric`), scoped so the header-bar scrubber is
+  unaffected; zero-count rows render no "(0)" (`src/ui/browser.rs`).
+- **Left align all columns (especially time)** — Text columns (Title,
+  Artist, Album, Genre, Composer, Date Modified) are left-aligned. Numeric
+  columns (`#`, Time, Year, Bitrate, Sample Rate, Plays) remain
+  right-aligned (`src/ui/tracklist.rs` `add_sorted_column` call sites), the
+  standard treatment for numeric magnitude comparison; the literal "left
+  align all" ask is therefore only partially adopted, and column-level
+  visual judgment on that divergence belongs to the operator's physical
+  review.
+- **(not asked, part of the same merge)** — Status bar aligns via
+  `.statusbar-box` (4px/12px padding, centered content) instead of
+  per-widget margins; screen readers announce each browser row as one
+  utterance ("Artist Name, (12)") at the `GtkListItem` boundary.
 
 User documentation reconciliation: the `[Unreleased]` → *Changed* →
 "Browser and tracklist presentation" CHANGELOG entry covers all of the above;
@@ -124,21 +143,40 @@ terminates and waits for the daemon this invocation started on every path.
 Results at this head (source tree identical to `730fc36e`; only this document
 changed afterwards):
 
-| Run | Result |
-|-----|--------|
-| Headless negative control, `TRIBUTARY_WIDGET_TESTS_FAIL_CLOSED` unset | Prints `gtk widget contracts test: no display session ($WAYLAND_DISPLAY/$DISPLAY unset); skipping.`, reports `ok`, exit 0 — the deliberate skip-gate proof and the preserved headless-CI behavior. This is the control, not acceptance evidence. |
-| Headless negative control, `TRIBUTARY_WIDGET_TESTS_FAIL_CLOSED=1` | Prints `FAIL-CLOSED positive run: no display session ...; refusing to skip.` and **exits 101** — the code-level gate refuses to let a positive run pass unexercised. |
-| Display-backed full suite (`gtk4-broadwayd :6`, shared runtime dir, fail-closed set) | exit 0; **0** skip diagnostics; contract ok-line present. Top-level libtest totals: `src/lib.rs` unittests 20 + `src/main.rs` unittests 1871 (incl. the consolidated widget contract) + `tests/packaging_metadata.rs` 30 = **1921 passed / 0 failed / 0 ignored**. The additional `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1870 filtered out` line is an internal subprocess re-run of the test binary spawned by `daap::client::tests::protected_daap_and_subsonic_streams_play_to_eos`; it is not a top-level suite and is not counted again. |
-| Display-backed, `GTK_THEME=Adwaita-dark` | Contract filter run: exit 0, no skip diagnostics, contract executed. |
-| Display-backed, `GTK_THEME=Raleigh` (non-Adwaita legacy theme) | Contract filter run: exit 0, no skip diagnostics, contract executed — the a11y contracts are property-level, not theme-dependent. |
-| Display-backed, `GDK_SCALE=2` (200% scaling) | Contract filter run: exit 0, no skip diagnostics, contract executed. |
+- **Headless negative control, `TRIBUTARY_WIDGET_TESTS_FAIL_CLOSED` unset** —
+  Prints
+  `gtk widget contracts test: no display session ($WAYLAND_DISPLAY/$DISPLAY unset); skipping.`,
+  reports `ok`, exit 0 — the deliberate skip-gate proof and the preserved
+  headless-CI behavior. This is the control, not acceptance evidence.
+- **Headless negative control, `TRIBUTARY_WIDGET_TESTS_FAIL_CLOSED=1`** —
+  Prints
+  `FAIL-CLOSED positive run: no display session ...; refusing to skip.` and
+  **exits 101** — the code-level gate refuses to let a positive run pass
+  unexercised.
+- **Display-backed full suite (`gtk4-broadwayd :6`, shared runtime dir,
+  fail-closed set)** — exit 0; **0** skip diagnostics; contract ok-line
+  present. Top-level libtest totals: `src/lib.rs` unittests 20 +
+  `src/main.rs` unittests 1871 (incl. the consolidated widget contract) +
+  `tests/packaging_metadata.rs` 30 = **1921 passed / 0 failed / 0 ignored**.
+  The additional
+  `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1870 filtered out`
+  line is an internal subprocess re-run of the test binary spawned by
+  `daap::client::tests::protected_daap_and_subsonic_streams_play_to_eos`;
+  it is not a top-level suite and is not counted again.
+- **Display-backed, `GTK_THEME=Adwaita-dark`** — Contract filter run:
+  exit 0, no skip diagnostics, contract executed.
+- **Display-backed, `GTK_THEME=Raleigh` (non-Adwaita legacy theme)** —
+  Contract filter run: exit 0, no skip diagnostics, contract executed — the
+  a11y contracts are property-level, not theme-dependent.
+- **Display-backed, `GDK_SCALE=2` (200% scaling)** — Contract filter run:
+  exit 0, no skip diagnostics, contract executed.
 
 Raw logs retained off-repo under
 `${TMPDIR:-/var/tmp}/tr3asjp-evidence.fXit0F/`, sha256-fingerprinted for
 verification (`suite.log` is the retained worked example of the trap: green
 suite, exit 0, one `GTK unavailable` skip — caught by the fail-closed greps):
 
-```
+```text
 b96d924e0899c4e9e94ab7a9e769c855235eb899e0c184e849013d9b28147513  daemon.log
 21b5c1a73cc0d4666e57b1b5bd69ecf7a3d56d85aa00e1c6c1e9235c584ace54  suite.log
 3d251cf2aa0302450be6ecaff44658ae00d8993eaa34a4458c79935ed0fdccf6  negative-control-r2.log
@@ -163,20 +201,31 @@ extracted verbatim from this document, with only a prepended shell
 function or environment for each injection. Run on this host 2026-09-17,
 `gtk4-broadwayd :6`, shared isolated runtime dir, fail-closed set.
 
-| Run | Outcome |
-|-----|---------|
-| Success: published block as written, full suite | **exit 0** in 164 s; contract ok-line present; **0** skip diagnostics; top-level totals 20 + 1871 + 30 = 1921 passed / 0 failed — same profile as the r2 display-backed row above. |
-| Injection: `cargo` returns 101 with a compilation-error line (the R1 repro) | **exit 1** (the r2 block returned 0 here); suite log contains only the injected failure, no contract, no suite. |
-| Injection: `cargo` exits 0 with a green-suite log missing the contract ok-line | **exit 1** — the required-contract check fails a green-but-unexercised run even with cargo at 0 and no skip diagnostics. |
-| Injection: `cargo` exits 0 with the `GTK unavailable` skip diagnostic (plus contract ok-line, to isolate this layer) | **exit 1** — the zero-skip-diagnostic greps still catch a green suite that never exercised the contract. |
-| Injection: `gtk4-broadwayd` replaced by a process that never creates the socket | **exit 1 after ~10 s** (readiness loop exhausts instead of falling through); the injected daemon process is reaped by the EXIT trap — no stray daemon or socket remains. |
+- **Success: published block as written, full suite** — **exit 0** in 164 s;
+  contract ok-line present; **0** skip diagnostics; top-level totals 20 +
+  1871 + 30 = 1921 passed / 0 failed — same profile as the r2 display-backed
+  row above.
+- **Injection: `cargo` returns 101 with a compilation-error line (the R1
+  repro)** — **exit 1** (the r2 block returned 0 here); suite log contains
+  only the injected failure, no contract, no suite.
+- **Injection: `cargo` exits 0 with a green-suite log missing the contract
+  ok-line** — **exit 1** — the required-contract check fails a
+  green-but-unexercised run even with cargo at 0 and no skip diagnostics.
+- **Injection: `cargo` exits 0 with the `GTK unavailable` skip diagnostic
+  (plus contract ok-line, to isolate this layer)** — **exit 1** — the
+  zero-skip-diagnostic greps still catch a green suite that never exercised
+  the contract.
+- **Injection: `gtk4-broadwayd` replaced by a process that never creates the
+  socket** — **exit 1 after ~10 s** (readiness loop exhausts instead of
+  falling through); the injected daemon process is reaped by the EXIT trap —
+  no stray daemon or socket remains.
 
 Raw harness-validation logs retained off-repo under
 `${TMPDIR:-/var/tmp}/tr3asjp-harness-r3/`, sha256-fingerprinted
 (`published-block.sh` is the verbatim extraction of the fenced block
 above at the time of the runs):
 
-```
+```text
 82a0bb9b4a220cc9345787287e64e62241a3b0e0422df7ee290f0cf586b1d69b  published-block.sh
 24f74795b160f186dbbde2c5180ba87d6bda2032c1fb88aa80e0ef76c70849ea  v1-suite.log
 b553eb1cedf8be53aab7f0ef85915d13c17f5c5412b7637c4c7cfe84a92297fa  v1-daemon.log
