@@ -1729,14 +1729,22 @@ mod tests {
         assert_no_preflight_residue(directory.path());
     }
 
-    /// #248 F2: after one target commits, post-save availability is derived
-    /// from the remaining targets, so a recoverable second target keeps Save
-    /// enabled and a retry re-writes only that second target.
-    #[test]
-    fn a_partial_save_recomputes_retry_availability_over_unwritten_targets() {
-        let directory = tempfile::tempdir().expect("create selection fixture");
-        let first = writable_selection(directory.path(), "first.flac");
-        let second = writable_selection(directory.path(), "second.flac");
+    /// #248 F2 scenario shared by the retry-availability tests: two writable
+    /// local targets whose first has already committed through the real
+    /// writer, exactly as the save worker leaves it, so the original list's
+    /// retained evidence is deliberately stale.
+    struct CommittedFirstOfTwo {
+        targets: Vec<SaveTarget>,
+        written_keys: Vec<SaveTargetKey>,
+        second_target: SaveTarget,
+        first_path: PathBuf,
+        second_path: PathBuf,
+        committed_first_bytes: Vec<u8>,
+    }
+
+    fn committed_first_of_two(directory: &std::path::Path) -> CommittedFirstOfTwo {
+        let first = writable_selection(directory, "first.flac");
+        let second = writable_selection(directory, "second.flac");
 
         let first_target = LocalMutationTarget::capture(&first);
         let second_target = LocalMutationTarget::capture(&second);
@@ -1754,28 +1762,51 @@ mod tests {
         first_target
             .write_tags(&first_edits)
             .expect("first target commits");
-        let written_keys = vec![SaveTargetKey::Local(first.clone())];
-        let first_bytes_after_commit =
-            std::fs::read(&first).expect("read the committed first target");
+        let committed_first_bytes = std::fs::read(&first).expect("read the committed first target");
 
-        // Probing the ORIGINAL list can no longer be Ready — the committed
-        // file's retained evidence is deliberately stale. That is exactly
-        // why the old code disabled retry.
+        CommittedFirstOfTwo {
+            targets,
+            written_keys: vec![SaveTargetKey::Local(first.clone())],
+            second_target: SaveTarget::Local(second_target),
+            first_path: first.clone(),
+            second_path: second,
+            committed_first_bytes,
+        }
+    }
+
+    /// #248 F2: probing the ORIGINAL list after one target commits can no
+    /// longer be Ready — the committed file's retained evidence is
+    /// deliberately stale, which is exactly why the old code disabled retry —
+    /// while the post-save availability recomputed over only the unwritten
+    /// targets keeps Save enabled.
+    #[test]
+    fn post_save_availability_is_recomputed_over_unwritten_targets() {
+        let directory = tempfile::tempdir().expect("create selection fixture");
+        let scenario = committed_first_of_two(directory.path());
+
         assert_ne!(
-            preflight_save_targets(&targets).availability(),
+            preflight_save_targets(&scenario.targets).availability(),
             TagEditingAvailability::Ready
         );
-
-        // Derived over only the unwritten targets, retry stays enabled and
-        // targets only the second file.
         assert_eq!(
-            post_save_availability(&targets, &written_keys, 1),
+            post_save_availability(&scenario.targets, &scenario.written_keys, 1),
             TagEditingAvailability::Ready
         );
-        let remaining = remaining_save_targets(&targets, &written_keys);
+        assert_no_preflight_residue(directory.path());
+    }
+
+    /// #248 F2: a retry derives its write set from the remaining targets —
+    /// only the recoverable second — and never rewrites the committed first
+    /// target.
+    #[test]
+    fn a_retry_rewrites_only_the_remaining_target() {
+        let directory = tempfile::tempdir().expect("create selection fixture");
+        let scenario = committed_first_of_two(directory.path());
+
+        let remaining = remaining_save_targets(&scenario.targets, &scenario.written_keys);
         assert_eq!(
             remaining,
-            vec![SaveTarget::Local(second_target)],
+            vec![scenario.second_target.clone()],
             "only the recoverable target is retried"
         );
 
@@ -1792,12 +1823,12 @@ mod tests {
         }
 
         assert_eq!(
-            std::fs::read(&first).expect("read the first target after the retry"),
-            first_bytes_after_commit,
+            std::fs::read(&scenario.first_path).expect("read the first target after the retry"),
+            scenario.committed_first_bytes,
             "the committed first target must not be rewritten by the retry"
         );
         assert_ne!(
-            std::fs::read(&second).expect("read the retried second target"),
+            std::fs::read(&scenario.second_path).expect("read the retried second target"),
             selection_fixture_bytes(),
             "the retry must write the remaining target"
         );

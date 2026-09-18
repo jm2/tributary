@@ -2847,35 +2847,33 @@ pub mod tests {
         );
     }
 
-    #[test]
-    fn held_admission_drives_the_completion_decision_and_refuses_a_source_swap() {
-        // Two devices exposing the same relative track ID form the live
-        // view. The activation snapshotted device A's row; while the
-        // admission worker is parked in the test gate the view switches to
-        // device B, whose row at the same position carries the same track
-        // string. The completion must refuse on the source-scoped identity
-        // and open for the unchanged control.
-        let device_a = SourceId::from_uuid(uuid::Uuid::new_v4());
-        let device_b = SourceId::from_uuid(uuid::Uuid::new_v4());
-        let device_key = |source: &SourceId| {
-            MediaKey::new(
-                *source,
-                TrackId::remote("track-9").expect("device track id"),
-            )
-        };
-        let pending_path = PathBuf::from("/definitely/not/here.flac");
+    type AdmittedLocals =
+        std::collections::HashMap<PathBuf, crate::local::tag_writer::LocalMutationTarget>;
 
-        // The worker parks inside the admission gate exactly as the
-        // dispatch's spawn_blocking worker can. `at_gate` marks the parked
-        // state without any timed sleep.
+    fn device_media_key(source: &SourceId) -> MediaKey {
+        MediaKey::new(
+            *source,
+            TrackId::remote("track-9").expect("device track id"),
+        )
+    }
+
+    /// Spawn the admission worker for `paths` and park it inside the test
+    /// gate exactly as the dispatch's spawn_blocking worker can park. The
+    /// `at_gate` flag marks the parked state without any timed sleep; the
+    /// returned sender releases the worker.
+    fn parked_admission_worker(
+        paths: Vec<PathBuf>,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<AdmittedLocals>,
+    ) {
         let (release, gate) = std::sync::mpsc::channel();
         *HELD_ADMISSION_GATE.lock().expect("gate lock") = Some(gate);
         let at_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let at_gate_worker = at_gate.clone();
-        let worker_paths = vec![pending_path.clone()];
         let worker = std::thread::spawn(move || {
             at_gate_worker.store(true, std::sync::atomic::Ordering::SeqCst);
-            capture_pending_locals(&worker_paths)
+            capture_pending_locals(&paths)
         });
         let mut waited = 0;
         while !at_gate.load(std::sync::atomic::Ordering::SeqCst) {
@@ -2886,57 +2884,62 @@ pub mod tests {
             waited += 1;
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        (release, worker)
+    }
 
-        // While the worker is parked, the main context the UI runs on must
-        // keep dispatching — that is the responsiveness the off-thread
-        // admission buys. An idle must run while the worker is still
-        // blocked.
-        let dispatched = std::rc::Rc::new(std::cell::Cell::new(false));
-        let dispatched_for_idle = dispatched.clone();
-        glib::idle_add_local_once(move || dispatched_for_idle.set(true));
-        let context = glib::MainContext::default();
+    /// Pumps the main context until `done` turns true, failing with
+    /// `timeout_message` instead of hanging.
+    fn pump_main_context_until(
+        context: &glib::MainContext,
+        done: impl Fn() -> bool,
+        timeout_message: &str,
+    ) {
         let mut pumped = 0;
-        while !dispatched.get() {
-            assert!(
-                pumped < 10_000,
-                "the main context stopped dispatching while the admission worker was parked"
-            );
+        while !done() {
+            assert!(pumped < 10_000, "{timeout_message}");
             pumped += 1;
             context.iteration(false);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        assert!(
-            !worker.is_finished(),
-            "the responsiveness proof must run while the worker is still parked"
-        );
+    }
 
-        // Release the worker and deliver its admitted set through the same
-        // async-channel + main-context transport the dispatch uses, decided
-        // by the same completion core the dialog opening depends on.
-        release.send(()).expect("release admission gate");
-        let admitted = worker.join().expect("admission worker");
-        assert_eq!(admitted.len(), 1, "admission must admit by path");
-        let (tx, rx) = async_channel::bounded::<PropertiesAdmission>(1);
-        tx.send_blocking(PropertiesAdmission {
-            locals: admitted,
+    /// Builds the single-path admitted set the completion stitches. This is
+    /// deliberately not `capture_pending_locals`: that fn parks while
+    /// another test holds the admission gate, and this suite's tests run
+    /// concurrently.
+    fn admitted_by_path(path: &std::path::Path) -> PropertiesAdmission {
+        PropertiesAdmission {
+            locals: std::iter::once((
+                path.to_path_buf(),
+                crate::local::tag_writer::LocalMutationTarget::capture(path),
+            ))
+            .collect(),
             removables: std::collections::HashMap::new(),
-        })
-        .expect("deliver the admitted set");
+        }
+    }
 
-        // The live rows now name device B at the snapshotted position:
-        // equal track string, different source-scoped identity.
-        let evidence = PropertiesSelectionEvidence {
-            positions: vec![0],
-            media_keys: vec![device_key(&device_a)],
-        };
+    /// Delivers `admission` through the same async-channel + main-context
+    /// transport the dispatch uses, decides with the same completion core
+    /// the dialog opening depends on, and pumps until the decision has run
+    /// on the main context.
+    fn deliver_admission_and_resolve_completion(
+        context: &glib::MainContext,
+        evidence: PropertiesSelectionEvidence,
+        media_key_at: impl Fn(u32) -> Option<MediaKey> + 'static,
+        admission: PropertiesAdmission,
+        pending_path: &std::path::Path,
+    ) -> std::rc::Rc<std::cell::RefCell<Option<PropertiesCompletion>>> {
         let outcome: std::rc::Rc<std::cell::RefCell<Option<PropertiesCompletion>>> =
             std::rc::Rc::new(std::cell::RefCell::new(None));
         let outcome_for_task = outcome.clone();
         let infos_for_task = vec![track_info_with_target(SaveTarget::PendingLocal(
             PendingLocalMutation {
-                path: pending_path.clone(),
+                path: pending_path.to_path_buf(),
             },
         ))];
+        let (tx, rx) = async_channel::bounded::<PropertiesAdmission>(1);
+        tx.send_blocking(admission)
+            .expect("deliver the admitted set");
         context.spawn_local(async move {
             let Ok(admission) = rx.recv().await else {
                 panic!("the admitted set must arrive");
@@ -2945,22 +2948,68 @@ pub mod tests {
                 &evidence,
                 1,
                 &|position| position == 0,
-                &move |position| (position == 0).then(|| device_key(&device_b)),
+                &media_key_at,
                 infos_for_task,
                 &admission,
             ));
         });
-        let mut settled = 0;
-        while outcome.borrow().is_none() {
-            assert!(
-                settled < 10_000,
-                "the completion never ran on the main context"
-            );
-            settled += 1;
-            context.iteration(false);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        pump_main_context_until(
+            context,
+            || outcome.borrow().is_some(),
+            "the completion never ran on the main context",
+        );
+        outcome
+    }
+
+    #[test]
+    fn held_admission_worker_parks_while_the_main_context_stays_responsive() {
+        // The worker parks inside the admission gate exactly as the
+        // dispatch's spawn_blocking worker can, and while it is parked the
+        // main context the UI runs on must keep dispatching — that is the
+        // responsiveness the off-thread admission buys.
+        let pending_path = PathBuf::from("/definitely/not/here.flac");
+        let (release, worker) = parked_admission_worker(vec![pending_path.clone()]);
+
+        let dispatched = std::rc::Rc::new(std::cell::Cell::new(false));
+        let dispatched_for_idle = dispatched.clone();
+        glib::idle_add_local_once(move || dispatched_for_idle.set(true));
+        let context = glib::MainContext::default();
+        pump_main_context_until(
+            &context,
+            || dispatched.get(),
+            "the main context stopped dispatching while the admission worker was parked",
+        );
+        assert!(
+            !worker.is_finished(),
+            "the responsiveness proof must run while the worker is still parked"
+        );
+
+        release.send(()).expect("release admission gate");
+        let admitted = worker.join().expect("admission worker");
+        assert_eq!(admitted.len(), 1, "admission must admit by path");
         *HELD_ADMISSION_GATE.lock().expect("gate lock") = None;
+    }
+
+    #[test]
+    fn a_source_swapped_row_refuses_the_completion_with_selection_changed() {
+        // Two devices exposing the same relative track ID form the live
+        // view. The activation snapshotted device A's row, but the live rows
+        // now name device B at the same position: equal track string,
+        // different source-scoped identity. The completion must refuse.
+        let device_a = SourceId::from_uuid(uuid::Uuid::new_v4());
+        let device_b = SourceId::from_uuid(uuid::Uuid::new_v4());
+        let pending_path = PathBuf::from("/definitely/not/here.flac");
+        let evidence = PropertiesSelectionEvidence {
+            positions: vec![0],
+            media_keys: vec![device_media_key(&device_a)],
+        };
+        let outcome = deliver_admission_and_resolve_completion(
+            &glib::MainContext::default(),
+            evidence,
+            move |position| (position == 0).then(|| device_media_key(&device_b)),
+            admitted_by_path(&pending_path),
+            &pending_path,
+        );
         assert!(
             matches!(
                 outcome.borrow().as_ref(),
@@ -2969,53 +3018,28 @@ pub mod tests {
             "a same-track-ID row from another source must refuse the completion, got {:?}",
             outcome.borrow()
         );
+    }
 
+    #[test]
+    fn the_unchanged_selection_opens_with_a_stitched_local_target() {
         // The unchanged control: the same activation snapshot over rows that
         // still name device A stitches the admitted set and opens, through
         // the same delivery transport.
+        let device_a = SourceId::from_uuid(uuid::Uuid::new_v4());
+        let pending_path = PathBuf::from("/definitely/not/here.flac");
         let evidence = PropertiesSelectionEvidence {
             positions: vec![0],
-            media_keys: vec![device_key(&device_a)],
+            media_keys: vec![device_media_key(&device_a)],
         };
-        let admitted = capture_pending_locals(std::slice::from_ref(&pending_path));
-        assert_eq!(admitted.len(), 1, "admission must admit by path");
-        let (tx, rx) = async_channel::bounded::<PropertiesAdmission>(1);
-        tx.send_blocking(PropertiesAdmission {
-            locals: admitted,
-            removables: std::collections::HashMap::new(),
-        })
-        .expect("deliver the admitted set");
-        let outcome: std::rc::Rc<std::cell::RefCell<Option<PropertiesCompletion>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(None));
-        let outcome_for_task = outcome.clone();
-        let infos_for_task = vec![track_info_with_target(SaveTarget::PendingLocal(
-            PendingLocalMutation {
-                path: pending_path.clone(),
-            },
-        ))];
-        context.spawn_local(async move {
-            let Ok(admission) = rx.recv().await else {
-                panic!("the admitted set must arrive");
-            };
-            *outcome_for_task.borrow_mut() = Some(resolve_properties_completion(
-                &evidence,
-                1,
-                &|position| position == 0,
-                &move |position| (position == 0).then(|| device_key(&device_a)),
-                infos_for_task,
-                &admission,
-            ));
-        });
-        let mut settled = 0;
-        while outcome.borrow().is_none() {
-            assert!(
-                settled < 10_000,
-                "the completion never ran on the main context"
-            );
-            settled += 1;
-            context.iteration(false);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        let admission = admitted_by_path(&pending_path);
+        assert_eq!(admission.locals.len(), 1, "admission must admit by path");
+        let outcome = deliver_admission_and_resolve_completion(
+            &glib::MainContext::default(),
+            evidence,
+            move |position| (position == 0).then(|| device_media_key(&device_a)),
+            admission,
+            &pending_path,
+        );
         match outcome.borrow().as_ref() {
             Some(PropertiesCompletion::Open(opened)) => {
                 assert!(matches!(opened[0].target, SaveTarget::Local(_)));
