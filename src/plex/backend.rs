@@ -14,7 +14,9 @@ use uuid::Uuid;
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
-use crate::architecture::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest, TrackId};
+use crate::architecture::{
+    AdvertisedHttpRoute, MediaRepresentation, RemoteMediaResolver, ResolvedHttpRequest, TrackId,
+};
 
 use super::api::{
     PlexAlbum, PlexAlbumsResponse, PlexArtist, PlexArtistsResponse, PlexIdentityResponse,
@@ -575,7 +577,14 @@ impl RemoteMediaResolver for PlexBackend {
                 entity_type: "track".into(),
                 id: deterministic_uuid(track_id.as_str()),
             })?;
-        self.client.resolved_stream_request(&part_key)
+        // Authority: the part key is the server's own file name
+        // (`/library/parts/12345/file.flac`), so its extension is library
+        // metadata, and Plex is asked for the original part with no
+        // transcoding parameters. A suffix outside the allowlist resolves to
+        // the explicit unknown rather than a guess.
+        let representation = plex_stream_representation(&part_key);
+        self.client
+            .resolved_stream_request(&part_key, representation)
     }
 
     async fn resolve_artwork(
@@ -605,6 +614,20 @@ fn deterministic_uuid(plex_id: &str) -> Uuid {
 
 fn plex_stream_locator(plex: &PlexTrack) -> Option<&str> {
     plex_stream_source(plex).map(|(_, locator)| locator)
+}
+
+/// The validated representation of a Plex stream request.
+///
+/// Plex part keys end in the server's file name, so the extension after the
+/// final dot is treated as library metadata — but only when it is genuinely a
+/// final path segment (no `/` may follow it). Anything else, including a key
+/// with no extension, resolves to the explicit unknown.
+fn plex_stream_representation(part_key: &str) -> MediaRepresentation {
+    let suffix = match part_key.rsplit_once('.') {
+        Some((_, suffix)) if !suffix.contains('/') => suffix,
+        _ => "",
+    };
+    MediaRepresentation::buffered_from_suffix(suffix)
 }
 
 fn plex_stream_source(plex: &PlexTrack) -> Option<(&PlexMedia, &str)> {

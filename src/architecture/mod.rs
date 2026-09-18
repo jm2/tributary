@@ -13,7 +13,10 @@ pub mod server_playlist;
 
 pub use backend::{load_track_catalog, MediaBackend};
 pub use identity::{MediaKey, NativePlaylistId, SourceId, TrackId, ViewOrigin};
-pub use media::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest};
+pub use media::{
+    AdvertisedHttpRoute, MediaRepresentation, MediaStreamKind, RemoteMediaResolver,
+    ResolvedHttpRequest,
+};
 pub use server_playlist::{
     ServerPlaylistSnapshot, ServerPlaylistSummary, MAX_SERVER_PLAYLISTS_PER_LIST,
     MAX_SERVER_PLAYLIST_ENTRIES,
