@@ -2936,43 +2936,21 @@ pub mod tests {
     ///
     /// `gtk_drop_target_emit_drop` calls `g_signal_emit_by_name(target,
     /// "drop", value, x, y, &ret)` passing the payload-typed `GValue*`; the
-    /// signal's `G_TYPE_VALUE` parameter collects that pointer as its boxed
-    /// content and the connected handler receives exactly the `GValue` GTK
-    /// delivered. glib-rs' `emit_by_name` cannot express this: its Rust-side
-    /// argument validation requires the argument to carry the declared
-    /// parameter type itself and rejects the payload-typed value that GTK's
-    /// own C emission passes, so the test must enter through the same C
-    /// entry point GTK uses.
+    /// signal's declared `G_TYPE_VALUE` parameter collect copies that
+    /// payload into the argument `GValue`, so the connected handler receives
+    /// exactly the `GValue` GTK delivered. glib-rs' argument validation
+    /// requires each emitted argument to carry the declared parameter type
+    /// itself and rejects the payload-typed value GTK's own C emission
+    /// passes, so the payload travels in the declared boxed `G_TYPE_VALUE`
+    /// container instead ([`glib::BoxedValue`]): validation accepts the
+    /// declared type, and the same `G_TYPE_VALUE` collect step unboxes it,
+    /// handing the installed `connect_drop` handler the identical payload
+    /// `GValue` — via `g_signal_emitv`, the same C emission machinery
+    /// `g_signal_emit_by_name` drives.
     #[cfg(not(target_os = "macos"))]
     fn emit_installed_drop(drop_target: &gtk::DropTarget, value: &glib::Value) -> bool {
-        use glib::translate::ToGlibPtr;
-
-        let mut result: glib::ffi::gboolean = glib::ffi::GFALSE;
-        // SAFETY (audited): the FFI surface is one synchronous call.
-        // - `drop_target.as_ptr()` borrows a valid, fully-initialized
-        //   GtkDropTarget GObject that outlives the call.
-        // - The "drop" signal exists on GtkDropTarget with the signature
-        //   (GValue, double, double) -> bool, so the argument list and the
-        //   out-location below match the C marshaler's expectations.
-        // - `value` is borrowed only for the duration of the emission: the
-        //   emission is synchronous on this thread, GObject passes the
-        //   argument GValues to the installed handlers by reference during
-        //   that call, and `value` outlives the call, so no aliasing
-        //   escapes it.
-        // - `glib::gobject_ffi::GObject` and the GValue passed have the
-        //   layouts GLib guarantees; the cast is the same one glib-rs'
-        //   own signal emission performs internally.
-        unsafe {
-            glib::gobject_ffi::g_signal_emit_by_name(
-                drop_target.as_ptr().cast::<glib::gobject_ffi::GObject>(),
-                c"drop".as_ptr(),
-                value.to_glib_none().0,
-                1.0f64,
-                1.0f64,
-                &mut result,
-            );
-        }
-        result != glib::ffi::GFALSE
+        let boxed = glib::BoxedValue(value.clone());
+        drop_target.emit_by_name::<bool>("drop", &[&boxed, &1.0f64, &1.0f64])
     }
 
     #[cfg(not(target_os = "macos"))]
