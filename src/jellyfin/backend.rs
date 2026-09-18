@@ -15,7 +15,9 @@ use uuid::Uuid;
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
-use crate::architecture::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest, TrackId};
+use crate::architecture::{
+    AdvertisedHttpRoute, MediaRepresentation, RemoteMediaResolver, ResolvedHttpRequest, TrackId,
+};
 
 use super::api::{JellyfinItem, JellyfinItemsResponse, JellyfinViewsResponse};
 use super::client::JellyfinClient;
@@ -52,6 +54,10 @@ struct LibraryCache {
     stream_locator_by_track_id: HashMap<TrackId, String>,
     /// Exact Jellyfin audio item ID → artwork item ID.
     track_artwork_locator_by_track_id: HashMap<TrackId, String>,
+    /// Exact Jellyfin audio item ID → validated stream representation. Items
+    /// whose container is absent or outside the allowlist map to the explicit
+    /// unknown.
+    representation_by_track_id: HashMap<TrackId, MediaRepresentation>,
 }
 
 impl LibraryCache {
@@ -62,6 +68,7 @@ impl LibraryCache {
             artists: Vec::new(),
             stream_locator_by_track_id: HashMap::new(),
             track_artwork_locator_by_track_id: HashMap::new(),
+            representation_by_track_id: HashMap::new(),
         }
     }
 }
@@ -200,6 +207,7 @@ impl JellyfinBackend {
         let mut all_artists = Vec::new();
         let mut stream_locator_by_track_id = HashMap::new();
         let mut track_artwork_locator_by_track_id = HashMap::new();
+        let mut representation_by_track_id = HashMap::new();
         let mut skipped_invalid_track_ids = 0usize;
 
         for lib in music_libraries {
@@ -233,6 +241,12 @@ impl JellyfinBackend {
                     jellyfin_item_to_track(item, track_id.clone(), track_uuid, artist_id, album_id);
 
                 stream_locator_by_track_id.insert(track_id.clone(), item.id.clone());
+                representation_by_track_id.insert(
+                    track_id.clone(),
+                    MediaRepresentation::buffered_from_suffix(
+                        item.container.as_deref().unwrap_or(""),
+                    ),
+                );
                 if let Some(album_id) = &item.album_id {
                     track_artwork_locator_by_track_id.insert(track_id, album_id.clone());
                 }
@@ -294,6 +308,7 @@ impl JellyfinBackend {
             artists: all_artists,
             stream_locator_by_track_id,
             track_artwork_locator_by_track_id,
+            representation_by_track_id,
         };
 
         Ok(())
@@ -552,10 +567,8 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
 #[async_trait]
 impl RemoteMediaResolver for JellyfinBackend {
     async fn resolve_stream(&self, track_id: &TrackId) -> BackendResult<ResolvedHttpRequest> {
-        let item_id = self
-            .cache
-            .read()
-            .await
+        let cache = self.cache.read().await;
+        let item_id = cache
             .stream_locator_by_track_id
             .get(track_id)
             .cloned()
@@ -563,7 +576,18 @@ impl RemoteMediaResolver for JellyfinBackend {
                 entity_type: "track".into(),
                 id: deterministic_uuid(track_id.as_str()),
             })?;
-        self.client.resolved_stream_request(&item_id)
+        // Authority: `static=true` asks for the original bytes with no
+        // transcoding, so the item's container from library metadata is the
+        // representation the server is asked to return. A container outside
+        // the allowlist resolves to the explicit unknown rather than a guess.
+        let representation = cache
+            .representation_by_track_id
+            .get(track_id)
+            .copied()
+            .unwrap_or_else(MediaRepresentation::buffered_unknown);
+        drop(cache);
+        self.client
+            .resolved_stream_request(&item_id, representation)
     }
 
     async fn resolve_artwork(

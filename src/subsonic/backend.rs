@@ -17,9 +17,9 @@ use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
 use crate::architecture::{
-    AdvertisedHttpRoute, NativePlaylistId, RemoteMediaResolver, ResolvedHttpRequest,
-    ServerPlaylistSnapshot, ServerPlaylistSummary, TrackId, MAX_SERVER_PLAYLISTS_PER_LIST,
-    MAX_SERVER_PLAYLIST_ENTRIES,
+    AdvertisedHttpRoute, MediaRepresentation, NativePlaylistId, RemoteMediaResolver,
+    ResolvedHttpRequest, ServerPlaylistSnapshot, ServerPlaylistSummary, TrackId,
+    MAX_SERVER_PLAYLISTS_PER_LIST, MAX_SERVER_PLAYLIST_ENTRIES,
 };
 
 use super::api::{AlbumEntry, ArtistEntry, SongEntry};
@@ -51,6 +51,9 @@ struct LibraryCache {
     stream_locator_by_track_id: HashMap<TrackId, String>,
     /// Exact Subsonic song ID → cover-art ID.
     track_artwork_locator_by_track_id: HashMap<TrackId, String>,
+    /// Exact Subsonic song ID → validated stream representation. Tracks whose
+    /// suffix is absent or outside the allowlist map to the explicit unknown.
+    representation_by_track_id: HashMap<TrackId, MediaRepresentation>,
 }
 
 impl LibraryCache {
@@ -61,6 +64,7 @@ impl LibraryCache {
             artists: Vec::new(),
             stream_locator_by_track_id: HashMap::new(),
             track_artwork_locator_by_track_id: HashMap::new(),
+            representation_by_track_id: HashMap::new(),
         }
     }
 }
@@ -393,6 +397,7 @@ impl SubsonicBackend {
         let mut all_artists = Vec::new();
         let mut stream_locator_by_track_id = HashMap::new();
         let mut track_artwork_locator_by_track_id = HashMap::new();
+        let mut representation_by_track_id = HashMap::new();
         let mut skipped_invalid_track_ids = 0usize;
 
         for (ai, (_, albums)) in artist_albums.iter().enumerate() {
@@ -427,6 +432,12 @@ impl SubsonicBackend {
                     );
 
                     stream_locator_by_track_id.insert(track_id.clone(), song.id.clone());
+                    representation_by_track_id.insert(
+                        track_id.clone(),
+                        MediaRepresentation::buffered_from_suffix(
+                            song.suffix.as_deref().unwrap_or(""),
+                        ),
+                    );
                     if let Some(cover_art_id) = &song.cover_art {
                         track_artwork_locator_by_track_id.insert(track_id, cover_art_id.clone());
                     }
@@ -465,6 +476,7 @@ impl SubsonicBackend {
             artists: all_artists,
             stream_locator_by_track_id,
             track_artwork_locator_by_track_id,
+            representation_by_track_id,
         };
 
         Ok(())
@@ -653,10 +665,8 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
 #[async_trait]
 impl RemoteMediaResolver for SubsonicBackend {
     async fn resolve_stream(&self, track_id: &TrackId) -> BackendResult<ResolvedHttpRequest> {
-        let song_id = self
-            .cache
-            .read()
-            .await
+        let cache = self.cache.read().await;
+        let song_id = cache
             .stream_locator_by_track_id
             .get(track_id)
             .cloned()
@@ -664,7 +674,18 @@ impl RemoteMediaResolver for SubsonicBackend {
                 entity_type: "track".into(),
                 id: deterministic_uuid(track_id.as_str()),
             })?;
-        self.client.resolved_stream_request(&song_id)
+        // Authority: `stream.view` is issued without transcoding parameters, so
+        // the source container from library metadata is the representation the
+        // server is asked to return. A suffix outside the allowlist resolves to
+        // the explicit unknown rather than a guess.
+        let representation = cache
+            .representation_by_track_id
+            .get(track_id)
+            .copied()
+            .unwrap_or_else(MediaRepresentation::buffered_unknown);
+        drop(cache);
+        self.client
+            .resolved_stream_request(&song_id, representation)
     }
 
     async fn resolve_artwork(

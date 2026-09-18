@@ -10,7 +10,7 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
-use crate::architecture::{AdvertisedHttpRoute, ResolvedHttpRequest};
+use crate::architecture::{AdvertisedHttpRoute, MediaRepresentation, ResolvedHttpRequest};
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
     append_base_path_segments, apply_advertised_http_route, authenticated_client_builder,
@@ -261,11 +261,18 @@ impl SubsonicClient {
 
     /// Resolve a stream request while keeping Subsonic authentication out of
     /// the inspectable endpoint.
+    ///
+    /// The caller supplies the validated representation of the media this
+    /// request returns (see `MediaRepresentation` for the authority rules);
+    /// artwork and other non-stream requests never carry one.
     pub(crate) fn resolved_stream_request(
         &self,
         song_id: &str,
+        representation: MediaRepresentation,
     ) -> BackendResult<ResolvedHttpRequest> {
-        self.resolved_media_request("stream.view", song_id)
+        Ok(self
+            .resolved_media_request("stream.view", song_id)?
+            .with_representation(representation))
     }
 
     /// Resolve an artwork request with the same credential isolation.
@@ -587,7 +594,7 @@ mod tests {
             );
             assert_eq!(
                 client
-                    .resolved_stream_request("song-id")
+                    .resolved_stream_request("song-id", MediaRepresentation::buffered_unknown())
                     .expect("stream request")
                     .endpoint()
                     .as_str(),
@@ -687,7 +694,7 @@ mod tests {
             .expect("client");
 
         let request = client
-            .resolved_stream_request("song-id")
+            .resolved_stream_request("song-id", MediaRepresentation::buffered_unknown())
             .expect("resolved request");
         let endpoint = request.endpoint().as_str();
         assert!(!endpoint.contains(&username));
@@ -723,7 +730,7 @@ mod tests {
         client.switch_to_plaintext_auth().expect("HTTPS fallback");
 
         let request = client
-            .resolved_stream_request("song-id")
+            .resolved_stream_request("song-id", MediaRepresentation::buffered_unknown())
             .expect("resolved request");
         assert!(!request.endpoint().as_str().contains(&password));
         assert!(request
@@ -747,7 +754,7 @@ mod tests {
                 .expect("routed client");
 
         for request in [
-            client.resolved_stream_request("song-id").unwrap(),
+            client.resolved_stream_request("song-id", MediaRepresentation::buffered_unknown()).unwrap(),
             client.resolved_artwork_request("cover-id").unwrap(),
         ] {
             assert_eq!(request.advertised_route(), Some(&route));
@@ -756,7 +763,7 @@ mod tests {
 
         let ordinary = SubsonicClient::new(origin, &username, &password).expect("ordinary client");
         assert!(ordinary
-            .resolved_stream_request("song-id")
+            .resolved_stream_request("song-id", MediaRepresentation::buffered_unknown())
             .unwrap()
             .advertised_route()
             .is_none());

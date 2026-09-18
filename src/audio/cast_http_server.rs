@@ -609,15 +609,24 @@ impl CastHttpServer {
     }
 
     fn register_upstream_request(&self, request: UpstreamRequest) -> String {
-        // Carry the upstream's media extension onto the ticket. The Cast
-        // `content_type` is guessed from the URL it is handed, so an
-        // extensionless ticket would advertise a proxied FLAC or Opus stream as
-        // the default `audio/mpeg` and the receiver would refuse or misplay it.
-        //
-        // Only a known audio extension is copied: the ticket path must stay
-        // opaque, and nothing from the upstream URL beyond this fixed set is
-        // allowed to shape it.
-        let ticket = match upstream_media_extension(request.endpoint()) {
+        // Ticket-shaping authority. A typed resolved request carries a
+        // validated `MediaRepresentation`, and its container suffix is
+        // authoritative for the ticket path: extensionless endpoints such as
+        // Subsonic `stream.view` and Jellyfin `Audio/{id}/stream` would
+        // otherwise leave the receiver nothing but its default and mislabel a
+        // proxied FLAC or Opus stream as `audio/mpeg`. When the descriptor is
+        // explicitly unknown, the URL's recognized extension (a Plex part key
+        // such as `/file.flac`) remains the fallback; only a known audio
+        // extension is ever copied, so the ticket path stays opaque and
+        // nothing beyond this fixed set may shape it.
+        let extension = match &request {
+            UpstreamRequest::Resolved(resolved) => resolved
+                .representation()
+                .ticket_suffix()
+                .or_else(|| upstream_media_extension(resolved.endpoint())),
+            UpstreamRequest::Legacy(url) => upstream_media_extension(url),
+        };
+        let ticket = match extension {
             Some(extension) => format!("{}.{extension}", Uuid::new_v4()),
             None => Uuid::new_v4().to_string(),
         };
@@ -687,7 +696,9 @@ impl Drop for CastHttpServer {
 ///
 /// A Plex part key ends in `/file.flac`; a Subsonic `stream.view` has no
 /// extension at all, in which case the receiver falls back to its default and
-/// there is nothing more we can say from the URL alone.
+/// there is nothing more we can say from the URL alone. This is only a
+/// fallback: a typed resolved request's validated `MediaRepresentation`
+/// takes precedence over URL sniffing.
 ///
 /// The allow-list is deliberate: the ticket path is otherwise a bare UUID, and
 /// only these fixed strings may ever be appended to it.
@@ -864,6 +875,18 @@ async fn proxy_upstream(
     ] {
         if let Some(value) = upstream.headers().get(&name) {
             response = response.header(name, value.clone());
+        }
+    }
+    // Content-Type authority: the upstream response header is the wire truth
+    // and is passed through untouched when present. When the upstream omits
+    // it (some extensionless endpoints do), the validated descriptor from
+    // media resolution fills the gap so the receiver never has to guess; an
+    // unknown container stays unlabeled rather than mislabeled.
+    if !upstream.headers().contains_key(&header::CONTENT_TYPE) {
+        if let UpstreamRequest::Resolved(resolved) = upstream_request {
+            if let Some(content_type) = resolved.representation().content_type() {
+                response = response.header(header::CONTENT_TYPE, content_type);
+            }
         }
     }
 

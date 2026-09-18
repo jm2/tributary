@@ -19,7 +19,7 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
-use crate::architecture::{AdvertisedHttpRoute, ResolvedHttpRequest};
+use crate::architecture::{AdvertisedHttpRoute, MediaRepresentation, ResolvedHttpRequest};
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
     append_base_path_segments, apply_advertised_http_route, authenticated_client_builder,
@@ -432,6 +432,10 @@ impl DaapClient {
     ///
     /// The untrusted format is encoded as part of one path segment, and the
     /// bearer `session-id` stays isolated until the app-owned fetch boundary.
+    /// The same format also builds the validated representation: DAAP serves
+    /// the track in the format named by the server's own `asfm` metadata, so
+    /// it is authoritative; a format outside the allowlist maps to the
+    /// explicit unknown (see `MediaRepresentation`).
     pub(super) fn stream_request(
         &self,
         scope: DaapCatalogueScope,
@@ -445,7 +449,9 @@ impl DaapClient {
             &mut endpoint,
             ["databases", database_id.as_str(), "items", item.as_str()],
         );
-        self.resolved_media_request(endpoint)
+        Ok(self
+            .resolved_media_request(endpoint)?
+            .with_representation(MediaRepresentation::buffered_from_suffix(format)))
     }
 
     fn resolved_media_request(&self, endpoint: Url) -> BackendResult<ResolvedHttpRequest> {
@@ -844,7 +850,7 @@ mod tests {
             let subsonic_client = SubsonicClient::new(server_url.as_str(), &username, &password)
                 .expect("Subsonic client");
             let subsonic_request = subsonic_client
-                .resolved_stream_request(&song_id)
+                .resolved_stream_request(&song_id, MediaRepresentation::buffered_unknown())
                 .expect("Subsonic stream request");
 
             let private_value = |key: &str| {

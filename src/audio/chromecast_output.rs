@@ -20,7 +20,7 @@ use tracing::{error, info};
 use super::cast_http_server::CastHttpServer;
 use super::output::{AudioOutput, OutputType};
 use super::{PlayerEvent, PlayerEventGeneration, PlayerState};
-use crate::architecture::media::ResolvedHttpRequest;
+use crate::architecture::{MediaRepresentation, MediaStreamKind, ResolvedHttpRequest};
 use crate::local::resolver::ResolvedLocalMedia;
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 5;
@@ -95,10 +95,54 @@ struct WorkerCommand {
     kind: CommandKind,
 }
 
+/// The concrete media descriptor sent in a LOAD request.
+///
+/// It is decided exactly once, at load-enqueue time, from the most
+/// authoritative source available for that load kind — the validated
+/// `MediaRepresentation` for typed backend-resolved requests, the URL or
+/// ticket extension for legacy direct-radio and local-file loads — and the
+/// transport sends it verbatim instead of re-guessing from the URI at send
+/// time. Extensionless protected media therefore reaches the receiver labeled
+/// with its real container instead of a default guess.
+#[derive(Clone, Copy)]
+struct CastLoadMedia {
+    content_type: &'static str,
+    live: bool,
+}
+
+/// Receiver default applied only on the explicit unknown path. The Cast
+/// Default Media Receiver assumes `audio/mpeg` for untyped media, so this is
+/// the documented least-wrong fallback — never a substitution for a known
+/// container.
+const RECEIVER_FALLBACK_CONTENT_TYPE: &str = "audio/mpeg";
+
+impl CastLoadMedia {
+    /// Authoritative descriptor from a validated representation. An explicit
+    /// unknown container falls back at this single named site.
+    fn from_representation(representation: MediaRepresentation) -> Self {
+        Self {
+            content_type: representation
+                .content_type()
+                .unwrap_or(RECEIVER_FALLBACK_CONTENT_TYPE),
+            live: matches!(representation.stream(), MediaStreamKind::Live),
+        }
+    }
+
+    /// Legacy URL-derived descriptor for direct radio URIs and local files,
+    /// where the URL extension is the only authority available.
+    fn from_uri(uri: &str) -> Self {
+        Self {
+            content_type: guess_content_type(uri),
+            live: is_live_uri(uri),
+        }
+    }
+}
+
 // Deliberately not Debug: Load contains credential-bearing media URLs.
 enum CommandKind {
     Load {
         uri: String,
+        media: CastLoadMedia,
         volume: f64,
     },
     RejectLoad {
@@ -568,7 +612,12 @@ trait CastTransport {
     fn connect_app(&mut self, app: &AppSession) -> CastResult<()>;
     fn disconnect_app(&mut self, app: &AppSession) -> CastResult<()>;
     fn stop_app(&mut self, app: &AppSession) -> CastResult<()>;
-    fn load(&mut self, app: &AppSession, uri: &str) -> CastResult<CastStatusSnapshot>;
+    fn load(
+        &mut self,
+        app: &AppSession,
+        uri: &str,
+        media: CastLoadMedia,
+    ) -> CastResult<CastStatusSnapshot>;
     fn play(&mut self, app: &AppSession, media_session_id: i32) -> CastResult<()>;
     fn pause(&mut self, app: &AppSession, media_session_id: i32) -> CastResult<()>;
     fn seek(&mut self, app: &AppSession, media_session_id: i32, position_ms: u64)
@@ -950,25 +999,29 @@ impl CastTransport for RustCastTransport {
         })
     }
 
-    fn load(&mut self, app: &AppSession, uri: &str) -> CastResult<CastStatusSnapshot> {
+    fn load(
+        &mut self,
+        app: &AppSession,
+        uri: &str,
+        media: CastLoadMedia,
+    ) -> CastResult<CastStatusSnapshot> {
         use rust_cast::channels::media::{Media, StreamType};
 
-        let stream_type = if is_live_uri(uri) {
-            StreamType::Live
-        } else {
-            StreamType::Buffered
-        };
-        let media = Media {
+        let request = Media {
             content_id: uri.to_string(),
-            content_type: guess_content_type(uri).to_string(),
-            stream_type,
+            content_type: media.content_type.to_string(),
+            stream_type: if media.live {
+                StreamType::Live
+            } else {
+                StreamType::Buffered
+            },
             duration: None,
             metadata: None,
         };
         self.with_deadline("media load", |transport| {
             transport
                 .media
-                .load(app.transport_id.clone(), app.session_id.clone(), &media)
+                .load(app.transport_id.clone(), app.session_id.clone(), &request)
                 .map(snapshot_from_status)
         })
     }
@@ -1163,12 +1216,17 @@ fn run_cast_worker<C>(
         match worker_rx.recv_timeout(wait) {
             Ok(command) => {
                 let poll_after_command = match command.kind {
-                    CommandKind::Load { uri, volume } => {
+                    CommandKind::Load {
+                        uri,
+                        media,
+                        volume,
+                    } => {
                         handle_load(
                             &mut connector,
                             &mut active,
                             command.owner,
                             uri,
+                            media,
                             volume,
                             &intent_epoch,
                             &current_state,
@@ -1309,6 +1367,7 @@ fn handle_load<C>(
     active: &mut Option<WorkerSession<C::Transport>>,
     owner: CommandOwner,
     uri: String,
+    media: CastLoadMedia,
     volume: f64,
     intent_epoch: &AtomicU64,
     current_state: &Mutex<PlayerState>,
@@ -1431,7 +1490,7 @@ fn handle_load<C>(
     }
 
     info!(
-        content_type = guess_content_type(&uri),
+        content_type = media.content_type,
         "Chromecast: loading media"
     );
     if !is_current(owner, intent_epoch) {
@@ -1439,7 +1498,7 @@ fn handle_load<C>(
     }
     let loaded = {
         let session = active.as_mut().expect("connected session recorded");
-        session.transport.load(&session.app, &uri)
+        session.transport.load(&session.app, &uri, media)
     };
     if let Ok(status) = loaded.as_ref() {
         if let Some(media_session_id) = status.media_session_id {
@@ -2389,6 +2448,7 @@ impl AudioOutput for ChromecastOutput {
         let owner = self.next_owner();
         let kind = match self.resolve_uri(uri) {
             Ok(uri) => CommandKind::Load {
+                media: CastLoadMedia::from_uri(&uri),
                 uri,
                 volume: self.volume,
             },
@@ -2400,8 +2460,13 @@ impl AudioOutput for ChromecastOutput {
 
     fn load_resolved(&self, request: ResolvedHttpRequest) -> bool {
         let owner = self.next_owner();
+        // The validated representation from media resolution is the authority
+        // for what this request returns; the ticket URL is never sniffed for a
+        // content type here.
+        let media = CastLoadMedia::from_representation(request.representation());
         let kind = match self.resolve_request(request) {
             Ok(uri) => CommandKind::Load {
+                media,
                 uri,
                 volume: self.volume,
             },
@@ -2415,6 +2480,7 @@ impl AudioOutput for ChromecastOutput {
         let owner = self.next_owner();
         let kind = match self.resolve_local_authority(media) {
             Ok(uri) => CommandKind::Load {
+                media: CastLoadMedia::from_uri(&uri),
                 uri,
                 volume: self.volume,
             },
@@ -2545,6 +2611,12 @@ mod tests {
     use super::*;
 
     const TEST_CAST_NAMESPACE: &str = "urn:x-cast:tributary.test";
+
+    /// Default descriptor for worker tests that do not assert media metadata:
+    /// a plain buffered MP3-shaped URL load.
+    fn test_load_media() -> CastLoadMedia {
+        CastLoadMedia::from_uri("https://music.test/a.mp3")
+    }
 
     struct ObservedCastIo {
         input: std::io::Cursor<Vec<u8>>,
@@ -2956,7 +3028,12 @@ mod tests {
                 .record(Point::AppStop, Action::Point(Point::AppStop))
         }
 
-        fn load(&mut self, _app: &AppSession, _uri: &str) -> CastResult<CastStatusSnapshot> {
+        fn load(
+            &mut self,
+            _app: &AppSession,
+            _uri: &str,
+            _media: CastLoadMedia,
+        ) -> CastResult<CastStatusSnapshot> {
             self.shared
                 .record(Point::Load, Action::Point(Point::Load))?;
             Ok(self
@@ -3213,6 +3290,7 @@ mod tests {
         harness.send(
             load,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -3241,6 +3319,7 @@ mod tests {
         harness.send(
             first,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -3251,6 +3330,7 @@ mod tests {
         harness.send(
             replacement,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/b".to_string(),
                 volume: 0.5,
             },
@@ -3276,6 +3356,7 @@ mod tests {
         harness.send(
             load,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -3317,6 +3398,7 @@ mod tests {
         harness.send(
             first,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a?api_key=secret".to_string(),
                 volume: 0.5,
             },
@@ -3328,6 +3410,7 @@ mod tests {
         harness.send(
             second,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/b".to_string(),
                 volume: 0.5,
             },
@@ -3373,6 +3456,7 @@ mod tests {
         harness.send(
             load,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -3409,6 +3493,7 @@ mod tests {
         harness.send(
             load,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -3450,6 +3535,7 @@ mod tests {
         harness.send(
             first,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -3468,6 +3554,7 @@ mod tests {
         harness.send(
             next,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/b".to_string(),
                 volume: 0.5,
             },
@@ -3507,6 +3594,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -3547,6 +3635,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a?api_key=secret-token".to_string(),
                 volume: 0.5,
             },
@@ -3588,6 +3677,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -3632,6 +3722,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -3668,6 +3759,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -3702,6 +3794,7 @@ mod tests {
         harness.send(
             first,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -3738,6 +3831,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -3788,6 +3882,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -3865,6 +3960,7 @@ mod tests {
         harness.send(
             first,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -3907,6 +4003,7 @@ mod tests {
         harness.send(
             replacement,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/b".to_string(),
                 volume: 0.5,
             },
@@ -3928,6 +4025,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -3970,6 +4068,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -4013,6 +4112,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -4074,6 +4174,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -4128,6 +4229,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -4172,6 +4274,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -4329,6 +4432,7 @@ mod tests {
         harness.send(
             first,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -4352,6 +4456,7 @@ mod tests {
         harness.send(
             second,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/b".to_string(),
                 volume: 0.5,
             },
@@ -4381,6 +4486,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -4417,6 +4523,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -5392,6 +5499,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -5517,6 +5625,7 @@ mod tests {
         let old = queue_test_owner(1);
         for kind in [
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/old".to_string(),
                 volume: 0.5,
             },
@@ -5581,6 +5690,7 @@ mod tests {
         harness.send(
             owner,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/a".to_string(),
                 volume: 0.5,
             },
@@ -5684,6 +5794,7 @@ mod tests {
         harness.send(
             replacement,
             CommandKind::Load {
+                media: test_load_media(),
                 uri: "https://music.test/b".to_string(),
                 volume: 0.5,
             },

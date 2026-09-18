@@ -10,7 +10,7 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
-use crate::architecture::{AdvertisedHttpRoute, ResolvedHttpRequest};
+use crate::architecture::{AdvertisedHttpRoute, MediaRepresentation, ResolvedHttpRequest};
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
     append_base_path_segments, apply_advertised_http_route, authenticated_client_builder,
@@ -325,18 +325,25 @@ impl JellyfinClient {
 
     /// Resolve a direct-stream request with authentication kept in a
     /// sensitive header rather than the URL.
+    ///
+    /// The caller supplies the validated representation of the media this
+    /// request returns; `static=true` means the original bytes, so the
+    /// container is authoritative (see `MediaRepresentation`).
     pub(crate) fn resolved_stream_request(
         &self,
         item_id: &str,
+        representation: MediaRepresentation,
     ) -> BackendResult<ResolvedHttpRequest> {
         let mut url = self.api_url(&format!("Audio/{item_id}/stream"));
         url.set_query(None);
         url.set_fragment(None);
         url.query_pairs_mut().append_pair("static", "true");
-        let request = ResolvedHttpRequest::new(url)?.with_sensitive_header(
-            HeaderName::from_static("x-emby-authorization"),
-            jellyfin_auth_header(&self.api_key)?,
-        )?;
+        let request = ResolvedHttpRequest::new(url)?
+            .with_representation(representation)
+            .with_sensitive_header(
+                HeaderName::from_static("x-emby-authorization"),
+                jellyfin_auth_header(&self.api_key)?,
+            )?;
         match &self.advertised_route {
             Some(route) => request.with_advertised_route(route.clone()),
             None => Ok(request),
@@ -640,7 +647,7 @@ mod tests {
         let client =
             JellyfinClient::new("https://media.example.test", &api_key, "user-id").expect("client");
 
-        let stream = client.resolved_stream_request("track-id").unwrap();
+        let stream = client.resolved_stream_request("track-id", MediaRepresentation::buffered_unknown()).unwrap();
         let artwork = client.resolved_artwork_request("album-id").unwrap();
         assert_eq!(stream.endpoint().query(), Some("static=true"));
         assert!(artwork.endpoint().query().is_none());
@@ -675,7 +682,7 @@ mod tests {
             );
             assert_eq!(
                 client
-                    .resolved_stream_request("track-id")
+                    .resolved_stream_request("track-id", MediaRepresentation::buffered_unknown())
                     .expect("stream request")
                     .endpoint()
                     .as_str(),
@@ -881,7 +888,7 @@ mod tests {
         .expect("routed client");
 
         for request in [
-            client.resolved_stream_request("track-id").unwrap(),
+            client.resolved_stream_request("track-id", MediaRepresentation::buffered_unknown()).unwrap(),
             client.resolved_artwork_request("album-id").unwrap(),
         ] {
             assert_eq!(request.advertised_route(), Some(&route));
@@ -890,7 +897,7 @@ mod tests {
 
         let ordinary = JellyfinClient::new(origin, "api-key", "user-id").expect("ordinary client");
         assert!(ordinary
-            .resolved_stream_request("track-id")
+            .resolved_stream_request("track-id", MediaRepresentation::buffered_unknown())
             .unwrap()
             .advertised_route()
             .is_none());
