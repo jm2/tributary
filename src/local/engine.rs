@@ -1587,16 +1587,41 @@ impl Drop for ScanWriteTxnGuard<'_> {
 /// transaction boundary — never raced into the open SQLite write, where its
 /// own connection acquisition would queue behind the scan's lock and fail at
 /// the busy timeout (PR #286 finding jq5lG).
+///
+/// The channel receive future is created once and retained across polls.
+/// `async_channel::Recv` only keeps its channel listener alive while the
+/// future lives, so constructing it fresh inside `poll` would unregister the
+/// listener every time the poll returned `Pending`: a command sent while the
+/// scan branch was parked could not wake this branch at all, and service
+/// would stall until the scan's next own wake (PR #286 thread jq0TgN).
 struct GatedCommandRecv<'a> {
-    rx: &'a async_channel::Receiver<LibraryCommand>,
+    // `+ Send`: the engine run future is spawned on the multi-thread GTK
+    // bridge runtime (src/ui/window.rs), so every future it composes must
+    // stay `Send`.
+    recv: std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<LibraryCommand, async_channel::RecvError>>
+                + Send
+                + 'a,
+        >,
+    >,
     gate: &'a ScanWriteTxnGate,
+}
+
+impl<'a> GatedCommandRecv<'a> {
+    fn new(rx: &'a async_channel::Receiver<LibraryCommand>, gate: &'a ScanWriteTxnGate) -> Self {
+        Self {
+            recv: Box::pin(rx.recv()),
+            gate,
+        }
+    }
 }
 
 impl std::future::Future for GatedCommandRecv<'_> {
     type Output = Result<LibraryCommand, async_channel::RecvError>;
 
     fn poll(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         if self.gate.is_open() {
@@ -1605,11 +1630,13 @@ impl std::future::Future for GatedCommandRecv<'_> {
             // safe because the gate only ever closes while the scan is being
             // polled: if the gate is open here, the scan branch has already
             // been polled pending in this same select! poll and its waker
-            // will re-poll this branch.
+            // will re-poll this branch. A listener registered by an earlier
+            // gate-closed poll may still fire while the gate is open; that
+            // only produces a spurious wake-and-repark, never a lost or
+            // early-received command.
             return std::task::Poll::Pending;
         }
-        let mut recv = Box::pin(self.rx.recv());
-        recv.as_mut().poll(cx)
+        self.recv.as_mut().poll(cx)
     }
 }
 
@@ -3951,10 +3978,7 @@ where
         let next = tokio::select! {
             biased;
             result = scan.as_mut() => return result,
-            command = GatedCommandRecv {
-                rx: command_rx,
-                gate: scan_write_txn,
-            } => command,
+            command = GatedCommandRecv::new(command_rx, scan_write_txn) => command,
         };
         match next {
             Ok(LibraryCommand::Flush { completion }) => {
@@ -10679,6 +10703,97 @@ mod tests {
             restarted[0].file_path.ends_with("present.wav"),
             "the reconciled track is the scanned file: {:?}",
             restarted[0].file_path
+        );
+    }
+
+    /// Deterministic jq0TgN regression: with the write gate closed, parking
+    /// on `GatedCommandRecv` must leave the channel listener alive, so a
+    /// command sent while parked wakes the receiver instead of stalling until
+    /// some unrelated wake re-polls the selector. The pre-fix implementation
+    /// created a fresh `rx.recv()` inside `poll` and dropped it on every
+    /// `Pending`, unregistering the listener before any send could fire it.
+    #[tokio::test]
+    async fn gated_command_recv_wakes_when_a_command_is_sent_while_parked() {
+        let (command_tx, command_rx) = async_channel::unbounded::<LibraryCommand>();
+        let gate = ScanWriteTxnGate::default();
+        let (completion, _completion_rx) = async_channel::unbounded();
+
+        // The sender yields first so the gated receiver is polled to its
+        // first Pending — listener registered or, pre-fix, dropped — strictly
+        // before the command is sent. `join!` polls both branches on every
+        // task poll, so the interleaving is deterministic on the
+        // current-thread test runtime.
+        let sender = async {
+            tokio::task::yield_now().await;
+            command_tx
+                .send(LibraryCommand::Flush { completion })
+                .await
+                .expect("send while the gated receiver is parked");
+        };
+        // Once the sender has settled, nothing else re-polls the receiver, so
+        // a missed wake can only surface as this timeout.
+        let gated = async {
+            let recv = GatedCommandRecv::new(&command_rx, &gate);
+            recv.await
+        };
+        let started = std::time::Instant::now();
+        let (received, ()) = tokio::time::timeout(
+            Duration::from_secs(10),
+            futures::future::join(gated, sender),
+        )
+        .await
+        .expect("a command sent while parked must wake the gated receiver (jq0TgN)");
+        // Promptness is the assertion: a dropped channel listener (the
+        // pre-fix fresh-per-poll receive) does not lose the command — it
+        // drains it on the NEXT unrelated wake. The only timer in play is
+        // the failsafe above, so a near-10s completion proves the send did
+        // not wake the receiver.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the send itself must wake the parked receiver (took {elapsed:?}; a \
+             late drain means the channel listener was dropped — jq0TgN)"
+        );
+        let received = received.expect("the receive succeeds");
+        assert!(
+            matches!(received, LibraryCommand::Flush { .. }),
+            "the parked receiver must wake and take the command: {received:?}"
+        );
+    }
+
+    /// The jq5lG contract at the future level: with a scan write transaction
+    /// open, the gated receiver stays pending even with a command already
+    /// queued, and delivers it once the gate closes again.
+    #[tokio::test]
+    async fn gated_command_recv_defers_queued_commands_while_the_write_gate_is_open() {
+        use std::future::Future as _;
+        let (command_tx, command_rx) = async_channel::unbounded::<LibraryCommand>();
+        let gate = ScanWriteTxnGate::default();
+        let open_txn = ScanWriteTxnGuard::open(&gate);
+        let (completion, _completion_rx) = async_channel::unbounded();
+        command_tx
+            .send(LibraryCommand::Flush { completion })
+            .await
+            .expect("queue the command");
+
+        let mut gated = Box::pin(GatedCommandRecv::new(&command_rx, &gate));
+        // Gate open: the queued command must not surface, even on repeated
+        // polls (a fresh-per-poll receive would drain it immediately).
+        let mut parked = std::task::Context::from_waker(std::task::Waker::noop());
+        for _ in 0..3 {
+            assert!(
+                matches!(gated.as_mut().poll(&mut parked), std::task::Poll::Pending),
+                "an open scan write transaction must defer the queued command"
+            );
+        }
+        drop(open_txn);
+        let received = tokio::time::timeout(Duration::from_secs(10), gated.as_mut())
+            .await
+            .expect("closing the gate must deliver the deferred command")
+            .expect("the receive succeeds");
+        assert!(
+            matches!(received, LibraryCommand::Flush { .. }),
+            "the deferred command is delivered after the gate closes: {received:?}"
         );
     }
 
