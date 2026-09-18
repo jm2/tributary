@@ -526,7 +526,13 @@ fn nested_directory_transfer_fixture() -> (
 fn windows_reparse_creation_forbidden(destination_root: &Path, outside: &Path) -> bool {
     let probe = destination_root.join(".reparse-probe");
     let creatable = std::os::windows::fs::symlink_dir(outside, &probe).is_ok();
-    let _ = std::fs::remove_file(&probe);
+    if creatable {
+        // A created directory reparse point is removed with `remove_dir`:
+        // `DeleteFile` (behind `remove_file`) refuses directory entries, so
+        // a surviving probe would pollute the destination-root survivor
+        // assertions below with transfer litter that no stage created.
+        std::fs::remove_dir(&probe).expect("remove the reparse-point probe link");
+    }
     !creatable
 }
 
