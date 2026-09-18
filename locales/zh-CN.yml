@@ -339,7 +339,6 @@ errors:
       dedicated_daemon_did_not_terminate_after_sigkill: "专用守护进程在 SIGKILL 后未终止"
       dedicated_daemon_could_not_be_restarted: "无法重启专用守护进程"
       dedicated_daemon_did_not_come_back_after_quiescence: "静默处理后专用守护进程未恢复"
-      dedicated_daemon_is_not_running_to_quiesce: "专用守护进程未运行，无法进行静默处理"
       local_http_client_could_not_be_created: "无法创建本地 HTTP 客户端"
       dedicated_daemon_rejected_the_request: "专用守护进程拒绝了请求"
       dedicated_daemon_is_unreachable: "无法连接专用守护进程"

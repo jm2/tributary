@@ -212,6 +212,24 @@ fn env_nonempty(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Why explicit configuration was refused: the catalog key of the reason. Kept
+/// as a key rather than a rendered message so the refusal is reported in the
+/// locale selected when it is shown, and so `probe` can name the operator's
+/// actual setup mistake instead of a generic "not configured" (PR #270 review,
+/// round 11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConfigRefusal(&'static str);
+
+const fn unavailable_config(reason: &'static str) -> ConfigRefusal {
+    ConfigRefusal(reason)
+}
+
+impl ConfigRefusal {
+    fn error(self) -> SenderError {
+        unavailable(self.0)
+    }
+}
+
 /// Filesystem + endpoint configuration for the dedicated instance.
 #[derive(Debug, Clone)]
 struct OwnToneConfig {
@@ -222,11 +240,28 @@ struct OwnToneConfig {
 }
 
 impl OwnToneConfig {
-    fn from_env() -> Result<Self, SenderError> {
-        let api = env_nonempty(ENV_API).ok_or_else(|| unavailable("not_configured"))?;
-        let pipe = env_nonempty(ENV_PIPE).ok_or_else(|| unavailable("not_configured"))?;
-        let state = env_nonempty(ENV_STATE_DIR).ok_or_else(|| unavailable("not_configured"))?;
-        let binary = env_nonempty(ENV_BIN).unwrap_or_else(|| DEFAULT_BIN.to_string());
+    fn from_env() -> Result<Self, ConfigRefusal> {
+        Self::from_values(
+            env_nonempty(ENV_API),
+            env_nonempty(ENV_PIPE),
+            env_nonempty(ENV_STATE_DIR),
+            env_nonempty(ENV_BIN),
+        )
+    }
+
+    /// Resolve the configuration from already-read values. Split from
+    /// [`Self::from_env`] so every refusal is unit-testable without mutating
+    /// the process environment.
+    fn from_values(
+        api: Option<String>,
+        pipe: Option<String>,
+        state: Option<String>,
+        binary: Option<String>,
+    ) -> Result<Self, ConfigRefusal> {
+        let api = api.ok_or(unavailable_config("not_configured"))?;
+        let pipe = pipe.ok_or(unavailable_config("not_configured"))?;
+        let state = state.ok_or(unavailable_config("not_configured"))?;
+        let binary = binary.unwrap_or_else(|| DEFAULT_BIN.to_string());
         let config = Self {
             api_base: api.trim_end_matches('/').to_string(),
             pipe_path: PathBuf::from(pipe),
@@ -240,9 +275,9 @@ impl OwnToneConfig {
     /// The JSON API must be loopback-bound: loopback is network isolation, not
     /// authentication (§7), and a non-loopback endpoint is never the dedicated
     /// instance this adapter is allowed to drive.
-    fn verify_loopback(&self) -> Result<(), SenderError> {
+    fn verify_loopback(&self) -> Result<(), ConfigRefusal> {
         let url = url::Url::parse(&self.api_base)
-            .map_err(|_| unavailable("configured_api_url_is_invalid"))?;
+            .map_err(|_| unavailable_config("configured_api_url_is_invalid"))?;
         let host = url.host_str().unwrap_or_default();
         if is_loopback_host(host) && !is_literal_loopback_host(host) {
             // "localhost" resolves to *both* loopback families, so the process
@@ -250,12 +285,12 @@ impl OwnToneConfig {
             // dials can be different listeners (review T5). Require the literal
             // address the client will use, so the observed family is the
             // endpoint's family by construction.
-            return Err(unavailable(
+            return Err(unavailable_config(
                 "json_api_loopback_host_must_be_a_literal_address",
             ));
         }
         if !is_loopback_host(host) {
-            return Err(unavailable("json_api_must_be_bound_to_loopback"));
+            return Err(unavailable_config("json_api_must_be_bound_to_loopback"));
         }
         Ok(())
     }
@@ -736,6 +771,11 @@ fn process_is_owned(process: &ListenerProcess, config: &OwnToneConfig) -> bool {
 /// an old record stays valid if the dedicated daemon stops and a shared
 /// instance binds the same port (review R5).
 fn verify_daemon_process(config: &OwnToneConfig) -> Result<(), SenderError> {
+    owned_listener(config).map(|_| ())
+}
+
+/// The endpoint's listener, proven to be the dedicated Tributary-owned daemon.
+fn owned_listener(config: &OwnToneConfig) -> Result<ListenerProcess, SenderError> {
     let Some(process) = listener_process(&config.api_base) else {
         return Err(unavailable(
             "no_process_is_bound_to_the_configured_dedicated_instance_endpoint",
@@ -747,7 +787,82 @@ fn verify_daemon_process(config: &OwnToneConfig) -> Result<(), SenderError> {
     if !cmdline_binds_instance(&process.argv, &config.state_dir, &config.pipe_path) {
         return Err(unavailable("endpoint_process_is_not_the_owned_instance"));
     }
-    Ok(())
+    Ok(process)
+}
+
+/// The socket inode a `/proc/<pid>/fd` entry points at, if it is a socket.
+fn socket_inode(fd: &Path) -> Option<u64> {
+    let target = std::fs::read_link(fd).ok()?;
+    target
+        .to_str()?
+        .strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+/// Whether the exact process `identity` names (pid and kernel start time) is
+/// alive and holds every one of `inodes`.
+fn process_holds_sockets(identity: ProcessIdentity, inodes: &[u64]) -> bool {
+    if process_start_time(identity.pid) != Some(identity.start_time) {
+        return false;
+    }
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{}/fd", identity.pid)) else {
+        return false;
+    };
+    let held: Vec<u64> = fds
+        .flatten()
+        .filter_map(|fd| socket_inode(&fd.path()))
+        .collect();
+    inodes.iter().all(|inode| held.contains(inode))
+}
+
+/// The process authority a control client re-proves before every mutating
+/// request (PR #270 review, round 11). `open_preflight` proves once that the
+/// endpoint's listener is the dedicated instance, but the client outlives that
+/// proof through the session and its recovery: if the daemon exits and another
+/// local process binds the same loopback address and port, a later
+/// `outputs/set`, queue, volume or playback request would reach it on the
+/// strength of the URL alone — the stale-ownership-record scenario the process
+/// check exists to prevent.
+struct ProcessGuard {
+    config: OwnToneConfig,
+    /// The owned listener last proven in full. While that exact process still
+    /// holds every listening socket of the endpoint a mutation needs no second
+    /// `/proc` walk; anything else (it exited, was restarted, or a second
+    /// listener joined the endpoint) repeats the full ownership proof.
+    verified: Mutex<Option<ProcessIdentity>>,
+}
+
+impl ProcessGuard {
+    fn new(config: &OwnToneConfig) -> Self {
+        Self {
+            config: config.clone(),
+            verified: Mutex::new(None),
+        }
+    }
+
+    fn authorize(&self) -> Result<(), SenderError> {
+        let inodes = listening_socket_inodes(&self.config.api_base);
+        if inodes.is_empty() {
+            return Err(unavailable(
+                "no_process_is_bound_to_the_configured_dedicated_instance_endpoint",
+            ));
+        }
+        let mut verified = self.verified.lock().unwrap_or_else(|p| p.into_inner());
+        if verified.is_some_and(|identity| process_holds_sockets(identity, &inodes)) {
+            return Ok(());
+        }
+        *verified = None;
+        let identity = owned_listener(&self.config)?.identity();
+        if !process_holds_sockets(identity, &inodes) {
+            // A second listener shares the endpoint: the kernel may hand this
+            // connection to either one.
+            return Err(unavailable("endpoint_process_is_not_the_owned_instance"));
+        }
+        *verified = Some(identity);
+        Ok(())
+    }
 }
 
 /// Re-verify, immediately before signalling, that the exact process the
@@ -940,11 +1055,11 @@ fn spawn_restart_command(command: &str) -> Result<(), SenderError> {
 fn wait_for_owned_listener(
     config: &OwnToneConfig,
     deadline: Instant,
-    previous: ProcessIdentity,
+    previous: Option<ProcessIdentity>,
 ) -> Result<(), SenderError> {
     loop {
         if let Some(process) = listener_process(&config.api_base) {
-            if process_is_owned(&process, config) && process.identity() != previous {
+            if process_is_owned(&process, config) && Some(process.identity()) != previous {
                 return Ok(());
             }
         }
@@ -965,7 +1080,7 @@ fn wait_for_owned_listener(
 /// against a daemon that cannot replay an old generation's mutation.
 fn quiesce_daemon(config: &OwnToneConfig) -> Result<(), SenderError> {
     let Some(process) = listener_process(&config.api_base) else {
-        return Err(unavailable("dedicated_daemon_is_not_running_to_quiesce"));
+        return restart_exited_daemon(config);
     };
     // Full authority, not just the binary: a same-binary shared instance that
     // happens to hold the endpoint must never be terminated (review S2).
@@ -983,7 +1098,38 @@ fn quiesce_daemon(config: &OwnToneConfig) -> Result<(), SenderError> {
     if let Some(command) = config.restart_command() {
         spawn_restart_command(&command)?;
     }
-    wait_for_owned_listener(config, Instant::now() + QUIESCE_RESTART_DEADLINE, previous)
+    wait_for_owned_listener(
+        config,
+        Instant::now() + QUIESCE_RESTART_DEADLINE,
+        Some(previous),
+    )
+}
+
+/// Quiescence when no process can be named on the endpoint: the dedicated
+/// instance already exited (it crashed after the takeover). A dead daemon
+/// cannot replay an old generation's mutation, so it is already quiesced —
+/// what is missing is the instance restoration needs. Refusing here left an
+/// installation that relies on the documented `restart_command` with its
+/// takeover record, instance lock and media route retained forever, because
+/// inline and supervisor recovery both retry through this same function (PR
+/// #270 review, round 11).
+///
+/// A socket that is still bound is either the exited instance's last threads
+/// releasing it or a listener this user cannot inspect: the release gets its
+/// bounded window, and a holder that stays is foreign — nothing is started
+/// over it.
+fn restart_exited_daemon(config: &OwnToneConfig) -> Result<(), SenderError> {
+    if endpoint_is_bound(&config.api_base) {
+        wait_for_endpoint_release(
+            &config.api_base,
+            Instant::now() + QUIESCE_TERMINATE_DEADLINE,
+        )
+        .map_err(|_| unavailable("endpoint_process_is_not_the_owned_instance"))?;
+    }
+    if let Some(command) = config.restart_command() {
+        spawn_restart_command(&command)?;
+    }
+    wait_for_owned_listener(config, Instant::now() + QUIESCE_RESTART_DEADLINE, None)
 }
 
 /// `true` when this package target has a documented OwnTone acquisition path.
@@ -1091,6 +1237,9 @@ fn map_receiver_to_output(
 struct OwnToneClient {
     http: reqwest::blocking::Client,
     base: String,
+    /// Present on the client a session drives the dedicated instance with;
+    /// absent only where no instance authority exists to prove.
+    guard: Option<ProcessGuard>,
 }
 
 impl OwnToneClient {
@@ -1105,7 +1254,21 @@ impl OwnToneClient {
         Ok(Self {
             http,
             base: base.to_string(),
+            guard: None,
         })
+    }
+
+    /// The client a session uses: every mutating request first re-proves that
+    /// the endpoint is still served by the dedicated Tributary-owned daemon.
+    fn for_owned_instance(config: &OwnToneConfig) -> Result<Self, SenderError> {
+        let mut client = Self::new(&config.api_base)?;
+        client.guard = Some(ProcessGuard::new(config));
+        Ok(client)
+    }
+
+    /// Refuse a mutation the verified daemon would not be the one to receive.
+    fn authorize_mutation(&self) -> Result<(), SenderError> {
+        self.guard.as_ref().map_or(Ok(()), ProcessGuard::authorize)
     }
 
     fn require_success(response: &reqwest::blocking::Response) -> Result<(), SenderError> {
@@ -1131,6 +1294,7 @@ impl OwnToneClient {
     }
 
     fn put(&self, path: &str) -> Result<(), SenderError> {
+        self.authorize_mutation()?;
         let response = self
             .http
             .put(format!("{}{}", self.base, path))
@@ -1141,6 +1305,7 @@ impl OwnToneClient {
     }
 
     fn put_json(&self, path: &str, body: &serde_json::Value) -> Result<(), SenderError> {
+        self.authorize_mutation()?;
         let response = self
             .http
             .put(format!("{}{}", self.base, path))
@@ -2830,23 +2995,19 @@ impl SenderSession for OwnToneSession {
 
 /// The OwnTone 29.x transmission path.
 pub(super) struct OwnToneSender {
-    config: Option<OwnToneConfig>,
+    /// The resolved configuration, or the specific reason it was refused.
+    config: Result<OwnToneConfig, ConfigRefusal>,
 }
 
 impl OwnToneSender {
     /// Resolve the adapter from explicit configuration. A missing or invalid
     /// configuration yields a sender whose `probe` fails closed.
     pub(super) fn from_env() -> Self {
-        let config = match OwnToneConfig::from_env() {
-            Ok(config) => {
-                info!(api = %config.api_base, "OwnTone AirPlay sender configured");
-                Some(config)
-            }
-            Err(error) => {
-                debug!(reason = %error.message(), "OwnTone AirPlay sender not configured");
-                None
-            }
-        };
+        let config = OwnToneConfig::from_env();
+        match &config {
+            Ok(config) => info!(api = %config.api_base, "OwnTone AirPlay sender configured"),
+            Err(refusal) => debug!(reason = refusal.0, "OwnTone AirPlay sender not configured"),
+        }
         Self { config }
     }
 
@@ -2882,10 +3043,9 @@ impl AirplaySender for OwnToneSender {
                 "this_platform_has_no_supported_owntone_acquisition_path",
             ));
         }
-        let config = self
-            .config
-            .as_ref()
-            .ok_or_else(|| unavailable("not_configured"))?;
+        // A refused configuration reports its own reason (a malformed,
+        // non-loopback or ambiguous API URL), never a generic "not configured".
+        let config = self.config.as_ref().map_err(|refusal| refusal.error())?;
         // Record-only here: the kernel-verified process binding (review R5)
         // walks `/proc`, so it stays on the worker with the rest of the
         // non-local gate.
@@ -2901,10 +3061,10 @@ impl AirplaySender for OwnToneSender {
         if ctx.cancel.is_cancelled() {
             return OpenOutcome::Cancelled;
         }
-        let Some(config) = self.config.clone() else {
-            return OpenOutcome::Failed(unavailable("not_configured"));
-        };
-        open(config, ctx)
+        match self.config.clone() {
+            Ok(config) => open(config, ctx),
+            Err(refusal) => OpenOutcome::Failed(refusal.error()),
+        }
     }
 }
 
@@ -3071,7 +3231,7 @@ fn open_preflight(
     ctx: &SenderOpenContext,
     deadline: Instant,
 ) -> Result<Preflight, OpenOutcome> {
-    let client = OwnToneClient::new(&config.api_base)
+    let client = OwnToneClient::for_owned_instance(config)
         .map(Arc::new)
         .map_err(|error| pre_mutation_failure(ctx, error))?;
     config
@@ -4025,9 +4185,7 @@ pub(super) fn test_owned_sender(api_base: &str, state_dir: &Path, binary: &Path)
     )
     .expect("write record");
     ensure_pipe(&config.pipe_path).expect("create pipe");
-    OwnToneSender {
-        config: Some(config),
-    }
+    OwnToneSender { config: Ok(config) }
 }
 
 #[cfg(test)]
@@ -4373,7 +4531,10 @@ mod tests {
                 let open = call.find('(')?;
                 // Only the two refusal constructors; `unavailable_in(locale, …)`
                 // and friends take a locale first.
-                if !matches!(&call[..open], "unavailable" | "unavailable_with_id") {
+                if !matches!(
+                    &call[..open],
+                    "unavailable" | "unavailable_with_id" | "unavailable_config"
+                ) {
                     return None;
                 }
                 let rest = call[open + 1..].trim_start();
@@ -4418,7 +4579,9 @@ mod tests {
 
     #[test]
     fn unconfigured_sender_probe_fails_closed() {
-        let sender = OwnToneSender { config: None };
+        let sender = OwnToneSender {
+            config: Err(unavailable_config("not_configured")),
+        };
         let error = sender.probe().expect_err("unconfigured sender must refuse");
         let expected = if platform_available() {
             "not configured"
@@ -4426,6 +4589,49 @@ mod tests {
             "no supported OwnTone acquisition path"
         };
         assert!(error.message().contains(expected), "{}", error.message());
+    }
+
+    /// A refused configuration reports the operator's actual mistake. The
+    /// sender used to drop the parser's error and answer "not configured" for
+    /// a malformed, non-loopback or ambiguous API URL, so those catalog
+    /// entries were unreachable from the UI (PR #270 review, round 11).
+    #[test]
+    fn a_refused_configuration_reports_its_own_reason() {
+        let resolve = |api: Option<&str>| {
+            OwnToneConfig::from_values(
+                api.map(str::to_string),
+                Some("/run/tributary/airplay.pcm".to_string()),
+                Some("/run/tributary".to_string()),
+                None,
+            )
+        };
+        assert!(resolve(Some("http://127.0.0.1:3689")).is_ok());
+        for (api, reason) in [
+            (None, "not_configured"),
+            (Some("not a url"), "configured_api_url_is_invalid"),
+            (
+                Some("http://192.0.2.10:3689"),
+                "json_api_must_be_bound_to_loopback",
+            ),
+            (
+                Some("http://localhost:3689"),
+                "json_api_loopback_host_must_be_a_literal_address",
+            ),
+        ] {
+            let refusal = resolve(api).expect_err("the configuration is refused");
+            assert_eq!(refusal, ConfigRefusal(reason), "{api:?}");
+            let sender = OwnToneSender {
+                config: Err(refusal),
+            };
+            let error = sender.probe().expect_err("a refused sender never probes");
+            if platform_available() {
+                assert_eq!(
+                    error.message(),
+                    unavailable_in("en", reason).message(),
+                    "{api:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -7788,6 +7994,95 @@ fn serve(stream: std::net::TcpStream) {
         assert!(client.outputs().is_ok());
     }
 
+    /// Terminate the fixture's daemon the way a crash leaves it: no listener,
+    /// nothing bound, and nobody but the recorded restart command to bring it
+    /// back.
+    #[cfg(owntone_host)]
+    fn crash(daemon: &RecordingOwnedDaemon) {
+        let process = listener_process(&daemon.config.api_base).expect("the daemon listens");
+        terminate_process(&process, &daemon.config, Duration::from_secs(5))
+            .expect("the daemon terminates");
+        wait_until(|| !endpoint_is_bound(&daemon.config.api_base));
+    }
+
+    /// An instance that already exited is quiesced by definition; recovery
+    /// must still run the recorded restart command so restoration can
+    /// proceed. Refusing with "not running" retained the takeover record, the
+    /// instance lock and the media route forever (PR #270 review, round 11).
+    #[cfg(owntone_host)]
+    #[test]
+    fn quiesce_restarts_an_instance_that_already_exited() {
+        let daemon = RecordingOwnedDaemon::start();
+        let before = listener_process(&daemon.config.api_base)
+            .expect("the daemon listens")
+            .identity();
+        crash(&daemon);
+        assert!(listener_process(&daemon.config.api_base).is_none());
+
+        quiesce_daemon(&daemon.config).expect("recovery restarts the exited instance");
+        let after =
+            listener_process(&daemon.config.api_base).expect("the restarted instance listens");
+        assert!(process_is_owned(&after, &daemon.config));
+        assert_ne!(after.identity(), before);
+        let client = OwnToneClient::new(&daemon.config.api_base).unwrap();
+        assert!(client.outputs().is_ok());
+    }
+
+    /// A listener that is not the dedicated instance never receives a
+    /// mutation: the session client proves the endpoint's process before it
+    /// transmits, not only once at open (PR #270 review, round 11).
+    #[cfg(owntone_host)]
+    #[test]
+    fn session_client_refuses_a_foreign_listener_before_sending() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let config = OwnToneConfig {
+            api_base: format!("http://{}", listener.local_addr().unwrap()),
+            pipe_path: directory.path().join("airplay.pcm"),
+            state_dir: directory.path().to_path_buf(),
+            binary: PathBuf::from("/usr/bin/owntone"),
+        };
+        let client = OwnToneClient::for_owned_instance(&config).unwrap();
+        for result in [client.clear_queue(), client.set_outputs(&[1])] {
+            let error = result.expect_err("a foreign listener is refused");
+            assert_eq!(
+                error.message(),
+                unavailable_in("en", "endpoint_process_is_not_the_owntone_binary").message()
+            );
+        }
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "no connection may reach the foreign listener"
+        );
+    }
+
+    /// The session client follows the owned instance across a legitimate
+    /// restart and refuses once nothing owned serves the endpoint.
+    #[cfg(owntone_host)]
+    #[test]
+    fn session_client_follows_the_owned_instance_and_refuses_once_it_is_gone() {
+        let daemon = RecordingOwnedDaemon::start();
+        let client = OwnToneClient::for_owned_instance(&daemon.config).unwrap();
+        client.clear_queue().expect("the owned instance accepts");
+        quiesce_daemon(&daemon.config).expect("quiescence restarts the instance");
+        client
+            .clear_queue()
+            .expect("the restarted owned instance is proven again and accepts");
+        crash(&daemon);
+        let error = client
+            .clear_queue()
+            .expect_err("nothing owned serves the endpoint");
+        assert_eq!(
+            error.message(),
+            unavailable_in(
+                "en",
+                "no_process_is_bound_to_the_configured_dedicated_instance_endpoint"
+            )
+            .message()
+        );
+    }
+
     #[cfg(owntone_host)]
     impl Drop for RecordingOwnedDaemon {
         fn drop(&mut self) {
@@ -7956,7 +8251,7 @@ fn serve(stream: std::net::TcpStream) {
         let controller = ControllerHarness::new(
             runtime.handle().clone(),
             Arc::new(OwnToneSender {
-                config: Some(daemon.config.clone()),
+                config: Ok(daemon.config.clone()),
             }),
             tx,
         )
@@ -8110,7 +8405,7 @@ fn serve(stream: std::net::TcpStream) {
         let controller = ControllerHarness::new(
             runtime.handle().clone(),
             Arc::new(OwnToneSender {
-                config: Some(daemon.config.clone()),
+                config: Ok(daemon.config.clone()),
             }),
             tx,
         )
@@ -8296,7 +8591,7 @@ fn serve(stream: std::net::TcpStream) {
         let controller = ControllerHarness::new(
             runtime.handle().clone(),
             Arc::new(OwnToneSender {
-                config: Some(daemon.config.clone()),
+                config: Ok(daemon.config.clone()),
             }),
             tx,
         )
@@ -8500,7 +8795,7 @@ fn serve(stream: std::net::TcpStream) {
             let controller = ControllerHarness::new(
                 runtime.handle().clone(),
                 Arc::new(OwnToneSender {
-                    config: Some(daemon.config.clone()),
+                    config: Ok(daemon.config.clone()),
                 }),
                 tx,
             )
@@ -9717,7 +10012,7 @@ fn serve(stream: std::net::TcpStream) {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let sender = Arc::new(ParkedOwnedSender {
             sender: OwnToneSender {
-                config: Some(daemon.config.clone()),
+                config: Ok(daemon.config.clone()),
             },
             opened: opened_tx,
             release: Mutex::new(release_rx),
@@ -9957,7 +10252,7 @@ fn serve(stream: std::net::TcpStream) {
         let mut controller = ControllerHarness::new(
             runtime.handle().clone(),
             Arc::new(OwnToneSender {
-                config: Some(daemon.config.clone()),
+                config: Ok(daemon.config.clone()),
             }),
             tx,
         )
@@ -9999,7 +10294,7 @@ fn serve(stream: std::net::TcpStream) {
             let prepared = prepare("replacement.wav", 30);
             let next_ticket = prepared.ticket().unwrap();
             controller.set_sender(Arc::new(OwnToneSender {
-                config: Some(next.config.clone()),
+                config: Ok(next.config.clone()),
             }));
             let next_generation = PlayerEventGeneration::from_raw(82);
             controller.set_generation(next_generation);
@@ -10084,7 +10379,7 @@ fn serve(stream: std::net::TcpStream) {
         let mut controller = ControllerHarness::new(
             runtime.handle().clone(),
             Arc::new(OwnToneSender {
-                config: Some(daemon.config.clone()),
+                config: Ok(daemon.config.clone()),
             }),
             tx,
         )
@@ -10155,7 +10450,7 @@ fn serve(stream: std::net::TcpStream) {
             let prepared = prepare("replacement.wav", 30);
             let next_ticket = prepared.ticket().unwrap();
             controller.set_sender(Arc::new(OwnToneSender {
-                config: Some(next.config.clone()),
+                config: Ok(next.config.clone()),
             }));
             let next_generation = PlayerEventGeneration::from_raw(82);
             controller.set_generation(next_generation);
@@ -10262,7 +10557,7 @@ fn serve(stream: std::net::TcpStream) {
         let mut controller = ControllerHarness::new(
             runtime.handle().clone(),
             Arc::new(OwnToneSender {
-                config: Some(daemon.config.clone()),
+                config: Ok(daemon.config.clone()),
             }),
             tx,
         )
@@ -10658,7 +10953,7 @@ fn serve(stream: std::net::TcpStream) {
         let controller = ControllerHarness::new(
             runtime.handle().clone(),
             Arc::new(OwnToneSender {
-                config: Some(daemon.config.clone()),
+                config: Ok(daemon.config.clone()),
             }),
             tx,
         )
@@ -10817,7 +11112,7 @@ fn serve(stream: std::net::TcpStream) {
         let mut controller = ControllerHarness::new(
             runtime.handle().clone(),
             Arc::new(OwnToneSender {
-                config: Some(daemon.config.clone()),
+                config: Ok(daemon.config.clone()),
             }),
             tx,
         )

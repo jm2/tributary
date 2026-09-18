@@ -339,7 +339,6 @@ errors:
       dedicated_daemon_did_not_terminate_after_sigkill: "el demonio dedicado no terminó tras SIGKILL"
       dedicated_daemon_could_not_be_restarted: "no se pudo reiniciar el demonio dedicado"
       dedicated_daemon_did_not_come_back_after_quiescence: "el demonio dedicado no volvió tras la pausa de reposo"
-      dedicated_daemon_is_not_running_to_quiesce: "el demonio dedicado no se está ejecutando para ponerlo en reposo"
       local_http_client_could_not_be_created: "no se pudo crear el cliente HTTP local"
       dedicated_daemon_rejected_the_request: "el demonio dedicado rechazó la solicitud"
       dedicated_daemon_is_unreachable: "el demonio dedicado no está accesible"

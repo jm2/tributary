@@ -339,7 +339,6 @@ errors:
       dedicated_daemon_did_not_terminate_after_sigkill: "der dedizierte Daemon wurde nach SIGKILL nicht beendet"
       dedicated_daemon_could_not_be_restarted: "der dedizierte Daemon konnte nicht neu gestartet werden"
       dedicated_daemon_did_not_come_back_after_quiescence: "der dedizierte Daemon kam nach der Ruhephase nicht zurück"
-      dedicated_daemon_is_not_running_to_quiesce: "der dedizierte Daemon läuft nicht und kann nicht in die Ruhephase versetzt werden"
       local_http_client_could_not_be_created: "der lokale HTTP-Client konnte nicht erstellt werden"
       dedicated_daemon_rejected_the_request: "der dedizierte Daemon hat die Anfrage abgelehnt"
       dedicated_daemon_is_unreachable: "der dedizierte Daemon ist nicht erreichbar"

@@ -339,7 +339,6 @@ errors:
       dedicated_daemon_did_not_terminate_after_sigkill: "専用デーモンが SIGKILL 後も終了しませんでした"
       dedicated_daemon_could_not_be_restarted: "専用デーモンを再起動できませんでした"
       dedicated_daemon_did_not_come_back_after_quiescence: "静止処理の後、専用デーモンが復帰しませんでした"
-      dedicated_daemon_is_not_running_to_quiesce: "専用デーモンが実行されていないため静止処理ができません"
       local_http_client_could_not_be_created: "ローカル HTTP クライアントを作成できませんでした"
       dedicated_daemon_rejected_the_request: "専用デーモンがリクエストを拒否しました"
       dedicated_daemon_is_unreachable: "専用デーモンに到達できません"

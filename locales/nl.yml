@@ -339,7 +339,6 @@ errors:
       dedicated_daemon_did_not_terminate_after_sigkill: "de toegewijde daemon is na SIGKILL niet beëindigd"
       dedicated_daemon_could_not_be_restarted: "de toegewijde daemon kon niet opnieuw worden gestart"
       dedicated_daemon_did_not_come_back_after_quiescence: "de toegewijde daemon kwam na de rustfase niet terug"
-      dedicated_daemon_is_not_running_to_quiesce: "de toegewijde daemon draait niet en kan niet in rust worden gebracht"
       local_http_client_could_not_be_created: "de lokale HTTP-client kon niet worden aangemaakt"
       dedicated_daemon_rejected_the_request: "de toegewijde daemon heeft het verzoek geweigerd"
       dedicated_daemon_is_unreachable: "de toegewijde daemon is onbereikbaar"

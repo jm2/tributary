@@ -372,7 +372,6 @@ errors:
       dedicated_daemon_did_not_terminate_after_sigkill: "the dedicated daemon did not terminate after SIGKILL"
       dedicated_daemon_could_not_be_restarted: "the dedicated daemon could not be restarted"
       dedicated_daemon_did_not_come_back_after_quiescence: "the dedicated daemon did not come back after quiescence"
-      dedicated_daemon_is_not_running_to_quiesce: "the dedicated daemon is not running to quiesce"
       local_http_client_could_not_be_created: "the local HTTP client could not be created"
       dedicated_daemon_rejected_the_request: "the dedicated daemon rejected the request"
       dedicated_daemon_is_unreachable: "the dedicated daemon is unreachable"

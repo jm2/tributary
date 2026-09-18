@@ -341,7 +341,6 @@ errors:
       dedicated_daemon_did_not_terminate_after_sigkill: "dedykowany demon nie zakończył się po SIGKILL"
       dedicated_daemon_could_not_be_restarted: "nie można ponownie uruchomić dedykowanego demona"
       dedicated_daemon_did_not_come_back_after_quiescence: "dedykowany demon nie wrócił po wyciszeniu"
-      dedicated_daemon_is_not_running_to_quiesce: "dedykowany demon nie działa i nie można go wyciszyć"
       local_http_client_could_not_be_created: "nie można utworzyć lokalnego klienta HTTP"
       dedicated_daemon_rejected_the_request: "dedykowany demon odrzucił żądanie"
       dedicated_daemon_is_unreachable: "dedykowany demon jest nieosiągalny"

@@ -339,7 +339,6 @@ errors:
       dedicated_daemon_did_not_terminate_after_sigkill: "전용 데몬이 SIGKILL 후에도 종료되지 않았습니다"
       dedicated_daemon_could_not_be_restarted: "전용 데몬을 다시 시작할 수 없습니다"
       dedicated_daemon_did_not_come_back_after_quiescence: "정지 처리 후 전용 데몬이 돌아오지 않았습니다"
-      dedicated_daemon_is_not_running_to_quiesce: "전용 데몬이 실행 중이 아니어서 정지 처리를 할 수 없습니다"
       local_http_client_could_not_be_created: "로컬 HTTP 클라이언트를 만들 수 없습니다"
       dedicated_daemon_rejected_the_request: "전용 데몬이 요청을 거부했습니다"
       dedicated_daemon_is_unreachable: "전용 데몬에 연결할 수 없습니다"

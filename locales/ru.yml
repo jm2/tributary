@@ -341,7 +341,6 @@ errors:
       dedicated_daemon_did_not_terminate_after_sigkill: "выделенный демон не завершился после SIGKILL"
       dedicated_daemon_could_not_be_restarted: "не удалось перезапустить выделенный демон"
       dedicated_daemon_did_not_come_back_after_quiescence: "выделенный демон не вернулся после приостановки"
-      dedicated_daemon_is_not_running_to_quiesce: "выделенный демон не запущен, приостановка невозможна"
       local_http_client_could_not_be_created: "не удалось создать локальный HTTP-клиент"
       dedicated_daemon_rejected_the_request: "выделенный демон отклонил запрос"
       dedicated_daemon_is_unreachable: "выделенный демон недоступен"

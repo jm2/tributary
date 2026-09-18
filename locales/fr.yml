@@ -339,7 +339,6 @@ errors:
       dedicated_daemon_did_not_terminate_after_sigkill: "le démon dédié ne s'est pas terminé après SIGKILL"
       dedicated_daemon_could_not_be_restarted: "le démon dédié n'a pas pu être redémarré"
       dedicated_daemon_did_not_come_back_after_quiescence: "le démon dédié n'est pas revenu après la mise au repos"
-      dedicated_daemon_is_not_running_to_quiesce: "le démon dédié ne s'exécute pas et ne peut pas être mis au repos"
       local_http_client_could_not_be_created: "le client HTTP local n'a pas pu être créé"
       dedicated_daemon_rejected_the_request: "le démon dédié a rejeté la requête"
       dedicated_daemon_is_unreachable: "le démon dédié est injoignable"

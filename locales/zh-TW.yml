@@ -339,7 +339,6 @@ errors:
       dedicated_daemon_did_not_terminate_after_sigkill: "專用常駐程式在 SIGKILL 後未終止"
       dedicated_daemon_could_not_be_restarted: "無法重新啟動專用常駐程式"
       dedicated_daemon_did_not_come_back_after_quiescence: "靜止處理後專用常駐程式未恢復"
-      dedicated_daemon_is_not_running_to_quiesce: "專用常駐程式未執行，無法進行靜止處理"
       local_http_client_could_not_be_created: "無法建立本機 HTTP 用戶端"
       dedicated_daemon_rejected_the_request: "專用常駐程式拒絕了要求"
       dedicated_daemon_is_unreachable: "無法連線至專用常駐程式"
