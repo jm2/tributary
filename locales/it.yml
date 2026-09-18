@@ -237,10 +237,10 @@ properties:
   write_invalid_file: "La modifica dei tag non è disponibile perché almeno un brano selezionato non è un normale file locale."
   write_unavailable: "La modifica dei tag non è disponibile perché almeno un file selezionato o la relativa cartella è di sola lettura o non disponibile."
   write_device_unavailable: "Questo dispositivo è attualmente di sola lettura o non disponibile. In Flatpak, aggiungi la sua cartella come libreria personalizzata nelle Preferenze per richiedere l’accesso in scrittura."
-  write_conflict: "Almeno un file selezionato è cambiato su disco da quando è stato aperto Proprietà. Riapri Proprietà per modificare i file attuali."
+  write_conflict: "Almeno un file selezionato è cambiato su disco da quando è stata aperta la finestra Proprietà. Riapri Proprietà per modificare i file attuali."
   save_conflict_heading: "Alcuni file sono cambiati su disco"
   save_failure_heading: "Impossibile salvare alcuni file"
-  save_conflict_all: "%{conflicts} file su %{total} sono cambiati su disco da quando è stato aperto Proprietà. I file in conflitto sono stati lasciati intatti: riapri Proprietà per modificare i file attuali."
+  save_conflict_all: "%{conflicts} file su %{total} sono cambiati su disco da quando è stata aperta la finestra Proprietà. I file in conflitto sono stati lasciati intatti: riapri Proprietà per modificare i file attuali."
   save_conflict_mixed: "%{conflicts} file su %{total} sono cambiati su disco e altri %{other} file non sono stati salvati; tutti sono stati lasciati invariati. Riapri Proprietà per i file cambiati."
   save_failure: "%{failed} file su %{total} non sono stati salvati e sono stati lasciati invariati."
 
