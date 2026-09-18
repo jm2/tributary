@@ -360,14 +360,11 @@ class FuzzLockPolicyTests(unittest.TestCase):
             )
 
     def _build_stale_removal_fixtures(self) -> tuple[dict, dict, dict, dict, dict]:
-        """
-        Locks mirroring the audited local-ip-address removal shape.
-
-        Returns (base, current, base_fuzz, stale_fuzz, repaired_fuzz): the
-        base root and fuzz still declare local-ip-address, the current root
-        and the repaired fuzz have dropped it, and the stale fuzz still
-        carries the removed direct edge awaiting its write-mode repair.
-        """
+        """Build the five stale-removal lock fixtures used by main() tests."""
+        # Mirrors the audited local-ip-address removal shape: the base root
+        # and fuzz still declare local-ip-address, the current root and the
+        # repaired fuzz have dropped it, and the stale fuzz still carries the
+        # removed direct edge awaiting its write-mode repair.
         base = lock(
             ["local-ip-address 1.0.0", "kept 1.0.0"],
             {"local-ip-address": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
@@ -389,14 +386,11 @@ class FuzzLockPolicyTests(unittest.TestCase):
         return base, current, base_fuzz, stale_fuzz, repaired_fuzz
 
     def _patch_main_fixtures(self, *, mode: str) -> tuple[dict, list[bytes]]:
-        """
-        Patch main()'s file/IO surface with a stale-removal fixture.
-
-        The submitted fuzz lock still carries the removed direct edge.
-        Returns (calls, writes) where calls counts graph-refresh and
-        lock-metadata validations and writes records any FUZZ_LOCK rollback
-        payload. Every patched module global is restored via addCleanup.
-        """
+        """Patch main()'s file/IO surface for one stale-removal main() run."""
+        # The stale submitted fuzz lock still carries the removed direct
+        # edge. Returns (calls, writes): calls counts graph-refresh and
+        # lock-metadata validations; writes records any FUZZ_LOCK rollback
+        # payload. Every patched module global is restored via addCleanup.
         base, current, base_fuzz, stale_fuzz, repaired_fuzz = (
             self._build_stale_removal_fixtures()
         )
