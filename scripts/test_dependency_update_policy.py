@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 # Tests execute checked-in scripts with argv-only subprocess calls.
@@ -356,6 +357,169 @@ class FuzzLockPolicyTests(unittest.TestCase):
                 base_fuzz,
                 rewritten_fuzz,
                 {"dependencies": {"kept": "1"}},
+            )
+
+    def _patch_main_fixtures(self, *, mode: str) -> tuple[dict, list[bytes]]:
+        """Patch main()'s file/IO surface with a stale-removal fixture.
+
+        The fixture mirrors the audited local-ip-address removal shape: the
+        submitted fuzz lock still carries the removed direct edge. Returns
+        (calls, writes) where calls counts graph-refresh and lock-metadata
+        validations and writes records any FUZZ_LOCK rollback payload. Every
+        patched module global is restored via addCleanup.
+        """
+        base = lock(
+            ["local-ip-address 1.0.0", "kept 1.0.0"],
+            {"local-ip-address": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
+        )
+        # package order: tributary, local-ip-address, kept, edge.
+        base["package"][1]["dependencies"] = ["edge 1.0.0"]
+        current = lock(["kept 1.0.0"], {"kept": ["1.0.0"], "edge": ["1.0.0"]})
+        base_fuzz = lock(
+            ["local-ip-address 1.0.0", "kept 1.0.0"],
+            {"local-ip-address": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
+        )
+        base_fuzz["package"][1]["dependencies"] = ["edge 1.0.0"]
+        stale_fuzz = lock(
+            ["local-ip-address 1.0.0", "kept 1.0.0"],
+            {"local-ip-address": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
+        )
+        stale_fuzz["package"][1]["dependencies"] = ["edge 1.0.0"]
+        repaired_fuzz = lock(["kept 1.0.0"], {"kept": ["1.0.0"], "edge": ["1.0.0"]})
+
+        views = {"fuzz": stale_fuzz}
+        calls = {"refresh": 0, "metadata": 0}
+        writes: list[bytes] = []
+
+        def fake_load_toml(path):
+            if path is sync_fuzz_lock.FUZZ_LOCK:
+                return views["fuzz"]
+            if path is sync_fuzz_lock.ROOT_LOCK:
+                return current
+            if path is sync_fuzz_lock.ROOT_MANIFEST:
+                return {"dependencies": {"kept": "1"}}
+            raise AssertionError(f"unexpected load_toml path {path!r}")
+
+        def fake_load_toml_from_git(_reference, path):
+            if path == "Cargo.toml":
+                return {"dependencies": {"kept": "1", "local-ip-address": "1"}}
+            if path == "fuzz/Cargo.lock":
+                return base_fuzz
+            return base
+
+        def fake_refresh(*, offline):
+            calls["refresh"] += 1
+            self.assertTrue(offline)
+            views["fuzz"] = repaired_fuzz
+
+        def fake_metadata(*, offline):
+            calls["metadata"] += 1
+            self.assertTrue(offline)
+
+        class FakeLockFile:
+            @staticmethod
+            def read_bytes():
+                return b"stale-lock-bytes"
+
+            @staticmethod
+            def write_bytes(payload):
+                writes.append(payload)
+
+        for name in (
+            "ROOT_LOCK",
+            "ROOT_MANIFEST",
+            "FUZZ_LOCK",
+            "load_toml",
+            "load_toml_from_git",
+            "parse_args",
+            "refresh_tributary_dependency_graph",
+            "validate_locked_fuzz_metadata",
+        ):
+            original = getattr(sync_fuzz_lock, name)
+            self.addCleanup(setattr, sync_fuzz_lock, name, original)
+        sync_fuzz_lock.ROOT_LOCK = object()
+        sync_fuzz_lock.ROOT_MANIFEST = object()
+        sync_fuzz_lock.FUZZ_LOCK = FakeLockFile()
+        sync_fuzz_lock.load_toml = fake_load_toml
+        sync_fuzz_lock.load_toml_from_git = fake_load_toml_from_git
+        sync_fuzz_lock.parse_args = lambda: argparse.Namespace(
+            mode=mode, base_ref="0" * 64, offline=True
+        )
+        sync_fuzz_lock.refresh_tributary_dependency_graph = fake_refresh
+        sync_fuzz_lock.validate_locked_fuzz_metadata = fake_metadata
+        return calls, writes
+
+    def test_write_mode_repairs_stale_removal_through_graph_refresh(self):
+        # R1 write-path regression (audit repro): the stale submitted lock
+        # legitimately still carries the removed direct edge, so the initial
+        # write-mode classification must retain the pending removal until the
+        # reviewed graph refresh regenerates the lock. Before the fix, main
+        # returned 2 with a zero refresh call count because the strict
+        # submitted view refused before any repair could run.
+        calls, writes = self._patch_main_fixtures(mode="write")
+
+        self.assertEqual(sync_fuzz_lock.main(), 0)
+        self.assertEqual(calls, {"refresh": 1, "metadata": 1})
+        self.assertEqual(writes, [])  # the rollback never fired
+
+    def test_check_mode_refuses_stale_removal_before_any_refresh(self):
+        # The check lane keeps failing closed on a stale submitted lock and
+        # must never reach the (write-only) graph refresh.
+        calls, _ = self._patch_main_fixtures(mode="check")
+
+        self.assertEqual(sync_fuzz_lock.main(), 2)
+        self.assertEqual(calls, {"refresh": 0, "metadata": 0})
+
+    def test_mixed_removal_update_rejects_pruning_outside_removal_closure(self):
+        # R2 regression (audit repro): prune authority must come from the
+        # removed dependencies' own old closure, never the union of all old
+        # roots. shared@1.0.0 sits solely in the updated b dependency's old
+        # closure, so deleting its retained shared->edge edge stays rejected
+        # even though an unrelated removal (a@1.0.0) is under review. Before
+        # the fix, the pure-prune arm accepted this via the vacuously empty
+        # update closure.
+        base = lock(
+            ["a 1.0.0", "b 1.0.0", "c 1.0.0"],
+            {
+                "a": ["1.0.0"],
+                "b": ["1.0.0", "2.0.0"],
+                "c": ["1.0.0"],
+                "shared": ["1.0.0"],
+                "edge": ["1.0.0"],
+            },
+        )
+        # package order: tributary, a, b@1, b@2, c, shared, edge.
+        base["package"][2]["dependencies"] = ["shared 1.0.0"]
+        base["package"][4]["dependencies"] = ["shared 1.0.0"]
+        base["package"][5]["dependencies"] = ["edge 1.0.0"]
+        current = lock(
+            ["b 2.0.0", "c 1.0.0"],
+            {"b": ["2.0.0"], "c": ["1.0.0"], "shared": ["1.0.0"], "edge": ["1.0.0"]},
+        )
+        # package order: tributary, b@2, c, shared, edge. The after-graph
+        # retains c->shared but no longer needs the shared->edge edge; the
+        # root lock shares this shape.
+        current["package"][2]["dependencies"] = ["shared 1.0.0"]
+        current["package"][3]["dependencies"] = []
+        # The submitted after-graph retains the shared and edge records but
+        # illicitly deletes the shared->edge edge; the root lock shares it.
+        submitted_fuzz = lock(
+            ["b 2.0.0", "c 1.0.0"],
+            {"b": ["2.0.0"], "c": ["1.0.0"], "shared": ["1.0.0"], "edge": ["1.0.0"]},
+        )
+        submitted_fuzz["package"][2]["dependencies"] = ["shared 1.0.0"]
+        submitted_fuzz["package"][3]["dependencies"] = []
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError,
+            "rewrote the dependency-name surface of shared@1.0.0",
+        ):
+            sync_fuzz_lock.validate_submitted_fuzz_update(
+                base,
+                current,
+                base,
+                submitted_fuzz,
+                {"dependencies": {"b": "2", "c": "1"}},
             )
 
     def test_removed_dependency_review_rejects_dropping_still_required_package(self):

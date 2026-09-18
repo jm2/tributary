@@ -647,6 +647,20 @@ def validate_dependency_edges(
         for transition in transitions
         if transition.target_root_version is None
     }
+    # A reviewed removal's prune authority is exactly the old closure of the
+    # removed dependencies themselves — never the union of all old roots,
+    # which would let a package that merely shares an unrelated update's old
+    # closure lose edges because an unrelated removal happens to be reviewed.
+    removal_roots = {
+        (transition.name, transition.current_fuzz_version)
+        for transition in transitions
+        if transition.target_root_version is None
+    }
+    removal_identities = (
+        dependency_closure_identities(before_lock, removal_roots)
+        if removal_roots
+        else set()
+    )
     for identity in sorted(before_records.keys() & after_records.keys()):
         before_metadata = {
             key: value
@@ -692,12 +706,22 @@ def validate_dependency_edges(
                 for target in before_edges[name]
             }
             # A removal review has no new root closure to bound resulting
-            # edges against. Its authority is the removed dependency's old
-            # closure — the pruned record and every lost target were
-            # reachable only through the reviewed removal — combined with
-            # the strict prune shape below, and the submitted lock is still
-            # independently verified by Cargo's locked materialization.
-            removal_review = bool(removal_names)
+            # edges against. Its authority is the removed dependencies' own
+            # old closure: both the pruned survivor and every lost target
+            # must be reachable only through the reviewed removal. Bounding
+            # this by the union of all old roots instead would let a record
+            # sitting solely in an unrelated update's old closure lose edges
+            # merely because an unrelated removal is also under review. The
+            # update-closure arm keeps requiring retained edges — a survivor
+            # left with none proves nothing about its lost edges through the
+            # update closure, so that shape stays fail-closed too.
+            removal_review = (
+                identity in removal_identities
+                and removed_edge_targets <= removal_identities
+            )
+            update_review = bool(after_names) and (
+                resulting_edge_targets <= target_identities
+            )
             pure_prune = (
                 identity in old_identities
                 and set(after_names) < set(before_names)
@@ -705,10 +729,7 @@ def validate_dependency_edges(
                     before_edges[name] == after_edges[name] for name in after_names
                 )
                 and removed_edge_targets <= old_identities
-                and (
-                    resulting_edge_targets <= target_identities
-                    or removal_review
-                )
+                and (update_review or removal_review)
             )
             if identity[0] != "tributary" and (
                 (
@@ -896,6 +917,8 @@ def validate_submitted_fuzz_update(
     base_fuzz_lock: dict[str, Any],
     current_fuzz_lock: dict[str, Any],
     current_manifest: dict[str, Any],
+    *,
+    retain_pending_removals: bool = False,
 ) -> tuple[list[Transition], list[Transition]]:
     """
     Apply the same base-fuzz-to-head proof used by CI `check` mode.
@@ -911,6 +934,12 @@ def validate_submitted_fuzz_update(
     direct edge. A submitted lock that performs the removal exactly is then
     bounded by validate_bounded_package_changes to dropping only the removed
     dependency's old closure.
+
+    ``retain_pending_removals=True`` is the write-repair classification: the
+    initial pass over a legitimately stale lock retains the pending removal
+    instead of raising, so the caller can run the reviewed graph refresh
+    first. The post-refresh recomputation and the final proof always use the
+    strict view, and check mode keeps the refusal unchanged.
     """
     requested_transitions = required_transitions(
         base_root_lock,
@@ -924,6 +953,7 @@ def validate_submitted_fuzz_update(
         current_root_lock,
         current_fuzz_lock,
         current_manifest,
+        retain_removals=retain_pending_removals,
     )
     if requested_transitions and not remaining_transitions:
         validate_bounded_package_changes(
@@ -943,6 +973,7 @@ def required_transitions(
     current_manifest: dict[str, Any],
     *,
     treat_removals_as_requested: bool = False,
+    retain_removals: bool = False,
 ) -> list[Transition]:
     """
     Compute the root-to-fuzz transitions the reviewed update must prove.
@@ -955,6 +986,12 @@ def required_transitions(
     the root removed by definition, so there the removal is precisely the
     graph rewrite under review, and ``validate_submitted_fuzz_update``
     still rejects the submitted lock separately while it retains the edge.
+    The write-repair view (``retain_removals=True``) classifies a stale
+    submitted lock without refusing: a pending removal is retained so the
+    caller can run the reviewed graph refresh that regenerates the lock
+    first. Only the initial write-mode classification uses it; every
+    post-refresh recomputation stays strict so a refresh that fails to drop
+    the removed edge still rolls back.
     """
     base = resolved_direct_versions(base_root_lock)
     current = resolved_direct_versions(current_root_lock)
@@ -966,7 +1003,7 @@ def required_transitions(
     # This is a graph rewrite, not a version substitution, and requires a
     # reviewed lock regeneration rather than an unsafe best guess.
     for name in sorted((set(base) - set(current)) & set(fuzz)):
-        if not treat_removals_as_requested:
+        if not treat_removals_as_requested and not retain_removals:
             raise PolicyError(
                 f"root production dependency {name!r} was removed but remains in "
                 "fuzz/Cargo.lock; regenerate the fuzz lock under review"
@@ -1104,12 +1141,19 @@ def main() -> int:
         current = load_toml(ROOT_LOCK)
         fuzz = load_toml(FUZZ_LOCK)
         manifest = load_toml(ROOT_MANIFEST)
+        # Write mode classifies a legitimately stale submitted lock without
+        # refusing: a pending removal is retained here so the reviewed graph
+        # refresh below can regenerate the lock first. The post-refresh
+        # recomputation and the final proof stay strict — a refresh that
+        # fails to drop the removed edge still rolls back and exits 2. Check
+        # mode keeps the exact refusal CI depends on.
         requested_transitions, transitions = validate_submitted_fuzz_update(
             base,
             current,
             base_fuzz,
             fuzz,
             manifest,
+            retain_pending_removals=args.mode == "write",
         )
 
         if args.mode == "write":
