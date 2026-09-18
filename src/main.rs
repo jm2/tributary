@@ -85,6 +85,8 @@ mod jellyfin;
 pub(crate) mod lastfm;
 #[allow(dead_code)]
 mod local;
+#[allow(dead_code)]
+mod offline;
 mod panic_reporting;
 mod paths;
 mod platform_runtime;
