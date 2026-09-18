@@ -228,6 +228,53 @@ fn non_main_base_fails_closed_and_supersedes_the_head_verdict() {
 }
 
 #[test]
+fn an_unreadable_pull_request_record_blocks_instead_of_skipping() {
+    // The record body is malformed JSON, so the base-branch read cannot
+    // succeed. Recording that as `.skipped` would read the failure as a
+    // retarget away from main — and a sibling candidate's clean evaluation
+    // would then publish a shared success for a record that was never
+    // evaluated. An unreadable record must block the shared verdict instead.
+    let sandbox = GateSandbox::new("malformed-pr-record-blocks");
+    sandbox.use_scenario("malformed-pr-record");
+    let output = sandbox.run("pull_request", Some(HEAD_SHA));
+    assert_blocked(&output, &[], "record was unreadable (malformed JSON body)");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("not main"),
+        "an unreadable record must not take the non-main skip path:\n{stderr}"
+    );
+    let check_run = sandbox.opened_and_finalized_verdict();
+    assert!(
+        check_run.contains(&format!("head_sha={HEAD_SHA}"))
+            && check_run.contains("conclusion=failure"),
+        "the blocked verdict must be published at the evaluated head:\n{check_run}"
+    );
+}
+
+#[test]
+fn a_pull_request_record_without_a_base_branch_blocks_instead_of_skipping() {
+    // A readable record that omits `.base.ref` is an incomplete observation,
+    // not proof that the pull request no longer targets main. It must block
+    // the shared verdict rather than take the skip path, for the same reason
+    // the malformed record above does.
+    let sandbox = GateSandbox::new("pr-record-missing-base-blocks");
+    sandbox.use_scenario("pr-record-missing-base");
+    let output = sandbox.run("pull_request", Some(HEAD_SHA));
+    assert_blocked(&output, &[], "record omitted the base branch");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("not main"),
+        "an incomplete record must not take the non-main skip path:\n{stderr}"
+    );
+    let check_run = sandbox.opened_and_finalized_verdict();
+    assert!(
+        check_run.contains(&format!("head_sha={HEAD_SHA}"))
+            && check_run.contains("conclusion=failure"),
+        "the blocked verdict must be published at the evaluated head:\n{check_run}"
+    );
+}
+
+#[test]
 fn an_announced_commit_only_a_descendant_contains_is_never_evaluated() {
     // `commits/<sha>/pulls` also returns stacked descendants that merely
     // CONTAIN the announced commit. Evaluating one anyway hits the

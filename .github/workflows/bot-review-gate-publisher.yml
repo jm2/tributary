@@ -486,7 +486,24 @@ jobs:
             record_blocked "${verdict_base}" "Pull request query failed; failing closed."
             return 1
           fi
-          pr_base="$(jq -r '.base.ref // ""' <<<"${pr_json}")"
+          # The base-branch read is structural: only an object record whose
+          # `.base.ref` is a string passes through. An unreadable body (jq
+          # itself fails) or a record that omits the base is an incomplete
+          # observation — recording it as `.skipped` would let a sibling
+          # candidate's clean evaluation publish a shared success for a pull
+          # request that was never evaluated — so both block the shared
+          # verdict. Only a successfully-read, genuinely non-`main` base
+          # takes the skip path.
+          if ! pr_base="$(jq -r 'if (type == "object" and (.base | type) == "object" and (.base.ref | type) == "string") then .base.ref else "" end' <<<"${pr_json}")"; then
+            echo "Pull request #${PR_NUMBER} record was unreadable (malformed JSON body); failing closed." >&2
+            record_blocked "${verdict_base}" "Pull request record was malformed; failing closed."
+            return 1
+          fi
+          if [ -z "${pr_base}" ]; then
+            echo "Pull request #${PR_NUMBER} record omitted the base branch; failing closed." >&2
+            record_blocked "${verdict_base}" "Pull request record omitted the base branch; failing closed."
+            return 1
+          fi
           if [ "${pr_base}" != "main" ]; then
             echo "Pull request #${PR_NUMBER} targets ${pr_base:-<unknown>}, not main; failing closed." >&2
             # A non-main pull request carries no required `Bot Review Gate`
