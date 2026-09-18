@@ -2292,12 +2292,24 @@ mod tests {
                 .expect("parse ticket URL")
                 .path_segments()
                 .and_then(|mut segments| segments.next_back())
-                .and_then(|segment| segment.rsplit_once('.').map(|(_, extension)| extension.to_owned()))
+                .and_then(|segment| {
+                    segment
+                        .rsplit_once('.')
+                        .map(|(_, extension)| extension.to_owned())
+                })
                 .unwrap_or_default()
         };
-        assert_eq!(ticket_extension(&flac_ticket), "flac", "flac ticket: {flac_ticket}");
+        assert_eq!(
+            ticket_extension(&flac_ticket),
+            "flac",
+            "flac ticket: {flac_ticket}"
+        );
         let aac_ticket = ticket_for(MediaRepresentation::buffered(MediaContainer::Aac));
-        assert_eq!(ticket_extension(&aac_ticket), "aac", "aac ticket: {aac_ticket}");
+        assert_eq!(
+            ticket_extension(&aac_ticket),
+            "aac",
+            "aac ticket: {aac_ticket}"
+        );
 
         // Explicit unknown stays unlabeled rather than claiming a container.
         let unknown_ticket = ticket_for(MediaRepresentation::buffered_unknown());
