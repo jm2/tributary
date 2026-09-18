@@ -526,8 +526,11 @@ impl LibraryEngine {
         // traversal/parsing cannot be cancelled while the window is open, so
         // awaiting it before this loop would let a held discovery step delay
         // every admitted rating/history edit until close (R9/R1). Both share
-        // one engine task, so catalogue mutations stay serialized.
+        // one engine task, so catalogue mutations stay serialized — except
+        // while the scan has a write transaction open across an await point,
+        // when the shared gate defers commands to the transaction boundary.
         let mut completed_commands = HashMap::new();
+        let scan_write_txn = ScanWriteTxnGate::default();
         let scan_result = service_commands_while_scanning(
             initial_scan_shutdown_aware(
                 &db,
@@ -536,7 +539,9 @@ impl LibraryEngine {
                 &playlist_sidebar_refresh,
                 &scan_cancellation,
                 &ScanDiscoveryHold::none(),
+                &scan_write_txn,
             ),
+            &scan_write_txn,
             &db,
             &music_dirs,
             &tx,
@@ -1367,12 +1372,12 @@ fn mark_scan_cancelled(root_scans: &mut [RootScan], reason: &str) {
 /// Run one retained-authority filesystem probe outside Tokio's async worker
 /// threads. Library roots may live on removable or network filesystems, so
 /// even a small handle validation can block indefinitely at the OS boundary.
-async fn spawn_authority_probe<F, T>(probe: F) -> Result<T, tokio::task::JoinError>
+fn spawn_authority_probe<F, T>(probe: F) -> tokio::task::JoinHandle<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(probe).await
+    tokio::task::spawn_blocking(probe)
 }
 
 /// Shutdown latency budget for read-only blocking scan work.
@@ -1446,19 +1451,29 @@ struct ScanDiscoveryHold {
     inner: Option<std::sync::Arc<ScanDiscoveryHoldInner>>,
 }
 
-/// A single read-only discovery stage a [`ScanDiscoveryHold`] can hold.
+/// A stage of the initial scan a [`ScanDiscoveryHold`] can hold.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScanDiscoveryStage {
     /// Before the first read-only traversal is submitted.
     Traversal,
     /// After a file's read-only parse settles and before any durable mutation.
     PostParse,
+    /// At the per-root status mutation, inside the scan write-transaction
+    /// gate span (`RootScan` persist). Regression seam for the root-status
+    /// admission boundary and the write-transaction command-service gate.
+    RootStatus,
+    /// Inside a track upsert's open write transaction, at the commit-guard
+    /// await. Regression seam for the suspended-mid-transaction state the
+    /// command-service selector must not switch branches at.
+    CommitGuard,
 }
 
 #[derive(Default)]
 struct ScanDiscoveryHoldInner {
     traversal: DiscoveryRendezvous,
     post_parse: DiscoveryRendezvous,
+    root_status: DiscoveryRendezvous,
+    commit_guard: DiscoveryRendezvous,
 }
 
 #[derive(Default)]
@@ -1473,6 +1488,8 @@ impl ScanDiscoveryHoldInner {
         match stage {
             ScanDiscoveryStage::Traversal => &self.traversal,
             ScanDiscoveryStage::PostParse => &self.post_parse,
+            ScanDiscoveryStage::RootStatus => &self.root_status,
+            ScanDiscoveryStage::CommitGuard => &self.commit_guard,
         }
     }
 }
@@ -1510,6 +1527,89 @@ impl ScanDiscoveryHold {
         }
         rendezvous.reached.notify_one();
         rendezvous.release.notified().await;
+    }
+}
+
+/// Shared flag the initial-scan driver reads before servicing library
+/// commands: it is held whenever the scan has a SQLite write transaction open
+/// across an await point (per-root status persist, track upsert, stale-row
+/// delete, and their retained-authority probes).
+///
+/// The scan and the command selector share one engine task, so the flag can
+/// only change while the selector is polling the scan. While it is set, the
+/// selector's `select!` disables the command branch entirely and keeps
+/// polling the scan until the transaction settles. Servicing a library
+/// command meanwhile would queue its write behind the open transaction and
+/// fail at the production five-second busy timeout (PR #286 finding jq5lG).
+#[derive(Clone, Default)]
+struct ScanWriteTxnGate {
+    open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ScanWriteTxnGate {
+    fn is_open(&self) -> bool {
+        self.open.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// RAII marker for the open span of a scan write transaction.
+///
+/// Constructed immediately before the transaction begins and dropped once the
+/// whole mutation settles (commit, rollback, or abandonment handling), so an
+/// early return or panic cannot leave the gate open and stall command service.
+struct ScanWriteTxnGuard<'a> {
+    gate: &'a ScanWriteTxnGate,
+}
+
+impl<'a> ScanWriteTxnGuard<'a> {
+    fn open(gate: &'a ScanWriteTxnGate) -> Self {
+        gate.open.store(true, std::sync::atomic::Ordering::Release);
+        Self { gate }
+    }
+}
+
+impl Drop for ScanWriteTxnGuard<'_> {
+    fn drop(&mut self) {
+        self.gate
+            .open
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Command receive that goes quiet while a scan write transaction is open.
+///
+/// While the [`ScanWriteTxnGate`] reports an open transaction, this future
+/// stays pending without touching the command channel: the very scan holding
+/// the transaction is what re-polls the selecting `select!` (biased, scan
+/// branch first), so the gate is re-checked after every step of scan progress
+/// and the first queued command is received as soon as the transaction
+/// settles. A command arriving mid-transaction is therefore deferred to the
+/// transaction boundary — never raced into the open SQLite write, where its
+/// own connection acquisition would queue behind the scan's lock and fail at
+/// the busy timeout (PR #286 finding jq5lG).
+struct GatedCommandRecv<'a> {
+    rx: &'a async_channel::Receiver<LibraryCommand>,
+    gate: &'a ScanWriteTxnGate,
+}
+
+impl std::future::Future for GatedCommandRecv<'_> {
+    type Output = Result<LibraryCommand, async_channel::RecvError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if self.gate.is_open() {
+            // No channel waker is registered while the transaction is open,
+            // which is what keeps command service exclusive of it. This is
+            // safe because the gate only ever closes while the scan is being
+            // polled: if the gate is open here, the scan branch has already
+            // been polled pending in this same select! poll and its waker
+            // will re-poll this branch.
+            return std::task::Poll::Pending;
+        }
+        let mut recv = Box::pin(self.rx.recv());
+        recv.as_mut().poll(cx)
     }
 }
 
@@ -3807,15 +3907,28 @@ async fn process_library_commands_without_watcher(
 /// the same task with `select!` means a held discovery step cannot delay an
 /// admitted rating or history edit until close: while the scan future is
 /// pending on its worker, the command branch is polled and the durable
-/// mutation settles. Because both branches run in one task, a scan mutation
-/// and a command mutation can never be in flight at the same time.
+/// mutation settles.
+///
+/// A scan write transaction is the one exception. Some scan mutations keep a
+/// SQLite write transaction open across an await point — the retained-authority
+/// probes inside a track upsert, root-status persist, or stale-row delete —
+/// and a library command serviced at that moment would queue its own write
+/// behind the open transaction and fail at the production five-second busy
+/// timeout (PR #286 finding jq5lG). `scan_write_txn` is held exactly over
+/// those spans; while it is open the command branch is disabled entirely and
+/// the loop keeps polling the scan until the transaction settles. The flag can
+/// only change while the scan is being polled, so a command that arrives during
+/// a transaction is serviced immediately after it commits — never lost, never
+/// starved behind a stuck one.
 ///
 /// `Flush` is the reserved drain marker. By the time the loop receives it,
 /// every earlier admitted command has settled in FIFO order, so the loop waits
 /// for the (cancelled) scan to reach settlement before acknowledging. That
 /// keeps the close drain behind every already admitted durable mutation.
+#[allow(clippy::too_many_arguments)]
 async fn service_commands_while_scanning<F>(
     scan: F,
+    scan_write_txn: &ScanWriteTxnGate,
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
@@ -3838,7 +3951,10 @@ where
         let next = tokio::select! {
             biased;
             result = scan.as_mut() => return result,
-            command = command_rx.recv() => command,
+            command = GatedCommandRecv {
+                rx: command_rx,
+                gate: scan_write_txn,
+            } => command,
         };
         match next {
             Ok(LibraryCommand::Flush { completion }) => {
@@ -3850,25 +3966,53 @@ where
                 return result;
             }
             Ok(command) => {
-                if let Some(pending) = process_library_command(
-                    db,
-                    music_dirs,
-                    tx,
-                    playlist_sidebar_refresh,
-                    completed_commands,
-                    command,
-                )
-                .await
-                {
-                    finish_pending_root_trust_scan(
+                // Service the command while KEEPING THE SCAN POLLED. The
+                // command's own DB work pends on the connection pool, and the
+                // pool may have granted its only connection to the parked
+                // scan's queued acquire; a grant held inside a future that is
+                // no longer polled would trap the connection and starve the
+                // command at the acquire timeout (observed as a 30s sqlx pool
+                // timeout in the jq5lG regression). Interleave both futures;
+                // if the scan settles first, the pool is idle and the
+                // remaining work finishes alone before the scan result is
+                // returned.
+                let mut work = Box::pin(async {
+                    if let Some(pending) = process_library_command(
                         db,
                         music_dirs,
                         tx,
                         playlist_sidebar_refresh,
                         completed_commands,
-                        pending,
+                        command,
                     )
-                    .await;
+                    .await
+                    {
+                        finish_pending_root_trust_scan(
+                            db,
+                            music_dirs,
+                            tx,
+                            playlist_sidebar_refresh,
+                            completed_commands,
+                            pending,
+                        )
+                        .await;
+                    }
+                });
+                let mut scan_settled: Option<anyhow::Result<()>> = None;
+                loop {
+                    if let Some(step) = scan_settled.take() {
+                        work.as_mut().await;
+                        return step;
+                    }
+                    tokio::select! {
+                        biased;
+                        () = work.as_mut() => {
+                            break;
+                        }
+                        step = scan.as_mut() => {
+                            scan_settled = Some(step);
+                        }
+                    }
                 }
             }
             Err(_) => commands_open = false,
@@ -3910,6 +4054,7 @@ async fn initial_scan_shutdown_aware(
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     cancellation: &CancellationToken,
     discovery: &ScanDiscoveryHold,
+    scan_write_txn: &ScanWriteTxnGate,
 ) -> anyhow::Result<()> {
     let forced_conversions = HashMap::new();
     let authority_guards = HashMap::new();
@@ -3924,6 +4069,7 @@ async fn initial_scan_shutdown_aware(
         playlist_sidebar_refresh,
         cancellation,
         discovery,
+        scan_write_txn,
     )
     .await
 }
@@ -3940,6 +4086,10 @@ async fn initial_scan_with_root_trust_guards(
     // Command-loop scans are never cancelled: a root-trust command must finish
     // its authority work before the FIFO barrier it was admitted behind.
     let cancellation = CancellationToken::new();
+    // These scans never share the driver's command-service selector (the
+    // command path awaits them directly), so the write-transaction gate is
+    // never observed; a private closed gate keeps the invariant local.
+    let scan_write_txn = ScanWriteTxnGate::default();
     initial_scan_with_control(
         db,
         music_dirs,
@@ -3950,6 +4100,7 @@ async fn initial_scan_with_root_trust_guards(
         playlist_sidebar_refresh,
         &cancellation,
         &ScanDiscoveryHold::none(),
+        &scan_write_txn,
     )
     .await
 }
@@ -3965,6 +4116,7 @@ async fn initial_scan_with_control(
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     cancellation: &CancellationToken,
     discovery: &ScanDiscoveryHold,
+    scan_write_txn: &ScanWriteTxnGate,
 ) -> anyhow::Result<()> {
     // A window that closes before (or during) database setup cancels the scan
     // before it can admit any mutation. Return immediately so the engine can
@@ -4255,6 +4407,33 @@ async fn initial_scan_with_control(
         // If availability state cannot be persisted, fail closed for this
         // scan: retaining stale metadata is safer than deleting it without a
         // durable device identity for the next startup.
+        //
+        // Admission is re-checked before EVERY root-status mutation, not once
+        // before the loop (PR #286 finding jq5ld): when shutdown is observed
+        // mid-loop — for example while an earlier root's persist was settling
+        // — the remaining roots must not receive status writes that would
+        // present them as freshly checked. Fail the remaining scans closed
+        // (marked cancelled) and stop without an error: the close drain
+        // acknowledges cancelled scans that committed nothing.
+        if !admit_scan_mutation(cancellation) {
+            let root_display = scan.root.display().to_string();
+            mark_scan_cancelled(
+                &mut root_scans,
+                "root-status persistence interrupted at shutdown",
+            );
+            info!(
+                root = %root_display,
+                "Initial scan cancelled before root-status persistence; no further status writes admitted"
+            );
+            return Ok(());
+        }
+        // The status persist opens a SQLite write transaction across an await
+        // point (the marker probe inside). Hold the write-transaction gate
+        // over the whole span so the command-service selector does not
+        // dispatch a library command into the open transaction (jq5lG). The
+        // RootStatus rendezvous is a test-only seam parked at this boundary.
+        let _scan_write_txn = ScanWriteTxnGuard::open(scan_write_txn);
+        discovery.arrive(ScanDiscoveryStage::RootStatus).await;
         match persist_root_scan_status(
             db,
             scan,
@@ -4488,7 +4667,17 @@ async fn initial_scan_with_control(
                     let mut invalidated_root = None;
                     let mut file_still_current = false;
                     let mut authority_task_failed = false;
+                    // The upsert keeps its SQLite write transaction open while
+                    // the commit guard probes the retained authority handle, so
+                    // the write-transaction gate spans the whole call: the
+                    // command-service selector defers library commands until the
+                    // transaction commits or rolls back (jq5lG).
+                    let _scan_write_txn = ScanWriteTxnGuard::open(scan_write_txn);
                     match upsert_track_with_commit_guard(db, &parsed, existing, || async {
+                        // Deterministic test rendezvous: suspend INSIDE the open
+                        // write transaction, at the very guard await a branch
+                        // switch used to race into.
+                        discovery.arrive(ScanDiscoveryStage::CommitGuard).await;
                         let guard_file = observed_file.clone();
                         let guard_lease = authority_lease.clone();
                         file_still_current = match spawn_authority_probe(move || {
@@ -4649,19 +4838,40 @@ async fn initial_scan_with_control(
             };
             let proof_lease = authority_lease.clone();
             let proof_path = row_path.to_path_buf();
-            let absence = match spawn_authority_probe(move || {
-                proof_lease.prove_absent(&proof_path).map(Arc::new)
-            })
+            // The absence proof is read-only blocking filesystem work against a
+            // possibly removable or network root; the kernel call can block
+            // well past window close. It therefore obeys the shutdown settle
+            // budget like the traversal and parse jobs (PR #286 finding jq5lT):
+            // when the budget is exhausted, abandon the probe, fail the scan
+            // closed, and PRESERVE the row — an unproven absence never deletes.
+            let absence = match await_readonly_blocking(
+                cancellation,
+                spawn_authority_probe(move || {
+                    // Test-only seam: park the probe the way a hung kernel call
+                    // would (jq5lT regression).
+                    #[cfg(test)]
+                    tests::hold_stale_absence_probe();
+                    proof_lease.prove_absent(&proof_path).map(Arc::new)
+                }),
+            )
             .await
             {
-                Ok(Ok(proof)) => proof,
-                Ok(Err(error)) => {
+                Some(Ok(Ok(proof))) => proof,
+                Some(Ok(Err(error))) => {
                     warn!(path = %row.file_path, %error, "Could not prove stale candidate absent through retained root authority — preserving metadata");
                     continue;
                 }
-                Err(error) => {
+                Some(Err(error)) => {
                     warn!(path = %row.file_path, %error, "Stale-candidate authority task failed — preserving metadata");
                     continue;
+                }
+                None => {
+                    mark_scan_cancelled(
+                        &mut root_scans,
+                        "stale-delete absence probe abandoned at shutdown",
+                    );
+                    info!(path = %row.file_path, "Initial scan cancelled while proving stale candidate absent; preserving metadata");
+                    return Ok(());
                 }
             };
             let (root_allows_delete, invalidated_root) = match revalidate_scan_root_for_path(
@@ -4707,6 +4917,10 @@ async fn initial_scan_with_control(
             let mut invalidated_root = None;
             let mut absence_still_current = false;
             let mut authority_task_failed = false;
+            // The delete keeps its SQLite write transaction open while the
+            // commit guard revalidates the absence proof and the root lease, so
+            // the write-transaction gate spans the whole call (jq5lG).
+            let _scan_write_txn = ScanWriteTxnGuard::open(scan_write_txn);
             match delete_track_with_commit_guard(db, &row.id, || async {
                 let guard_absence = absence.clone();
                 let guard_lease = authority_lease.clone();
@@ -7298,6 +7512,28 @@ mod tests {
     use sea_orm::QueryOrder;
 
     use super::*;
+
+    /// jq5lT regression seam: when armed, the stale-deletion absence probe
+    /// parks its blocking worker thread the way a removable/network root
+    /// parks the kernel call, so the shutdown settle budget becomes
+    /// observable. The flag is never armed outside the regression test, and
+    /// the closure reference is compiled only under `cfg(test)`.
+    static STALE_ABSENCE_PROBE_HELD: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Set just before the armed probe starts spinning, so the regression
+    /// driver knows the scan is parked inside the absence proof.
+    static STALE_ABSENCE_PROBE_ARRIVED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    pub(super) fn hold_stale_absence_probe() {
+        if STALE_ABSENCE_PROBE_HELD.load(std::sync::atomic::Ordering::SeqCst) {
+            STALE_ABSENCE_PROBE_ARRIVED.store(true, std::sync::atomic::Ordering::SeqCst);
+            while STALE_ABSENCE_PROBE_HELD.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
 
     struct TestDirectory {
         path: PathBuf,
@@ -10248,6 +10484,7 @@ mod tests {
             &test_playlist_sidebar_refresh(),
             &cancellation,
             &ScanDiscoveryHold::none(),
+            &ScanWriteTxnGate::default(),
         )
         .await
         .expect("cancelled scan returns cleanly");
@@ -10304,6 +10541,7 @@ mod tests {
         let authority_guards = HashMap::new();
         let evidence_refreshes = HashMap::new();
 
+        let scan_write_txn = ScanWriteTxnGate::default();
         let scan = initial_scan_with_control(
             &db,
             &music_dirs,
@@ -10314,14 +10552,17 @@ mod tests {
             &refresh,
             &cancellation,
             &hold,
+            &scan_write_txn,
         );
         let driver = async {
             // The traversal hold engages first; release it so the scan can
-            // reach the parser and settle.
+            // reach the parser and settle. The per-root status persist runs
+            // before the parse; let it through uncaptured.
             control
                 .wait_until_reached(ScanDiscoveryStage::Traversal)
                 .await;
             control.release(ScanDiscoveryStage::Traversal);
+            control.release(ScanDiscoveryStage::RootStatus);
             // The parser has settled with the window still open.
             control
                 .wait_until_reached(ScanDiscoveryStage::PostParse)
@@ -10368,6 +10609,7 @@ mod tests {
         let evidence_refreshes = HashMap::new();
 
         // ── First startup: cancel right after the parser settles. ──
+        let cancelled_scan_write_txn = ScanWriteTxnGate::default();
         let cancelled_scan = initial_scan_with_control(
             &db,
             &music_dirs,
@@ -10378,14 +10620,17 @@ mod tests {
             &refresh,
             &cancellation,
             &hold,
+            &cancelled_scan_write_txn,
         );
         let driver = async {
             // The traversal hold engages first; release it so the scan can
-            // reach the parser and settle.
+            // reach the parser and settle. The per-root status persist runs
+            // before the parse; let it through uncaptured.
             control
                 .wait_until_reached(ScanDiscoveryStage::Traversal)
                 .await;
             control.release(ScanDiscoveryStage::Traversal);
+            control.release(ScanDiscoveryStage::RootStatus);
             // Shutdown arrives after the parse and before any durable
             // mutation; the admission boundary must refuse the upsert.
             control
@@ -10416,6 +10661,7 @@ mod tests {
             &refresh,
             &restart_cancellation,
             &ScanDiscoveryHold::none(),
+            &ScanWriteTxnGate::default(),
         )
         .await
         .expect("the restarting scan completes");
@@ -10466,6 +10712,7 @@ mod tests {
         let (hold, control) = ScanDiscoveryHold::controlling();
         let mut completed = HashMap::new();
 
+        let scan_write_txn = ScanWriteTxnGate::default();
         let engine = service_commands_while_scanning(
             initial_scan_shutdown_aware(
                 &db,
@@ -10474,7 +10721,9 @@ mod tests {
                 &refresh,
                 &cancellation,
                 &hold,
+                &scan_write_txn,
             ),
+            &scan_write_txn,
             &db,
             &music_dirs,
             &event_tx,
@@ -10505,8 +10754,12 @@ mod tests {
             control.release(ScanDiscoveryStage::Traversal);
             // The scan's own parse will engage the post-parse hold next; the
             // rating has already settled, so let the whole scan finish rather
-            // than parking the engine on a hold nobody will release.
+            // than parking the engine on a hold nobody will release. Release
+            // the mutation-span holds too so the per-root status persist and
+            // the guarded upsert run to settlement.
             control.release(ScanDiscoveryStage::PostParse);
+            control.release(ScanDiscoveryStage::RootStatus);
+            control.release(ScanDiscoveryStage::CommitGuard);
         };
 
         let (scan_result, ()) = tokio::join!(engine, async {
@@ -10544,6 +10797,7 @@ mod tests {
         let (flush_tx, flush_rx) = async_channel::bounded(1);
         let mut completed = HashMap::new();
 
+        let scan_write_txn = ScanWriteTxnGate::default();
         let engine = service_commands_while_scanning(
             initial_scan_shutdown_aware(
                 &db,
@@ -10552,7 +10806,9 @@ mod tests {
                 &refresh,
                 &cancellation,
                 &hold,
+                &scan_write_txn,
             ),
+            &scan_write_txn,
             &db,
             &music_dirs,
             &event_tx,
@@ -10580,9 +10836,11 @@ mod tests {
             );
             control.release(ScanDiscoveryStage::Traversal);
             // The scan's parse engages the post-parse hold on its way to
-            // settlement; release it too, or the drain being asserted here
-            // would never be acknowledged.
+            // settlement; release it plus the mutation-span holds, or the
+            // drain being asserted here would never be acknowledged.
             control.release(ScanDiscoveryStage::PostParse);
+            control.release(ScanDiscoveryStage::RootStatus);
+            control.release(ScanDiscoveryStage::CommitGuard);
             flush_rx
                 .recv()
                 .await
@@ -10599,6 +10857,328 @@ mod tests {
         // not required because the engine returned at the Flush marker.
         drop(command_tx);
         let _ = event_rx.try_recv();
+    }
+
+    /// jq5lG regression: a rating command that arrives while the scan is
+    /// suspended *inside* an open SQLite write transaction (the upsert commit
+    /// guard) must be deferred to the transaction boundary and then serviced —
+    /// not raced into the open transaction, where its write would queue behind
+    /// the scan's lock and fail at the production five-second busy timeout.
+    #[tokio::test]
+    async fn command_arriving_inside_a_scan_write_transaction_is_deferred_not_dropped() {
+        let db = rename_test_database().await;
+        // The rating target lives outside the scan root, so the scan itself
+        // never touches it and any busy contention is purely scheduler-level.
+        let rating_path = std::env::temp_dir().join("tributary-txn-rating.flac");
+        insert_rename_test_track(
+            &db,
+            "txn-rating-track",
+            rating_path.to_string_lossy().as_ref(),
+            "Txn",
+            0,
+        )
+        .await;
+        let directory = TestDirectory::new("scan-txn-gate");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join("present.wav"));
+
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let cancellation = CancellationToken::new();
+        let (hold, control) = ScanDiscoveryHold::controlling();
+        let scan_write_txn = ScanWriteTxnGate::default();
+        let mut completed = HashMap::new();
+
+        let engine = service_commands_while_scanning(
+            initial_scan_shutdown_aware(
+                &db,
+                &music_dirs,
+                &event_tx,
+                &refresh,
+                &cancellation,
+                &hold,
+                &scan_write_txn,
+            ),
+            &scan_write_txn,
+            &db,
+            &music_dirs,
+            &event_tx,
+            &command_rx,
+            &mut completed,
+            &refresh,
+        );
+        let driver = async {
+            // Let the read-only phases through uncaptured (traversal, the
+            // per-root status persist, and the per-file post-parse rendezvous);
+            // the hold this test cares about parks the scan *inside* the
+            // upsert's write transaction.
+            control.release(ScanDiscoveryStage::Traversal);
+            control.release(ScanDiscoveryStage::RootStatus);
+            control.release(ScanDiscoveryStage::PostParse);
+            control
+                .wait_until_reached(ScanDiscoveryStage::CommitGuard)
+                .await;
+            // The scan is now suspended inside its open write transaction.
+            // Admit a rating: the selector must not dispatch it into the open
+            // transaction.
+            command_tx
+                .send(LibraryCommand::SetTrackRating {
+                    track_id: TrackId::new("txn-rating-track").expect("valid track ID"),
+                    rating: Some(Rating::new(80).expect("valid rating")),
+                })
+                .await
+                .expect("admit the rating command");
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            while let Ok(event) = event_rx.try_recv() {
+                assert!(
+                    !matches!(event, LibraryEvent::TrackRatingUpdated(_)),
+                    "a command must not be serviced while a scan write transaction is open"
+                );
+            }
+            // Settle the transaction. The queued rating is then serviced
+            // immediately — never dropped, never failed at the busy timeout.
+            control.release(ScanDiscoveryStage::CommitGuard);
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(30), event_rx.recv())
+                    .await
+                    .expect("the deferred rating must be serviced after the transaction settles")
+                    .expect("event channel stays open");
+                if matches!(event, LibraryEvent::TrackRatingUpdated(_)) {
+                    break;
+                }
+            }
+        };
+
+        let (scan_result, ()) = tokio::join!(engine, async {
+            tokio::time::timeout(Duration::from_secs(60), driver)
+                .await
+                .expect("the transaction-gated driver must settle");
+        });
+        scan_result.expect("scan completes after the write-transaction hold is released");
+
+        let rated = track::Entity::find_by_id("txn-rating-track")
+            .one(&db)
+            .await
+            .expect("query rated track")
+            .expect("rated track exists");
+        assert_eq!(
+            rated.rating,
+            Some(80),
+            "the command deferred behind the scan write transaction must still commit"
+        );
+    }
+
+    /// jq5ld regression: shutdown observed while the per-root status loop is
+    /// mid-flight must settle only the already-admitted persist and refuse
+    /// every remaining root's status write — a later root must not be left
+    /// presenting itself as freshly checked, and the cancelled scan must
+    /// return cleanly (no error event) so the close drain can acknowledge.
+    #[tokio::test]
+    async fn mid_loop_shutdown_refuses_remaining_root_status_writes() {
+        let db = rename_test_database().await;
+        // Two configured roots: the first engages the per-root status hold,
+        // the second must be refused after cancellation. Lexicographic order
+        // (`configured_dirs.sort_unstable`) makes root A the held one.
+        let root_a = TestDirectory::new("mid-loop-cancel-a");
+        let root_b = TestDirectory::new("mid-loop-cancel-b");
+
+        let music_dirs = vec![root_a.path().to_path_buf(), root_b.path().to_path_buf()];
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let cancellation = CancellationToken::new();
+        let (hold, control) = ScanDiscoveryHold::controlling();
+        let scan_write_txn = ScanWriteTxnGate::default();
+        let forced_conversions = HashMap::new();
+        let authority_guards = HashMap::new();
+        let evidence_refreshes = HashMap::new();
+
+        let scan = initial_scan_with_control(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &forced_conversions,
+            &authority_guards,
+            &evidence_refreshes,
+            &refresh,
+            &cancellation,
+            &hold,
+            &scan_write_txn,
+        );
+        let driver = async {
+            // The traversal is read-only; let it through. The first per-root
+            // status persist then parks at the RootStatus hold.
+            control.release(ScanDiscoveryStage::Traversal);
+            control
+                .wait_until_reached(ScanDiscoveryStage::RootStatus)
+                .await;
+            // Root B's status row does not exist yet: the per-root loop has
+            // only reached root A's persist. Shut down mid-loop.
+            cancellation.cancel();
+            // Root A's already-admitted persist settles; root B's iteration
+            // must then be refused before its status write is admitted.
+            control.release(ScanDiscoveryStage::RootStatus);
+        };
+
+        let (scan_result, ()) = tokio::join!(scan, async {
+            tokio::time::timeout(Duration::from_secs(60), driver)
+                .await
+                .expect("the mid-loop shutdown must settle within the driver budget");
+        });
+        scan_result.expect("a mid-loop cancelled scan returns cleanly");
+
+        let rows = library_root::Entity::find()
+            .all(&db)
+            .await
+            .expect("query library roots");
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly the already-admitted root may receive a status write: {rows:?}"
+        );
+        assert_eq!(
+            rows[0].path,
+            root_a.path().to_string_lossy().as_ref(),
+            "the admitted root-status write must be the first root's, not the refused one"
+        );
+        assert!(
+            library_root::Entity::find_by_id(root_b.path().to_string_lossy().into_owned())
+                .one(&db)
+                .await
+                .expect("query refused root")
+                .is_none(),
+            "a root whose status write was refused mid-loop must not appear freshly checked"
+        );
+        // The scan returned early, so it never published a snapshot.
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a mid-loop cancelled scan must not emit FullSync"
+        );
+    }
+
+    /// jq5lT regression: the stale-deletion absence proof is read-only
+    /// blocking work against the root, so a removable/network filesystem can
+    /// park it indefinitely past window close. With shutdown observed while
+    /// the proof is unsettled, the probe must be abandoned at the settle
+    /// budget, the scan must return (so the reserved `Flush` drain is
+    /// acknowledged instead of hanging), and the unproven row must be
+    /// preserved — an absence that was never proven never deletes.
+    #[tokio::test]
+    async fn un_settleable_absence_probe_is_abandoned_and_preserves_row_at_shutdown() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("absence-shutdown");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join("present.wav"));
+        // Establish the root's durable identity first: reconciliation
+        // authority (and therefore stale-deletion candidacy) requires a
+        // previously confirmed marker identity.
+        let enrollment = scan_root(directory.path().to_path_buf());
+        persist_root_scan_status(&db, &enrollment, None, true, true, false)
+            .await
+            .expect("seed confirmed root identity");
+        // A row whose file is absent on disk: the stale-deletion candidate
+        // whose absence proof will be parked for this test.
+        insert_rename_test_track(
+            &db,
+            "stale-absent-track",
+            directory.path().join("gone.wav").to_string_lossy().as_ref(),
+            "Gone",
+            3,
+        )
+        .await;
+
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let cancellation = CancellationToken::new();
+        let scan_write_txn = ScanWriteTxnGate::default();
+        let mut completed = HashMap::new();
+
+        STALE_ABSENCE_PROBE_HELD.store(true, std::sync::atomic::Ordering::SeqCst);
+        let no_hold = ScanDiscoveryHold::none();
+        let engine = service_commands_while_scanning(
+            initial_scan_shutdown_aware(
+                &db,
+                &music_dirs,
+                &event_tx,
+                &refresh,
+                &cancellation,
+                &no_hold,
+                &scan_write_txn,
+            ),
+            &scan_write_txn,
+            &db,
+            &music_dirs,
+            &event_tx,
+            &command_rx,
+            &mut completed,
+            &refresh,
+        );
+        let (flush_tx, flush_rx) = async_channel::bounded(1);
+        let driver = async {
+            // Wait until the absence probe is parked (it sets the flag before
+            // spinning): the scan is now blocked on filesystem work that will
+            // never settle on its own.
+            loop {
+                if STALE_ABSENCE_PROBE_ARRIVED.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // Window close while the proof is unsettled.
+            cancellation.cancel();
+            // The reserved drain: with the probe budgeted, this acknowledges
+            // once the scan abandons the probe; un-budgeted it would hang.
+            command_tx
+                .send(LibraryCommand::Flush {
+                    completion: flush_tx,
+                })
+                .await
+                .expect("admit the reserved flush");
+            tokio::time::timeout(Duration::from_secs(30), flush_rx.recv())
+                .await
+                .expect("the drain must be acknowledged even though the probe never settles")
+                .expect("flush completion channel stays open");
+        };
+
+        let (scan_result, ()) = tokio::join!(engine, async {
+            tokio::time::timeout(Duration::from_secs(60), driver)
+                .await
+                .expect("the shutdown drain must settle while the probe is parked");
+        });
+        scan_result.expect("a scan whose absence probe was abandoned returns cleanly");
+        // Let the abandoned probe thread exit before its fixtures drop.
+        STALE_ABSENCE_PROBE_HELD.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let preserved = track::Entity::find_by_id("stale-absent-track")
+            .one(&db)
+            .await
+            .expect("query preserved row")
+            .expect("an unproven absence must preserve the row");
+        assert_eq!(
+            preserved.rating,
+            Some(88),
+            "the preserved row keeps its metadata untouched"
+        );
+        assert!(
+            track::Entity::find()
+                .filter(
+                    track::Column::FilePath.eq(directory
+                        .path()
+                        .join("present.wav")
+                        .to_string_lossy()
+                        .as_ref())
+                )
+                .one(&db)
+                .await
+                .expect("query upserted track")
+                .is_some(),
+            "the scan had progressed past the catalogue loop when shutdown arrived"
+        );
     }
 
     // ── Paired directory renames ────────────────────────────────────────
