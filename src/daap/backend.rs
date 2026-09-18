@@ -377,6 +377,27 @@ fn unavailable_catalogue() -> BackendError {
     }
 }
 
+/// Prove the attribution lookup fails closed while a refresh holds the cache
+/// write lock, then succeeds once the cache is readable again. Lives beside
+/// the cache field so the real-socket lifecycle test suite can exercise
+/// contention without widening field visibility.
+#[cfg(test)]
+pub(super) async fn assert_attribution_fails_closed_while_cache_contended(
+    backend: &DaapBackend,
+    track_id: &TrackId,
+) {
+    let guard = backend.cache.write().await;
+    assert!(
+        backend.catalogue_attribution_profile(track_id).is_none(),
+        "contended cache must refuse attribution instead of blocking"
+    );
+    drop(guard);
+    assert!(
+        backend.catalogue_attribution_profile(track_id).is_some(),
+        "uncontended cache must serve the retained profile again"
+    );
+}
+
 /// Admit one canonical DAAP item identity. A duplicate `miid` is ambiguous:
 /// silently overwriting it could bind catalogue metadata to another row's
 /// stream, so reject the complete candidate catalogue before publication.

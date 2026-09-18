@@ -222,7 +222,7 @@ fn empty_remote_sources() -> &'static HashSet<SourceId> {
 /// exact identity into each minted source authority, and dispatch re-derives
 /// its authority from the same slot at the moment of use.
 #[derive(Clone, Default)]
-pub(crate) struct LastFmLivePolicy(std::sync::Arc<std::sync::Mutex<LastFmPolicyGeneration>>);
+pub struct LastFmLivePolicy(std::sync::Arc<std::sync::Mutex<LastFmPolicyGeneration>>);
 
 impl LastFmLivePolicy {
     /// Wrap an already-shared UI policy slot.
@@ -265,7 +265,7 @@ impl LastFmLivePolicy {
 /// generation is refused the moment the live generation moves past it, even
 /// when its source remains opted in.
 #[derive(Clone, Eq, PartialEq)]
-pub(crate) struct LastFmDispatchAuthority {
+pub struct LastFmDispatchAuthority {
     generation: u64,
     enabled_remote_sources: HashSet<SourceId>,
 }

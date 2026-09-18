@@ -3319,12 +3319,12 @@ impl ProvenanceClaims {
 /// [`SourceRegistry::try_admit_playback_action`] flows without duplicating
 /// the in-module fake probe. Compiled only under `cfg(test)`.
 #[cfg(test)]
-pub(crate) mod playback_attribution_fixture {
+pub mod playback_attribution_fixture {
     use super::sealed::AbortableSourceAdapter as SealedAbortable;
     use super::{
-        AdapterCloseFuture, CatalogueFuture, CloseAuthority, ManagedSourceAdapter,
+        lock, AdapterCloseFuture, CatalogueFuture, CloseAuthority, ManagedSourceAdapter,
         PlaybackAttributionCapability, PlaybackAttributionProfile, SourceProvenance,
-        SourceRegistry, Track, TrackId, lock,
+        SourceRegistry, Track, TrackId,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -3332,7 +3332,7 @@ pub(crate) mod playback_attribution_fixture {
     /// Minimal authenticated-remote adapter: publishes one fixed initial
     /// catalogue and serves per-track attribution profiles from a private
     /// map. Every other adapter capability stays at its deny-by-default.
-    pub(crate) struct FixtureRemoteAdapter {
+    pub struct FixtureRemoteAdapter {
         catalogue: Vec<Track>,
         profiles: Mutex<HashMap<TrackId, PlaybackAttributionProfile>>,
     }
@@ -3383,7 +3383,7 @@ pub(crate) mod playback_attribution_fixture {
 
     /// Catalogue row for one exact native track ID with fixed fixture
     /// metadata, suitable for [`FixtureRemoteAdapter::new`].
-    pub(crate) fn fixture_track(track_id: TrackId) -> Track {
+    pub fn fixture_track(track_id: TrackId) -> Track {
         Track {
             id: uuid::Uuid::new_v4(),
             native_track_id: Some(track_id),
@@ -3416,7 +3416,7 @@ pub(crate) mod playback_attribution_fixture {
     /// Claim Saved provenance, connect the fixture adapter, and resolve once
     /// the initial catalogue is accepted. Returns the live session epoch the
     /// caller must pass to [`SourceRegistry::mint_session_playback_source`].
-    pub(crate) async fn connect_saved_remote(
+    pub async fn connect_saved_remote(
         registry: &SourceRegistry,
         source_id: crate::architecture::SourceId,
         adapter: FixtureRemoteAdapter,

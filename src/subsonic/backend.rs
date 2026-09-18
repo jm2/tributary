@@ -1176,6 +1176,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attribution_profiles_are_frozen_from_raw_rows_before_display_fallbacks() {
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/rest/ping.view").reply(MockResponse::json(
+                serde_json::json!({"subsonic-response": {"status": "ok"}}),
+            )),
+            MockRoute::get("/rest/getArtists.view").reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "artists": {"index": [{"artist": [
+                        {"id": "raw-artist", "name": "Raw Artist"}
+                    ]}]}
+                }
+            }))),
+            MockRoute::get("/rest/getArtist.view")
+                .with_query("id", "raw-artist")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "artist": {
+                            "id": "raw-artist",
+                            "name": "Raw Artist",
+                            "album": [{"id": "raw-album", "name": "Raw Album"}]
+                        }
+                    }
+                }))),
+            MockRoute::get("/rest/getAlbum.view")
+                .with_query("id", "raw-album")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "album": {
+                            "id": "raw-album",
+                            "name": "Raw Album",
+                            "song": [
+                                {
+                                    "id": "gap-row",
+                                    "album": "Raw Album"
+                                },
+                                {
+                                    "id": "complete-row",
+                                    "title": "Raw Complete",
+                                    "artist": "Raw Artist",
+                                    "album": "Raw Album",
+                                    "track": 3,
+                                    "duration": 201
+                                },
+                                {
+                                    "id": "server-unknown-row",
+                                    "title": "Unknown",
+                                    "artist": "Unknown",
+                                    "album": "Raw Album"
+                                },
+                                {
+                                    "id": "album-less-row",
+                                    "title": "Raw Bare",
+                                    "artist": "Raw Artist"
+                                }
+                            ]
+                        }
+                    }
+                }))),
+        ])
+        .await;
+        let password = Uuid::new_v4().to_string();
+        let backend = SubsonicBackend::connect("fixture", &service.base_url(), "user", &password)
+            .await
+            .expect("raw-row fixture connects");
+
+        // Every accepted row becomes a display track; the metadata-gap row
+        // displays the synthesized "Unknown" fallback text.
+        let native_by_id = {
+            let cache = backend.cache.read().await;
+            assert_eq!(cache.tracks.len(), 4);
+            let gap_display_title = cache
+                .tracks
+                .iter()
+                .find(|track| {
+                    track
+                        .native_track_id
+                        .as_ref()
+                        .is_some_and(|id| id.as_str() == "gap-row")
+                })
+                .map(|track| track.title.clone());
+            assert_eq!(gap_display_title.as_deref(), Some("Unknown"));
+            cache
+                .tracks
+                .iter()
+                .filter_map(|track| {
+                    let native = track.native_track_id.clone()?;
+                    Some((native.as_str().to_string(), native))
+                })
+                .collect::<HashMap<String, TrackId>>()
+        };
+        let gap_id = &native_by_id["gap-row"];
+        let complete_id = &native_by_id["complete-row"];
+        let server_unknown_id = &native_by_id["server-unknown-row"];
+        let album_less_id = &native_by_id["album-less-row"];
+
+        // Raw row with missing title and artist: accepted for playback, but
+        // carries no attribution proof — the display "Unknown" fallback is
+        // not authority.
+        assert!(backend.catalogue_attribution_profile(gap_id).is_none());
+
+        // Complete raw row: the exact provenance is retained.
+        let complete = backend
+            .catalogue_attribution_profile(complete_id)
+            .expect("complete row retains its provenance profile");
+        assert_eq!(complete.title(), "Raw Complete");
+        assert_eq!(complete.artist(), "Raw Artist");
+        assert_eq!(complete.album(), Some("Raw Album"));
+
+        // A server-supplied "Unknown" is real row data, so it stays
+        // attributable and distinguishable from the synthesized fallback.
+        let server_unknown = backend
+            .catalogue_attribution_profile(server_unknown_id)
+            .expect("server-supplied Unknown remains attributable");
+        assert_eq!(server_unknown.title(), "Unknown");
+        assert_eq!(server_unknown.artist(), "Unknown");
+
+        // An absent optional album stays absent in the profile.
+        let album_less = backend
+            .catalogue_attribution_profile(album_less_id)
+            .expect("album-less row retains its provenance profile");
+        assert_eq!(album_less.title(), "Raw Bare");
+        assert_eq!(album_less.artist(), "Raw Artist");
+        assert_eq!(album_less.album(), None);
+
+        // Unknown or stale native IDs refuse attribution.
+        let stale_id = TrackId::remote("never-refreshed").expect("bounded stale track ID");
+        assert!(backend.catalogue_attribution_profile(&stale_id).is_none());
+
+        // A contended cache (refresh in flight) fails closed instead of
+        // blocking attribution on the lifecycle lock.
+        let guard = backend.cache.write().await;
+        assert!(backend.catalogue_attribution_profile(complete_id).is_none());
+        drop(guard);
+        assert!(backend.catalogue_attribution_profile(complete_id).is_some());
+
+        service.finish().await;
+    }
+
+    #[tokio::test]
     async fn native_playlist_http_preserves_prefix_auth_order_duplicates_and_count_hints() {
         const PREFIX: &str = "/proxy";
         let mut routes = empty_catalogue_routes(PREFIX);
