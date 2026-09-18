@@ -29,8 +29,6 @@ use super::delivery::{
     LastFmDeliveryDisposition, LastFmTransport,
 };
 use super::lifecycle::{acquire_vault_lifecycle, LastFmVaultLifecycleLease};
-#[cfg(test)]
-use std::collections::HashSet;
 use super::policy::LastFmLivePolicy;
 #[cfg(test)]
 use super::policy::LastFmPolicyGeneration;
@@ -42,6 +40,8 @@ use super::worker::{
     LastFmDeliveryAcknowledgement, LastFmDeliveryDirective, LastFmDeliveryEvent,
     LastFmDeliveryGeneration, LastFmDeliveryWorker, LastFmDeliveryWorkerFailure,
 };
+#[cfg(test)]
+use std::collections::HashSet;
 
 const METADATA_INGRESS_CAPACITY: usize = 64;
 const CONTROL_RESERVED_CAPACITY: usize = 4;

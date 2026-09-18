@@ -1220,9 +1220,27 @@ mod tests {
         service.finish().await;
     }
 
-    #[tokio::test]
-    async fn search_retains_provenance_profiles_for_rows_outside_the_catalogue() {
-        let service = MockHttpService::start(vec![
+    fn search_row_items() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({
+                "Id": "search-complete",
+                "Name": "Search Complete",
+                "Type": "Audio",
+                "Album": "Search Album",
+                "AlbumArtist": "Search Artist",
+                "ArtistItems": [{"Id": "artist-1", "Name": "Search Artist"}],
+                "IndexNumber": 5,
+                "RunTimeTicks": 2_220_000_000i64
+            }),
+            serde_json::json!({
+                "Id": "search-gap",
+                "Type": "Audio"
+            }),
+        ]
+    }
+
+    fn search_outside_catalogue_routes() -> Vec<MockRoute> {
+        vec![
             MockRoute::get("/System/Ping").reply(MockResponse::text("Jellyfin Server")),
             MockRoute::get("/Users/fixture-user/Views").reply(MockResponse::json(
                 serde_json::json!({
@@ -1257,38 +1275,13 @@ mod tests {
                 .with_query("SearchTerm", "Fixture")
                 .with_query("IncludeItemTypes", "Audio,MusicAlbum,MusicArtist")
                 .reply(MockResponse::json(serde_json::json!({
-                    "Items": [
-                        {
-                            "Id": "search-complete",
-                            "Name": "Search Complete",
-                            "Type": "Audio",
-                            "Album": "Search Album",
-                            "AlbumArtist": "Search Artist",
-                            "ArtistItems": [{"Id": "artist-1", "Name": "Search Artist"}],
-                            "IndexNumber": 5,
-                            "RunTimeTicks": 2_220_000_000i64
-                        },
-                        {
-                            "Id": "search-gap",
-                            "Type": "Audio"
-                        }
-                    ],
+                    "Items": search_row_items(),
                     "TotalRecordCount": 2
                 }))),
-        ])
-        .await;
-        let token = Uuid::new_v4().to_string();
-        let backend =
-            JellyfinBackend::connect("fixture", &service.base_url(), &token, "fixture-user")
-                .await
-                .expect("connect Jellyfin search fixture");
+        ]
+    }
 
-        let results = backend
-            .search("Fixture", 10)
-            .await
-            .expect("search the fixture server");
-        assert_eq!(results.tracks.len(), 2);
-
+    fn assert_search_row_provenance_profiles(backend: &JellyfinBackend) {
         // A searched row that never went through the catalogue refresh still
         // carries its raw provenance as Last.fm attribution authority, with
         // the same field precedence as the refresh path.
@@ -1304,6 +1297,23 @@ mod tests {
         // of becoming attribution authority.
         let gap_id = TrackId::remote("search-gap").expect("bounded track ID");
         assert!(backend.catalogue_attribution_profile(&gap_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn search_retains_provenance_profiles_for_rows_outside_the_catalogue() {
+        let service = MockHttpService::start(search_outside_catalogue_routes()).await;
+        let token = Uuid::new_v4().to_string();
+        let backend =
+            JellyfinBackend::connect("fixture", &service.base_url(), &token, "fixture-user")
+                .await
+                .expect("connect Jellyfin search fixture");
+
+        let results = backend
+            .search("Fixture", 10)
+            .await
+            .expect("search the fixture server");
+        assert_eq!(results.tracks.len(), 2);
+        assert_search_row_provenance_profiles(&backend);
         service.finish().await;
     }
 }

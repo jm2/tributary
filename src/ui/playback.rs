@@ -2787,7 +2787,8 @@ pub fn play_external_session(
     super::open_files::invalidate_admission();
     // The external occurrence freezes the exact live generation that was
     // current when the queue was captured, exactly like visible-track capture.
-    let policy_generation = crate::lastfm::policy::lock_policy_slot(&ctx.lastfm_policy).generation();
+    let policy_generation =
+        crate::lastfm::policy::lock_policy_slot(&ctx.lastfm_policy).generation();
     let item = QueueItem::external(external, policy_generation);
     let previous_external = ctx.session.borrow().current_external_source_id();
     if !ctx.session.borrow_mut().replace_queue(vec![item], 0) {

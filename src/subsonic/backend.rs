@@ -1801,9 +1801,8 @@ mod tests {
         service.finish().await;
     }
 
-    #[tokio::test]
-    async fn search_retains_provenance_profiles_for_rows_outside_the_catalogue() {
-        let service = MockHttpService::start(vec![
+    fn search_outside_catalogue_routes() -> Vec<MockRoute> {
+        vec![
             MockRoute::get("/rest/ping.view").reply(MockResponse::json(
                 serde_json::json!({"subsonic-response": {"status": "ok"}}),
             )),
@@ -1832,19 +1831,10 @@ mod tests {
                         }
                     }
                 }))),
-        ])
-        .await;
-        let password = Uuid::new_v4().to_string();
-        let backend = SubsonicBackend::connect("fixture", &service.base_url(), "user", &password)
-            .await
-            .expect("connect search fixture");
+        ]
+    }
 
-        let results = backend
-            .search("Song", 10)
-            .await
-            .expect("search the fixture server");
-        assert_eq!(results.tracks.len(), 2);
-
+    fn assert_search_row_provenance_profiles(backend: &SubsonicBackend) {
         // A searched row that never went through the catalogue refresh still
         // carries its raw provenance as Last.fm attribution authority.
         let complete_id = TrackId::remote("search-complete").expect("bounded track ID");
@@ -1859,6 +1849,22 @@ mod tests {
         // of becoming attribution authority.
         let gap_id = TrackId::remote("search-gap").expect("bounded track ID");
         assert!(backend.catalogue_attribution_profile(&gap_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn search_retains_provenance_profiles_for_rows_outside_the_catalogue() {
+        let service = MockHttpService::start(search_outside_catalogue_routes()).await;
+        let password = Uuid::new_v4().to_string();
+        let backend = SubsonicBackend::connect("fixture", &service.base_url(), "user", &password)
+            .await
+            .expect("connect search fixture");
+
+        let results = backend
+            .search("Song", 10)
+            .await
+            .expect("search the fixture server");
+        assert_eq!(results.tracks.len(), 2);
+        assert_search_row_provenance_profiles(&backend);
 
         assert_eq!(service.requests().len(), 3);
         service.finish().await;

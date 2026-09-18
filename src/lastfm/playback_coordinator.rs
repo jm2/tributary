@@ -3891,10 +3891,7 @@ mod tests {
             binding.observe_event(&PlayerEvent::position(first, 1_000, 100_000)),
             LastFmPlaybackCoordinatorOutcome::Applied
         );
-        assert_eq!(
-            port.calls(),
-            vec![LastFmPlaybackHandoffKind::NowPlaying]
-        );
+        assert_eq!(port.calls(), vec![LastFmPlaybackHandoffKind::NowPlaying]);
 
         // The closed default generation lands before the next accepted load:
         // the committed replacement is rejected while the coordinator stays
