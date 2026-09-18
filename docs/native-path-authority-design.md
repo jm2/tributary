@@ -6,9 +6,9 @@ representation plus an explicit unsupported-input boundary, for review before
 any behavior changes. It authorizes follow-up implementation beads; it does not
 ship them.
 
-Revision 3 (this head) is a corrective revision of the independently rejected
-heads `16140be0d03d17c1f299cf7690adea6648722160` and
-`bc49dbe514334e94c081e3156ab97a12df11f066`. Revision 2 withdrew the size/mtime
+Revision 4 (this head) continues the corrective chain over the independently
+rejected heads `16140be0d03d17c1f299cf7690adea6648722160` (Revision 2) and
+`bc49dbe514334e94c081e3156ab97a12df11f066` (Revision 3). Revision 2 withdrew the size/mtime
 legacy-adoption rule (F1), made the rollout fail-closed-first so no authority
 consumer is ever exposed to a row it cannot prove (F2), and removed the
 older-binary compatibility claim in favor of an enforced version guard plus a
@@ -16,7 +16,14 @@ mechanical carrier removal (F3). Revision 3 additionally corrects the migration
 rebuild sequence: foreign-key suppression is a connection-level prelude before
 the transaction begins, restoration is verified on every exit path, and
 `legacy_alter_table` is banned as a substitute (the migration reference-loss
-finding). §13 is the finding-to-revision map. No behavior changes: every
+finding). Revision 4 answers the five round-2 review findings verified at
+`6218ec03` (§13.2): the permanent root UTF-8 boundary is restored for root
+reauthorization (R2-F1), the migration preservation gate compares exact
+entry-to-track binding pairs (R2-F2), the §4.4 diagram matches the backfill
+states the migration actually writes (R2-F3), the older-binary containment
+claim is narrowed to what its two mechanisms actually deliver (R2-F4), and
+XSPF export fails closed with an `Err` instead of omitting rows (R2-F5).
+§13 is the finding-to-revision map. No behavior changes: every
 revision makes the contract stricter, not more permissive.
 
 Scope: the built-in local library only. No change to removable media,
@@ -53,9 +60,11 @@ Two decisions are made here:
    **renamed** `tracks.file_path` → `tracks.display_path`; it becomes
    non-authoritative display text, loses its UNIQUE constraint, and is never
    used to open a file, key a row, or prove identity. The rename is deliberate:
-   it removes the legacy authority carrier so that a pre-R11 binary fails closed
-   instead of silently regaining lossy authority over the upgraded database
-   (§4.5).
+   it removes the legacy authority carrier so that pre-R11 access to that
+   authority column fails closed instead of silently regaining lossy authority
+   over the upgraded database (§4.5 states the exact scope of that containment:
+   statements naming the removed column, plus the contract-aware version
+   guard — not a blanket executable rejection of pre-R11 binaries).
 2. **Explicit unsupported-input boundary (secondary, permanent).** A local
    library **root** must itself be a valid UTF-8 absolute path. Roots are the
    one object whose stored key (`library_roots.path`) is not part of this
@@ -285,16 +294,23 @@ The executable sequence on the single dedicated migration connection is:
 4. Drop `tracks`, rename `tracks_new` to `tracks`, recreate the artist/album/
    genre indexes, the `display_path` display index, and the new partial unique
    `native_path` index.
-5. **In-transaction preservation gate (before `COMMIT`).** Compare snapshots
-   taken before the drop against the rebuilt table and require all of: the same
+5. **In-transaction preservation gate (before `COMMIT`).** Snapshot, before
+   the drop, the exact set of populated playlist bindings — every
+   `(playlist_entries.id, local_track_id)` pair with a non-NULL
+   `local_track_id` — and require, against the rebuilt table: the same
    `tracks` row count with an identical id set; the same `playlist_entries`
-   row count; the same count of non-NULL `playlist_entries.local_track_id`
-   values bound to the identical set of track ids — no binding may change, in
-   particular none may go from non-NULL to NULL; and an empty
+   row count; and **pair-set equality** of that binding snapshot — each entry
+   id must still be bound to exactly the track id it was bound to before, so
+   no binding may change in any way: none may go from non-NULL to NULL, none
+   may be rebound to a different track id, and swapping two entries' track ids
+   fails the gate even though a swap preserves both the row count and the
+   multiset of bound track ids. Then require an empty
    `PRAGMA foreign_key_check`. `foreign_key_check` alone is explicitly
    insufficient — `SET NULL` damage is invisible to it because NULL is legal —
-   so the populated binding comparison is mandatory. Any mismatch aborts the
-   transaction and rolls everything back.
+   and count-plus-track-id-set comparisons are explicitly insufficient because
+   they cannot detect swapped or otherwise rebound entries — so the exact
+   pair-set comparison is mandatory. Any mismatch aborts the transaction and
+   rolls everything back.
 6. Record the authority marker (a validated `schema_capabilities` singleton row
    and the mirrored `PRAGMA user_version`, §4.5), written **last** inside the
    same transaction.
@@ -339,17 +355,26 @@ distinct native paths.
 ### 4.4 Quarantine state machine
 
 ```text
-                migration
-  (none) ────────────────────> authoritative (1) ── rename/scan ──> authoritative
-         │  display has no U+FFFD (exact round-trip)
-         │
-         ├──────────────> legacy_verified_utf8 (2) ── exact key re-observed ──> authoritative (1)
-         │                └─ key mismatch / not observed ──> quarantined (3)
-         │
-         └── display has U+FFFD ────> quarantined_ambiguous (3)
-                 ├─ exact retained key only ──> authoritative (1)
-                 └─ otherwise ────────────────> stays (3)
+              migration backfill (terminates in state 2 or 3;
+                                  never writes state 1)
+  (none) ── display has no U+FFFD ──> legacy_verified_utf8 (2)
+          │                             ├─ exact key re-observed ──> authoritative (1)
+          │                             └─ key mismatch / not observed ──> quarantined (3)
+          │
+          └── display has U+FFFD ───────────> quarantined_ambiguous (3)
+                                                ├─ exact retained key only ──> authoritative (1)
+                                                └─ otherwise ────────────────> stays (3)
+
+  new post-migration enrollment (scan/watcher insert) ──> authoritative (1)
+  authoritative (1) ── rename/scan re-observation ──> authoritative (1)
 ```
+
+The migration itself never writes state 1: §4.2 step 3 and §4.3 terminate the
+backfill in state 2 for a U+FFFD-free display string and state 3 for a
+U+FFFD-bearing one. `authoritative` (1) is entered only by a later exact-key
+re-observation of a state-2 row, by an exact retained key for a state-3 row
+(§5.4), or by a new post-migration enrollment; there is no direct
+migration→1 transition.
 
 - **Quarantined rows are never deleted or silently re-identified.** Their id,
   ratings, play counts, history, and playlist bindings are retained. They are
@@ -378,7 +403,9 @@ distinct native paths.
 The encoding is reversible by construction, but **backward compatibility is not
 provided and is not claimed**. A database carrying native-path authority may
 only be opened by a binary that implements this contract; running a pre-R11
-binary against it is unsupported. Two independent mechanisms enforce that:
+binary against it is unsupported. Two mechanisms contain the exposure — and
+their scope must be stated exactly, because neither mechanically rejects an
+arbitrary pre-R11 binary at open:
 
 1. **Supported-version startup guard.** The migration records
    `native_path_authority_version = 1` in a validated singleton
@@ -391,13 +418,23 @@ binary against it is unsupported. Two independent mechanisms enforce that:
      R11-aware but older reader/writer;
    - refuses to scan or write when the database declares authority but the
      binary lacks the §7/§9 fail-closed consumer baseline.
-   A database whose marker is absent is pre-R11 and unaffected.
+
+   A database whose marker is absent is pre-R11 and unaffected. The marker is
+   read by contract-aware binaries only: a pre-R11 binary that knows nothing
+   of `schema_capabilities` or `PRAGMA user_version` is not stopped by this
+   guard.
 2. **Mechanical carrier removal.** The rebuilt `tracks` table has no `file_path`
    column (§4.2); display text lives only in `display_path`. A pre-guard binary
    that selects or writes `file_path` fails closed at statement preparation
    ("no such column") instead of regaining lossy authority. Successful SQL
    reads/inserts of the legacy column are therefore explicitly **not** evidence
-   of compatibility: they cannot occur.
+   of compatibility: they cannot occur. The barrier is scoped to statements
+   that name the removed column: a statement that does not name `file_path` —
+   `SELECT *`, or a read of the surviving columns (ids, ratings, play counts,
+   history) — prepares and executes against the rebuilt table. An arbitrary
+   pre-R11 binary is therefore unsupported-but-not-mechanically-rejected unless
+   the statement it runs names `file_path`; no executable barrier in this
+   design rejects every pre-R11 read or write.
 
 Validation requires an **old-binary / open-database rejection trace** test that
 simulates a pre-R11 consumer (prepare `SELECT file_path FROM tracks`, and an
@@ -495,9 +532,17 @@ raising the confidence of a guess.
   collision rejection (`engine.rs:2175-2190`) becomes unreachable for genuine
   native collisions because the keys are now distinct; it remains as a
   fail-closed guard and should be retained.
-- **Root reauthorization** no longer needs to reject non-UTF-8 destinations
-  (`engine.rs:1180-1182,1233`); retarget through the native codec and only
-  refuse if the new native key cannot be encoded or exceeds the bound.
+- **Root reauthorization** keeps the permanent root boundary (§1, §7): the
+  destination **root** itself must remain a valid UTF-8 absolute path, because
+  it is persisted through the lossy `library_roots.path` key that this contract
+  explicitly does not govern (§10). The existing refusals
+  (`engine.rs:1180-1182,1233`) are retained unchanged for the root; only
+  descendant track/playlist paths inside the reauthorized root gain
+  native-codec retargeting. A reauthorization whose destination root is not
+  valid UTF-8 is refused with a closed diagnostic (§8.14) and no rows move; it
+  is never retargeted through the native codec, which would encode the
+  destination losslessly for descendants while the root row itself collapses
+  distinct invalid-byte roots in `library_roots.path` via `to_string_lossy`.
 
 ## 6. Contract: consumers
 
@@ -534,10 +579,15 @@ favor of the id-keyed lookup.
   canonical percent-encoded form of the native bytes (XSPF `<location>` is XML
   text, so raw invalid bytes cannot appear). The exact mapping is defined with
   the codec and covered by tests. Until that mapping ships (R11d), export must
-  **fail closed**: it omits or diagnoses non-authoritative rows rather than
-  emitting a lossy `display_path` location. This is part of the §7 baseline and
-  must land before schema/scanner activation, so an intermediate build can never
-  export a false locator for a newly enrolled row.
+  **fail closed**: encountering any non-authoritative row (U+FFFD display text,
+  `native_path_state` 0 or 3, or `native_path IS NULL`) aborts the whole
+  export with an `Err` **before** serialization or atomic persistence begins,
+  leaving the destination file unchanged; the existing UI `Err` handling
+  surfaces the failure. Export never omits non-authoritative rows into a
+  silently incomplete playlist artifact, and it never emits a lossy
+  `display_path` location. This is part of the §7 baseline and must land
+  before schema/scanner activation, so an intermediate build can never export
+  a false locator for a newly enrolled row.
 - **XSPF import** decodes the percent-encoded location losslessly back to a
   native path and matches by native key first; the metadata/duration fingerprint
   fallback (`ImportedTrackMatchIndex`, `playlist_io.rs:591-700`) is unchanged
@@ -573,8 +623,11 @@ for unrepresentable input, the boundary is:
   update that row, emit a bounded diagnostic, and (once the schema lands) create
   a distinct row instead. Never overwrite authority.
 - **Export refusal.** XSPF export never emits a lossy `display_path` as a
-  location. Non-authoritative rows are omitted or diagnosed; authoritative rows
-  are emitted only from a decoded native key (§6.3). Import accepts a location
+  location. Any non-authoritative row makes the whole export fail closed with
+  an `Err` before serialization or atomic persistence begins, leaving the
+  destination file unchanged — rows are never omitted into a silently
+  incomplete artifact (§6.3); authoritative rows are emitted only from a
+  decoded native key. Import accepts a location
   as authority only when it decodes to an exact native key.
 - **Closed, redacted diagnostics.** Diagnostics name a category, not raw native
   bytes or absolute paths, consistent with the path-free diagnostics rule in
@@ -638,10 +691,14 @@ Required tests:
 11. **Old-binary / open-database rejection trace (F3).** Simulate a pre-R11
     consumer: a prepared `SELECT file_path FROM tracks` and an insert naming
     `file_path` both fail closed ("no such column"); the
-    `native_path_authority_version` startup guard refuses a binary that does not
-    support the database's authority version; `down()` refuses while any row
-    would be ambiguous under the old schema and otherwise restores the
-    `file_path` column name. Assert
+    `native_path_authority_version` startup guard refuses a contract-aware
+    binary compiled below the database's authority version; `down()` refuses
+    while any row would be ambiguous under the old schema and otherwise
+    restores the `file_path` column name. Assert the containment scope
+    symmetrically: a `SELECT *` and a read naming only surviving columns
+    succeed against the rebuilt table, demonstrating that the mechanical
+    barrier covers statements naming the removed column, not arbitrary
+    pre-R11 statements (§4.5). Assert
     row ids, ratings, play counts, history, and playlist references are
     byte-identical across the upgrade.
 12. **Intermediate-version integration matrix (F2).** For every independently
@@ -655,9 +712,10 @@ Required tests:
     Run migration `000021` against a populated database: several `tracks` rows
     covering states 2 and 3, live `playlist_entries` rows whose non-NULL
     `local_track_id` values reference them, plus ratings, play counts, and
-    history. Assert after the migration: playlist binding rows are unchanged
-    (same entry ids, same non-NULL `local_track_id` set — in particular no
-    binding became NULL), track ids/ratings/play counts/history are
+    history. Assert after the migration: playlist binding rows are unchanged —
+    exact `(playlist_entries.id, local_track_id)` pair-set equality, so no
+    binding became NULL and no two entries' bindings were swapped — track
+    ids/ratings/play counts/history are
     byte-identical (the migration-grain form of §8.11's cross-upgrade
     assertion), and `foreign_key_check` is empty. Additionally assert the
     failure paths: (a) a connection where `PRAGMA foreign_keys = OFF` does not
@@ -668,6 +726,12 @@ Required tests:
     `PRAGMA legacy_alter_table`; and (d) the connection epilogue restores
     foreign-key enforcement with a verified read-back, including when the
     migration body returns an error or panics.
+14. **Root reauthorization boundary (§5.5).** A library-root reauthorization
+    whose destination root is not valid UTF-8 is refused with a closed
+    diagnostic before any row is moved; no `library_roots` row is written with
+    a lossy destination and no track rows are retargeted. Reauthorization of
+    descendants inside a valid UTF-8 destination root proceeds through the
+    native codec as §5.5 specifies.
 
 Physical-platform validation remains separate from automated checks: APFS and
 Windows reject invalid-byte filenames, so the end-to-end scan/reproduction is a
@@ -686,8 +750,9 @@ not expose a newly-lossless row to a consumer that cannot prove it.
    U+FFFD-bearing display path with a closed unavailable reason instead of
    `PathBuf::from(display_path)`; the tag-write target refuses it; stale and
    watcher removal never use display text as authority for a U+FFFD key (no
-   wrong delete/reassign); XSPF export omits/diagnoses U+FFFD locations instead
-   of emitting a false locator and import refuses unprovable locations; the UI
+   wrong delete/reassign); XSPF export fails closed with an `Err` on any
+   U+FFFD or non-authoritative location instead of emitting a false locator or
+   a silently incomplete artifact, and import refuses unprovable locations; the UI
    tag-write URI path refuses. This slice only removes false authority, so it is
    safe standing alone and changes no stored data.
 2. **R11b — codec + schema + scanner keys (activation).** Shared
@@ -701,8 +766,9 @@ not expose a newly-lossless row to a consumer that cannot prove it.
 3. **R11c — playback + tag-write authority.** Resolver decodes `native_path`;
    tag-write target id-keyed; coordinate the R1 content-revision boundary.
 4. **R11d — import/export + Rhythmbox.** Lossless XSPF location mapping; export
-   switches from baseline omission to lossless emission only for authoritative
-   rows; decide and document the Rhythmbox non-UTF-8 scope.
+   switches from the baseline whole-export `Err` refusal to lossless emission
+   only for authoritative rows; decide and document the Rhythmbox non-UTF-8
+   scope.
 5. **R11e — legacy cleanup.** Remove any remaining display-as-authority fallback
    once scans prove the native keys; keep `display_path` display-only.
 
@@ -778,7 +844,7 @@ Each acceptance item, with the sections where it is satisfied:
   §4, §5, §6
 - Linux fixtures: invalid bytes, literal replacement collisions,
   Unicode/normalization, rename — §8
-- Safe rejection/diagnostics until lossless support — §7
+- Safe rejection/diagnostics until lossless support — §7, §8.14
 - No lossy consumer exposed to newly encoded rows (fail-closed-first) — §7, §9,
   §8.12
 - Older-binary / version-guard containment (no false authority re-enabled) —
@@ -856,10 +922,105 @@ the required correction, where the design changed, and the validation added.
   `legacy_alter_table` ban; extended the §4.5 rollback/restart contract;
   updated the §12 mapping
 - **Validation added:** §8.13 populated preservation + failure-injection
-  tests: pre-`BEGIN` abort on failed suppression, mid-rebuild rollback to a
-  byte-identical database with bindings intact, no `legacy_alter_table`
-  issued, verified FK restore on success/error/panic; §12 preservation row
-  cites §8.13
+   tests: pre-`BEGIN` abort on failed suppression, mid-rebuild rollback to a
+   byte-identical database with bindings intact, no `legacy_alter_table`
+   issued, verified FK restore on success/error/panic; §12 preservation row
+   cites §8.13
+
+### 13.2 Revision 4 mapping (round-2 review of `6218ec03`)
+
+Revision 4 answers the five valid unresolved review threads verified in
+`refinery-20260918-6218ec03-tr-ldhwt/corrective-round2-findings.md` (PR #283
+at head `6218ec030b8c36055d1212c299e699304455318f`). All corrections are
+doc-only; labeled R2-F1…R2-F5 to distinguish them from the §13 Revision-2
+findings.
+
+#### R2-F1 — root reauthorization dropped the permanent root UTF-8 boundary
+
+- **Finding:** §5.5 instructed that root reauthorization "no longer needs to
+  reject non-UTF-8 destinations" and the appendix routed it to the native
+  codec, so an invalid-byte destination root would be accepted and persisted
+  through the lossy `library_roots.path` key — re-creating the exact
+  lossy-root collapse R11 removes. It contradicted the permanent §1 root
+  boundary, §7, and the appendix's own "unchanged (root boundary)" rows.
+- **Required correction:** the destination root keeps the explicit UTF-8
+  refusal (it is a root, not a descendant); only descendant track/playlist
+  paths gain native-codec retargeting; add the required refusal test note.
+- **Where changed:** rewrote the §5.5 root-reauthorization bullet; corrected
+  the Appendix A row to "unchanged: destination root keeps the UTF-8
+  refusal"; added the §8.14 reauthorization-boundary test; §12
+  safe-refusal row cites §8.14.
+- **Validation added:** §8.14 — refusal of a non-UTF-8 destination root with
+  no rows moved, and codec retargeting of descendants inside a valid UTF-8
+  root.
+
+#### R2-F2 — preservation gate could not detect swapped bindings
+
+- **Finding:** the §4.2 step-5 gate compared only the `playlist_entries` row
+  count and the multiset of non-NULL `local_track_id` values; swapping two
+  entries' track bindings preserves both and would pass, contradicting the
+  step's own "no binding may change".
+- **Required correction:** snapshot and compare exact
+  `(playlist_entries.id, local_track_id)` pairs before and after the rebuild;
+  require pair-set equality before `COMMIT`, keeping the row-count, track
+  id-set, and `foreign_key_check` clauses.
+- **Where changed:** rewrote §4.2 step 5 around the exact binding-pair
+  snapshot with explicit swap detection; strengthened the §8.13 assertion to
+  the same pair-set equality.
+- **Validation added:** §8.13 binding assertion now fails on any rebind,
+  including swaps, not only on NULL-ing.
+
+#### R2-F3 — state diagram implied migration writes state 1
+
+- **Finding:** the §4.4 diagram's top arrow showed "migration →
+  authoritative (1)" for a "(none)" origin, while §4.2 step 3 and §4.3
+  guarantee the migration never writes state 1 — backfill terminates in
+  state 2 (U+FFFD-free) or state 3 (U+FFFD).
+- **Required correction:** relabel the diagram: the backfill path terminates
+  in state 2 (state 3 for U+FFFD); state 1 is entered only by exact-key
+  re-observation of a state-2 row, an exact retained key for a state-3 row,
+  or new post-migration enrollment; no direct migration→1 arrow.
+- **Where changed:** redrew the §4.4 diagram and added the explicit
+  "migration never writes state 1" paragraph beneath it.
+- **Validation added:** none beyond the diagram/text consistency; §4.2
+  step 3, §4.3, and §4.4 now state the same transition set.
+
+#### R2-F4 — older-binary containment overstated
+
+- **Finding:** §4.5 claimed "two independent mechanisms enforce" that a
+  pre-R11 binary is rejected, but the version guard is read by contract-aware
+  binaries only, and carrier removal fails statements only when they name
+  `file_path` (`SELECT *` and reads of surviving columns prepare and execute
+  fine). No executable barrier rejects an arbitrary pre-R11 binary.
+- **Required correction:** narrow the claim to what the mechanisms deliver —
+  version-check rejection of contract-aware older binaries, and
+  statement-preparation failure for anything naming `file_path` — and state
+  plainly that an arbitrary pre-R11 binary is unsupported-but-not-
+  mechanically-rejected unless it names the removed column.
+- **Where changed:** rewrote the §4.5 intro and both mechanism descriptions
+  with the exact scope; aligned §1's carrier-removal sentence; updated the
+  §8.11 trace to assert the scope symmetrically (`SELECT *` succeeds).
+- **Validation added:** §8.11 now asserts both the barrier (statements naming
+  `file_path` fail) and its boundary (statements not naming it succeed).
+
+#### R2-F5 — export "omits" contradicted the fail-closed baseline
+
+- **Finding:** §6.3 allowed export to "omit or diagnose" non-authoritative
+  rows; omission silently produces an incomplete playlist artifact, which is
+  not failing closed and contradicts §1, §4.4, and the §7 baseline.
+- **Required correction:** encountering any non-authoritative row makes the
+  whole export return an `Err` before serialization or atomic persistence
+  begins, leaving the destination file unchanged; existing UI `Err` handling
+  surfaces the failure; drop "omits".
+- **Where changed:** rewrote the §6.3 export bullet, the §7 export-refusal
+  bullet, and the §9 R11a slice description to the all-or-error contract.
+- **Validation added:** §8.12's per-slice matrix already asserts "no lossy
+  export"; its refusal is now specified as whole-export `Err` with the
+  destination unchanged.
+
+Nothing in this revision expands product behavior; every change makes the
+contract stricter. Threads stay unresolved until this head lands and the five
+fixes are independently re-verified.
 
 ## Appendix A — Lossy conversion inventory (`src/local/`)
 
@@ -877,7 +1038,7 @@ entries below name the legacy identifier as it exists at the design commit.
 | `engine.rs:5902,5936,6020` | dir-rename surplus / removal events | native key |
 | `engine.rs:6400-6444` | file rename retarget | native key |
 | `engine.rs:6504-6573` | dir rename prefix/join | native key |
-| `engine.rs:1180-1182,1233` | root reauthorization non-UTF-8 refusal | native codec |
+| `engine.rs:1180-1182,1233` | root reauthorization non-UTF-8 refusal | unchanged; see §5.5 |
 | `engine.rs:2753,2868,2953,2989` | `library_roots.path` keys | unchanged (root boundary) |
 | `engine.rs:3647,3705,4343,4356` | `library_roots.path` keys | unchanged (root boundary) |
 | `resolver.rs:353` | playback `PathBuf::from(file_path)` | decode `native_path` |
