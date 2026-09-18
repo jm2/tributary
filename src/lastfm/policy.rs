@@ -233,7 +233,7 @@ pub struct LastFmLivePolicy(std::sync::Arc<std::sync::Mutex<LastFmPolicyGenerati
 /// [`std::sync::PoisonError::into_inner`] preserves the last published
 /// generation and keeps every later consumer alive: dispatch refuses dormant
 /// generations by value, never by lock state.
-pub(crate) fn lock_policy_slot(
+pub fn lock_policy_slot(
     slot: &std::sync::Mutex<LastFmPolicyGeneration>,
 ) -> std::sync::MutexGuard<'_, LastFmPolicyGeneration> {
     slot.lock()
