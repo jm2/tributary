@@ -507,14 +507,33 @@ for detail in "$src"/rulesets/*.json; do
     continue
   fi
   jq -e 'type == "object" and (.rules | type) == "array"' "$detail" >/dev/null 2>&1 || continue
-  enforcement="$(jq -r '
-    [.rules[]
+  # Conversation-resolution evidence is read structurally, never through jq
+  # truthiness: a bare `all` promotes any non-null/non-false value — the
+  # string "false", 0, {} and [] — into "enforced", and a failed jq read
+  # must not collapse into "absent", which is a legal not-enforced state.
+  # Only boolean true is affirmative enforcement evidence; boolean false and
+  # an absent flag are legitimate not-enforced observations. A pull_request
+  # rule whose parameters are not an object, or whose flag is present but
+  # not boolean, is a malformed observation that fails closed instead of
+  # being upgraded into enforcement or hidden by another valid rule.
+  if ! resolution_read="$(jq -er '
+    [ .rules[]
       | select(type == "object" and .type == "pull_request")
-      | .parameters.required_review_thread_resolution]
-    | if length == 0 then "absent"
-      elif all then "enforced"
-      else "off" end' "$detail" 2>/dev/null || printf 'absent')"
-  [ "$enforcement" = "enforced" ] && resolution_enforced=1
+      | if (.parameters | type) != "object" then error("pull_request parameters are not an object")
+        elif (.parameters | has("required_review_thread_resolution") | not) then "off"
+        elif .parameters.required_review_thread_resolution == true then "enforced"
+        elif (.parameters.required_review_thread_resolution | type) == "boolean" then "off"
+        else error("required_review_thread_resolution is present but not a boolean")
+        end
+    ]
+    | if any(.[]; . == "enforced") then "enforced"
+      elif any(.[]; . == "off") then "off"
+      else "absent" end' "$detail" 2>>"$scratch/jq.err")"; then
+    parse_error "malformed pull_request rule in $detail: parameters must be an object and required_review_thread_resolution, when present, must be a boolean"
+    printf '%s\n' "$detail" >> "$invalid_details"
+    continue
+  fi
+  [ "$resolution_read" = "enforced" ] && resolution_enforced=1
 done
 
 # Validate the complete reviewed environment policy: exact-main custom branch

@@ -301,13 +301,25 @@ jobs:
               | .parameters.required_status_checks[]
               | "\(.context)|\(.integration_id // "")"' \
               "${RUNNER_TEMP}/ruleset-${rule_id}.json" >> "${required_contexts}"
+            # Structural boolean evidence, never jq truthiness: a bare `all`
+            # promotes the string "false", 0, {} and [] into "enforced".
+            # Only boolean true counts; boolean false and an absent flag are
+            # legitimate not-enforced observations; malformed parameters or
+            # a non-boolean flag error the read, which fails the diagnostic
+            # closed below instead of being hidden by a valid rule.
             enforcement="$(jq -r '
               [.rules[]?
                 | select(.type == "pull_request")
-                | .parameters.required_review_thread_resolution]
-              | if length == 0 then "absent"
-                elif all then "enforced"
-                else "off" end' \
+                | if (.parameters | type) != "object" then error("pull_request parameters are not an object")
+                  elif (.parameters | has("required_review_thread_resolution") | not) then "off"
+                  elif .parameters.required_review_thread_resolution == true then "enforced"
+                  elif (.parameters.required_review_thread_resolution | type) == "boolean" then "off"
+                  else error("required_review_thread_resolution is present but not a boolean")
+                  end
+              ]
+              | if any(.[]; . == "enforced") then "enforced"
+                elif any(.[]; . == "off") then "off"
+                else "absent" end' \
               "${RUNNER_TEMP}/ruleset-${rule_id}.json")" || {
                 echo "Unable to evaluate require-conversation-resolution in ruleset ${rule_id}; readiness inspection fails closed." >&2
                 exit 1

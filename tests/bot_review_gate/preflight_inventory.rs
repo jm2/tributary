@@ -147,3 +147,31 @@ fn offline_unknown_rule_type_remains_valid() {
     );
     assert!(stdout_of(&output).contains("configuration is consistent"));
 }
+
+#[test]
+fn offline_non_object_pull_request_parameters_fail_closed() {
+    // A pull_request rule whose parameters are not an object cannot carry a
+    // boolean resolution flag; the evidence is unreadable and must fail the
+    // observation closed instead of reading as an unset (not-enforced)
+    // requirement. Parse errors are phase-independent.
+    let fixture = Fixture::new("pull-request-parameters-scalar");
+    fixture
+        .file("branch-rules.json", r#"[{"ruleset_id":17650907}]"#)
+        .file(
+            "rulesets/17650907.json",
+            r#"{"rules":[{"type":"pull_request","parameters":5}]}"#,
+        );
+    let output = fixture.run();
+    assert!(
+        !output.status.success(),
+        "non-object pull_request parameters must fail closed:\n{}\n{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("PARSE-FAILED")
+            && stderr_of(&output).contains("required_review_thread_resolution"),
+        "the malformed pull_request parameters must be reported:\n{}",
+        stderr_of(&output)
+    );
+}

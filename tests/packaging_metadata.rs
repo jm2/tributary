@@ -2338,6 +2338,23 @@ fn assert_precondition_enforces_the_full_policy() {
                 .contains("with require-conversation-resolution"),
         "the precondition must refuse auto-merge unless the live ruleset enforces require-conversation-resolution"
     );
+    // The flag must be read as structural boolean evidence, never by jq
+    // truthiness: a bare `all` promotes the string "false", 0, {} and []
+    // into "enforced". Only boolean true counts; malformed parameters or a
+    // non-boolean flag must error the jq read (failing the diagnostic
+    // closed) instead of being upgraded into enforcement or hidden by a
+    // valid rule.
+    assert!(
+        !DEPENDABOT_AUTOMERGE.contains("elif all then \"enforced\"")
+            && DEPENDABOT_AUTOMERGE.contains("== true then \"enforced\"")
+            && DEPENDABOT_AUTOMERGE.contains("| type) == \"boolean\" then \"off\"")
+            && DEPENDABOT_AUTOMERGE
+                .contains("error(\"pull_request parameters are not an object\")")
+            && DEPENDABOT_AUTOMERGE.contains(
+                "error(\"required_review_thread_resolution is present but not a boolean\")"
+            ),
+        "the readiness reduction must accept only structural boolean enforcement evidence"
+    );
     assert!(
         DEPENDABOT_AUTOMERGE.contains("Refusing to report readiness")
             && DEPENDABOT_AUTOMERGE.contains("readiness inspection fails closed"),

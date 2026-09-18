@@ -146,6 +146,15 @@ pub const EXACT_MAIN_POLICY: &str =
 pub const ENV_CUSTOM_MAIN: &str = r#"{"deployment_branch_policy":{"custom_branch_policies":true,"protected_branches":false},"protection_rules":[]}"#;
 
 pub fn validated_ruleset(app_id: u64) -> String {
+    format!(
+        r#"{{"rules":[{{"type":"required_status_checks","parameters":{{"required_status_checks":[{}]}}}},{{"type":"pull_request","parameters":{{"required_review_thread_resolution":true}}}}]}}"#,
+        validated_checks_json(app_id)
+    )
+}
+
+/// The complete required-check inventory of [`validated_ruleset`] without its
+/// trailing `pull_request` rule.
+fn validated_checks_json(app_id: u64) -> String {
     let checks: [(&str, Option<u64>); 18] = [
         ("Security Audit", Some(15368)),
         ("Linux (x86_64)", Some(15368)),
@@ -166,7 +175,7 @@ pub fn validated_ruleset(app_id: u64) -> String {
         ("Codacy Static Code Analysis", Some(56611)),
         ("CodeRabbit", None),
     ];
-    let items: Vec<String> = checks
+    checks
         .iter()
         .map(|(context, integration)| {
             integration.as_ref().map_or_else(
@@ -174,10 +183,29 @@ pub fn validated_ruleset(app_id: u64) -> String {
                 |id| format!(r#"{{"context":"{context}","integration_id":{id}}}"#),
             )
         })
-        .collect();
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The validated ruleset with the `pull_request` rule's
+/// `required_review_thread_resolution` parameter set to an arbitrary JSON
+/// literal (e.g. `"false"`, `0`, `{}`, `[]`), keeping the complete
+/// required-check inventory intact. Resolution-evidence regressions vary
+/// exactly this one value.
+pub fn resolution_ruleset(app_id: u64, resolution_flag: &str) -> String {
+    validated_ruleset(app_id).replace(
+        "\"required_review_thread_resolution\":true",
+        &format!("\"required_review_thread_resolution\":{resolution_flag}"),
+    )
+}
+
+/// The validated ruleset whose `pull_request` rule carries object parameters
+/// that omit the resolution flag entirely — GitHub's shape for "the
+/// requirement is unset" — keeping the complete required-check inventory.
+pub fn resolution_flag_absent_ruleset(app_id: u64) -> String {
     format!(
-        r#"{{"rules":[{{"type":"required_status_checks","parameters":{{"required_status_checks":[{}]}}}},{{"type":"pull_request","parameters":{{"required_review_thread_resolution":true}}}}]}}"#,
-        items.join(",")
+        r#"{{"rules":[{{"type":"required_status_checks","parameters":{{"required_status_checks":[{}]}}}},{{"type":"pull_request","parameters":{{}}}}]}}"#,
+        validated_checks_json(app_id)
     )
 }
 
