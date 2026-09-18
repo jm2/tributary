@@ -667,7 +667,13 @@ impl PlaylistRowDropContext {
     /// Test-only constructor: same drop resolution as production, but the
     /// accepted destination and payload go to `on_drop` instead of the live
     /// mutation context.
-    #[cfg(test)]
+    ///
+    /// Gated to the exact platforms whose tests can call it: its only
+    /// caller is the per-row drop harness, which requires a display and is
+    /// therefore `not(target_os = "macos")`. Leaving this merely `#[cfg(test)]`
+    /// made the constructor dead code on macOS test builds, failing
+    /// `cargo clippy --all-targets -- -D warnings` there.
+    #[cfg(all(test, not(target_os = "macos")))]
     fn for_test(store: gtk::gio::ListStore, on_drop: PlaylistDropSink) -> Self {
         Self { store, on_drop }
     }
