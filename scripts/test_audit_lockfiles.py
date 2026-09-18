@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Fixture tests for the two-graph lockfile security audit helper.
+"""Fixture tests for the two-graph lockfile security audit helper."""
 
-Every test runs `scripts/audit_lockfiles.py` against a hermetic repository whose
-`cargo-audit` is a fake that records each invocation and emits a controlled JSON
-report. This proves the helper selects the fuzz lock explicitly, applies only
-that graph's scoped exceptions, and fails when a finding exists only in the fuzz
-graph instead of hiding behind a green root audit.
-"""
+# Every test runs `scripts/audit_lockfiles.py` against a hermetic repository
+# whose `cargo-audit` is a fake that records each invocation and emits a
+# controlled JSON report. This proves the helper selects the fuzz lock
+# explicitly, applies only that graph's scoped exceptions, and fails when a
+# finding exists only in the fuzz graph instead of hiding behind a green root
+# audit.
 
 from __future__ import annotations
 
@@ -101,6 +101,13 @@ def write_config(path: Path, ignores: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     rendered = ", ".join(json.dumps(item) for item in ignores)
     path.write_text(f"[advisories]\nignore = [{rendered}]\n")
+
+
+def failure_text(result: audit_lockfiles.GraphResult) -> str:
+    """Return the graph's failure message for substring assertions."""
+    if result.error is None:
+        raise AssertionError(f"expected a failure, got: {result}")
+    return result.error
 
 
 class AuditLockfilesTests(unittest.TestCase):
@@ -201,7 +208,7 @@ class AuditLockfilesTests(unittest.TestCase):
 
         self.assertIsNone(results["root"].error)
         self.assertIsNotNone(results["fuzz"].error)
-        self.assertIn("RUSTSEC-FUZZ-ONLY", results["fuzz"].error)
+        self.assertIn("RUSTSEC-FUZZ-ONLY", failure_text(results["fuzz"]))
 
     def test_root_finding_is_reported_for_the_root_graph(self) -> None:
         self.build_graphs(
@@ -215,7 +222,7 @@ class AuditLockfilesTests(unittest.TestCase):
         results = {result.name: result for result in self.audit()}
 
         self.assertIsNotNone(results["root"].error)
-        self.assertIn("RUSTSEC-ROOT-ONLY", results["root"].error)
+        self.assertIn("RUSTSEC-ROOT-ONLY", failure_text(results["root"]))
         self.assertIsNone(results["fuzz"].error)
 
     def test_root_exception_does_not_cover_a_fuzz_finding(self) -> None:
@@ -235,7 +242,7 @@ class AuditLockfilesTests(unittest.TestCase):
 
         self.assertIsNone(results["root"].error)
         self.assertIsNotNone(results["fuzz"].error)
-        self.assertIn("RUSTSEC-2026-0235", results["fuzz"].error)
+        self.assertIn("RUSTSEC-2026-0235", failure_text(results["fuzz"]))
         calls = {Path(call["cwd"]).name: call for call in self.recorded_calls()}
         # The root exception was never forwarded to the fuzz invocation.
         self.assertEqual(calls["fuzz"]["ignore"], [])
@@ -254,7 +261,7 @@ class AuditLockfilesTests(unittest.TestCase):
         results = {result.name: result for result in self.audit()}
 
         self.assertIsNotNone(results["fuzz"].error)
-        self.assertIn("different graph", results["fuzz"].error)
+        self.assertIn("different graph", failure_text(results["fuzz"]))
 
     def test_missing_fuzz_config_fails_closed(self) -> None:
         self.build_graphs(fuzz_config=False)
@@ -262,7 +269,7 @@ class AuditLockfilesTests(unittest.TestCase):
         results = {result.name: result for result in self.audit()}
 
         self.assertIsNotNone(results["fuzz"].error)
-        self.assertIn("audit.toml", results["fuzz"].error)
+        self.assertIn("audit.toml", failure_text(results["fuzz"]))
 
     def test_nonzero_status_fails_despite_valid_green_json(self) -> None:
         # cargo-audit can exit nonzero after emitting a valid zero-finding
@@ -277,7 +284,7 @@ class AuditLockfilesTests(unittest.TestCase):
 
         self.assertIsNone(results["root"].error)
         self.assertIsNotNone(results["fuzz"].error)
-        self.assertIn("status 7", results["fuzz"].error)
+        self.assertIn("status 7", failure_text(results["fuzz"]))
         # The failed graph must not stop the other graph from being audited.
         self.assertEqual(len(self.recorded_calls()), 2)
 
@@ -289,9 +296,9 @@ class AuditLockfilesTests(unittest.TestCase):
         results = {result.name: result for result in self.audit()}
 
         self.assertIsNotNone(results["root"].error)
-        self.assertIn("status 3", results["root"].error)
+        self.assertIn("status 3", failure_text(results["root"]))
         # The diagnostic names the graph that failed, not just the status.
-        self.assertIn("root", results["root"].error)
+        self.assertIn("root", failure_text(results["root"]))
         self.assertIsNone(results["fuzz"].error)
 
     def test_malformed_vulnerability_list_is_rejected(self) -> None:
@@ -314,7 +321,7 @@ class AuditLockfilesTests(unittest.TestCase):
 
         self.assertIsNone(results["root"].error)
         self.assertIsNotNone(results["fuzz"].error)
-        self.assertIn("vulnerabilities.list", results["fuzz"].error)
+        self.assertIn("vulnerabilities.list", failure_text(results["fuzz"]))
 
     def test_vulnerability_entry_without_advisory_id_is_rejected(self) -> None:
         self.build_graphs(
@@ -336,7 +343,7 @@ class AuditLockfilesTests(unittest.TestCase):
         results = {result.name: result for result in self.audit()}
 
         self.assertIsNotNone(results["fuzz"].error)
-        self.assertIn("malformed vulnerability entry", results["fuzz"].error)
+        self.assertIn("malformed vulnerability entry", failure_text(results["fuzz"]))
 
     def test_vulnerability_count_mismatch_is_rejected(self) -> None:
         # A zero count with a populated list is the dangerous incomplete
@@ -361,8 +368,8 @@ class AuditLockfilesTests(unittest.TestCase):
 
         self.assertIsNone(results["root"].error)
         self.assertIsNotNone(results["fuzz"].error)
-        self.assertIn("does not match", results["fuzz"].error)
-        self.assertIn("RUSTSEC-HIDDEN", results["fuzz"].error)
+        self.assertIn("does not match", failure_text(results["fuzz"]))
+        self.assertIn("RUSTSEC-HIDDEN", failure_text(results["fuzz"]))
 
     def test_checked_in_workflow_runs_the_helper_and_fuzz_config_exists(self) -> None:
         workflow = (REPOSITORY / ".github" / "workflows" / "ci.yml").read_text()

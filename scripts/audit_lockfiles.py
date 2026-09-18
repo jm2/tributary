@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
-"""
-Audit both the root and the independent fuzz Cargo.lock graphs.
+"""Audit the root and fuzz Cargo.lock graphs as separate security boundaries."""
 
-The fuzz crate is a separate Cargo workspace that owns `fuzz/Cargo.lock`, so it
-is a separate dependency graph with its own scoped advisory exceptions. Syncing
-the two locks (`scripts/sync_fuzz_lock.py`) proves shared production-direct
-versions stay coherent; it does not prove that both graphs were security
-audited. A vulnerable package that exists only in the fuzz graph can therefore
-hide behind a green root audit.
-
-This helper audits each graph on its own terms:
-
-* the graph's own lockfile is passed explicitly with `--file`, and the working
-  directory is the graph directory, so cargo-audit cannot silently fall back to
-  a different lock;
-* the graph's own `.cargo/audit.toml` `[advisories].ignore` list is read here
-  and passed with `--ignore`, so an exception granted to one graph can never
-  suppress a finding in the other;
-* the JSON report is validated before it is trusted: its scanned dependency
-  count must match the requested lockfile, its applied ignore set must match the
-  graph's scoped exceptions, and it must report no remaining vulnerabilities;
-* a nonzero auditor exit status fails its graph even when the emitted report
-  looks clean, and structurally incomplete or malformed vulnerability results
-  are rejected instead of being read as zero findings.
-
-`root` describes the repository's production lock and `fuzz` the independent
-fuzz workspace lock. The command exits non-zero if either graph fails.
-"""
+# The fuzz crate is a separate Cargo workspace that owns `fuzz/Cargo.lock`, so
+# it is a separate dependency graph with its own scoped advisory exceptions.
+# Syncing the two locks (`scripts/sync_fuzz_lock.py`) proves shared production-
+# direct versions stay coherent; it does not prove that both graphs were
+# security audited. A vulnerable package that exists only in the fuzz graph can
+# therefore hide behind a green root audit. See docs/dependency-updates.md
+# ("Security audit boundaries") for the policy.
+#
+# This helper audits each graph on its own terms:
+#
+# * the graph's own lockfile is passed explicitly with `--file`, and the working
+#   directory is the graph directory, so cargo-audit cannot silently fall back
+#   to a different lock;
+# * the graph's own `.cargo/audit.toml` `[advisories].ignore` list is read here
+#   and passed with `--ignore`, so an exception granted to one graph can never
+#   suppress a finding in the other;
+# * the JSON report is validated before it is trusted: its scanned dependency
+#   count must match the requested lockfile, its applied ignore set must match
+#   the graph's scoped exceptions, and it must report no remaining
+#   vulnerabilities;
+# * a nonzero auditor exit status fails its graph even when the emitted report
+#   looks clean, and structurally incomplete or malformed vulnerability results
+#   are rejected instead of being read as zero findings.
+#
+# `root` describes the repository's production lock and `fuzz` the independent
+# fuzz workspace lock. The command exits non-zero if either graph fails.
 
 from __future__ import annotations
 
@@ -152,16 +152,14 @@ def parse_report(stdout: str, stderr: str) -> dict[str, Any]:
     return report
 
 
-def audit_graph(graph: Graph, audit_bin: str) -> GraphResult:
-    """Audit one graph and validate the report proves the intended scan."""
-    ignores = load_ignores(graph.config)
-    if not graph.lockfile.is_file():
-        raise AuditError(f"missing lockfile {graph.lockfile}")
-    expected_packages = count_packages(graph.lockfile)
-
+def run_scan(
+    graph: Graph, audit_bin: str, ignores: list[str]
+) -> subprocess.CompletedProcess[str]:
+    """Run the auditor for one graph with its explicit lock and exceptions."""
+    command = scan_command(graph, audit_bin, ignores)
     try:
-        completed = subprocess.run(  # nosec B603 -- explicit argv, no shell
-            scan_command(graph, audit_bin, ignores),
+        completed = subprocess.run(  # nosec B603 and nosemgrep (explicit argv, no shell)
+            command,
             cwd=graph.directory,
             capture_output=True,
             text=True,
@@ -169,26 +167,38 @@ def audit_graph(graph: Graph, audit_bin: str) -> GraphResult:
         )
     except OSError as error:
         raise AuditError(f"cannot run {audit_bin!r}: {error}") from error
+    return completed
 
-    report = parse_report(completed.stdout, completed.stderr)
 
+def ensure_requested_lock_was_scanned(
+    report: dict[str, Any], graph: Graph, expected_packages: int
+) -> None:
+    """Reject a report whose dependency count proves a different graph."""
     scanned = report.get("lockfile")
     scanned_count = scanned.get("dependency-count") if isinstance(scanned, dict) else None
-    if scanned_count != expected_packages:
-        raise AuditError(
-            "cargo-audit scanned a different graph: "
-            f"requested {graph.lockfile} with {expected_packages} packages, "
-            f"but the report covered {scanned_count}"
-        )
+    if scanned_count == expected_packages:
+        return
+    raise AuditError(
+        "cargo-audit scanned a different graph: "
+        f"requested {graph.lockfile} with {expected_packages} packages, "
+        f"but the report covered {scanned_count}"
+    )
 
+
+def ensure_applied_ignores_match(report: dict[str, Any], ignores: list[str]) -> None:
+    """Reject a report whose applied ignore set differs from the scoped list."""
     settings = report.get("settings")
     applied = settings.get("ignore", []) if isinstance(settings, dict) else []
-    if not isinstance(applied, list) or set(applied) != set(ignores):
-        raise AuditError(
-            f"scoped exceptions did not apply as written: expected {ignores}, "
-            f"cargo-audit reported {applied}"
-        )
+    if isinstance(applied, list) and set(applied) == set(ignores):
+        return
+    raise AuditError(
+        f"scoped exceptions did not apply as written: expected {ignores}, "
+        f"cargo-audit reported {applied}"
+    )
 
+
+def vulnerability_ids(report: dict[str, Any]) -> list[str]:
+    """Extract advisory ids, rejecting malformed or self-contradictory results."""
     vulnerabilities = report.get("vulnerabilities")
     if not isinstance(vulnerabilities, dict):
         raise AuditError("cargo-audit report is missing the vulnerabilities section")
@@ -215,19 +225,42 @@ def audit_graph(graph: Graph, audit_bin: str) -> GraphResult:
         )
     if count:
         raise AuditError(f"unhandled vulnerabilities reported: {sorted(ids)}")
+    return ids
 
-    # A nonzero auditor status is a failed audit even when the parsed report
-    # looks clean: validate the exit status last so a graph that found
-    # vulnerabilities still names them, but no failing auditor is ever promoted
-    # to a green result by its own JSON output.
-    if completed.returncode != 0:
-        detail = completed.stderr.strip().splitlines()
-        tail = detail[-1] if detail else "no stderr"
-        raise AuditError(
-            f"cargo-audit for graph {graph.name} ({graph.lockfile}) exited with "
-            f"status {completed.returncode} while reporting no unhandled "
-            f"vulnerabilities; last stderr: {tail}"
-        )
+
+def ensure_auditor_succeeded(
+    completed: subprocess.CompletedProcess[str], graph: Graph
+) -> None:
+    """Fail the graph on a nonzero auditor status despite a clean report."""
+    if completed.returncode == 0:
+        return
+    detail = completed.stderr.strip().splitlines()
+    tail = detail[-1] if detail else "no stderr"
+    raise AuditError(
+        f"cargo-audit for graph {graph.name} ({graph.lockfile}) exited with "
+        f"status {completed.returncode} while reporting no unhandled "
+        f"vulnerabilities; last stderr: {tail}"
+    )
+
+
+def audit_graph(graph: Graph, audit_bin: str) -> GraphResult:
+    """Audit one graph and validate the report proves the intended scan."""
+    ignores = load_ignores(graph.config)
+    if not graph.lockfile.is_file():
+        raise AuditError(f"missing lockfile {graph.lockfile}")
+    expected_packages = count_packages(graph.lockfile)
+
+    completed = run_scan(graph, audit_bin, ignores)
+    report = parse_report(completed.stdout, completed.stderr)
+
+    # Report content is validated before the exit status: a graph that found
+    # vulnerabilities must name them even when the auditor also failed, while a
+    # failing auditor is never promoted to a green result by its own JSON
+    # output.
+    ensure_requested_lock_was_scanned(report, graph, expected_packages)
+    ensure_applied_ignores_match(report, ignores)
+    ids = vulnerability_ids(report)
+    ensure_auditor_succeeded(completed, graph)
 
     return GraphResult(
         name=graph.name,
