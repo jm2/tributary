@@ -3,9 +3,11 @@
 //! validator's own pagination, nested-failure, malformed-input, and
 //! environment-policy reads run end to end — a static success fixture cannot
 //! prove that a failed nested read or a truncated inventory fails closed.
+//! The resolution-evidence live variants live in
+//! `preflight_live_resolution.rs`.
 
 use crate::preflight_support::{
-    resolution_ruleset, stderr_of, stdout_of, valid_active_pages, LiveFixture, ACTIVATION_PAGE,
+    stderr_of, stdout_of, valid_active_pages, LiveFixture, ACTIVATION_PAGE,
     DEPLOYMENT_POLICIES_PAGE, ENV_PAGE, ENV_SECRETS_PAGE, GATE_RULESET, NARROW_RULESET,
 };
 
@@ -532,64 +534,6 @@ fn live_incomplete_secret_inventory_fails_closed() {
     assert!(
         stderr_of(&output).contains("incomplete inventory"),
         "the incomplete inventory must be reported:\n{}",
-        stderr_of(&output)
-    );
-}
-
-#[test]
-fn live_non_boolean_resolution_evidence_fails_closed() {
-    // Live repro of the reproduced rejection: the readiness read fed
-    // required_review_thread_resolution to jq `all`, whose truthiness
-    // promotes the string "false", 0, {} and [] into "enforced". A full
-    // otherwise-valid live ACTIVE configuration carrying any of those
-    // values must fail closed through the stubbed reads too.
-    for flag in [r#""false""#, "0", "{}", "[]"] {
-        let fixture = LiveFixture::new("live-resolution-not-boolean");
-        valid_active_pages(&fixture);
-        fixture.page("rulesets_17650907.json", &resolution_ruleset(424_242, flag));
-        let output = fixture.run();
-        assert!(
-            !output.status.success(),
-            "a {flag} resolution flag must fail the live preflight closed:\n{}\n{}",
-            stdout_of(&output),
-            stderr_of(&output)
-        );
-        let stderr = stderr_of(&output);
-        assert!(
-            stderr.contains("PARSE-FAILED") && stderr.contains("required_review_thread_resolution"),
-            "the non-boolean resolution evidence must be reported as malformed:\n{stderr}"
-        );
-    }
-}
-
-#[test]
-fn live_boolean_false_resolution_reports_missing_enforcement() {
-    // Control preserved from the pre-fix semantics: a genuine boolean false
-    // is a complete not-enforced observation, never malformed; the live
-    // active phase reports the unmet requirement without a parse failure.
-    let fixture = LiveFixture::new("live-resolution-false-off");
-    valid_active_pages(&fixture);
-    fixture.page(
-        "rulesets_17650907.json",
-        &resolution_ruleset(424_242, "false"),
-    );
-    let output = fixture.run();
-    assert!(
-        !output.status.success(),
-        "the requirement is not enforced, so the live ACTIVE configuration must fail:\n{}\n{}",
-        stdout_of(&output),
-        stderr_of(&output)
-    );
-    let stdout = stdout_of(&output);
-    assert!(
-        stdout.contains(
-            "MISSING: no applicable main ruleset enforces require-conversation-resolution"
-        ),
-        "the unmet requirement must be reported:\n{stdout}"
-    );
-    assert!(
-        !stderr_of(&output).contains("PARSE-FAILED"),
-        "a boolean false must not be classified as malformed:\n{}",
         stderr_of(&output)
     );
 }

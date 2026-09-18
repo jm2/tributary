@@ -2284,19 +2284,32 @@ fn assert_ruleset_read_uses_the_minted_app_token(workflow: &serde_yaml::Value) {
 
 // Every policy context must be present in the workflow's expected set, the
 // applicable rulesets must be discovered via the branch-rules endpoint, and
-// every query failure or coverage gap must fail closed.
+// every query failure or coverage gap must fail closed. The individual
+// assertions live in focused helpers so each stays within the method size
+// and complexity budget.
 fn assert_precondition_enforces_the_full_policy() {
+    assert_required_contexts_bind_the_gate_to_the_publisher_app();
+    assert_precondition_derives_applicable_rulesets_from_branch_rules();
+    assert_resolution_evidence_is_structural_boolean();
+    assert!(
+        DEPENDABOT_AUTOMERGE.contains("Refusing to report readiness")
+            && DEPENDABOT_AUTOMERGE.contains("readiness inspection fails closed"),
+        "every query failure or coverage gap must fail the readiness diagnostic closed"
+    );
+}
+
+// The Bot Review Gate context must be required from the dedicated
+// gate-publisher App, never from the shared Actions integration a
+// pull-request job can forge a same-named check under: the app id comes
+// from a repository variable, the literal 15368 binding must be gone,
+// and an unset or non-numeric value must refuse auto-merge.
+fn assert_required_contexts_bind_the_gate_to_the_publisher_app() {
     for expected in required_policy_check_contexts() {
         assert!(
             DEPENDABOT_AUTOMERGE.contains(&format!("\"{expected}\"")),
             "the auto-merge precondition must require live ruleset context {expected}"
         );
     }
-    // The Bot Review Gate context must be required from the dedicated
-    // gate-publisher App, never from the shared Actions integration a
-    // pull-request job can forge a same-named check under: the app id comes
-    // from a repository variable, the literal 15368 binding must be gone,
-    // and an unset or non-numeric value must refuse auto-merge.
     assert!(
         DEPENDABOT_AUTOMERGE.contains("\"Bot Review Gate|${GATE_PUBLISHER_APP_ID}\"")
             && !DEPENDABOT_AUTOMERGE.contains("\"Bot Review Gate|15368\"")
@@ -2308,11 +2321,14 @@ fn assert_precondition_enforces_the_full_policy() {
         DEPENDABOT_AUTOMERGE.contains("''|*[!0-9]*"),
         "an unset or non-numeric gate app id must refuse auto-merge"
     );
-    // The ruleset list endpoint ignores a ref parameter and returns rulesets
-    // for every branch, so the precondition must read the branch-rules
-    // endpoint to know which rulesets actually apply to main. That endpoint
-    // reports per-rule records carrying `ruleset_id` (rules inherited from
-    // active rulesets only), not ruleset records with `id` and `enforcement`.
+}
+
+// The ruleset list endpoint ignores a ref parameter and returns rulesets
+// for every branch, so the precondition must read the branch-rules
+// endpoint to know which rulesets actually apply to main. That endpoint
+// reports per-rule records carrying `ruleset_id` (rules inherited from
+// active rulesets only), not ruleset records with `id` and `enforcement`.
+fn assert_precondition_derives_applicable_rulesets_from_branch_rules() {
     assert!(
         DEPENDABOT_AUTOMERGE.contains("rules/branches/main")
             && !DEPENDABOT_AUTOMERGE.contains("rulesets?ref=main")
@@ -2325,11 +2341,20 @@ fn assert_precondition_enforces_the_full_policy() {
             && DEPENDABOT_AUTOMERGE.contains("rulesets/${rule_id}"),
         "the precondition must fetch each active ruleset's actual required checks"
     );
-    // Require-conversation-resolution is the native merge-time backstop for
-    // a reopened review thread (reopening fires no Actions event), so the
-    // rollout mandates it in the same edit that widens the checks; the
-    // precondition must read the saved ruleset — not the intent — and
-    // refuse auto-merge unless every applicable ruleset carries the flag.
+}
+
+// Require-conversation-resolution is the native merge-time backstop for
+// a reopened review thread (reopening fires no Actions event), so the
+// rollout mandates it in the same edit that widens the checks; the
+// precondition must read the saved ruleset — not the intent — and
+// refuse auto-merge unless every applicable ruleset carries the flag.
+// The flag must be read as structural boolean evidence, never by jq
+// truthiness: a bare `all` promotes the string "false", 0, {} and []
+// into "enforced". Only boolean true counts; malformed parameters or a
+// non-boolean flag must error the jq read (failing the diagnostic
+// closed) instead of being upgraded into enforcement or hidden by a
+// valid rule.
+fn assert_resolution_evidence_is_structural_boolean() {
     assert!(
         DEPENDABOT_AUTOMERGE
             .contains("select(.type == \"pull_request\")")
@@ -2338,12 +2363,6 @@ fn assert_precondition_enforces_the_full_policy() {
                 .contains("with require-conversation-resolution"),
         "the precondition must refuse auto-merge unless the live ruleset enforces require-conversation-resolution"
     );
-    // The flag must be read as structural boolean evidence, never by jq
-    // truthiness: a bare `all` promotes the string "false", 0, {} and []
-    // into "enforced". Only boolean true counts; malformed parameters or a
-    // non-boolean flag must error the jq read (failing the diagnostic
-    // closed) instead of being upgraded into enforcement or hidden by a
-    // valid rule.
     assert!(
         !DEPENDABOT_AUTOMERGE.contains("elif all then \"enforced\"")
             && DEPENDABOT_AUTOMERGE.contains("== true then \"enforced\"")
@@ -2354,11 +2373,6 @@ fn assert_precondition_enforces_the_full_policy() {
                 "error(\"required_review_thread_resolution is present but not a boolean\")"
             ),
         "the readiness reduction must accept only structural boolean enforcement evidence"
-    );
-    assert!(
-        DEPENDABOT_AUTOMERGE.contains("Refusing to report readiness")
-            && DEPENDABOT_AUTOMERGE.contains("readiness inspection fails closed"),
-        "every query failure or coverage gap must fail the readiness diagnostic closed"
     );
 }
 
