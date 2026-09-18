@@ -14,6 +14,9 @@
 # * the graph's own lockfile is passed explicitly with `--file`, and the working
 #   directory is the graph directory, so cargo-audit cannot silently fall back
 #   to a different lock;
+# * caller-supplied paths are resolved to absolute form before any child
+#   process runs, so a relative `--repository .` or a local `./cargo-audit`
+#   cannot be reinterpreted against a graph directory after the child chdirs;
 # * the graph's own `.cargo/audit.toml` `[advisories].ignore` list is read here
 #   and passed with `--ignore`, so an exception granted to one graph can never
 #   suppress a finding in the other;
@@ -331,17 +334,29 @@ def main(argv: list[str] | None = None) -> int:
     )
     arguments = parser.parse_args(argv)
 
-    if shutil.which(arguments.audit_bin) is None and not Path(
-        arguments.audit_bin
-    ).is_file():
-        print(
-            f"error: {arguments.audit_bin!r} is not on PATH; "
-            "install it with `cargo install cargo-audit --locked`",
-            file=sys.stderr,
-        )
-        return 1
+    # PATH lookup keeps precedence for a bare executable name; a slash-bearing
+    # relative path (or a PATH hit returned as given) must become absolute
+    # against the caller's cwd, because every scan later runs with
+    # cwd=<graph directory> and would otherwise resolve the binary there.
+    audit_bin = shutil.which(arguments.audit_bin)
+    if audit_bin is None:
+        if not Path(arguments.audit_bin).is_file():
+            print(
+                f"error: {arguments.audit_bin!r} is not on PATH; "
+                "install it with `cargo install cargo-audit --locked`",
+                file=sys.stderr,
+            )
+            return 1
+        audit_bin = str(Path(arguments.audit_bin).resolve())
+    else:
+        audit_bin = str(Path(audit_bin).resolve())
 
-    results = audit_repository(arguments.repository, arguments.audit_bin)
+    # Resolve the repository before any child changes directory: a relative
+    # `--repository .` would otherwise turn the fuzz graph's lockfile into
+    # fuzz/fuzz/Cargo.lock inside the child's cwd and fail the audit with a
+    # confusing false failure. Resolving here keeps the missing-lockfile and
+    # config errors pointing at the caller's own paths.
+    results = audit_repository(arguments.repository.resolve(), audit_bin)
     failed = False
     for result in results:
         print(format_result(result))

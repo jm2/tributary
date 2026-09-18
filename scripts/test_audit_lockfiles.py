@@ -195,6 +195,81 @@ class AuditLockfilesTests(unittest.TestCase):
         self.assertEqual(calls["repo"]["ignore"], ["RUSTSEC-ROOT"])
         self.assertEqual(calls["fuzz"]["ignore"], ["RUSTSEC-FUZZ"])
 
+    def test_relative_repository_scans_both_graphs(self) -> None:
+        # `--repository .` is the natural CLI form. The helper must resolve it
+        # to an absolute path before the fuzz child chdirs into fuzz/, or the
+        # child would look for fuzz/fuzz/Cargo.lock and the audit would fail
+        # closed with a confusing false failure.
+        self.build_graphs(root_packages=3, fuzz_packages=5)
+        local_fake = self.repository / "fake-audit"
+        local_fake.write_text(FAKE_AUDIT)
+        local_fake.chmod(0o755)
+
+        original = Path.cwd()
+        os.chdir(self.repository)
+        self.addCleanup(os.chdir, original)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AUDIT_FIXTURE_CALLS": str(self.calls),
+                "AUDIT_FIXTURE_REPORT": str(self.report),
+            },
+        ):
+            exit_code = audit_lockfiles.main(
+                ["--repository", ".", "--audit-bin", str(local_fake)]
+            )
+
+        self.assertEqual(exit_code, 0)
+        calls = self.recorded_calls()
+        self.assertEqual(len(calls), 2)
+        by_cwd = {call["cwd"]: call for call in calls}
+        self.assertEqual(
+            sorted(Path(cwd).name for cwd in by_cwd), ["fuzz", "repo"]
+        )
+        # Each graph was scanned with its own lock resolved to absolute form —
+        # in particular not fuzz/fuzz/Cargo.lock inside the fuzz child's cwd.
+        self.assertEqual(
+            Path(by_cwd[str(self.repository)]["file"]),
+            self.repository / "Cargo.lock",
+        )
+        self.assertEqual(
+            Path(by_cwd[str(self.repository / "fuzz")]["file"]),
+            self.repository / "fuzz" / "Cargo.lock",
+        )
+
+    def test_relative_audit_bin_resolves_against_the_caller_cwd(self) -> None:
+        # A slash-bearing relative --audit-bin must resolve against the
+        # caller's working directory before any child chdirs into a graph
+        # directory; PATH lookup for a bare name keeps precedence.
+        self.build_graphs(root_packages=3, fuzz_packages=5)
+
+        original = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, original)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AUDIT_FIXTURE_CALLS": str(self.calls),
+                "AUDIT_FIXTURE_REPORT": str(self.report),
+            },
+        ):
+            exit_code = audit_lockfiles.main(
+                [
+                    "--repository",
+                    str(self.repository),
+                    "--audit-bin",
+                    "./cargo-audit",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        calls = self.recorded_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            sorted(Path(call["cwd"]).name for call in calls),
+            ["fuzz", "repo"],
+        )
+
     def test_fuzz_only_finding_fails_while_root_stays_green(self) -> None:
         self.build_graphs(
             fixture={
