@@ -45,7 +45,7 @@ needed.
 | `startup_fullsync_ms` | engine spawn → `FullSync` publication of the initial scan |
 | `startup_scan_settle_ms` | engine spawn → `ScanComplete` |
 | `post_scan_drain_ms` | `ScanComplete` → command channel drained |
-| `cancellation_flush_settle_ms` | engine spawn → `Flush` ack (scan settles first) |
+| `cancellation_flush_settle_ms` | engine spawn → `Flush` ack (scan settles first; recorded pre-abort — historical name) |
 | `scan_progress_events` | count of `ScanProgress` events (informational) |
 
 Time-to-interactive ≈ `startup_fullsync_ms` (engine side) +
@@ -85,9 +85,11 @@ GDK_BACKEND=broadway BROADWAY_DISPLAY=:97 DISPLAY=:97 \
 
 ## Recorded baselines and budgets
 
-Budgets agreed 2026-09-18 pre-optimization. Debug-profile numbers are
-upper bounds by nature; an optimized build only gets faster, so budgets
-below carry that slack deliberately.
+Budgets agreed 2026-09-18 pre-optimization. The measured values below
+are conservative baselines for their labelled Linux debug-profile
+runners: the harnesses are ignored measurement runs, not CI budget
+gates, and optimized (release) builds are not measured here — they need
+their own measurement run before any budget is claimed against them.
 
 Engine numbers were **re-measured with the corrected arrival-time
 sampler** (PR #291 review Correction 1: the first sampler revision
@@ -110,6 +112,12 @@ trusting the numbers elsewhere.
 | `startup_scan_settle_ms` | 369 – 417 | < 900 |
 | `post_scan_drain_ms` | 0.65 – 0.75 | < 5 |
 | `cancellation_flush_settle_ms` | 369 – 418 | < 900 |
+
+`cancellation_flush_settle_ms` is the historical metric key for the
+during-scan `Flush` barrier ack (`flush_ack_us`): it is recorded before
+the benchmark aborts the engine task, so it measures startup/during-scan
+settlement, not post-cancellation teardown — no post-abort settlement
+is measured today.
 
 Scaling point (`TRIBUTARY_Q4_TRACKS=4000`): `startup_fullsync_ms`
 ≈ 4362, `startup_scan_settle_ms` ≈ 4370 (~1.1 ms/row in debug) — scan
@@ -135,8 +143,9 @@ the parse-side lane's budgets, not doubled here.
   ms at 10k rows (single-digit ms at 1k) in debug.
 - The during-scan settlement contract holds with margin: with the
   corrected sampler the `Flush` ack lands ~0.7 ms after `ScanComplete`
-  on the engine-table runner, and the admitted command publishes
-  strictly after the scan settles.
+  on the engine-table runner, and the admitted command publishes at or
+  after scan settlement (the benchmark asserts the non-strict
+  `command_applied_us >= scan_complete_us`).
 - No endpoint above misses its budget on its recorded runner today;
   the harnesses exist so the next regression or optimization is
   measured against an agreed budget instead of vibes. All budgets
