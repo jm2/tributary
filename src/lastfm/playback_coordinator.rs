@@ -745,8 +745,12 @@ impl LastFmActivePlaybackEnvironment {
                 Some(authority) => owner.accept_output_load(load, &self.registry, &authority),
                 None => {
                     load.revoke();
+                    // A dormant policy ends the active occurrence terminally,
+                    // so its predecessor handoff must still be carried: an
+                    // empty update would strand the retired predecessor and
+                    // leave its now-playing clear forever unpublished.
                     LastFmPlaybackLoadAdmission::Rejected(
-                        LastFmPlaybackOwnerUpdate::retire_handoff(None),
+                        LastFmPlaybackOwnerUpdate::retire_handoff(owner.retire()),
                     )
                 }
             }
@@ -3850,6 +3854,82 @@ mod tests {
         );
         assert_eq!(owner.shutdown(), LastFmPlaybackCoordinatorOutcome::Applied);
         source_registry.shutdown().wait().await;
+    }
+
+    /// A dormant live generation rejects a committed output replacement, and
+    /// that rejection must terminally retire the predecessor occurrence —
+    /// not strand it in `owner.active` with delayed evidence still mutable.
+    /// Once the policy re-enables, no delayed predecessor event may reach the
+    /// runtime as a stale scrobble (the carried retirement clear itself is
+    /// refused by the same dormant authority before runtime ingress).
+    #[test]
+    fn dormant_policy_load_rejection_retires_the_predecessor_terminally() {
+        let (_runtime, registry) = registry();
+        let mut owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
+        let binding = owner.bind_window(registry).expect("bind window");
+        let port = RecordingRuntimePort::default();
+        let live = LastFmLivePolicy::default();
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
+        let activation = binding
+            .activate_with_runtime_port(
+                Box::new(port.clone()),
+                test_completion_runtime(),
+                live.clone(),
+            )
+            .expect("activate with live generation");
+        let first = PlayerEventGeneration::from_raw(95);
+        assert_eq!(
+            binding.accept_output_load_lazy(
+                first,
+                || Some(accepted_local_load(first, "dormant-reject-first-private")),
+                || panic!("active bridge must not discard"),
+            ),
+            LastFmPlaybackCoordinatorOutcome::Applied
+        );
+        assert_eq!(
+            binding.observe_event(&PlayerEvent::state(first, PlayerState::Playing)),
+            LastFmPlaybackCoordinatorOutcome::Applied
+        );
+        assert_eq!(
+            binding.observe_event(&PlayerEvent::position(first, 1_000, 100_000)),
+            LastFmPlaybackCoordinatorOutcome::Applied
+        );
+        assert_eq!(
+            port.calls(),
+            vec![LastFmPlaybackHandoffKind::NowPlaying]
+        );
+
+        // The closed default generation lands before the next accepted load:
+        // the committed replacement is rejected while the coordinator stays
+        // active, exactly the dormant admission branch.
+        live.publish(LastFmPolicyGeneration::default());
+        let second = PlayerEventGeneration::from_raw(96);
+        assert_eq!(
+            binding.accept_output_load_lazy(
+                second,
+                || Some(accepted_local_load(second, "dormant-reject-second-private")),
+                || panic!("active bridge must not discard"),
+            ),
+            LastFmPlaybackCoordinatorOutcome::SourceRejected,
+            "a dormant policy must reject the committed output replacement"
+        );
+
+        // Re-enable the policy: delayed predecessor evidence must stay inert
+        // because the rejection retired the occurrence terminally.
+        live.publish(LastFmPolicyGeneration::for_test(2, HashSet::new()));
+        assert_eq!(
+            binding.observe_event(&PlayerEvent::position(first, 51_000, 100_000)),
+            LastFmPlaybackCoordinatorOutcome::Applied,
+            "a retired occurrence must not observe delayed evidence"
+        );
+        assert_eq!(
+            port.calls(),
+            vec![LastFmPlaybackHandoffKind::NowPlaying],
+            "delayed predecessor evidence must not reach the runtime as a \
+             stale scrobble after the dormant-policy rejection"
+        );
+
+        drop(activation);
     }
 
     #[test]
