@@ -1090,7 +1090,7 @@ pub fn show_properties_dialog(
                 Ok(SaveOutcome::Blocked {
                     availability,
                     conflicts,
-                    total,
+                    total: _blocked_total,
                 }) => {
                     dialog.set_can_close(true);
                     cancel_button.set_sensitive(true);
@@ -1107,8 +1107,11 @@ pub fn show_properties_dialog(
                     // explain it with the same localized changed-on-disk
                     // guidance the post-write path uses, not the generic
                     // unavailable message the availability ladder produces.
+                    // Only the known-bad targets are reported: nothing was
+                    // attempted, so the clean remainder of the selection must
+                    // not be counted as failed writes.
                     if conflicts > 0 {
-                        show_save_failure_alert(&parent, 0, total, conflicts);
+                        show_save_failure_alert(&parent, 0, conflicts, conflicts);
                     }
                 }
                 Ok(SaveOutcome::Finished {
@@ -1852,6 +1855,51 @@ mod tests {
         assert_ne!(english_all.heading, english_io.heading);
         assert!(!english_all.body.contains("%{"));
         assert!(!english_mixed.body.contains("%{"));
+    }
+
+    /// The preflight-refusal alert reports only the targets known to have
+    /// changed on disk. The refusal fires before the first write, so the
+    /// clean remainder of a mixed selection was never attempted and must not
+    /// be counted as failed: the alert is built from
+    /// `show_save_failure_alert(&parent, 0, conflicts, conflicts)` — never
+    /// `(0, total, conflicts)`, which fabricated `total - conflicts` "other
+    /// file(s) could not be saved" for files the save never touched.
+    #[test]
+    fn preflight_refusal_alert_counts_only_conflicted_targets() {
+        // A three-target selection in which exactly one changed on disk. The
+        // refusal alert's arguments are (modified = 0, failed = conflicts,
+        // conflicts), so its copy is the all-conflict framing over the one
+        // conflicted file.
+        let refusal = save_failure_copy("en", 0, 1, 1);
+
+        assert!(
+            !refusal.body.contains("other file"),
+            "an unattempted clean target must not be reported as a failed write: {}",
+            refusal.body
+        );
+        assert_eq!(
+            refusal.body, english_all_conflict_body(1),
+            "the refusal must describe exactly the conflicted subset"
+        );
+
+        // The defective arguments, kept here as the regression pin: counting
+        // the whole selection as attempted is what produced the fabricated
+        // "2 other file(s) could not be saved" clause.
+        let defective = save_failure_copy("en", 0, 3, 1);
+        assert_ne!(refusal.body, defective.body);
+        assert!(defective.body.contains("other file"));
+    }
+
+    /// The English all-conflict body for `conflicts` files — the framing the
+    /// preflight refusal must produce.
+    fn english_all_conflict_body(conflicts: usize) -> String {
+        rust_i18n::t!(
+            "properties.save_conflict_all",
+            locale = "en",
+            conflicts = conflicts,
+            total = conflicts
+        )
+        .into_owned()
     }
 
     /// #248 F3: the conflict alert copy is localized in every shipped
