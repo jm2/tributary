@@ -34,7 +34,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use crate::audio::equalizer::{ClipProtection, Preset};
+use crate::audio::equalizer::{ClipProtection, EqSettings, Preset};
 
 use super::widgets::{preset_from_menu_position, preset_menu_position, snap_gain};
 use super::{EqualizerControls, SharedAudioOutput};
@@ -180,6 +180,48 @@ fn wire_preset_dropdown(
 /// gain — a late delivery of our own reflection, e.g. after a
 /// Reset/Reload/preset `set_value` — is never a user edit, so it
 /// neither applies nor moves the preset to `Custom`.
+/// Shared body of the preamp and band gain `value-changed` handlers:
+/// guard check, echo-safety skip, apply, reflect. `slot` projects the
+/// gain this handler owns (the recorded value the skip compares against
+/// and the applied value the reflection writes back); `set_slot` writes
+/// the user's request into the same slot.
+///
+/// Echo safety (see the module header): the value-changed of our own
+/// applied-state reflection can arrive after the guard is cleared, so a
+/// snapped request already equal to the recorded gain in this slot is
+/// that echo — never a user edit. Applying it would flip the
+/// just-restored preset to `custom`, re-apply identical settings
+/// (arming a spurious debounced save), and move the combo to `Custom`
+/// seconds after a Reset/Reload/preset action. Skip it; a genuine edit
+/// always differs from the recorded state. The `updating` guard stays
+/// the first check, unchanged (first line of defense).
+fn apply_gain_edit(
+    output: &SharedAudioOutput,
+    preset_dropdown: &gtk::DropDown,
+    updating: &Cell<bool>,
+    scale: &gtk::Scale,
+    slot: impl Fn(&EqSettings) -> f64,
+    set_slot: impl Fn(&mut EqSettings, f64),
+) {
+    if updating.get() {
+        return;
+    }
+    let wanted = snap_gain(scale.value());
+    #[allow(clippy::float_cmp)] // snapped gains are exactly representable half-steps
+    if slot(&output.borrow().equalizer_settings()) == wanted {
+        return;
+    }
+    let mut settings = output.borrow().equalizer_settings();
+    set_slot(&mut settings, wanted);
+    settings.mark_custom();
+    output.borrow().apply_equalizer_settings(settings);
+    let applied = output.borrow().equalizer_settings();
+    updating.set(true);
+    scale.set_value(slot(&applied));
+    preset_dropdown.set_selected(preset_menu_position(applied.preset));
+    updating.set(false);
+}
+
 fn wire_gain_sliders(
     active_output: &SharedAudioOutput,
     preset_dropdown: &gtk::DropDown,
@@ -192,34 +234,14 @@ fn wire_gain_sliders(
         let updating_for_preamp = updating.clone();
         let preset_dropdown_for_preamp = preset_dropdown.clone();
         preamp_scale.connect_value_changed(move |scale| {
-            if updating_for_preamp.get() {
-                return;
-            }
-            // Echo safety (see the module header): the value-changed of
-            // our own applied-state reflection can arrive after the
-            // guard is cleared, so a snapped request already equal to
-            // the recorded preamp is that echo — never a user edit.
-            // Applying it would flip the just-restored preset to
-            // `custom`, re-apply identical settings (arming a spurious
-            // debounced save), and move the combo to `Custom` seconds
-            // after a Reset/Reload/preset action. Skip it; a genuine
-            // edit always differs from the recorded state.
-            let wanted = snap_gain(scale.value());
-            #[allow(clippy::float_cmp)] // snapped gains are exactly representable half-steps
-            if output_for_preamp.borrow().equalizer_settings().preamp_db == wanted {
-                return;
-            }
-            let mut settings = output_for_preamp.borrow().equalizer_settings();
-            settings.preamp_db = wanted;
-            settings.mark_custom();
-            output_for_preamp
-                .borrow()
-                .apply_equalizer_settings(settings);
-            let applied = output_for_preamp.borrow().equalizer_settings();
-            updating_for_preamp.set(true);
-            scale.set_value(applied.preamp_db);
-            preset_dropdown_for_preamp.set_selected(preset_menu_position(applied.preset));
-            updating_for_preamp.set(false);
+            apply_gain_edit(
+                &output_for_preamp,
+                &preset_dropdown_for_preamp,
+                &updating_for_preamp,
+                scale,
+                |settings| settings.preamp_db,
+                |settings, gain| settings.preamp_db = gain,
+            );
         });
     }
 
@@ -228,32 +250,14 @@ fn wire_gain_sliders(
         let updating_for_band = updating.clone();
         let preset_dropdown_for_band = preset_dropdown.clone();
         scale.connect_value_changed(move |scale| {
-            if updating_for_band.get() {
-                return;
-            }
-            // Echo safety (see the module header): the value-changed of
-            // our own applied-state reflection can arrive after the
-            // guard is cleared, so a snapped request already equal to
-            // the recorded band gain is that echo — never a user edit.
-            // Applying it would flip the just-restored preset to
-            // `custom`, re-apply identical settings (arming a spurious
-            // debounced save), and move the combo to `Custom` seconds
-            // after a Reset/Reload/preset action. Skip it; a genuine
-            // edit always differs from the recorded state.
-            let wanted = snap_gain(scale.value());
-            #[allow(clippy::float_cmp)] // snapped gains are exactly representable half-steps
-            if output_for_band.borrow().equalizer_settings().bands_db[index] == wanted {
-                return;
-            }
-            let mut settings = output_for_band.borrow().equalizer_settings();
-            settings.bands_db[index] = wanted;
-            settings.mark_custom();
-            output_for_band.borrow().apply_equalizer_settings(settings);
-            let applied = output_for_band.borrow().equalizer_settings();
-            updating_for_band.set(true);
-            scale.set_value(applied.bands_db[index]);
-            preset_dropdown_for_band.set_selected(preset_menu_position(applied.preset));
-            updating_for_band.set(false);
+            apply_gain_edit(
+                &output_for_band,
+                &preset_dropdown_for_band,
+                &updating_for_band,
+                scale,
+                move |settings| settings.bands_db[index],
+                move |settings, gain| settings.bands_db[index] = gain,
+            );
         });
     }
 }
