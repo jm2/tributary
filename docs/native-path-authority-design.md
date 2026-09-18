@@ -443,12 +443,28 @@ ratings, play counts, history, and playlist references remain byte-identical
 across the upgrade.
 
 **Downgrade is separate from reopening.** Reopening the upgraded database with
-an older binary is not a downgrade and is refused by the guard. The only
+an older binary is not a downgrade, and reopening is not uniformly refused: an
+older **contract-aware** binary — one that reads `schema_capabilities` /
+`PRAGMA user_version` — is refused by the supported-version startup guard when
+the database's authority version exceeds that binary's compiled maximum, while
+an arbitrary pre-R11 binary is not stopped by that guard at all; it is
+contained only by the statement-preparation failure when the statements it runs
+name the removed `file_path` column, and is otherwise
+unsupported-but-not-mechanically-rejected, exactly as scoped in items 1–2
+above. The only
 supported downgrade is the migration's `down()`, which restores the `file_path`
 column name and refuses whenever any row would be left ambiguous under the old
 schema — any non-`NULL` `native_path` whose decoded bytes differ from its
 display text, or any state-0/3 row — matching the `drop_if_lossless` refusal
-pattern of migration 20. `down()` is transactional and idempotent.
+pattern of migration 20. `down()` is transactional and idempotent, and it must
+also revert the authority markers: `up()` writes the `schema_capabilities`
+authority singleton row and the mirrored `PRAGMA user_version` **last** inside
+its transaction (§4.2 step 6), so a successful `down()` deletes that singleton
+row and resets the mirrored `PRAGMA user_version` to its pre-R11 value in the
+same transaction as the table rebuild. A downgraded database therefore
+presents as pre-R11 — authority marker absent — to every contract-aware
+binary; authority is never left declared where the contract's columns no
+longer exist.
 
 **Rollback / restart.** The table rebuild, the backfill, the index creation, and
 the `schema_capabilities` marker write all execute in a single transaction
@@ -694,7 +710,11 @@ Required tests:
     `native_path_authority_version` startup guard refuses a contract-aware
     binary compiled below the database's authority version; `down()` refuses
     while any row would be ambiguous under the old schema and otherwise
-    restores the `file_path` column name. Assert the containment scope
+    restores the `file_path` column name, deletes the `schema_capabilities`
+    authority singleton row, and resets the mirrored `PRAGMA user_version` to
+    the pre-R11 value — assert that after a successful `down()` **both markers
+    are absent**, so the downgraded database presents as pre-R11 to every
+    contract-aware binary (§4.5). Assert the containment scope
     symmetrically: a `SELECT *` and a read naming only surviving columns
     succeed against the rebuilt table, demonstrating that the mechanical
     barrier covers statements naming the removed column, not arbitrary
