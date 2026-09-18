@@ -2936,6 +2936,7 @@ mod tests {
     /// The selected file is edited in place while the save stages and tags —
     /// after the write-start revision proof, before the commit. The commit's
     /// revision gate must refuse and preserve the competing edit.
+    #[cfg(unix)]
     #[test]
     fn a_local_selection_refuses_an_in_place_edit_during_the_commit() {
         use std::sync::{Arc, Mutex};
@@ -2980,6 +2981,7 @@ mod tests {
     /// The selected file is replaced during the staging window — after the
     /// write-start proof, before the commit. The commit must refuse and
     /// preserve both the admitted file (displaced) and the newcomer.
+    #[cfg(unix)]
     #[test]
     fn a_local_selection_refuses_a_replacement_during_the_commit() {
         use std::sync::{Arc, Mutex};
