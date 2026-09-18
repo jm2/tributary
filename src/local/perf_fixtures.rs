@@ -6,6 +6,14 @@
 //! the traversal/parse path or a `MediaBackend` by a deterministic amount, and
 //! record comparable numbers without depending on a real slow disk or network.
 //!
+//! The synthetic catalogue carries real per-file ID3v2.3 metadata matching the
+//! `Artist…/Album…/Track…` directory layout, because the production scan
+//! persists what the tag parser reads and the backend aggregates on those
+//! persisted values — not on directory names. Fixture fan-out must become
+//! catalogue fan-out (12 tracks/album, 4 albums/artist; see
+//! [`expected_album_count`] / [`expected_artist_count`]), otherwise album and
+//! artist measurements only ever see a single collapsed row.
+//!
 //! Nothing here ships in a release build. The library is generated on demand
 //! under `${TMPDIR:-/var/tmp}` and removed when the fixture is dropped — no
 //! synthetic audio is checked into the tree.
@@ -64,10 +72,14 @@ pub fn track_count_from_env() -> usize {
         .unwrap_or(DEFAULT_TRACK_COUNT)
 }
 
-/// A minimal but valid 8 kHz mono WAV payload.
+/// A minimal but valid untagged 8 kHz mono WAV payload.
 ///
 /// `lofty` parses this successfully, so the fixture exercises the production
-/// tag-parse path instead of logging unparseable-file skips.
+/// tag-parse path instead of logging unparseable-file skips. With no tag
+/// chunk the production parser falls back to `Unknown Artist` /
+/// `Unknown Album`, which is exactly why [`SyntheticLibrary`] never writes
+/// this payload directly: an untagged catalogue collapses every row into one
+/// artist and one album (see [`tagged_wav_bytes`]).
 pub fn minimal_wav_bytes() -> Vec<u8> {
     let data_size = 1_u32;
     let mut bytes = Vec::with_capacity(45);
@@ -87,18 +99,139 @@ pub fn minimal_wav_bytes() -> Vec<u8> {
     bytes
 }
 
+/// One ID3v2.3 text frame: 4-byte frame id, big-endian payload size, two
+/// flag bytes, then an ISO-8859-1 encoding byte, the text, and the NUL
+/// terminator. This is the payload shape the production `lofty` version
+/// reads from a WAV `id3 ` chunk.
+fn id3v2_text_frame(id: &[u8; 4], value: &str) -> Vec<u8> {
+    let payload_len = 1 + value.len() + 1; // encoding byte + text + NUL
+    let mut frame = Vec::with_capacity(10 + payload_len);
+    frame.extend_from_slice(id);
+    frame.extend_from_slice(&(payload_len as u32).to_be_bytes());
+    frame.extend_from_slice(&[0x00, 0x00]);
+    frame.push(0x00); // ISO-8859-1
+    frame.extend_from_slice(value.as_bytes());
+    frame.push(0x00);
+    frame
+}
+
+/// Encode a plain u32 as an ID3v2 syncsafe integer (four 7-bit groups).
+fn id3v2_syncsafe(size: u32) -> [u8; 4] {
+    [
+        ((size >> 21) & 0x7f) as u8,
+        ((size >> 14) & 0x7f) as u8,
+        ((size >> 7) & 0x7f) as u8,
+        (size & 0x7f) as u8,
+    ]
+}
+
+/// An ID3v2.3 tag wrapping the given prebuilt frames.
+fn id3v2_tag(frames: &[Vec<u8>]) -> Vec<u8> {
+    let body: usize = frames.iter().map(Vec::len).sum();
+    let mut tag = Vec::with_capacity(10 + body);
+    tag.extend_from_slice(b"ID3");
+    tag.push(0x03); // major version 2.3
+    tag.push(0x00); // revision
+    tag.push(0x00); // no flags
+    tag.extend_from_slice(&id3v2_syncsafe(body as u32));
+    for frame in frames {
+        tag.extend_from_slice(frame);
+    }
+    tag
+}
+
+/// A valid 8 kHz mono WAV carrying the given metadata as an ID3v2.3 tag in
+/// a RIFF `id3 ` chunk.
+///
+/// The production parser (`tag_parser::parse_audio_file*`) reads title,
+/// artist, album, and track number from exactly these frames, so files
+/// written with this payload persist as *distinct* catalogue rows instead
+/// of collapsing into the `Unknown Artist` / `Unknown Album` bucket. The
+/// fixture must use the real tag path: backend album/artist aggregation
+/// groups on persisted metadata values, not on directory names.
+pub fn tagged_wav_bytes(
+    artist: &str,
+    album: &str,
+    title: &str,
+    track_number: usize,
+    tracks_on_album: usize,
+) -> Vec<u8> {
+    let frames = [
+        id3v2_text_frame(b"TIT2", title),
+        id3v2_text_frame(b"TPE1", artist),
+        id3v2_text_frame(b"TALB", album),
+        id3v2_text_frame(b"TRCK", &format!("{track_number}/{tracks_on_album}")),
+    ];
+    let tag = id3v2_tag(&frames);
+
+    // Start from the minimal WAV and append the tag as a trailing `id3 `
+    // chunk, widening the RIFF size accordingly. Chunk payloads are
+    // word-aligned, so pad the tag to an even length.
+    let mut bytes = minimal_wav_bytes();
+    let pad = tag.len() % 2;
+    let riff_size = u32::from_le_bytes(bytes[4..8].try_into().expect("RIFF size field"))
+        + 8
+        + tag.len() as u32
+        + pad as u32;
+    bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
+    bytes.extend_from_slice(b"id3 ");
+    bytes.extend_from_slice(&(tag.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&tag);
+    if pad == 1 {
+        bytes.push(0x00);
+    }
+    bytes
+}
+
+/// Artist name persisted for the `artist`-th synthetic artist group.
+pub fn artist_name_for(artist: usize) -> String {
+    format!("Artist{artist:04}")
+}
+
+/// Album title persisted for the `album`-th synthetic album group.
+pub fn album_title_for(album: usize) -> String {
+    format!("Album{album:04}")
+}
+
+/// Title persisted for the `index`-th synthetic track.
+pub fn track_title_for(index: usize) -> String {
+    format!("Track{index:06}")
+}
+
+/// Distinct albums the production backend must report for a library of
+/// `track_count` fixture files: one album group per [`TRACKS_PER_ALBUM`]
+/// tracks, with a final partial group when the count does not divide evenly.
+pub fn expected_album_count(track_count: usize) -> usize {
+    track_count.div_ceil(TRACKS_PER_ALBUM)
+}
+
+/// Distinct artists the production backend must report for a library of
+/// `track_count` fixture files: one artist group per [`ALBUMS_PER_ARTIST`]
+/// albums, with a final partial group.
+pub fn expected_artist_count(track_count: usize) -> usize {
+    expected_album_count(track_count).div_ceil(ALBUMS_PER_ARTIST)
+}
+
 /// A fixed, deterministic synthetic library on disk.
 ///
 /// The layout is `Artist{artist:04}/Album{album:04}/Track{track:06}.wav` with
 /// [`TRACKS_PER_ALBUM`] tracks per album and [`ALBUMS_PER_ARTIST`] albums per
 /// artist, so two runs at the same size produce the same catalogue shape.
+///
+/// Every file also carries ID3v2.3 metadata matching its directory position
+/// ([`artist_name_for`] / [`album_title_for`] / [`track_title_for`]), which
+/// is what the production parser and backend actually group on. The
+/// directory names alone are presentation; without the tags the whole
+/// catalogue collapses into one `Unknown Artist` / `Unknown Album` row pair
+/// and album/artist aggregation has nothing to fan out over.
 pub struct SyntheticLibrary {
     root: PathBuf,
     track_count: usize,
 }
 
 impl SyntheticLibrary {
-    /// Generate `track_count` minimal WAV files under a fresh scratch root.
+    /// Generate `track_count` tagged minimal WAV files under a fresh scratch
+    /// root.
     pub fn generate(track_count: usize) -> std::io::Result<Self> {
         let root = scratch_root().join(format!(
             "tributary-q4-library-{}-{}",
@@ -106,14 +239,23 @@ impl SyntheticLibrary {
             Uuid::new_v4()
         ));
         std::fs::create_dir_all(&root)?;
-        let payload = minimal_wav_bytes();
         for index in 0..track_count {
             let album = index / TRACKS_PER_ALBUM;
             let artist = album / ALBUMS_PER_ARTIST;
             let directory = root
-                .join(format!("Artist{artist:04}"))
-                .join(format!("Album{album:04}"));
+                .join(artist_name_for(artist))
+                .join(album_title_for(album));
             std::fs::create_dir_all(&directory)?;
+            // The last album group may be partial; every other group is full.
+            let tracks_on_this_album =
+                usize::min(TRACKS_PER_ALBUM, track_count - album * TRACKS_PER_ALBUM);
+            let payload = tagged_wav_bytes(
+                &artist_name_for(artist),
+                &album_title_for(album),
+                &track_title_for(index),
+                index % TRACKS_PER_ALBUM + 1,
+                tracks_on_this_album,
+            );
             std::fs::write(directory.join(format!("Track{index:06}.wav")), &payload)?;
         }
         Ok(Self { root, track_count })
@@ -343,8 +485,44 @@ mod tests {
             super::super::tag_parser::parse_audio_file(&path).expect("parse minimal WAV fixture");
         assert_eq!(parsed.format, "WAV");
         assert_eq!(parsed.file_size_bytes, Some(45));
+        // The untagged payload is why it must never be used for a catalogue:
+        // production falls back to the Unknown Artist / Unknown Album bucket,
+        // which would collapse the whole library into one artist and album.
+        assert!(!parsed.artist_from_tag);
+        assert!(!parsed.album_from_tag);
+        assert_eq!(parsed.artist_name, "Unknown Artist");
+        assert_eq!(parsed.album_title, "Unknown Album");
 
         std::fs::remove_dir_all(&directory).expect("remove wav fixture dir");
+    }
+
+    #[test]
+    fn tagged_wav_metadata_is_read_by_the_production_parser() {
+        let directory = scratch_root().join(format!(
+            "tributary-q4-tagged-wav-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).expect("create tagged wav fixture dir");
+        let path = directory.join("track.wav");
+        std::fs::write(
+            &path,
+            tagged_wav_bytes("Artist0007", "Album0003", "Track000043", 7, 12),
+        )
+        .expect("write tagged wav fixture");
+
+        let parsed =
+            super::super::tag_parser::parse_audio_file(&path).expect("parse tagged WAV fixture");
+        assert_eq!(parsed.format, "WAV");
+        assert!(parsed.title_from_tag);
+        assert!(parsed.artist_from_tag);
+        assert!(parsed.album_from_tag);
+        assert_eq!(parsed.title, "Track000043");
+        assert_eq!(parsed.artist_name, "Artist0007");
+        assert_eq!(parsed.album_title, "Album0003");
+        assert_eq!(parsed.track_number, Some(7));
+
+        std::fs::remove_dir_all(&directory).expect("remove tagged wav fixture dir");
     }
 
     #[test]
@@ -356,6 +534,41 @@ mod tests {
         // 24 tracks / 12 per album = 2 albums, both under the first artist.
         let album1 = library.root().join("Artist0000").join("Album0001");
         assert!(album1.join("Track000012.wav").exists());
+
+        // Directory position and persisted metadata must agree: the scan
+        // groups on the parsed tag values, so a directory fan-out that does
+        // not reach the tags produces no catalogue fan-out.
+        let parsed = super::super::tag_parser::parse_audio_file(&album1.join("Track000012.wav"))
+            .expect("parse generated fixture file");
+        assert_eq!(parsed.title, "Track000012");
+        assert_eq!(parsed.artist_name, "Artist0000");
+        assert_eq!(parsed.album_title, "Album0001");
+        assert_eq!(parsed.track_number, Some(1));
+    }
+
+    #[test]
+    fn expected_catalogue_cardinalities_match_the_documented_layout() {
+        // 12 tracks per album, 4 albums per artist, final partial groups.
+        // These are the numbers the refinery acceptance requires the
+        // measurement to assert through the real backend.
+        assert_eq!(expected_album_count(10_000), 834);
+        assert_eq!(expected_artist_count(10_000), 209);
+        assert_eq!(expected_album_count(100_000), 8_334);
+        assert_eq!(expected_artist_count(100_000), 2_084);
+
+        // Final partial groups: 10_000 = 833 full albums + 4 tracks; the
+        // 834 albums = 208 full artists (4 albums each) + 1 artist with the
+        // final 2 albums. Same shape at 100k.
+        assert_eq!(10_000 - 833 * TRACKS_PER_ALBUM, 4);
+        assert_eq!(834 - 208 * ALBUMS_PER_ARTIST, 2);
+        assert_eq!(100_000 - 8_333 * TRACKS_PER_ALBUM, 4);
+        assert_eq!(8_334 - 2_083 * ALBUMS_PER_ARTIST, 2);
+
+        // Small sizes stay exact too.
+        assert_eq!(expected_album_count(24), 2);
+        assert_eq!(expected_artist_count(24), 1);
+        assert_eq!(expected_album_count(100), 9);
+        assert_eq!(expected_artist_count(100), 3);
     }
 
     #[test]
