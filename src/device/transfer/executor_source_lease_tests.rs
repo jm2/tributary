@@ -18,12 +18,18 @@
 //! a concurrent writer can rename the leased root aside, so the tests race
 //! the copy exactly that way and assert the full authority-loss path: the
 //! typed failure, no completion callback, and correct rollback. On Windows
-//! the retained root handle omits delete sharing, so the OS itself refuses
-//! to rename the root aside while the transfer holds it — the retained
-//! lease prevents the interposition outright. There the tests assert that
-//! refusal (the platform's authority evidence) and that the legitimate
-//! transfer still completes correctly; delete-share protection is never
-//! weakened to simulate a loss the platform prevents.
+//! the outcome depends on what the interposition touches. During a file
+//! copy the open source-file descendant pins the tree, so the OS refuses
+//! to rename the root aside (access denied 5 / sharing violation 32) while
+//! the transfer holds it — the retained lease prevents the interposition
+//! outright, and the tests assert that refusal (the platform's authority
+//! evidence) and that the legitimate transfer still completes correctly;
+//! delete-share protection is never weakened to simulate a loss the
+//! platform prevents. At a bare directory stage nothing below the root is
+//! open and the mounted root's unmount-friendly sharing lets the rename
+//! through, so that regression branches on the observed outcome: refusal
+//! asserts the legitimate completion, a completed rename asserts the same
+//! publication-boundary loss as Unix.
 
 use std::path::PathBuf;
 
@@ -522,14 +528,20 @@ fn race_source_root_replacement_on_directory_stage() -> DirectoryReplacementRace
 /// can refuse the run. The failed stage reports no completion callback and
 /// rollback removes the created directory, leaving no litter.
 ///
-/// On Windows the retained lease refuses the replacement outright (the
-/// root handle omits delete sharing), so the same interposition asserts
-/// the refusal and that the legitimate directory creation still completes.
-/// Unix arm of the directory-stage publication regression: the rename
+/// On Windows the outcome of the rename interposition is
+/// platform-managed, so the regression branches on it: when the retained
+/// lease refuses the replacement outright, the same interposition asserts
+/// the refusal and that the legitimate directory creation still completes;
+/// when the rename goes through (the mounted root grants delete sharing by
+/// design — `MountedRootAuthority::unmount_friendly_sharing`), the
+/// publication-loss assertions below apply unchanged.
+///
+/// Directory-stage publication-loss arm (both platforms): the rename
 /// interposition wins, so the run must fail with the typed authority loss
 /// naming the publication boundary, report no completion callback, and
-/// roll back the created directory without litter.
-#[cfg(unix)]
+/// roll back the created directory without litter. On Unix the rename
+/// always wins; on Windows it wins whenever the mounted root's
+/// unmount-friendly sharing let the interposition through.
 fn assert_directory_stage_publication_loss(race: DirectoryReplacementRace) {
     let error = race
         .run
@@ -555,12 +567,23 @@ fn assert_directory_stage_publication_loss(race: DirectoryReplacementRace) {
     );
 }
 
-/// Windows arm of the directory-stage publication regression: the
-/// retained lease refuses the replacement outright, so the legitimate
-/// directory creation must complete exactly once and the source root must
-/// still stand at its original path.
+/// Windows arm of the directory-stage publication regression. The rename
+/// interposition has two legitimate outcomes on Windows, so the arm
+/// branches on the observed one: when the retained lease refused the
+/// replacement outright (raw access-denied 5 / sharing-violation 32 —
+/// the platform's authority evidence), the legitimate directory creation
+/// must complete exactly once and the source root must still stand at its
+/// original path; when the rename went through, the publication-loss
+/// assertions apply exactly as on Unix.
 #[cfg(windows)]
 fn assert_directory_stage_lease_refusal(race: DirectoryReplacementRace) {
+    if !race.progress.replacement_refused {
+        // The rename succeeded — the mounted root grants delete sharing by
+        // design — so the created-directory publication boundary must have
+        // refused the run against the replaced source, exactly as on Unix.
+        assert_directory_stage_publication_loss(race);
+        return;
+    }
     let summary = race.run.expect(
         "the retained lease refuses the replacement, so the legitimate directory creation \
          must complete",
