@@ -40,12 +40,12 @@ during-scan admissions on any machine — no artificial parse delay
 needed.
 
 | Metric | Definition |
-|---|---|
+| --- | --- |
 | `startup_server_ready_ms` | engine spawn → `ServerPlaylistRuntimeReady` |
 | `startup_fullsync_ms` | engine spawn → `FullSync` publication of the initial scan |
 | `startup_scan_settle_ms` | engine spawn → `ScanComplete` |
 | `post_scan_drain_ms` | `ScanComplete` → command channel drained |
-| `cancellation_flush_settle_ms` | engine spawn → `Flush` ack (scan settled first; contract asserts the command applied only after `ScanComplete`) |
+| `cancellation_flush_settle_ms` | engine spawn → `Flush` ack (scan settles first) |
 | `scan_progress_events` | count of `ScanProgress` events (informational) |
 
 Time-to-interactive ≈ `startup_fullsync_ms` (engine side) +
@@ -78,8 +78,8 @@ GDK_BACKEND=broadway BROADWAY_DISPLAY=:97 DISPLAY=:97 \
 ```
 
 | Metric | Definition |
-|---|---|
-| `publication_first_ms` | `display_tracks` 0 → N rows on a browser built empty (mirrors the startup FullSync path); synchronous, so this IS the main-loop stall |
+| --- | --- |
+| `publication_first_ms` | `display_tracks` 0 → N rows on an empty browser (startup FullSync path) |
 | `publication_resync_ms` | `display_tracks` N → N rows (idempotent republication) |
 | `browser_rebuild_ms` | `rebuild_browser_data` alone at N rows |
 
@@ -93,7 +93,7 @@ only gets faster, so budgets below carry that slack deliberately.
 ### Engine (400-row fixture unless noted)
 
 | Metric | Measured (3 runs) | Budget |
-|---|---|---|
+| --- | --- | --- |
 | `startup_server_ready_ms` | 0.09 – 0.20 | < 5 |
 | `startup_fullsync_ms` | 404 – 470 | < 800 |
 | `startup_scan_settle_ms` | 428 – 494 | < 900 |
@@ -109,7 +109,7 @@ the parse-side lane's budgets, not doubled here.
 ### GTK (1000 / 10000 rows)
 
 | Metric | Measured | Budget |
-|---|---|---|
+| --- | --- | --- |
 | `publication_first_ms` @1000 | 4.9 | < 12 |
 | `publication_resync_ms` @1000 | 1.9 | < 6 |
 | `browser_rebuild_ms` @1000 | 1.3 | < 4 |
