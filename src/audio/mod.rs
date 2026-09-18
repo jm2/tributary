@@ -212,6 +212,110 @@ fn equalizer_persistence_allowed(state: &EqEngineState) -> bool {
     !state.persistence_suppressed
 }
 
+/// What one non-blocking poll tick of the parked limiter edit's
+/// completion discovered.
+enum PendingClipSwapPoll {
+    /// The transaction is still parked on the streaming thread.
+    StillParked,
+    /// The chain vanished: the transaction died with it and the poll
+    /// retires itself.
+    ChainRetired,
+    /// The transaction settled: `installed` is the adopted outcome and
+    /// `requested` is the protection peeked from the parked request
+    /// before adoption (`None` only if the request vanished with a
+    /// concurrently-completed transaction).
+    Adopted(bool, Option<equalizer::ClipProtection>),
+}
+
+/// Run one tick of the main-context poll for a parked limiter edit's
+/// completion (refinery R1). Non-blocking: `None` from
+/// `poll_pending_limiter_edit` keeps the transaction parked and the UI
+/// running; a settled transaction falls through to reconciliation.
+/// Extracted from the arming method to keep it within its method-length
+/// budget (Codacy, PR 220 head cea20fe); behavior is unchanged.
+fn poll_pending_clip_swap_tick(state_rc: &Rc<RefCell<EqEngineState>>) -> PendingClipSwapPoll {
+    let mut state = state_rc.borrow_mut();
+    let Some(chain) = state.chain.as_mut() else {
+        // The chain is gone (the bin was retired while the edit was in
+        // flight): the transaction died with it, and so does the poll.
+        state.clip_swap_poll_armed = false;
+        return PendingClipSwapPoll::ChainRetired;
+    };
+    let requested = chain.pending_limiter_edit_request();
+    match chain.poll_pending_limiter_edit() {
+        None => PendingClipSwapPoll::StillParked,
+        Some(installed) => PendingClipSwapPoll::Adopted(installed, requested),
+    }
+}
+
+/// Reconcile the recorded clip protection with a settled limiter edit and
+/// persist the truth (the same recorded-vs-installed discipline the
+/// synchronous path applies). Extracted from the arming method to keep it
+/// within its method-length budget (Codacy, PR 220 head cea20fe);
+/// behavior is unchanged.
+fn reconcile_adopted_clip_swap(
+    state_rc: &Rc<RefCell<EqEngineState>>,
+    installed: bool,
+    requested: Option<equalizer::ClipProtection>,
+) {
+    let mut state = state_rc.borrow_mut();
+    state.clip_swap_poll_armed = false;
+    // Reconcile the topology-dependent recorded field against the
+    // settled graph (the same recorded-vs-installed discipline the
+    // synchronous path applies): a successful edit records the requested
+    // protection; a rollback or wedge records what the adopted chain
+    // actually carries.
+    let chain_truth = state.chain.as_ref().map(|chain| {
+        if chain.clip_protection_installed() {
+            equalizer::ClipProtection::Soft
+        } else {
+            equalizer::ClipProtection::Off
+        }
+    });
+    let Some(chain_truth) = chain_truth else {
+        // The chain vanished between adoption and reconciliation (an
+        // error retirement ran first on this main context): the retire
+        // path owns the recorded state now — nothing to reconcile.
+        return;
+    };
+    state.settings.clip_protection = if installed {
+        // The requested toggle is installed; the request was peeked from
+        // the parked transaction before adoption, so it is present here.
+        requested.unwrap_or(chain_truth)
+    } else {
+        // Rollback or wedge: what the chain carries is truth.
+        chain_truth
+    };
+    drop(state);
+    // Persist the reconciled truth through the trailing-edge debounce
+    // (the same schedule the apply path uses).
+    schedule_eq_save_for(state_rc);
+}
+
+/// The shared body of the trailing-edge debounced equalizer persistence:
+/// re-arm the save timer and let only the newest generation write.
+/// Extracted from the `Player` method so the main-context poll's
+/// reconciliation can share it (Codacy, PR 220 head cea20fe); behavior is
+/// unchanged.
+fn schedule_eq_save_for(state_rc: &Rc<RefCell<EqEngineState>>) {
+    let next_generation = state_rc.borrow().save_generation.wrapping_add(1);
+    state_rc.borrow_mut().save_generation = next_generation;
+    let state = Rc::clone(state_rc);
+    glib::timeout_add_local_once(
+        Duration::from_millis(equalizer::SAVE_DEBOUNCE_MS),
+        move || {
+            let state = state.borrow_mut();
+            if state.save_generation != next_generation {
+                return;
+            }
+            if !equalizer_persistence_allowed(&state) {
+                return;
+            }
+            let _ = equalizer::save_equalizer_settings_to_disk(&state.settings);
+        },
+    );
+}
+
 /// Classify a zero-timeout `state()` query. Returns `Some(was_playing)`
 /// when the pipeline reports a *settled* state (`Success` or `NoPreroll`
 /// with no pending target), and `None` when a state transition is in
@@ -865,75 +969,13 @@ impl Player {
         let state_rc = Rc::clone(&self.eq_state);
         glib::timeout_add_local(
             Duration::from_millis(PENDING_CLIP_SWAP_POLL_MS),
-            move || {
-                // Non-blocking poll: `None` keeps the transaction parked
-                // and the UI running; a settled transaction falls through
-                // to reconciliation.
-                let (installed, requested) = {
-                    let mut state = state_rc.borrow_mut();
-                    let Some(chain) = state.chain.as_mut() else {
-                        // The chain is gone (the bin was retired while the
-                        // edit was in flight): the transaction died with
-                        // it, and so does the poll.
-                        state.clip_swap_poll_armed = false;
-                        return glib::ControlFlow::Break;
-                    };
-                    let requested = chain.pending_limiter_edit_request();
-                    match chain.poll_pending_limiter_edit() {
-                        None => return glib::ControlFlow::Continue,
-                        Some(installed) => (installed, requested),
-                    }
-                };
-                let mut state = state_rc.borrow_mut();
-                state.clip_swap_poll_armed = false;
-                // Reconcile the topology-dependent recorded field against
-                // the settled graph (the same recorded-vs-installed
-                // discipline the synchronous path applies): a successful
-                // edit records the requested protection; a rollback or
-                // wedge records what the adopted chain actually carries.
-                let chain_truth = state.chain.as_ref().map(|chain| {
-                    if chain.clip_protection_installed() {
-                        equalizer::ClipProtection::Soft
-                    } else {
-                        equalizer::ClipProtection::Off
-                    }
-                });
-                let Some(chain_truth) = chain_truth else {
-                    // The chain vanished between adoption and
-                    // reconciliation (an error retirement ran first on
-                    // this main context): the retire path owns the
-                    // recorded state now — nothing to reconcile.
-                    return glib::ControlFlow::Break;
-                };
-                state.settings.clip_protection = if installed {
-                    // The requested toggle is installed; the request was
-                    // peeked from the parked transaction before adoption,
-                    // so it is present here.
-                    requested.unwrap_or(chain_truth)
-                } else {
-                    // Rollback or wedge: what the chain carries is truth.
-                    chain_truth
-                };
-                // Persist the reconciled truth through the trailing-edge
-                // debounce (the same schedule the apply path uses).
-                let next_generation = state.save_generation.wrapping_add(1);
-                state.save_generation = next_generation;
-                drop(state);
-                let state_rc = Rc::clone(&state_rc);
-                glib::timeout_add_local_once(
-                    Duration::from_millis(equalizer::SAVE_DEBOUNCE_MS),
-                    move || {
-                        let state = state_rc.borrow_mut();
-                        if state.save_generation != next_generation {
-                            return;
-                        }
-                        if !equalizer_persistence_allowed(&state) {
-                            return;
-                        }
-                        let _ = equalizer::save_equalizer_settings_to_disk(&state.settings);
-                    },
-                );
-                glib::ControlFlow::Break
+            move || match poll_pending_clip_swap_tick(&state_rc) {
+                PendingClipSwapPoll::StillParked => glib::ControlFlow::Continue,
+                PendingClipSwapPoll::ChainRetired => glib::ControlFlow::Break,
+                PendingClipSwapPoll::Adopted(installed, requested) => {
+                    reconcile_adopted_clip_swap(&state_rc, installed, requested);
+                    glib::ControlFlow::Break
+                }
             },
         );
     }
@@ -1160,22 +1202,7 @@ impl Player {
     /// A transient unreadable `equalizer.cfg` suppresses the write until
     /// a subsequent read succeeds (see [`equalizer_persistence_allowed`]).
     fn schedule_equalizer_save(&self) {
-        let next_generation = self.eq_state.borrow().save_generation.wrapping_add(1);
-        self.eq_state.borrow_mut().save_generation = next_generation;
-        let state = Rc::clone(&self.eq_state);
-        glib::timeout_add_local_once(
-            Duration::from_millis(equalizer::SAVE_DEBOUNCE_MS),
-            move || {
-                let state = state.borrow_mut();
-                if state.save_generation != next_generation {
-                    return;
-                }
-                if !equalizer_persistence_allowed(&state) {
-                    return;
-                }
-                let _ = equalizer::save_equalizer_settings_to_disk(&state.settings);
-            },
-        );
+        schedule_eq_save_for(&self.eq_state);
     }
 
     /// Shutdown flush: synchronously write the current state before the
@@ -2500,30 +2527,19 @@ mod tests {
         assert!(installed_audio_filter(&playbin).is_none());
     }
 
-    /// Regression (refinery R1, PR 220 audit): a clip edit that engaged
-    /// under its blocking probe and outlived the engagement window is
-    /// parked — the caller (the GTK thread) never waits for the surgery.
-    /// While the transaction is in flight the recorded clip protection
-    /// stays at the **pre-edit** truth (the parked transaction owns the
-    /// handle in its slot), and once the callback publishes, the
-    /// main-context poll adopts the outcome, reconciles the recorded
-    /// state to the settled graph, and persists it through the ordinary
-    /// debounce. No pause/relink fallback may run over the in-flight
-    /// graph.
-    #[test]
-    fn pending_clip_swap_records_pre_edit_truth_then_reconciles_on_completion() {
-        use std::time::{Duration, Instant};
-
-        if !eq_engine_plugins_available() {
-            return;
-        }
+    /// Parked-transaction fixture: a playing player whose installed chain
+    /// carries a pending (engaged, unpublished) limiter edit for
+    /// `requested`, as if its surgery had engaged and outlived the
+    /// caller's engagement window. Extracted so the transaction tests
+    /// stay within their method-length budgets (Codacy, PR 220 head
+    /// cea20fe); behavior is unchanged.
+    fn eq_player_with_pending_clip_edit(requested: equalizer::ClipProtection) -> Player {
         let playbin = eq_test_playbin();
         let settings = eq_enabled_settings(equalizer::ClipProtection::Soft);
         let chain = equalizer::EqChain::build(&settings).expect("chain builds");
         playbin.set_property("audio-filter", Some(&chain.bin));
-        let player = eq_test_player(playbin.clone(), eq_state_with(Some(chain), settings));
+        let player = eq_test_player(playbin, eq_state_with(Some(chain), settings));
         *player.playing_override.borrow_mut() = Some(true);
-
         // Park a removal transaction as if its surgery had engaged and
         // outlived the caller's engagement window.
         player
@@ -2532,18 +2548,82 @@ mod tests {
             .chain
             .as_mut()
             .expect("chain installed")
-            .inject_pending_limiter_edit(equalizer::ClipProtection::Off);
+            .inject_pending_limiter_edit(requested);
+        player
+    }
+
+    /// Publish `installed` as the outcome of the player's parked limiter
+    /// edit, if one is parked. Extracted so the transaction tests stay
+    /// within their method-length budgets (Codacy, PR 220 head cea20fe);
+    /// behavior is unchanged.
+    fn complete_pending_edit(player: &Player, installed: bool) -> bool {
+        player
+            .eq_state
+            .borrow_mut()
+            .chain
+            .as_mut()
+            .expect("chain retained")
+            .complete_pending_limiter_edit(installed)
+    }
+
+    /// Drive the global default main context — under `CONTEXT_DRIVE_LOCK`,
+    /// exactly as the UI loop would — until `done` observes the settled
+    /// condition on the player's EQ state, or the bounded deadline
+    /// passes. Returns whether the condition was observed. Extracted so
+    /// the transaction tests stay within their method-length budgets
+    /// (Codacy, PR 220 head cea20fe); behavior is unchanged.
+    fn drive_context_until_eq_state(
+        player: &Player,
+        done: impl Fn(&EqEngineState) -> bool,
+    ) -> bool {
+        use std::time::{Duration, Instant};
+
+        let context = glib::MainContext::default();
+        let _guard = CONTEXT_DRIVE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        context
+            .with_thread_default(|| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline {
+                    context.iteration(false);
+                    if done(&player.eq_state.borrow()) {
+                        return true;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                false
+            })
+            .unwrap_or(false)
+    }
+
+    /// Regression (refinery R1, PR 220 audit): a clip-protection toggle
+    /// refused because a transaction is parked must record the PRE-EDIT
+    /// truth, never the unconfirmed result, and skip the pause/relink
+    /// fallback over the in-flight graph; when the parked surgery then
+    /// publishes its outcome, the main-context poll adopts it and
+    /// reconciles the recorded state to the settled truth through the
+    /// trailing-edge debounce. No pause/relink fallback may run over the
+    /// in-flight graph.
+    #[test]
+    fn pending_clip_swap_records_pre_edit_truth_then_reconciles_on_completion() {
+        use equalizer::ClipProtection;
+
+        if !eq_engine_plugins_available() {
+            return;
+        }
+        let player = eq_player_with_pending_clip_edit(ClipProtection::Off);
 
         // The user requests the same toggle. The pending guard must
         // refuse the dynamic edit, skip the pause/relink fallback
         // entirely, and record the pre-edit truth while in flight.
-        apply_serialized(&player, eq_enabled_settings(equalizer::ClipProtection::Off));
+        apply_serialized(&player, eq_enabled_settings(ClipProtection::Off));
         {
             let state = player.eq_state.borrow();
             assert!(state.settings.enabled);
             assert_eq!(
                 state.settings.clip_protection,
-                equalizer::ClipProtection::Soft,
+                ClipProtection::Soft,
                 "the recorded protection must stay at the pre-edit truth while the edit is parked"
             );
             let chain = state.chain.as_ref().expect("chain retained");
@@ -2557,46 +2637,18 @@ mod tests {
 
         // The callback finishes its surgery and publishes the outcome;
         // the main-context poll adopts it and reconciles the recorded
-        // state. Drive the context exactly as the UI's loop would —
-        // under the same lock the apply path uses, because the poll
-        // timer is attached to the global default main context.
-        assert!(
-            player
-                .eq_state
-                .borrow_mut()
-                .chain
-                .as_mut()
-                .expect("chain retained")
-                .complete_pending_limiter_edit(true),
-            "the parked transaction accepted its publication"
-        );
-        let context = glib::MainContext::default();
-        let adopted = {
-            let _guard = CONTEXT_DRIVE_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            context
-                .with_thread_default(|| {
-                    let deadline = Instant::now() + Duration::from_secs(5);
-                    while Instant::now() < deadline {
-                        context.iteration(false);
-                        if player.eq_state.borrow().settings.clip_protection
-                            == equalizer::ClipProtection::Off
-                        {
-                            return true;
-                        }
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    false
-                })
-                .unwrap_or(false)
-        };
+        // state.
+        let accepted = complete_pending_edit(&player, true);
+        assert!(accepted, "the parked transaction accepted its publication");
+        let adopted = drive_context_until_eq_state(&player, |state| {
+            state.settings.clip_protection == ClipProtection::Off
+        });
         assert!(adopted, "the parked completion was never adopted");
         {
             let state = player.eq_state.borrow();
             assert_eq!(
                 state.settings.clip_protection,
-                equalizer::ClipProtection::Off,
+                ClipProtection::Off,
                 "the settled truth is reconciled on the main context"
             );
             let chain = state.chain.as_ref().expect("chain retained");
