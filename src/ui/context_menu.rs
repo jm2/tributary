@@ -3692,9 +3692,7 @@ pub mod tests {
             };
             let value = payload.to_value();
             let e = |index: usize, value: &glib::Value| {
-                self.rows[index]
-                    .drop_target
-                    .emit_by_name::<bool>("drop", &[value, &1.0f64, &1.0f64])
+                emit_installed_drop(&self.rows[index].drop_target, value)
             };
 
             // Focus rests on the first editable playlist (set in `new`); the
@@ -3761,6 +3759,35 @@ pub mod tests {
                 .borrow_mut()
                 .push((playlist_id, playlist_name, candidates));
         })
+    }
+
+    /// Emits the installed per-row `drop` handler the way GTK itself does.
+    ///
+    /// `gtk_drop_target_emit_drop` calls `g_signal_emit_by_name(target,
+    /// "drop", value, x, y, &ret)` passing the payload-typed `GValue*`; the
+    /// signal's `G_TYPE_VALUE` parameter collects that pointer as its boxed
+    /// content and the connected handler receives exactly the `GValue` GTK
+    /// delivered. glib-rs' `emit_by_name` cannot express this: its Rust-side
+    /// argument validation requires the argument to carry the declared
+    /// parameter type itself and rejects the payload-typed value that GTK's
+    /// own C emission passes, so the test must enter through the same C
+    /// entry point GTK uses.
+    #[cfg(not(target_os = "macos"))]
+    fn emit_installed_drop(drop_target: &gtk::DropTarget, value: &glib::Value) -> bool {
+        use glib::translate::ToGlibPtr;
+
+        let mut result: glib::ffi::gboolean = glib::ffi::GFALSE;
+        unsafe {
+            glib::gobject_ffi::g_signal_emit_by_name(
+                drop_target.as_ptr() as *mut glib::gobject_ffi::GObject,
+                c"drop".as_ptr(),
+                value.to_glib_none().0,
+                1.0f64,
+                1.0f64,
+                &mut result,
+            );
+        }
+        result != glib::ffi::GFALSE
     }
 
     #[cfg(not(target_os = "macos"))]
