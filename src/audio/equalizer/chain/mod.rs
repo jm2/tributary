@@ -13,8 +13,8 @@ use super::{ClipProtection, EqSettings};
 mod limiter;
 
 use limiter::{
-    await_limiter_edit_outcome, edit_limiter_topology, limiter_edit_probe_callback,
-    LimiterEditGate, LimiterEditOutcome, LimiterEditWait, LimiterGraph, LimiterProbeEdit,
+    await_limiter_edit_outcome, edit_limiter_topology, install_limiter_edit_probe,
+    LimiterEditOutcome, LimiterEditWait, LimiterGraph,
 };
 
 /// How long the dynamic limiter edit waits, after installing its blocking
@@ -553,51 +553,16 @@ impl EqChain {
         // owns the handle, so `clip_protection_installed` answers from
         // this recorded value.
         let pre_edit_installed = self.clipper.is_some();
-        let graph = self.limiter_graph();
-        // The probe callback runs on the streaming thread, so it cannot
-        // borrow the chain: the owned `rglimiter` handle is threaded
-        // through a shared slot, the outcome is reported over a channel,
-        // and a shared gate serializes the caller's cancel decision with
-        // the callback's start. The test-fault decisions are resolved
-        // before the closure is built and captured by value, so the
-        // callback never touches the chain.
-        let decisions = self.take_limiter_fault_decisions();
-        let slot = Arc::new(Mutex::new(self.clipper.take()));
-        let (tx, rx) = std::sync::mpsc::sync_channel::<LimiterEditOutcome>(1);
-        let signal = Arc::new(Mutex::new(tx));
-        let gate = Arc::new(Mutex::new(LimiterEditGate::default()));
-        let graph_cb = graph.clone();
-        let slot_cb = Arc::clone(&slot);
-        let signal_cb = Arc::clone(&signal);
-        let gate_cb = Arc::clone(&gate);
-        #[cfg(test)]
-        let hold_cb = self.probe_hold.take();
-        let probe_id = eq_src.add_probe(
-            gst::PadProbeType::BLOCK_DOWNSTREAM | gst::PadProbeType::IDLE,
-            move |_pad, _info| {
-                limiter_edit_probe_callback(
-                    &gate_cb,
-                    &slot_cb,
-                    &signal_cb,
-                    LimiterProbeEdit {
-                        graph: &graph_cb,
-                        soft,
-                        decisions,
-                        #[cfg(test)]
-                        hold: hold_cb.clone(),
-                    },
-                )
-            },
-        );
+        let edit = install_limiter_edit_probe(self, &eq_src, soft);
         // A pad that reports idle synchronously runs the callback before
         // `add_probe` returns and reports no id; either way the outcome
         // arrives over the channel. A missing outcome within the bounded
         // window means the callback either never engaged (cancel it) or
         // already started (park the transaction and adopt its outcome on
         // the main context — never block this caller for it).
-        match await_limiter_edit_outcome(&eq_src, probe_id, &gate, &rx) {
+        match await_limiter_edit_outcome(&eq_src, edit.probe_id, &edit.gate, &edit.rx) {
             LimiterEditWait::Completed(outcome, probe_id) => {
-                self.adopt_limiter_edit_outcome(&eq_src, &slot, Some(outcome), false, probe_id)
+                self.adopt_limiter_edit_outcome(&eq_src, &edit.slot, Some(outcome), false, probe_id)
             }
             LimiterEditWait::NotEngagedCancelled => None,
             LimiterEditWait::Engaged(probe_id) => {
@@ -607,8 +572,8 @@ impl EqChain {
                 // adoption. The caller observes `None` +
                 // `has_pending_limiter_edit()` and runs no fallback.
                 self.pending_edit = Some(PendingLimiterEdit {
-                    rx,
-                    slot,
+                    rx: edit.rx,
+                    slot: edit.slot,
                     probe_id,
                     eq_src: eq_src.clone(),
                     requested: soft,

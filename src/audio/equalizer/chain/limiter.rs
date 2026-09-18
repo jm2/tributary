@@ -5,7 +5,7 @@
 //! lets the caller cancel only an edit that has demonstrably not started,
 //! and the outcome the callback publishes back to the waiting caller.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use gst::prelude::*;
 use gstreamer as gst;
@@ -164,6 +164,84 @@ pub(super) fn limiter_edit_probe_callback(
         gst::PadProbeReturn::Ok
     } else {
         gst::PadProbeReturn::Remove
+    }
+}
+
+/// Everything one blocking limiter edit shares between the chain and its
+/// streaming-thread callback: the `rglimiter` handle slot, the
+/// cancel/engage gate, the outcome channel (both ends), and the id of the
+/// installed `BLOCK_DOWNSTREAM|IDLE` probe (`None` when an idle pad ran
+/// the callback synchronously before `add_probe` returned).
+pub(super) struct LimiterEditResources {
+    /// The `rglimiter` handle slot shared with the callback: the surgery
+    /// moves the owned handle through it, and adoption takes it back.
+    pub(super) slot: Arc<Mutex<Option<gst::Element>>>,
+    /// Serializes the caller's cancel decision with the callback's start.
+    pub(super) gate: Arc<Mutex<LimiterEditGate>>,
+    /// Held by the caller while the edit is in flight, so losing the
+    /// callback's sender clone cannot disconnect the receiver.
+    #[allow(dead_code)]
+    // keep-alive: dropped at fn end, exactly like the caller-owned sender it replaces
+    pub(super) signal: Arc<Mutex<std::sync::mpsc::SyncSender<LimiterEditOutcome>>>,
+    /// The callback publishes exactly one outcome here.
+    pub(super) rx: std::sync::mpsc::Receiver<LimiterEditOutcome>,
+    /// The installed blocking probe's id, if the pad reported one.
+    pub(super) probe_id: Option<gst::PadProbeId>,
+}
+
+/// Arm one blocking limiter edit for `chain`: bundle the graph, the
+/// test-fault decisions and the owned `rglimiter` handle into shared
+/// state, then install the `BLOCK_DOWNSTREAM|IDLE` probe that performs the
+/// surgery on the streaming thread.
+///
+/// The probe callback runs on the streaming thread, so it cannot borrow
+/// the chain: the owned `rglimiter` handle is threaded through a shared
+/// slot, the outcome is reported over a channel, and a shared gate
+/// serializes the caller's cancel decision with the callback's start. The
+/// test-fault decisions and the test-only hold are resolved here and
+/// captured by value, so the callback never touches the chain. Extracted
+/// from the public seam to keep that method within its method-length
+/// budget (Codacy, PR 220 head cea20fe); behavior is unchanged.
+pub(super) fn install_limiter_edit_probe(
+    chain: &mut super::EqChain,
+    eq_src: &gst::Pad,
+    soft: ClipProtection,
+) -> LimiterEditResources {
+    let graph = chain.limiter_graph();
+    let decisions = chain.take_limiter_fault_decisions();
+    let slot = Arc::new(Mutex::new(chain.clipper.take()));
+    let (tx, rx) = std::sync::mpsc::sync_channel::<LimiterEditOutcome>(1);
+    let signal = Arc::new(Mutex::new(tx));
+    let gate = Arc::new(Mutex::new(LimiterEditGate::default()));
+    #[cfg(test)]
+    let hold = chain.probe_hold.take();
+    let graph_cb = graph.clone();
+    let slot_cb = Arc::clone(&slot);
+    let signal_cb = Arc::clone(&signal);
+    let gate_cb = Arc::clone(&gate);
+    let probe_id = eq_src.add_probe(
+        gst::PadProbeType::BLOCK_DOWNSTREAM | gst::PadProbeType::IDLE,
+        move |_pad, _info| {
+            limiter_edit_probe_callback(
+                &gate_cb,
+                &slot_cb,
+                &signal_cb,
+                LimiterProbeEdit {
+                    graph: &graph_cb,
+                    soft,
+                    decisions,
+                    #[cfg(test)]
+                    hold: hold.clone(),
+                },
+            )
+        },
+    );
+    LimiterEditResources {
+        slot,
+        gate,
+        signal,
+        rx,
+        probe_id,
     }
 }
 
