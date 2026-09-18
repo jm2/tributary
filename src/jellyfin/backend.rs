@@ -870,9 +870,39 @@ mod tests {
         service.finish().await;
     }
 
-    #[tokio::test]
-    async fn attribution_profiles_are_frozen_from_raw_rows_before_display_fallbacks() {
-        let service = MockHttpService::start(vec![
+    fn raw_row_audio_items() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({
+                "Id": "gap-row",
+                "Type": "Audio"
+            }),
+            serde_json::json!({
+                "Id": "complete-row",
+                "Name": "Raw Complete",
+                "Type": "Audio",
+                "Album": "Raw Album",
+                "AlbumId": "raw-album",
+                "ArtistItems": [{"Id": "artist-1", "Name": "Raw Artist"}],
+                "IndexNumber": 3,
+                "RunTimeTicks": 2_010_000_000
+            }),
+            serde_json::json!({
+                "Id": "server-unknown-row",
+                "Name": "Unknown",
+                "Type": "Audio",
+                "ArtistItems": [{"Id": "artist-1", "Name": "Unknown"}]
+            }),
+            serde_json::json!({
+                "Id": "album-less-row",
+                "Name": "Raw Bare",
+                "Type": "Audio",
+                "ArtistItems": [{"Id": "artist-1", "Name": "Raw Artist"}]
+            }),
+        ]
+    }
+
+    fn raw_row_routes() -> Vec<MockRoute> {
+        vec![
             MockRoute::get("/System/Ping").reply(MockResponse::text("Jellyfin Server")),
             MockRoute::get("/Users/fixture-user/Views").reply(MockResponse::json(
                 serde_json::json!({
@@ -886,34 +916,7 @@ mod tests {
                 .with_query("ParentId", "music-library")
                 .with_query("IncludeItemTypes", "Audio")
                 .reply(MockResponse::json(serde_json::json!({
-                    "Items": [
-                        {
-                            "Id": "gap-row",
-                            "Type": "Audio"
-                        },
-                        {
-                            "Id": "complete-row",
-                            "Name": "Raw Complete",
-                            "Type": "Audio",
-                            "Album": "Raw Album",
-                            "AlbumId": "raw-album",
-                            "ArtistItems": [{"Id": "artist-1", "Name": "Raw Artist"}],
-                            "IndexNumber": 3,
-                            "RunTimeTicks": 2_010_000_000
-                        },
-                        {
-                            "Id": "server-unknown-row",
-                            "Name": "Unknown",
-                            "Type": "Audio",
-                            "ArtistItems": [{"Id": "artist-1", "Name": "Unknown"}]
-                        },
-                        {
-                            "Id": "album-less-row",
-                            "Name": "Raw Bare",
-                            "Type": "Audio",
-                            "ArtistItems": [{"Id": "artist-1", "Name": "Raw Artist"}]
-                        }
-                    ],
+                    "Items": raw_row_audio_items(),
                     "TotalRecordCount": 4
                 }))),
             MockRoute::get("/Users/fixture-user/Items")
@@ -928,41 +931,41 @@ mod tests {
                 .reply(MockResponse::json(
                     serde_json::json!({"Items": [], "TotalRecordCount": 0}),
                 )),
-        ])
-        .await;
-        let token = Uuid::new_v4().to_string();
-        let backend =
-            JellyfinBackend::connect("fixture", &service.base_url(), &token, "fixture-user")
-                .await
-                .expect("connect raw-row fixture");
+        ]
+    }
 
-        let native_by_id = {
-            let cache = backend.cache.read().await;
-            assert_eq!(cache.tracks.len(), 4);
-            let gap_display_title = cache
-                .tracks
-                .iter()
-                .find(|track| {
-                    track
-                        .native_track_id
-                        .as_ref()
-                        .is_some_and(|id| id.as_str() == "gap-row")
-                })
-                .map(|track| track.title.clone());
-            assert_eq!(gap_display_title.as_deref(), Some("Unknown"));
-            cache
-                .tracks
-                .iter()
-                .filter_map(|track| {
-                    let native = track.native_track_id.clone()?;
-                    Some((native.as_str().to_string(), native))
-                })
-                .collect::<HashMap<String, TrackId>>()
-        };
-        let gap_id = &native_by_id["gap-row"];
-        let complete_id = &native_by_id["complete-row"];
-        let server_unknown_id = &native_by_id["server-unknown-row"];
-        let album_less_id = &native_by_id["album-less-row"];
+    async fn raw_row_native_ids(backend: &JellyfinBackend) -> HashMap<String, TrackId> {
+        let cache = backend.cache.read().await;
+        assert_eq!(cache.tracks.len(), 4);
+        let gap_display_title = cache
+            .tracks
+            .iter()
+            .find(|track| {
+                track
+                    .native_track_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == "gap-row")
+            })
+            .map(|track| track.title.clone());
+        assert_eq!(gap_display_title.as_deref(), Some("Unknown"));
+        cache
+            .tracks
+            .iter()
+            .filter_map(|track| {
+                let native = track.native_track_id.clone()?;
+                Some((native.as_str().to_string(), native))
+            })
+            .collect::<HashMap<String, TrackId>>()
+    }
+
+    fn assert_raw_row_profiles_are_frozen(
+        backend: &JellyfinBackend,
+        ids: &HashMap<String, TrackId>,
+    ) {
+        let gap_id = &ids["gap-row"];
+        let complete_id = &ids["complete-row"];
+        let server_unknown_id = &ids["server-unknown-row"];
+        let album_less_id = &ids["album-less-row"];
 
         // Raw row with missing title and artist: accepted for playback, but
         // carries no attribution proof — the display "Unknown" fallback is
@@ -996,13 +999,36 @@ mod tests {
         // Unknown or stale native IDs refuse attribution.
         let stale_id = TrackId::remote("never-refreshed").expect("bounded stale track ID");
         assert!(backend.catalogue_attribution_profile(&stale_id).is_none());
+    }
 
+    async fn assert_raw_row_lookup_fails_closed_while_cache_contended(
+        backend: &JellyfinBackend,
+        complete_id: &TrackId,
+    ) {
         // A contended cache (refresh in flight) fails closed instead of
         // blocking attribution on the lifecycle lock.
         let guard = backend.cache.write().await;
         assert!(backend.catalogue_attribution_profile(complete_id).is_none());
         drop(guard);
         assert!(backend.catalogue_attribution_profile(complete_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn attribution_profiles_are_frozen_from_raw_rows_before_display_fallbacks() {
+        let service = MockHttpService::start(raw_row_routes()).await;
+        let token = Uuid::new_v4().to_string();
+        let backend =
+            JellyfinBackend::connect("fixture", &service.base_url(), &token, "fixture-user")
+                .await
+                .expect("connect raw-row fixture");
+
+        let native_by_id = raw_row_native_ids(&backend).await;
+        assert_raw_row_profiles_are_frozen(&backend, &native_by_id);
+        assert_raw_row_lookup_fails_closed_while_cache_contended(
+            &backend,
+            &native_by_id["complete-row"],
+        )
+        .await;
 
         service.finish().await;
     }

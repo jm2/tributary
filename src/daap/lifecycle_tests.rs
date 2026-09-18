@@ -849,39 +849,7 @@ fn raw_row_items_response() -> Vec<u8> {
     tlv(b"adbs", &[tlv_u32(b"mstt", 200), listing].concat())
 }
 
-#[tokio::test]
-async fn attribution_profiles_are_frozen_from_raw_dmap_rows() {
-    let server = MockDaapServer::start().await;
-    server.enqueue(
-        MockEndpoint::Items,
-        MockResponse::dmap(raw_row_items_response()),
-    );
-    let registry = registry();
-    let source_id = SourceId::random();
-    claim_saved(&registry, source_id);
-
-    let generation = connect_daap(
-        &registry,
-        source_id,
-        "Raw rows DAAP",
-        server.base_url.clone(),
-    );
-    let (session_epoch, tracks) = wait_for_catalogue(&registry, source_id, generation).await;
-    assert_eq!(tracks.len(), 4);
-
-    // The metadata-gap row is accepted for playback and displays the
-    // synthesized "Unknown" fallback.
-    let gap_display_title = tracks
-        .iter()
-        .find(|track| {
-            track
-                .native_track_id
-                .as_ref()
-                .is_some_and(|id| id.as_str() == "90")
-        })
-        .map(|track| track.title.clone());
-    assert_eq!(gap_display_title.as_deref(), Some("Unknown"));
-
+fn assert_raw_row_mint_proofs(registry: &SourceRegistry, source_id: SourceId, session_epoch: u64) {
     let enabled = HashSet::from([source_id]);
     let media_key_for = |native: &str| {
         MediaKey::new(
@@ -925,13 +893,9 @@ async fn attribution_profiles_are_frozen_from_raw_dmap_rows() {
     assert!(registry
         .mint_session_playback_source(media_key_for("999999"), session_epoch, &enabled)
         .is_none());
+}
 
-    let barrier = registry.shutdown();
-    tokio::time::timeout(MOCK_DEADLINE, barrier.wait())
-        .await
-        .expect("raw-row registry shutdown must finish");
-    server.wait_for_requests(MockEndpoint::Logout, 1).await;
-
+async fn assert_daap_direct_raw_row_divergence(server: &MockDaapServer) {
     // Direct-adapter leg: the same rows through login + load_catalogue prove
     // the display-fallback/profile divergence and the contended-refresh
     // fail-closed lookup on the concrete backend.
@@ -969,6 +933,50 @@ async fn attribution_profiles_are_frozen_from_raw_dmap_rows() {
     assert!(backend.catalogue_attribution_profile(&stale).is_none());
 
     assert_attribution_fails_closed_while_cache_contended(&backend, &native("101")).await;
+}
+
+#[tokio::test]
+async fn attribution_profiles_are_frozen_from_raw_dmap_rows() {
+    let server = MockDaapServer::start().await;
+    server.enqueue(
+        MockEndpoint::Items,
+        MockResponse::dmap(raw_row_items_response()),
+    );
+    let registry = registry();
+    let source_id = SourceId::random();
+    claim_saved(&registry, source_id);
+
+    let generation = connect_daap(
+        &registry,
+        source_id,
+        "Raw rows DAAP",
+        server.base_url.clone(),
+    );
+    let (session_epoch, tracks) = wait_for_catalogue(&registry, source_id, generation).await;
+    assert_eq!(tracks.len(), 4);
+
+    // The metadata-gap row is accepted for playback and displays the
+    // synthesized "Unknown" fallback.
+    let gap_display_title = tracks
+        .iter()
+        .find(|track| {
+            track
+                .native_track_id
+                .as_ref()
+                .is_some_and(|id| id.as_str() == "90")
+        })
+        .map(|track| track.title.clone());
+    assert_eq!(gap_display_title.as_deref(), Some("Unknown"));
+
+    assert_raw_row_mint_proofs(&registry, source_id, session_epoch);
+
+    let barrier = registry.shutdown();
+    tokio::time::timeout(MOCK_DEADLINE, barrier.wait())
+        .await
+        .expect("raw-row registry shutdown must finish");
+    server.wait_for_requests(MockEndpoint::Logout, 1).await;
+
+    assert_daap_direct_raw_row_divergence(&server).await;
 
     server.assert_healthy();
 }

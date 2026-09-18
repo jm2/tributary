@@ -927,17 +927,46 @@ mod tests {
         service.finish().await;
     }
 
-    #[tokio::test]
-    async fn attribution_profiles_are_frozen_from_raw_rows_before_display_fallbacks() {
-        fn playable_media() -> serde_json::Value {
-            serde_json::json!({
-                "bitrate": 1411,
-                "audioCodec": "flac",
-                "Part": [{"key": "/library/parts/raw/file.flac"}]
-            })
-        }
+    fn playable_media() -> serde_json::Value {
+        serde_json::json!({
+            "bitrate": 1411,
+            "audioCodec": "flac",
+            "Part": [{"key": "/library/parts/raw/file.flac"}]
+        })
+    }
 
-        let service = MockHttpService::start(vec![
+    fn raw_row_metadata_items() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({
+                "ratingKey": "gap-row",
+                "Media": [playable_media()]
+            }),
+            serde_json::json!({
+                "ratingKey": "complete-row",
+                "title": "Raw Complete",
+                "grandparentTitle": "Raw Artist",
+                "parentTitle": "Raw Album",
+                "index": 3,
+                "duration": 201_000,
+                "Media": [playable_media()]
+            }),
+            serde_json::json!({
+                "ratingKey": "server-unknown-row",
+                "title": "Unknown",
+                "grandparentTitle": "Unknown",
+                "Media": [playable_media()]
+            }),
+            serde_json::json!({
+                "ratingKey": "album-less-row",
+                "title": "Raw Bare",
+                "grandparentTitle": "Raw Artist",
+                "Media": [playable_media()]
+            }),
+        ]
+    }
+
+    fn raw_row_routes() -> Vec<MockRoute> {
+        vec![
             MockRoute::get("/identity").reply(MockResponse::json(serde_json::json!({
                 "MediaContainer": {
                     "machineIdentifier": "fixture-machine",
@@ -959,33 +988,7 @@ mod tests {
                         "size": 4,
                         "totalSize": 4,
                         "offset": 0,
-                        "Metadata": [
-                            {
-                                "ratingKey": "gap-row",
-                                "Media": [playable_media()]
-                            },
-                            {
-                                "ratingKey": "complete-row",
-                                "title": "Raw Complete",
-                                "grandparentTitle": "Raw Artist",
-                                "parentTitle": "Raw Album",
-                                "index": 3,
-                                "duration": 201_000,
-                                "Media": [playable_media()]
-                            },
-                            {
-                                "ratingKey": "server-unknown-row",
-                                "title": "Unknown",
-                                "grandparentTitle": "Unknown",
-                                "Media": [playable_media()]
-                            },
-                            {
-                                "ratingKey": "album-less-row",
-                                "title": "Raw Bare",
-                                "grandparentTitle": "Raw Artist",
-                                "Media": [playable_media()]
-                            }
-                        ]
+                        "Metadata": raw_row_metadata_items()
                     }
                 }))),
             MockRoute::get("/library/sections/7/all")
@@ -998,43 +1001,38 @@ mod tests {
                 .reply(MockResponse::json(serde_json::json!({
                     "MediaContainer": {"size": 0, "totalSize": 0, "offset": 0}
                 }))),
-        ])
-        .await;
-        let token = Uuid::new_v4().to_string();
-        let backend = PlexBackend::connect("fixture", &service.base_url(), &token)
-            .await
-            .expect("connect raw-row fixture");
-        crate::architecture::load_track_catalog(&backend)
-            .await
-            .expect("raw-row catalogue loads");
+        ]
+    }
 
-        let native_by_id = {
-            let cache = backend.cache.read().await;
-            assert_eq!(cache.tracks.len(), 4);
-            let gap_display_title = cache
-                .tracks
-                .iter()
-                .find(|track| {
-                    track
-                        .native_track_id
-                        .as_ref()
-                        .is_some_and(|id| id.as_str() == "gap-row")
-                })
-                .map(|track| track.title.clone());
-            assert_eq!(gap_display_title.as_deref(), Some("Unknown"));
-            cache
-                .tracks
-                .iter()
-                .filter_map(|track| {
-                    let native = track.native_track_id.clone()?;
-                    Some((native.as_str().to_string(), native))
-                })
-                .collect::<HashMap<String, TrackId>>()
-        };
-        let gap_id = &native_by_id["gap-row"];
-        let complete_id = &native_by_id["complete-row"];
-        let server_unknown_id = &native_by_id["server-unknown-row"];
-        let album_less_id = &native_by_id["album-less-row"];
+    async fn raw_row_native_ids(backend: &PlexBackend) -> HashMap<String, TrackId> {
+        let cache = backend.cache.read().await;
+        assert_eq!(cache.tracks.len(), 4);
+        let gap_display_title = cache
+            .tracks
+            .iter()
+            .find(|track| {
+                track
+                    .native_track_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == "gap-row")
+            })
+            .map(|track| track.title.clone());
+        assert_eq!(gap_display_title.as_deref(), Some("Unknown"));
+        cache
+            .tracks
+            .iter()
+            .filter_map(|track| {
+                let native = track.native_track_id.clone()?;
+                Some((native.as_str().to_string(), native))
+            })
+            .collect::<HashMap<String, TrackId>>()
+    }
+
+    fn assert_raw_row_profiles_are_frozen(backend: &PlexBackend, ids: &HashMap<String, TrackId>) {
+        let gap_id = &ids["gap-row"];
+        let complete_id = &ids["complete-row"];
+        let server_unknown_id = &ids["server-unknown-row"];
+        let album_less_id = &ids["album-less-row"];
 
         // Raw row with missing title and artist: accepted for playback, but
         // carries no attribution proof — the display "Unknown" fallback is
@@ -1068,13 +1066,38 @@ mod tests {
         // Unknown or stale native IDs refuse attribution.
         let stale_id = TrackId::remote("never-refreshed").expect("bounded stale track ID");
         assert!(backend.catalogue_attribution_profile(&stale_id).is_none());
+    }
 
+    async fn assert_raw_row_lookup_fails_closed_while_cache_contended(
+        backend: &PlexBackend,
+        complete_id: &TrackId,
+    ) {
         // A contended cache (refresh in flight) fails closed instead of
         // blocking attribution on the lifecycle lock.
         let guard = backend.cache.write().await;
         assert!(backend.catalogue_attribution_profile(complete_id).is_none());
         drop(guard);
         assert!(backend.catalogue_attribution_profile(complete_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn attribution_profiles_are_frozen_from_raw_rows_before_display_fallbacks() {
+        let service = MockHttpService::start(raw_row_routes()).await;
+        let token = Uuid::new_v4().to_string();
+        let backend = PlexBackend::connect("fixture", &service.base_url(), &token)
+            .await
+            .expect("connect raw-row fixture");
+        crate::architecture::load_track_catalog(&backend)
+            .await
+            .expect("raw-row catalogue loads");
+
+        let native_by_id = raw_row_native_ids(&backend).await;
+        assert_raw_row_profiles_are_frozen(&backend, &native_by_id);
+        assert_raw_row_lookup_fails_closed_while_cache_contended(
+            &backend,
+            &native_by_id["complete-row"],
+        )
+        .await;
 
         service.finish().await;
     }
