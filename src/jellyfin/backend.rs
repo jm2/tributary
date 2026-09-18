@@ -459,6 +459,8 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
         let mut artists = Vec::new();
         let mut stream_locators = Vec::new();
         let mut track_artwork_locators = Vec::new();
+        let mut attribution_profiles: Vec<(TrackId, Option<PlaybackAttributionProfile>)> =
+            Vec::new();
 
         for item in &resp.items {
             match item.item_type.as_deref() {
@@ -471,6 +473,26 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
                     let album_id = item.album_id.as_deref().map(deterministic_uuid);
                     stream_locators.push((track_id.clone(), item.id.clone()));
                     track_artwork_locators.push((track_id.clone(), item.album_id.clone()));
+                    // Retained rows outside the refreshed catalogue still need
+                    // Last.fm attribution authority: freeze the profile from
+                    // the raw accepted row with the same field precedence as
+                    // the display converter, before any "Unknown" fallback is
+                    // substituted, so a synthesized fallback can never become
+                    // attribution authority.
+                    attribution_profiles.push((
+                        track_id.clone(),
+                        PlaybackAttributionProfile::from_remote_row(
+                            item.name.clone(),
+                            item.artist_items
+                                .first()
+                                .map(|a| a.name.clone())
+                                .or_else(|| item.album_artist.clone()),
+                            item.album.clone(),
+                            item.album_artist.clone(),
+                            item.index_number,
+                            item.run_time_ticks.map(|t| t / 10_000_000),
+                        ),
+                    ));
                     tracks.push(jellyfin_item_to_track(
                         item, track_id, uuid, artist_id, album_id,
                     ));
@@ -513,6 +535,13 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
                     .insert(track_id, artwork_item_id);
             } else {
                 cache.track_artwork_locator_by_track_id.remove(&track_id);
+            }
+        }
+        for (track_id, profile) in attribution_profiles {
+            if let Some(profile) = profile {
+                cache.attribution_profiles.insert(track_id, profile);
+            } else {
+                cache.attribution_profiles.remove(&track_id);
             }
         }
 
@@ -1188,6 +1217,93 @@ mod tests {
             assert!(authorization.contains(&format!(r#"Token="{token}""#)));
             assert!(request.headers.get(reqwest::header::REFERER).is_none());
         }
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn search_retains_provenance_profiles_for_rows_outside_the_catalogue() {
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/System/Ping").reply(MockResponse::text("Jellyfin Server")),
+            MockRoute::get("/Users/fixture-user/Views").reply(MockResponse::json(
+                serde_json::json!({
+                    "Items": [
+                        {"Id": "music-library", "Name": "Music", "CollectionType": "music"}
+                    ],
+                    "TotalRecordCount": 1
+                }),
+            )),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "Audio")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [],
+                    "TotalRecordCount": 0
+                }))),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "MusicAlbum")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [],
+                    "TotalRecordCount": 0
+                }))),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "MusicArtist")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [],
+                    "TotalRecordCount": 0
+                }))),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("SearchTerm", "Fixture")
+                .with_query("IncludeItemTypes", "Audio,MusicAlbum,MusicArtist")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [
+                        {
+                            "Id": "search-complete",
+                            "Name": "Search Complete",
+                            "Type": "Audio",
+                            "Album": "Search Album",
+                            "AlbumArtist": "Search Artist",
+                            "ArtistItems": [{"Id": "artist-1", "Name": "Search Artist"}],
+                            "IndexNumber": 5,
+                            "RunTimeTicks": 2_220_000_000i64
+                        },
+                        {
+                            "Id": "search-gap",
+                            "Type": "Audio"
+                        }
+                    ],
+                    "TotalRecordCount": 2
+                }))),
+        ])
+        .await;
+        let token = Uuid::new_v4().to_string();
+        let backend =
+            JellyfinBackend::connect("fixture", &service.base_url(), &token, "fixture-user")
+                .await
+                .expect("connect Jellyfin search fixture");
+
+        let results = backend
+            .search("Fixture", 10)
+            .await
+            .expect("search the fixture server");
+        assert_eq!(results.tracks.len(), 2);
+
+        // A searched row that never went through the catalogue refresh still
+        // carries its raw provenance as Last.fm attribution authority, with
+        // the same field precedence as the refresh path.
+        let complete_id = TrackId::remote("search-complete").expect("bounded track ID");
+        let profile = backend
+            .catalogue_attribution_profile(&complete_id)
+            .expect("searched row outside the catalogue retains its provenance profile");
+        assert_eq!(profile.title(), "Search Complete");
+        assert_eq!(profile.artist(), "Search Artist");
+        assert_eq!(profile.album(), Some("Search Album"));
+
+        // A searched row without enough raw provenance fails closed instead
+        // of becoming attribution authority.
+        let gap_id = TrackId::remote("search-gap").expect("bounded track ID");
+        assert!(backend.catalogue_attribution_profile(&gap_id).is_none());
         service.finish().await;
     }
 }

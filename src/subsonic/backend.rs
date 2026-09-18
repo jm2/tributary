@@ -612,9 +612,25 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
             if let Some(cover_art_id) = &song.cover_art {
                 cache
                     .track_artwork_locator_by_track_id
-                    .insert(track_id, cover_art_id.clone());
+                    .insert(track_id.clone(), cover_art_id.clone());
             } else {
                 cache.track_artwork_locator_by_track_id.remove(&track_id);
+            }
+            // Retained rows outside the refreshed catalogue still need Last.fm
+            // attribution authority: freeze the profile from the raw accepted
+            // row, and drop a stale profile when the row no longer carries
+            // enough provenance.
+            if let Some(profile) = PlaybackAttributionProfile::from_remote_row(
+                song.title.clone(),
+                song.artist.clone(),
+                song.album.clone(),
+                None,
+                song.track,
+                song.duration,
+            ) {
+                cache.attribution_profiles.insert(track_id, profile);
+            } else {
+                cache.attribution_profiles.remove(&track_id);
             }
         }
 
@@ -1782,6 +1798,69 @@ mod tests {
         assert!(rendered.contains("Subsonic API error 70"));
         assert!(!rendered.contains(&server_message));
         assert!(!rendered.contains(&password));
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn search_retains_provenance_profiles_for_rows_outside_the_catalogue() {
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/rest/ping.view").reply(MockResponse::json(
+                serde_json::json!({"subsonic-response": {"status": "ok"}}),
+            )),
+            MockRoute::get("/rest/getArtists.view").reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {"status": "ok", "artists": {"index": []}}
+            }))),
+            MockRoute::get("/rest/search3.view")
+                .with_query("query", "Song")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "searchResult3": {
+                            "song": [
+                                {
+                                    "id": "search-complete",
+                                    "title": "Search Complete",
+                                    "artist": "Search Artist",
+                                    "album": "Search Album",
+                                    "track": 7,
+                                    "duration": 222
+                                },
+                                {
+                                    "id": "search-gap"
+                                }
+                            ]
+                        }
+                    }
+                }))),
+        ])
+        .await;
+        let password = Uuid::new_v4().to_string();
+        let backend = SubsonicBackend::connect("fixture", &service.base_url(), "user", &password)
+            .await
+            .expect("connect search fixture");
+
+        let results = backend
+            .search("Song", 10)
+            .await
+            .expect("search the fixture server");
+        assert_eq!(results.tracks.len(), 2);
+
+        // A searched row that never went through the catalogue refresh still
+        // carries its raw provenance as Last.fm attribution authority.
+        let complete_id = TrackId::remote("search-complete").expect("bounded track ID");
+        let profile = backend
+            .catalogue_attribution_profile(&complete_id)
+            .expect("searched row outside the catalogue retains its provenance profile");
+        assert_eq!(profile.title(), "Search Complete");
+        assert_eq!(profile.artist(), "Search Artist");
+        assert_eq!(profile.album(), Some("Search Album"));
+
+        // A searched row without enough raw provenance fails closed instead
+        // of becoming attribution authority.
+        let gap_id = TrackId::remote("search-gap").expect("bounded track ID");
+        assert!(backend.catalogue_attribution_profile(&gap_id).is_none());
+
+        assert_eq!(service.requests().len(), 3);
         service.finish().await;
     }
 }
