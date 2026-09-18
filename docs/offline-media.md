@@ -48,7 +48,7 @@ the download/cache engine must satisfy.
 
 | Area | What this document decides | What is explicitly reserved |
 | --- | --- | --- |
-| Identity | Cache entries use the same `SourceId` + `TrackId` shape as live playback. The download engine adopts the live per-source `MediaKey`; it never invents a new identity kind. | New persisted media identifier kinds, new schema migrations for media identity, on-disk naming conventions beyond `task.md` and the credential-boundary section. The durable `SourceIncarnationId` of [restart authorization](#authenticated-resumable-download-jobs) is a registry-side durable field, not a media identifier kind; pre-existing saved sources receive one stable, persisted value at first load. |
+| Identity | Cache entries use the same `SourceId` + `TrackId` shape as live playback. The download engine adopts the live per-source `MediaKey`; it never invents a new identity kind. | New persisted media identifier kinds, new schema migrations for media identity, on-disk naming conventions beyond `task.md` and the credential-boundary section. The durable `SourceIncarnationId` of [restart authorization](#authenticated-resumable-download-jobs) is a registry-side durable field, not a media identifier kind; pre-existing saved sources receive one stable, persisted value at first load, and a committed cache row records its owning incarnation as resolution evidence — the same registry-side field mirrored onto the row, still not a new identifier kind. |
 | Authority | Every cached media entry remains owned by its source. The source registry's exact-snapshot capability gates download admission, reconciliation, and retirement. A committed snapshot renders offline without a live registry round-trip; disconnect and refresh never gate playback of committed bytes. No offline bypass of the registry for admission. | Concurrent access contracts for the registry's offline catalogue; specific read-side materialisation policies. |
 | Download jobs | A bounded resumable job model keyed by exact `(SourceId, TrackId)` with a durable, `fsync`'d progress journal, entity validators (`If-Range`) on every range request, opaque server caps, deterministic cancellation, and structured redacted failures. Job state survives restart; it is never memory-only. The journal's bounded per-segment metadata and its fixed publish-intent, intent-clear, and terminal-verdict lifecycle records are engine-owned and charged against the same global quota as payload, while the per-track cap remains a payload limit; the lifecycle records are bounded by a capped publish-attempt budget and covered by a single per-job lifecycle reservation sized to that whole bounded worst case, charged once and held for the job's whole life so the mandatory durable intent, clear, verdict, and exhaustion records are always writable at the quota boundary without being charged twice and without a run of retries outgrowing the reserve. Restart authorization is by durable source-incarnation identity (`SourceId` + `SourceIncarnationId`), never by the transient accepted-generation number, applied consistently to lease reacquisition, resumption, and publish-intent adoption. | Concrete worker pool scheduling, threading model, runtime selection, telemetry. |
 | Storage | Verify-then-publish: the temp file lives in the same directory (same filesystem) as its final cache path, integrity is verified on the temp file before any rename, and publish is an atomic rename — durability-ordered on Unix by a parent-directory `fsync` chain that re-derives and re-syncs the complete ancestor chain on every attempt, and on Windows by the documented `MOVEFILE_WRITE_THROUGH` barrier ([Atomic storage](#atomic-storage)). The final path is snapshot-scoped, so a refresh publishes a sibling instead of overwriting a predecessor's bytes; a journaled publish intent makes the rename-to-commit window crash-recoverable — adoption at startup completes the pending publication barrier, re-syncing the directory entry for the already-renamed file, and acquires an exact session commit authority atomically at the final admission before it may insert the row or clear the intent — and a durable delete intent — the publish intent itself, or the `fsync`'d terminal-verdict record that supersedes it on a post-rename terminal transition — is the delete owner for a file published without a row. Cross-filesystem publish is refused at admission, never emulated with copy+sync+delete. A `tracks` row may link to a cache path only when integrity passed, the per-track cap held before the rename, and the file is current. | Database migrations, schema, table layout, index choice, cache placement, encryption. |
@@ -313,7 +313,13 @@ transient generation number.** The registry persists, per durable source, a
 non-secret `SourceIncarnationId`: minted with the source's durable
 registration and re-minted only when the source is replaced by a genuinely
 different incarnation — a new endpoint, adapter identity, or saved
-configuration. A mere process restart resets the transient operation
+configuration. Every such re-mint generates a fresh, persisted,
+non-derived value: the deterministic derivation this contract defines is a
+property of the one-time v1→v2 backfill only (below) and is never applied
+to a re-mint, so a replacement that reverts the identity fields to an
+earlier configuration cannot reproduce a retired incarnation — the ABA
+replacement is closed by construction. A mere process restart resets the
+transient operation
 generation and session epoch counters but leaves `SourceIncarnationId`
 unchanged; it is a durable identity, not an epoch or generation, and carries
 no credential, locator, or route. The job records the `SourceIncarnationId`
@@ -368,8 +374,10 @@ A v2 envelope carries `schema_version: 2` and a `servers` array of rows
 levels. The supported read versions are v1 and v2; the supported write
 version is v2. On first load of a v1 file the loader validates it exactly
 as today — canonical endpoint, valid persisted `source_id`, and the
-existing duplicate rules — then derives each row's deterministic
-incarnation and replaces the file with the v2 envelope through a
+existing duplicate rules — then derives each row's backfill incarnation as
+the one deterministic derivation this contract permits, scoped to this
+first-load replacement and never reused for a later re-mint (below) — and
+replaces the file with the v2 envelope through a
 same-directory atomic write: a temp file in the parent directory, a file
 `fsync`, a `rename`, and — on Unix — a parent-directory `fsync`. The v2
 writer propagates a `fsync` failure as an error instead of discarding it:
@@ -392,10 +400,11 @@ later `fsync` cannot roll back a completed `rename`:
   across this cut is precise and attainable: the destination is always one
   of two complete, parseable configurations — the original v1, if a power
   loss reverts the not-yet-synced directory entry, or the replacement v2 —
-  and never a torn or partial file. Because each row's incarnation is a
-  deterministic function of that row's durable identity, both states carry
-  the same `SourceIncarnationId` per row, so the accepted incarnation is
-  preserved either way: no re-mint, no dropped source, and no data loss
+   and never a torn or partial file. Because each row's backfilled
+   incarnation is a deterministic function of that row's durable identity,
+   both states carry the same `SourceIncarnationId` per row, so the
+   accepted incarnation is preserved either way: no re-mint, no dropped
+   source, and no data loss
   (every v1 row is representable in v2). Recovery and retry follow the
   file the destination actually names: a v2 file is validated and used
   as-is and never re-minted; a v1 file — a reverted or never-durable
@@ -407,10 +416,10 @@ On Windows the v2 writer uses the loader's same-directory rename primitive
 and claims no parent-directory durability barrier the platform does not
 document (the same honest bound in
 [Atomic storage](#atomic-storage) for the cache publish); the same
-two-complete-states guarantee holds there, and because the incarnation is
-a deterministic function of the row's durable identity, a replacement lost
-to that undocumented ancestor-entry gap re-derives the identical value on
-the next load rather than minting a new one. Migration is idempotent
+two-complete-states guarantee holds there, and because the backfilled
+incarnation is a deterministic function of the row's durable identity, a
+replacement lost to that undocumented ancestor-entry gap re-derives the
+identical value on the next load rather than minting a new one. Migration is idempotent
 across restarts: a v2 file is validated and used as-is, and re-loading it
 never re-mints an incarnation. Downgrade is explicitly unsupported and
 fail-closed: a pre-offline binary supports only v1 and quarantines an
@@ -419,15 +428,28 @@ downgrade makes saved sources unavailable but never silently drops an
 incarnation or destroys the v2 file, and re-upgrading recovers every
 source with its durable identity intact.
 
-The assignment is idempotent and derivation-stable: the value is a
+The backfill assignment is idempotent and derivation-stable: the value is a
 deterministic function of the row's durable identity fields (`source_id`,
 `type`, and `url`), so a retry, a crash before the durable write lands, or a
 concurrent load converges on a single value instead of racing to mint
-several, and the persisted value, once written, is the authority. A later
-change to any of those identity fields is a genuine replacement under the
-re-minting rule above and mints a new incarnation; an unchanged row reloaded
-after a process restart keeps the incarnation it was assigned, so a resumed
-job's `SourceId` + `SourceIncarnationId` still rebinds. Until a source's
+several, and the persisted value, once written, is the authority. This
+determinism is scoped to the one-time backfill and is deliberately not
+reused for later replacements: deriving a replacement deterministically
+would let an ABA replacement — `A` changed to `B`, then back to `A` —
+reproduce the first `A`'s incarnation and re-authorize the first `A`'s
+durable jobs against the third source state. Every later replacement of a
+source — a genuine change to any identity field under the re-minting rule
+above — therefore mints a fresh, persisted, non-derived value: a newly
+generated nonce, not a function of the old or new identity fields.
+Replacement durability carries the convergence property instead: the new
+nonce is persisted through the same atomic v2 envelope replacement as the
+identity change itself, so the durable state always holds a consistent
+(identity, incarnation) pair — a crash before that write lands leaves the
+previous pair in force and the retry mints fresh, while concurrent loads
+converge because the envelope replacement is one atomic rename whose single
+result every loader adopts. An unchanged row reloaded after a process
+restart keeps the incarnation it was assigned, so a resumed job's
+`SourceId` + `SourceIncarnationId` still rebinds. Until a source's
 incarnation is persisted, no offline job for that source is admitted,
 resumed, or adopted. The assigned value is itself opaque and non-secret: it
 carries no credential, locator, or route, and it is not a display name.
@@ -565,8 +587,10 @@ directory.
    so no committed row can reference a path whose ancestor chain was not
    durably published.
 6. **Commit.** Only after a successful rename does the cache row exist.
-   The row records the `MediaKey` → cache-path mapping, the engine-computed
-   digest, the digest provenance used, and the licence label at commit.
+   The row records the `MediaKey` → cache-path mapping, the source's
+   current durable `SourceIncarnationId` re-verified by the
+   commit-authority acquisition, the engine-computed digest, the digest
+   provenance used, and the licence label at commit.
    The commit clears the journaled publish intent. A terminal state
    reached before the rename clears it too — nothing was published. A
    terminal state reached after the rename never abandons the intent with
@@ -922,7 +946,7 @@ the window and its single recovery resolution:
    | Row committed (Windows), then power loss loses a newly created ancestor entry or the published name | Intent cleared at the commit; row present; the recorded path does not resolve. | Post-commit loss path: the row is never served — lookup and the startup reconciliation pass mark it non-playable and recoverable, a fresh download job may republish a new snapshot, and the never-a-silent-pass rule applies. The predecessor snapshot, if any, is untouched. | Windows documents no normal-user ancestor-entry durability barrier; detection and repair, not an undocumented flush, bound this case. Unix excludes it by the step-5 `fsync` chain. |
    | Crash during the step-6 commit (row inserted, intent not yet cleared) | Intent present; row present; final present. | Row-recognition path: the exact committed row — identity, recorded path, and recorded digest all matching the intent — stands; preserve its bytes, clear the intent. The insert an adoption would re-run is an idempotent no-op. | Completion is idempotent; a committed row is never re-adjudicated by adoption gates. |
    | Row committed (Windows), intent not yet cleared, and the recorded path lost to post-commit ancestor loss | Intent present; row present; the recorded path does not resolve. | Row-recognition path: the committed row stands on its durable evidence — identity, recorded path, recorded digest — and the intent is cleared; the unresolvable path routes the row through the post-commit loss reconciliation (never served, marked non-playable and recoverable, a fresh download job may republish a new snapshot), never through this recovery's unlink. | Recognition never consults the file to authorize cleanup; a committed row is never unlinked by publish-intent recovery, whatever the file's state. |
-   | Row committed, then the source is replaced by a different durable incarnation before recovery | Intent present; row present; final present; the job's recorded `SourceIncarnationId` no longer matches the restored source's. | Row-recognition path: the committed row stands and the intent is cleared; the incarnation mismatch retires the job, never the row. Any later retirement of the row goes through its own retirement protocol, not the recovery unlink. | A committed row is never unlinked by publish-intent recovery; incarnation replacement governs admission and job adoption, not already-committed bytes. |
+   | Row committed, then the source is replaced by a different durable incarnation before recovery | Intent present; row present; final present; the job's recorded `SourceIncarnationId` no longer matches the restored source's. | Row-recognition path: the committed row stands and the intent is cleared; the incarnation mismatch retires the job, never the row. The row's own recorded owning incarnation is the durable evidence reconciliation applies afterwards: resolution excludes the row immediately, and its retirement runs through the row's own staged-delete protocol, whatever job metadata has since been cleaned up — not the recovery unlink. | A committed row is never unlinked by publish-intent recovery; incarnation replacement governs admission and job adoption, and — through the row's recorded incarnation — the row's own resolution and retirement, never by this recovery's unlink. |
    | Row committed, then a licence or capability revocation lands before recovery | Intent present; row present; final present; the registry's durable state shows the revocation. | Row-recognition path: the row stands and the intent is cleared; the revocation is observed by reconciliation — licence revocation retires the row and preserves the file per the Licensing rules, and a capability-driven retirement of the bytes goes through the staged tombstone of [Eviction](#cancellation-quota-and-eviction). | Recovery never orphans a playable row; revocation retires rows through their own durable transitions, never the recovery unlink. |
    | Post-rename terminal decided, verdict record not yet `fsync`'d | Indistinguishable from the rename-applied row — no durable verdict exists. | The rule-3 resolution order: committed-row recognition first — a committed row stands and the intent is cleared — then the ordinary adoption gates, which refuse adoption for a revocation, a denied or withdrawn capability, or a replaced incarnation: the durable licence/capability state and durable `SourceIncarnationId` checks, plus the current-authority revalidation of capability, licence, and validator against the source's accepted generation. | The journal-admission window every state transition shares; verdict-first ordering means no destructive step has run. |
    | Verdict record `fsync`'d, before the unlink | Intent present; verdict present; final present. | Cleanup path: never adopt; idempotent unlink; then intent clear. | The verdict is durable before any destructive step. |
@@ -1022,10 +1046,19 @@ valid and playable until the staged delete of
 sibling rule of snapshot immutability implementable on the filesystem.
 
 The durable mapping recorded in the cache row at commit is
-`(source_key, track_key, snapshot_key)` → cache path; lookups are
-table-driven. No code path reconstructs a cache path from an identifier
-except through this recorded mapping, and no URL or credential is
-recoverable from a location.
+`(source_key, track_key, snapshot_key)` → cache path, together with the
+owning `SourceIncarnationId` the commit-authority acquisition verified —
+row-owned evidence that survives any job-metadata cleanup; lookups are
+table-driven. Resolution by `MediaKey` matches the row's recorded
+incarnation against the source's current durable incarnation: a row
+resolves only while the two agree, so a source re-registered against a
+different endpoint under the same `SourceId` — even one that re-publishes
+the same native `TrackId` — cannot resolve its predecessor's committed
+bytes, and a row whose recorded incarnation no longer matches is excluded
+from resolution immediately and retired through the same staged-delete
+protocol as any superseded snapshot. No code path reconstructs a cache
+path from an identifier except through this recorded mapping, and no URL
+or credential is recoverable from a location.
 
 The file name inside `<snapshot_key>/` is an implementation-chosen,
 credential-free constant — the directory is the per-snapshot scope, so the
@@ -1160,6 +1193,15 @@ does not mutate; it siblings. The rules:
    removal, `source_unlink`, and `Unlink` invalidate the offline catalogue
    row; the underlying file is unlinked through the same path validation as
    a regular cache unlink. Stale projection work is discarded.
+5. **Resolution is incarnation-checked.** Every cache row records the
+   owning `SourceIncarnationId` verified at its commit, and a row resolves
+   for playback only while that recorded incarnation matches the source's
+   current durable one. A source re-registered against a different
+   endpoint under the same `SourceId` — even one republishing the same
+   native `TrackId` — never resolves its predecessor's bytes: the
+   mismatched row is excluded from resolution immediately and retired
+   through the same staged delete as any superseded snapshot, whatever
+   cleanup its job's records have undergone.
 
 ## Cancellation, quota, and eviction
 
@@ -1566,9 +1608,10 @@ This contract fixes the following failure cases:
 | Row committed (Windows), publish intent still pending, and the recorded path unresolvable | Recognition stands the row on its durable evidence and clears the intent; the unresolvable path routes the row through the post-commit loss reconciliation — never served, marked non-playable and recoverable — never through the publish-intent recovery's unlink. |
 | Failure, cancellation, supersession, or a commit error lands after the publish rename | Post-rename terminal rule, verdict-first: the terminal verdict and its delete intent are journalled and `fsync`'d before any destructive step; the published file is then unlinked through the validated cache-unlink path; the intent is cleared last. A crash before the unlink leaves the verdict record in place as the durable delete owner; startup recovery consults it, never adopts the job as playable, and finishes the cleanup. |
 | Licence or capability revoked between the rename and the commit, whether recorded durably or observable only by re-establishing current source authority | The job is not publication-eligible: the pending intent resolves to recorded-file cleanup, never adoption. No playable row. A current accepted generation that is merely unestablishable at recovery defers non-destructively — no row, no unlink, the pending intent retained for a later pass — rather than treating the publication as revoked. |
-| Row committed, then the source is replaced by a different durable incarnation or a revocation lands before startup recovery | Row-recognition path: the committed row and its bytes stand and the intent is cleared; the revocation or incarnation mismatch is applied to the row by its own retirement protocol — licence revocation retires the row and preserves the file, capability-driven byte retirement uses the staged tombstone — never by the publish-intent recovery's unlink. |
+| Row committed, then the source is replaced by a different durable incarnation or a revocation lands before startup recovery | Row-recognition path: the committed row and its bytes stand and the intent is cleared; the revocation or incarnation mismatch is applied to the row by its own retirement protocol — licence revocation retires the row and preserves the file, capability-driven byte retirement uses the staged tombstone — never by the publish-intent recovery's unlink. The row carries its owning `SourceIncarnationId`, so the mismatch stays readable from the row after job cleanup, and resolution excludes the row until the retirement completes. |
 | Crash between a delete tombstone and its unlink | The row stays non-playable throughout; the recovery pass re-attempts the idempotent unlink for tombstoned rows that still record a path. |
-| First-load v1→v2 `servers.json` replacement fails after a successful rename but before the parent-directory `fsync` | The destination names the already-durable v2 file; the error is reported and the rename is not rolled back. The next load validates v2 as-is and never re-mints; if a power loss reverted the not-yet-synced directory entry, it reads the intact v1 file and re-runs the same idempotent replacement. Both complete states carry each row's deterministic `SourceIncarnationId`, so no source is dropped, no incarnation is re-minted, and no data is lost. |
+| Power loss rolls back a retirement-sweep deletion — a sweep unlink or directory removal whose directory entry was not yet durable (on Windows, any sweep deletion before the cache root's absence is established) | No stranding: the metadata drop is ordered after the bottom-up deletion barrier of the retirement sweep (on Windows, withheld until the absent-or-empty cache root is verified), and the durable retirement marker stands until that final drop, so every surviving file remains attributed by the intact metadata and the retirement restarts idempotently from the row walk. |
+| First-load v1→v2 `servers.json` replacement fails after a successful rename but before the parent-directory `fsync` | The destination names the already-durable v2 file; the error is reported and the rename is not rolled back. The next load validates v2 as-is and never re-mints; if a power loss reverted the not-yet-synced directory entry, it reads the intact v1 file and re-runs the same idempotent replacement. Both complete states carry each row's backfilled `SourceIncarnationId`, so no source is dropped, no incarnation is re-minted, and no data is lost. |
 
 ## Migration plan
 
@@ -1579,7 +1622,8 @@ every pre-existing saved source. The exact schema, indexes, and triggers
 are deliberately left for the implementation record. The migration:
 
 1. Creates the cache table keyed by the derived cache key
-   (`source_key`, `track_key`, `snapshot_key`) — an identity in its own
+   (`source_key`, `track_key`, `snapshot_key`) and carrying the owning
+   `SourceIncarnationId` as a required column — an identity in its own
    right, **not** a strict foreign key on `tracks(id)`. A nullable advisory
    link to `tracks(id)` may exist for UI join convenience, but the cache
    row must remain valid when the track's catalogue row is absent,
@@ -1609,13 +1653,17 @@ are deliberately left for the implementation record. The migration:
 5. Backfills a durable `SourceIncarnationId` for every pre-existing saved
    source that lacks one, under the first-load rule of
    [restart authorization](#authenticated-resumable-download-jobs): the
-   value is assigned once, derived stably from the row's durable identity,
-   and persisted durably as that row's `source_incarnation` field through
+    value is assigned once, derived stably from the row's durable identity
+    — the one derivation this contract permits, scoped to this backfill —
+    and persisted durably as that row's `source_incarnation` field through
    the atomic v1→v2 saved-source envelope replacement described there —
    never by adding a field to the strict v1 row — so the first restart
    after the upgrade preserves each source's incarnation and a resumed job
-   still rebinds. The backfill is idempotent and re-mints nothing for a
-   source that already holds an incarnation. Before the rename a failed
+    still rebinds. The backfill is idempotent and re-mints nothing for a
+    source that already holds an incarnation; every post-migration
+    replacement mints a fresh persisted non-derived value instead, so
+    reverted identity fields cannot resurrect a retired incarnation.
+    Before the rename a failed
    replacement preserves the original v1 configuration and publishes no
    rows; after a successful rename a failed directory-entry `fsync` leaves
    the destination naming the already-durable v2 file and resolves under
@@ -1638,16 +1686,17 @@ Each slice lands with its own focused regression suite. The slices are:
 
 | Slice | Coverage |
 | --- | --- |
-| Identity | Same `SourceId` + `TrackId` semantics as live; no second identity kind minted. Derived cache keys: fixed hex charset and width, no separators or traversal, byte-exact identifier input. |
+| Identity | Same `SourceId` + `TrackId` semantics as live; no second identity kind minted. Derived cache keys: fixed hex charset and width, no separators or traversal, byte-exact identifier input. A committed row resolves only under a matching recorded owning incarnation: a re-registered source never resolves predecessor bytes, and a mismatched row is excluded from resolution and retired by the staged delete. |
 | Capability | Default-deny behaviour for adapters that opt out; Subsonic/Jellyfin/Plex/DAAP opt in. |
 | Resumable job | Bounded, `If-Range`-validated range requests; `200`/`412` restarts from zero; journal survives crash (offset truncation, last-segment digest re-check); segment bytes durable before journal progress and bounded by the remaining quota allowance — payload plus the bounded journal/sidecar record that certifies it — reserved atomically from the same-process global total before each append (and, for a declared-length response, its whole not-yet-durable payload plus the bounded segment metadata it can grow reserved at admission), while the job's single lifecycle reservation is charged once before its first byte and held across appends, cancellation, and deferred cleanup — so concurrent jobs cannot both spend the same free global quota, journal/sidecar metadata is charged and is never an uncharged durable write, and any unused payload-and-segment reservation (payload not received and records never written) is released exactly once on a short, failed, or cancelled receive, with the single lifecycle reservation sized to the whole bounded publish-attempt budget and released only at terminal cleanup, so repeated intent-before-rename crashes at the exact quota boundary cannot outgrow it or make an uncharged lifecycle write while an exhausted budget resolves as the `PublishRetriesExhausted` safe refusal — so durable payload never exceeds the per-track payload cap and durable payload plus its charged metadata never exceeds the global total; a bounded read that fills the reservation exactly is accepted as end-of-stream unless a non-durable probe finds further payload, so an exact-cap response is not misreported as `QuotaExceeded`; a short-file or digest-mismatch recovery restarts from zero without trusting the offset; no-validator jobs restart only; a crash mid-sidecar-append is resolved before any resume or competitor admission — the record tail, whether a torn partial record or a full-length frame whose body fails its per-record checksum, is truncated to the framing-and-checksum-validated prefix or, when truncation cannot be made durable, charged at its physical length until reclaimable, with the full-length torn-frame case exercised so a corrupted frame is never admitted as lifecycle state — and an unreadable or untruncatable sidecar fails admission closed. |
-| Restart authorization | Lease reacquisition, resumption, and publish-intent adoption all rebind by durable `SourceId` + `SourceIncarnationId`, never by a transient generation number, and both resumption and adoption revalidate current authority — capability, licence, and validator against the source's accepted generation — rather than trusting a durable identity and the absence of a persisted revocation. A valid restart on the same durable incarnation with a changed transient generation authorizes and resumes; a replaced incarnation, even one whose transient generation recycles the job's recorded `capability_epoch`, does not authorize and terminates; a backend-side revocation that left no durable record refuses adoption; an unestablishable current generation defers non-destructively. An adoption's playable insert acquires an exact session commit authority atomically after the platform publication barrier and retains it across the idempotent insert, and the ordinary step-6 commit uses that same authority boundary at the row insert; staleness before admission rejects non-destructively with no row and the pending intent retained, and replacement or shutdown after admission waits. Pre-existing saved sources receive one stable, persisted incarnation at first load and keep it across restart (no re-mint per load, no spurious replacement), and the saved-source format migrates from v1 to the v2 envelope by an atomic durable replacement — Unix temp-file `fsync`, same-directory `rename`, parent-directory `fsync`, with a `fsync` failure propagated rather than swallowed — that is idempotent across retry and concurrent load, returns an error before the rename with the original v1 file intact and no rows published, and after a successful rename with a failed parent-directory `fsync` leaves the destination naming the already-durable v2 file — reported, never described as rolled back — under the two-complete-states guarantee (original v1 if a power loss reverts the entry, otherwise v2) that preserves each row's deterministic incarnation, no re-mint and no data loss; it re-loads a v2 file without re-minting, re-replaces a v1 file, and lets a strict v1 loader quarantine an unknown-version envelope in place without data loss. No lease handle or credential is persisted. |
+| Restart authorization | Lease reacquisition, resumption, and publish-intent adoption all rebind by durable `SourceId` + `SourceIncarnationId`, never by a transient generation number, and both resumption and adoption revalidate current authority — capability, licence, and validator against the source's accepted generation — rather than trusting a durable identity and the absence of a persisted revocation. A valid restart on the same durable incarnation with a changed transient generation authorizes and resumes; a replaced incarnation, even one whose transient generation recycles the job's recorded `capability_epoch`, does not authorize and terminates; a backend-side revocation that left no durable record refuses adoption; an unestablishable current generation defers non-destructively. An adoption's playable insert acquires an exact session commit authority atomically after the platform publication barrier and retains it across the idempotent insert, and the ordinary step-6 commit uses that same authority boundary at the row insert; staleness before admission rejects non-destructively with no row and the pending intent retained, and replacement or shutdown after admission waits. Pre-existing saved sources receive one stable, persisted incarnation at first load and keep it across restart (no re-mint per load, no spurious replacement); every later replacement mints a fresh persisted non-derived value so reverted identity fields cannot resurrect a retired incarnation (the ABA case), and the saved-source format migrates from v1 to the v2 envelope by an atomic durable replacement — Unix temp-file `fsync`, same-directory `rename`, parent-directory `fsync`, with a `fsync` failure propagated rather than swallowed — that is idempotent across retry and concurrent load, returns an error before the rename with the original v1 file intact and no rows published, and after a successful rename with a failed parent-directory `fsync` leaves the destination naming the already-durable v2 file — reported, never described as rolled back — under the two-complete-states guarantee (original v1 if a power loss reverts the entry, otherwise v2) that preserves each row's deterministic incarnation, no re-mint and no data loss; it re-loads a v2 file without re-minting, re-replaces a v1 file, and lets a strict v1 loader quarantine an unknown-version envelope in place without data loss. No lease handle or credential is persisted. |
 | Atomic storage | Same-directory temp reservation (missing ancestors created at reservation); verify-before-publish ordering; same-filesystem rename; cross-filesystem publish refused. Unix validation lane: the complete ancestor chain is re-derived from the recorded final path and re-synced top-down, idempotently, before the rename on every attempt — including after a crash that happened before the previous process ran the pass — and the rename-to-commit chain is ordered behind it. Windows validation lane: the documented `FlushFileBuffers` + `MOVEFILE_WRITE_THROUGH` barrier on the published file, and missing-path recovery — never served, marked non-playable and recoverable, a fresh job may republish — including the combined pending-intent + committed-row + unresolvable-path case. Both lanes: publish-intent recovery across every kill point of the crash-point matrix, including the crash-before-directory-sync and power-loss rows, repeated intent-before-rename crashes to the bounded publish-attempt budget and its `PublishRetriesExhausted` safe refusal, the verdict-first post-rename terminal transition, its adoption gates (including the current-authority revalidation of capability, licence, and validator against the source's accepted generation), the atomic commit-authority acquisition at the final admission after the publication barrier, and committed-row recognition with a revocation or incarnation replacement landing after the commit, before recovery. The ordinary step-6 commit acquires the same exact session commit authority immediately before the row insert and retains it through the idempotent insert and the intent clear, so a replacement, disconnect, retirement, shutdown, capability withdrawal, or licence revocation winning between admission and the commit refuses promotion — no row, no intent clear — instead of letting a stale job become playable. A pass blocked on current authority, the commit-authority admission, or a platform barrier defers non-destructively and leaves the durable owner in place, so an authority-blocked, durably owned file may survive multiple passes and is never resolved by destructive cleanup. |
 | Digest provenance | Advertised digest compared exactly; double-fetch fallback equality; no-tier backends fail `IntegrityUnverifiable` before publish. |
 | Credential boundary | No credential in metadata, file name, sidecar, log, or GTK row. Isolation scope per `task-remediation-2026-07.md` P1.6; redaction mechanics per P1.4. |
 | Redirect policy | Per `task-remediation-2026-07.md` P1.4 matrix; HTTPS-only, no `Referer`, no HTTPS→HTTP downgrade. |
 | Licensing | Default-deny; revocation retires rows but preserves files. |
 | Reconciliation | Refresh creates a sibling with its own snapshot-scoped path; no in-place mutation; staged-delete unlink with idempotent recovery. |
+| Retirement | Quiesce → row walk (staged deletes) → bounded root sweep with the bottom-up, idempotent deletion barrier → metadata drop ordered after the barrier under the durable retirement marker; an interrupted retirement restarts from the row walk; on Windows the drop is withheld until the cache root's absent-or-empty verification; no file outlives its attribution. |
 | Cancellation | Lifecycle supersession cancels in-flight jobs; a cancel landing in the rename-to-commit window follows the verdict-first post-rename terminal rule and is never adopted as playable. |
 | Quota and eviction | Quota accounting covers committed bytes, in-flight temps, published-but-uncommitted pending-intent files, durable journal/sidecar metadata, and every reservation — declared-length and unknown-length alike — charged against the same same-process global total. The per-track cap is a payload limit: it is enforced at admission (a declared total that exceeds it fails) and on the verified payload size before the rename, so data crossing the cap fails before any further byte is durable and no published-but-uncommitted file ever exceeds the cap. Separately, the global total must cover every engine-owned byte. Before its first byte a job atomically charges its single lifecycle reservation, sized to the whole bounded publish-attempt budget, from that global total, and at admission a declared-length job additionally reserves its not-yet-durable declared payload plus the bounded segment metadata it can grow — failing `QuotaExceeded` when the free global quota cannot cover the combined reservation — while an unknown-length response reserves, before each append, the largest payload `P` such that `P ≤ remaining per-track cap` and `P + metadata(P) ≤ free global quota` (the lifecycle reservation already held, so it is not re-charged), bounding that append to `P` — so two concurrent jobs cannot both reserve the same free global quota, metadata is charged rather than written uncharged, an unused payload-and-segment remainder is released exactly once on a short, failed, or cancelled receive, the lifecycle reservation is sized to the bounded attempt budget, retained across appends and retries, and released only at terminal cleanup, durable payload never exceeds the cap, and durable payload plus its charged metadata never exceeds the global total. On restart the durable journal bytes are re-charged and the still-unwritten lifecycle obligation is reconstructed from the durable attempt counter, bounded by the same budget, as a reservation before any competing job is admitted. Restart also validates each sidecar's record prefix by framing and per-record checksum and resolves a mid-append casualty — a torn partial tail or a full-length frame whose body fails its checksum — durably truncated, or charged at its physical length until reclaimable, failing admission closed when the sidecar can neither be read, validated, nor truncated — before any competing job is admitted, segment and lifecycle records alike, including the zero-free-quota crash-mid-sidecar-append case with a competitor admitted only after the pass. A job that cannot cover the next segment record fails `QuotaExceeded` before that record is written, while the budget-sized lifecycle reservation keeps every mandatory intent, clear, verdict, and exhaustion record writable, and metadata already durable is released on terminal cleanup so admission and eviction accounting agree. A bounded read that fills the reservation exactly is accepted as end-of-stream when no further payload exists (the retained end-of-stream signal, or a non-durable one-byte probe), so an exact-cap response passes the verified-size check instead of failing `QuotaExceeded`. Eviction walks sources oldest-cache-first, newest-first within a source; staged tombstone-then-unlink; recovery completes interrupted deletes. |
 | UI | Credential-free GTK rows; localised progress and failure. |
@@ -1699,7 +1748,12 @@ When the project eventually retires the offline subsystem, retirement is an
 ordered, two-phase operation: every on-disk media file is reconciled while
 the cache rows that own it still exist, and only then is the metadata
 dropped. The order is normative — the follower migration never destroys the
-`MediaKey` → cache-path mapping while an owning file may still exist:
+`MediaKey` → cache-path mapping while an owning file may still exist.
+Retirement first appends a durable retirement marker to the offline
+metadata — an `fsync`'d record naming the retirement and the cache root —
+and clears it only in the final drop transaction, so an interruption at
+any point leaves the metadata that attributes whatever is still on disk,
+and the retirement restarts idempotently from the row walk:
 
 1. **Quiesce admission and drain jobs.** The offline capability is withdrawn
    first: no new download is admitted, and every in-flight job is driven to
@@ -1717,22 +1771,42 @@ dropped. The order is normative — the follower migration never destroys the
    already-missing file succeeds; the row is tombstoned all the same. A
    crash-orphaned file left by an interrupted unlink is absorbed by the
    bounded root sweep of step 3.
-3. **Sweep the engine-owned cache root.** After the row walk, the engine
-   unlinks every remaining file inside `<cache_root>` — crash-orphaned
-   `<final_name>.part-<job-id>` temps among them — and removes the
-   now-empty `<source_key>/<track_key>/<snapshot_key>/` directories it
-   created. Nothing outside the cache root is touched.
-4. **Drop the metadata.** Only when no owning row remains does the follower
-   migration drop the offline tables, indexes, and triggers in one
+3. **Sweep the engine-owned cache root, then make the sweep durable.**
+   After the row walk, the engine unlinks every remaining file inside
+   `<cache_root>` — crash-orphaned `<final_name>.part-<job-id>` temps
+   among them — and removes the now-empty
+   `<source_key>/<track_key>/<snapshot_key>/` directories it created,
+   children before parents. Nothing outside the cache root is touched.
+   The sweep then runs the durability discipline of step 5 of
+   [Atomic storage](#atomic-storage) in reverse: every modified parent
+   directory is `fsync`'d, bottom-up along the complete ancestor chain to
+   and including `<cache_root>`, idempotently, re-derived from the
+   cache-root layout rather than from the sweeping process's memory. Only
+   when that deletion barrier has completed is the sweep durable. On
+   Windows, which documents no directory-entry deletion barrier, the
+   engine does not claim one: the metadata drop below is withheld, and
+   the retirement marker and the emptied tables persist — a bounded,
+   credential-free attribution record — until a later maintenance pass
+   verifies the cache root absent or empty across a full startup
+   enumeration after the operator has removed it, the deletion-durability
+   evidence Windows can actually establish.
+4. **Drop the metadata.** Only when no owning row remains and the deletion
+   barrier of step 3 has completed — or, on Windows, its absent-cache-root
+   evidence has been established — does the follower migration drop the
+   offline tables, indexes, triggers, and the retirement marker in one
    transaction, mirroring the forward migration's reversibility: any error
    restores the predecessor schema and data so the retirement remains
    retryable.
 
 Because a file is only ever unlinked while the row naming it is queryable —
 as a live row or as a durable tombstone — or inside the bounded root sweep,
-retirement cannot strand media that no remaining metadata can attribute, and
-it cannot delete anything the offline subsystem does not own. No live
-production path depends on the offline machinery existing.
+and because the metadata drop is ordered after the deletion barrier (or, on
+Windows, after the absent-cache-root evidence above) while the durable
+retirement marker stands, a power loss can never roll a deletion back past
+the metadata that names it: retirement cannot strand media that no
+remaining metadata can attribute, and it cannot delete anything the offline
+subsystem does not own. No live production path depends on the offline
+machinery existing.
 
 ## See also
 
