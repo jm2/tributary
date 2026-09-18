@@ -25,13 +25,19 @@ keys they tuned were removed from the pack as well. The live completion gate
 is the guarded reconciler `.gc/operations/reconcile.py`, run every five
 minutes by the `tributary-reconcile` order. It polls GitHub's
 `statusCheckRollup` per open PR head and is **deadline-free and fail-closed**:
-checks still running simply park the bead as pending until they conclude,
-an empty rollup never reads as green, and any failure conclusion routes the
-bead back to the polecat pool as rework. There is no deadline at which a
-pending branch can be wrongly rejected, and no check-name allowlist — every
-check observed on the head (required or advisory) must be completed and
-green, which is the machine enforcement of the all-green operator policy
-below.
+any failure-class conclusion on any observed check routes the bead back to
+the polecat pool as rework, and an empty rollup never reads as green. Checks
+still running park the bead as pending — but only when the unfinished check
+is a *gating* one: the main-branch ruleset's required contexts plus the two
+city gates (`Codacy Static Code Analysis`, `Coverage (Linux x86_64)`).
+Queued advisory jobs such as `SHA256 Checksums` — which GitHub's
+per-account Actions concurrency cap can hold for an hour or more — do not
+delay review or an operator landing that the ruleset itself would allow.
+There is no deadline at which a pending branch can be wrongly rejected.
+This gate is **not** the machine enforcement of the all-green operator
+policy below: that 2026-09-03 policy is historical. The live gate is
+name-sensitive in exactly one place — the required ∪ city gating set —
+and reworks on any failure anywhere.
 
 Verification against the live rig, including the exact ruleset-required
 check contexts and fresh dry-run decisions, is recorded in
@@ -62,10 +68,13 @@ Audit, Linux (x86_64), Linux (aarch64), macOS (aarch64), Windows (x86_64),
 Flatpak (Linux), and MSRV — and no reviews. Coverage, CodeQL, Codacy Static
 Code Analysis, CodeRabbit, Windows (aarch64), and every bot review are
 advisory as far as the repository is concerned: GitHub will merge without
-them. Until the ruleset is widened, the all-green rule is enforced by the
-refinery's own fail-closed check polling (which observes every check on the
-head, required or not) and by review discipline — not by the repository
-refusing the merge.
+them. Until the ruleset is widened, the gap between the policy and the
+machine gate persists: the live reconciler (verified 2026-09-17) scans every
+check on the head for failure conclusions, but its pending set is only the
+ruleset-required contexts plus the two city gates — an unfinished advisory
+check (CodeRabbit, Windows (aarch64), Desktop Metadata, `SHA256 Checksums`)
+no longer delays it, and the all-green rule above remains operator policy
+enforced by review discipline, not by the repository refusing the merge.
 
 **Routine auto-merge stays off until the live gate matches the policy.** The
 `dependabot-automerge` workflow enables GitHub native auto-merge on clean
