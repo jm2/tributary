@@ -3498,11 +3498,7 @@ mod tests {
         let live = LastFmLivePolicy::default();
         live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
         let activation = binding
-            .activate(
-                ingress,
-                tokio::runtime::Handle::current(),
-                live,
-            )
+            .activate(ingress, tokio::runtime::Handle::current(), live)
             .expect("activate with genuine claimed runtime ingress");
         let generation = PlayerEventGeneration::from_raw(80);
         assert_eq!(
@@ -3719,7 +3715,11 @@ mod tests {
         let live = LastFmLivePolicy::default();
         live.publish(LastFmPolicyGeneration::for_test(1, enabled));
         let activation = binding
-            .activate_with_runtime_port(Box::new(port.clone()), test_completion_runtime(), live.clone())
+            .activate_with_runtime_port(
+                Box::new(port.clone()),
+                test_completion_runtime(),
+                live.clone(),
+            )
             .expect("activate with live generation");
         // Capture an exact source proof under live generation 1.
         let reference = source_registry
@@ -3750,7 +3750,10 @@ mod tests {
         assert!(
             source_registry
                 .mint_session_playback_source(
-                    MediaKey::new(source_id, TrackId::remote("stale-generation-track").expect("valid remote track id")),
+                    MediaKey::new(
+                        source_id,
+                        TrackId::remote("stale-generation-track").expect("valid remote track id")
+                    ),
                     session_epoch,
                     &HashSet::new(),
                 )
@@ -3769,7 +3772,8 @@ mod tests {
     #[tokio::test]
     async fn re_enabling_the_source_never_retroactively_attributes_a_stale_capture() {
         let source_registry = SourceRegistry::new(tokio::runtime::Handle::current());
-        let track_id = TrackId::remote("re-enabled-generation-track").expect("valid remote track id");
+        let track_id =
+            TrackId::remote("re-enabled-generation-track").expect("valid remote track id");
         let profile = PlaybackAttributionProfile::for_test(
             "Fixture Title",
             "Fixture Artist",
@@ -3787,9 +3791,16 @@ mod tests {
             .expect("bind coordinator window");
         let port = RecordingRuntimePort::default();
         let live = LastFmLivePolicy::default();
-        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::from([source_id])));
+        live.publish(LastFmPolicyGeneration::for_test(
+            1,
+            HashSet::from([source_id]),
+        ));
         let activation = binding
-            .activate_with_runtime_port(Box::new(port.clone()), test_completion_runtime(), live.clone())
+            .activate_with_runtime_port(
+                Box::new(port.clone()),
+                test_completion_runtime(),
+                live.clone(),
+            )
             .expect("activate with live generation");
         let reference = source_registry
             .mint_session_playback_source(
@@ -3813,7 +3824,10 @@ mod tests {
         // re-enabling must not retroactively authorize it at either the
         // capture or the dispatch boundary.
         live.publish(LastFmPolicyGeneration::for_test(2, HashSet::new()));
-        live.publish(LastFmPolicyGeneration::for_test(3, HashSet::from([source_id])));
+        live.publish(LastFmPolicyGeneration::for_test(
+            3,
+            HashSet::from([source_id]),
+        ));
         let stale_attempt = PlayerEventGeneration::from_raw(94);
         assert_eq!(
             binding.accept_output_load_lazy(
