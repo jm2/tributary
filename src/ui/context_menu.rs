@@ -3738,12 +3738,25 @@ pub mod tests {
                 "each drop must reach the row under the pointer, in payload order"
             );
 
-            // Noneditable rows refuse without reaching the mutation sink.
-            assert!(!e(1, &value));
-            assert!(!e(3, &value));
-            // A cancelled or unrelated drag carries no playlist payload.
+            // Noneditable rows refuse without reaching the mutation sink;
+            // a cancelled or unrelated drag carries no playlist payload.
+            self.assert_refusals_leave_the_sink_untouched(&e, &value);
+        }
+
+        /// The refusal tail of the routing contract: the noneditable rows
+        /// (smart playlist, header) refuse the track drag without reaching
+        /// the mutation sink, a cancelled or unrelated drag carries no
+        /// playlist payload and is declined as well, and only the two
+        /// accepted drops above may have mutated a playlist.
+        fn assert_refusals_leave_the_sink_untouched(
+            &self,
+            emit: &impl Fn(usize, &glib::Value) -> bool,
+            payload_value: &glib::Value,
+        ) {
+            assert!(!emit(1, payload_value));
+            assert!(!emit(3, payload_value));
             let unrelated = "playlist-reorder".to_value();
-            assert!(!e(0, &unrelated));
+            assert!(!emit(0, &unrelated));
             assert_eq!(
                 self.dropped.borrow().len(),
                 2,
@@ -3777,6 +3790,20 @@ pub mod tests {
         use glib::translate::ToGlibPtr;
 
         let mut result: glib::ffi::gboolean = glib::ffi::GFALSE;
+        // SAFETY (audited): the FFI surface is one synchronous call.
+        // - `drop_target.as_ptr()` borrows a valid, fully-initialized
+        //   GtkDropTarget GObject that outlives the call.
+        // - The "drop" signal exists on GtkDropTarget with the signature
+        //   (GValue, double, double) -> bool, so the argument list and the
+        //   out-location below match the C marshaler's expectations.
+        // - `value` is borrowed only for the duration of the emission: the
+        //   emission is synchronous on this thread, GObject passes the
+        //   argument GValues to the installed handlers by reference during
+        //   that call, and `value` outlives the call, so no aliasing
+        //   escapes it.
+        // - `glib::gobject_ffi::GObject` and the GValue passed have the
+        //   layouts GLib guarantees; the cast is the same one glib-rs'
+        //   own signal emission performs internally.
         unsafe {
             glib::gobject_ffi::g_signal_emit_by_name(
                 drop_target.as_ptr().cast::<glib::gobject_ffi::GObject>(),
