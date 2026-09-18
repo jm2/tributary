@@ -13327,8 +13327,7 @@ mod tests {
     ) -> Q4StartupTimeline {
         let mut timeline = Q4StartupTimeline::default();
         loop {
-            let elapsed_us = start.elapsed().as_micros() as u64;
-            let next = tokio::select! {
+            tokio::select! {
                 biased;
                 ack = flush_rx.recv() => {
                     assert!(ack.is_ok(), "Flush barrier must be acknowledged");
@@ -13336,10 +13335,15 @@ mod tests {
                     break;
                 }
                 event = event_rx.recv() => {
-                    event.expect("engine event channel stays open until flush")
+                    let event = event.expect("engine event channel stays open until flush");
+                    // Stamp arrival, not wait start: sampling before the
+                    // select! would record every event with the previous
+                    // iteration's time and underreport the startup endpoints
+                    // whenever the loop blocked on an empty channel.
+                    let elapsed_us = start.elapsed().as_micros() as u64;
+                    timeline.record(&event, elapsed_us, command_track);
                 }
-            };
-            timeline.record(&next, elapsed_us, command_track);
+            }
         }
         // The command event was published before the flush ack, so a
         // bounded non-blocking drain settles any remaining race.
@@ -13348,6 +13352,78 @@ mod tests {
             timeline.record(&event, elapsed_us, command_track);
         }
         timeline
+    }
+
+    /// Regression (PR #291 review Correction 1): the startup-timeline
+    /// sampler must stamp each event when it ARRIVES, not when the
+    /// `select!` wait began. Feed two events at known post-entry delays
+    /// and require the recorded `*_us` values to reflect those delays —
+    /// the defective sampler stamped the first event with ~0 µs (loop
+    /// entry) because it sampled before blocking on the empty channel.
+    /// Cheap by construction: no fixture tree, no engine, no `#[ignore]`.
+    #[tokio::test]
+    async fn q4_startup_timeline_stamps_arrival_not_wait_start() {
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (flush_tx, flush_rx) = async_channel::bounded(1);
+        const FIRST_DELAY_MS: u64 = 60;
+        const SECOND_DELAY_MS: u64 = 140;
+        let start = std::time::Instant::now();
+        let feeder = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(FIRST_DELAY_MS)).await;
+            event_tx
+                .send(LibraryEvent::ScanComplete)
+                .await
+                .expect("send first timed event");
+            tokio::time::sleep(std::time::Duration::from_millis(
+                SECOND_DELAY_MS - FIRST_DELAY_MS,
+            ))
+            .await;
+            event_tx
+                .send(LibraryEvent::FullSync(Vec::new()))
+                .await
+                .expect("send second timed event");
+            flush_tx.send(()).await.expect("ack the flush barrier");
+        });
+        let timeline = q4_collect_startup_timeline(
+            &event_rx,
+            flush_rx,
+            "q4-timing-test-no-command-track",
+            start,
+        )
+        .await;
+        feeder.await.expect("feeder task completes");
+
+        // Both stamps are sampled after `recv()` resolves, so each is at
+        // least its feeder delay measured from `start` (captured before the
+        // feeder spawned; tokio sleeps never fire early).
+        let scan_complete_us = timeline
+            .scan_complete_us
+            .expect("ScanComplete recorded with arrival stamp");
+        let fullsync_us = timeline
+            .fullsync_us
+            .expect("FullSync recorded with arrival stamp");
+        assert!(
+            scan_complete_us >= FIRST_DELAY_MS * 1_000,
+            "ScanComplete must be stamped at arrival (>= {FIRST_DELAY_MS} ms), got {scan_complete_us} us"
+        );
+        assert!(
+            fullsync_us >= SECOND_DELAY_MS * 1_000,
+            "FullSync must be stamped at arrival (>= {SECOND_DELAY_MS} ms), got {fullsync_us} us"
+        );
+        assert!(
+            fullsync_us > scan_complete_us,
+            "arrival stamps must be strictly monotonic across events"
+        );
+        // The flush send happens after the second feeder sleep, so its
+        // stamp is floored at the second delay. It may legitimately land
+        // BEFORE the FullSync stamp: under `biased;` the flush arm wins
+        // when both channels are ready and the drain loop then stamps the
+        // already-queued event — still at its own receipt, just later.
+        let flush_ack_us = timeline.flush_ack_us.expect("flush ack recorded");
+        assert!(
+            flush_ack_us >= SECOND_DELAY_MS * 1_000,
+            "the flush ack must be stamped at its own arrival (>= {SECOND_DELAY_MS} ms), got {flush_ack_us} us"
+        );
     }
 
     /// Q4 measurement: production engine startup on a sized fixture tree,
