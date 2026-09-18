@@ -658,6 +658,37 @@ class BacklogConsistencyTests(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("broken link target 'missing.md'", problems[0])
 
+    def test_definition_with_angle_destination_resolves(self):
+        root = self.make_root()
+        self.write(root, "docs/user guide.md", "# User guide\n")
+        guide = self.write(
+            root, "docs/guide.md", "[guide]: <user guide.md>\nSee [the guide][guide].\n"
+        )
+        self.assertEqual(checker.check_links(root, [guide]), [])
+
+    def test_definition_with_broken_angle_destination_is_reported(self):
+        root = self.make_root()
+        guide = self.write(
+            root, "docs/guide.md", "[guide]: <missing file.md>\nSee [the guide][guide].\n"
+        )
+        problems = checker.check_links(root, [guide])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("broken link target 'missing file.md'", problems[0])
+
+    def test_close_fence_allows_trailing_tab(self):
+        # CommonMark permits trailing whitespace including tabs on the closing
+        # fence; only spaces used to be accepted, which left the fence open
+        # and swallowed every following record, heading and link.
+        root = self.make_root()
+        page = self.write(
+            root,
+            "docs/guide.md",
+            "```markdown\nfenced [x](missing.md)\n```\t\n[after](missing.md)\n",
+        )
+        problems = checker.check_links(root, [page])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("broken link target 'missing.md'", problems[0])
+
     # ── fence tracking (rework finding F3) ───────────────────────────────────
     def test_longer_backtick_fence_keeps_inner_content_literal(self):
         # A four-backtick fence is not closed by the triple-backtick pair

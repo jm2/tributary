@@ -51,8 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "not yet published"), merged-but-unreconciled records, and stale review heads from a
   ledger snapshot. It never edits the index, closes a parent record, or assigns a
   worker. The checker reports a top-level checkbox without a stable ID instead of
-  silently skipping it, resolves angle-bracket link destinations that contain spaces,
-  tracks fenced code blocks by delimiter character and run length, requires link
+  silently skipping it, resolves angle-bracket link destinations that contain spaces
+  (inline links and reference definitions), tracks fenced code blocks by delimiter
+  character and run length (closing fences may carry trailing tabs), requires link
   targets to stay inside the repository root (including through symlinks), and
   enumerates only tracked Markdown files in a Git checkout (falling back to a
   recursive walk outside Git); exit `2` for a missing task index or ledger snapshot

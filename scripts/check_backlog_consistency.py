@@ -62,7 +62,7 @@ INLINE_LINK = re.compile(
     r"(?:<(?P<angled>[^<>]*)>|(?P<plain>[^)\s]+))"
     r"(?:\s+\"[^\"]*\")?\s*\)"
 )
-DEFINITION_LINK = re.compile(r"^\[(?P<label>[^\]]+)\]:\s*(?P<target>\S+)")
+DEFINITION_LINK = re.compile(r"^\[(?P<label>[^\]]+)\]:\s*(?P<target><[^<>]*>|\S+)")
 HEADING = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<title>.*?)\s*#*\s*$")
 ABSOLUTE_TARGET = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 
@@ -164,7 +164,8 @@ def iter_content_lines(text: str) -> Iterable[tuple[int, str]]:
             fence_len = len(opening.group("fence"))
             continue
         closing = re.fullmatch(
-            r" {0,3}" + re.escape(fence_char) + r"{" + str(fence_len) + r",} *", line
+            r" {0,3}" + re.escape(fence_char) + r"{" + str(fence_len) + r",}[ \t]*",
+            line,
         )
         if closing is not None:
             fence_char = None
@@ -284,7 +285,12 @@ def iter_link_targets(line: str) -> Iterable[str]:
             yield target
     definition = DEFINITION_LINK.match(line)
     if definition:
-        yield definition.group("target")
+        target = definition.group("target")
+        if target.startswith("<") and target.endswith(">"):
+            # An angle-bracketed definition destination may contain spaces;
+            # the brackets are Markdown syntax, not part of the path.
+            target = target[1:-1]
+        yield target
 
 
 def split_target(target: str) -> tuple[str | None, str]:
