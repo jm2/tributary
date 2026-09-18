@@ -39,8 +39,11 @@ struct LibraryCache {
     track_by_uuid: HashMap<Uuid, usize>,
     /// Tributary UUID → DAAP item ID.
     track_to_daap_id: HashMap<Uuid, u32>,
-    /// DAAP item ID → validated stream format for exact at-use resolution.
-    format_by_daap_id: HashMap<u32, String>,
+    /// DAAP item ID → server-declared stream format. The raw `Option` is
+    /// preserved: `None` means the server never declared `asfm`, and the
+    /// resolved representation must stay explicitly unknown instead of
+    /// inheriting a guessed default (issue #255).
+    format_by_daap_id: HashMap<u32, Option<String>>,
 }
 
 impl LibraryCache {
@@ -134,7 +137,7 @@ impl DaapBackend {
             let disc_number = dmap::find_u16(nodes, b"asdn");
             let genre = dmap::find_string(nodes, b"asgn");
             let year = dmap::find_u16(nodes, b"asyr");
-            let format = dmap::find_string(nodes, b"asfm").unwrap_or_else(|| "mp3".to_string());
+            let format = dmap::find_string(nodes, b"asfm");
             remember_track_format(&mut format_by_daap_id, daap_id, format.clone())?;
             let bitrate = dmap::find_u16(nodes, b"asbr");
             let sample_rate = dmap::find_u32(nodes, b"assr");
@@ -174,7 +177,7 @@ impl DaapBackend {
                 date_modified,
                 bitrate_kbps: bitrate.map(u32::from),
                 sample_rate_hz: sample_rate,
-                format: Some(format.clone()),
+                format,
                 play_count: None,
                 rating: TrackRating::unsupported(),
                 last_played: None,
@@ -274,7 +277,8 @@ impl DaapBackend {
             .format_by_daap_id
             .get(&song_id)
             .ok_or_else(unavailable_catalogue)?;
-        self.client.stream_request(scope, song_id, format)
+        self.client
+            .stream_request(scope, song_id, format.as_deref())
     }
 
     async fn artwork_request_for_native_id(
@@ -308,7 +312,7 @@ impl DaapBackend {
                     id: *track_id,
                 })?;
         let idx = cache.track_by_uuid[track_id];
-        let format = cache.tracks[idx].format.as_deref().unwrap_or("mp3");
+        let format = cache.tracks[idx].format.as_deref();
         let scope = cache.scope.ok_or_else(unavailable_catalogue)?;
         self.client.stream_request(scope, *song_id, format)
     }
@@ -336,9 +340,9 @@ fn unavailable_catalogue() -> BackendError {
 /// silently overwriting it could bind catalogue metadata to another row's
 /// stream, so reject the complete candidate catalogue before publication.
 fn remember_track_format(
-    formats: &mut HashMap<u32, String>,
+    formats: &mut HashMap<u32, Option<String>>,
     daap_id: u32,
-    format: String,
+    format: Option<String>,
 ) -> BackendResult<()> {
     if formats.contains_key(&daap_id) {
         return Err(BackendError::ParseError {
@@ -538,13 +542,95 @@ fn deterministic_uuid_from_name(name: &str) -> Uuid {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::architecture::media::{MediaContainer, MediaRepresentation};
+
+    /// A backend whose cache holds exactly what catalogue ingest would store
+    /// for one track with the given server-declared `asfm` (`None` when the
+    /// server never declared one). Resolution-site methods build requests
+    /// offline; no network is involved.
+    fn backend_with_declared_format(song_id: u32, format: Option<&str>) -> DaapBackend {
+        let mut cache = LibraryCache::empty();
+        cache.scope = Some(DaapCatalogueScope::for_adapter_tests());
+        cache
+            .format_by_daap_id
+            .insert(song_id, format.map(str::to_string));
+        DaapBackend {
+            display_name: "descriptor fixture".to_string(),
+            client: DaapClient::for_adapter_tests("http://198.51.100.10:3689/"),
+            cache: RwLock::new(cache),
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_allowlisted_format_resolves_to_the_matching_descriptor() {
+        let backend = backend_with_declared_format(7, Some("flac"));
+        let track_id = TrackId::remote("7").expect("track id");
+
+        let request = backend
+            .stream_request_for_native_id(&track_id)
+            .await
+            .expect("stream resolution");
+
+        assert_eq!(
+            request.representation(),
+            MediaRepresentation::buffered(MediaContainer::Flac)
+        );
+        assert!(request
+            .endpoint()
+            .path()
+            .ends_with("/databases/1/items/7.flac"));
+    }
+
+    #[tokio::test]
+    async fn non_allowlisted_declared_format_resolves_to_explicit_unknown() {
+        let backend = backend_with_declared_format(7, Some("shn"));
+        let track_id = TrackId::remote("7").expect("track id");
+
+        let request = backend
+            .stream_request_for_native_id(&track_id)
+            .await
+            .expect("stream resolution");
+
+        assert_eq!(
+            request.representation(),
+            MediaRepresentation::buffered_unknown()
+        );
+        assert!(request
+            .endpoint()
+            .path()
+            .ends_with("/databases/1/items/7.shn"));
+    }
+
+    #[tokio::test]
+    async fn absent_declared_format_stays_unknown_instead_of_guessing_mp3() {
+        // The cache stores the raw `None` — the historical behaviour stored
+        // a defaulted "mp3" here, which leaked `audio/mpeg` LOAD descriptors
+        // and `.mp3` ticket suffixes onto media of unknown container.
+        let backend = backend_with_declared_format(7, None);
+        let track_id = TrackId::remote("7").expect("track id");
+
+        let request = backend
+            .stream_request_for_native_id(&track_id)
+            .await
+            .expect("stream resolution");
+
+        let representation = request.representation();
+        assert_eq!(representation, MediaRepresentation::buffered_unknown());
+        assert_eq!(representation.content_type(), None);
+        assert_eq!(representation.ticket_suffix(), None);
+        // The legacy URL item hint is unchanged; the descriptor is not.
+        assert!(request
+            .endpoint()
+            .path()
+            .ends_with("/databases/1/items/7.mp3"));
+    }
 
     #[test]
     fn duplicate_daap_item_identity_fails_closed_without_overwriting_first_row() {
         let mut formats = HashMap::new();
-        remember_track_format(&mut formats, 7, "flac".to_string()).expect("first identity");
+        remember_track_format(&mut formats, 7, Some("flac".to_string())).expect("first identity");
 
-        let error = remember_track_format(&mut formats, 7, "mp3".to_string())
+        let error = remember_track_format(&mut formats, 7, Some("mp3".to_string()))
             .expect_err("duplicate identity must reject the candidate catalogue");
 
         assert!(matches!(
@@ -554,6 +640,6 @@ mod tests {
                 source: None
             } if message == "DAAP catalogue contains duplicate item identity"
         ));
-        assert_eq!(formats.get(&7).map(String::as_str), Some("flac"));
+        assert_eq!(formats.get(&7).and_then(Option::as_deref), Some("flac"));
     }
 }
