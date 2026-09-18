@@ -199,6 +199,11 @@ struct ProbeEditHold {
 struct ProbeEditHoldState {
     entered: bool,
     released: bool,
+    /// Set when the test discards the attempt (the asynchronous-dispatch
+    /// scenario did not materialize): a releaser still waiting for the
+    /// callback to engage returns immediately instead of burning its
+    /// whole entry timeout on a callback that will never run.
+    abandoned: bool,
     /// The thread the held callback is running on (the streaming thread).
     thread: Option<std::thread::ThreadId>,
 }
@@ -210,6 +215,7 @@ impl ProbeEditHold {
             state: Mutex::new(ProbeEditHoldState {
                 entered: false,
                 released: false,
+                abandoned: false,
                 thread: None,
             }),
             cv: std::sync::Condvar::new(),
@@ -234,7 +240,9 @@ impl ProbeEditHold {
         }
     }
 
-    /// Block (bounded) until the callback has entered the hold.
+    /// Block (bounded) until the callback has entered the hold. Returns
+    /// early (with `false`) once the hold is abandoned: the test is
+    /// discarding the attempt and the callback will never engage.
     fn wait_until_entered(&self, timeout: Duration) -> bool {
         let state = self
             .state
@@ -242,9 +250,22 @@ impl ProbeEditHold {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (state, _) = self
             .cv
-            .wait_timeout_while(state, timeout, |state| !state.entered)
+            .wait_timeout_while(state, timeout, |state| !state.entered && !state.abandoned)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.entered
+    }
+
+    /// Mark the attempt discarded: a releaser still waiting for the
+    /// callback to engage must unwind promptly instead of waiting out its
+    /// entry timeout. Harmless once the callback already entered or
+    /// completed (the surgery itself is never force-released).
+    fn abandon(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.abandoned = true;
+        self.cv.notify_all();
     }
 
     /// The thread the held callback is running on, once it has entered.
