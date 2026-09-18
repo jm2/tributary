@@ -631,7 +631,6 @@ def validate_dependency_edges(
     before_lock: dict[str, Any],
     after_lock: dict[str, Any],
     transitions: list[Transition],
-    authorized_identities: set[tuple[str, str]],
     old_identities: set[tuple[str, str]],
     target_identities: set[tuple[str, str]],
     replacements: dict[tuple[str, str], tuple[str, str]],
@@ -797,25 +796,38 @@ def validate_dependency_edges(
                     f"{dependency_name!r}: {before_targets} -> {after_targets}"
                 )
 
-            # A removal's old-closure version span is prune-only authority:
-            # it authorizes dropping records and edges inside the span, never
-            # rebinding a retained consumer between two versions that merely
-            # co-exist inside it. A rebind on a retained consumer therefore
-            # needs tie to a requested transition — every newly added target
-            # must be an exact reviewed transition target and every dropped
-            # target must sit inside the reviewed old closure — or the exact
-            # unification mapping proven below. A shared@1 -> shared@2
-            # rewrite whose endpoints co-exist only inside a removal's old
-            # closure is unreviewed drift and fails closed.
+            # Review-closure authority is split by what the review can prove.
+            # A record inside the reviewed AFTER closure may rebind freely:
+            # the independently materialized target closure verifies every
+            # resulting edge. A removal's old closure is prune-only
+            # authority: it authorizes dropping records and edges inside the
+            # span — including one of several same-name targets on a
+            # survivor that the removed dependency alone reached — never
+            # rebinding anyone between two versions that merely co-exist
+            # inside it. The transition-tied exception covers a retained
+            # consumer outside every closure, and because it exists for
+            # REBINDS it must show at least one newly added exact reviewed
+            # transition target: a pure edge drop adds nothing and belongs
+            # to the bounded prune arms. The exact unification mapping is
+            # the last admitted path. A shared@1 -> shared@2 rewrite whose
+            # endpoints co-exist only inside a removal's old closure stays
+            # unreviewed drift and fails closed.
             changed_after_targets = set(after_targets) - set(before_targets)
             dropped_before_targets = set(before_targets) - set(after_targets)
             transition_tied_rebind = (
-                changed_after_targets <= transition_target_identities
+                bool(changed_after_targets)
+                and changed_after_targets <= transition_target_identities
                 and dropped_before_targets <= old_identities
             )
+            bounded_target_prune = (
+                not changed_after_targets
+                and identity in removal_identities
+                and dropped_before_targets <= removal_identities
+            )
             if (
-                identity in authorized_identities
+                identity in target_identities
                 or transition_tied_rebind
+                or bounded_target_prune
                 # A shared-transitive promotion can rebind an unchanged
                 # consumer onto the single unified record. Admit only an
                 # exact old->replacement mapping proven by
@@ -861,7 +873,6 @@ def validate_bounded_package_changes(
     }
     old_identities = dependency_closure_identities(before_fuzz_lock, old_roots)
     after_identities = dependency_closure_identities(after_fuzz_lock, new_roots)
-    authorized_identities = old_identities | after_identities
 
     before_records = package_records_by_identity(before_fuzz_lock)
     after_records = package_records_by_identity(after_fuzz_lock)
@@ -930,7 +941,6 @@ def validate_bounded_package_changes(
         before_fuzz_lock,
         after_fuzz_lock,
         transitions,
-        authorized_identities,
         old_identities,
         after_identities,
         replacements,

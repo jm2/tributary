@@ -653,6 +653,128 @@ class FuzzLockPolicyTests(unittest.TestCase):
             [sync_fuzz_lock.Transition("local-ip", "1.0.0", None)],
         )
 
+    def test_removed_closure_span_survivor_rejects_general_rebind(self):
+        # Round-2 Codex P2 regression (M1): a record inside the removed
+        # dependency's old closure that also survives through a retained
+        # root (x is reachable from both the removed a and the retained b)
+        # must not keep the general rebind path open. Removal old-closure
+        # authority is prune-only, so x may not rewrite its shared edge
+        # onto the span's co-existing shared@2.0.0 even though x itself is
+        # a span member — a rebind corresponding to no reviewed root
+        # transition and no exact unification mapping.
+        base = lock(
+            ["a 1.0.0", "b 1.0.0"],
+            {
+                "a": ["1.0.0"],
+                "b": ["1.0.0"],
+                "shared": ["1.0.0", "2.0.0"],
+                "x": ["1.0.0"],
+            },
+        )
+        # package order: tributary, a, b, shared@1, shared@2, x.
+        base["package"][1]["dependencies"] = ["x 1.0.0"]
+        base["package"][2]["dependencies"] = ["x 1.0.0"]
+        base["package"][5]["dependencies"] = ["shared 1.0.0"]
+        unsafe_fuzz = lock(
+            ["b 1.0.0"],
+            {"b": ["1.0.0"], "shared": ["1.0.0", "2.0.0"], "x": ["1.0.0"]},
+        )
+        # package order: tributary, b, shared@1, shared@2, x. The submitted
+        # lock prunes a@1.0.0 exactly but rewrites the surviving span
+        # member's edge onto the other version inside the span.
+        unsafe_fuzz["package"][1]["dependencies"] = ["x 1.0.0"]
+        unsafe_fuzz["package"][4]["dependencies"] = ["shared 2.0.0"]
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError,
+            "semantically rebound an edge outside the reviewed dependency "
+            "surface: x@1.0.0 shared",
+        ):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                unsafe_fuzz,
+                base,
+                unsafe_fuzz,
+                [sync_fuzz_lock.Transition("a", "1.0.0", None)],
+            )
+
+    def test_removed_closure_span_survivor_prunes_span_target(self):
+        # Prune authority (loss) for a removal-closure survivor: x survives
+        # through the retained b root, and its shared@2.0.0 edge — a target
+        # reachable only through the removed a — disappears with the
+        # removal. Losing an edge inside the span without adding anything
+        # is exactly the authority a reviewed removal grants, so the proof
+        # succeeds while any rebind (M1) still fails.
+        base = lock(
+            ["a 1.0.0", "b 1.0.0"],
+            {
+                "a": ["1.0.0"],
+                "b": ["1.0.0"],
+                "shared": ["1.0.0", "2.0.0"],
+                "x": ["1.0.0"],
+            },
+        )
+        # package order: tributary, a, b, shared@1, shared@2, x.
+        base["package"][1]["dependencies"] = ["shared 2.0.0", "x 1.0.0"]
+        base["package"][2]["dependencies"] = ["x 1.0.0"]
+        base["package"][5]["dependencies"] = ["shared 1.0.0", "shared 2.0.0"]
+        pruned_fuzz = lock(
+            ["b 1.0.0"],
+            {"b": ["1.0.0"], "shared": ["1.0.0", "2.0.0"], "x": ["1.0.0"]},
+        )
+        # package order: tributary, b, shared@1, shared@2, x. x drops only
+        # the span-internal shared@2.0.0 edge; shared@1.0.0 stays exact.
+        pruned_fuzz["package"][1]["dependencies"] = ["x 1.0.0"]
+        pruned_fuzz["package"][4]["dependencies"] = ["shared 1.0.0"]
+
+        sync_fuzz_lock.validate_bounded_package_changes(
+            base,
+            pruned_fuzz,
+            base,
+            pruned_fuzz,
+            [sync_fuzz_lock.Transition("a", "1.0.0", None)],
+        )
+
+    def test_transition_tied_rebind_rejects_pure_edge_drop(self):
+        # Round-2 Codex P2 regression (M2): the transition-tied exception
+        # exists for REBINDS, so its empty added-target set must not
+        # vacuously admit a pure edge drop. drift@1.0.0 sits outside every
+        # reviewed closure; its dropped shared@2.0.0 target does sit inside
+        # the removal's old closure, but drift itself does not — the loss
+        # belongs to no bounded prune arm and fails closed.
+        base = lock(
+            ["a 1.0.0"],
+            {
+                "a": ["1.0.0"],
+                "shared": ["1.0.0", "2.0.0"],
+                "drift": ["1.0.0"],
+            },
+        )
+        # package order: tributary, a, shared@1, shared@2, drift.
+        base["package"][1]["dependencies"] = ["shared 2.0.0"]
+        base["package"][4]["dependencies"] = ["shared 1.0.0", "shared 2.0.0"]
+        unsafe_fuzz = lock(
+            [],
+            {"shared": ["1.0.0", "2.0.0"], "drift": ["1.0.0"]},
+        )
+        # package order: tributary, shared@1, shared@2, drift. The
+        # submitted lock prunes a@1.0.0 exactly but silently drops one of
+        # the retained outsider's two same-name edges.
+        unsafe_fuzz["package"][3]["dependencies"] = ["shared 1.0.0"]
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError,
+            "semantically rebound an edge outside the reviewed dependency "
+            "surface: drift@1.0.0 shared",
+        ):
+            sync_fuzz_lock.validate_bounded_package_changes(
+                base,
+                unsafe_fuzz,
+                base,
+                unsafe_fuzz,
+                [sync_fuzz_lock.Transition("a", "1.0.0", None)],
+            )
+
     def test_removed_dependency_review_rejects_dropping_still_required_package(self):
         # edge@1.0.0 was pruned from the submitted lock, yet the retained
         # kept@1.0.0 record still declares it; every surviving edge must
