@@ -343,6 +343,9 @@ errors:
     airplay_owntone_unavailable: "AirPlay via the OwnTone sender is unavailable: %{reason}"
     airplay_owntone_no_acquisition_path: "this platform has no supported OwnTone acquisition path"
     airplay_owntone_reason:
+      receiver_published_no_retained_identifier: "the selected receiver published no retained device identifier"
+      receiver_not_in_daemon_output_list: "the selected receiver (%{id}) is not present in the daemon's output list"
+      receiver_maps_to_multiple_outputs: "the selected receiver (%{id}) maps to more than one daemon output"
       not_configured: "not configured"
       configured_api_url_is_invalid: "the configured API URL is invalid"
       json_api_loopback_host_must_be_a_literal_address: "the JSON API loopback host must be a literal address (127.0.0.1 or ::1), not an ambiguous name"

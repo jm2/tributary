@@ -118,10 +118,20 @@ fn unavailable_in(locale: &str, reason: &str) -> SenderError {
 /// The catalog map holding every refusal reason.
 const REASON_CATALOG: &str = "errors.playback.airplay_owntone_reason";
 
-/// A refusal whose reason is already user-facing text (an error produced by
-/// another stage, itself localized).
-fn unavailable_raw(reason: &str) -> SenderError {
-    unavailable_raw_in(rust_i18n::locale().as_ref(), reason)
+/// A refusal whose reason carries the daemon output identifier the catalog
+/// entry names as `%{id}`.
+fn unavailable_with_id(reason: &str, id: u64) -> SenderError {
+    unavailable_with_id_in(rust_i18n::locale().as_ref(), reason, id)
+}
+
+fn unavailable_with_id_in(locale: &str, reason: &str, id: u64) -> SenderError {
+    let key = format!("{REASON_CATALOG}.{reason}");
+    let reason_text = rust_i18n::t!(key.as_str(), id = id, locale = locale);
+    debug_assert!(
+        !reason_text.contains(REASON_CATALOG),
+        "missing catalog entry for OwnTone refusal reason {reason}"
+    );
+    unavailable_raw_in(locale, reason_text.as_ref())
 }
 
 fn unavailable_raw_in(locale: &str, reason: &str) -> SenderError {
@@ -975,6 +985,19 @@ enum MappingFailure {
     MissingIdentifier,
     NoMatch(u64),
     Ambiguous(u64),
+}
+
+impl MappingFailure {
+    /// The localized refusal for this mapping outcome. The English `Display`
+    /// text is for logs; user-facing refusals render the catalog entry with
+    /// the output identifier as a parameter (PR #270 review, round 9).
+    fn refusal(&self) -> SenderError {
+        match self {
+            Self::MissingIdentifier => unavailable("receiver_published_no_retained_identifier"),
+            Self::NoMatch(id) => unavailable_with_id("receiver_not_in_daemon_output_list", *id),
+            Self::Ambiguous(id) => unavailable_with_id("receiver_maps_to_multiple_outputs", *id),
+        }
+    }
 }
 
 impl std::fmt::Display for MappingFailure {
@@ -3094,7 +3117,7 @@ fn observe_takeover_target(
         .outputs()
         .map_err(|error| pre_mutation_failure(ctx, error))?;
     let selected = map_receiver_to_output(&outputs, ctx.target.device_id.as_deref())
-        .map_err(|failure| pre_mutation_failure(ctx, unavailable_raw(&failure.to_string())))?;
+        .map_err(|failure| pre_mutation_failure(ctx, failure.refusal()))?;
     // Never preempt audible playback on the dedicated instance.
     match client.player_state() {
         Ok(state) if state == "play" => Err(pre_mutation_failure(
@@ -4169,6 +4192,59 @@ mod tests {
         }
     }
 
+    /// The receiver-mapping refusals render from the selected catalog with the
+    /// output identifier as a parameter — no English clause in a translated
+    /// sentence (PR #270 review, round 9).
+    #[test]
+    fn mapping_failures_are_localized_in_every_catalog() {
+        let english_no_match = MappingFailure::NoMatch(0x8EE5)
+            .refusal()
+            .message()
+            .to_string();
+        assert!(english_no_match.contains("36581"), "{english_no_match}");
+        for locale in rust_i18n::available_locales!() {
+            for (failure, key) in [
+                (
+                    MappingFailure::MissingIdentifier,
+                    "receiver_published_no_retained_identifier",
+                ),
+                (
+                    MappingFailure::NoMatch(0x8EE5),
+                    "receiver_not_in_daemon_output_list",
+                ),
+                (
+                    MappingFailure::Ambiguous(0x8EE5),
+                    "receiver_maps_to_multiple_outputs",
+                ),
+            ] {
+                let message = match failure {
+                    MappingFailure::MissingIdentifier => unavailable_in(&locale, key),
+                    MappingFailure::NoMatch(id) | MappingFailure::Ambiguous(id) => {
+                        unavailable_with_id_in(&locale, key, id)
+                    }
+                };
+                let message = message.message().to_string();
+                assert!(
+                    !message.contains("airplay_owntone_reason"),
+                    "{locale}: {message}"
+                );
+                assert!(
+                    !message.contains("%{"),
+                    "{locale}: unrendered id in {message}"
+                );
+                if !matches!(failure, MappingFailure::MissingIdentifier) {
+                    assert!(message.contains("36581"), "{locale}: {message}");
+                }
+                if locale != "en" {
+                    assert!(
+                        !message.contains(&failure.to_string()),
+                        "{locale} carries the English mapping text: {message}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Every reason key this module refuses with exists in every catalog, so
     /// no locale can fall back to English for a runtime refusal.
     #[test]
@@ -4177,9 +4253,17 @@ mod tests {
         // whitespace between the paren and the opening quote.
         let source = include_str!("airplay_owntone.rs");
         let mut keys: Vec<&str> = source
-            .match_indices("unavailable(")
+            .match_indices("unavailable")
             .filter_map(|(at, _)| {
-                let rest = source[at + "unavailable(".len()..].trim_start();
+                // A refusal constructor call whose first argument is the key literal.
+                let call = &source[at..];
+                let open = call.find('(')?;
+                // Only the two refusal constructors; `unavailable_in(locale, …)`
+                // and friends take a locale first.
+                if !matches!(&call[..open], "unavailable" | "unavailable_with_id") {
+                    return None;
+                }
+                let rest = call[open + 1..].trim_start();
                 let body = rest.strip_prefix('"')?;
                 Some(&body[..body.find('"')?])
             })

@@ -310,6 +310,9 @@ errors:
     airplay_owntone_unavailable: "透過 OwnTone 傳送器的 AirPlay 無法使用：%{reason}"
     airplay_owntone_no_acquisition_path: "此平台沒有受支援的 OwnTone 取得路徑"
     airplay_owntone_reason:
+      receiver_published_no_retained_identifier: "所選接收器未發布保留的裝置識別碼"
+      receiver_not_in_daemon_output_list: "所選接收器（%{id}）不在常駐程式的輸出清單中"
+      receiver_maps_to_multiple_outputs: "所選接收器（%{id}）對應多個常駐程式輸出"
       not_configured: "未設定"
       configured_api_url_is_invalid: "設定的 API URL 無效"
       json_api_loopback_host_must_be_a_literal_address: "JSON API 的回送主機必須是字面位址（127.0.0.1 或 ::1），而不是含糊的名稱"

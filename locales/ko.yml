@@ -310,6 +310,9 @@ errors:
     airplay_owntone_unavailable: "OwnTone 송신기를 통한 AirPlay를 사용할 수 없습니다: %{reason}"
     airplay_owntone_no_acquisition_path: "이 플랫폼에는 지원되는 OwnTone 획득 경로가 없습니다"
     airplay_owntone_reason:
+      receiver_published_no_retained_identifier: "선택한 수신기가 보존된 장치 식별자를 게시하지 않았습니다"
+      receiver_not_in_daemon_output_list: "선택한 수신기(%{id})가 데몬의 출력 목록에 없습니다"
+      receiver_maps_to_multiple_outputs: "선택한 수신기(%{id})가 둘 이상의 데몬 출력에 대응합니다"
       not_configured: "구성되지 않음"
       configured_api_url_is_invalid: "구성된 API URL이 잘못되었습니다"
       json_api_loopback_host_must_be_a_literal_address: "JSON API 루프백 호스트는 모호한 이름이 아니라 리터럴 주소(127.0.0.1 또는 ::1)여야 합니다"

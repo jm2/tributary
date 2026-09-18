@@ -310,6 +310,9 @@ errors:
     airplay_owntone_unavailable: "AirPlay via de OwnTone-zender is niet beschikbaar: %{reason}"
     airplay_owntone_no_acquisition_path: "dit platform heeft geen ondersteund OwnTone-acquisitiepad"
     airplay_owntone_reason:
+      receiver_published_no_retained_identifier: "de geselecteerde ontvanger heeft geen bewaarde apparaat-id gepubliceerd"
+      receiver_not_in_daemon_output_list: "de geselecteerde ontvanger (%{id}) staat niet in de uitvoerlijst van de daemon"
+      receiver_maps_to_multiple_outputs: "de geselecteerde ontvanger (%{id}) komt overeen met meer dan één daemon-uitvoer"
       not_configured: "niet geconfigureerd"
       configured_api_url_is_invalid: "de geconfigureerde API-URL is ongeldig"
       json_api_loopback_host_must_be_a_literal_address: "de loopback-host van de JSON-API moet een letterlijk adres zijn (127.0.0.1 of ::1), geen dubbelzinnige naam"

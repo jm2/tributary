@@ -310,6 +310,9 @@ errors:
     airplay_owntone_unavailable: "OwnTone 送信機による AirPlay は利用できません: %{reason}"
     airplay_owntone_no_acquisition_path: "このプラットフォームには対応する OwnTone 取得経路がありません"
     airplay_owntone_reason:
+      receiver_published_no_retained_identifier: "選択したレシーバーは保持されるデバイス識別子を公開していません"
+      receiver_not_in_daemon_output_list: "選択したレシーバー（%{id}）はデーモンの出力一覧にありません"
+      receiver_maps_to_multiple_outputs: "選択したレシーバー（%{id}）は複数のデーモン出力に対応しています"
       not_configured: "設定されていません"
       configured_api_url_is_invalid: "設定された API URL が無効です"
       json_api_loopback_host_must_be_a_literal_address: "JSON API のループバックホストはあいまいな名前ではなく、リテラルアドレス（127.0.0.1 または ::1）である必要があります"

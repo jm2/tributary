@@ -312,6 +312,9 @@ errors:
     airplay_owntone_unavailable: "AirPlay через передатчик OwnTone недоступен: %{reason}"
     airplay_owntone_no_acquisition_path: "на этой платформе нет поддерживаемого пути получения OwnTone"
     airplay_owntone_reason:
+      receiver_published_no_retained_identifier: "выбранный приёмник не опубликовал сохраняемый идентификатор устройства"
+      receiver_not_in_daemon_output_list: "выбранный приёмник (%{id}) отсутствует в списке выходов демона"
+      receiver_maps_to_multiple_outputs: "выбранный приёмник (%{id}) соответствует более чем одному выходу демона"
       not_configured: "не настроено"
       configured_api_url_is_invalid: "настроенный URL API недопустим"
       json_api_loopback_host_must_be_a_literal_address: "loopback-хост JSON API должен быть буквальным адресом (127.0.0.1 или ::1), а не неоднозначным именем"
