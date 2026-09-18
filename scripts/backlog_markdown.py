@@ -179,34 +179,46 @@ def _parse_angle_destination(line: str, cursor: int) -> tuple[str, int] | None:
     return line[cursor + 1 : close], tail.end()
 
 
+def _plain_scan_step(
+    line: str, index: int, depth: int, characters: list[str]
+) -> tuple[int, int] | None:
+    """Consume one plain-destination character; return ``(next_index, depth)``."""
+    # A backslash-escaped parenthesis belongs to the destination.  A plain
+    # destination keeps balanced parentheses intact, so ``ADR_(draft).md``
+    # arrives whole instead of being truncated at the first ``)``.  The
+    # ``None`` return reports a scan stop: whitespace, or an unbalanced
+    # closing parenthesis, which GitHub renders as literal text.
+    char = line[index]
+    if char == "\\" and line[index + 1 : index + 2] in ("(", ")"):
+        characters.append(line[index + 1])
+        return index + 2, depth
+    if char.isspace():
+        return None
+    if char == "(":
+        characters.append(char)
+        return index + 1, depth + 1
+    if char == ")":
+        if depth == 0:
+            return None
+        characters.append(char)
+        return index + 1, depth - 1
+    characters.append(char)
+    return index + 1, depth
+
+
 def _scan_plain_destination(line: str, cursor: int) -> tuple[str, int] | None:
     """Scan a plain destination; return ``(target, end)`` or ``None``."""
-    # A plain destination keeps balanced parentheses intact and honours
-    # backslash-escaped ones, so ``ADR_(draft).md`` and ``file\\(1\\).md``
-    # both arrive whole instead of being truncated at the first ``)``.
-    # Unbalanced parentheses or an empty scan mean GitHub renders this as
+    # An empty scan or an unbalanced one means GitHub renders this as
     # literal text, which the ``None`` return reports.
     characters: list[str] = []
     depth = 0
     index = cursor
     total = len(line)
     while index < total:
-        char = line[index]
-        if char == "\\" and index + 1 < total and line[index + 1] in "()":
-            # A backslash-escaped parenthesis belongs to the destination.
-            characters.append(line[index + 1])
-            index += 2
-            continue
-        if char.isspace():
+        step = _plain_scan_step(line, index, depth, characters)
+        if step is None:
             break
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            if depth == 0:
-                break
-            depth -= 1
-        characters.append(char)
-        index += 1
+        index, depth = step
     if depth != 0 or not characters:
         return None
     return "".join(characters), index

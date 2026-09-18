@@ -270,6 +270,7 @@ class BacklogConsistencyReworkTests(unittest.TestCase):
 
 class InlineSyntaxTests(unittest.TestCase):
     """Regressions for the 2026-09-18 refinery rework (threads jroR8/jroR-/jroSB)."""
+
     # Three current-head defects made the every-tracked-file audit report
     # false results: inline-code and escaped-bracket link examples were
     # validated as real links (jroR8), plain destinations were truncated at
