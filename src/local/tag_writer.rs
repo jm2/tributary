@@ -73,6 +73,19 @@ pub enum TagWritePreflightError {
     Unavailable,
 }
 
+impl std::fmt::Display for TagWritePreflightError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::UnsupportedFormat => "the file format does not support tag writes",
+            Self::NotRegularFile => "the selection is not a regular file",
+            Self::Unavailable => "the file cannot currently be read or written",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for TagWritePreflightError {}
+
 /// Return whether `path` has the exact shape emitted for a tag-write sibling.
 ///
 /// The bounded ASCII name is `.tributary-tag-<canonical UUID>.<format>`. Exact
@@ -1206,6 +1219,12 @@ impl LocalSelectionEvidence {
 pub struct LocalMutationTarget {
     path: PathBuf,
     evidence: Option<LocalSelectionEvidence>,
+    /// Why capture could not identify the selection, when the failure is a
+    /// capability problem the dialog can name (unreadable, missing, or
+    /// non-regular). `None` with no evidence means a genuinely unprovable
+    /// selection — the fail-closed conflict bucket. A target is never
+    /// written without evidence either way.
+    capture_failure: Option<TagWritePreflightError>,
 }
 
 impl std::fmt::Debug for LocalMutationTarget {
@@ -1214,6 +1233,7 @@ impl std::fmt::Debug for LocalMutationTarget {
             .debug_struct("LocalMutationTarget")
             .field("path", &self.path)
             .field("identified", &self.evidence.is_some())
+            .field("capture_failure", &self.capture_failure)
             .finish()
     }
 }
@@ -1224,11 +1244,22 @@ impl LocalMutationTarget {
     ///
     /// Never fails: a file that cannot be identified at selection is retained
     /// without evidence, and the write path refuses it rather than editing an
-    /// unproven target.
+    /// unproven target. A capability failure with a known category — missing,
+    /// unreadable, or non-regular — is classified so the dialog can explain
+    /// the real problem instead of a changed-on-disk conflict that a
+    /// permission or file-type issue cannot fix.
     pub fn capture(path: &Path) -> Self {
-        Self {
-            path: path.to_path_buf(),
-            evidence: capture_local_selection_evidence(path).ok(),
+        match capture_local_selection_evidence(path) {
+            Ok(evidence) => Self {
+                path: path.to_path_buf(),
+                evidence: Some(evidence),
+                capture_failure: None,
+            },
+            Err(error) => Self {
+                path: path.to_path_buf(),
+                evidence: None,
+                capture_failure: classify_capture_failure(&error),
+            },
         }
     }
 
@@ -1251,8 +1282,13 @@ impl LocalMutationTarget {
     pub fn preflight_write_capability(&self) -> Result<(), LocalTagPreflightError> {
         let Some(evidence) = self.evidence.clone() else {
             // No evidence was captured, so no write can be proven against the
-            // selection. That is the selection-identity conflict, not a
-            // capability failure.
+            // selection — it is never written either way. A classified
+            // capability failure keeps its own category so the dialog explains
+            // the real problem; only an unprovable selection is reported as
+            // the selection-identity conflict.
+            if let Some(failure) = self.capture_failure {
+                return Err(LocalTagPreflightError::Unavailable(failure));
+            }
             return Err(LocalTagPreflightError::Conflict(
                 LocalTagWriteConflict::SelectionUnavailable,
             ));
@@ -1340,6 +1376,15 @@ impl LocalMutationTarget {
         edits.validate()?;
 
         let Some(evidence) = self.evidence.clone() else {
+            // Same discipline as the preflight: a classified capability
+            // failure is an availability error, not a changed-on-disk
+            // conflict; an unprovable selection still fails closed as the
+            // conflict. Neither path writes.
+            if let Some(failure) = self.capture_failure {
+                return Err(
+                    anyhow::Error::new(failure).context("the selected file cannot be written")
+                );
+            }
             return Err(conflict_error(LocalTagWriteConflict::SelectionUnavailable));
         };
 
@@ -1408,7 +1453,9 @@ impl LocalMutationTarget {
 
 impl PartialEq for LocalMutationTarget {
     fn eq(&self, other: &Self) -> bool {
-        self.path == other.path && self.evidence == other.evidence
+        self.path == other.path
+            && self.evidence == other.evidence
+            && self.capture_failure == other.capture_failure
     }
 }
 
@@ -1445,6 +1492,39 @@ fn resolve_authority_parent(parent: &Path) -> std::io::Result<PathBuf> {
 #[cfg(not(unix))]
 fn resolve_authority_parent(parent: &Path) -> std::io::Result<PathBuf> {
     Ok(parent.to_path_buf())
+}
+
+/// Name the capability category of a capture failure when it has one.
+///
+/// A selection that is missing, unreadable, or not a regular file can never
+/// become writable by reopening Properties, so those failures keep their own
+/// [`TagWritePreflightError`] category instead of masquerading as the
+/// changed-on-disk conflict. Only a genuinely unprovable selection — an I/O
+/// or authority error where the identity could not be established — stays
+/// unclassified and falls to the fail-closed conflict bucket. Either way a
+/// target without evidence is never written.
+fn classify_capture_failure(error: &std::io::Error) -> Option<TagWritePreflightError> {
+    // A symlinked leaf is refused by the open itself with ELOOP on unix —
+    // exactly the "symlinks are not rewritten" case, so it keeps the
+    // non-regular category. (io_error_more's FilesystemLoop kind is not yet
+    // stable, so match the errno the authority machinery already uses.)
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
+        return Some(TagWritePreflightError::NotRegularFile);
+    }
+    match error.kind() {
+        // The authority's marker machinery rejects anything that is not a
+        // regular file: a directory at the leaf, or a reparse point on
+        // Windows.
+        std::io::ErrorKind::InvalidData => Some(TagWritePreflightError::NotRegularFile),
+        // A selection that is gone or unreadable is an availability problem:
+        // there is nothing to prove an identity against, and no conflict with
+        // a prior selection exists.
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+            Some(TagWritePreflightError::Unavailable)
+        }
+        _ => None,
+    }
 }
 
 /// Snapshot the exact directory, object, and content revision named by `path`.
@@ -3058,6 +3138,88 @@ mod tests {
         assert!(
             directory.temp_files().is_empty(),
             "a refused save leaves no private sibling behind"
+        );
+    }
+
+    /// A selection that is not a regular file keeps its own category: the
+    /// dialog explains a file-type problem, not a changed-on-disk conflict
+    /// that reopening Properties cannot fix. The write path refuses with the
+    /// same category, never a conflict, and never writes.
+    #[test]
+    fn a_non_regular_selection_reports_its_own_category() {
+        let directory = TestDirectory::new("local-selection-not-regular");
+        let selected = directory.path.join("not-a-track");
+        std::fs::write(&selected, b"this is a directory entry, not a tag target")
+            .expect("create the non-regular selection");
+        // Point the selection at the directory itself: an existing, readable,
+        // but non-regular filesystem object.
+        let target = LocalMutationTarget::capture(&directory.path);
+
+        assert_eq!(
+            target.preflight_write_capability(),
+            Err(LocalTagPreflightError::Unavailable(
+                TagWritePreflightError::NotRegularFile
+            )),
+            "a non-regular selection is an availability category, not a conflict"
+        );
+
+        let error = target
+            .write_tags(&year("2026"))
+            .expect_err("a non-regular selection must never be written");
+        assert_eq!(
+            error.downcast_ref::<TagWritePreflightError>(),
+            Some(&TagWritePreflightError::NotRegularFile),
+            "the write refusal must carry the file-type category, got: {error:#}"
+        );
+    }
+
+    /// A selection named by a path that does not exist is an availability
+    /// problem, not a changed-on-disk conflict: there is no prior selection
+    /// state to conflict with.
+    #[test]
+    fn a_missing_selection_reports_unavailable() {
+        let directory = TestDirectory::new("local-selection-missing");
+        let target = LocalMutationTarget::capture(&directory.path.join("never-existed.flac"));
+
+        assert_eq!(
+            target.preflight_write_capability(),
+            Err(LocalTagPreflightError::Unavailable(
+                TagWritePreflightError::Unavailable
+            )),
+            "a missing selection is an availability category, not a conflict"
+        );
+    }
+
+    /// An unreadable selection keeps the availability category. Privileged
+    /// containers can read despite mode 000; the probe below skips those.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_selection_reports_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("local-selection-unreadable");
+        let track = directory.path.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write the fixture");
+        std::fs::set_permissions(&track, std::fs::Permissions::from_mode(0o000))
+            .expect("remove file permissions");
+
+        if std::fs::File::open(&track).is_ok() {
+            std::fs::set_permissions(&track, std::fs::Permissions::from_mode(0o644))
+                .expect("restore file permissions");
+            return;
+        }
+
+        let target = LocalMutationTarget::capture(&track);
+        let verdict = target.preflight_write_capability();
+        std::fs::set_permissions(&track, std::fs::Permissions::from_mode(0o644))
+            .expect("restore file permissions");
+
+        assert_eq!(
+            verdict,
+            Err(LocalTagPreflightError::Unavailable(
+                TagWritePreflightError::Unavailable
+            )),
+            "an unreadable selection is an availability category, not a conflict"
         );
     }
 
