@@ -712,8 +712,10 @@ Required tests:
     while any row would be ambiguous under the old schema and otherwise
     restores the `file_path` column name, deletes the `schema_capabilities`
     authority singleton row, and resets the mirrored `PRAGMA user_version` to
-    the pre-R11 value — assert that after a successful `down()` **both markers
-    are absent**, so the downgraded database presents as pre-R11 to every
+    the pre-R11 value — assert that after a successful `down()` the
+    `schema_capabilities` authority row is absent and `PRAGMA user_version`
+    equals the captured pre-R11 value (the numeric marker is restored, not
+    absent), so the downgraded database presents as pre-R11 to every
     contract-aware binary (§4.5). Assert the containment scope
     symmetrically: a `SELECT *` and a read naming only surviving columns
     succeed against the rebuilt table, demonstrating that the mechanical
