@@ -1835,11 +1835,11 @@ mod tests {
         assert_no_preflight_residue(directory.path());
     }
 
-    /// #248 F3: the conflict alert copy is localized in every shipped
-    /// catalog, for both the all-conflict and the mixed-conflict result, and
-    /// its count placeholders are interpolated.
+    /// #248 F3: the English copy distinguishes the all-conflict,
+    /// mixed-conflict, and I/O failure shapes, with every count placeholder
+    /// interpolated.
     #[test]
-    fn save_failure_copy_localizes_all_and_mixed_conflicts() {
+    fn english_save_failure_copy_separates_all_mixed_and_io_conflicts() {
         let english_all = save_failure_copy("en", 0, 2, 2);
         let english_mixed = save_failure_copy("en", 0, 3, 1);
         let english_io = save_failure_copy("en", 0, 2, 0);
@@ -1852,6 +1852,15 @@ mod tests {
         assert_ne!(english_all.heading, english_io.heading);
         assert!(!english_all.body.contains("%{"));
         assert!(!english_mixed.body.contains("%{"));
+    }
+
+    /// #248 F3: the conflict alert copy is localized in every shipped
+    /// catalog, for both the all-conflict and the mixed-conflict result, and
+    /// its count placeholders are interpolated.
+    #[test]
+    fn save_failure_copy_localizes_all_and_mixed_conflicts() {
+        let english_all = save_failure_copy("en", 0, 2, 2);
+        let english_mixed = save_failure_copy("en", 0, 3, 1);
 
         for locale in rust_i18n::available_locales!() {
             let all = save_failure_copy(&locale, 0, 2, 2);
