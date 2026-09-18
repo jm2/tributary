@@ -3779,7 +3779,7 @@ pub mod tests {
         let mut result: glib::ffi::gboolean = glib::ffi::GFALSE;
         unsafe {
             glib::gobject_ffi::g_signal_emit_by_name(
-                drop_target.as_ptr() as *mut glib::gobject_ffi::GObject,
+                drop_target.as_ptr().cast::<glib::gobject_ffi::GObject>(),
                 c"drop".as_ptr(),
                 value.to_glib_none().0,
                 1.0f64,
