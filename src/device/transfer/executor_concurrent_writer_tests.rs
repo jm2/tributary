@@ -520,20 +520,73 @@ fn nested_directory_transfer_fixture() -> (
 /// stage must fail — never report the external twin as the planned
 /// destination — and the writer's objects must survive untouched. Skipped
 /// on Windows when the runner forbids reparse-point creation.
+/// Probes whether the Windows runner forbids reparse-point creation (the
+/// interposition cannot be exercised there); cleans up the probe link.
+#[cfg(windows)]
+fn windows_reparse_creation_forbidden(destination_root: &Path, outside: &Path) -> bool {
+    let probe = destination_root.join(".reparse-probe");
+    let creatable = std::os::windows::fs::symlink_dir(outside, &probe).is_ok();
+    let _ = std::fs::remove_file(&probe);
+    !creatable
+}
+
+/// Assertions for the refused leaf stage beneath a replaced ancestor: only
+/// the ancestor stage reported a completion, the failure is the typed
+/// AlreadyExists I/O error naming the failed creation, and every object —
+/// the writer's symlink, its moved-aside original, and the external twin —
+/// survives untouched with no transfer litter.
+fn assert_refused_leaf_stage_survivors(
+    error: &TransferError,
+    completions: u32,
+    destination_root: &Path,
+    outside: &Path,
+) {
+    assert_eq!(
+        completions, 1,
+        "only the ancestor stage may report a completion; the raced stage must not"
+    );
+    assert!(
+        matches!(error, TransferError::Io { .. }),
+        "the raced stage must fail with the typed I/O error: {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("directory creation failed with AlreadyExists"),
+        "the error must name the failed directory creation: {error}"
+    );
+    assert!(
+        std::fs::symlink_metadata(destination_root.join("album"))
+            .expect("read replaced ancestor")
+            .file_type()
+            .is_symlink(),
+        "the writer's symlink must survive untouched"
+    );
+    assert!(
+        destination_root.join("album-writer-moved").is_dir(),
+        "the writer's moved-aside original must survive untouched"
+    );
+    assert!(
+        outside.join("disc").is_dir(),
+        "the external twin must survive untouched — never adopted, never destroyed"
+    );
+    let survivors = entry_names(destination_root);
+    assert_eq!(
+        survivors,
+        vec!["album".to_string(), "album-writer-moved".to_string()],
+        "the writer's objects only — no transfer litter: {survivors:?}"
+    );
+}
+
 #[test]
 fn adopted_directory_ancestor_replaced_by_symlink_is_refused_at_the_leaf_stage() {
     let (_source_root, destination_root, outside, request, plan) =
         nested_directory_transfer_fixture();
     #[cfg(windows)]
-    {
-        let probe = destination_root.path().join(".reparse-probe");
-        let creatable = std::os::windows::fs::symlink_dir(outside.path(), &probe).is_ok();
-        let _ = std::fs::remove_file(&probe);
-        if !creatable {
-            // The runner forbids reparse-point creation; the interposition
-            // cannot be exercised here.
-            return;
-        }
+    if windows_reparse_creation_forbidden(destination_root.path(), outside.path()) {
+        // The runner forbids reparse-point creation; the interposition
+        // cannot be exercised here.
+        return;
     }
     let mut progress = SwapAdoptedAncestorForSymlink {
         ancestor: destination_root.path().join("album"),
@@ -549,39 +602,10 @@ fn adopted_directory_ancestor_replaced_by_symlink_is_refused_at_the_leaf_stage()
             "the leaf stage beneath the replaced ancestor must fail, never adopt the external \
              twin",
         );
-    assert_eq!(
-        progress.completions, 1,
-        "only the ancestor stage may report a completion; the raced stage must not"
-    );
-    assert!(
-        matches!(error, TransferError::Io { .. }),
-        "the raced stage must fail with the typed I/O error: {error:?}"
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("directory creation failed with AlreadyExists"),
-        "the error must name the failed directory creation: {error}"
-    );
-    assert!(
-        std::fs::symlink_metadata(destination_root.path().join("album"))
-            .expect("read replaced ancestor")
-            .file_type()
-            .is_symlink(),
-        "the writer's symlink must survive untouched"
-    );
-    assert!(
-        destination_root.path().join("album-writer-moved").is_dir(),
-        "the writer's moved-aside original must survive untouched"
-    );
-    assert!(
-        outside.path().join("disc").is_dir(),
-        "the external twin must survive untouched — never adopted, never destroyed"
-    );
-    let survivors = entry_names(destination_root.path());
-    assert_eq!(
-        survivors,
-        vec!["album".to_string(), "album-writer-moved".to_string()],
-        "the writer's objects only — no transfer litter: {survivors:?}"
+    assert_refused_leaf_stage_survivors(
+        &error,
+        progress.completions,
+        destination_root.path(),
+        outside.path(),
     );
 }

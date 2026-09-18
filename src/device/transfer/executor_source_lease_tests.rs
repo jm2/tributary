@@ -525,63 +525,77 @@ fn race_source_root_replacement_on_directory_stage() -> DirectoryReplacementRace
 /// On Windows the retained lease refuses the replacement outright (the
 /// root handle omits delete sharing), so the same interposition asserts
 /// the refusal and that the legitimate directory creation still completes.
+/// Unix arm of the directory-stage publication regression: the rename
+/// interposition wins, so the run must fail with the typed authority loss
+/// naming the publication boundary, report no completion callback, and
+/// roll back the created directory without litter.
+#[cfg(unix)]
+fn assert_directory_stage_publication_loss(race: DirectoryReplacementRace) {
+    let error = race
+        .run
+        .expect_err("a source lease lost before the directory stage must fail the transfer");
+    assert!(
+        matches!(error, TransferError::AuthorityLost { .. }),
+        "the failure must be the typed authority loss: {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("source not current at publication"),
+        "the error must name the publication-boundary source loss: {error}"
+    );
+    assert_eq!(
+        race.progress.stage_completes, 0,
+        "the failed stage must not report a completion callback"
+    );
+    let survivors = entry_names(race.destination_root.path());
+    assert!(
+        survivors.is_empty(),
+        "rollback must remove the created directory: {survivors:?}"
+    );
+}
+
+/// Windows arm of the directory-stage publication regression: the
+/// retained lease refuses the replacement outright, so the legitimate
+/// directory creation must complete exactly once and the source root must
+/// still stand at its original path.
+#[cfg(windows)]
+fn assert_directory_stage_lease_refusal(race: DirectoryReplacementRace) {
+    let summary = race.run.expect(
+        "the retained lease refuses the replacement, so the legitimate directory creation \
+         must complete",
+    );
+    assert!(
+        race.progress.replacement_refused,
+        "the interposition must have been attempted and refused by the lease"
+    );
+    assert_eq!(
+        race.progress.stage_completes, 1,
+        "the completed stage must report exactly one completion callback"
+    );
+    assert!(summary.completed, "the transfer must complete: {summary:?}");
+    assert_eq!(summary.committed_stages, 1);
+    assert!(
+        race.destination_root.path().join("album").is_dir(),
+        "the legitimate directory creation must have landed"
+    );
+    assert!(
+        race.source.root.is_dir(),
+        "the source root must still stand at its original path"
+    );
+    assert!(
+        !race.source.moved.exists(),
+        "the lease must have prevented any move of the source root"
+    );
+}
+
 #[test]
 fn source_root_replaced_before_a_directory_stage_fails_and_rolls_back() {
     let race = race_source_root_replacement_on_directory_stage();
     #[cfg(unix)]
-    {
-        let error = race
-            .run
-            .expect_err("a source lease lost before the directory stage must fail the transfer");
-        assert!(
-            matches!(error, TransferError::AuthorityLost { .. }),
-            "the failure must be the typed authority loss: {error:?}"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("source not current at publication"),
-            "the error must name the publication-boundary source loss: {error}"
-        );
-        assert_eq!(
-            race.progress.stage_completes, 0,
-            "the failed stage must not report a completion callback"
-        );
-        let survivors = entry_names(race.destination_root.path());
-        assert!(
-            survivors.is_empty(),
-            "rollback must remove the created directory: {survivors:?}"
-        );
-    }
+    assert_directory_stage_publication_loss(race);
     #[cfg(windows)]
-    {
-        let summary = race.run.expect(
-            "the retained lease refuses the replacement, so the legitimate directory creation \
-             must complete",
-        );
-        assert!(
-            race.progress.replacement_refused,
-            "the interposition must have been attempted and refused by the lease"
-        );
-        assert_eq!(
-            race.progress.stage_completes, 1,
-            "the completed stage must report exactly one completion callback"
-        );
-        assert!(summary.completed, "the transfer must complete: {summary:?}");
-        assert_eq!(summary.committed_stages, 1);
-        assert!(
-            race.destination_root.path().join("album").is_dir(),
-            "the legitimate directory creation must have landed"
-        );
-        assert!(
-            race.source.root.is_dir(),
-            "the source root must still stand at its original path"
-        );
-        assert!(
-            !race.source.moved.exists(),
-            "the lease must have prevented any move of the source root"
-        );
-    }
+    assert_directory_stage_lease_refusal(race);
 }
 
 /// The valid-root control for the directory boundary: an untouched source
