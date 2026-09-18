@@ -13232,4 +13232,256 @@ mod tests {
         // Should return empty string, not panic.
         assert!(result.is_empty());
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Q4 engine-loop/GTK responsiveness lane (tr-am6qr).
+    //
+    // Measurement harness for the engine-side startup endpoints this lane
+    // owns: time to publish the startup snapshot (FullSync / ScanComplete)
+    // and cancellation settlement of the FIFO barrier when commands and the
+    // shutdown Flush are admitted while the initial scan is still in
+    // flight. The GTK-side publication/stall endpoints are measured by the
+    // env-gated helper in `ui::browser::tests` (see that module). Sibling
+    // lane tr-7nguk owns the shared fixture/parse-delay seam; until it
+    // lands this harness stands alone on committed fixture bytes.
+    //
+    // The harness is `#[ignore]`d because it is an explicit measurement
+    // run (budgets are recorded per runner in
+    // `docs/engine-ui-responsiveness.md`), not a CI gate.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Fixture size for the startup benchmark (`TRIBUTARY_Q4_TRACKS`).
+    fn q4_startup_fixture_track_count() -> usize {
+        std::env::var("TRIBUTARY_Q4_TRACKS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(400)
+    }
+
+    /// Write `count` valid audio files (copies of the committed 99-byte
+    /// silent FLAC) so the scanner parses real metadata for every row.
+    fn q4_write_startup_fixture(root: &Path, count: usize) {
+        let audio = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/audio/silence.flac"
+        ));
+        for index in 0..count {
+            let path = root.join(format!("q4-track-{index:05}.flac"));
+            std::fs::write(&path, audio).expect("write q4 startup fixture audio");
+        }
+    }
+
+    /// Observed startup timeline, in microseconds from engine start.
+    #[derive(Debug, Default)]
+    struct Q4StartupTimeline {
+        server_ready_us: Option<u64>,
+        fullsync_us: Option<u64>,
+        fullsync_rows: usize,
+        scan_complete_us: Option<u64>,
+        scan_progress_events: usize,
+        /// When the during-scan-admitted history command published its
+        /// committed-row event (always after `scan_complete_us`).
+        during_scan_command_applied_us: Option<u64>,
+        flush_ack_us: Option<u64>,
+    }
+
+    impl Q4StartupTimeline {
+        /// Record one engine event's arrival offset.
+        fn record(&mut self, event: &LibraryEvent, elapsed_us: u64, command_track: &str) {
+            match event {
+                LibraryEvent::ServerPlaylistRuntimeReady(_) => {
+                    self.server_ready_us.get_or_insert(elapsed_us);
+                }
+                LibraryEvent::FullSync(tracks) => {
+                    self.fullsync_us.get_or_insert(elapsed_us);
+                    self.fullsync_rows = tracks.len();
+                }
+                LibraryEvent::ScanComplete => {
+                    self.scan_complete_us.get_or_insert(elapsed_us);
+                }
+                LibraryEvent::ScanProgress(_, _) => {
+                    self.scan_progress_events += 1;
+                }
+                LibraryEvent::PlaybackHistoryUpdated(track)
+                    if track.native_track_id.as_ref().map(TrackId::as_str)
+                        == Some(command_track) =>
+                {
+                    self.during_scan_command_applied_us = Some(elapsed_us);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Drive the production `run()` shape and collect the startup timeline.
+    ///
+    /// The command FIFO (one history mutation plus the Flush barrier) is
+    /// enqueued by the caller before the engine task is polled, and `run()`
+    /// awaits `initial_scan` before its command loop starts — so both are
+    /// structurally during-scan admissions regardless of machine speed.
+    async fn q4_collect_startup_timeline(
+        event_rx: &async_channel::Receiver<LibraryEvent>,
+        flush_rx: async_channel::Receiver<()>,
+        command_track: &str,
+        start: std::time::Instant,
+    ) -> Q4StartupTimeline {
+        let mut timeline = Q4StartupTimeline::default();
+        loop {
+            let elapsed_us = start.elapsed().as_micros() as u64;
+            let next = tokio::select! {
+                biased;
+                ack = flush_rx.recv() => {
+                    assert!(ack.is_ok(), "Flush barrier must be acknowledged");
+                    timeline.flush_ack_us = Some(start.elapsed().as_micros() as u64);
+                    break;
+                }
+                event = event_rx.recv() => {
+                    event.expect("engine event channel stays open until flush")
+                }
+            };
+            timeline.record(&next, elapsed_us, command_track);
+        }
+        // The command event was published before the flush ack, so a
+        // bounded non-blocking drain settles any remaining race.
+        while let Ok(event) = event_rx.try_recv() {
+            let elapsed_us = start.elapsed().as_micros() as u64;
+            timeline.record(&event, elapsed_us, command_track);
+        }
+        timeline
+    }
+
+    /// Q4 measurement: production engine startup on a sized fixture tree,
+    /// with a history command and the shutdown Flush admitted during the
+    /// initial scan. Prints `Q4_ENGINE_METRIC` lines and asserts the
+    /// settlement contract: the scan publishes its snapshot, the admitted
+    /// command commits only after the scan settles, and the FIFO barrier
+    /// acks last — nothing admitted during the scan is lost or reordered.
+    #[ignore = "explicit Q4 measurement harness; run with --ignored (tr-am6qr)"]
+    #[tokio::test]
+    async fn q4_engine_startup_and_during_scan_admission_benchmark() {
+        let track_count = q4_startup_fixture_track_count();
+        let db = rename_test_database().await;
+        let fixture = TestDirectory::new("q4-startup-responsiveness");
+        let root = fixture.path().to_path_buf();
+        q4_write_startup_fixture(&root, track_count);
+        let marker = create_root_marker(&root)
+            .expect("create q4 root marker")
+            .identity;
+        insert_reauthorization_root(&db, &root, &marker, true).await;
+        const COMMAND_TRACK: &str = "q4-during-scan-cmd";
+        insert_playback_history_test_track(&db, COMMAND_TRACK, 0, Some(0)).await;
+
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let (refresh, refresh_rx) =
+            super::super::playlist_sidebar::playlist_sidebar_refresh_channel();
+        let (coordinator, coordinator_shutdown) =
+            crate::server_playlist_coordinator::spawn_server_playlist_coordinator();
+        let source_registry =
+            crate::source_registry::SourceRegistry::new(tokio::runtime::Handle::current());
+        let invalidations = source_registry.subscribe_invalidations();
+        let services = LibraryEngineServices::new(
+            refresh,
+            refresh_rx,
+            coordinator,
+            coordinator_shutdown,
+            source_registry,
+            invalidations,
+        );
+        let engine = LibraryEngine::new(
+            db.clone(),
+            vec![root.clone()],
+            Vec::new(),
+            event_tx,
+            command_rx,
+            services,
+        );
+        let start = std::time::Instant::now();
+
+        // Admit during the scan: run() awaits initial_scan before its
+        // command loop, so these queue while the scan owns the engine.
+        let (flush_tx, flush_rx) = async_channel::bounded(1);
+        command_tx
+            .send(LibraryCommand::RecordPlaybackHistory {
+                track_id: TrackId::new(COMMAND_TRACK).expect("valid q4 command track ID"),
+                counted_at_ms: 1_000,
+            })
+            .await
+            .expect("admit during-scan history command");
+        command_tx
+            .send(LibraryCommand::Flush {
+                completion: flush_tx,
+            })
+            .await
+            .expect("admit during-scan Flush barrier");
+
+        let engine_task = tokio::spawn(engine.run());
+        let timeline = q4_collect_startup_timeline(&event_rx, flush_rx, COMMAND_TRACK, start).await;
+
+        // ── Settlement contract ──
+        // The published snapshot covers the fixture rows plus the one
+        // pre-inserted command track (the scan does not know it apart).
+        assert_eq!(
+            timeline.fullsync_rows,
+            track_count + 1,
+            "startup snapshot must publish every fixture row"
+        );
+        let scan_complete_us = timeline
+            .scan_complete_us
+            .expect("initial scan publishes ScanComplete");
+        let flush_ack_us = timeline
+            .flush_ack_us
+            .expect("flush acknowledged by the collector loop");
+        let command_applied_us = timeline
+            .during_scan_command_applied_us
+            .expect("during-scan command commits and publishes after the scan");
+        assert!(
+            scan_complete_us <= flush_ack_us,
+            "the scan settles before the FIFO barrier acks"
+        );
+        assert!(
+            command_applied_us >= scan_complete_us,
+            "a command admitted during the scan applies only after the scan settles"
+        );
+        let command_row = track::Entity::find_by_id(COMMAND_TRACK)
+            .one(&db)
+            .await
+            .expect("query during-scan command row")
+            .expect("during-scan command row exists");
+        assert_eq!(
+            command_row.play_count, 1,
+            "the during-scan-admitted occurrence is durably counted"
+        );
+
+        // ── Metrics (budgets live in docs/engine-ui-responsiveness.md) ──
+        let metric = |name: &str, value: f64| {
+            println!("Q4_ENGINE_METRIC name={name} rows={track_count} value={value:.3}");
+        };
+        if let Some(us) = timeline.server_ready_us {
+            metric("startup_server_ready_ms", us as f64 / 1_000.0);
+        }
+        if let Some(us) = timeline.fullsync_us {
+            metric("startup_fullsync_ms", us as f64 / 1_000.0);
+        }
+        metric("startup_scan_settle_ms", scan_complete_us as f64 / 1_000.0);
+        metric(
+            "post_scan_drain_ms",
+            (flush_ack_us - scan_complete_us) as f64 / 1_000.0,
+        );
+        metric(
+            "cancellation_flush_settle_ms",
+            flush_ack_us as f64 / 1_000.0,
+        );
+        println!(
+            "Q4_ENGINE_METRIC name=scan_progress_events rows={track_count} value={}",
+            timeline.scan_progress_events
+        );
+
+        // Teardown hygiene: production shutdown aborts the spawned engine
+        // task rather than joining it (the watcher/command loop lives until
+        // abort), so mirror that here instead of awaiting an exit that
+        // never comes.
+        drop(command_tx);
+        engine_task.abort();
+    }
 }

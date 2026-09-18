@@ -1157,6 +1157,156 @@ mod tests {
         assert_eq!(row.count().text(), "");
     }
 
+    // ── Q4 engine-loop/GTK responsiveness lane (tr-am6qr) ──────────────
+
+    /// Deterministic synthetic snapshot spread over 4 genres, 5 artists,
+    /// and 4 album-per-artist groups, so browser pane cardinality is a
+    /// known function of the row count.
+    fn q4_bench_track_objects(count: usize) -> Vec<TrackObject> {
+        (0..count)
+            .map(|index| {
+                TrackObject::new(
+                    (index % 12) as u32,
+                    &format!("Q4 Bench Track {index:05}"),
+                    180,
+                    &format!("Q4 Artist {}", index % 5),
+                    &format!("Q4 Album {}", index % 4),
+                    &format!("Q4 Genre {}", index % 4),
+                    "",
+                    2026,
+                    "2026-09-18",
+                    320,
+                    44_100,
+                    0,
+                    "FLAC",
+                    &format!("file:///q4-bench/{index:05}.flac"),
+                )
+            })
+            .collect()
+    }
+
+    /// The genre/artist/album ListStores behind the browser panes, in pane
+    /// order (same traversal contract as `rebuild_browser_data`).
+    fn q4_browser_pane_stores(browser_box: &gtk::Box) -> Vec<gio::ListStore> {
+        let mut stores = Vec::new();
+        let Some(panes_box) = browser_box.last_child().and_downcast::<gtk::Box>() else {
+            return stores;
+        };
+        let mut child = panes_box.first_child();
+        while let Some(widget) = child {
+            if let Some(pane) = widget.downcast_ref::<gtk::Box>() {
+                if let Some(store) = get_store_from_pane(pane) {
+                    stores.push(store);
+                }
+            }
+            child = widget.next_sibling();
+        }
+        stores
+    }
+
+    /// FullSync publication contract plus the opt-in measurement for the
+    /// GTK-side endpoints this lane owns (source publication / browser
+    /// rebuild latency after the scan settles, and the main-loop stall the
+    /// synchronous publication inflicts).
+    ///
+    /// The contract half always runs: a `display_tracks` publication over a
+    /// small snapshot must replace the track store, the master rows, the
+    /// browser snapshot, and repopulate the genre pane. The measurement
+    /// half runs only when `TRIBUTARY_Q4_UI_BENCH_TRACKS` is set to a row
+    /// count — an explicit measurement run, recorded per runner in
+    /// `docs/engine-ui-responsiveness.md`. Runs inside the crate's single
+    /// GTK session (see the consolidated test below).
+    fn q4_publication_contract_and_bench() {
+        let objects = q4_bench_track_objects(60);
+        let (browser_box, browser_state) = build_browser(&[], false, Box::new(|_, _, _, _, _| {}));
+        let track_store = gio::ListStore::new::<TrackObject>();
+        // The production tracklist drives a ColumnView over a selection
+        // model wrapping the store; mirror that so `display_tracks`'s
+        // scroll_to target exists.
+        let selection = gtk::SingleSelection::new(Some(track_store.clone()));
+        let column_view = gtk::ColumnView::new(Some(selection));
+        let master_tracks = RefCell::new(Vec::new());
+        let status_label = gtk::Label::default();
+
+        crate::ui::window::display_tracks(
+            &objects,
+            &track_store,
+            &master_tracks,
+            &browser_box,
+            &browser_state,
+            &status_label,
+            &column_view,
+        );
+        assert_eq!(
+            track_store.n_items() as usize,
+            objects.len(),
+            "publication must replace the visible track store"
+        );
+        assert_eq!(
+            master_tracks.borrow().len(),
+            objects.len(),
+            "publication must replace the master row set"
+        );
+        assert_eq!(
+            browser_state.tracks.borrow().len(),
+            objects.len(),
+            "publication must replace the browser snapshot"
+        );
+        let pane_stores = q4_browser_pane_stores(&browser_box);
+        // populate_genres prepends the "All" row: 1 + the 4 synthetic genres.
+        assert_eq!(
+            pane_stores.first().map(gio::ListStore::n_items),
+            Some(5),
+            "publication must repopulate the genre pane from the snapshot"
+        );
+
+        if let Ok(bench_rows) = std::env::var("TRIBUTARY_Q4_UI_BENCH_TRACKS") {
+            if let Ok(rows) = bench_rows.parse::<usize>() {
+                if rows > 0 {
+                    q4_measure_publication_rebuild(rows);
+                }
+            }
+        }
+    }
+
+    /// Timed publication at `rows` scale, on a browser built empty so the
+    /// first publication mirrors the startup FullSync path (empty panes →
+    /// full snapshot). Prints `Q4_UI_METRIC` lines.
+    fn q4_measure_publication_rebuild(rows: usize) {
+        let objects = q4_bench_track_objects(rows);
+        let (browser_box, browser_state) = build_browser(&[], false, Box::new(|_, _, _, _, _| {}));
+        let track_store = gio::ListStore::new::<TrackObject>();
+        let selection = gtk::SingleSelection::new(Some(track_store.clone()));
+        let column_view = gtk::ColumnView::new(Some(selection));
+        let master_tracks = RefCell::new(Vec::new());
+        let status_label = gtk::Label::default();
+        let publish = |objects: &[TrackObject]| {
+            crate::ui::window::display_tracks(
+                objects,
+                &track_store,
+                &master_tracks,
+                &browser_box,
+                &browser_state,
+                &status_label,
+                &column_view,
+            );
+        };
+
+        let first_started = std::time::Instant::now();
+        publish(&objects);
+        let first_ms = first_started.elapsed().as_micros() as f64 / 1_000.0;
+        let resync_started = std::time::Instant::now();
+        publish(&objects);
+        let resync_ms = resync_started.elapsed().as_micros() as f64 / 1_000.0;
+        let rebuild_started = std::time::Instant::now();
+        rebuild_browser_data(&browser_box, &browser_state, &objects);
+        let rebuild_ms = rebuild_started.elapsed().as_micros() as f64 / 1_000.0;
+
+        println!("Q4_UI_METRIC name=publication_first_ms rows={rows} value={first_ms:.3}");
+        println!("Q4_UI_METRIC name=publication_resync_ms rows={rows} value={resync_ms:.3}");
+        println!("Q4_UI_METRIC name=browser_rebuild_ms rows={rows} value={rebuild_ms:.3}");
+    }
+
     /// The crate's single consolidated GTK widget test, all run on the ONE
     /// thread that owns the GTK session:
     ///
@@ -1173,7 +1323,12 @@ mod tests {
     ///   a disabled pane, no dangling edge gutters
     ///   ([`crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones`]);
     /// - tracklist drags must start only from the data row area (folded
-    ///   into the popover contract).
+    ///   into the popover contract);
+    /// - a FullSync publication must replace the visible track store, the
+    ///   master rows, the browser snapshot, and repopulate the genre panes;
+    ///   when `TRIBUTARY_Q4_UI_BENCH_TRACKS` is set it additionally times
+    ///   the publication/rebuild endpoints at that scale
+    ///   ([`Self::q4_publication_contract_and_bench`], tr-am6qr).
     ///
     /// This is deliberately the only GTK-initializing `#[test]` in the
     /// crate: the `ui::widget_test_session` mutex serializes but does not
@@ -1204,6 +1359,7 @@ mod tests {
 
                 crate::ui::context_menu::tests::popover_from_menu_model_attaches_a_visible_child_widget();
                 crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones();
+                q4_publication_contract_and_bench();
             },
         ) else {
             return;
