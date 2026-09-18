@@ -115,7 +115,10 @@ fn wire_enable_switch(
 
 /// Preset combo: load the named preset's band vector and preamp, apply,
 /// then reflect the full preset write across the sliders from the
-/// **authoritative applied state**.
+/// **authoritative applied state**. The echo-safety skip (module header)
+/// also guards this control: a `selected` notify naming the already
+/// recorded preset — a late delivery of our own reflection — is never a
+/// user choice, so it neither re-applies nor arms a spurious save.
 fn wire_preset_dropdown(
     active_output: &SharedAudioOutput,
     preset_dropdown: &gtk::DropDown,
@@ -139,6 +142,16 @@ fn wire_preset_dropdown(
         let Some(preset) = preset_from_menu_position(position) else {
             return;
         };
+        // Echo safety (see the module header): the selected-notify of our
+        // own applied-state reflection can arrive after the guard is
+        // cleared, so a choice equal to the recorded preset is that echo
+        // — never a user choice. Applying it would re-apply identical
+        // settings (arming a spurious debounced save) right after a
+        // Reset/Reload/reflection that just landed this preset. Skip it;
+        // a genuine choice always differs from the recorded preset.
+        if active_output.borrow().equalizer_settings().preset == preset {
+            return;
+        }
         let mut settings = active_output.borrow().equalizer_settings();
         settings.preset = preset;
         settings.bands_db = preset.band_gains_db();
@@ -161,7 +174,12 @@ fn wire_preset_dropdown(
 /// preset combo to `Custom` (contract acceptance 5: the persisted
 /// `preset` field becomes `custom` and the UI combo displays `Custom`)
 /// — sourced from the applied state and running under the same
-/// re-entrancy guard so it cannot be mistaken for a menu choice.
+/// re-entrancy guard so it cannot be mistaken for a menu choice. The
+/// echo-safety skip (module header) also guards these controls: a
+/// `value-changed` whose snapped value already equals the recorded
+/// gain — a late delivery of our own reflection, e.g. after a
+/// Reset/Reload/preset `set_value` — is never a user edit, so it
+/// neither applies nor moves the preset to `Custom`.
 fn wire_gain_sliders(
     active_output: &SharedAudioOutput,
     preset_dropdown: &gtk::DropDown,
@@ -177,8 +195,22 @@ fn wire_gain_sliders(
             if updating_for_preamp.get() {
                 return;
             }
+            // Echo safety (see the module header): the value-changed of
+            // our own applied-state reflection can arrive after the
+            // guard is cleared, so a snapped request already equal to
+            // the recorded preamp is that echo — never a user edit.
+            // Applying it would flip the just-restored preset to
+            // `custom`, re-apply identical settings (arming a spurious
+            // debounced save), and move the combo to `Custom` seconds
+            // after a Reset/Reload/preset action. Skip it; a genuine
+            // edit always differs from the recorded state.
+            let wanted = snap_gain(scale.value());
+            #[allow(clippy::float_cmp)] // snapped gains are exactly representable half-steps
+            if output_for_preamp.borrow().equalizer_settings().preamp_db == wanted {
+                return;
+            }
             let mut settings = output_for_preamp.borrow().equalizer_settings();
-            settings.preamp_db = snap_gain(scale.value());
+            settings.preamp_db = wanted;
             settings.mark_custom();
             output_for_preamp
                 .borrow()
@@ -199,8 +231,22 @@ fn wire_gain_sliders(
             if updating_for_band.get() {
                 return;
             }
+            // Echo safety (see the module header): the value-changed of
+            // our own applied-state reflection can arrive after the
+            // guard is cleared, so a snapped request already equal to
+            // the recorded band gain is that echo — never a user edit.
+            // Applying it would flip the just-restored preset to
+            // `custom`, re-apply identical settings (arming a spurious
+            // debounced save), and move the combo to `Custom` seconds
+            // after a Reset/Reload/preset action. Skip it; a genuine
+            // edit always differs from the recorded state.
+            let wanted = snap_gain(scale.value());
+            #[allow(clippy::float_cmp)] // snapped gains are exactly representable half-steps
+            if output_for_band.borrow().equalizer_settings().bands_db[index] == wanted {
+                return;
+            }
             let mut settings = output_for_band.borrow().equalizer_settings();
-            settings.bands_db[index] = snap_gain(scale.value());
+            settings.bands_db[index] = wanted;
             settings.mark_custom();
             output_for_band.borrow().apply_equalizer_settings(settings);
             let applied = output_for_band.borrow().equalizer_settings();
@@ -300,14 +346,18 @@ fn wire_reset_button(
 
 /// Reload from disk: the only escape hatch from a malformed file,
 /// performed by the audio module (which owns the path), then reflect
-/// the loaded state across every control. A supported output reloads
-/// through its own state and the panel shows the **authoritative
-/// applied state** afterwards; an unsupported active renderer parks the
-/// local settings on disk, so the reload surfaces the parked persisted
-/// state — the disabled panel must keep showing the last-saved values,
-/// never defaults (contract: *Capability matrix*), and the shared
-/// reader keeps the repair-and-diagnose behavior identical to
-/// startup's.
+/// the loaded state across every control. Reload is a supported-output
+/// affordance — for an unsupported active renderer the buttons row is
+/// insensitive (capability matrix; `build.rs`
+/// `apply_unsupported_rendering`), so this handler only ever runs
+/// against a supported output. That output reloads through its own
+/// state, and the panel reflects the **authoritative applied state**
+/// afterwards (a deferred edit keeps the installed topology) rather
+/// than the freshly loaded file. The parked persisted state an
+/// unsupported output must show (contract: *Capability matrix*) is
+/// sourced at build time by `build_equalizer_group` through the shared
+/// `load_settings_with_status()` reader, which keeps the
+/// repair-and-diagnose behavior identical to startup's.
 fn wire_reload_button(
     active_output: &SharedAudioOutput,
     controls: &EqualizerControls,
@@ -323,15 +373,15 @@ fn wire_reload_button(
     controls.reload_button.connect_clicked(move |_| {
         let settings = {
             let output = active_output.borrow();
-            if output.supports_equalizer() {
-                output.reload_equalizer_settings();
-                // The apply above is the authority; reflect the state the
-                // output now reports (a deferred edit keeps the installed
-                // topology) rather than the freshly loaded file.
-                output.equalizer_settings()
-            } else {
-                crate::audio::equalizer::config::load_settings_with_status().0
-            }
+            // Reachability note: the buttons row is insensitive for an
+            // unsupported output (`build.rs`
+            // `apply_unsupported_rendering`), so this closure only ever
+            // fires for a supported active renderer.
+            output.reload_equalizer_settings();
+            // The reload above is the authority; reflect the state the
+            // output now reports (a deferred edit keeps the installed
+            // topology) rather than the freshly loaded file.
+            output.equalizer_settings()
         };
         updating.set(true);
         enable_row.set_active(settings.enabled);
