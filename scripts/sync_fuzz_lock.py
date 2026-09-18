@@ -45,6 +45,9 @@ class Transition:
     align onto. It is None for a removal: the root no longer declares the
     dependency, so the transition proves the fuzz graph dropped the removed
     direct edge and its orphaned closure instead of aligning onto a version.
+    A removal's old closure is prune-only authority: it authorizes dropping
+    the removed records and edges, never rebinding a retained consumer's
+    edge between two versions that merely co-exist inside the span.
     """
 
     name: str
@@ -642,6 +645,11 @@ def validate_dependency_edges(
         for transition in transitions
         if transition.target_root_version is not None
     }
+    # The exact reviewed alignment identities. A retained consumer outside
+    # every reviewed closure may rebind an edge only onto one of these —
+    # never onto a version that merely co-exists inside a removal's
+    # old-closure span.
+    transition_target_identities = set(transition_targets.values())
     removal_names = {
         transition.name
         for transition in transitions
@@ -789,10 +797,25 @@ def validate_dependency_edges(
                     f"{dependency_name!r}: {before_targets} -> {after_targets}"
                 )
 
-            edge_surface = set(before_targets) | set(after_targets)
+            # A removal's old-closure version span is prune-only authority:
+            # it authorizes dropping records and edges inside the span, never
+            # rebinding a retained consumer between two versions that merely
+            # co-exist inside it. A rebind on a retained consumer therefore
+            # needs tie to a requested transition — every newly added target
+            # must be an exact reviewed transition target and every dropped
+            # target must sit inside the reviewed old closure — or the exact
+            # unification mapping proven below. A shared@1 -> shared@2
+            # rewrite whose endpoints co-exist only inside a removal's old
+            # closure is unreviewed drift and fails closed.
+            changed_after_targets = set(after_targets) - set(before_targets)
+            dropped_before_targets = set(before_targets) - set(after_targets)
+            transition_tied_rebind = (
+                changed_after_targets <= transition_target_identities
+                and dropped_before_targets <= old_identities
+            )
             if (
                 identity in authorized_identities
-                or edge_surface <= authorized_identities
+                or transition_tied_rebind
                 # A shared-transitive promotion can rebind an unchanged
                 # consumer onto the single unified record. Admit only an
                 # exact old->replacement mapping proven by
@@ -826,8 +849,11 @@ def validate_bounded_package_changes(
         for transition in transitions
     }
     # A removal has no new root identity: its after-closure contribution is
-    # empty and the checks below bound the submitted lock to dropping
-    # exactly the removed dependency's old closure — nothing else.
+    # empty and the checks below bound the submitted lock to pruning
+    # exactly the removed dependency's old closure — nothing else. That
+    # old closure is prune-only authority: it proves which records and
+    # edges may disappear, and never rebinds a retained consumer's edge
+    # between two versions that merely co-exist inside the span.
     new_roots = {
         (transition.name, transition.target_root_version)
         for transition in transitions
@@ -932,8 +958,9 @@ def validate_submitted_fuzz_update(
     view records the removal transition, while the submitted view below
     fails closed until the submitted lock no longer carries the removed
     direct edge. A submitted lock that performs the removal exactly is then
-    bounded by validate_bounded_package_changes to dropping only the removed
-    dependency's old closure.
+    bounded by validate_bounded_package_changes to pruning only the removed
+    dependency's old closure; that closure is prune-only authority and never
+    rewrites a retained consumer's edges.
 
     ``retain_pending_removals=True`` is the write-repair classification: the
     initial pass over a legitimately stale lock retains the pending removal
