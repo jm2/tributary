@@ -197,32 +197,46 @@ def ensure_applied_ignores_match(report: dict[str, Any], ignores: list[str]) -> 
     )
 
 
-def vulnerability_ids(report: dict[str, Any]) -> list[str]:
-    """Extract advisory ids, rejecting malformed or self-contradictory results."""
-    vulnerabilities = report.get("vulnerabilities")
-    if not isinstance(vulnerabilities, dict):
-        raise AuditError("cargo-audit report is missing the vulnerabilities section")
+def entry_advisory_id(entry: Any) -> str:
+    """Return the advisory id of one vulnerability entry, rejecting bad shapes."""
+    advisory = entry.get("advisory") if isinstance(entry, dict) else None
+    advisory_id = advisory.get("id") if isinstance(advisory, dict) else None
+    if not isinstance(advisory_id, str):
+        raise AuditError(
+            "cargo-audit report has a malformed vulnerability entry: "
+            f"{entry!r}"
+        )
+    return advisory_id
+
+
+def validated_entry_ids(vulnerabilities: dict[str, Any]) -> list[str]:
+    """Collect advisory ids from the report's vulnerabilities.list."""
     entries = vulnerabilities.get("list")
     if not isinstance(entries, list):
         raise AuditError(
             "cargo-audit report vulnerabilities.list is missing or not a list"
         )
-    ids: list[str] = []
-    for entry in entries:
-        advisory = entry.get("advisory") if isinstance(entry, dict) else None
-        advisory_id = advisory.get("id") if isinstance(advisory, dict) else None
-        if not isinstance(advisory_id, str):
-            raise AuditError(
-                "cargo-audit report has a malformed vulnerability entry: "
-                f"{entry!r}"
-            )
-        ids.append(advisory_id)
+    return [entry_advisory_id(entry) for entry in entries]
+
+
+def validated_entry_count(vulnerabilities: dict[str, Any], ids: list[str]) -> int:
+    """Return the reported entry count, rejecting self-contradictory results."""
     count = vulnerabilities.get("count")
     if not isinstance(count, int) or isinstance(count, bool) or count != len(ids):
         raise AuditError(
             f"cargo-audit report vulnerabilities.count {count!r} does not match "
             f"its {len(ids)} entries: {sorted(ids)}"
         )
+    return count
+
+
+def vulnerability_ids(report: dict[str, Any]) -> list[str]:
+    """Extract advisory ids, rejecting malformed or self-contradictory results."""
+    vulnerabilities = report.get("vulnerabilities")
+    if not isinstance(vulnerabilities, dict):
+        raise AuditError("cargo-audit report is missing the vulnerabilities section")
+    ids = validated_entry_ids(vulnerabilities)
+    count = validated_entry_count(vulnerabilities, ids)
     if count:
         raise AuditError(f"unhandled vulnerabilities reported: {sorted(ids)}")
     return ids
