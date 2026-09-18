@@ -217,9 +217,19 @@ def derived_counts(records: Sequence[Record]) -> dict[str, tuple[int, int]]:
     }
 
 
+def _counter_search_text(text: str) -> str:
+    """Return the fenced-block-free text that counter patterns may search."""
+    # Counters are prose, so they are searched on the same filtered view the
+    # record parser uses: a fenced code block holds syntax examples, not
+    # progress, and must never be selected as the counter nor reported as an
+    # arithmetic inconsistency.
+    return "\n".join(line for _, line in iter_content_lines(text))
+
+
 def check_counters(text: str, records: Sequence[Record]) -> list[str]:
     """Report prose counters that disagree with the checkbox state or arithmetic."""
-    normalized = re.sub(r"\s+", " ", text)
+    searchable = _counter_search_text(text)
+    normalized = re.sub(r"\s+", " ", searchable)
     expected = derived_counts(records)
     problems: list[str] = []
 
@@ -247,8 +257,10 @@ def check_counters(text: str, records: Sequence[Record]) -> list[str]:
 
     # Every explicit percentage must at least be arithmetically consistent.
     # The archived remediation counter additionally gets a mechanical recount
-    # against its source document in check_archived_counter.
-    for match in PERCENT_COUNTER.finditer(text):
+    # against its source document in check_archived_counter.  The scan runs on
+    # the filtered prose: a fenced example such as ``**1/3 (50.0%)**`` is
+    # documentation, not a stated progress figure.
+    for match in PERCENT_COUNTER.finditer(searchable):
         complete = int(match.group("complete"))
         total = int(match.group("total"))
         stated = float(match.group("percent"))
@@ -342,7 +354,10 @@ def derive_archived_counts(path: Path) -> tuple[int, int, list[str]]:
 
 def check_archived_counter(text: str, root: Path) -> list[str]:
     """Report drift between the archived counter prose and its source boxes."""
-    match = ARCHIVED_COUNTER_PATTERN.search(text)
+    # Like the active counters, the archived counter is searched on the
+    # filtered prose: a fenced example of the counter wording is
+    # documentation and must not be selected as the counter.
+    match = ARCHIVED_COUNTER_PATTERN.search(_counter_search_text(text))
     if match is None:
         missing = (
             "counter: could not find the archived remediation counter; "

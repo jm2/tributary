@@ -26,7 +26,9 @@ is a read-only, dependency-free checker for those invariants. It runs in the CI
    boxes are excluded, mirroring that document's own accounting, and a
    checkbox under any other heading is reported as unclassifiable rather than
    silently ignored. Every explicit percentage in the file must also be
-   arithmetically consistent.
+   arithmetically consistent. Counter patterns are matched against the prose
+   only: fenced code blocks hold syntax examples, not progress, so an example
+   counter inside a fence is neither selected nor arithmetically validated.
 3. **Internal links and anchors.** Every relative Markdown link target must
    exist inside the repository root — a target that resolves outside the root
    (including through a symlink) is reported — and every `#anchor` into

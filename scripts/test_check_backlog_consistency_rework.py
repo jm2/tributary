@@ -397,5 +397,84 @@ class InlineSyntaxTests(unittest.TestCase):
         self.assertEqual(checker.check_links(root, [guide, target]), [])
 
 
+class CounterSearchTextTests(unittest.TestCase):
+    """Regressions for the filtered-counter-search review finding."""
+
+    # check_counters and check_archived_counter used to search raw text, so a
+    # fenced documentation example could be selected as the prose counter or
+    # reported as an arithmetic inconsistency.  Every counter search now runs
+    # on the same fence-filtered view the record parser uses.
+
+    def make_root(self):
+        temporary = tempfile.TemporaryDirectory(prefix="tributary-backlog-")
+        self.addCleanup(temporary.cleanup)
+        return Path(temporary.name).resolve()
+
+    def write(self, root, name, text):
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def write_archived_fixture(self, root, **kwargs):
+        return self.write(root, checker.ARCHIVED_INDEX_NAME, archived_remediation_doc(**kwargs))
+
+    def test_fenced_prose_counter_example_is_not_selected(self):
+        # A fenced example of the counter wording must neither be selected
+        # over the real prose counter nor contradict it.
+        text = (
+            "```markdown\n"
+            "Current status: **9/9 (100.0%)** records complete. The retained\n"
+            "baseline is **9/9**, with **9/9** new corrective and **9/9**\n"
+            "engineering records complete.\n"
+            "```\n"
+            + counter_paragraph()
+            + sample_records()
+        )
+        records = checker.parse_records(text)
+        self.assertEqual(checker.check_counters(text, records), [])
+
+    def test_fenced_arithmetic_example_does_not_fail(self):
+        # ``**1/3 (50.0%)**`` is arithmetically inconsistent; inside a fence
+        # it is documentation and must not be reported as a bad percentage.
+        text = (
+            "```markdown\n"
+            "Progress example: **1/3 (50.0%)**\n"
+            "```\n"
+            + counter_paragraph()
+            + sample_records()
+        )
+        records = checker.parse_records(text)
+        self.assertEqual(checker.check_counters(text, records), [])
+
+    def test_fenced_archived_counter_example_is_not_selected(self):
+        # A fenced archived-counter example with wrong numbers must not be
+        # taken as the counter: the real prose counter is validated instead.
+        root = self.make_root()
+        text = (
+            "```markdown\n"
+            "The archived remediation remains **1/3 (50.0%)**.\n"
+            "```\n"
+            + counter_paragraph()
+        )
+        self.write(root, "docs/task.md", text)
+        self.write_archived_fixture(root)
+        self.assertEqual(checker.check_archived_counter(text, root), [])
+
+    def test_real_counter_drift_is_still_reported(self):
+        # No lost detections: with the fenced example present, a genuinely
+        # wrong prose counter still fails.
+        text = (
+            "```markdown\n"
+            "Progress example: **1/3 (50.0%)**\n"
+            "```\n"
+            + counter_paragraph(overall=(4, 4, 100.0))
+            + sample_records()
+        )
+        records = checker.parse_records(text)
+        problems = checker.check_counters(text, records)
+        self.assertTrue(any("overall says 4/4" in problem for problem in problems), problems)
+
+
 if __name__ == "__main__":
     unittest.main()
