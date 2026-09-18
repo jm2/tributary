@@ -75,29 +75,7 @@ impl<'a> PlanBuilder<'a> {
         let source_absolute = self.request.source.root().join(&item.source_relative_path);
         let metadata = read_source_metadata(&source_absolute, &item.source_relative_path)?;
         if metadata.is_dir() {
-            // The directory item itself is part of the retained source tree
-            // and must be probed through the retained root exactly like every
-            // walked subdirectory below, regardless of recursion: the
-            // classification lookup above is an absolute-path
-            // `symlink_metadata` whose resolution follows symlink/reparse
-            // ancestors, so a non-recursive item beneath a replaced ancestor
-            // would otherwise stage — and its creation execute — entirely
-            // outside the retained boundary.
-            self.ensure_walked_directory_boundary(&source_absolute)?;
-            // A directory item mapped to a nested destination must stage
-            // every missing ancestor before its leaf, exactly once each:
-            // the executor records each created component for rollback, so
-            // a failed transfer removes the whole created chain instead of
-            // leaving ancestors behind.
-            ensure_ancestor_directory_stages(
-                &item.destination_relative_path,
-                &mut self.stages,
-                &mut self.directory_count,
-                &mut self.created_directories,
-            )?;
-            if self.request.recurse_directories {
-                self.collect_directory_stages(item)?;
-            }
+            self.plan_directory_item(item, &source_absolute)?;
         } else if metadata.is_file() {
             self.ensure_source_file_boundary(&source_absolute)?;
             self.plan_file_item(item, metadata.len())?;
@@ -105,6 +83,39 @@ impl<'a> PlanBuilder<'a> {
             return Err(TransferError::UnsupportedSourceEntry {
                 path: item.source_relative_path.clone(),
             });
+        }
+        Ok(())
+    }
+
+    /// Plan one directory item: the retained-root boundary probe, the
+    /// destination ancestor stages, then the recursive walk when requested.
+    fn plan_directory_item(
+        &mut self,
+        item: &TransferItem,
+        source_absolute: &Path,
+    ) -> Result<(), TransferError> {
+        // The directory item itself is part of the retained source tree
+        // and must be probed through the retained root exactly like every
+        // walked subdirectory below, regardless of recursion: the
+        // classification lookup above is an absolute-path
+        // `symlink_metadata` whose resolution follows symlink/reparse
+        // ancestors, so a non-recursive item beneath a replaced ancestor
+        // would otherwise stage — and its creation execute — entirely
+        // outside the retained boundary.
+        self.ensure_walked_directory_boundary(source_absolute)?;
+        // A directory item mapped to a nested destination must stage
+        // every missing ancestor before its leaf, exactly once each:
+        // the executor records each created component for rollback, so
+        // a failed transfer removes the whole created chain instead of
+        // leaving ancestors behind.
+        ensure_ancestor_directory_stages(
+            &item.destination_relative_path,
+            &mut self.stages,
+            &mut self.directory_count,
+            &mut self.created_directories,
+        )?;
+        if self.request.recurse_directories {
+            self.collect_directory_stages(item)?;
         }
         Ok(())
     }
