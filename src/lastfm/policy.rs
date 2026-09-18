@@ -224,6 +224,22 @@ fn empty_remote_sources() -> &'static HashSet<SourceId> {
 #[derive(Clone, Default)]
 pub struct LastFmLivePolicy(std::sync::Arc<std::sync::Mutex<LastFmPolicyGeneration>>);
 
+/// Lock the shared UI policy slot, recovering from a poisoned mutex.
+///
+/// The slot's value is replaced wholesale and re-validated on every read, so
+/// a panic while a guard is held (for example a poisoned removable-media
+/// catalogue panicking inside `play_track_at`'s queue capture) cannot leave a
+/// torn generation behind. Recovering with
+/// [`std::sync::PoisonError::into_inner`] preserves the last published
+/// generation and keeps every later consumer alive: dispatch refuses dormant
+/// generations by value, never by lock state.
+pub(crate) fn lock_policy_slot(
+    slot: &std::sync::Mutex<LastFmPolicyGeneration>,
+) -> std::sync::MutexGuard<'_, LastFmPolicyGeneration> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl LastFmLivePolicy {
     /// Wrap an already-shared UI policy slot.
     pub(crate) fn from_shared(
@@ -234,18 +250,12 @@ impl LastFmLivePolicy {
 
     /// Freeze one exact observation of the live generation.
     pub(crate) fn snapshot(&self) -> LastFmPolicyGeneration {
-        self.0
-            .lock()
-            .expect("lastfm policy mutex must not be poisoned")
-            .clone()
+        lock_policy_slot(&self.0).clone()
     }
 
     /// Publish a successor generation from the database-init path.
     pub(crate) fn publish(&self, generation: LastFmPolicyGeneration) {
-        *self
-            .0
-            .lock()
-            .expect("lastfm policy mutex must not be poisoned") = generation;
+        *lock_policy_slot(&self.0) = generation;
     }
 
     /// The dispatch authority of the current live generation.
@@ -887,5 +897,47 @@ mod tests {
         .unwrap();
         assert!(disabled.activation_remote_sources().is_none());
         assert!(disabled.queue_capture_remote_sources().is_empty());
+    }
+
+    /// A panic while a policy guard is held (for example a poisoned removable
+    /// catalogue inside the visible-queue capture) poisons the shared slot.
+    /// Every later consumer must recover through `lock_policy_slot`: the
+    /// generation is replaced wholesale and re-validated by value, so neither
+    /// snapshot, dispatch, nor publish may cascade the poison.
+    #[test]
+    fn poisoned_policy_slot_recovers_for_snapshot_publish_and_dispatch() {
+        let live = LastFmLivePolicy::default();
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
+
+        // Poison the shared slot exactly like a panic under a held guard.
+        let slot = live.0.clone();
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = slot.lock().expect("hold the slot while panicking");
+            panic!("poison the policy slot");
+        }));
+        assert!(poison.is_err());
+        assert!(slot.is_poisoned());
+
+        assert_eq!(
+            live.snapshot().generation(),
+            1,
+            "snapshot must survive a poisoned slot"
+        );
+        assert!(
+            live.dispatch_authority()
+                .is_some_and(|authority| authority.generation() == 1),
+            "dispatch authority must survive a poisoned slot"
+        );
+        live.publish(LastFmPolicyGeneration::for_test(2, HashSet::new()));
+        assert_eq!(
+            live.snapshot().generation(),
+            2,
+            "publish must stay writable through a poisoned slot"
+        );
+        assert!(
+            live.dispatch_authority()
+                .is_some_and(|authority| authority.generation() == 2),
+            "the republished generation must drive dispatch after recovery"
+        );
     }
 }

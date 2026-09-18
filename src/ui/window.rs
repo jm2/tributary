@@ -2106,7 +2106,11 @@ pub(crate) fn build_window(
                 // malformed record.
                 match crate::lastfm::policy::load_policy_generation(&db).await {
                     Ok(policy) => {
-                        *engine_lastfm_policy.lock().unwrap() = policy;
+                        // Recovering publish: the shared slot must stay
+                        // writable even after a poisoned lock, because the
+                        // value is replaced wholesale and re-validated on
+                        // every read.
+                        *crate::lastfm::policy::lock_policy_slot(&engine_lastfm_policy) = policy;
                     }
                     Err(error) => {
                         tracing::warn!(

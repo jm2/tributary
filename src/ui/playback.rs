@@ -1892,7 +1892,10 @@ fn control_current_output(ctx: &PlaybackContext, control: impl FnOnce(&dyn Audio
 /// starts the selected item. Later view mutations do not alter that queue.
 pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     let source_key = ctx.active_source_key.borrow().clone();
-    let policy = ctx.lastfm_policy.lock().unwrap();
+    // Recovering lock: the capture below can transitively reach fallible
+    // adapters (removable media), so the policy slot must survive a poisoned
+    // mutex instead of panicking on every later consumer.
+    let policy = crate::lastfm::policy::lock_policy_slot(&ctx.lastfm_policy);
     let Some(captured) = capture_visible_queue(
         &ctx.model,
         &source_key,
@@ -2784,7 +2787,7 @@ pub fn play_external_session(
     super::open_files::invalidate_admission();
     // The external occurrence freezes the exact live generation that was
     // current when the queue was captured, exactly like visible-track capture.
-    let policy_generation = ctx.lastfm_policy.lock().unwrap().generation();
+    let policy_generation = crate::lastfm::policy::lock_policy_slot(&ctx.lastfm_policy).generation();
     let item = QueueItem::external(external, policy_generation);
     let previous_external = ctx.session.borrow().current_external_source_id();
     if !ctx.session.borrow_mut().replace_queue(vec![item], 0) {
