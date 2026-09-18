@@ -1196,6 +1196,34 @@ impl LocalSelectionEvidence {
     }
 }
 
+/// The outcome of re-admitting a retained selection through its authority.
+///
+/// The distinction matters to the user: a leaf that no longer opens through
+/// its still-valid parent authority was renamed or deleted since selection —
+/// the changed-on-disk condition — while every other failure is an
+/// availability problem the dialog explains with generic guidance.
+enum RetainedTargetAdmission {
+    Ready(std::sync::Arc<MountedRootAuthority>, MountedMutationTarget),
+    /// The admitted leaf no longer exists at its resolved location: it was
+    /// renamed or deleted after selection.
+    LeafMissing,
+    /// Every other authority or access failure.
+    Unavailable(std::io::Error),
+}
+
+/// Whether a leaf-reopen failure means the admitted leaf is gone.
+///
+/// The parent authority was just acquired and validated, so a miss through it
+/// is a renamed or deleted leaf — not a broken device, a refused permission,
+/// or an authority that moved. Only ENOENT- and ENOTDIR-shaped misses
+/// qualify.
+fn is_missing_leaf_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
 /// Retained selection evidence for one exact local-library file, and the only
 /// way a local properties-dialog write may replace it.
 ///
@@ -1293,9 +1321,22 @@ impl LocalMutationTarget {
                 LocalTagWriteConflict::SelectionUnavailable,
             ));
         };
-        let (authority, target) = self.retained_target().map_err(|_| {
-            LocalTagPreflightError::Unavailable(TagWritePreflightError::Unavailable)
-        })?;
+        let (authority, target) = match self.retained_target() {
+            RetainedTargetAdmission::Ready(authority, target) => (authority, target),
+            RetainedTargetAdmission::LeafMissing => {
+                // The admitted leaf was renamed or deleted since selection:
+                // the changed-on-disk condition, not a generic availability
+                // failure — reopening Properties is exactly the fix.
+                return Err(LocalTagPreflightError::Conflict(
+                    LocalTagWriteConflict::TargetReplaced,
+                ));
+            }
+            RetainedTargetAdmission::Unavailable(_) => {
+                return Err(LocalTagPreflightError::Unavailable(
+                    TagWritePreflightError::Unavailable,
+                ));
+            }
+        };
         if authority.root_identity() != evidence.parent_identity {
             return Err(LocalTagPreflightError::Conflict(
                 LocalTagWriteConflict::ParentChanged,
@@ -1388,9 +1429,20 @@ impl LocalMutationTarget {
             return Err(conflict_error(LocalTagWriteConflict::SelectionUnavailable));
         };
 
-        let (authority, target) = self.retained_target().map_err(|error| {
-            anyhow::Error::new(error).context("the selected file is unavailable")
-        })?;
+        let (authority, target) = match self.retained_target() {
+            RetainedTargetAdmission::Ready(authority, target) => (authority, target),
+            RetainedTargetAdmission::LeafMissing => {
+                // Same distinction as the preflight: a vanished admitted leaf
+                // is the localized TargetReplaced conflict, and the write
+                // must not chase or recreate anything at the old name.
+                return Err(conflict_error(LocalTagWriteConflict::TargetReplaced));
+            }
+            RetainedTargetAdmission::Unavailable(error) => {
+                return Err(
+                    anyhow::Error::new(error).context("the selected file is unavailable")
+                );
+            }
+        };
         if authority.root_identity() != evidence.parent_identity {
             return Err(conflict_error(LocalTagWriteConflict::ParentChanged));
         }
@@ -1426,28 +1478,35 @@ impl LocalMutationTarget {
 
     /// Re-admit the selected file through a retained authority over its
     /// containing directory.
-    fn retained_target(
-        &self,
-    ) -> std::io::Result<(std::sync::Arc<MountedRootAuthority>, MountedMutationTarget)> {
-        let parent = self.path.parent().ok_or_else(|| {
-            std::io::Error::new(
+    fn retained_target(&self) -> RetainedTargetAdmission {
+        let Some(parent) = self.path.parent() else {
+            return RetainedTargetAdmission::Unavailable(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "the selected file has no containing directory",
-            )
-        })?;
-        let leaf = self.path.file_name().ok_or_else(|| {
-            std::io::Error::new(
+            ));
+        };
+        let Some(leaf) = self.path.file_name() else {
+            return RetainedTargetAdmission::Unavailable(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "the selected file has no name",
-            )
-        })?;
+            ));
+        };
         // Re-admit through the same resolved containing directory capture
         // bound, so the identity comparisons below prove the same object on
         // every save — including a selection reached through a symlink.
-        let resolved_parent = resolve_authority_parent(parent)?;
-        let authority = std::sync::Arc::new(MountedRootAuthority::acquire(&resolved_parent)?);
-        let target = authority.open_mutation_target(Path::new(leaf))?;
-        Ok((authority, target))
+        let resolved_parent = match resolve_authority_parent(parent) {
+            Ok(resolved_parent) => resolved_parent,
+            Err(error) => return RetainedTargetAdmission::Unavailable(error),
+        };
+        let authority = match MountedRootAuthority::acquire(&resolved_parent) {
+            Ok(authority) => std::sync::Arc::new(authority),
+            Err(error) => return RetainedTargetAdmission::Unavailable(error),
+        };
+        match authority.open_mutation_target(Path::new(leaf)) {
+            Ok(target) => RetainedTargetAdmission::Ready(authority, target),
+            Err(error) if is_missing_leaf_error(&error) => RetainedTargetAdmission::LeafMissing,
+            Err(error) => RetainedTargetAdmission::Unavailable(error),
+        }
     }
 }
 
@@ -3220,6 +3279,43 @@ mod tests {
                 TagWritePreflightError::Unavailable
             )),
             "an unreadable selection is an availability category, not a conflict"
+        );
+    }
+
+    /// The admitted leaf is renamed away between selection and Save: both the
+    /// preflight and the write must report the changed-on-disk conflict —
+    /// the parent authority is still valid, so the miss proves the leaf is
+    /// gone — not the generic read-only/device guidance. The displaced file
+    /// is left exactly where it was moved.
+    #[test]
+    fn a_vanished_admitted_leaf_reports_the_conflict() {
+        let (directory, track, target) = local_selection_fixture("local-leaf-vanished");
+        let original = silence_fixture_bytes().to_vec();
+
+        let displaced = directory.path.join("displaced.flac");
+        std::fs::rename(&track, &displaced).expect("rename the admitted leaf away");
+
+        assert_eq!(
+            target.preflight_write_capability(),
+            Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::TargetReplaced
+            )),
+            "a vanished admitted leaf is a changed-on-disk conflict, not unavailability"
+        );
+
+        let error = target
+            .write_tags(&year("2026"))
+            .expect_err("a vanished admitted leaf must refuse the save");
+        assert_eq!(conflict_of(&error), LocalTagWriteConflict::TargetReplaced);
+
+        assert_eq!(
+            std::fs::read(&displaced).expect("read the displaced file back"),
+            original,
+            "the admitted file must be byte-for-byte untouched at its new name"
+        );
+        assert!(
+            directory.temp_files().is_empty(),
+            "a refused save leaves no private sibling behind"
         );
     }
 
