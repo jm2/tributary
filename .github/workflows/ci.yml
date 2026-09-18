@@ -27,7 +27,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # The dependency policy compares PR lock state with the exact base.
+          # Full history so the dependency policy can diff PR lock state
+          # against the exact base commit it resolves at run time.
           fetch-depth: 0
           persist-credentials: false
 
@@ -49,9 +50,19 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           DEPENDENCY_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: >-
-          python3 scripts/sync_fuzz_lock.py check
-          --base-ref "$DEPENDENCY_BASE_SHA"
+        run: |
+          # checkout checks out the PR merge commit (refs/pull/<n>/merge),
+          # whose first parent is the base-branch tip the merge was built
+          # against. The PR's recorded base.sha can be older than that tip
+          # once the base branch advances, so diffing against it attributes
+          # the base's own lock updates to the PR and fails this check
+          # spuriously (blocked PR #175). Diff against the merge's actual
+          # first parent instead; fall back to the recorded base.sha only
+          # when HEAD is not a merge commit.
+          if git rev-parse --verify --quiet HEAD^2 >/dev/null; then
+            DEPENDENCY_BASE_SHA="$(git rev-parse HEAD^1)"
+          fi
+          python3 scripts/sync_fuzz_lock.py check --base-ref "$DEPENDENCY_BASE_SHA"
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
