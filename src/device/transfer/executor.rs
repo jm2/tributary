@@ -195,24 +195,33 @@ impl TransferExecutor {
     }
 
     /// Create one destination directory. Idempotent: an existing directory
-    /// with the same identity is not an error. Exactly the components the
-    /// authority reports as created by this call — leaf and any ancestors it
-    /// had to create along the way — are recorded for rollback, so a nested
-    /// destination never leaves created ancestor directories behind after a
-    /// reversal. Ownership is never inferred from a pre-creation absence
-    /// scan: a component that already existed, including one a concurrent
-    /// writer created moments before the creation call, is adopted rather
-    /// than owned and must survive rollback. The recorded identity of each
-    /// created component is the one the authority captured during the
-    /// exclusive creation itself — never a post-hoc lookup of the path,
-    /// which a newcomer replacing the just-created directory between
-    /// creation and capture would poison into an owned record.
+    /// with the same identity is not an error — rechecked through the
+    /// destination authority's per-component no-follow traversal, never an
+    /// absolute-path lookup, so an ancestor a concurrent writer replaced
+    /// with a symlink/reparse point cannot redirect the classification into
+    /// an external directory and silently adopt it. Exactly the components
+    /// the authority reports as created by this call — leaf and any
+    /// ancestors it had to create along the way — are recorded for
+    /// rollback, so a nested destination never leaves created ancestor
+    /// directories behind after a reversal. Ownership is never inferred
+    /// from a pre-creation absence scan: a component that already existed,
+    /// including one a concurrent writer created moments before the
+    /// creation call, is adopted rather than owned and must survive
+    /// rollback. The recorded identity of each created component is the one
+    /// the authority captured during the exclusive creation itself — never
+    /// a post-hoc lookup of the path, which a newcomer replacing the
+    /// just-created directory between creation and capture would poison
+    /// into an owned record. Directory-only plans never cross the copy
+    /// path's publication boundary, so once the creation has landed and
+    /// been recorded the stage revalidates the source exactly as a
+    /// committed file copy does: a lease lost during the creation fails the
+    /// stage and rolls the recorded directories back instead of reporting
+    /// a completed transfer against a replaced source.
     fn execute_create_directory(
         &self,
         relative: &Path,
         context: &mut RunContext<'_>,
     ) -> Result<(), TransferError> {
-        let final_path = self.request.destination.root().join(relative);
         ensure_normal_item_path(relative)?;
         self.request.destination.validate().map_err(|error| {
             TransferError::authority(format!("destination not current: {error}"))
@@ -229,11 +238,14 @@ impl TransferExecutor {
                         relative_path: created_directory.relative_path,
                     });
                 }
+                self.request.source.validate().map_err(|error| {
+                    TransferError::authority(format!("source not current at publication: {error}"))
+                })?;
                 Ok(())
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                match std::fs::symlink_metadata(&final_path) {
-                    Ok(metadata) if metadata.is_dir() => Ok(()),
+                match self.request.destination.relative_directory_exists(relative) {
+                    Ok(true) => Ok(()),
                     _ => Err(TransferError::io(
                         "directory creation failed with AlreadyExists",
                         error,

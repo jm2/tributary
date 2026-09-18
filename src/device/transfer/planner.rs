@@ -75,6 +75,15 @@ impl<'a> PlanBuilder<'a> {
         let source_absolute = self.request.source.root().join(&item.source_relative_path);
         let metadata = read_source_metadata(&source_absolute, &item.source_relative_path)?;
         if metadata.is_dir() {
+            // The directory item itself is part of the retained source tree
+            // and must be probed through the retained root exactly like every
+            // walked subdirectory below, regardless of recursion: the
+            // classification lookup above is an absolute-path
+            // `symlink_metadata` whose resolution follows symlink/reparse
+            // ancestors, so a non-recursive item beneath a replaced ancestor
+            // would otherwise stage — and its creation execute — entirely
+            // outside the retained boundary.
+            self.ensure_walked_directory_boundary(&source_absolute)?;
             // A directory item mapped to a nested destination must stage
             // every missing ancestor before its leaf, exactly once each:
             // the executor records each created component for rollback, so

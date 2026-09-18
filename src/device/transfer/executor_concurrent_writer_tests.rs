@@ -435,3 +435,153 @@ fn preserve_sibling_allocation_race_exhausting_the_bound_fails_typed() {
         "no private staged leaves may survive: {survivors:?}"
     );
 }
+
+// ── Directory-classification interposition regression ──────────────────
+
+/// A progress sink that, once the adopted `album` ancestor stage has
+/// completed, replaces it with a symlink/reparse point into an external
+/// tree — the concurrent-writer interposition the destination-directory
+/// classification probe must survive. Counts completions so a test can
+/// assert the raced stage never reported success.
+struct SwapAdoptedAncestorForSymlink {
+    ancestor: PathBuf,
+    ancestor_moved_aside: PathBuf,
+    link_target: PathBuf,
+    fired: bool,
+    completions: u32,
+}
+
+impl TransferProgress for SwapAdoptedAncestorForSymlink {
+    fn on_stage_completed(
+        &mut self,
+        _stage: &Stage,
+        _index: u32,
+        _total: u32,
+        _bytes_so_far: u64,
+        _total_bytes: u64,
+    ) {
+        self.completions = self.completions.saturating_add(1);
+        if self.fired {
+            return;
+        }
+        self.fired = true;
+        std::fs::rename(&self.ancestor, &self.ancestor_moved_aside)
+            .expect("writer renames the adopted ancestor aside");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&self.link_target, &self.ancestor)
+            .expect("writer installs the symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&self.link_target, &self.ancestor)
+            .expect("writer installs the reparse point");
+    }
+}
+
+/// The fixture for the raced directory classification: a source `disc`
+/// directory item mapped to a nested destination beneath `album`, which
+/// already exists at the destination (adopted, never owned), plus an
+/// external tree holding the same-named `disc` twin the symlink will
+/// redirect the leaf lookup into. Returns the rooted trees, the planned
+/// request, and the plan.
+fn nested_directory_transfer_fixture() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    TransferRequest,
+    TransferPlan,
+) {
+    let source_root = tempfile::tempdir().expect("temporary source root");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    let outside = tempfile::tempdir().expect("temporary outside root");
+    std::fs::create_dir(source_root.path().join("disc")).expect("create source disc");
+    std::fs::create_dir(destination_root.path().join("album")).expect("create destination album");
+    std::fs::create_dir(outside.path().join("disc")).expect("create external disc twin");
+    let source = read_authority(source_root.path());
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = TransferRequest {
+        source,
+        destination,
+        items: vec![TransferItem::new(
+            PathBuf::from("disc"),
+            PathBuf::from("album/disc"),
+        )],
+        conflict_policy: ConflictPolicy::Skip,
+        capacity_budget: None,
+        recurse_directories: false,
+    };
+    let plan = TransferPlanner::new().plan(&request).expect("plan");
+    (source_root, destination_root, outside, request, plan)
+}
+
+/// An adopted destination ancestor replaced by a symlink mid-run must not
+/// be adopted back through: the next stage's creation reports
+/// `AlreadyExists` via a lookup that FOLLOWS the replaced ancestor into
+/// the external tree, and only a recheck through the destination
+/// authority's no-follow traversal can see the traversal is foreign. The
+/// stage must fail — never report the external twin as the planned
+/// destination — and the writer's objects must survive untouched. Skipped
+/// on Windows when the runner forbids reparse-point creation.
+#[test]
+fn adopted_directory_ancestor_replaced_by_symlink_is_refused_at_the_leaf_stage() {
+    let (_source_root, destination_root, outside, request, plan) =
+        nested_directory_transfer_fixture();
+    #[cfg(windows)]
+    {
+        let probe = destination_root.path().join(".reparse-probe");
+        let creatable = std::os::windows::fs::symlink_dir(outside.path(), &probe).is_ok();
+        let _ = std::fs::remove_file(&probe);
+        if !creatable {
+            // The runner forbids reparse-point creation; the interposition
+            // cannot be exercised here.
+            return;
+        }
+    }
+    let mut progress = SwapAdoptedAncestorForSymlink {
+        ancestor: destination_root.path().join("album"),
+        ancestor_moved_aside: destination_root.path().join("album-writer-moved"),
+        link_target: outside.path().to_path_buf(),
+        fired: false,
+        completions: 0,
+    };
+    let observer = CancellationObserver::never_cancelled();
+    let error = TransferExecutor::new(request, plan)
+        .run(&mut progress, &observer)
+        .expect_err(
+            "the leaf stage beneath the replaced ancestor must fail, never adopt the external \
+             twin",
+        );
+    assert_eq!(
+        progress.completions, 1,
+        "only the ancestor stage may report a completion; the raced stage must not"
+    );
+    assert!(
+        matches!(error, TransferError::Io { .. }),
+        "the raced stage must fail with the typed I/O error: {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("directory creation failed with AlreadyExists"),
+        "the error must name the failed directory creation: {error}"
+    );
+    assert!(
+        std::fs::symlink_metadata(destination_root.path().join("album"))
+            .expect("read replaced ancestor")
+            .file_type()
+            .is_symlink(),
+        "the writer's symlink must survive untouched"
+    );
+    assert!(
+        destination_root.path().join("album-writer-moved").is_dir(),
+        "the writer's moved-aside original must survive untouched"
+    );
+    assert!(
+        outside.path().join("disc").is_dir(),
+        "the external twin must survive untouched — never adopted, never destroyed"
+    );
+    let survivors = entry_names(destination_root.path());
+    assert_eq!(
+        survivors,
+        vec!["album".to_string(), "album-writer-moved".to_string()],
+        "the writer's objects only — no transfer litter: {survivors:?}"
+    );
+}

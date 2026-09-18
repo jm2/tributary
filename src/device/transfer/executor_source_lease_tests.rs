@@ -4,14 +4,15 @@
 //! The source authority is read-only, and its retained descriptor keeps
 //! serving bytes to EOF even after the source root has been renamed aside
 //! and a replacement directory installed at the old name. A lease lost
-//! during the copy must therefore be revalidated at the publication
-//! boundary and never reported as a completed transfer. These regressions
-//! replace the source root inside `on_bytes_copied` on a single final
-//! stage — fresh and overwrite destinations — and assert the publish is
-//! failed, the failed stage reports no completion, and rollback reverses
+//! removed, the failed stage reports no completion, and rollback reverses
 //! the publication (removing a fresh destination, restoring an overwritten
 //! original). A valid-root control pins that the added revalidation does
-//! not fail an ordinary transfer.
+//! not fail an ordinary transfer. A directory-only plan never copies a
+//! byte, so its regressions race the same replacement on the first stage
+//! start and pin the created-directory publication boundary: the transfer
+//! fails, reports no completion, and rollback removes the created
+//! directory; a valid-root control proves an ordinary directory creation
+//! still completes.
 //!
 //! The replacement interposition is platform-specific by necessity. On Unix
 //! a concurrent writer can rename the leased root aside, so the tests race
@@ -29,7 +30,9 @@ use std::path::PathBuf;
 use super::executor_rollback_tests::entry_names;
 use super::executor_tests::transfer_request;
 use super::test_support::{authority_pair, read_authority, write_source_file};
-use super::types::{Stage, TransferError, TransferItem, TransferProgress, TransferSummary};
+use super::types::{
+    Stage, TransferError, TransferItem, TransferProgress, TransferRequest, TransferSummary,
+};
 use super::{TransferExecutor, TransferPlanner};
 use crate::local::write_authority::ConflictPolicy;
 use crate::source_lifecycle::CancellationObserver;
@@ -395,5 +398,221 @@ fn valid_source_root_control_completes() {
     assert_eq!(
         std::fs::read(destination_root.path().join("song.flac")).expect("read final"),
         b"copy me"
+    );
+}
+
+// ── Directory-stage publication regressions ─────────────────────────────
+
+/// A progress sink that, on the first stage start, renames the source root
+/// aside and installs an empty replacement directory at the old path — the
+/// same concurrent-writer interposition the file regressions race through
+/// `on_bytes_copied`, moved to `on_stage_started` because a directory-only
+/// plan never copies a byte. It also counts completion callbacks so a test
+/// can assert the failed stage never reported success.
+struct ReplaceSourceRootOnStageStart {
+    source_root: PathBuf,
+    moved_root: PathBuf,
+    fired: bool,
+    /// Set when the platform refused the replacement outright: the
+    /// retained source lease omits delete sharing, so the OS rejects
+    /// renaming the root aside while the transfer holds it (Windows).
+    replacement_refused: bool,
+    stage_completes: u32,
+}
+
+impl TransferProgress for ReplaceSourceRootOnStageStart {
+    fn on_stage_started(&mut self, _stage: &Stage, _index: u32, _total: u32) {
+        if self.fired {
+            return;
+        }
+        self.fired = true;
+        match std::fs::rename(&self.source_root, &self.moved_root) {
+            Ok(()) => {
+                std::fs::create_dir(&self.source_root).expect("create replacement source root");
+            }
+            Err(error) => {
+                // On Unix the rename must succeed: a concurrent writer CAN
+                // replace a read-leased root, which is exactly the
+                // interposition the publication boundary must catch.
+                #[cfg(unix)]
+                {
+                    panic!("unix must permit the source-root replacement interposition: {error}");
+                }
+                // On Windows the retained root handle omits delete sharing,
+                // so the OS refuses the replacement outright (access denied
+                // 5 / sharing violation 32). That refusal is the platform's
+                // authority evidence; the legitimate creation must remain
+                // correct.
+                #[cfg(windows)]
+                {
+                    assert!(
+                        matches!(error.raw_os_error(), Some(5 | 32)),
+                        "windows must refuse the root replacement via the retained lease: {error}"
+                    );
+                    self.replacement_refused = true;
+                }
+            }
+        }
+    }
+
+    fn on_stage_completed(
+        &mut self,
+        _stage: &Stage,
+        _index: u32,
+        _total: u32,
+        _bytes_so_far: u64,
+        _total_bytes: u64,
+    ) {
+        self.stage_completes = self.stage_completes.saturating_add(1);
+    }
+}
+
+/// Everything the directory-stage regressions inspect: the executed
+/// directory-only transfer (one non-recursive `album` directory item, one
+/// `CreateDirectory` stage) with the stage-start replacement sink
+/// attached, plus the rooted trees the assertions read. The source (and
+/// the outer tree owning it) must stay alive through the Windows refusal
+/// assertions; on Unix nothing after the run reads it.
+struct DirectoryReplacementRace {
+    run: Result<TransferSummary, TransferError>,
+    progress: ReplaceSourceRootOnStageStart,
+    #[cfg(windows)]
+    source: RenameableSource,
+    destination_root: tempfile::TempDir,
+}
+
+/// Executes the directory-only transfer with the root-replacement sink
+/// attached — the shared body of the directory-stage regressions.
+fn race_source_root_replacement_on_directory_stage() -> DirectoryReplacementRace {
+    let source = RenameableSource::new();
+    std::fs::create_dir(source.root.join("album")).expect("create source album directory");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    let read = read_authority(&source.root);
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = TransferRequest {
+        source: read,
+        destination,
+        items: vec![TransferItem::same(PathBuf::from("album"))],
+        conflict_policy: ConflictPolicy::Preserve,
+        capacity_budget: None,
+        recurse_directories: false,
+    };
+    let plan = TransferPlanner::new().plan(&request).expect("plan");
+    let observer = CancellationObserver::never_cancelled();
+    let mut progress = ReplaceSourceRootOnStageStart {
+        source_root: source.root.clone(),
+        moved_root: source.moved.clone(),
+        fired: false,
+        replacement_refused: false,
+        stage_completes: 0,
+    };
+    let run = TransferExecutor::new(request, plan).run(&mut progress, &observer);
+    DirectoryReplacementRace {
+        run,
+        progress,
+        #[cfg(windows)]
+        source,
+        destination_root,
+    }
+}
+
+/// A source root replaced before the (only) directory stage must fail the
+/// transfer at the created-directory publication boundary — the stage
+/// records the created directory, so only an explicit source revalidation
+/// can refuse the run. The failed stage reports no completion callback and
+/// rollback removes the created directory, leaving no litter.
+///
+/// On Windows the retained lease refuses the replacement outright (the
+/// root handle omits delete sharing), so the same interposition asserts
+/// the refusal and that the legitimate directory creation still completes.
+#[test]
+fn source_root_replaced_before_a_directory_stage_fails_and_rolls_back() {
+    let race = race_source_root_replacement_on_directory_stage();
+    #[cfg(unix)]
+    {
+        let error = race
+            .run
+            .expect_err("a source lease lost before the directory stage must fail the transfer");
+        assert!(
+            matches!(error, TransferError::AuthorityLost { .. }),
+            "the failure must be the typed authority loss: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("source not current at publication"),
+            "the error must name the publication-boundary source loss: {error}"
+        );
+        assert_eq!(
+            race.progress.stage_completes, 0,
+            "the failed stage must not report a completion callback"
+        );
+        let survivors = entry_names(race.destination_root.path());
+        assert!(
+            survivors.is_empty(),
+            "rollback must remove the created directory: {survivors:?}"
+        );
+    }
+    #[cfg(windows)]
+    {
+        let summary = race.run.expect(
+            "the retained lease refuses the replacement, so the legitimate directory creation \
+             must complete",
+        );
+        assert!(
+            race.progress.replacement_refused,
+            "the interposition must have been attempted and refused by the lease"
+        );
+        assert_eq!(
+            race.progress.stage_completes, 1,
+            "the completed stage must report exactly one completion callback"
+        );
+        assert!(summary.completed, "the transfer must complete: {summary:?}");
+        assert_eq!(summary.committed_stages, 1);
+        assert!(
+            race.destination_root.path().join("album").is_dir(),
+            "the legitimate directory creation must have landed"
+        );
+        assert!(
+            race.source.root.is_dir(),
+            "the source root must still stand at its original path"
+        );
+        assert!(
+            !race.source.moved.exists(),
+            "the lease must have prevented any move of the source root"
+        );
+    }
+}
+
+/// The valid-root control for the directory boundary: an untouched source
+/// root still lets a directory-only plan complete under the added
+/// publication-boundary revalidation, proving the check does not fail an
+/// ordinary directory creation.
+#[test]
+fn valid_source_root_directory_stage_completes() {
+    let source = RenameableSource::new();
+    std::fs::create_dir(source.root.join("album")).expect("create source album directory");
+    let destination_root = tempfile::tempdir().expect("temporary destination root");
+    let read = read_authority(&source.root);
+    let (_, destination) = authority_pair(destination_root.path());
+    let request = TransferRequest {
+        source: read,
+        destination,
+        items: vec![TransferItem::same(PathBuf::from("album"))],
+        conflict_policy: ConflictPolicy::Preserve,
+        capacity_budget: None,
+        recurse_directories: false,
+    };
+    let plan = TransferPlanner::new().plan(&request).expect("plan");
+    let observer = CancellationObserver::never_cancelled();
+    let mut progress = ();
+    let summary: TransferSummary = TransferExecutor::new(request, plan)
+        .run(&mut progress, &observer)
+        .expect("a valid source root must not fail the directory-stage revalidation");
+    assert!(summary.completed);
+    assert_eq!(summary.committed_stages, 1);
+    assert!(
+        destination_root.path().join("album").is_dir(),
+        "the directory creation must have landed"
     );
 }
