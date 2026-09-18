@@ -111,6 +111,14 @@ pub trait AudioOutput {
         self.equalizer_settings()
     }
 
+    /// Synchronously flush any pending equalizer persistence this output
+    /// still owes to disk. The normal close-request drain invokes this
+    /// while the output is still alive: the process exits via
+    /// `std::process::exit` after the GTK main loop unwinds, so `Drop`
+    /// cannot be relied on to run a still-armed debounced save. A no-op
+    /// for outputs without an equalizer engine.
+    fn flush_equalizer_for_shutdown(&self) {}
+
     // ── Playback controls ───────────────────────────────────────────
 
     /// Load a URI and start playback.

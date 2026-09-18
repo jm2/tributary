@@ -167,31 +167,60 @@ pub(super) fn limiter_edit_probe_callback(
     }
 }
 
-/// Wait for the blocking-probe callback to publish an outcome.
+/// What the bounded engagement wait decided about one limiter edit.
+///
+/// The wait itself is always bounded by
+/// [`super::LIMITER_PROBE_ENGAGE_TIMEOUT`]; an engaged-but-unpublished
+/// edit is *parked*, never awaited (refinery R1, PR 220 audit): the
+/// caller runs synchronously on the GTK thread, so an unbounded wait
+/// for a slow or stuck surgery would stall the whole UI and its
+/// error/teardown dispatch for the callback's entire duration.
+pub(super) enum LimiterEditWait {
+    /// The callback published an outcome within the engagement window.
+    /// The still-installed probe id travels back so the caller can retire
+    /// it over the validated topology.
+    Completed(LimiterEditOutcome, Option<gst::PadProbeId>),
+    /// The window elapsed while the callback was engaged: the edit is in
+    /// flight on the streaming thread and owns the graph mutation and
+    /// the `rglimiter` handle. The caller parks the transaction and
+    /// adopts the outcome on the main context; it must not remove the
+    /// probe and must not wait here. The still-installed probe id
+    /// travels back so the parked transaction keeps its ownership.
+    Engaged(Option<gst::PadProbeId>),
+    /// The window elapsed with no engagement: the edit demonstrably
+    /// never started, was marked cancelled under the shared gate, and
+    /// its probe was removed inside the wait.
+    NotEngagedCancelled,
+}
+
+/// Wait — within the bounded engagement window — for the
+/// blocking-probe callback to publish an outcome.
 ///
 /// A bounded engagement window may cancel only an edit that has
-/// demonstrably not started; once the callback has engaged, the caller waits
-/// for its published outcome instead of removing the probe, because the edit
-/// already owns the graph mutation and the `rglimiter` handle. Returns the
-/// outcome, whether engagement was confirmed, and the probe id still
-/// installed (if any).
+/// demonstrably not started; once the callback has engaged, the caller
+/// parks the transaction ([`LimiterEditWait::Engaged`]) and adopts the
+/// published outcome asynchronously, because the edit already owns the
+/// graph mutation and the `rglimiter` handle. The probe is removed here
+/// only on the not-engaged path.
 pub(super) fn await_limiter_edit_outcome(
     eq_src: &gst::Pad,
     mut probe_id: Option<gst::PadProbeId>,
     gate: &Mutex<LimiterEditGate>,
     rx: &std::sync::mpsc::Receiver<LimiterEditOutcome>,
-) -> (Option<LimiterEditOutcome>, bool, Option<gst::PadProbeId>) {
+) -> LimiterEditWait {
     match rx.recv_timeout(super::LIMITER_PROBE_ENGAGE_TIMEOUT) {
-        Ok(outcome) => (Some(outcome), false, probe_id),
+        Ok(outcome) => LimiterEditWait::Completed(outcome, probe_id),
         Err(_) => {
             let mut gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if gate.engaged {
-                // The edit is already executing on the streaming thread. Do
-                // not remove its probe: wait for the outcome it publishes,
-                // so the final topology and the owned handle are retained
-                // rather than stranded.
-                drop(gate);
-                (rx.recv().ok(), true, probe_id)
+                // The edit is already executing on the streaming thread.
+                // Neither remove its probe nor block this (UI) thread on
+                // its outcome: the caller parks the transaction with the
+                // probe retained, and the completion is adopted on the
+                // main context, so the final topology and the owned
+                // handle are retained rather than stranded — while the
+                // UI keeps running for the callback's whole duration.
+                LimiterEditWait::Engaged(probe_id)
             } else {
                 // Demonstrably not started: mark it cancelled under the same
                 // gate the callback checks, then retire the probe. A callback
@@ -202,7 +231,7 @@ pub(super) fn await_limiter_edit_outcome(
                 if let Some(id) = probe_id.take() {
                     eq_src.remove_probe(id);
                 }
-                (None, false, None)
+                LimiterEditWait::NotEngagedCancelled
             }
         }
     }

@@ -51,6 +51,10 @@ impl AudioOutput for LocalOutput {
         self.player.reload_equalizer_settings()
     }
 
+    fn flush_equalizer_for_shutdown(&self) {
+        self.player.flush_equalizer_for_shutdown();
+    }
+
     fn load_uri(&self, uri: &str) -> bool {
         self.player.load_uri(uri);
         true
