@@ -1,0 +1,10 @@
+# Codacy repository configuration.
+#
+# Test fixtures under tests/fixtures/ are data served by the test doubles,
+# not analyzed code. Several scenarios are intentionally malformed (for
+# example tests/fixtures/bot_review_gate/malformed-pr-record/pr.1.json, which
+# proves the bot-review-gate publisher fails closed on an unreadable pull
+# request record), so static analysis of them can only produce false
+# positives.
+exclude_paths:
+  - "tests/fixtures/**"

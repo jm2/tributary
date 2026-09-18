@@ -25,6 +25,7 @@ mod preflight;
 mod preflight_inventory;
 mod preflight_live;
 mod preflight_live_resolution;
+mod preflight_live_rulesets;
 mod preflight_resolution;
 mod preflight_support;
 mod publication;
