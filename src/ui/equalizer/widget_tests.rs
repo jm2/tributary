@@ -382,6 +382,118 @@ fn unsupported_panel_describes_every_exposed_control() {
     }
 }
 
+/// Shared echo invariant of the Refinery review 2026-09-18T18:41Z
+/// scenarios: after the late redelivery of the panel's own reflection
+/// notifies, the recorded state must be untouched — `expected_applies`
+/// applies in total (no re-apply, no spurious debounced save), the
+/// persisted preset / preamp / band vector still at the restored named
+/// values (no `mark_custom`) — and the real combo must still display
+/// `expected_position`.
+fn assert_named_preset_survives_the_echo(
+    state: &RefCell<PanelState>,
+    preset: &gtk::DropDown,
+    expected_applies: u32,
+    expected_preset: Preset,
+    expected_preamp_db: f64,
+    expected_bands_db: &[f64; 10],
+    expected_position: u32,
+) {
+    assert_eq!(
+        state.borrow().apply_calls,
+        expected_applies,
+        "a late echo must neither re-apply identical settings nor arm a spurious save"
+    );
+    assert_eq!(
+        state.borrow().settings.preset,
+        expected_preset,
+        "a late echo must not move the persisted preset to custom"
+    );
+    assert_eq!(state.borrow().settings.preamp_db, expected_preamp_db);
+    assert_eq!(
+        state.borrow().settings.bands_db,
+        *expected_bands_db,
+        "a late echo must not alter the restored band vector"
+    );
+    assert_eq!(
+        preset.selected(),
+        expected_position,
+        "the combo must still show the named preset after the echo"
+    );
+}
+
+/// Positive control of the reset scenario: a genuine differing edit
+/// applies exactly once and moves the persisted preset to `custom`. The
+/// dragged scale is whichever gain scale the tree yields first (preamp
+/// or band) — either way exactly one gain slot must carry the -2.0 edit
+/// and the rest must stay at their restored 0.0.
+fn drag_first_gain_scale_and_expect_one_custom_edit(
+    state: &RefCell<PanelState>,
+    group: &impl IsA<gtk::Widget>,
+    preset: &gtk::DropDown,
+) {
+    let dragged = descendants::<gtk::Scale>(group)
+        .into_iter()
+        .next()
+        .expect("a gain scale to drag");
+    dragged.set_value(-2.0);
+    assert_eq!(state.borrow().apply_calls, 2, "one apply per real edit");
+    let recorded = state.borrow().settings;
+    assert_eq!(
+        recorded.preset,
+        Preset::Custom,
+        "a genuine slider edit must move the persisted preset to custom"
+    );
+    assert_eq!(
+        recorded
+            .bands_db
+            .iter()
+            .filter(|gain| **gain == -2.0)
+            .count()
+            + usize::from(recorded.preamp_db == -2.0),
+        1,
+        "exactly one gain slot carries the genuine edit"
+    );
+    assert!(
+        recorded
+            .bands_db
+            .iter()
+            .all(|gain| *gain == 0.0 || *gain == -2.0)
+            && (recorded.preamp_db == 0.0 || recorded.preamp_db == -2.0),
+        "no other gain slot may move"
+    );
+    assert_eq!(
+        preset.selected(),
+        5,
+        "the combo must display the non-activatable Custom entry"
+    );
+}
+
+/// Positive control of the reload scenario: a genuine preset choice
+/// applies exactly once and records the named preset with its canonical
+/// vector.
+fn choose_flat_preset_and_expect_one_apply(state: &RefCell<PanelState>, preset: &gtk::DropDown) {
+    preset.set_selected(0);
+    assert_eq!(
+        state.borrow().apply_calls,
+        1,
+        "one apply per genuine preset choice"
+    );
+    assert_eq!(
+        state.borrow().settings.preset,
+        Preset::Flat,
+        "the chosen named preset must be recorded"
+    );
+    assert!(
+        state
+            .borrow()
+            .settings
+            .bands_db
+            .iter()
+            .all(|gain| *gain == 0.0),
+        "the chosen preset's canonical vector must be applied"
+    );
+}
+
 /// Refinery review 2026-09-18T18:41Z (reset): after Reset-to-Flat, a
 /// late redelivery of the panel's own reflection notifies must apply
 /// nothing (no spurious debounced save), keep the recorded preset at
@@ -424,72 +536,11 @@ fn reset_echo_applies_nothing_and_keeps_the_named_preset() {
     // echo would re-apply, flip the just-restored Flat to `custom`, and
     // arm a spurious save.
     redeliver_reflection_notifies(&group);
-    assert_eq!(
-        state.borrow().apply_calls,
-        1,
-        "a late echo must not re-apply identical settings"
-    );
-    assert_eq!(
-        state.borrow().settings.preset,
-        Preset::Flat,
-        "a late echo must not move the persisted preset to custom"
-    );
-    assert_eq!(state.borrow().settings.preamp_db, 0.0);
-    assert!(
-        state
-            .borrow()
-            .settings
-            .bands_db
-            .iter()
-            .all(|gain| *gain == 0.0),
-        "a late echo must not alter the restored band vector"
-    );
-    assert_eq!(
-        preset.selected(),
-        0,
-        "the combo must still show Flat after the echo"
-    );
+    assert_named_preset_survives_the_echo(&state, &preset, 1, Preset::Flat, 0.0, &[0.0; 10], 0);
 
     // Positive control: a genuine differing edit applies exactly once
-    // and moves the persisted preset to `custom`. The dragged scale is
-    // whichever gain scale the tree yields first (preamp or band) —
-    // either way exactly one gain slot must carry the -2.0 edit and the
-    // rest must stay at their restored 0.0.
-    let dragged = descendants::<gtk::Scale>(&group)
-        .into_iter()
-        .next()
-        .expect("a gain scale to drag");
-    dragged.set_value(-2.0);
-    assert_eq!(state.borrow().apply_calls, 2, "one apply per real edit");
-    let recorded = state.borrow().settings;
-    assert_eq!(
-        recorded.preset,
-        Preset::Custom,
-        "a genuine slider edit must move the persisted preset to custom"
-    );
-    assert_eq!(
-        recorded
-            .bands_db
-            .iter()
-            .filter(|gain| **gain == -2.0)
-            .count()
-            + usize::from(recorded.preamp_db == -2.0),
-        1,
-        "exactly one gain slot carries the genuine edit"
-    );
-    assert!(
-        recorded
-            .bands_db
-            .iter()
-            .all(|gain| *gain == 0.0 || *gain == -2.0)
-            && (recorded.preamp_db == 0.0 || recorded.preamp_db == -2.0),
-        "no other gain slot may move"
-    );
-    assert_eq!(
-        preset.selected(),
-        5,
-        "the combo must display the non-activatable Custom entry"
-    );
+    // and moves the persisted preset to `custom` (helper above).
+    drag_first_gain_scale_and_expect_one_custom_edit(&state, &group, &preset);
 }
 
 /// Refinery review 2026-09-18T18:41Z (reload): after Reload-from-disk,
@@ -528,52 +579,19 @@ fn reload_echo_applies_nothing_and_keeps_the_named_preset() {
 
     // The late echo of the reload reflection.
     redeliver_reflection_notifies(&group);
-    assert_eq!(
-        state.borrow().apply_calls,
+    assert_named_preset_survives_the_echo(
+        &state,
+        &preset,
         0,
-        "a late echo must not arm a spurious save"
-    );
-    assert_eq!(
-        state.borrow().settings.preset,
         Preset::Jazz,
-        "a late echo must not move the persisted preset to custom"
-    );
-    assert_eq!(
-        state.borrow().settings.preamp_db,
-        Preset::Jazz.recommended_preamp_db()
-    );
-    assert_eq!(
-        state.borrow().settings.bands_db,
-        Preset::Jazz.band_gains_db(),
-        "a late echo must not alter the restored band vector"
-    );
-    assert_eq!(
-        preset.selected(),
+        Preset::Jazz.recommended_preamp_db(),
+        &Preset::Jazz.band_gains_db(),
         3,
-        "the combo must still show Jazz after the echo"
     );
 
-    // Positive control: a genuine preset choice applies exactly once.
-    preset.set_selected(0);
-    assert_eq!(
-        state.borrow().apply_calls,
-        1,
-        "one apply per genuine preset choice"
-    );
-    assert_eq!(
-        state.borrow().settings.preset,
-        Preset::Flat,
-        "the chosen named preset must be recorded"
-    );
-    assert!(
-        state
-            .borrow()
-            .settings
-            .bands_db
-            .iter()
-            .all(|gain| *gain == 0.0),
-        "the chosen preset's canonical vector must be applied"
-    );
+    // Positive control: a genuine preset choice applies exactly once
+    // (helper above).
+    choose_flat_preset_and_expect_one_apply(&state, &preset);
 }
 
 /// Entry point for the crate's single GTK test: runs the equalizer
