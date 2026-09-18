@@ -43,6 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without the exclusive confirmation fails closed to `Unconfirmed`. The Add Output dialog
   saves supervision only together with the exclusive confirmation, paired with a localized
   warning/confirmation message in every supported catalog (13 locales).
+- **Large-library responsiveness fixtures** — Add a deterministic test-only fixture that
+  generates fixed 10k/100k-track libraries, a latency-injecting `MediaBackend` wrapper, and
+  an opt-in measurement harness that records scan time, backend source/filter/rebuild
+  latency, retained catalogue bytes, update bursts, and a delayed filesystem/parser pass
+  (Q4, #275). Pass/fail budgets are agreed separately on a named runner; no production
+  behavior changes.
 
 ### Changed
 

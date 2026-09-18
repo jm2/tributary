@@ -2,6 +2,8 @@
 
 pub mod backend;
 pub mod engine;
+#[cfg(test)]
+pub mod perf_fixtures;
 pub mod playback_history;
 pub mod playlist_io;
 pub mod playlist_manager;

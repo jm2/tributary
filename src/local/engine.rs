@@ -3566,6 +3566,43 @@ async fn process_library_commands_without_watcher(
     }
 }
 
+/// Test-only per-file parse delay for the Q4 held/delayed filesystem fixtures.
+///
+/// The opt-in large-library measurement test sets this to model a slow disk or
+/// parser without depending on real storage timing, and R9 (#256) consumes the
+/// same seam to hold a scan while exercising command admission and
+/// cancellation. It is compiled out of production builds.
+#[cfg(test)]
+static TEST_ONLY_PARSE_DELAY_MICROS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Counts the parses that pass through this seam, so a measurement can assert
+/// the parse path was really exercised per file instead of inferring it from
+/// elapsed wall time. When [`TEST_ONLY_PARSE_DELAY_MICROS`] is nonzero, every
+/// counted parse also slept for that delay.
+#[cfg(test)]
+static TEST_ONLY_PARSE_DELAY_INVOCATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn apply_test_only_parse_delay() {
+    TEST_ONLY_PARSE_DELAY_INVOCATIONS.fetch_add(1, Ordering::Relaxed);
+    let micros = TEST_ONLY_PARSE_DELAY_MICROS.load(Ordering::Relaxed);
+    if micros > 0 {
+        std::thread::sleep(Duration::from_micros(micros));
+    }
+}
+
+#[cfg(test)]
+fn reset_test_only_parse_delay_invocations() {
+    TEST_ONLY_PARSE_DELAY_INVOCATIONS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn test_only_parse_delay_invocations() -> u64 {
+    TEST_ONLY_PARSE_DELAY_INVOCATIONS.load(Ordering::Relaxed)
+}
+
 async fn initial_scan(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
@@ -3950,6 +3987,8 @@ async fn initial_scan_with_root_trust_guards(
 
             let p = path.clone();
             let parse_result = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                apply_test_only_parse_delay();
                 tag_parser::parse_audio_file_from_file(parse_file, &p)
             })
             .await;
@@ -13231,5 +13270,451 @@ mod tests {
         let result = get_mtime(std::path::Path::new("/nonexistent/path/file.flac"));
         // Should return empty string, not panic.
         assert!(result.is_empty());
+    }
+
+    /// Opt-in Q4 responsiveness measurement over a fixed synthetic library.
+    ///
+    /// Ignored because it generates a 10k/100k-track on-disk fixture. Run it
+    /// against a named reference runner with:
+    ///
+    /// ```text
+    /// TRIBUTARY_Q4_TRACKS=100000 \
+    ///   cargo test --bin tributary --release -- --ignored --nocapture \
+    ///   q4_measured_large_library_responsiveness
+    /// ```
+    ///
+    /// `TRIBUTARY_Q4_PARSE_DELAY_MICROS=<n>` additionally runs a second scan
+    /// against a FRESH second database with `n` microseconds of deterministic
+    /// per-file parse delay. The fresh database makes every row `needs_update`,
+    /// so every measured file really enters the delayed `spawn_blocking` parse
+    /// branch; the test asserts the recorded parse-delay invocation count and
+    /// the persisted row cardinality instead of inferring anything from wall
+    /// time alone.
+    #[tokio::test]
+    #[ignore = "opt-in Q4 large-library measurement; generates a large fixture"]
+    async fn q4_measured_large_library_responsiveness() {
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        use crate::architecture::models::{Rating, SortField, SortOrder};
+
+        use super::super::perf_fixtures::{
+            catalogue_bytes, expected_album_count, expected_artist_count, track_count_from_env,
+            DelayedBackend, ResponsivenessReport, SyntheticLibrary,
+        };
+
+        struct ParseDelayGuard;
+
+        impl ParseDelayGuard {
+            fn set(micros: u64) -> Self {
+                super::reset_test_only_parse_delay_invocations();
+                super::TEST_ONLY_PARSE_DELAY_MICROS.store(micros, Ordering::Relaxed);
+                Self
+            }
+        }
+
+        impl Drop for ParseDelayGuard {
+            fn drop(&mut self) {
+                super::TEST_ONLY_PARSE_DELAY_MICROS.store(0, Ordering::Relaxed);
+            }
+        }
+
+        let track_count = track_count_from_env();
+        let library =
+            SyntheticLibrary::generate(track_count).expect("generate synthetic library fixture");
+        let db = rename_test_database().await;
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+
+        // Baseline scan. The database is fresh, so every file must actually be
+        // parsed: assert the parse invocations and the persisted cardinality
+        // instead of trusting elapsed wall time.
+        let scan_started = Instant::now();
+        let baseline_guard = ParseDelayGuard::set(0);
+        initial_scan(&db, &[library.root().to_path_buf()], &event_tx, &refresh)
+            .await
+            .expect("measured initial scan");
+        let scan_elapsed = scan_started.elapsed();
+        let baseline_parses = super::test_only_parse_delay_invocations();
+        drop(baseline_guard);
+        let persisted = track::Entity::find()
+            .all(&db)
+            .await
+            .expect("count persisted tracks")
+            .len();
+        assert_eq!(
+            baseline_parses, track_count as u64,
+            "baseline scan must parse every fixture file exactly once"
+        );
+        assert_eq!(
+            persisted, track_count,
+            "baseline scan must persist one row per fixture file"
+        );
+        // The fixture's directory fan-out must survive the real scan/parse/
+        // persist path into the real backend aggregation: distinct tags per
+        // file mean 12-track album groups and 4-album artist groups (with
+        // documented final partial groups), never a single collapsed
+        // Unknown-Artist/Unknown-Album row pair. Assert BEFORE any metric is
+        // recorded so a collapsed catalogue cannot pass as measurement
+        // output.
+        let catalogue_backend = LocalBackend::new(db.clone());
+        let scanned_albums = catalogue_backend
+            .list_albums(SortField::Title, SortOrder::Ascending)
+            .await
+            .expect("list albums for cardinality proof");
+        let scanned_artists = catalogue_backend
+            .list_artists()
+            .await
+            .expect("list artists for cardinality proof");
+        assert_eq!(
+            scanned_albums.len(),
+            expected_album_count(track_count),
+            "persisted catalogue must fan out to one album group per 12 fixture tracks"
+        );
+        assert_eq!(
+            scanned_artists.len(),
+            expected_artist_count(track_count),
+            "persisted catalogue must fan out to one artist group per 4 fixture albums"
+        );
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).count();
+
+        let runner = std::env::var("TRIBUTARY_Q4_RUNNER")
+            .unwrap_or_else(|_| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH));
+        let mut report = ResponsivenessReport::new(runner);
+        report.record(
+            "scan_tracks_persisted",
+            track_count,
+            persisted as f64,
+            "tracks",
+        );
+        report.record(
+            "scan_parse_invocations",
+            track_count,
+            baseline_parses as f64,
+            "parses",
+        );
+        report.record(
+            "scan_albums",
+            track_count,
+            scanned_albums.len() as f64,
+            "albums",
+        );
+        report.record(
+            "scan_artists",
+            track_count,
+            scanned_artists.len() as f64,
+            "artists",
+        );
+        report.record_ms("scan_elapsed", track_count, scan_elapsed);
+        report.record("scan_events", track_count, events as f64, "events");
+        if scan_elapsed.as_secs_f64() > 0.0 {
+            report.record(
+                "scan_throughput",
+                track_count,
+                persisted as f64 / scan_elapsed.as_secs_f64(),
+                "tracks_per_second",
+            );
+        }
+
+        // Source/filter/rebuild latency and retained bytes through the real
+        // backend seam, measured over the freshly scanned catalogue.
+        let backend = LocalBackend::new(db.clone());
+        let tracks_started = Instant::now();
+        let catalogue = backend.list_tracks().await.expect("list tracks");
+        report.record_ms("backend_list_tracks", track_count, tracks_started.elapsed());
+        report.record(
+            "catalogue_retained_bytes",
+            track_count,
+            catalogue_bytes(&catalogue) as f64,
+            "bytes",
+        );
+
+        let albums_started = Instant::now();
+        backend
+            .list_albums(SortField::Title, SortOrder::Ascending)
+            .await
+            .expect("list albums");
+        report.record_ms("backend_list_albums", track_count, albums_started.elapsed());
+
+        let artists_started = Instant::now();
+        backend.list_artists().await.expect("list artists");
+        report.record_ms(
+            "backend_list_artists",
+            track_count,
+            artists_started.elapsed(),
+        );
+
+        let search_started = Instant::now();
+        backend
+            .search("Track0001", 50)
+            .await
+            .expect("search catalogue");
+        report.record_ms("backend_search", track_count, search_started.elapsed());
+
+        let stats_started = Instant::now();
+        backend.get_stats().await.expect("read library stats");
+        report.record_ms("backend_get_stats", track_count, stats_started.elapsed());
+
+        // Rating mutations over the same catalogue: first directly through the
+        // backend seam, then through the production engine command FIFO with a
+        // Flush barrier, which is the admission/settlement path the app
+        // actually uses for app-owned writes.
+        let updates = 100_usize.min(track_count);
+        let rating = Rating::new(80).expect("valid rating");
+        let track_id = catalogue
+            .iter()
+            .find_map(|track| track.native_track_id.clone())
+            .expect("catalogue exposes a native track id");
+
+        let burst_started = Instant::now();
+        for _ in 0..updates {
+            backend
+                .set_track_rating(&track_id, Some(rating))
+                .await
+                .expect("update rating");
+        }
+        let burst = burst_started.elapsed();
+        report.record("update_burst_count", track_count, updates as f64, "updates");
+        report.record_ms("update_burst_total", track_count, burst);
+        report.record(
+            "update_burst_per_update",
+            track_count,
+            burst.as_secs_f64() * 1_000.0 / updates as f64,
+            "ms",
+        );
+
+        // Command admission + settlement through the production FIFO loop:
+        // enqueue `updates` rating commands plus a Flush barrier while the
+        // engine command loop is running, and measure the time until the
+        // barrier is acknowledged (the production shutdown-settlement
+        // observable). The barrier must always settle.
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let loop_db = db.clone();
+        let loop_tx = event_tx.clone();
+        let loop_dirs = vec![library.root().to_path_buf()];
+        let loop_refresh = test_playlist_sidebar_refresh();
+        let loop_task = tokio::spawn(async move {
+            let mut completed = HashMap::new();
+            process_library_commands_without_watcher(
+                &loop_db,
+                &loop_dirs,
+                &loop_tx,
+                &command_rx,
+                &mut completed,
+                &loop_refresh,
+            )
+            .await;
+        });
+
+        let fifo_started = Instant::now();
+        for _ in 0..updates {
+            command_tx
+                .send(LibraryCommand::SetTrackRating {
+                    track_id: track_id.clone(),
+                    rating: Some(rating),
+                })
+                .await
+                .expect("send rating command");
+        }
+        let (flush_tx, flush_rx) = async_channel::unbounded();
+        command_tx
+            .send(LibraryCommand::Flush {
+                completion: flush_tx,
+            })
+            .await
+            .expect("send flush barrier");
+        drop(command_tx);
+        flush_rx
+            .recv()
+            .await
+            .expect("flush barrier must be acknowledged");
+        let fifo_settlement = fifo_started.elapsed();
+        loop_task.await.expect("engine command loop task finishes");
+
+        report.record(
+            "command_fifo_commands",
+            track_count,
+            updates as f64,
+            "commands",
+        );
+        report.record_ms(
+            "command_fifo_flush_settlement",
+            track_count,
+            fifo_settlement,
+        );
+
+        // Prove the delayed-backend fixture adds deterministic latency.
+        let delayed = DelayedBackend::new(LocalBackend::new(db.clone()), Duration::from_millis(5));
+        let delayed_started = Instant::now();
+        delayed
+            .list_tracks()
+            .await
+            .expect("list tracks through delay");
+        let delayed_elapsed = delayed_started.elapsed();
+        report.record_ms("delayed_backend_list_tracks", track_count, delayed_elapsed);
+        report.record(
+            "delayed_backend_calls",
+            track_count,
+            delayed.calls() as f64,
+            "calls",
+        );
+
+        // Optional delayed-filesystem/parser pass. It scans the SAME fixture
+        // into a FRESH second database so every row is new and every file
+        // really goes through the delayed parse branch, then asserts the
+        // recorded parse-delay invocation count and persisted cardinality.
+        if let Ok(micros) = std::env::var("TRIBUTARY_Q4_PARSE_DELAY_MICROS") {
+            if let Ok(micros) = micros.parse::<u64>() {
+                if micros > 0 {
+                    let delayed_db = rename_test_database().await;
+                    let delay_guard = ParseDelayGuard::set(micros);
+                    let delayed_scan_started = Instant::now();
+                    initial_scan(
+                        &delayed_db,
+                        &[library.root().to_path_buf()],
+                        &event_tx,
+                        &refresh,
+                    )
+                    .await
+                    .expect("delayed initial scan");
+                    let delayed_scan_elapsed = delayed_scan_started.elapsed();
+                    let delayed_parses = super::test_only_parse_delay_invocations();
+                    drop(delay_guard);
+                    let delayed_persisted = track::Entity::find()
+                        .all(&delayed_db)
+                        .await
+                        .expect("count delayed-scan tracks")
+                        .len();
+
+                    assert_eq!(
+                        delayed_parses, track_count as u64,
+                        "delayed scan must apply the parse delay to every fixture file"
+                    );
+                    assert_eq!(
+                        delayed_persisted, track_count,
+                        "delayed scan must persist one row per fixture file"
+                    );
+                    // The delayed pass must reproduce the same real catalogue
+                    // fan-out, not a collapsed Unknown-Artist/Unknown-Album
+                    // row pair.
+                    let delayed_backend = LocalBackend::new(delayed_db.clone());
+                    let delayed_albums = delayed_backend
+                        .list_albums(SortField::Title, SortOrder::Ascending)
+                        .await
+                        .expect("list albums in delayed pass for cardinality proof");
+                    let delayed_artists = delayed_backend
+                        .list_artists()
+                        .await
+                        .expect("list artists in delayed pass for cardinality proof");
+                    assert_eq!(
+                        delayed_albums.len(),
+                        expected_album_count(track_count),
+                        "delayed scan must persist the full album fan-out"
+                    );
+                    assert_eq!(
+                        delayed_artists.len(),
+                        expected_artist_count(track_count),
+                        "delayed scan must persist the full artist fan-out"
+                    );
+
+                    report.record_ms(
+                        "delayed_parse_scan_elapsed",
+                        track_count,
+                        delayed_scan_elapsed,
+                    );
+                    report.record(
+                        "delayed_parse_files_parsed",
+                        track_count,
+                        delayed_parses as f64,
+                        "parses",
+                    );
+                    report.record(
+                        "delayed_parse_micros_per_file",
+                        track_count,
+                        micros as f64,
+                        "microseconds",
+                    );
+                    report.record(
+                        "delayed_parse_estimated_delay_total_ms",
+                        track_count,
+                        delayed_parses as f64 * micros as f64 / 1_000.0,
+                        "ms",
+                    );
+                }
+            }
+        }
+
+        println!("{}", report.render());
+    }
+
+    /// Guard the Q4 fixture lane against catalogue collapse.
+    ///
+    /// Unlike the ignored measurement above, this runs in every `cargo test`:
+    /// a 100-track [`SyntheticLibrary`] goes through the real `initial_scan`,
+    /// and the production backend must report the documented album/artist
+    /// fan-out (100 tracks -> 9 albums across 3 artists, with partial final
+    /// groups) rather than one Unknown-Artist/Unknown-Album row pair. The
+    /// 10k/100k measurement asserts the same cardinalities before recording
+    /// any metric.
+    #[tokio::test]
+    async fn q4_fixture_scan_produces_real_catalogue_fan_out() {
+        use crate::architecture::models::{SortField, SortOrder};
+
+        use super::super::perf_fixtures::{
+            expected_album_count, expected_artist_count, SyntheticLibrary,
+        };
+
+        const TRACKS: usize = 100;
+
+        let library = SyntheticLibrary::generate(TRACKS).expect("generate small fixture library");
+        let db = rename_test_database().await;
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        initial_scan(&db, &[library.root().to_path_buf()], &event_tx, &refresh)
+            .await
+            .expect("scan small fixture library");
+
+        let persisted = track::Entity::find()
+            .all(&db)
+            .await
+            .expect("count persisted fixture tracks")
+            .len();
+        assert_eq!(persisted, TRACKS, "one row per fixture file");
+
+        let backend = LocalBackend::new(db);
+        let albums = backend
+            .list_albums(SortField::Title, SortOrder::Ascending)
+            .await
+            .expect("list fixture albums");
+        let artists = backend.list_artists().await.expect("list fixture artists");
+        assert_eq!(
+            albums.len(),
+            expected_album_count(TRACKS),
+            "fixture tags must become distinct album rows (100 tracks -> 9 albums)"
+        );
+        assert_eq!(
+            artists.len(),
+            expected_artist_count(TRACKS),
+            "fixture tags must become distinct artist rows (9 albums -> 3 artists)"
+        );
+
+        // Spot-check attribution: tracks 96..100 form the final partial
+        // album group (4 tracks); the 9 albums split 4/4/1 across artists,
+        // so the final artist owns exactly that one album.
+        let last_album = albums
+            .iter()
+            .find(|album| album.title == super::super::perf_fixtures::album_title_for(8))
+            .expect("final album group present");
+        assert_eq!(last_album.track_count, 4);
+        assert_eq!(
+            last_album.artist_name,
+            super::super::perf_fixtures::artist_name_for(2)
+        );
+        let last_artist = artists
+            .iter()
+            .find(|artist| artist.name == super::super::perf_fixtures::artist_name_for(2))
+            .expect("final artist group present");
+        assert_eq!(last_artist.album_count, 1);
+        assert_eq!(last_artist.track_count, 4);
     }
 }
