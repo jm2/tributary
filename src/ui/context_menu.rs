@@ -3501,9 +3501,19 @@ pub mod tests {
         });
         let sort_model = gtk::SortListModel::new(Some(store), Some(sorter));
         let selection = gtk::MultiSelection::new(Some(sort_model.clone()));
-        // Select the first and last displayed rows, out of store order.
+        // Select the first and last displayed rows, out of store order. The
+        // second call must pass `unselect_rest = false`: the flag clears every
+        // other row, so chaining two `true` calls would leave only the last
+        // row selected.
         selection.select_item(0, true);
-        selection.select_item(2, true);
+        selection.select_item(2, false);
+        // Guard the fixture itself: before any payload is built from this
+        // selection, exactly the first and last displayed rows must carry the
+        // selection the contracts assert against.
+        assert!(
+            selection.is_selected(0) && !selection.is_selected(1) && selection.is_selected(2),
+            "fixture must select exactly the first and last displayed rows"
+        );
         (sort_model, selection)
     }
 
@@ -3573,9 +3583,12 @@ pub mod tests {
     /// `GtkListView` whose factory installs the same
     /// `attach_playlist_drop_target` the sidebar uses, real `GtkListItem`
     /// positions, and the actual `connect_drop` handler reached by emitting
-    /// the `drop` signal. This is the coverage the merged #182/#242 review
-    /// thread called out as missing when only
-    /// `is_editable_regular_playlist()` was asserted.
+    /// the `drop` signal. Two distinct editable regular playlists are
+    /// realized, with the keyboard focus resting on one while the drop is
+    /// emitted on the other (and then reversed), so a destination resolved
+    /// from the focus or hardcoded to the first editable row fails. This is
+    /// the coverage the merged #182/#242 review thread called out as missing
+    /// when only `is_editable_regular_playlist()` was asserted.
     #[cfg(not(target_os = "macos"))]
     pub fn per_row_playlist_drop_target_drives_the_production_drop_path() {
         drag_payload_preserves_displayed_selection_order();
@@ -3600,6 +3613,7 @@ pub mod tests {
     struct PerRowDropHarness {
         _window: gtk::Window,
         store: gtk::gio::ListStore,
+        selection: gtk::SingleSelection,
         rows: Vec<RealizedDropRow>,
         dropped: RecordedDrops,
     }
@@ -3610,23 +3624,34 @@ pub mod tests {
             let store = gtk::gio::ListStore::new::<SourceObject>();
             store.append(&regular_playlist_source());
             store.append(&smart_playlist_source());
+            store.append(&second_regular_playlist_source());
             store.append(&header_source());
+
+            // Sidebar-like keyboard focus resting on the first editable
+            // regular playlist: every drop below is then issued on a row
+            // other than the focused one, so a destination resolved from the
+            // focus (or from "the first editable row in the store") records
+            // the wrong playlist and fails these assertions.
+            let selection = gtk::SingleSelection::new(Some(store.clone()));
+            selection.set_autoselect(false);
+            selection.select_item(0, true);
 
             let dropped: RecordedDrops = Rc::new(RefCell::new(Vec::new()));
             let on_drop = recorded_drop_sink(Rc::clone(&dropped));
             let drop_context = PlaylistRowDropContext::for_test(store.clone(), on_drop);
-            let (window, recorded) = realize_drop_list_view(store.clone(), drop_context);
+            let (window, recorded) = realize_drop_list_view(selection.clone(), drop_context);
 
             Self {
                 _window: window,
                 store,
+                selection,
                 rows: realized_drop_rows(&recorded),
                 dropped,
             }
         }
 
-        /// The accept decision sees the row under the pointer: only the
-        /// editable regular playlist row accepts a track drag, while the
+        /// The accept decision sees the row under the pointer: only the two
+        /// editable regular playlist rows accept a track drag, while the
         /// smart playlist and header rows refuse it, and a playlist-reorder
         /// drag is always left to the reorder target.
         fn assert_accept_resolution(&self) {
@@ -3634,7 +3659,7 @@ pub mod tests {
 
             assert_eq!(
                 self.rows.iter().map(|row| row.position).collect::<Vec<_>>(),
-                vec![0, 1, 2],
+                vec![0, 1, 2, 3],
                 "every row must be bound to its real list position"
             );
 
@@ -3650,14 +3675,17 @@ pub mod tests {
 
             assert!(accepts(0, &track_drag, DragAction::COPY));
             assert!(!accepts(1, &track_drag, DragAction::COPY));
-            assert!(!accepts(2, &track_drag, DragAction::COPY));
+            assert!(accepts(2, &track_drag, DragAction::COPY));
+            assert!(!accepts(3, &track_drag, DragAction::COPY));
             assert!(!accepts(0, &reorder_drag, DragAction::MOVE));
             assert!(!accepts(0, &track_drag, DragAction::MOVE));
         }
 
         /// The drop handler resolves the destination from the row under the
-        /// pointer and forwards the exact displayed candidate order there;
-        /// noneditable rows and unrelated (cancelled) drags mutate nothing.
+        /// pointer — never from the focused row, never from "the first
+        /// editable playlist" — and forwards the exact displayed candidate
+        /// order there; noneditable rows and unrelated (cancelled) drags
+        /// mutate nothing.
         fn assert_drop_routes_to_the_pointer_row(&self) {
             let payload = PlaylistDragPayload {
                 candidates: drag_candidates(["second-track", "first-track"]),
@@ -3669,30 +3697,59 @@ pub mod tests {
                     .emit_by_name::<bool>("drop", &[value, &1.0f64, &1.0f64])
             };
 
+            // Focus rests on the first editable playlist (set in `new`); the
+            // drop lands on the second. The sink must record the pointer
+            // row's playlist — an implementation that resolves the focused
+            // row or the first editable row would record "regular-id" here.
             assert!(
-                e(0, &value),
-                "the regular playlist row must accept the drop"
+                e(2, &value),
+                "the second editable regular playlist row must accept the drop"
             );
             assert_eq!(
                 self.dropped.borrow().as_slice(),
                 [(
-                    "regular-id".to_string(),
-                    "My Mix".to_string(),
+                    "other-regular-id".to_string(),
+                    "Road Trip".to_string(),
                     payload.candidates.clone()
                 )],
-                "the drop must reach the pointer row's playlist in payload order"
+                "the drop must reach the pointer row's playlist, not the focused row"
+            );
+
+            // Reverse trip: focus the second editable playlist and drop on
+            // the first, so a destination hardcoded to either end of the
+            // sidebar fails exactly one of the two drops.
+            self.selection.select_item(2, true);
+            assert!(
+                e(0, &value),
+                "the first editable regular playlist row must accept the drop"
+            );
+            assert_eq!(
+                self.dropped.borrow().as_slice(),
+                [
+                    (
+                        "other-regular-id".to_string(),
+                        "Road Trip".to_string(),
+                        payload.candidates.clone()
+                    ),
+                    (
+                        "regular-id".to_string(),
+                        "My Mix".to_string(),
+                        payload.candidates.clone()
+                    ),
+                ],
+                "each drop must reach the row under the pointer, in payload order"
             );
 
             // Noneditable rows refuse without reaching the mutation sink.
             assert!(!e(1, &value));
-            assert!(!e(2, &value));
+            assert!(!e(3, &value));
             // A cancelled or unrelated drag carries no playlist payload.
             let unrelated = "playlist-reorder".to_value();
             assert!(!e(0, &unrelated));
             assert_eq!(
                 self.dropped.borrow().len(),
-                1,
-                "only the accepted drop may mutate a playlist"
+                2,
+                "only the accepted drops may mutate a playlist"
             );
         }
     }
@@ -3708,7 +3765,7 @@ pub mod tests {
 
     #[cfg(not(target_os = "macos"))]
     fn realize_drop_list_view(
-        store: gtk::gio::ListStore,
+        selection: gtk::SingleSelection,
         drop_context: PlaylistRowDropContext,
     ) -> (gtk::Window, Rc<RefCell<Vec<gtk::ListItem>>>) {
         let recorded: Rc<RefCell<Vec<gtk::ListItem>>> = Rc::new(RefCell::new(Vec::new()));
@@ -3727,8 +3784,8 @@ pub mod tests {
             });
         }
 
-        let expected_rows = store.n_items() as usize;
-        let list_view = gtk::ListView::new(Some(gtk::NoSelection::new(Some(store))), Some(factory));
+        let expected_rows = selection.n_items() as usize;
+        let list_view = gtk::ListView::new(Some(selection), Some(factory));
         let window = gtk::Window::builder().child(&list_view).build();
         window.present();
         // Item binding happens on the view's frame clock after the window
@@ -3797,6 +3854,16 @@ pub mod tests {
         SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
             "regular-id",
             "My Mix",
+            PlaylistSidebarKind::EditableRegular,
+        ))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn second_regular_playlist_source() -> SourceObject {
+        use crate::local::playlist_sidebar::{PlaylistSidebarEntry, PlaylistSidebarKind};
+        SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "other-regular-id",
+            "Road Trip",
             PlaylistSidebarKind::EditableRegular,
         ))
     }
