@@ -2805,16 +2805,30 @@ pub mod tests {
         // be a pure pathname snapshot: the file does not exist, and the
         // classification still succeeds without touching the filesystem.
         // Admission to an exact object happens on the worker when the
-        // action fires.
+        // action fires. The fixture path is platform-native because
+        // Url::to_file_path requires a drive letter on Windows (a
+        // drive-less file:/// path cannot authorize a write there); the
+        // asserted behavior is identical on both platforms: a nonexistent
+        // file classifies from the pathname alone.
+        #[cfg(windows)]
+        let (uri, expected_path) = (
+            "file:///C:/definitely/not/here.flac",
+            PathBuf::from(r"C:\definitely\not\here.flac"),
+        );
+        #[cfg(not(windows))]
+        let (uri, expected_path) = (
+            "file:///definitely/not/here.flac",
+            PathBuf::from("/definitely/not/here.flac"),
+        );
         let sidebar_store = gtk::gio::ListStore::new::<SourceObject>();
-        let track = local_ctx_track("ctx-local", "file:///definitely/not/here.flac");
+        let track = local_ctx_track("ctx-local", uri);
 
         let target = properties_save_target(&track, &sidebar_store)
             .expect("a pathless local row classifies");
 
         match target {
             SaveTarget::PendingLocal(pending) => {
-                assert_eq!(pending.path, PathBuf::from("/definitely/not/here.flac"));
+                assert_eq!(pending.path, expected_path);
             }
             other => panic!("local row must classify as pending, got {other:?}"),
         }
