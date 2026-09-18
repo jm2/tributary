@@ -27,6 +27,7 @@ mod tests;
 // `#[test]` (GTK must be exercised from one thread); see
 // `widget_tests` and `crate::ui::widget_test_session`.
 #[cfg(all(test, not(target_os = "macos")))]
+#[allow(clippy::float_cmp)] // snapped gains land on exactly representable half-steps
 pub mod widget_tests;
 
 pub use build::build_equalizer_group;

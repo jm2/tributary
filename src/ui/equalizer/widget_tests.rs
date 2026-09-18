@@ -17,6 +17,13 @@
 //! - **F4 / r3985258427:** the unsupported-output rendering must attach its
 //!   own accessible-description relation to the exposed reset and reload
 //!   buttons, not only their parent row.
+//! - **Refinery review 2026-09-18T18:41Z:** the echo-safety invariant of
+//!   the module header must hold for *every* reflected control, not only
+//!   enable/clip: after a Reset or Reload reflection, a late redelivery
+//!   of the panel's own value-changed / selected notifies must neither
+//!   re-apply (arming a spurious debounced save) nor move the persisted
+//!   preset to `custom`, while a genuine differing edit still applies
+//!   exactly once.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -24,7 +31,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 
 use crate::architecture::media::ResolvedHttpRequest;
-use crate::audio::equalizer::{ClipProtection, EqSettings};
+use crate::audio::equalizer::{ClipProtection, EqSettings, Preset};
 use crate::audio::output::{AudioOutput, OutputType};
 use crate::audio::{PlayerEventGeneration, PlayerState};
 use crate::local::resolver::ResolvedLocalMedia;
@@ -191,6 +198,31 @@ fn clip_dropdown(root: &impl IsA<gtk::Widget>) -> gtk::DropDown {
         .expect("clip-protection dropdown")
 }
 
+/// The preset combo: the only `DropDown` whose model has the fixed six
+/// entries (`0 = Flat` .. `4 = Classical`, `5 = Custom`, never
+/// activatable).
+fn preset_dropdown(root: &impl IsA<gtk::Widget>) -> gtk::DropDown {
+    descendants::<gtk::DropDown>(root)
+        .into_iter()
+        .find(|dropdown| dropdown.model().map(|model| model.n_items()).unwrap_or(0) == 6)
+        .expect("preset dropdown")
+}
+
+/// Redeliver the change notifications GTK would deliver for the panel's
+/// own applied-state reflection, after the re-entrancy guard has
+/// cleared: every gain scale re-emits `value-changed` with its value
+/// unchanged, and the preset combo re-notifies `selected` at its
+/// position unchanged. This is the late-echo shape the 2026-09-18
+/// review pinned: GTK delivers reflection-driven notifies from inside
+/// the triggering handler (suppressed by the guard), but a queued or
+/// programmatic redelivery can land once the guard is gone.
+fn redeliver_reflection_notifies(root: &impl IsA<gtk::Widget>) {
+    for scale in descendants::<gtk::Scale>(root) {
+        scale.emit_by_name::<()>("value-changed", &[]);
+    }
+    preset_dropdown(root).notify("selected");
+}
+
 /// The enable switch row in the panel.
 fn enable_switch(root: &impl IsA<gtk::Widget>) -> adw::SwitchRow {
     descendants::<adw::SwitchRow>(root)
@@ -350,6 +382,200 @@ fn unsupported_panel_describes_every_exposed_control() {
     }
 }
 
+/// Refinery review 2026-09-18T18:41Z (reset): after Reset-to-Flat, a
+/// late redelivery of the panel's own reflection notifies must apply
+/// nothing (no spurious debounced save), keep the recorded preset at
+/// the named `Flat` (no `mark_custom`), and leave the real combo on
+/// Flat — while a genuine differing edit still applies exactly once and
+/// moves the persisted preset to `custom`.
+fn reset_echo_applies_nothing_and_keeps_the_named_preset() {
+    let (output, state) = PanelOutput::panel(
+        true,
+        EqSettings {
+            enabled: true,
+            preset: Preset::Pop,
+            preamp_db: Preset::Pop.recommended_preamp_db(),
+            bands_db: Preset::Pop.band_gains_db(),
+            clip_protection: ClipProtection::Off,
+        },
+    );
+    let group = build_equalizer_group(&output);
+    let reset = button_with_label(&group, &translated("equalizer.reset_flat"));
+    let preset = preset_dropdown(&group);
+    assert_eq!(
+        preset.selected(),
+        1,
+        "the panel starts from the recorded Pop"
+    );
+
+    // Reset to Flat: exactly one apply, then the full reflection (the
+    // slider writes and the combo move happen under the guard).
+    reset.emit_clicked();
+    assert_eq!(state.borrow().apply_calls, 1, "one apply per reset");
+    assert_eq!(state.borrow().settings.preset, Preset::Flat);
+    assert_eq!(
+        preset.selected(),
+        0,
+        "the reflection must move the real combo to Flat"
+    );
+
+    // The late echo: the reflection's own notifies redelivered after
+    // the guard cleared. Without the recorded-state skip, every scale
+    // echo would re-apply, flip the just-restored Flat to `custom`, and
+    // arm a spurious save.
+    redeliver_reflection_notifies(&group);
+    assert_eq!(
+        state.borrow().apply_calls,
+        1,
+        "a late echo must not re-apply identical settings"
+    );
+    assert_eq!(
+        state.borrow().settings.preset,
+        Preset::Flat,
+        "a late echo must not move the persisted preset to custom"
+    );
+    assert_eq!(state.borrow().settings.preamp_db, 0.0);
+    assert!(
+        state
+            .borrow()
+            .settings
+            .bands_db
+            .iter()
+            .all(|gain| *gain == 0.0),
+        "a late echo must not alter the restored band vector"
+    );
+    assert_eq!(
+        preset.selected(),
+        0,
+        "the combo must still show Flat after the echo"
+    );
+
+    // Positive control: a genuine differing edit applies exactly once
+    // and moves the persisted preset to `custom`. The dragged scale is
+    // whichever gain scale the tree yields first (preamp or band) —
+    // either way exactly one gain slot must carry the -2.0 edit and the
+    // rest must stay at their restored 0.0.
+    let dragged = descendants::<gtk::Scale>(&group)
+        .into_iter()
+        .next()
+        .expect("a gain scale to drag");
+    dragged.set_value(-2.0);
+    assert_eq!(state.borrow().apply_calls, 2, "one apply per real edit");
+    let recorded = state.borrow().settings;
+    assert_eq!(
+        recorded.preset,
+        Preset::Custom,
+        "a genuine slider edit must move the persisted preset to custom"
+    );
+    assert_eq!(
+        recorded
+            .bands_db
+            .iter()
+            .filter(|gain| **gain == -2.0)
+            .count()
+            + usize::from(recorded.preamp_db == -2.0),
+        1,
+        "exactly one gain slot carries the genuine edit"
+    );
+    assert!(
+        recorded
+            .bands_db
+            .iter()
+            .all(|gain| *gain == 0.0 || *gain == -2.0)
+            && (recorded.preamp_db == 0.0 || recorded.preamp_db == -2.0),
+        "no other gain slot may move"
+    );
+    assert_eq!(
+        preset.selected(),
+        5,
+        "the combo must display the non-activatable Custom entry"
+    );
+}
+
+/// Refinery review 2026-09-18T18:41Z (reload): after Reload-from-disk,
+/// the late reflection echo must apply nothing and keep both the
+/// recorded state and the real combo on the named preset, and a
+/// genuine preset choice must still apply exactly once.
+fn reload_echo_applies_nothing_and_keeps_the_named_preset() {
+    let (output, state) = PanelOutput::panel(
+        true,
+        EqSettings {
+            enabled: true,
+            preset: Preset::Jazz,
+            preamp_db: Preset::Jazz.recommended_preamp_db(),
+            bands_db: Preset::Jazz.band_gains_db(),
+            clip_protection: ClipProtection::Off,
+        },
+    );
+    let group = build_equalizer_group(&output);
+    let reload = button_with_label(&group, &translated("equalizer.reload"));
+    let preset = preset_dropdown(&group);
+    assert_eq!(
+        preset.selected(),
+        3,
+        "the panel starts from the recorded Jazz"
+    );
+
+    // Reload from disk: the reload path never applies — it re-reads
+    // through the output and reflects what the output now reports.
+    reload.emit_clicked();
+    assert_eq!(
+        state.borrow().apply_calls,
+        0,
+        "reload reflects; it must not arm an apply"
+    );
+    assert_eq!(state.borrow().settings.preset, Preset::Jazz);
+
+    // The late echo of the reload reflection.
+    redeliver_reflection_notifies(&group);
+    assert_eq!(
+        state.borrow().apply_calls,
+        0,
+        "a late echo must not arm a spurious save"
+    );
+    assert_eq!(
+        state.borrow().settings.preset,
+        Preset::Jazz,
+        "a late echo must not move the persisted preset to custom"
+    );
+    assert_eq!(
+        state.borrow().settings.preamp_db,
+        Preset::Jazz.recommended_preamp_db()
+    );
+    assert_eq!(
+        state.borrow().settings.bands_db,
+        Preset::Jazz.band_gains_db(),
+        "a late echo must not alter the restored band vector"
+    );
+    assert_eq!(
+        preset.selected(),
+        3,
+        "the combo must still show Jazz after the echo"
+    );
+
+    // Positive control: a genuine preset choice applies exactly once.
+    preset.set_selected(0);
+    assert_eq!(
+        state.borrow().apply_calls,
+        1,
+        "one apply per genuine preset choice"
+    );
+    assert_eq!(
+        state.borrow().settings.preset,
+        Preset::Flat,
+        "the chosen named preset must be recorded"
+    );
+    assert!(
+        state
+            .borrow()
+            .settings
+            .bands_db
+            .iter()
+            .all(|gain| *gain == 0.0),
+        "the chosen preset's canonical vector must be applied"
+    );
+}
+
 /// Entry point for the crate's single GTK test: runs the equalizer
 /// panel's real-widget contracts.
 pub fn equalizer_panel_widget_contracts() {
@@ -359,4 +585,6 @@ pub fn equalizer_panel_widget_contracts() {
     unsupported_panel_describes_every_exposed_control();
     enable_switch_reflects_the_applied_state_and_retries();
     clip_dropdown_reflects_the_applied_state_and_retries();
+    reset_echo_applies_nothing_and_keeps_the_named_preset();
+    reload_echo_applies_nothing_and_keeps_the_named_preset();
 }
