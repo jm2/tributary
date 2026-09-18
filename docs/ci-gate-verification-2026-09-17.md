@@ -22,11 +22,19 @@ pack configuration was changed by this verification.
 - `.gc/operations/reconcile.py` — the guarded reconciler that is the live
   completion gate (778 lines at SHA256
   edd3b6591ed805e8dab3b2c94ce774ee64055951116ef355ca1594b359d63037, read in
-  full). Evidence revision: an earlier draft of this report cited revision
+  full). Evidence revisions: an earlier draft of this report cited revision
   d49cbfee (769 lines); the live source changed during the review window
   (optional-check gating and the review-overlaps-CI ordering were added), so
   every behavioral claim below was re-probed against the SHA above, and
-  historical observations are labeled as such where they predate it.
+  historical observations are labeled as such where they predate it. Two
+  later live-source changes are folded in where they affect the text: the
+  2026-09-18 conflict-rework ordering — the source this revision started
+  from ran 786 lines with 92 tests — and the 2026-09-18 expected-vs-observed
+  absence parking demanded by the refinery reject at ee52050b on tr-vde5d
+  (the source now runs 798 lines at SHA256
+  07afbc38a6c90399887cfd6b9d42135634a02305739255d44287074afe72fa62 with 95
+  tests green; a fresh read-only dry run over 24 open PRs produced zero
+  errors and reclassified no live bead).
 - `.gc/operations/orders/tributary-reconcile.toml` — the order that executes
   the gate.
 - Direct probes of the live `reconcile.py` functions (`decide`,
@@ -106,6 +114,19 @@ The live completion gate is `.gc/operations/reconcile.py`, executed by the
   block the merge on it either, and a failed optional check was already
   caught by the failure-first scan. If no gating check concluded SUCCESS,
   the bead parks as `pending` ("no successful checks (all skipped/neutral)").
+- **Expected-vs-observed comparison.** The unfinished-check scan only sees
+  checks that exist; a gating context that never materialized as a run is
+  invisible to it, so a rollup that merely lacks an expected context is not
+  a passing one. After the approval check, `decide()` therefore compares the
+  observed check names against the complete gating set
+  (`required_checks() | CITY_GATES`) and parks as `pending` ("gating checks
+  absent from rollup: …") with the absent contexts named whenever any
+  expected context is missing from the rollup entirely. All seven ruleset
+  checks green while both city gates are absent is `pending`, not `ready`
+  (refinery reject at ee52050b on tr-vde5d, thread V2; regressions
+  `test_absent_city_gates_park_when_every_ruleset_check_is_green`,
+  `test_absent_required_check_parks_even_when_the_rest_is_green`,
+  `test_complete_green_gating_set_with_queued_advisory_stays_ready`).
 - **Status vs conclusion.** `COMPLETED` is the check *status* field;
   SUCCESS/FAILURE/etc. are *conclusions*. A conclusion value is never
   "COMPLETED" — probe: a gating check with status `COMPLETED` and an empty
@@ -117,19 +138,25 @@ The live completion gate is `.gc/operations/reconcile.py`, executed by the
   reject at this head (→ `hold`), unresolved changes-requested reviews
   (→ `rework`), the failure-first scan over every check (→ `rework`), then
   independent approval evidence (→ `review`), and only then the
-  unfinished-check scan (→ `pending`). Two probed consequences of that
-  order: a failure conclusion wins over missing approval, and a missing
-  approval wins over queued checks — review is requested while checks are
-  still in flight, not after they drain. A held, draft, changes-requested,
-  or failure-flagged PR never reads as merely pending, whatever its checks
-  are doing.
+  expected-vs-observed gating comparison and the unfinished-check scan
+  (→ `pending`). Two probed consequences of that order: a failure
+  conclusion wins over missing approval, and a missing approval wins over
+  queued or absent checks — review is requested while checks are still in
+  flight, not after they drain. A held, draft, changes-requested, or
+  failure-flagged PR never reads as merely pending, whatever its checks are
+  doing — with one explicit exception: an opted-in held or draft bead
+  (`review.corrections_while_held = "true"`, Finding 4) parks as `pending`
+  while its current-head review evidence is missing or stale, and the hold
+  itself stays in force throughout.
 
 Because there is no timer, the failure mode tr-3h7 documented — a green
 branch rejected as "pending at deadline" while slow checks were still
 in flight — is structurally eliminated: a slow branch simply stays pending
 until the checks conclude, provided no earlier condition (hold, draft,
-changes-requested, review evidence, a failure conclusion) applies — pending
-is what remains when nothing worse was observed. Pending state is parked
+changes-requested, review evidence, a failure conclusion) applies — the sole
+exception being the Finding 4 opt-in, under which a held/draft bead can
+itself be pending over missing review evidence — pending is what remains
+when nothing worse was observed. Pending state is parked
 with `merge_result = pull_request_pending` and `gc.routed_to = human`
 (`reconcile_one`); the next reconciliation pass re-examines it with no
 operator action required.
@@ -172,11 +199,14 @@ Three distinct sets exist, with different roles:
      contexts of set 1 plus the two city gates (`Codacy Static Code
      Analysis`, `Coverage (Linux x86_64)`). A gating check whose status is
      not COMPLETED, or whose conclusion is outside the pass set, parks as
-     `pending`, as does a rollup with no successful gating check. An
-     unfinished *optional* check is skipped: GitHub's per-account Actions
-     concurrency cap queues those jobs for an hour or more, the ruleset
-     would not block the merge on them either, and a failed optional check
-     was already caught by the universal failure scan.
+     `pending`, as does a rollup with no successful gating check — and, as
+     of the 2026-09-18 correction, a rollup from which an expected gating
+     context is entirely absent parks as well, with the absent contexts
+     named (see Finding 2). An unfinished *optional* check is skipped:
+     GitHub's per-account Actions concurrency cap queues those jobs for an
+     hour or more, the ruleset would not block the merge on them either,
+     and a failed optional check was already caught by the universal
+     failure scan.
    - *Direct probes of the live `decide()`* (source SHA
      `edd3b659…d63037`, fixtures under `${TMPDIR:-/var/tmp}`, no
      `--apply`): with complete current-head approval evidence and a
@@ -184,7 +214,14 @@ Three distinct sets exist, with different roles:
      same queued check renamed `Linux (x86_64)` decides **pending**
      (`Linux (x86_64): not completed`); a queued `Codacy Static Code
      Analysis` decides **pending** (`Codacy Static Code Analysis: not
-     completed`).
+     completed`). Re-run against the corrected source (SHA
+      `07afbc38…72fa62`) every earlier result holds, and the absence probes
+      added with the 2026-09-18 correction read: seven green ruleset checks
+      with both city gates absent from the rollup → `pending` ("gating
+      checks absent from rollup: Codacy Static Code Analysis, Coverage
+      (Linux x86_64)"); one ruleset context (MSRV) absent with everything
+      else green → `pending` naming `MSRV`; the full gating set green
+      beside a queued `SHA256 Checksums` → `ready`.
 
    The gate is therefore name-sensitive for pending, but has no static
    allowlist constant: the required half of the gating set is read live
@@ -195,15 +232,21 @@ Three distinct sets exist, with different roles:
    snapshot belonged to the retired agent gate, not to this one.
 
 3. **Operator all-green policy (2026-09-03, documented in
-   `docs/refinery-config.md`) — historical, not what set 2 enforces.** The
-   operator's 2026-09-03 rule was that a PR is merge-ready only when every
-   check and every bot review is green, "required" or not. The deployed
-   reconciler implements a different, narrower contract: universal failure
-   scanning plus the required/city pending gate of set 2, with unfinished
-   optional checks explicitly non-blocking. Where
-   `docs/refinery-config.md` describes the all-green rule it is recording
-   this superseded operator policy and the gap that remains between policy
-   and machine gate — not the live gate's semantics.
+   `docs/refinery-config.md`) — in force; live enforcement of it is
+   partial.** The operator's 2026-09-03 rule is that a PR is merge-ready
+   only when every check and every bot review is green, "required" or not.
+   The deployed reconciler enforces a narrower slice of that rule:
+   universal failure scanning plus the required/city pending gate of set 2
+   (expected contexts absent from the rollup included), with unfinished
+   optional checks explicitly non-blocking. What the gate does not yet
+   enforce of the policy is an enforcement gap that persists until the
+   ruleset is widened — the policy itself is not retired, and review
+   discipline covers the remainder. Where `docs/refinery-config.md`
+   describes the all-green rule it is stating current operator policy and
+   the gap between policy and machine gate — not a historical artifact.
+   (An earlier revision of this report called the policy "historical" and
+   "superseded"; that wording was wrong and is corrected here — refinery
+   reject at ee52050b on tr-vde5d, thread V1.)
 
 The reconciler additionally refuses completion unless semantic review
 evidence matches the exact current head SHA: independent semantic approval
@@ -228,7 +271,12 @@ adjacent path:
   and `reconcile_one` stores that disposition as `merge_result = blocked`
   with `gc.routed_to = human` while preserving `status = open` — the bead is
   parked for human disposition; it is not recorded as waiting on CI and the
-  PR itself is never touched.
+  PR itself is never touched. This disposition is absolute **except** for
+  the explicit `review.corrections_while_held = "true"` opt-in in the next
+  bullet: an opted-in held/draft bead whose current-head review evidence is
+  missing, incomplete, or stale parks as `pending` ("complete current-head
+  review evidence is missing") while the hold itself remains in force
+  (refinery reject at ee52050b on tr-vde5d, thread V3).
 - Unknown check conclusions on gating checks park; they are never treated as
   passing (see Finding 2 for the gating/optional distinction).
 - **Corrective review alongside a hold is an explicit opt-in, not a hold
@@ -354,7 +402,8 @@ Hold semantics in the live gate, unchanged and enforced:
   of CI color. The one exception-shaped path is the explicit
   `review.corrections_while_held` opt-in described in Finding 4, which can
   raise a `review` action for new findings or an unreviewed corrective
-  handoff *while the merge hold remains* — it never clears the hold,
+  handoff — or park `pending` over missing current-head evidence — *while
+  the merge hold remains*; it never clears the hold,
   undrafts the PR, or authorizes a merge.
 
 ## Fresh execution evidence (2026-09-17, dry run)
@@ -392,12 +441,15 @@ approval evaluations preceding any pending disposition.
   first.
 - Exact check contexts: seven ruleset-required contexts (listed above).
   The completion gate's pending decisions cover exactly those plus the two
-  city gates (`Codacy Static Code Analysis`, `Coverage (Linux x86_64)`);
-  its failure scan covers every observed check; and unfinished advisory
-  checks do not block (probed: successful MSRV beside a queued
-  `SHA256 Checksums` → ready). The operator's all-green policy is
-  documented as historical — a policy the live gate deliberately does not
-  enforce.
+  city gates (`Codacy Static Code Analysis`, `Coverage (Linux x86_64)`) —
+  including, since the 2026-09-18 correction, a gating context expected but
+  absent from the rollup entirely, which parks with the absent contexts
+  named; its failure scan covers every observed check; and unfinished
+  advisory checks do not block (probed: successful MSRV beside a queued
+  `SHA256 Checksums` → ready). The operator's all-green policy remains in
+  force for the operator; the live gate enforces part of it, and the rest
+  is an enforcement gap (the ruleset is not yet widened), not a retirement
+  of the policy.
 - Failure-first non-green behavior is implemented as documented and probed
   against the live functions. Correction routing constants (6 → notify,
   12 → park) are verified at the function level, with the acknowledgement
@@ -443,11 +495,29 @@ approval evaluations preceding any pending disposition.
   and green with no name sensitivity. All sections now state the deployed
   contract consistently: universal failure scan over every check; pending
   confined to `required_checks() | CITY_GATES`; unfinished optional checks
-  non-blocking, with direct probe I/O at source SHA `edd3b659…d63037`
-  (queued `SHA256 Checksums` → ready; queued `Linux (x86_64)` or
-  `Codacy Static Code Analysis` → pending; failure → rework and missing
-  approval → review, both ahead of any pending disposition); and the
-  all-green operator policy labeled historical in both documents. The
-  Method/evidence revision now names the live source SHA (778 lines) and
-  the 90-test suite instead of mixing later behavior into the stale
-  d49cbfee/769-line/83-test citations.
+   non-blocking, with direct probe I/O at source SHA `edd3b659…d63037`
+   (queued `SHA256 Checksums` → ready; queued `Linux (x86_64)` or
+   `Codacy Static Code Analysis` → pending; failure → rework and missing
+   approval → review, both ahead of any pending disposition); and the
+   all-green operator policy was — wrongly, as corrected on 2026-09-18 —
+   labeled historical in both documents: the policy remains in force, with
+   the live gate's enforcement of it partial (enforcement gap, not
+   retirement). The Method/evidence revision now names the live source SHA
+   (778 lines) and the then-current test suite instead of mixing later
+   behavior into the stale d49cbfee/769-line/83-test citations.
+- **Refinery reject at ee52050b on tr-vde5d (2026-09-18) → the
+  expected-vs-observed gating comparison, the draft-hold qualification,
+  and the all-green reframing, here and in `docs/refinery-config.md`.**
+  V2: the pending scans only saw checks that exist, so a gating context
+  absent from the rollup entirely could not park the bead; `decide()` now
+  compares observed names against `required_checks() | CITY_GATES` and
+  parks pending with the absent contexts named (live source applied and
+  re-verified: 798 lines at SHA `07afbc38…72fa62`, 95 tests green, a fresh
+  read-only dry run over 24 open PRs with zero errors and no
+  reclassification of any live bead). V3: the absolute draft/hold
+  statements in this report are qualified with the
+  `review.corrections_while_held` opt-in under which missing or stale
+  evidence parks pending while the hold persists. V1: every "historical"
+  retirement of the all-green operator policy is replaced with the
+  enforcement-gap framing — the policy is in force; the live gate
+  enforces part of it until the ruleset is widened.
