@@ -1438,9 +1438,7 @@ impl LocalMutationTarget {
                 return Err(conflict_error(LocalTagWriteConflict::TargetReplaced));
             }
             RetainedTargetAdmission::Unavailable(error) => {
-                return Err(
-                    anyhow::Error::new(error).context("the selected file is unavailable")
-                );
+                return Err(anyhow::Error::new(error).context("the selected file is unavailable"));
             }
         };
         if authority.root_identity() != evidence.parent_identity {

@@ -1878,7 +1878,8 @@ mod tests {
             refusal.body
         );
         assert_eq!(
-            refusal.body, english_all_conflict_body(1),
+            refusal.body,
+            english_all_conflict_body(1),
             "the refusal must describe exactly the conflicted subset"
         );
 
