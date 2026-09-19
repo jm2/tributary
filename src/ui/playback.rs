@@ -1340,8 +1340,9 @@ impl PlaybackSession {
     /// previous play — and [`Self::take_orphaned_pending_history_credit`]
     /// then rides its delivery on the next admission attempt. The
     /// replacement's slot is always empty here (`play_track_at` installs
-    /// into a fresh `Default` session before any other use), so the
-    /// transfer can never evict an undelivered orphan.
+    /// into a fresh `Default` session that no admission attempt has filled
+    /// yet — history events only arrive from the output after the start
+    /// attempt), so the transfer can never evict an undelivered orphan.
     fn inherit_pending_history_credit(&mut self, pending: Option<(PendingHistoryCredit, i64)>) {
         debug_assert!(self.pending_history_credit.is_none());
         self.pending_history_credit = pending;
@@ -2219,26 +2220,26 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
         return false;
     }
 
-    // PR #286 round-4 finding A1: past this point no path restores
-    // `previous` — both remaining outcomes (successful start, explicit
-    // abandonment after a failed output load) drop it — and the queue
-    // replacement has retired its occurrence. Any pending credit it still
-    // held would therefore die with the dropped session, permanently
-    // omitting that play from history. Transfer it into the replacement,
-    // where it is orphaned by construction and rides the existing
-    // orphan-retry delivery on the next admission attempt (the same paths
-    // the terminal `clear` transition relies on). The restore paths above
-    // are untouched: `previous` still holds the credit, so a wholesale
-    // rollback reinstates it exactly.
-    let carried_pending_history_credit = previous.take_pending_history_credit();
-    ctx.session
-        .borrow_mut()
-        .inherit_pending_history_credit(carried_pending_history_credit);
+    // PR #286 round-4 finding A1: the queue replacement has retired the
+    // previous occurrence, and the two paths below that drop `previous`
+    // (successful start; explicit abandonment after a failed output load)
+    // would otherwise kill any pending credit with the dropped session,
+    // permanently omitting that play from history. Each of those paths
+    // transfers the credit into the replacement first, where it is
+    // orphaned by construction and rides the existing orphan-retry
+    // delivery on the next admission attempt (the same paths the terminal
+    // `clear` transition relies on; `clear` itself preserves the slot).
+    // The restore paths are untouched: the credit stays in `previous`, so
+    // a wholesale rollback reinstates it exactly.
 
     if play_current(ctx) {
         // `play_current` has already committed and published the replacement
         // output intent, so registry retirement cannot race ahead of Last.fm
         // predecessor retirement.
+        let carried_pending_history_credit = previous.take_pending_history_credit();
+        ctx.session
+            .borrow_mut()
+            .inherit_pending_history_credit(carried_pending_history_credit);
         if let Some(source_id) = previous_external {
             let _ = ctx.source_registry.retire_external(source_id);
         }
@@ -2246,7 +2247,13 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     } else if let Some(source_id) = previous_external {
         // A previous external capability is never restored as a retry target.
         // No replacement intent was emitted, so abandon playback explicitly
-        // before revoking its registry authority.
+        // before revoking its registry authority. The credit transferred
+        // below survives: installing it into the replacement orphans it by
+        // construction, and the abandonment's `clear` preserves the slot.
+        let carried_pending_history_credit = previous.take_pending_history_credit();
+        ctx.session
+            .borrow_mut()
+            .inherit_pending_history_credit(carried_pending_history_credit);
         abandon_external_playback(
             &ctx.session,
             &ctx.lastfm_playback,
@@ -2256,6 +2263,8 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
         );
         false
     } else {
+        // No replacement intent was emitted at all: wholesale rollback, and
+        // `previous` keeps its own pending credit exactly as it held it.
         *ctx.session.borrow_mut() = previous;
         false
     }
@@ -6833,8 +6842,9 @@ mod tests {
     /// credit — on every path past the queue swap, so activating a row (or
     /// play-or-start from idle) while the FIFO was full permanently
     /// omitted the earlier play. `play_track_at` now transfers the credit
-    /// into the replacement with `inherit_pending_history_credit` before
-    /// `play_current`; orphaned by construction there, it rides the normal
+    /// into the replacement with `inherit_pending_history_credit` on every
+    /// path that drops `previous` (successful start, external abandonment);
+    /// orphaned by construction there, it rides the normal
     /// orphan-retry delivery once the FIFO drains. Both entry points that
     /// reach the transfer (`column_view.connect_activate` and
     /// `play_or_start`'s `StartAt` arm) share this exact statement
