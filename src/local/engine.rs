@@ -1466,6 +1466,13 @@ enum ScanDiscoveryStage {
     /// await. Regression seam for the suspended-mid-transaction state the
     /// command-service selector must not switch branches at.
     CommitGuard,
+    /// Parked at the root-status boundary's command-settlement wait, before
+    /// the write transaction opens. Regression seam for the post-settlement
+    /// admission re-check (PR #286 round-4 finding j9j81). Signalled, not
+    /// held: the scan parks itself at the reciprocal settlement wait
+    /// immediately after, so holding here would deadlock every scan
+    /// regression that does not release this stage.
+    CommandSettlement,
 }
 
 #[derive(Default)]
@@ -1474,6 +1481,7 @@ struct ScanDiscoveryHoldInner {
     post_parse: DiscoveryRendezvous,
     root_status: DiscoveryRendezvous,
     commit_guard: DiscoveryRendezvous,
+    command_settlement: DiscoveryRendezvous,
 }
 
 #[derive(Default)]
@@ -1490,6 +1498,7 @@ impl ScanDiscoveryHoldInner {
             ScanDiscoveryStage::PostParse => &self.post_parse,
             ScanDiscoveryStage::RootStatus => &self.root_status,
             ScanDiscoveryStage::CommitGuard => &self.commit_guard,
+            ScanDiscoveryStage::CommandSettlement => &self.command_settlement,
         }
     }
 }
@@ -1527,6 +1536,22 @@ impl ScanDiscoveryHold {
         }
         rendezvous.reached.notify_one();
         rendezvous.release.notified().await;
+    }
+
+    /// Signal `stage` to a test-side waiter without holding the scan.
+    ///
+    /// The settlement-wait seam needs only an arrival notification: the scan
+    /// parks itself at the very next await (the reciprocal command-settlement
+    /// wait) whenever command work is actually in flight, so holding here
+    /// would deadlock every regression that never releases this stage.
+    /// One-shot `engaged` bookkeeping does not apply — the boundary fires
+    /// once per root and repeated notifications to a waiting test are
+    /// harmless.
+    fn signal(&self, stage: ScanDiscoveryStage) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        inner.stage(stage).reached.notify_one();
     }
 }
 
@@ -4560,7 +4585,28 @@ async fn initial_scan_with_control(
         // Reciprocal invariant: if a command was already dispatched, park
         // here — outside the transaction — until its work settles instead of
         // making its own writes queue behind this transaction (cid 4051684281).
+        // The CommandSettlement seam is a test-only signal fired at this
+        // boundary, before the wait: a regression driver learns the pre-wait
+        // admission check passed and the scan is about to park on the
+        // reciprocal settlement wait (PR #286 round-4 finding j9j81).
+        discovery.signal(ScanDiscoveryStage::CommandSettlement);
         wait_for_command_settlement(scan_write_txn).await;
+        // Re-check admission once the wait resolves (PR #286 round-4 finding
+        // j9j81): the park can span the shutdown cancellation, so refusing
+        // only before the wait would still open a post-cancellation write
+        // transaction and delay the close drain.
+        if !admit_scan_mutation(cancellation) {
+            let root_display = scan.root.display().to_string();
+            mark_scan_cancelled(
+                &mut root_scans,
+                "root-status persistence interrupted at shutdown",
+            );
+            info!(
+                root = %root_display,
+                "Initial scan cancelled after command settlement, before root-status persistence; no further status writes admitted"
+            );
+            return Ok(());
+        }
         let _scan_write_txn = ScanWriteTxnGuard::open(scan_write_txn);
         discovery.arrive(ScanDiscoveryStage::RootStatus).await;
         match persist_root_scan_status(
@@ -4804,6 +4850,18 @@ async fn initial_scan_with_control(
                     // park here while a dispatched command's work is still in
                     // flight (cid 4051684281).
                     wait_for_command_settlement(scan_write_txn).await;
+                    // Re-check admission once the wait resolves (PR #286
+                    // round-4 finding j9j81): the park can span the shutdown
+                    // cancellation, so refusing only before the wait would
+                    // still open a post-cancellation write transaction.
+                    if !admit_scan_mutation(cancellation) {
+                        mark_scan_cancelled(
+                            &mut root_scans,
+                            "upsert admission refused at shutdown",
+                        );
+                        info!(path = %path.display(), "Initial scan cancelled after command settlement, before upsert; no new durable work");
+                        return Ok(());
+                    }
                     let _scan_write_txn = ScanWriteTxnGuard::open(scan_write_txn);
                     match upsert_track_with_commit_guard(db, &parsed, existing, || async {
                         // Deterministic test rendezvous: suspend INSIDE the open
@@ -5055,6 +5113,18 @@ async fn initial_scan_with_control(
             // Reciprocally, park here while a dispatched command's work is
             // still in flight (cid 4051684281).
             wait_for_command_settlement(scan_write_txn).await;
+            // Re-check admission once the wait resolves (PR #286 round-4
+            // finding j9j81): the park can span the shutdown cancellation, so
+            // refusing only before the wait would still open a
+            // post-cancellation write transaction and delay the close drain.
+            if !admit_scan_mutation(cancellation) {
+                mark_scan_cancelled(
+                    &mut root_scans,
+                    "stale-delete admission refused at shutdown",
+                );
+                info!(path = %row.file_path, "Initial scan cancelled after command settlement, before stale deletion; preserving metadata");
+                return Ok(());
+            }
             let _scan_write_txn = ScanWriteTxnGuard::open(scan_write_txn);
             match delete_track_with_commit_guard(db, &row.id, || async {
                 let guard_absence = absence.clone();
@@ -11308,6 +11378,119 @@ mod tests {
             Some(80),
             "the deferred command must still commit promptly"
         );
+    }
+
+    /// Round-4 regression (PR #286 finding j9j81): cancellation that arrives
+    /// WHILE the scan is parked at a write boundary's command-settlement wait
+    /// must still refuse to open a write transaction. The pre-wait admission
+    /// check cannot observe a shutdown that lands mid-park, so the boundary
+    /// must re-check admission after the wait resolves — refusing exactly as
+    /// the pre-wait check does, keeping the write-transaction gate closed,
+    /// admitting no durable mutation, and letting the close drain settle
+    /// promptly. Fail-closed: a regression to the pre-round-4 behavior opens
+    /// the transaction here and the engine future never settles inside the
+    /// join timeout.
+    #[tokio::test]
+    async fn scan_cancelled_during_command_settlement_wait_never_opens_write_txn() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("scan-settlement-cancel");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join("present.wav"));
+
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let cancellation = CancellationToken::new();
+        let (hold, control) = ScanDiscoveryHold::controlling();
+        let scan_write_txn = ScanWriteTxnGate::default();
+        let mut completed = HashMap::new();
+
+        // Simulate dispatched command work whose in-flight arm is held when
+        // the scan reaches the root-status boundary: the boundary's pre-wait
+        // admission check passes (no cancellation yet) and the boundary parks
+        // at the settlement wait, because the reciprocal invariant keeps the
+        // write transaction closed while work is in flight.
+        let in_flight = CommandInFlightGuard::arm(&scan_write_txn);
+
+        let engine = service_commands_while_scanning(
+            initial_scan_shutdown_aware(
+                &db,
+                &music_dirs,
+                &event_tx,
+                &refresh,
+                &cancellation,
+                &hold,
+                &scan_write_txn,
+            ),
+            &scan_write_txn,
+            &db,
+            &music_dirs,
+            &event_tx,
+            &command_rx,
+            &mut completed,
+            &refresh,
+        );
+        let driver = async {
+            // Read-only phases pass uncaptured; the seam this test cares
+            // about is signalled at the root-status boundary, right before
+            // its settlement wait. With command work in flight the scan
+            // parks itself there.
+            control.release(ScanDiscoveryStage::Traversal);
+            control.release(ScanDiscoveryStage::PostParse);
+            control
+                .wait_until_reached(ScanDiscoveryStage::CommandSettlement)
+                .await;
+            assert!(
+                !scan_write_txn.is_open(),
+                "the boundary must park at the settlement wait before any \
+                 write transaction opens"
+            );
+            // Shutdown lands while the scan is parked mid-wait — exactly the
+            // state the pre-wait admission check already passed.
+            cancellation.cancel();
+            // Mirror close_and_flush: the UI queues the reserved drain marker
+            // while the scan is still parked. The reciprocal gate keeps the
+            // command branch disabled mid-park, so the marker stays queued;
+            // settling the in-flight work must let the cancelled scan refuse
+            // and return so the drain unwinds promptly instead of waiting
+            // behind a post-cancellation write transaction.
+            let (completion_tx, _completion_rx) = async_channel::bounded(1);
+            command_tx
+                .send(LibraryCommand::Flush {
+                    completion: completion_tx,
+                })
+                .await
+                .expect("queue the shutdown drain marker");
+            // The in-flight work has settled: the settlement wait resolves
+            // and the post-settlement admission re-check must now refuse.
+            drop(in_flight);
+        };
+
+        let (scan_result, ()) = tokio::time::timeout(Duration::from_secs(120), async {
+            tokio::join!(engine, driver)
+        })
+        .await
+        .expect(
+            "the engine must settle once the in-flight work settles and the \
+             park is released",
+        );
+        scan_result.expect("the cancelled scan returns cleanly after the park");
+        assert!(
+            !scan_write_txn.is_open(),
+            "a scan cancelled mid-park must not open a post-cancellation \
+             write transaction"
+        );
+
+        // No durable mutation was admitted after cancellation: the root was
+        // never persisted and the traversed file was never upserted.
+        let tracks = track::Entity::find().all(&db).await.expect("query tracks");
+        assert!(
+            tracks.is_empty(),
+            "a scan cancelled mid-park must admit no durable writes: {tracks:?}"
+        );
+        drop(command_tx);
+        let _ = event_rx.try_recv();
     }
 
     /// Round-3 reciprocal regression (cid 4051684281): dispatched command work
