@@ -30,7 +30,6 @@ use super::delivery::{
 };
 use super::lifecycle::{acquire_vault_lifecycle, LastFmVaultLifecycleLease};
 use super::policy::LastFmLivePolicy;
-#[cfg(test)]
 use super::policy::LastFmPolicyGeneration;
 use super::storage::{
     self, LastFmEnqueueOutcome, LastFmQueueError, PendingLastFmScrobble, UnboundLastFmScrobble,
@@ -1044,6 +1043,7 @@ enum RuntimeEvent {
         generation: LastFmNowPlayingGeneration,
         result: Result<NowPlayingTaskExit, tokio::task::JoinError>,
     },
+    PolicyChanged,
 }
 
 enum Command {
@@ -1152,6 +1152,52 @@ struct ActiveAccount {
     vault_lease: Option<SharedVaultLifecycleLease>,
 }
 
+/// Change-driven supervision of the policy generation that minted the
+/// runtime activation.
+///
+/// The owner freezes the issuing generation and observes only publications
+/// made after startup: any later generation that is disabled, or that is not
+/// the frozen one, supersedes the runtime. Reacting to the publication wake,
+/// not to a scheduled re-check, bounds how long the delivery worker may keep
+/// draining the durable queue after its authority is gone.
+struct PolicySupervision {
+    generation: u64,
+    live: LastFmLivePolicy,
+    changes: watch::Receiver<LastFmPolicyGeneration>,
+}
+
+impl PolicySupervision {
+    /// Supervise the activation's frozen generation.
+    ///
+    /// The starting publication is consumed immediately so only later
+    /// publications register as changes.
+    fn for_activation(live: &LastFmLivePolicy, generation: u64) -> Self {
+        let mut changes = live.subscribe();
+        changes.borrow_and_update();
+        Self {
+            generation,
+            live: live.clone(),
+            changes,
+        }
+    }
+
+    /// Idle supervision for owners built directly in tests: the watch sender
+    /// stays alive inside `live`, nothing ever publishes to it, and the owner
+    /// keeps reacting to commands alone.
+    #[cfg(test)]
+    fn idle() -> Self {
+        Self::for_activation(&LastFmLivePolicy::default(), 0)
+    }
+
+    /// Consume the latest publication and report whether it supersedes the
+    /// frozen generation: the live slot is disabled or consent-revoked, or a
+    /// different generation now holds the authority.
+    fn supersedes_frozen(&mut self) -> bool {
+        let generation = self.changes.borrow_and_update();
+        !generation.consented_and_enabled() || generation.generation() != self.generation
+    }
+}
+
 struct RuntimeOwner {
     database: DatabaseConnection,
     credentials: Arc<dyn SessionCredentialStore>,
@@ -1168,18 +1214,34 @@ struct RuntimeOwner {
     account: Option<ActiveAccount>,
     transport: Arc<dyn LastFmTransport>,
     clock: Arc<dyn LastFmClock>,
+    supervision: PolicySupervision,
 }
 
 impl RuntimeOwner {
     async fn next_event(&mut self) -> RuntimeEvent {
         let commands = &self.commands;
         let Some(now_playing) = self.now_playing.as_mut() else {
-            return RuntimeEvent::Command(commands.recv().await.ok());
+            tokio::select! {
+                biased;
+                changed = self.supervision.changes.changed() => {
+                    // A closed watch channel can never change again; the
+                    // re-check below observes the last published generation.
+                    let _ = changed;
+                    return RuntimeEvent::PolicyChanged;
+                }
+                command = commands.recv() => {
+                    return RuntimeEvent::Command(command.ok());
+                }
+            }
         };
         let generation = now_playing.generation;
         tokio::select! {
             biased;
             result = &mut now_playing.task => RuntimeEvent::NowPlaying { generation, result },
+            changed = self.supervision.changes.changed() => {
+                let _ = changed;
+                RuntimeEvent::PolicyChanged
+            }
             command = commands.recv() => RuntimeEvent::Command(command.ok()),
         }
     }
@@ -1191,6 +1253,23 @@ impl RuntimeOwner {
                 RuntimeEvent::Command(None) => return self.fail_and_retire().await,
                 RuntimeEvent::NowPlaying { generation, result } => {
                     self.handle_now_playing_result(generation, result).await;
+                    continue;
+                }
+                RuntimeEvent::PolicyChanged => {
+                    if self.supervision.supersedes_frozen() {
+                        // The issuing generation lost its authority. Refuse
+                        // every further command and retire all workers before
+                        // the delivery worker can drain more of the durable
+                        // queue; the queue itself stays durable.
+                        if let Ok(mut ingress) = self.ingress.lock() {
+                            ingress.phase = IngressPhase::Closed;
+                            ingress.queue_admission_open = false;
+                            ingress.shutdown_queued = true;
+                        }
+                        return self
+                            .retire_for_stop(LastFmRuntimeShutdownReason::Superseded)
+                            .await;
+                    }
                     continue;
                 }
             };
@@ -1305,32 +1384,9 @@ impl RuntimeOwner {
                         .await;
                 }
                 Command::Shutdown => {
-                    self.publish(LastFmRuntimePhase::ShuttingDown, None);
-                    let binding = self
-                        .account
-                        .as_ref()
-                        .filter(|account| !account.queue_purged)
-                        .map(|account| account.binding);
-                    self.retire_now_playing(LastFmRuntimeCommandError::OwnerStopped)
+                    return self
+                        .retire_for_stop(LastFmRuntimeShutdownReason::Drained)
                         .await;
-                    let retirement = self.retire_delivery().await;
-                    let failure_paused = if let Some(binding) =
-                        binding.filter(|_| !retirement.joined || retirement.failure.is_some())
-                    {
-                        self.ensure_worker_failure_pause(binding).await
-                    } else {
-                        true
-                    };
-                    self.account = None;
-                    if retirement.joined && failure_paused {
-                        self.publish(LastFmRuntimePhase::Stopped, None);
-                        return Ok(LastFmRuntimeShutdownReason::Drained);
-                    }
-                    self.publish(
-                        LastFmRuntimePhase::Failed,
-                        Some(LastFmRuntimeCommandError::OwnerStopped),
-                    );
-                    return Err(LastFmRuntimeShutdownError);
                 }
                 #[cfg(test)]
                 Command::PanicForQuiescenceTest => {
@@ -1338,6 +1394,41 @@ impl RuntimeOwner {
                 }
             }
         }
+    }
+
+    /// Retire every worker for a stop the owner itself observed — either a
+    /// handle-requested shutdown or a superseded policy generation — and
+    /// complete the drain with `completed` when the workers joined cleanly.
+    async fn retire_for_stop(
+        &mut self,
+        completed: LastFmRuntimeShutdownReason,
+    ) -> Result<LastFmRuntimeShutdownReason, LastFmRuntimeShutdownError> {
+        self.publish(LastFmRuntimePhase::ShuttingDown, None);
+        let binding = self
+            .account
+            .as_ref()
+            .filter(|account| !account.queue_purged)
+            .map(|account| account.binding);
+        self.retire_now_playing(LastFmRuntimeCommandError::OwnerStopped)
+            .await;
+        let retirement = self.retire_delivery().await;
+        let failure_paused = if let Some(binding) =
+            binding.filter(|_| !retirement.joined || retirement.failure.is_some())
+        {
+            self.ensure_worker_failure_pause(binding).await
+        } else {
+            true
+        };
+        self.account = None;
+        if retirement.joined && failure_paused {
+            self.publish(LastFmRuntimePhase::Stopped, None);
+            return Ok(completed);
+        }
+        self.publish(
+            LastFmRuntimePhase::Failed,
+            Some(LastFmRuntimeCommandError::OwnerStopped),
+        );
+        Err(LastFmRuntimeShutdownError)
     }
 
     async fn fail_and_retire(
@@ -3288,7 +3379,13 @@ impl From<LastFmQueueError> for LastFmRuntimeStartError {
 /// Why the actor completed its explicit FIFO drain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LastFmRuntimeShutdownReason {
+    /// The handle requested an ordinary shutdown and every worker joined.
     Drained,
+    /// The live policy generation superseded the activation's frozen
+    /// generation, so the runtime stopped on its own: the delivery worker was
+    /// cancelled before it could drain more of the durable queue, and the
+    /// queue itself stays durable for a future authorized runtime.
+    Superseded,
 }
 
 /// Sanitized owner/barrier failure.
@@ -3571,6 +3668,17 @@ pub async fn spawn_lastfm_runtime(
     let cleanup_only =
         queue_state.durable_pause == Some(storage::LastFmDurablePause::CredentialCleanupRequired);
     let epoch = LastFmAccountEpoch::INITIAL;
+    // The tombstone query, the blocking credential load, and the queue
+    // validation above are awaits this start does not control. Freeze the live
+    // slot one final time immediately before the delivery worker can observe
+    // the durable queue: a token superseded during those awaits refuses
+    // exactly like one refused before the lease.
+    let preworker_generation = live_policy.snapshot();
+    if !preworker_generation.consented_and_enabled()
+        || preworker_generation.generation() != activation.policy_generation
+    {
+        return Err(LastFmRuntimeStartError::PolicySuperseded);
+    }
     let (command_sender, command_receiver) = async_channel::bounded(COMMAND_CAPACITY);
     let initial_status = LastFmRuntimeStatus::startup(queue_state, clock.now_unix_ms().ok());
     let (status_sender, status) = watch::channel(initial_status);
@@ -3671,6 +3779,7 @@ pub async fn spawn_lastfm_runtime(
             vault_lease: Some(Arc::new(vault_lease)),
         }),
         now_playing: None,
+        supervision: PolicySupervision::for_activation(live_policy, activation.policy_generation),
     };
     let (completion_sender, completion) = watch::channel(LastFmRuntimeDrainState::Pending);
     let owner_task = tokio::spawn(async move {
@@ -3998,6 +4107,51 @@ mod tests {
         }
     }
 
+    /// A credential store whose load announces the exact moment the runtime
+    /// start crosses the vault await and then parks until released, so a test
+    /// can publish a superseding policy while the start is provably between
+    /// the post-lease validation and the delivery-worker creation.
+    struct GatedCredentialStore {
+        session: StoredSession,
+        entered: std::sync::mpsc::Sender<()>,
+        attempts: AtomicUsize,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl GatedCredentialStore {
+        fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst)
+        }
+
+        fn release(&self) {
+            let (released, signal) = &*self.gate;
+            *released.lock().unwrap() = true;
+            signal.notify_all();
+        }
+    }
+
+    impl SessionCredentialStore for GatedCredentialStore {
+        fn load(&self) -> Result<Option<StoredSession>, CredentialError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let _ = self.entered.send(());
+            let (released, signal) = &*self.gate;
+            let mut guard = released.lock().unwrap();
+            while !*guard {
+                guard = signal.wait(guard).unwrap();
+            }
+            Ok(Some(self.session.clone()))
+        }
+
+        fn save(&self, session: &StoredSession) -> Result<(), CredentialError> {
+            let _ = session;
+            Err(CredentialError::Unavailable)
+        }
+
+        fn delete(&self) -> Result<(), CredentialError> {
+            Err(CredentialError::Unavailable)
+        }
+    }
+
     async fn database() -> DatabaseConnection {
         let database = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&database, None).await.unwrap();
@@ -4208,6 +4362,185 @@ mod tests {
             store.load_attempts(),
             0,
             "no credential load may happen once the post-lease policy check refuses"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_superseded_during_startup_awaits_refuses_before_worker_creation() {
+        let live = LastFmLivePolicy::default();
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
+        let Some(activation) = LastFmRuntimeActivation::issue_after_consent_and_enablement(&live)
+        else {
+            panic!("an enabled generation issues the runtime activation");
+        };
+        let (load_entered, entered) = std::sync::mpsc::channel();
+        let gate: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
+        let store = Arc::new(GatedCredentialStore {
+            session: session("pre-worker-listener"),
+            entered: load_entered,
+            attempts: AtomicUsize::new(0),
+            gate: Arc::clone(&gate),
+        });
+        // A helper thread waits for the gated vault load to be entered, then
+        // publishes a consented, enabled replacement generation before
+        // releasing the load. The start cannot pass the load until the
+        // superseding generation is already live, so the ordering — publish
+        // strictly between the post-lease validation and the pre-worker
+        // validation — is deterministic without any scheduler timing.
+        let publisher = live.clone();
+        let thread_gate = Arc::clone(&gate);
+        std::thread::spawn(move || {
+            entered
+                .recv()
+                .expect("the runtime start must reach the gated vault load");
+            publisher.publish(LastFmPolicyGeneration::for_test(2, HashSet::new()));
+            let (released, signal) = &*thread_gate;
+            *released.lock().unwrap() = true;
+            signal.notify_all();
+        });
+
+        let error = spawn_lastfm_runtime(
+            activation,
+            &live,
+            database().await,
+            Arc::clone(&store) as Arc<dyn SessionCredentialStore>,
+            pending_transport(),
+            fixed_clock(),
+        )
+        .await
+        .expect_err("a policy superseded during the startup awaits must refuse the start");
+        assert_eq!(error, LastFmRuntimeStartError::PolicySuperseded);
+        assert_eq!(
+            store.attempts(),
+            1,
+            "the refusal must be the pre-worker validation: the vault load already ran once"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_disabled_after_start_stops_the_active_runtime() {
+        let live = LastFmLivePolicy::default();
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
+        let Some(activation) = LastFmRuntimeActivation::issue_after_consent_and_enablement(&live)
+        else {
+            panic!("an enabled generation issues the runtime activation");
+        };
+        let store = Arc::new(TestCredentialStore::new(session(
+            "superseded-active-listener",
+        )));
+        let (handle, shutdown) = spawn_lastfm_runtime(
+            activation,
+            &live,
+            database().await,
+            store,
+            pending_transport(),
+            fixed_clock(),
+        )
+        .await
+        .unwrap();
+        let barrier = shutdown.barrier();
+
+        // Revoking consent supersedes the issuing generation: the runtime
+        // must stop on its own, before any handle request, and the delivery
+        // worker joins instead of draining more of the durable queue.
+        live.publish(LastFmPolicyGeneration::default());
+        assert_eq!(
+            shutdown.shutdown().await,
+            Ok(LastFmRuntimeShutdownReason::Superseded)
+        );
+        assert_eq!(
+            barrier.state(),
+            LastFmRuntimeDrainState::Drained,
+            "the superseded stop completes the runtime drain"
+        );
+        assert_eq!(
+            handle.inner.status.borrow().phase,
+            LastFmRuntimePhase::Stopped,
+            "the superseded stop publishes the stopped phase"
+        );
+        assert!(
+            handle.try_claim_playback_ingress().is_err(),
+            "the closed ingress must refuse any further playback claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_replacement_after_start_stops_the_active_runtime() {
+        let live = LastFmLivePolicy::default();
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
+        let Some(activation) = LastFmRuntimeActivation::issue_after_consent_and_enablement(&live)
+        else {
+            panic!("an enabled generation issues the runtime activation");
+        };
+        let store = Arc::new(TestCredentialStore::new(session(
+            "replaced-active-listener",
+        )));
+        let (handle, shutdown) = spawn_lastfm_runtime(
+            activation,
+            &live,
+            database().await,
+            store,
+            pending_transport(),
+            fixed_clock(),
+        )
+        .await
+        .unwrap();
+        let barrier = shutdown.barrier();
+
+        // A consented, enabled replacement generation also supersedes the
+        // frozen token: the runtime's authority is the exact generation that
+        // minted its activation, not merely "any enabled policy".
+        live.publish(LastFmPolicyGeneration::for_test(2, HashSet::new()));
+        assert_eq!(
+            shutdown.shutdown().await,
+            Ok(LastFmRuntimeShutdownReason::Superseded)
+        );
+        assert_eq!(
+            barrier.state(),
+            LastFmRuntimeDrainState::Drained,
+            "the superseded stop completes the runtime drain"
+        );
+        assert_eq!(
+            handle.inner.status.borrow().phase,
+            LastFmRuntimePhase::Stopped,
+            "the superseded stop publishes the stopped phase"
+        );
+        assert!(
+            handle.try_claim_playback_ingress().is_err(),
+            "the closed ingress must refuse any further playback claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_generation_publication_keeps_the_runtime_active() {
+        let live = LastFmLivePolicy::default();
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
+        let Some(activation) = LastFmRuntimeActivation::issue_after_consent_and_enablement(&live)
+        else {
+            panic!("an enabled generation issues the runtime activation");
+        };
+        let store = Arc::new(TestCredentialStore::new(session("stable-listener")));
+        let (handle, shutdown) = spawn_lastfm_runtime(
+            activation,
+            &live,
+            database().await,
+            store,
+            pending_transport(),
+            fixed_clock(),
+        )
+        .await
+        .unwrap();
+
+        // Re-publishing the exact frozen generation is not a supersession:
+        // the runtime stays authorized and completes an ordinary drain.
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
+        assert_eq!(
+            shutdown.shutdown().await,
+            Ok(LastFmRuntimeShutdownReason::Drained)
+        );
+        assert_eq!(
+            handle.inner.status.borrow().phase,
+            LastFmRuntimePhase::Stopped
         );
     }
 
@@ -4540,6 +4873,7 @@ mod tests {
             }),
             now_playing: None,
             clock: fixed_clock(),
+            supervision: PolicySupervision::idle(),
         };
         let (completion, completed) = oneshot::channel();
 
@@ -4641,6 +4975,7 @@ mod tests {
             }),
             now_playing: None,
             clock: fixed_clock(),
+            supervision: PolicySupervision::idle(),
         };
 
         let (failure_acknowledgement, failure_directive) =
@@ -4941,6 +5276,7 @@ mod tests {
             }),
             now_playing: None,
             clock: fixed_clock(),
+            supervision: PolicySupervision::idle(),
         };
 
         owner.handle_delivery(binding, epoch, stale_event).await;
@@ -5438,6 +5774,7 @@ mod tests {
             now_playing: None,
             transport: pending_transport(),
             clock: fixed_clock(),
+            supervision: PolicySupervision::idle(),
         };
         let (completion, result) = oneshot::channel();
         owner.retry_cleanup(binding, epoch, completion).await;

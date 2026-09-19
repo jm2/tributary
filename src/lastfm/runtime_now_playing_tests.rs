@@ -478,6 +478,7 @@ async fn ready_now_playing_result_precedes_an_already_queued_metadata_command() 
         account: None,
         transport,
         clock: Arc::new(FixedClock),
+        supervision: PolicySupervision::idle(),
     };
 
     match owner.next_event().await {
@@ -488,6 +489,9 @@ async fn ready_now_playing_result_precedes_an_already_queued_metadata_command() 
         } => assert_eq!(observed.0, generation.0),
         RuntimeEvent::NowPlaying { .. } | RuntimeEvent::Command(_) => {
             panic!("ready now-playing result must win biased arbitration")
+        }
+        RuntimeEvent::PolicyChanged => {
+            panic!("idle supervision must never observe a policy change")
         }
     }
     assert_eq!(

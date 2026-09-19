@@ -19,6 +19,7 @@ use std::fmt;
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
 use thiserror::Error;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::architecture::SourceId;
@@ -221,8 +222,26 @@ fn empty_remote_sources() -> &'static HashSet<SourceId> {
 /// therefore observe one shared live generation source: capture freezes its
 /// exact identity into each minted source authority, and dispatch re-derives
 /// its authority from the same slot at the moment of use.
-#[derive(Clone, Default)]
-pub struct LastFmLivePolicy(std::sync::Arc<std::sync::Mutex<LastFmPolicyGeneration>>);
+///
+/// Every publication also wakes [`Self::subscribe`] watchers, so a runtime
+/// that must terminate when its issuing generation is superseded can react
+/// change-driven instead of polling the slot.
+#[derive(Clone)]
+pub struct LastFmLivePolicy {
+    slot: std::sync::Arc<std::sync::Mutex<LastFmPolicyGeneration>>,
+    changes: std::sync::Arc<watch::Sender<LastFmPolicyGeneration>>,
+}
+
+impl Default for LastFmLivePolicy {
+    fn default() -> Self {
+        let initial = LastFmPolicyGeneration::default();
+        let (changes, _) = watch::channel(initial.clone());
+        Self {
+            slot: std::sync::Arc::new(std::sync::Mutex::new(initial)),
+            changes: std::sync::Arc::new(changes),
+        }
+    }
+}
 
 /// Lock the shared UI policy slot, recovering from a poisoned mutex.
 ///
@@ -242,20 +261,40 @@ pub fn lock_policy_slot(
 
 impl LastFmLivePolicy {
     /// Wrap an already-shared UI policy slot.
+    ///
+    /// The watch channel starts at the slot's current value: subscribers only
+    /// observe publications made after they subscribed, so pre-existing state
+    /// is read through [`Self::snapshot`], never misread as a change.
     pub(crate) fn from_shared(
         shared: std::sync::Arc<std::sync::Mutex<LastFmPolicyGeneration>>,
     ) -> Self {
-        Self(shared)
+        let initial = lock_policy_slot(&shared).clone();
+        let (changes, _) = watch::channel(initial);
+        Self {
+            slot: shared,
+            changes: std::sync::Arc::new(changes),
+        }
     }
 
     /// Freeze one exact observation of the live generation.
     pub(crate) fn snapshot(&self) -> LastFmPolicyGeneration {
-        lock_policy_slot(&self.0).clone()
+        lock_policy_slot(&self.slot).clone()
     }
 
     /// Publish a successor generation from the database-init path.
     pub(crate) fn publish(&self, generation: LastFmPolicyGeneration) {
-        *lock_policy_slot(&self.0) = generation;
+        *lock_policy_slot(&self.slot) = generation.clone();
+        // A publication with no watchers must not fail the publish itself.
+        let _ = self.changes.send(generation);
+    }
+
+    /// Watch for live-policy publications.
+    ///
+    /// The receiver starts with the current generation marked as unseen; call
+    /// `borrow_and_update` once before the first `changed` wait to consume the
+    /// starting state so only later publications wake the watcher.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<LastFmPolicyGeneration> {
+        self.changes.subscribe()
     }
 
     /// The dispatch authority of the current live generation.
@@ -910,7 +949,7 @@ mod tests {
         live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
 
         // Poison the shared slot exactly like a panic under a held guard.
-        let slot = live.0.clone();
+        let slot = live.slot.clone();
         let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = slot.lock().expect("hold the slot while panicking");
             panic!("poison the policy slot");
