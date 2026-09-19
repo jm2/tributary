@@ -122,6 +122,77 @@ def _indent_width(line: str) -> int:
     return width
 
 
+def _blocks_paragraph(line: str) -> bool:
+    """Return True when *line* starts a block that ends a paragraph."""
+    return (
+        _NON_PARAGRAPH.match(line) is not None
+        or SETEXT_UNDERLINE.match(line) is not None
+        or HEADING.match(line) is not None
+    )
+
+
+class _ProseTracker:
+    """Fence and indented-code state for a line-by-line prose scan."""
+
+    def __init__(self) -> None:
+        self.fence_char: str | None = None
+        self.fence_len = 0
+        self.in_code = False
+        self.in_paragraph = False
+
+    def _closes_fence(self, line: str) -> bool:
+        closing = re.fullmatch(
+            r" {0,3}" + re.escape(self.fence_char) + "{%d,}[ \t]*" % self.fence_len,
+            line,
+        )
+        return closing is not None
+
+    def _opens_fence(self, line: str) -> bool:
+        """Absorb a fence opener in *line*; return True when one opened."""
+        opening = FENCE_PATTERN.match(line)
+        if opening is None:
+            return False
+        char = opening.group("char")
+        if char == "`" and "`" in opening.group("info"):
+            # A backtick run whose info string holds a backtick is literal
+            # text, not a fence opener; the line stays ordinary prose.
+            return False
+        self.fence_char = char
+        self.fence_len = len(opening.group("fence"))
+        return True
+
+    def visit(self, line: str) -> bool:
+        """Absorb one line and report whether it renders as prose."""
+        if self.fence_char is not None:
+            if self._closes_fence(line):
+                self.fence_char = None
+                self.in_paragraph = False
+            return False
+        if self._opens_fence(line):
+            # A real fence interrupts any paragraph and any indented code
+            # block started before it.
+            self.in_paragraph = False
+            self.in_code = False
+            return False
+        if not line.strip():
+            # A blank line ends a paragraph but never closes an indented
+            # code block (blank lines are part of one).
+            self.in_paragraph = False
+            return not self.in_code
+        if self.in_code:
+            if _indent_width(line) >= 4:
+                return False
+            self.in_code = False
+        elif _indent_width(line) >= 4:
+            if self.in_paragraph:
+                # Lazy continuation: paragraph text renders, links are real.
+                return True
+            self.in_code = True
+            return False
+        self.in_paragraph = not _blocks_paragraph(line)
+        return True
+
+
 def iter_prose_lines(text: str) -> Iterable[tuple[int, str]]:
     """Yield ``(line_number, line)`` pairs outside fenced and indented code."""
     # Link targets exist only in rendered prose.  Fenced code is literal
@@ -144,60 +215,10 @@ def iter_prose_lines(text: str) -> Iterable[tuple[int, str]]:
     # approximation: they are classified as code when no paragraph is
     # open, which errs toward skipping literal-looking content rather
     # than auditing it.
-    fence_char: str | None = None
-    fence_len = 0
-    in_code = False
-    in_paragraph = False
+    tracker = _ProseTracker()
     for number, line in enumerate(text.splitlines(), start=1):
-        if fence_char is not None:
-            closing = re.fullmatch(
-                r" {0,3}" + re.escape(fence_char) + "{%d,}[ \t]*" % fence_len, line
-            )
-            if closing is not None:
-                fence_char = None
-                in_paragraph = False
-            continue
-        opening = FENCE_PATTERN.match(line)
-        if opening is not None:
-            char = opening.group("char")
-            info = opening.group("info")
-            if not (char == "`" and "`" in info):
-                # A real fence interrupts any paragraph and any indented
-                # code block started before it.
-                fence_char = char
-                fence_len = len(opening.group("fence"))
-                in_paragraph = False
-                in_code = False
-                continue
-            # A backtick run whose info string holds a backtick is literal
-            # text, not a fence opener; treat the line as ordinary prose.
-        if not line.strip():
-            # A blank line ends a paragraph but never closes an indented
-            # code block (blank lines are part of one).
-            if not in_code:
-                yield number, line
-            in_paragraph = False
-            continue
-        if in_code:
-            if _indent_width(line) >= 4:
-                continue
-            in_code = False
-        elif _indent_width(line) >= 4:
-            if in_paragraph:
-                # Lazy continuation: paragraph text renders, links are real.
-                yield number, line
-                continue
-            in_code = True
-            continue
-        if (
-            _NON_PARAGRAPH.match(line) is not None
-            or SETEXT_UNDERLINE.match(line) is not None
-            or HEADING.match(line) is not None
-        ):
-            in_paragraph = False
-        else:
-            in_paragraph = True
-        yield number, line
+        if tracker.visit(line):
+            yield number, line
 
 
 def _code_span_bounds(line: str, index: int) -> tuple[int, int, int] | None:
