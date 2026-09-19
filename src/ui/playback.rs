@@ -25,6 +25,7 @@ use crate::lastfm::playback_owner::{
     LastFmAcceptedOutputFreshness, LastFmAcceptedOutputLoad, LastFmAcceptedPlayback,
     LastFmOutputIntent, LastFmPlaybackOccurrenceIdentity, LastFmPlaybackSource,
 };
+use crate::local::engine::LibraryCommand;
 use crate::local::playback_history::PlaybackHistoryProgress;
 use crate::source_registry::{
     PlaybackAttributionProfile, PlaybackSourceReference, RegularPlaylistCatalogueGuard,
@@ -34,6 +35,7 @@ use crate::ui::header_bar::RepeatMode;
 use crate::ui::objects::{PlaylistOccurrenceState, TrackObject};
 
 use super::album_art;
+use super::library_commands::{CommandAdmissionOutcome, LibraryCommandAdmission};
 
 /// The source key of the local library.
 pub const LOCAL_SOURCE_KEY: &str = "local";
@@ -717,6 +719,150 @@ impl PlaybackHistoryOccurrence {
     }
 }
 
+/// A qualified durable-play credit candidate produced by
+/// [`PlaybackSession::observe_history_event`].
+///
+/// Observing the qualifying event already consumes the occurrence's one-shot
+/// progress latch, but the durable command is what commits the play — so the
+/// candidate carries a pre-observation snapshot of the occurrence. If the
+/// bounded command FIFO refuses admission, the snapshot un-consumes the latch
+/// (see [`PlaybackSession::retain_history_credit`]) and the next qualifying
+/// sample re-earns the play instead of the event being lost forever.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingHistoryCredit {
+    track_id: TrackId,
+    occurrence_snapshot: PlaybackHistoryOccurrence,
+}
+
+impl PendingHistoryCredit {
+    pub fn track_id(&self) -> &TrackId {
+        &self.track_id
+    }
+}
+
+/// Admit one qualified playback-history credit through the bounded command
+/// FIFO.
+///
+/// Shared production sequence for the GTK player-event loop, factored out so
+/// the overload contract is first-hand testable without a GTK main loop:
+/// [`CommandAdmissionOutcome::Accepted`] commits the durable command;
+/// [`CommandAdmissionOutcome::Overloaded`] retains the credit inside the
+/// session so a later qualifying sample re-earns it, and also stashes it in
+/// the session-level pending slot so the play survives the occurrence's
+/// retirement at a queue transition (PR #286 round-4 finding j9j83); the
+/// explicit shutdown [`CommandAdmissionOutcome::Closed`] drops the credit
+/// quietly because normal shutdown has already closed and drained the FIFO —
+/// the pending command would never be serviced, so a shutdown drop is not an
+/// overload drop and must not be surfaced as one.
+///
+/// Every invocation first retries a pending credit whose occurrence a queue
+/// transition has since retired: that credit has no retained snapshot left to
+/// re-earn through, so each admission attempt is its only remaining path to
+/// the FIFO.
+pub(super) fn admit_history_credit(
+    admission: &LibraryCommandAdmission,
+    session: &RefCell<PlaybackSession>,
+    credit: Option<PendingHistoryCredit>,
+    counted_at_ms: i64,
+) {
+    // Post-transition retry: an orphaned pending credit has no re-earn path
+    // left, so ride its delivery on this admission attempt. A credit whose
+    // occurrence is still live keeps its stash untouched — the retained
+    // snapshot already re-earns it through the normal path. The take result
+    // is bound FIRST so the `RefMut` temporary drops before the retry body:
+    // keeping the borrow in the `if let` scrutinee would make the nested
+    // `borrow_mut()` calls below panic with "RefCell already borrowed".
+    let pending_orphan = session.borrow_mut().take_orphaned_pending_history_credit();
+    if let Some((orphan, orphan_counted_at_ms)) = pending_orphan {
+        let outcome = admission.try_send(LibraryCommand::RecordPlaybackHistory {
+            track_id: orphan.track_id().clone(),
+            counted_at_ms: orphan_counted_at_ms,
+        });
+        match outcome {
+            CommandAdmissionOutcome::Accepted => {}
+            CommandAdmissionOutcome::Overloaded => {
+                session
+                    .borrow_mut()
+                    .stash_pending_history_credit(orphan, orphan_counted_at_ms);
+            }
+            CommandAdmissionOutcome::Closed => {
+                // Shutdown quiet drop; see the fn documentation.
+            }
+        }
+    }
+    let Some(credit) = credit else {
+        return;
+    };
+    let track_id = credit.track_id().clone();
+    let outcome = admission.try_send(LibraryCommand::RecordPlaybackHistory {
+        track_id,
+        counted_at_ms,
+    });
+    match outcome {
+        CommandAdmissionOutcome::Accepted => {
+            // The play committed through the live occurrence; a stashed copy
+            // of the same play is now stale and must not double-send.
+            session.borrow_mut().clear_pending_history_credit(&credit);
+        }
+        CommandAdmissionOutcome::Overloaded => {
+            session.borrow_mut().retain_history_credit(credit.clone());
+            // The stash may be DEFERRED here: when an orphaned credit
+            // already occupies the pending slot (this admission's own
+            // orphan retry just re-stashed it after overloading), the
+            // never-evict-an-orphan invariant keeps the orphan and skips
+            // this stash. That is not a loss — `retain_history_credit`
+            // above restored the snapshot, so a later qualifying sample
+            // re-earns this credit through the normal path (PR #286
+            // round-4 finding A2).
+            session
+                .borrow_mut()
+                .stash_pending_history_credit(credit, counted_at_ms);
+            warn!(
+                ?outcome,
+                "Playback history command was not admitted; the credit was retained so a \
+                 later qualifying sample can re-earn it"
+            );
+        }
+        CommandAdmissionOutcome::Closed => {
+            // Explicit quiet drop at shutdown; see the fn documentation.
+        }
+    }
+}
+
+/// Retry a pending history credit immediately before a queue transition.
+///
+/// The window's `TrackEnded` branch calls this before replay, auto-advance,
+/// or the terminal clear: at that point the stashed credit's occurrence is
+/// still live, so the generic post-transition drain in
+/// [`admit_history_credit`] would defer it, yet the imminent transition is
+/// what removes the occurrence a terminal-EOS play would re-earn through.
+/// A successful retry commits the play before the transition; a refusal
+/// keeps the stash, and every later admission attempt retries it.
+pub(super) fn retry_pending_history_credit_before_transition(
+    admission: &LibraryCommandAdmission,
+    session: &RefCell<PlaybackSession>,
+) {
+    let Some((pending, counted_at_ms)) = session.borrow_mut().take_pending_history_credit() else {
+        return;
+    };
+    let outcome = admission.try_send(LibraryCommand::RecordPlaybackHistory {
+        track_id: pending.track_id().clone(),
+        counted_at_ms,
+    });
+    match outcome {
+        CommandAdmissionOutcome::Accepted => {}
+        CommandAdmissionOutcome::Overloaded => {
+            session
+                .borrow_mut()
+                .stash_pending_history_credit(pending, counted_at_ms);
+        }
+        CommandAdmissionOutcome::Closed => {
+            // Shutdown quiet drop; see the admit_history_credit
+            // documentation.
+        }
+    }
+}
+
 /// Maximum number of real queue occurrences retained before the current one.
 const SHUFFLE_PRIOR_LIMIT: usize = 10;
 const SHUFFLE_TIMELINE_CAPACITY: usize = SHUFFLE_PRIOR_LIMIT + 1;
@@ -801,6 +947,29 @@ pub struct PlaybackSession {
     /// Remote, removable, radio, and external items deliberately leave this
     /// empty even when their backend-native track ID resembles a local ID.
     history_occurrence: Option<PlaybackHistoryOccurrence>,
+    /// A pending durable-play credit whose admission the bounded command FIFO
+    /// refused, with the `counted_at_ms` it must be delivered under. Unlike
+    /// the snapshot `retain_history_credit` restores into the live occurrence
+    /// (which re-earns through a later qualifying sample), this slot survives
+    /// the occurrence's retirement at a queue transition — without it, a
+    /// play qualified at terminal EOS and refused during overload would be
+    /// lost forever once `clear` or the next track replaced the occurrence
+    /// (PR #286 round-4 finding j9j83).
+    ///
+    /// Eviction invariant (PR #286 round-4 finding A2): the slot holds at
+    /// most one credit, and [`Self::stash_pending_history_credit`] NEVER
+    /// evicts an orphaned incumbent — one whose play the live occurrence no
+    /// longer owns, so the orphan retry at every admission attempt is its
+    /// only remaining delivery path. When an orphan occupies the slot, a
+    /// second overload in the same admission defers its own stash instead;
+    /// that incoming credit is occurrence-backed (its snapshot was just
+    /// retained), so a later qualifying sample re-earns it through the
+    /// normal path. Only a live-owned incumbent may be replaced: its
+    /// retained snapshot re-earns the play, so a fresher refusal takes the
+    /// slot without loss. The slot is emptied only by a successful delivery
+    /// of the same play, the explicit shutdown drop, or such a replacement
+    /// of a live-owned incumbent — never by occurrence retirement.
+    pending_history_credit: Option<(PendingHistoryCredit, i64)>,
     /// Frozen candidate shared by accepted retries of the current genuine
     /// queue occurrence. Queue navigation and Repeat One replace it even when
     /// the stable media key and metadata are unchanged.
@@ -842,6 +1011,11 @@ impl PlaybackSession {
         self.event_generation = self.event_generation.next();
         self.pending_resolution = None;
         self.resolution_failed = false;
+        // `pending_history_credit` deliberately survives this retirement: a
+        // terminal-EOS play refused during overload has no occurrence left to
+        // re-earn through, so the stash is the credit's only path to the FIFO
+        // (PR #286 round-4 finding j9j83). It is drained by the next
+        // admission attempt or emptied by an explicit shutdown drop.
         self.history_occurrence = None;
         self.lastfm_occurrence_candidate = None;
     }
@@ -976,9 +1150,16 @@ impl PlaybackSession {
     /// state and delivery generation are independent: pause, buffering,
     /// retry, and resume re-anchor the next position without replacing the
     /// occurrence, while stale and rejected deliveries cannot contribute.
-    /// The exact stable local [`TrackId`] is returned once, at the point the
-    /// occurrence first qualifies for persistence.
-    pub(crate) fn observe_history_event(&mut self, event: &PlayerEvent) -> Option<TrackId> {
+    /// A [`PendingHistoryCredit`] candidate is returned once, at the point
+    /// the occurrence first qualifies for persistence. The observation has
+    /// already consumed the one-shot progress latch; only admitting the
+    /// durable command commits the credit, and a refused admission restores
+    /// the snapshot via [`Self::retain_history_credit`] so the next
+    /// qualifying sample re-earns the play.
+    pub(crate) fn observe_history_event(
+        &mut self,
+        event: &PlayerEvent,
+    ) -> Option<PendingHistoryCredit> {
         let generation = event.generation();
         if !self.accepts_event_generation(generation) {
             return None;
@@ -1000,6 +1181,10 @@ impl PlaybackSession {
         {
             return None;
         }
+        // Snapshot BEFORE the match below advances the occurrence: if
+        // admission later refuses the durable command, the snapshot
+        // un-consumes the one-shot latch so the credit is not lost.
+        let occurrence_snapshot = occurrence.clone();
 
         let counted = match event {
             PlayerEvent::StateChanged { state, .. } => {
@@ -1062,7 +1247,121 @@ impl PlaybackSession {
             }
         };
 
-        counted.then_some(current_track_id)
+        counted.then_some(PendingHistoryCredit {
+            track_id: current_track_id,
+            occurrence_snapshot,
+        })
+    }
+
+    /// Restore a credit candidate whose durable command was not admitted.
+    ///
+    /// The pre-observation snapshot replaces the live occurrence accounting
+    /// only while the queue still carries the same local track and accepted
+    /// generation; a queue transition in between invalidates the candidate
+    /// and the snapshot is dropped. Restoring also un-consumes the one-shot
+    /// progress latch (it is part of the snapshot), so the next qualifying
+    /// position sample re-earns the credit.
+    pub(crate) fn retain_history_credit(&mut self, credit: PendingHistoryCredit) {
+        let Some(occurrence) = self.history_occurrence.as_mut() else {
+            return;
+        };
+        if occurrence.track_id != credit.track_id
+            || occurrence.accepted_generation != credit.occurrence_snapshot.accepted_generation
+        {
+            return;
+        }
+        *occurrence = credit.occurrence_snapshot;
+    }
+
+    /// Stash a refused credit in the session-level pending slot.
+    ///
+    /// Never evicts an orphaned incumbent (see the
+    /// `pending_history_credit` field documentation for the exact
+    /// invariant): when an undelivered orphan occupies the slot, the
+    /// incoming stash is deferred and the credit re-earns through the
+    /// snapshot [`Self::retain_history_credit`] just restored. Only a
+    /// live-owned incumbent may be replaced by a fresher refusal.
+    fn stash_pending_history_credit(&mut self, credit: PendingHistoryCredit, counted_at_ms: i64) {
+        if self
+            .pending_history_credit
+            .as_ref()
+            .is_some_and(|(incumbent, _)| !self.pending_credit_is_owned(incumbent))
+        {
+            return;
+        }
+        self.pending_history_credit = Some((credit, counted_at_ms));
+    }
+
+    /// Take the pending slot unconditionally (the pre-transition retry).
+    fn take_pending_history_credit(&mut self) -> Option<(PendingHistoryCredit, i64)> {
+        self.pending_history_credit.take()
+    }
+
+    /// Whether the live occurrence still owns `credit`'s play — and can
+    /// therefore re-earn it through a later qualifying sample via the
+    /// snapshot [`Self::retain_history_credit`] restored. `false` means
+    /// the credit is orphaned: no retained snapshot is left, so each
+    /// admission attempt is its only delivery path.
+    fn pending_credit_is_owned(&self, credit: &PendingHistoryCredit) -> bool {
+        match self.history_occurrence.as_ref() {
+            Some(occurrence) => {
+                occurrence.track_id == credit.track_id
+                    && occurrence.accepted_generation
+                        == credit.occurrence_snapshot.accepted_generation
+            }
+            None => false,
+        }
+    }
+
+    /// Take the pending slot only when the live occurrence no longer owns
+    /// the stashed play.
+    ///
+    /// A queue transition retired or replaced the occurrence, so the credit
+    /// has no retained snapshot left to re-earn through and each admission
+    /// attempt is its remaining delivery path. A credit whose occurrence is
+    /// still live keeps its stash — the retained snapshot re-earns it
+    /// through the normal path — and is restored untouched.
+    fn take_orphaned_pending_history_credit(&mut self) -> Option<(PendingHistoryCredit, i64)> {
+        let pending = self.pending_history_credit.take()?;
+        if self.pending_credit_is_owned(&pending.0) {
+            self.pending_history_credit = Some(pending);
+            None
+        } else {
+            Some(pending)
+        }
+    }
+
+    /// Carry a refused credit across a whole-session queue replacement.
+    ///
+    /// Replacing the session retires the previous occurrence, so a pending
+    /// credit the dropped session still held would die with it (PR #286
+    /// round-4 finding A1). Installing it into the replacement orphans it
+    /// by construction — the replacement's fresh occurrence cannot own the
+    /// previous play — and [`Self::take_orphaned_pending_history_credit`]
+    /// then rides its delivery on the next admission attempt. The
+    /// replacement's slot is always empty here (`play_track_at` installs
+    /// into a fresh `Default` session that no admission attempt has filled
+    /// yet — history events only arrive from the output after the start
+    /// attempt), so the transfer can never evict an undelivered orphan.
+    fn inherit_pending_history_credit(&mut self, pending: Option<(PendingHistoryCredit, i64)>) {
+        debug_assert!(self.pending_history_credit.is_none());
+        self.pending_history_credit = pending;
+    }
+
+    /// Drop the pending slot when the exact stashed play commits durably, so
+    /// a later re-earn admission cannot double-send it.
+    fn clear_pending_history_credit(&mut self, credit: &PendingHistoryCredit) {
+        let matches_stash = self
+            .pending_history_credit
+            .as_ref()
+            .is_some_and(|(pending, _)| {
+                pending.track_id == credit.track_id
+                    && pending.occurrence_snapshot.accepted_generation
+                        == credit.occurrence_snapshot.accepted_generation
+            });
+        if matches_stash {
+            self.pending_history_credit = None;
+        }
     }
 
     /// Re-anchor one accepted local occurrence around an explicit user seek.
@@ -1901,7 +2200,7 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     // A visible-track selection is a newer playback intent than any
     // OS-open admission still parsing in the background.
     super::open_files::invalidate_admission();
-    let previous = std::mem::take(&mut *ctx.session.borrow_mut());
+    let mut previous = std::mem::take(&mut *ctx.session.borrow_mut());
     let previous_external = previous.current_external_source_id();
     let predecessor_suspension = previous.accepted_lastfm_load.suspension();
     // The replacement is fresh except for the monotonic event generation.
@@ -1921,10 +2220,26 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
         return false;
     }
 
+    // PR #286 round-4 finding A1: the queue replacement has retired the
+    // previous occurrence, and the two paths below that drop `previous`
+    // (successful start; explicit abandonment after a failed output load)
+    // would otherwise kill any pending credit with the dropped session,
+    // permanently omitting that play from history. Each of those paths
+    // transfers the credit into the replacement first, where it is
+    // orphaned by construction and rides the existing orphan-retry
+    // delivery on the next admission attempt (the same paths the terminal
+    // `clear` transition relies on; `clear` itself preserves the slot).
+    // The restore paths are untouched: the credit stays in `previous`, so
+    // a wholesale rollback reinstates it exactly.
+
     if play_current(ctx) {
         // `play_current` has already committed and published the replacement
         // output intent, so registry retirement cannot race ahead of Last.fm
         // predecessor retirement.
+        let carried_pending_history_credit = previous.take_pending_history_credit();
+        ctx.session
+            .borrow_mut()
+            .inherit_pending_history_credit(carried_pending_history_credit);
         if let Some(source_id) = previous_external {
             let _ = ctx.source_registry.retire_external(source_id);
         }
@@ -1932,7 +2247,13 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     } else if let Some(source_id) = previous_external {
         // A previous external capability is never restored as a retry target.
         // No replacement intent was emitted, so abandon playback explicitly
-        // before revoking its registry authority.
+        // before revoking its registry authority. The credit transferred
+        // below survives: installing it into the replacement orphans it by
+        // construction, and the abandonment's `clear` preserves the slot.
+        let carried_pending_history_credit = previous.take_pending_history_credit();
+        ctx.session
+            .borrow_mut()
+            .inherit_pending_history_credit(carried_pending_history_credit);
         abandon_external_playback(
             &ctx.session,
             &ctx.lastfm_playback,
@@ -1942,6 +2263,8 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
         );
         false
     } else {
+        // No replacement intent was emitted at all: wholesale rollback, and
+        // `previous` keeps its own pending credit exactly as it held it.
         *ctx.session.borrow_mut() = previous;
         false
     }
@@ -2813,6 +3136,8 @@ mod tests {
     use std::cell::Cell;
     use std::collections::HashSet;
 
+    use crate::ui::library_commands::COMMAND_FIFO_CAPACITY;
+
     use super::*;
 
     #[derive(Debug, Default)]
@@ -3106,7 +3431,9 @@ mod tests {
         position_ms: u64,
         duration_ms: u64,
     ) -> Option<TrackId> {
-        session.observe_history_event(&PlayerEvent::position(generation, position_ms, duration_ms))
+        session
+            .observe_history_event(&PlayerEvent::position(generation, position_ms, duration_ms))
+            .map(|credit| credit.track_id().clone())
     }
 
     fn protected_item(source: &str, id: &str) -> QueueItem {
@@ -5914,6 +6241,749 @@ mod tests {
         );
     }
 
+    /// Round-3 regression: the one-shot history latch must not be consumed by
+    /// an event the bounded command FIFO refuses. A qualifying position
+    /// sample that arrives during overload retains its credit — a later
+    /// qualifying sample re-earns it, and once the FIFO drains the durable
+    /// command lands. Under the previous latch-on-observe behavior the play
+    /// was lost forever the moment the FIFO was full.
+    #[test]
+    fn history_credit_survives_fifo_overload_and_lands_after_drain() {
+        let (admission, receiver) = LibraryCommandAdmission::channel();
+        let session = RefCell::new({
+            let mut session = PlaybackSession::default();
+            assert!(
+                session.replace_queue(vec![history_item("local", "overload", Some(20_000))], 0,)
+            );
+            session
+        });
+        let generation = accept_history_load(&mut session.borrow_mut());
+        observe_playing(&mut session.borrow_mut(), generation);
+
+        // Saturate every ordinary slot; one stays reserved for Flush.
+        for ordinal in 0..(COMMAND_FIFO_CAPACITY - 1) {
+            let command = LibraryCommand::SetTrackRating {
+                track_id: TrackId::new(format!("filler-{ordinal}")).expect("valid track ID"),
+                rating: None,
+            };
+            assert_eq!(
+                admission.try_send(command),
+                CommandAdmissionOutcome::Accepted
+            );
+        }
+
+        // The first qualifying sample is refused by the saturated FIFO. With
+        // a 20s track the count threshold is 10s of cumulative advance, so
+        // the anchor at 0 does not qualify while the jump to 10_001 does.
+        assert_eq!(
+            observe_position(&mut session.borrow_mut(), generation, 0, 20_000),
+            None
+        );
+        let credit = session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::position(generation, 10_001, 20_000))
+            .expect("the sample must qualify for a durable credit");
+        admit_history_credit(&admission, &session, Some(credit), 1_000);
+
+        // Nothing durable landed, and the retained latch is unconsumed.
+        let mut landed_history = 0;
+        while let Ok(command) = receiver.try_recv() {
+            if matches!(command, LibraryCommand::RecordPlaybackHistory { .. }) {
+                landed_history += 1;
+            }
+        }
+        assert_eq!(
+            landed_history, 0,
+            "an overloaded FIFO must not admit a history command"
+        );
+
+        // A later qualifying sample re-earns the retained credit.
+        let retried = session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::position(generation, 11_000, 20_000))
+            .expect("the retained credit must re-earn on the next qualifying sample");
+        while receiver.try_recv().is_ok() {}
+        admit_history_credit(&admission, &session, Some(retried), 2_000);
+        match receiver
+            .try_recv()
+            .expect("the durable command must land after drain")
+        {
+            LibraryCommand::RecordPlaybackHistory {
+                track_id,
+                counted_at_ms,
+            } => {
+                assert_eq!(track_id.as_str(), "overload");
+                assert_eq!(counted_at_ms, 2_000);
+            }
+            LibraryCommand::Flush { .. } => {
+                panic!("the reserved shutdown slot must not be consumed by a retry")
+            }
+            LibraryCommand::ConfirmRootTrust(_)
+            | LibraryCommand::SetTrackRating { .. }
+            | LibraryCommand::ApplyRhythmboxMigration(_) => {
+                panic!("expected a history command after drain")
+            }
+        }
+
+        // Shutdown boundary: an explicitly closed admission drops the credit
+        // quietly — normal shutdown drained the FIFO, so the pending command
+        // would never be serviced. A fresh occurrence provides the candidate.
+        let (completion_tx, _completion_rx) = async_channel::bounded(1);
+        assert!(admission.close_and_flush(completion_tx));
+        let closed_session = RefCell::new({
+            let mut session = PlaybackSession::default();
+            assert!(session.replace_queue(vec![history_item("local", "closed", Some(20_000))], 0));
+            session
+        });
+        let closed_generation = accept_history_load(&mut closed_session.borrow_mut());
+        observe_playing(&mut closed_session.borrow_mut(), closed_generation);
+        assert_eq!(
+            observe_position(
+                &mut closed_session.borrow_mut(),
+                closed_generation,
+                0,
+                20_000
+            ),
+            None
+        );
+        let post_close = closed_session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::position(closed_generation, 10_001, 20_000))
+            .expect("qualification is independent of the admission boundary");
+        admit_history_credit(&admission, &closed_session, Some(post_close), 3_000);
+        match receiver.try_recv().expect("only the drain marker remains") {
+            LibraryCommand::Flush { .. } => {}
+            other => panic!("expected only the drain marker after close, got {other:?}"),
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "no durable command may land after close"
+        );
+    }
+
+    /// Round-4 regression (PR #286 finding j9j83): a play that qualifies at
+    /// terminal EOS and is refused by the saturated FIFO must survive the
+    /// terminal transition. The refusal retains the snapshot into the live
+    /// occurrence — but the window's `TrackEnded` branch then retires that
+    /// occurrence (`clear`), so no later sample can re-earn through it and
+    /// the play was lost forever. The session-level pending slot now carries
+    /// the credit across the retirement, and the next admission attempt
+    /// delivers it under its original timestamp.
+    #[test]
+    fn terminal_eos_overload_credit_survives_occurrence_retirement_and_lands_after_drain() {
+        let (admission, receiver) = LibraryCommandAdmission::channel();
+        let session = RefCell::new({
+            let mut session = PlaybackSession::default();
+            // Unknown duration: a natural end with no forward-skip evidence
+            // qualifies the play at the ended event itself.
+            assert!(session.replace_queue(vec![history_item("local", "terminal", None)], 0,));
+            session
+        });
+        let generation = accept_history_load(&mut session.borrow_mut());
+        observe_playing(&mut session.borrow_mut(), generation);
+
+        // Saturate every ordinary slot; one stays reserved for Flush.
+        for ordinal in 0..(COMMAND_FIFO_CAPACITY - 1) {
+            let command = LibraryCommand::SetTrackRating {
+                track_id: TrackId::new(format!("terminal-filler-{ordinal}"))
+                    .expect("valid track ID"),
+                rating: None,
+            };
+            assert_eq!(
+                admission.try_send(command),
+                CommandAdmissionOutcome::Accepted
+            );
+        }
+
+        // EOS qualifies the play; the saturated FIFO refuses it.
+        let credit = session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::ended(generation))
+            .expect("an unsought natural end must qualify for a durable credit");
+        admit_history_credit(&admission, &session, Some(credit), 1_000);
+        let mut landed_history = 0;
+        while let Ok(command) = receiver.try_recv() {
+            if matches!(command, LibraryCommand::RecordPlaybackHistory { .. }) {
+                landed_history += 1;
+            }
+        }
+        assert_eq!(
+            landed_history, 0,
+            "an overloaded FIFO must not admit a history command"
+        );
+
+        // The terminal transition retires the occurrence — the exact state
+        // in which the pre-round-4 behavior dropped the play permanently.
+        session.borrow_mut().clear();
+        assert!(
+            session.borrow().history_occurrence.is_none(),
+            "the terminal transition must retire the occurrence for this \
+             regression to bind"
+        );
+
+        // Drain the FIFO. The next admission attempt is the stashed credit's
+        // delivery path, and it must land under its ORIGINAL timestamp.
+        while receiver.try_recv().is_ok() {}
+        admit_history_credit(&admission, &session, None, 2_000);
+        match receiver
+            .try_recv()
+            .expect("the ended track's play must land after the drain")
+        {
+            LibraryCommand::RecordPlaybackHistory {
+                track_id,
+                counted_at_ms,
+            } => {
+                assert_eq!(track_id.as_str(), "terminal");
+                assert_eq!(
+                    counted_at_ms, 1_000,
+                    "the stashed play must deliver under its original timestamp"
+                );
+            }
+            other => panic!("expected the ended track's history command, got {other:?}"),
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "the stashed credit must deliver exactly once"
+        );
+    }
+
+    /// Round-4 regression (PR #286 finding j9j83): the window retries a
+    /// pending credit immediately BEFORE the `TrackEnded` transition, so a
+    /// terminal-EOS play commits as soon as the FIFO has room at transition
+    /// time instead of waiting for admission attempts that may never come
+    /// after a terminal clear.
+    #[test]
+    fn pre_transition_retry_lands_the_terminal_credit_once_the_fifo_has_room() {
+        let (admission, receiver) = LibraryCommandAdmission::channel();
+        let session = RefCell::new({
+            let mut session = PlaybackSession::default();
+            assert!(session.replace_queue(vec![history_item("local", "pre-retry", None)], 0,));
+            session
+        });
+        let generation = accept_history_load(&mut session.borrow_mut());
+        observe_playing(&mut session.borrow_mut(), generation);
+
+        for ordinal in 0..(COMMAND_FIFO_CAPACITY - 1) {
+            let command = LibraryCommand::SetTrackRating {
+                track_id: TrackId::new(format!("pre-retry-filler-{ordinal}"))
+                    .expect("valid track ID"),
+                rating: None,
+            };
+            assert_eq!(
+                admission.try_send(command),
+                CommandAdmissionOutcome::Accepted
+            );
+        }
+
+        let credit = session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::ended(generation))
+            .expect("an unsought natural end must qualify for a durable credit");
+        admit_history_credit(&admission, &session, Some(credit), 1_000);
+
+        // Free exactly one ordinary slot; the pre-transition retry must use
+        // it immediately.
+        while receiver.try_recv().is_ok() {}
+        let command = LibraryCommand::SetTrackRating {
+            track_id: TrackId::new("pre-retry-probe").expect("valid track ID"),
+            rating: None,
+        };
+        assert_eq!(
+            admission.try_send(command),
+            CommandAdmissionOutcome::Accepted,
+            "one ordinary slot must be free after the drain"
+        );
+        retry_pending_history_credit_before_transition(&admission, &session);
+        match receiver
+            .try_recv()
+            .expect("the freed slot must be visible to the receiver")
+        {
+            LibraryCommand::SetTrackRating { track_id, .. } => {
+                assert_eq!(track_id.as_str(), "pre-retry-probe");
+            }
+            other => panic!("expected the probe rating, got {other:?}"),
+        }
+        match receiver
+            .try_recv()
+            .expect("the pre-transition retry must commit the play")
+        {
+            LibraryCommand::RecordPlaybackHistory {
+                track_id,
+                counted_at_ms,
+            } => {
+                assert_eq!(track_id.as_str(), "pre-retry");
+                assert_eq!(counted_at_ms, 1_000);
+            }
+            other => panic!("expected the ended track's history command, got {other:?}"),
+        }
+
+        // The transition then retires the occurrence; no second copy of the
+        // play may surface afterwards.
+        session.borrow_mut().clear();
+        let mut landed_history = 0;
+        while let Ok(command) = receiver.try_recv() {
+            if matches!(command, LibraryCommand::RecordPlaybackHistory { .. }) {
+                landed_history += 1;
+            }
+        }
+        assert_eq!(
+            landed_history, 0,
+            "a committed play must not be re-delivered after the transition"
+        );
+    }
+
+    /// Round-4 regression (PR #286 finding j9j83): while the stashed play's
+    /// occurrence is still live, a successful re-earn admission must clear
+    /// the stash — the retained snapshot and the stash describe the SAME
+    /// play, so leaving the stash behind would double-send it on a later
+    /// admission attempt.
+    #[test]
+    fn accepted_re_earn_clears_the_stash_without_double_sending() {
+        let (admission, receiver) = LibraryCommandAdmission::channel();
+        let session = RefCell::new({
+            let mut session = PlaybackSession::default();
+            assert!(session.replace_queue(vec![history_item("local", "dedupe", Some(20_000))], 0,));
+            session
+        });
+        let generation = accept_history_load(&mut session.borrow_mut());
+        observe_playing(&mut session.borrow_mut(), generation);
+
+        for ordinal in 0..(COMMAND_FIFO_CAPACITY - 1) {
+            let command = LibraryCommand::SetTrackRating {
+                track_id: TrackId::new(format!("dedupe-filler-{ordinal}")).expect("valid track ID"),
+                rating: None,
+            };
+            assert_eq!(
+                admission.try_send(command),
+                CommandAdmissionOutcome::Accepted
+            );
+        }
+
+        // The first qualifying sample is refused: retained AND stashed.
+        assert_eq!(
+            observe_position(&mut session.borrow_mut(), generation, 0, 20_000),
+            None
+        );
+        let credit = session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::position(generation, 10_001, 20_000))
+            .expect("the sample must qualify for a durable credit");
+        admit_history_credit(&admission, &session, Some(credit), 1_000);
+
+        // Drain, then let a later qualifying sample re-earn and commit.
+        while receiver.try_recv().is_ok() {}
+        let retried = session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::position(generation, 11_000, 20_000))
+            .expect("the retained credit must re-earn on the next qualifying sample");
+        admit_history_credit(&admission, &session, Some(retried), 2_000);
+
+        let mut landed_history = 0;
+        while let Ok(command) = receiver.try_recv() {
+            if matches!(command, LibraryCommand::RecordPlaybackHistory { .. }) {
+                landed_history += 1;
+            }
+        }
+        assert_eq!(
+            landed_history, 1,
+            "the play must commit exactly once: the stash is cleared when \
+             the same play commits through its occurrence"
+        );
+    }
+
+    /// Round-4 rework regression (PR #286 finding A2): an orphaned credit
+    /// re-stashed after an overloaded retry must NOT be evicted when the
+    /// SAME admission attempt also overloads for the next track. The stash
+    /// used to replace any incumbent, so the second refusal evicted the
+    /// orphan — which has no retained snapshot left and therefore no
+    /// re-earn path — permanently dropping that play. The
+    /// never-evict-an-orphan invariant now defers the incoming stash
+    /// instead; the deferred credit is occurrence-backed and re-earns
+    /// through a later qualifying sample, so neither play is lost.
+    #[test]
+    fn orphan_credit_survives_a_second_overload_in_the_same_admission() {
+        let (admission, receiver) = LibraryCommandAdmission::channel();
+        let session = RefCell::new({
+            let mut session = PlaybackSession::default();
+            // Unknown duration: a natural end with no forward-skip evidence
+            // qualifies the play at the ended event itself.
+            assert!(session.replace_queue(vec![history_item("local", "orphan-a", None)], 0,));
+            session
+        });
+        let generation_a = accept_history_load(&mut session.borrow_mut());
+        observe_playing(&mut session.borrow_mut(), generation_a);
+
+        // Saturate every ordinary slot; one stays reserved for Flush.
+        for ordinal in 0..(COMMAND_FIFO_CAPACITY - 1) {
+            let command = LibraryCommand::SetTrackRating {
+                track_id: TrackId::new(format!("orphan-filler-{ordinal}")).expect("valid track ID"),
+                rating: None,
+            };
+            assert_eq!(
+                admission.try_send(command),
+                CommandAdmissionOutcome::Accepted
+            );
+        }
+
+        // A's play qualifies at EOS and is refused: retained AND stashed.
+        let credit_a = session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::ended(generation_a))
+            .expect("an unsought natural end must qualify for a durable credit");
+        admit_history_credit(&admission, &session, Some(credit_a), 1_000);
+
+        // The terminal transition retires A's occurrence, orphaning the
+        // stash: no retained snapshot is left, so every admission attempt
+        // is its only delivery path.
+        session.borrow_mut().clear();
+        assert!(
+            session
+                .borrow()
+                .pending_history_credit
+                .as_ref()
+                .is_some_and(|(pending, _)| pending.track_id().as_str() == "orphan-a"),
+            "the stash must hold orphan-a across the occurrence retirement"
+        );
+
+        // A new occurrence for track B starts playing. Its first qualifying
+        // sample meets the still-saturated FIFO in the SAME admission
+        // attempt that also retries the orphan.
+        assert!(session
+            .borrow_mut()
+            .replace_queue(vec![history_item("local", "orphan-b", Some(20_000))], 0,));
+        let generation_b = accept_history_load(&mut session.borrow_mut());
+        observe_playing(&mut session.borrow_mut(), generation_b);
+        // With a 20s track the count threshold is 10s of cumulative
+        // advance: the anchor at 0 does not qualify while the jump to
+        // 10_001 does.
+        assert_eq!(
+            observe_position(&mut session.borrow_mut(), generation_b, 0, 20_000),
+            None
+        );
+        let credit_b = session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::position(generation_b, 10_001, 20_000))
+            .expect("the sample must qualify for a durable credit");
+        admit_history_credit(&admission, &session, Some(credit_b), 2_000);
+
+        // Neither play may land while the FIFO is full, and the ORPHAN must
+        // still occupy the stash: B's refusal was deferred, not substituted.
+        let mut landed_history = 0;
+        while let Ok(command) = receiver.try_recv() {
+            if matches!(command, LibraryCommand::RecordPlaybackHistory { .. }) {
+                landed_history += 1;
+            }
+        }
+        assert_eq!(
+            landed_history, 0,
+            "an overloaded FIFO must not admit a history command"
+        );
+        assert!(
+            session
+                .borrow()
+                .pending_history_credit
+                .as_ref()
+                .is_some_and(|(pending, _)| pending.track_id().as_str() == "orphan-a"),
+            "the second overload must not evict the undelivered orphan from \
+             the stash (PR #286 finding A2)"
+        );
+
+        // Drain. The orphan's delivery rides the next admission attempt
+        // under its ORIGINAL timestamp; the deferred B credit re-earns
+        // through its retained snapshot and lands afterwards.
+        while receiver.try_recv().is_ok() {}
+        admit_history_credit(&admission, &session, None, 3_000);
+        match receiver
+            .try_recv()
+            .expect("the orphaned play must land after the drain")
+        {
+            LibraryCommand::RecordPlaybackHistory {
+                track_id,
+                counted_at_ms,
+            } => {
+                assert_eq!(track_id.as_str(), "orphan-a");
+                assert_eq!(counted_at_ms, 1_000);
+            }
+            other => panic!("expected orphan-a's history command, got {other:?}"),
+        }
+        let reearned_b = session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::position(generation_b, 11_000, 20_000))
+            .expect("the deferred credit must re-earn through its retained snapshot");
+        admit_history_credit(&admission, &session, Some(reearned_b), 4_000);
+        match receiver
+            .try_recv()
+            .expect("the re-earned play must land after the drain")
+        {
+            LibraryCommand::RecordPlaybackHistory {
+                track_id,
+                counted_at_ms,
+            } => {
+                assert_eq!(track_id.as_str(), "orphan-b");
+                assert_eq!(counted_at_ms, 4_000);
+            }
+            other => panic!("expected orphan-b's history command, got {other:?}"),
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "neither play may deliver more than once"
+        );
+        assert!(session.borrow().pending_history_credit.is_none());
+    }
+
+    /// Round-4 rework regression (PR #286 finding A2, single-occupant
+    /// behavior preserved): once the orphan's retry is ACCEPTED the slot is
+    /// empty again, so the next track's overload stashes normally — exactly
+    /// the pre-rework single-credit behavior.
+    #[test]
+    fn accepted_orphan_retry_lets_the_next_overload_stash_normally() {
+        let (admission, receiver) = LibraryCommandAdmission::channel();
+        let session = RefCell::new({
+            let mut session = PlaybackSession::default();
+            assert!(session.replace_queue(vec![history_item("local", "orphan-a", None)], 0,));
+            session
+        });
+        let generation_a = accept_history_load(&mut session.borrow_mut());
+        observe_playing(&mut session.borrow_mut(), generation_a);
+
+        for ordinal in 0..(COMMAND_FIFO_CAPACITY - 1) {
+            let command = LibraryCommand::SetTrackRating {
+                track_id: TrackId::new(format!("orphan-filler-{ordinal}")).expect("valid track ID"),
+                rating: None,
+            };
+            assert_eq!(
+                admission.try_send(command),
+                CommandAdmissionOutcome::Accepted
+            );
+        }
+
+        let credit_a = session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::ended(generation_a))
+            .expect("an unsought natural end must qualify for a durable credit");
+        admit_history_credit(&admission, &session, Some(credit_a), 1_000);
+        session.borrow_mut().clear();
+
+        // Leave exactly ONE ordinary slot free: enough for the orphan's
+        // retry, not for the next track's own admission.
+        while receiver.try_recv().is_ok() {}
+        for ordinal in 0..(COMMAND_FIFO_CAPACITY - 2) {
+            let command = LibraryCommand::SetTrackRating {
+                track_id: TrackId::new(format!("orphan-refill-{ordinal}")).expect("valid track ID"),
+                rating: None,
+            };
+            assert_eq!(
+                admission.try_send(command),
+                CommandAdmissionOutcome::Accepted
+            );
+        }
+
+        assert!(session
+            .borrow_mut()
+            .replace_queue(vec![history_item("local", "orphan-b", Some(20_000))], 0,));
+        let generation_b = accept_history_load(&mut session.borrow_mut());
+        observe_playing(&mut session.borrow_mut(), generation_b);
+        assert_eq!(
+            observe_position(&mut session.borrow_mut(), generation_b, 0, 20_000),
+            None
+        );
+        let credit_b = session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::position(generation_b, 10_001, 20_000))
+            .expect("the sample must qualify for a durable credit");
+        admit_history_credit(&admission, &session, Some(credit_b), 2_000);
+
+        // The orphan's retry consumed the free slot; B was refused and must
+        // now own the stash as the single occupant. Drain the receiver,
+        // counting exactly one history command: the accepted orphan retry.
+        let mut landed_history = 0;
+        while let Ok(command) = receiver.try_recv() {
+            if matches!(command, LibraryCommand::RecordPlaybackHistory { .. }) {
+                landed_history += 1;
+            }
+        }
+        assert_eq!(
+            landed_history, 1,
+            "exactly the orphan's retry may commit while the FIFO is refilled"
+        );
+        assert!(
+            session
+                .borrow()
+                .pending_history_credit
+                .as_ref()
+                .is_some_and(|(pending, _)| pending.track_id().as_str() == "orphan-b"),
+            "after the orphan is delivered, B's overload must stash normally"
+        );
+
+        // Drain; then B's own transition retires its occurrence, orphaning
+        // the fresh stash, and the next admission attempt delivers it under
+        // its original timestamp.
+        while receiver.try_recv().is_ok() {}
+        session.borrow_mut().clear();
+        admit_history_credit(&admission, &session, None, 3_000);
+        match receiver
+            .try_recv()
+            .expect("the stashed play must land after the drain")
+        {
+            LibraryCommand::RecordPlaybackHistory {
+                track_id,
+                counted_at_ms,
+            } => {
+                assert_eq!(track_id.as_str(), "orphan-b");
+                assert_eq!(counted_at_ms, 2_000);
+            }
+            other => panic!("expected orphan-b's history command, got {other:?}"),
+        }
+        assert!(receiver.try_recv().is_err());
+    }
+
+    /// Round-4 rework regression (PR #286 finding A1): a whole-session
+    /// queue replacement used to drop `previous` — and with it any pending
+    /// credit — on every path past the queue swap, so activating a row (or
+    /// play-or-start from idle) while the FIFO was full permanently
+    /// omitted the earlier play. `play_track_at` now transfers the credit
+    /// into the replacement with `inherit_pending_history_credit` on every
+    /// path that drops `previous` (successful start, external abandonment);
+    /// orphaned by construction there, it rides the normal
+    /// orphan-retry delivery once the FIFO drains. Both entry points that
+    /// reach the transfer (`column_view.connect_activate` and
+    /// `play_or_start`'s `StartAt` arm) share this exact statement
+    /// sequence, mirrored here from `play_track_at`.
+    #[test]
+    fn session_replacement_carries_the_pending_credit_into_the_replacement() {
+        let (admission, receiver) = LibraryCommandAdmission::channel();
+        let session = RefCell::new({
+            let mut session = PlaybackSession::default();
+            assert!(session.replace_queue(vec![history_item("local", "carried-a", None)], 0,));
+            session
+        });
+        let generation_a = accept_history_load(&mut session.borrow_mut());
+        observe_playing(&mut session.borrow_mut(), generation_a);
+
+        for ordinal in 0..(COMMAND_FIFO_CAPACITY - 1) {
+            let command = LibraryCommand::SetTrackRating {
+                track_id: TrackId::new(format!("carried-filler-{ordinal}"))
+                    .expect("valid track ID"),
+                rating: None,
+            };
+            assert_eq!(
+                admission.try_send(command),
+                CommandAdmissionOutcome::Accepted
+            );
+        }
+
+        // The earlier play qualifies and is refused: retained AND stashed.
+        let credit_a = session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::ended(generation_a))
+            .expect("an unsought natural end must qualify for a durable credit");
+        admit_history_credit(&admission, &session, Some(credit_a), 1_000);
+
+        // Row activation while the FIFO is full: the exact replacement
+        // sequence `play_track_at` runs past its `replace_queue` gate.
+        let mut previous = std::mem::take(&mut *session.borrow_mut());
+        assert!(session
+            .borrow_mut()
+            .replace_queue(vec![history_item("local", "carried-b", Some(20_000))], 0,));
+        let carried_pending_history_credit = previous.take_pending_history_credit();
+        session
+            .borrow_mut()
+            .inherit_pending_history_credit(carried_pending_history_credit);
+        drop(previous);
+        let generation_b = accept_history_load(&mut session.borrow_mut());
+        observe_playing(&mut session.borrow_mut(), generation_b);
+
+        assert!(
+            session
+                .borrow()
+                .pending_history_credit
+                .as_ref()
+                .is_some_and(|(pending, _)| pending.track_id().as_str() == "carried-a"),
+            "the pending credit must transfer into the replacement session"
+        );
+
+        // Drain. The carried play lands exactly once, under its original
+        // timestamp; the replacement session's own play is unaffected.
+        while receiver.try_recv().is_ok() {}
+        admit_history_credit(&admission, &session, None, 2_000);
+        match receiver
+            .try_recv()
+            .expect("the carried play must land after the drain")
+        {
+            LibraryCommand::RecordPlaybackHistory {
+                track_id,
+                counted_at_ms,
+            } => {
+                assert_eq!(track_id.as_str(), "carried-a");
+                assert_eq!(
+                    counted_at_ms, 1_000,
+                    "the carried play must deliver under its original timestamp"
+                );
+            }
+            other => panic!("expected carried-a's history command, got {other:?}"),
+        }
+        assert!(receiver.try_recv().is_err());
+
+        // The replacement's own play still earns and commits normally.
+        assert_eq!(
+            observe_position(&mut session.borrow_mut(), generation_b, 0, 20_000),
+            None
+        );
+        let credit_b = session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::position(generation_b, 10_001, 20_000))
+            .expect("the replacement's own sample must still qualify");
+        admit_history_credit(&admission, &session, Some(credit_b), 3_000);
+        match receiver
+            .try_recv()
+            .expect("the replacement's play must commit")
+        {
+            LibraryCommand::RecordPlaybackHistory { track_id, .. } => {
+                assert_eq!(track_id.as_str(), "carried-b");
+            }
+            other => panic!("expected carried-b's history command, got {other:?}"),
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "the transferred play must not double-send alongside the \
+             replacement's own play"
+        );
+    }
+
+    /// Round-4 rework regression (PR #286 finding A1, behavior unchanged):
+    /// a replacement with NO pending credit installs `None` and delivers
+    /// nothing — the transfer must not conjure a phantom play.
+    #[test]
+    fn session_replacement_without_pending_credit_delivers_nothing() {
+        let (admission, receiver) = LibraryCommandAdmission::channel();
+        let session = RefCell::new({
+            let mut session = PlaybackSession::default();
+            assert!(session.replace_queue(vec![history_item("local", "plain-a", None)], 0,));
+            session
+        });
+        let generation_a = accept_history_load(&mut session.borrow_mut());
+        observe_playing(&mut session.borrow_mut(), generation_a);
+
+        let mut previous = std::mem::take(&mut *session.borrow_mut());
+        assert!(session
+            .borrow_mut()
+            .replace_queue(vec![history_item("local", "plain-b", Some(20_000))], 0,));
+        let carried_pending_history_credit = previous.take_pending_history_credit();
+        assert!(carried_pending_history_credit.is_none());
+        session
+            .borrow_mut()
+            .inherit_pending_history_credit(carried_pending_history_credit);
+        drop(previous);
+
+        assert!(session.borrow().pending_history_credit.is_none());
+        admit_history_credit(&admission, &session, None, 1_000);
+        assert!(
+            receiver.try_recv().is_err(),
+            "a replacement without a pending credit must not deliver a \
+             history command"
+        );
+    }
+
     #[test]
     fn pause_buffer_and_missing_playing_state_reanchor_without_jump_credit() {
         let mut session = PlaybackSession::default();
@@ -6057,7 +7127,7 @@ mod tests {
             restarted
                 .observe_history_event(&PlayerEvent::ended(generation))
                 .as_ref()
-                .map(TrackId::as_str),
+                .map(|credit| credit.track_id().as_str()),
             Some("restarted"),
             "a backward Previous restart is not skip evidence"
         );
@@ -6224,7 +7294,7 @@ mod tests {
             unknown
                 .observe_history_event(&PlayerEvent::ended(unknown_generation))
                 .as_ref()
-                .map(TrackId::as_str),
+                .map(|credit| credit.track_id().as_str()),
             Some("unknown-eos")
         );
         assert_eq!(
