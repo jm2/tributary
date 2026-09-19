@@ -258,6 +258,15 @@ registered in `mod.rs`). The next free slot is `000021` after
   display text, but is no longer unique and is no longer an authority carrier.
   The rename matters: see §4.2 and §4.5. No column named `file_path` survives
   the migration.
+- `playlist_entries.match_native_path TEXT NULL` — the canonical native key
+  (§3.1) of an unresolved local entry's decoded locator: written by XSPF
+  import when no currently-indexed track matches and read FIRST by orphan
+  reconciliation (§6.3.1); `NULL` for resolved, non-local, or absent
+  locators. Added by migration `000021` as a plain `ALTER TABLE ...
+  ADD COLUMN` (no table rebuild, no foreign-key interaction) and dropped by
+  `down()`; the column is inert until R11d activates the write/read pair
+  (§9). `match_file_path` remains display text and is never promoted to
+  identity.
 
 ### 4.2 Uniqueness moves to the native key, and the legacy carrier is removed
 
@@ -469,7 +478,8 @@ name the removed `file_path` column, and is otherwise
 unsupported-but-not-mechanically-rejected, exactly as scoped in items 1–2
 above. The only
 supported downgrade is the migration's `down()`, which restores the `file_path`
-column name and refuses whenever any row would be left ambiguous under the old
+column name, drops the `playlist_entries.match_native_path` column (§4.1), and
+refuses whenever any row would be left ambiguous under the old
 schema — any non-`NULL` `native_path` whose decoded bytes differ from its
 display text, or any state-0/3 row — matching the `drop_if_lossless` refusal
 pattern of migration 20.
@@ -688,9 +698,18 @@ native-scheme := "unix" | "windows-utf16le" | "portable-utf8"
   closed diagnostic: it is never re-encoded, never "corrected", and never
   interpreted lossily.
 - **Distinction from ordinary file URIs.** A location whose scheme is not one
-  of the three tokens — `file:`, `http:`, a relative reference, or any other
-  scheme — is never treated as native authority; it flows to the unchanged
-  fingerprint fallback at lower precedence, exactly as today.
+  of the three tokens is never treated as native authority. A **valid local
+  `file:` URI** keeps today's exact path-first precedence: import decodes it
+  with the unchanged `uri_to_file_path` rule (`playlist_io.rs:754-766` —
+  parseable URI, `file` scheme, no query or fragment, decodable to a
+  filesystem path) into the entry's path and exact-matches that path FIRST
+  (`playlist_io.rs:639-644`); under this contract that surviving-path match is
+  by native key, so it is authority-grade, and a location-only entry (XSPF
+  metadata is optional) still matches exactly as it does today
+  (README.md:610-616). Only a location that fails this decode — an
+  unparseable URI, a non-local scheme such as `http:`, a relative reference,
+  or an absent location — flows to the unchanged metadata/duration
+  fingerprint fallback at lower precedence.
 - **Round-trip fixtures.** Test 10 (§8) enumerates the required fixture
   families: invalid Unix bytes, `%`-bearing names, separator-lookalike and
   escape-lookalike spellings inside names, malformed Windows UTF-16 and
@@ -699,6 +718,18 @@ native-scheme := "unix" | "windows-utf16le" | "portable-utf8"
 - `playlist_entries.match_file_path` stays display/fingerprint text but must
   never be the sole authority; local matching prefers
   `playlist_entries.local_track_id` and the native row.
+- **Persisted native locator for unresolved entries.** When an imported local
+  entry's decoded native locator matches no currently-indexed track, import
+  persists that canonical native key (§3.1) in the new
+  `playlist_entries.match_native_path` column (§4.1); `match_file_path`
+  continues to hold display text and is never read as the key. Orphan
+  reconciliation (`playlist_manager.rs:1097-1118`) consults
+  `match_native_path` FIRST — exact native-key membership — and only falls
+  back to the unchanged title/artist/album/duration fingerprint when the
+  column is `NULL`, so a temporarily absent invalid-byte track relinks by
+  exact identity when it reappears; the lossy U+FFFD display locator that the
+  old flow discarded at import time can never provide this (covered by the
+  Test 10 reconciliation fixture).
 - **Rhythmbox import/migration** currently refuse non-UTF-8 locations
   (`rhythmbox_import.rs:1534`). Under this contract a non-UTF-8 Rhythmbox
   location becomes representable; the exact scope (accept losslessly vs. keep
@@ -819,6 +850,13 @@ Required tests:
     filesystem-free grain of Test 9; and every non-canonical spelling —
     uppercase hex, odd-length payload, embedded NUL, unknown scheme, and an
     ordinary `file:` URI — is refused by import as native authority (§6.3.1).
+    Test 10 also covers **unresolved-entry reconciliation**: an import whose
+    valid native location matches no currently-indexed track persists
+    `match_native_path` (§4.1); once the file appears, orphan reconciliation
+    relinks the entry by exact native key — including for an invalid-byte
+    filename whose `match_file_path` is U+FFFD-bearing display text — and a
+    `NULL` `match_native_path` entry still reconciles through the unchanged
+    metadata/duration fallback.
 11. **Old-binary / open-database rejection trace (F3).** Simulate a pre-R11
     consumer: a prepared `SELECT file_path FROM tracks` and an insert naming
     `file_path` both fail closed ("no such column"); the
@@ -900,7 +938,8 @@ Required tests:
     `down()`: exact `(playlist_entries.id, local_track_id)` pair-set equality
     across the downgrade — no binding became NULL, none was rebound, and no two
     entries' bindings were swapped — track ids, ratings, play counts, and
-    history are byte-identical, the `file_path` column is restored (§4.5), and
+    history are byte-identical, the `file_path` column is restored (§4.5), the
+    `playlist_entries.match_native_path` column is dropped (§4.1), and
     `foreign_key_check` is empty. Additionally assert the failure paths at
     `down()` grain: (a) a connection where `PRAGMA foreign_keys = OFF` does not
     take effect (read-back not `0`) aborts before `BEGIN` with zero writes; (b)
@@ -934,7 +973,8 @@ not expose a newly-lossless row to a consumer that cannot prove it.
    safe standing alone and changes no stored data.
 2. **R11b — codec + schema + scanner keys (activation).** Shared
    absolute-native-path codec; migration `000021` (rename to `display_path`,
-   native columns, table rebuild, partial unique index, backfill,
+   native columns, the inert `playlist_entries.match_native_path` match
+   locator (§4.1), table rebuild, partial unique index, backfill,
    `schema_capabilities` marker); scanner/stale/rename keying by native path.
    Activation is gated on R11a: the binary refuses to write the marker or enroll
    native rows unless the fail-closed baseline is compiled in (§4.5). New rows
@@ -947,7 +987,10 @@ not expose a newly-lossless row to a consumer that cannot prove it.
 4. **R11d — import/export + Rhythmbox.** Lossless XSPF location mapping
    (§6.3.1); export
    switches from the baseline whole-export `Err` refusal to lossless emission
-   only for authoritative rows; decide and document the Rhythmbox non-UTF-8
+   only for authoritative rows; import persists the canonical native locator
+   of unresolved local entries (`playlist_entries.match_native_path`, §4.1)
+   and orphan reconciliation consults it before the metadata fallback
+   (§6.3.1); decide and document the Rhythmbox non-UTF-8
    scope.
 5. **R11e — legacy cleanup.** Remove any remaining display-as-authority fallback
    once scans prove the native keys; keep `display_path` display-only.
@@ -1342,7 +1385,10 @@ A2 to match the review report.
   `NativePath::encode_absolute` with the §3.3 bound checked at encode time,
   import canonicality by decode-then-re-encode equality with closed refusal
   of non-canonical spellings, and the scheme-token distinction from ordinary
-  `file:`/`http:` URIs (which flow to the unchanged fingerprint fallback);
+  URIs (a valid local `file:` URI keeps today's exact path-first match;
+  only a location that fails to decode to a local path, a non-local scheme
+  such as `http:`, or an absent location flows to the unchanged fingerprint
+  fallback);
   §6.3's export and import bullets now cite §6.3.1 and state the
   intermediate-state exact-display export rule; §9's R11d cites §6.3.1; the
   §10 open item is deleted (the mapping is defined, so no authorized slice
@@ -1395,6 +1441,69 @@ Nothing in this revision expands product behavior; the XSPF grammar makes an
 implicit claim explicit and the rollout invariant more precise. The threads
 stay unresolved until this head lands and the fixes are independently
 re-verified.
+
+### 13.6 Revision 8 mapping (round-7 review of `f26850cc`)
+
+Revision 8 answers the two findings verified first-hand in
+`refinery-20260919-f26850c-tr-ldhwt-round7/review.md` (PR #283 at head
+`f26850cc41eb75fc1e71a38f108dfe14a6c18ad4`; threads R7-A1 and R7-A2). All
+corrections are doc-only; labeled A1/A2 to match the review report.
+
+#### A1 (thread R7-A1) — the §6.3.1 bullet and §13.5 recap misstated `file:` matching
+
+- **Finding:** the §6.3.1 distinction bullet and the §13.5 recap claimed that
+  `file:`/`http:` URIs "flow to the unchanged fingerprint fallback ... exactly
+  as today". Factually wrong: `apply_xspf_field` decodes a valid local `file:`
+  location via `uri_to_file_path` into `ImportedTrack.file_path`, and
+  `ImportedTrackMatchIndex::find` exact-matches that path FIRST, with the
+  normalized metadata/duration fingerprint only on path miss
+  (`playlist_io.rs:639-644`); README.md:610-616 documents the same contract.
+  As written, the design routed valid local `file:` locations past exact path
+  matching — and because XSPF metadata is optional, a location-only entry
+  would reach `find` with empty title/artist and return None, permanently
+  unmatched.
+- **Required correction:** specify that import decodes valid local `file:`
+  URIs into the native key and exact-matches them FIRST (today's precedence,
+  now authority-grade); only malformed, non-local, or absent locations flow
+  to the unchanged fingerprint fallback. Fix the §6.3.1 bullet and the
+  §13.5 recap.
+- **Where changed:** §6.3.1's distinction bullet states the unchanged
+  `uri_to_file_path` decode (`playlist_io.rs:754-766`) and the exact
+  path-first match (`playlist_io.rs:639-644`), authority-grade under §5,
+  with only undecodable, non-local, or absent locations on the fingerprint
+  fallback; the §13.5 recap is corrected to match. The native-scheme
+  canonicality rules (round-6 approved) are untouched.
+
+#### A2 (thread R7-A2) — unresolved entries persisted only a lossy locator for reconciliation
+
+- **Finding:** for an imported native-scheme location matching no
+  currently-indexed track, the design persisted only
+  `playlist_entries.match_file_path` as locator evidence. Orphan
+  reconciliation (`playlist_manager.rs:1097-1118`) matches solely from
+  `match_title/artist/album`, `match_file_path`, and `match_duration_secs`;
+  for an invalid-byte filename that field is U+FFFD-bearing lossy display
+  text, so the decoded native locator was discarded at import time and the
+  entry could never exact-match when the track reappeared (rescan or library
+  rebuild) — contradicting the bullet's own "never the sole authority" rule
+  and the design's lossless import/export goal.
+- **Required correction:** persist a canonical native-key match field for
+  unresolved local playlist entries at import (or an equivalent durable
+  native-locator store) and have reconciliation consult it before the
+  metadata fallback; keep `match_file_path` as display text.
+- **Where changed:** new `playlist_entries.match_native_path` column (§4.1)
+  created by migration `000021` as a plain `ADD COLUMN` (no rebuild, no
+  foreign-key interaction) and dropped by `down()` (§4.5); import persists
+  the canonical native key of an unresolved entry's decoded locator and
+  orphan reconciliation consults it FIRST, before the unchanged
+  metadata/duration fallback (§6.3.1); the column stays inert until R11d
+  activates the write/read pair (§9); Test 10 gains the reconciliation
+  fixture family and Test 15 asserts the `down()` drop.
+
+Nothing in this revision expands product behavior beyond the two corrected
+contract points: the `file:` path-first statement restores today's documented
+precedence, and the persisted native locator replaces silent identity loss
+with an exact relink. The threads stay unresolved until this head lands and
+the fixes are independently re-verified.
 
 ## Appendix A — Lossy conversion inventory (`src/local/`)
 
