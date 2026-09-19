@@ -2410,7 +2410,7 @@ pub mod tests {
         // scheduled, so pumping it is safe; the expect documents the
         // invariant that this helper runs inside a widget test session.
         let context = glib::MainContext::thread_default()
-            .expect("widget_test_session::acquire pushes a thread-default context");
+            .expect("widget_test_session::with_session pushes a thread-default context");
         while context.pending() {
             context.iteration(false);
         }
