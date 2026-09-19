@@ -859,6 +859,139 @@ class FuzzLockPolicyTests(unittest.TestCase):
         )
         self.assertEqual(remaining, [])
 
+    def test_removal_accepts_shared_fuzz_only_retained_record(self):
+        # Codex P2 regression (thread j9vog): a removed Tributary
+        # dependency shared with a fuzz-only dependency stays reachable
+        # from the fuzz workspace root after the reviewed removal, so
+        # cargo's regeneration legitimately retains its record. Rooting
+        # after-removal reachability at the inner tributary path package
+        # alone cannot see the fuzz-only edge and falsely classified the
+        # live record orphaned; reachability must span every workspace
+        # member.
+        base = lock(["foo 1.0.0"], {"foo": ["1.0.0"]})
+        current = lock([], {})
+        base_fuzz = lock(["foo 1.0.0"], {"foo": ["1.0.0"]})
+        # package order: tributary, foo. Add the fuzz workspace root
+        # member: tributary-fuzz -> libfuzzer-sys -> foo.
+        base_fuzz["package"].append(
+            {
+                "name": "libfuzzer-sys",
+                "version": "0.4.7",
+                "source": (
+                    "registry+https://github.com/rust-lang/crates.io-index"
+                ),
+                "dependencies": ["foo 1.0.0"],
+            }
+        )
+        base_fuzz["package"].append(
+            {
+                "name": "tributary-fuzz",
+                "version": "0.5.1",
+                "dependencies": ["libfuzzer-sys 0.4.7"],
+            }
+        )
+        # The submitted lock drops the tributary->foo edge, and the
+        # regenerated lock retains foo: it is still reachable from the
+        # workspace root through libfuzzer-sys.
+        shared_fuzz = lock([], {"foo": ["1.0.0"]})
+        shared_fuzz["package"].append(
+            {
+                "name": "libfuzzer-sys",
+                "version": "0.4.7",
+                "source": (
+                    "registry+https://github.com/rust-lang/crates.io-index"
+                ),
+                "dependencies": ["foo 1.0.0"],
+            }
+        )
+        shared_fuzz["package"].append(
+            {
+                "name": "tributary-fuzz",
+                "version": "0.5.1",
+                "dependencies": ["libfuzzer-sys 0.4.7"],
+            }
+        )
+
+        requested, remaining = sync_fuzz_lock.validate_submitted_fuzz_update(
+            base,
+            current,
+            base_fuzz,
+            shared_fuzz,
+            {"dependencies": {}},
+        )
+        self.assertEqual(
+            requested,
+            [sync_fuzz_lock.Transition("foo", "1.0.0", None)],
+        )
+        self.assertEqual(remaining, [])
+
+    def test_removal_rejects_member_unreachable_true_orphan(self):
+        # True-orphan guard preserved under member-rooted reachability
+        # (Codex j9vog correction): foo is retained by the submitted lock
+        # but reaches nothing and no member reaches it, while its old
+        # closure peer bar stays live through a fuzz-only member. The
+        # proof must reject foo alone — per-record classification, not a
+        # wholesale refusal of the removal.
+        base = lock(["foo 1.0.0"], {"foo": ["1.0.0"], "bar": ["2.0.0"]})
+        # package order: tributary, foo, bar. foo reaches bar.
+        base["package"][1]["dependencies"] = ["bar 2.0.0"]
+        current = lock([], {})
+        base_fuzz = lock(["foo 1.0.0"], {"foo": ["1.0.0"], "bar": ["2.0.0"]})
+        base_fuzz["package"][1]["dependencies"] = ["bar 2.0.0"]
+        # Fuzz-only members keep bar live independently of foo.
+        base_fuzz["package"].append(
+            {
+                "name": "libfuzzer-sys",
+                "version": "0.4.7",
+                "source": (
+                    "registry+https://github.com/rust-lang/crates.io-index"
+                ),
+                "dependencies": ["bar 2.0.0"],
+            }
+        )
+        base_fuzz["package"].append(
+            {
+                "name": "tributary-fuzz",
+                "version": "0.5.1",
+                "dependencies": ["libfuzzer-sys 0.4.7"],
+            }
+        )
+        # The submitted lock drops the tributary->foo edge and keeps bar
+        # live through the fuzz member, but retains foo with no live
+        # consumer: a true orphan cargo would prune.
+        orphaned_fuzz = lock([], {"foo": ["1.0.0"], "bar": ["2.0.0"]})
+        orphaned_fuzz["package"][1]["dependencies"] = ["bar 2.0.0"]
+        orphaned_fuzz["package"].append(
+            {
+                "name": "libfuzzer-sys",
+                "version": "0.4.7",
+                "source": (
+                    "registry+https://github.com/rust-lang/crates.io-index"
+                ),
+                "dependencies": ["bar 2.0.0"],
+            }
+        )
+        orphaned_fuzz["package"].append(
+            {
+                "name": "tributary-fuzz",
+                "version": "0.5.1",
+                "dependencies": ["libfuzzer-sys 0.4.7"],
+            }
+        )
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError,
+            r"retained unreachable old-closure package records: "
+            r"\[\('foo', '1\.0\.0'\)\]",
+        ):
+            sync_fuzz_lock.validate_submitted_fuzz_update(
+                base,
+                current,
+                base_fuzz,
+                orphaned_fuzz,
+                {"dependencies": {}},
+            )
+
     def test_transition_tied_rebind_rejects_pure_edge_drop(self):
         # Round-2 Codex P2 regression (M2): the transition-tied exception
         # exists for REBINDS, so its empty added-target set must not

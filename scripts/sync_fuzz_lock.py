@@ -954,9 +954,16 @@ def validate_bounded_package_changes(
     # set, so removed_identities stays empty, and a pure removal has no new
     # roots whose after-closure could require reachability. Real cargo
     # resolution prunes unreachable records, so every surviving member of a
-    # removal closure must remain reachable from the fuzz workspace root.
-    # Unification survivors are unaffected: a retained consumer's edge
-    # keeps its record reachable, and only true orphans are named here.
+    # removal closure must remain reachable from the fuzz workspace graph.
+    # That graph is rooted at the workspace itself, not at the inner
+    # tributary path package: Cargo.lock marks every workspace member by
+    # the absence of a source field, and cargo's unit graph reaches all of
+    # them, so a record kept alive by a fuzz-only member (Codex j9vog:
+    # tributary-fuzz -> libfuzzer-sys -> <removed dep>) is legitimately
+    # retained by a regenerated lock. A record reachable from no member is
+    # a true orphan cargo would prune. Unification survivors are
+    # unaffected: a retained consumer's edge keeps its record reachable,
+    # and only those true orphans are named here.
     removal_roots = {
         (transition.name, transition.current_fuzz_version)
         for transition in transitions
@@ -966,9 +973,13 @@ def validate_bounded_package_changes(
         removal_closure = dependency_closure_identities(
             before_fuzz_lock, removal_roots
         )
-        workspace = workspace_package(after_fuzz_lock, "tributary")
+        after_members = {
+            (package["name"], package["version"])
+            for package in after_fuzz_lock.get("package", [])
+            if "source" not in package
+        }
         after_reachable = dependency_closure_identities(
-            after_fuzz_lock, {(workspace["name"], workspace["version"])}
+            after_fuzz_lock, after_members
         )
         orphaned = (removal_closure & after_records.keys()) - after_reachable
         if orphaned:
