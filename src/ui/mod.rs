@@ -176,17 +176,21 @@ pub mod widget_test_session {
         let thread_default = ThreadDefaultMainContext::push(gtk::glib::MainContext::new());
 
         Some(SessionGuard {
-            _lock: guard,
             _thread_default: thread_default,
+            _lock: guard,
         })
     }
 
     /// Holds the GTK test mutex and the session's pushed thread-default
     /// main context for the lifetime of a widget test session. Dropping it
-    /// pops the context first and then releases the lock.
+    /// pops the context first and then releases the lock: Rust drops
+    /// struct fields in declaration order, so the context member is
+    /// declared before the lock member and is therefore torn down first —
+    /// the push/pop pair never straddles a lock handoff to the next
+    /// widget test.
     pub struct SessionGuard {
-        _lock: MutexGuard<'static, ()>,
         _thread_default: ThreadDefaultMainContext,
+        _lock: MutexGuard<'static, ()>,
     }
 
     /// RAII for `g_main_context_push_thread_default` /
