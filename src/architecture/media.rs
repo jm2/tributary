@@ -416,6 +416,202 @@ impl Drop for MediaLeasePermit {
     }
 }
 
+/// Whether a resolved media stream is an unbounded live source or a finite
+/// buffered track.
+///
+/// The distinction drives downstream player metadata (for example the
+/// Chromecast LOAD `streamType`), not access control: both variants describe
+/// the same credential-isolated fetch path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MediaStreamKind {
+    /// Unbounded live source (for example an internet radio relay).
+    Live,
+    /// Finite, seekable track bytes.
+    Buffered,
+}
+
+/// Validated audio containers a resolved request may claim.
+///
+/// The variant set is a fixed allowlist: every variant maps to one constant
+/// MIME type and one constant ticket suffix, both defined here and nowhere
+/// else. Server-supplied strings never become a `MediaContainer` directly —
+/// they must pass [`MediaContainer::from_suffix`] — so a descriptor is
+/// non-secret by construction and safe to surface in player metadata and
+/// receiver-visible metadata.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MediaContainer {
+    Mp3,
+    Flac,
+    Ogg,
+    Oga,
+    Opus,
+    Wav,
+    Aac,
+    M4a,
+    Aiff,
+    Wma,
+}
+
+impl MediaContainer {
+    /// The canonical MIME type for this container.
+    pub fn content_type(self) -> &'static str {
+        match self {
+            Self::Mp3 => "audio/mpeg",
+            Self::Flac => "audio/flac",
+            Self::Ogg | Self::Oga | Self::Opus => "audio/ogg",
+            Self::Wav => "audio/wav",
+            // `.aac` is a raw AAC/ADTS stream — IANA registers `audio/aac`;
+            // `audio/mp4` describes MP4-framed carriage (the M4A family), so
+            // the two variants must not share a label.
+            Self::Aac => "audio/aac",
+            Self::M4a => "audio/mp4",
+            Self::Aiff => "audio/aiff",
+            Self::Wma => "audio/x-ms-wma",
+        }
+    }
+
+    /// Canonical ticket suffix plus accepted library-supplied aliases for
+    /// each container, in one row per variant. This table is the single
+    /// authority for receiver-visible extensions: [`Self::ticket_suffix`]
+    /// emits only the canonical column and [`Self::from_suffix`] accepts the
+    /// canonical suffix plus its aliases — nowhere else. New variants must
+    /// add a row here; the exhaustive `content_type` match keeps the build
+    /// honest if one is added without it.
+    const CONTAINER_SUFFIX_TABLE: &'static [(Self, &'static str, &'static [&'static str])] = &[
+        (Self::Mp3, "mp3", &["mp3"]),
+        (Self::Flac, "flac", &["flac"]),
+        (Self::Ogg, "ogg", &["ogg", "ogx"]),
+        (Self::Oga, "oga", &["oga"]),
+        (Self::Opus, "opus", &["opus"]),
+        (Self::Wav, "wav", &["wav"]),
+        (Self::Aac, "aac", &["aac"]),
+        (Self::M4a, "m4a", &["m4a", "m4b", "mp4"]),
+        (Self::Aiff, "aiff", &["aiff", "aif"]),
+        (Self::Wma, "wma", &["wma"]),
+    ];
+
+    /// The ticket-path suffix for this container. Only exact allowlist
+    /// strings may be appended to the opaque loopback ticket path.
+    pub fn ticket_suffix(self) -> &'static str {
+        Self::CONTAINER_SUFFIX_TABLE
+            .iter()
+            .find(|(container, _, _)| *container == self)
+            .map(|(_, suffix, _)| *suffix)
+            .expect("every MediaContainer variant has a CONTAINER_SUFFIX_TABLE row")
+    }
+
+    /// Validate a server-supplied suffix against the container allowlist.
+    ///
+    /// Matching is case-insensitive because libraries disagree on
+    /// normalization ("FLAC", "flac", "Flac" all occur). Anything outside the
+    /// allowlist — including plausible-but-unvalidated extensions — returns
+    /// `None`; callers must treat that as "unknown", never fall back to a
+    /// guessed container.
+    pub fn from_suffix(suffix: &str) -> Option<Self> {
+        let normalized = suffix.to_ascii_lowercase();
+        Self::CONTAINER_SUFFIX_TABLE
+            .iter()
+            .find(|(_, _, aliases)| aliases.contains(&normalized.as_str()))
+            .map(|(container, _, _)| *container)
+    }
+}
+
+/// The validated representation a resolved media request is authoritative
+/// for: one allowlisted container (or an explicit "unknown") plus the stream
+/// kind.
+///
+/// **Authority.** The descriptor states the representation the client asked
+/// the server to return. None of the current resolvers request server-side
+/// transcoding, so the source container from library metadata is
+/// authoritative. If a resolver later adds transcoding parameters, it must
+/// build the descriptor from the transcode target at that same resolution
+/// site. A server that transcodes without being asked breaks this contract;
+/// the media proxy's passthrough of the upstream `Content-Type` header stays
+/// the wire truth in that case.
+///
+/// **Unknown is explicit.** An absent or unsupported container is represented
+/// by `container == None` — never by a guessed MIME. Consumers choose one
+/// documented fallback per consumer (for example the Chromecast receiver
+/// default) at a single named site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MediaRepresentation {
+    container: Option<MediaContainer>,
+    stream: MediaStreamKind,
+}
+
+impl MediaRepresentation {
+    /// A buffered stream with a validated container.
+    pub fn buffered(container: MediaContainer) -> Self {
+        Self {
+            container: Some(container),
+            stream: MediaStreamKind::Buffered,
+        }
+    }
+
+    /// A live stream with a validated container.
+    pub fn live(container: MediaContainer) -> Self {
+        Self {
+            container: Some(container),
+            stream: MediaStreamKind::Live,
+        }
+    }
+
+    /// A buffered stream whose container is explicitly unknown.
+    pub fn buffered_unknown() -> Self {
+        Self {
+            container: None,
+            stream: MediaStreamKind::Buffered,
+        }
+    }
+
+    /// A live stream whose container is explicitly unknown.
+    pub fn live_unknown() -> Self {
+        Self {
+            container: None,
+            stream: MediaStreamKind::Live,
+        }
+    }
+
+    /// Build a buffered representation from a server-supplied suffix,
+    /// mapping anything outside the allowlist to the explicit unknown.
+    pub fn buffered_from_suffix(suffix: &str) -> Self {
+        Self::from_suffix(suffix, MediaStreamKind::Buffered)
+    }
+
+    /// Build a representation from a server-supplied suffix and stream kind,
+    /// mapping anything outside the allowlist to the explicit unknown.
+    pub fn from_suffix(suffix: &str, stream: MediaStreamKind) -> Self {
+        let container = MediaContainer::from_suffix(suffix);
+        Self { container, stream }
+    }
+
+    /// The validated container, or `None` when explicitly unknown.
+    pub fn container(&self) -> Option<MediaContainer> {
+        self.container
+    }
+
+    /// The stream kind (live vs buffered).
+    pub fn stream(&self) -> MediaStreamKind {
+        self.stream
+    }
+
+    /// The validated MIME type, or `None` when the container is unknown.
+    pub fn content_type(&self) -> Option<&'static str> {
+        self.container.map(MediaContainer::content_type)
+    }
+
+    /// The validated ticket-path suffix, or `None` when unknown.
+    pub fn ticket_suffix(&self) -> Option<&'static str> {
+        self.container.map(MediaContainer::ticket_suffix)
+    }
+}
+
+impl Default for MediaRepresentation {
+    fn default() -> Self {
+        Self::buffered_unknown()
+    }
+}
+
 /// A resolved HTTP request whose credential material is isolated from its URL.
 ///
 /// This type is intentionally `Clone` but neither `Debug` nor serializable.
@@ -430,6 +626,7 @@ pub struct ResolvedHttpRequest {
     private_query_pairs: Vec<(String, String)>,
     advertised_route: Option<AdvertisedHttpRoute>,
     lease: Option<MediaLease>,
+    representation: MediaRepresentation,
 }
 
 impl ResolvedHttpRequest {
@@ -443,7 +640,18 @@ impl ResolvedHttpRequest {
             private_query_pairs: Vec::new(),
             advertised_route: None,
             lease: None,
+            representation: MediaRepresentation::default(),
         })
+    }
+
+    /// Attach the validated representation this request is authoritative for.
+    ///
+    /// Call this at the resolution site that knows the container (and stream
+    /// kind) the server will return — see [`MediaRepresentation`] for the
+    /// authority rules, especially under transcoding.
+    pub(crate) fn with_representation(mut self, representation: MediaRepresentation) -> Self {
+        self.representation = representation;
+        self
     }
 
     /// Add a fixed, non-secret header required by the remote media protocol.
@@ -535,6 +743,11 @@ impl ResolvedHttpRequest {
 
     pub(crate) fn advertised_route(&self) -> Option<&AdvertisedHttpRoute> {
         self.advertised_route.as_ref()
+    }
+
+    /// The validated representation this request is authoritative for.
+    pub(crate) fn representation(&self) -> MediaRepresentation {
+        self.representation
     }
 
     /// Whether the source session that issued this request still owns it.
@@ -632,6 +845,86 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn media_container_suffix_allowlist_is_case_insensitive_and_validated() {
+        assert_eq!(
+            MediaContainer::from_suffix("FLAC"),
+            Some(MediaContainer::Flac)
+        );
+        assert_eq!(
+            MediaContainer::from_suffix("aif"),
+            Some(MediaContainer::Aiff)
+        );
+        assert_eq!(
+            MediaContainer::from_suffix("m4b"),
+            Some(MediaContainer::M4a)
+        );
+        assert_eq!(MediaContainer::from_suffix("exe"), None);
+        assert_eq!(MediaContainer::from_suffix(""), None);
+        assert_eq!(MediaContainer::from_suffix("m3u"), None);
+    }
+
+    #[test]
+    fn media_representation_maps_containers_to_fixed_mime_and_suffix() {
+        let flac = MediaRepresentation::buffered(MediaContainer::Flac);
+        assert_eq!(flac.content_type(), Some("audio/flac"));
+        assert_eq!(flac.ticket_suffix(), Some("flac"));
+        assert_eq!(flac.stream(), MediaStreamKind::Buffered);
+
+        let aac = MediaRepresentation::buffered_from_suffix("AAC");
+        assert_eq!(aac.content_type(), Some("audio/aac"));
+        assert_eq!(aac.ticket_suffix(), Some("aac"));
+
+        let m4a = MediaRepresentation::buffered_from_suffix("m4a");
+        assert_eq!(m4a.content_type(), Some("audio/mp4"));
+        assert_eq!(m4a.ticket_suffix(), Some("m4a"));
+
+        let opus = MediaRepresentation::buffered(MediaContainer::Opus);
+        assert_eq!(opus.content_type(), Some("audio/ogg"));
+        assert_eq!(opus.ticket_suffix(), Some("opus"));
+
+        let wma = MediaRepresentation::buffered(MediaContainer::Wma);
+        assert_eq!(wma.content_type(), Some("audio/x-ms-wma"));
+        assert_eq!(wma.ticket_suffix(), Some("wma"));
+    }
+
+    #[test]
+    fn media_representation_unknown_is_explicit_not_guessed() {
+        let unknown = MediaRepresentation::buffered_from_suffix("whatever");
+        assert_eq!(unknown.container(), None);
+        assert_eq!(unknown.content_type(), None);
+        assert_eq!(unknown.ticket_suffix(), None);
+        assert_eq!(unknown.stream(), MediaStreamKind::Buffered);
+
+        let default = MediaRepresentation::default();
+        assert_eq!(default, MediaRepresentation::buffered_unknown());
+
+        let live = MediaRepresentation::live_unknown();
+        assert_eq!(live.stream(), MediaStreamKind::Live);
+        assert_eq!(live.content_type(), None);
+    }
+
+    #[test]
+    fn resolved_request_defaults_to_unknown_buffered_representation() {
+        let request = ResolvedHttpRequest::new(
+            Url::parse("https://media.example.invalid/rest/stream.view?id=1").expect("valid url"),
+        )
+        .expect("valid endpoint");
+        assert_eq!(
+            request.representation(),
+            MediaRepresentation::buffered_unknown()
+        );
+
+        let request = request
+            .with_representation(MediaRepresentation::buffered(MediaContainer::Flac))
+            .with_private_query_pair("u", "alice")
+            .expect("allowlisted query pair");
+        assert_eq!(
+            request.representation(),
+            MediaRepresentation::buffered(MediaContainer::Flac)
+        );
+    }
 
     #[test]
     fn lease_revocation_waits_for_admitted_permit_and_closes_new_admission() {
