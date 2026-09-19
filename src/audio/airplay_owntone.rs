@@ -1237,6 +1237,41 @@ fn map_receiver_to_output(
     Ok(first.id)
 }
 
+/// The outcome of one mutating request primitive, distinguishing a refusal
+/// by the process guard — which happens strictly before transmission — from
+/// a failure at or after it (PR #270 review, round 12). A takeover step
+/// proves the guard twice (once by [`OwnToneClient::takeover_step`], once at
+/// the transmission boundary inside the primitive), and the endpoint can
+/// stop being the owned instance between the two: reporting that refusal as
+/// unsettled unwound a request that was never sent through serialized
+/// recovery and restarted a daemon holding nothing of ours.
+#[derive(Debug)]
+enum MutationOutcome {
+    /// The guard refused before the request was transmitted: the daemon
+    /// holds nothing of ours to replay, so the failure settles with its
+    /// own reason.
+    Refused(SenderError),
+    /// The request was transmitted, or its failure is not provably
+    /// pre-send: whether the daemon applied it is unknown.
+    Unsettled(SenderError),
+}
+
+impl MutationOutcome {
+    /// The localized, user-actionable message to surface verbatim.
+    fn message(&self) -> &str {
+        match self {
+            Self::Refused(error) | Self::Unsettled(error) => error.message(),
+        }
+    }
+
+    /// Collapse the distinction where no unwind decision depends on it.
+    fn into_error(self) -> SenderError {
+        match self {
+            Self::Refused(error) | Self::Unsettled(error) => error,
+        }
+    }
+}
+
 /// Blocking control-plane client for the dedicated instance's loopback JSON
 /// API. Every call is deadline-bounded and reports its own localized failure.
 struct OwnToneClient {
@@ -1281,13 +1316,20 @@ impl OwnToneClient {
     /// daemon holds nothing of ours to replay, so it unwinds cleanly with its
     /// own reason. Counting it as unsettled terminated and restarted a healthy
     /// daemon to settle a request that was never sent, and hid the reason
-    /// behind "recovery is pending" (pre-review audit, round 11).
+    /// behind "recovery is pending" (pre-review audit, round 11). The step
+    /// bodies re-prove the guard at the transmission boundary, where the
+    /// endpoint can have stopped being the owned instance since this outer
+    /// check, so a refusal carried by the primitive is classified exactly the
+    /// same way — settled, with its own reason (PR #270 review, round 12).
     fn takeover_step(
         &self,
-        step: impl FnOnce(&Self) -> Result<(), SenderError>,
+        step: impl FnOnce(&Self) -> Result<(), MutationOutcome>,
     ) -> Result<(), (SenderError, bool)> {
         self.authorize_mutation().map_err(|error| (error, false))?;
-        step(self).map_err(|error| (error, true))
+        step(self).map_err(|outcome| match outcome {
+            MutationOutcome::Refused(error) => (error, false),
+            MutationOutcome::Unsettled(error) => (error, true),
+        })
     }
 
     fn require_success(response: &reqwest::blocking::Response) -> Result<(), SenderError> {
@@ -1312,26 +1354,32 @@ impl OwnToneClient {
             .map_err(|_| unavailable("dedicated_daemon_sent_a_malformed_response"))
     }
 
-    fn put(&self, path: &str) -> Result<(), SenderError> {
-        self.authorize_mutation()?;
+    fn put(&self, path: &str) -> Result<(), MutationOutcome> {
+        self.authorize_mutation()
+            .map_err(MutationOutcome::Refused)?;
         let response = self
             .http
             .put(format!("{}{}", self.base, path))
             .send()
-            .map_err(|_| unavailable("dedicated_daemon_is_unreachable"))?;
-        Self::require_success(&response)?;
+            .map_err(|_| {
+                MutationOutcome::Unsettled(unavailable("dedicated_daemon_is_unreachable"))
+            })?;
+        Self::require_success(&response).map_err(MutationOutcome::Unsettled)?;
         Ok(())
     }
 
-    fn put_json(&self, path: &str, body: &serde_json::Value) -> Result<(), SenderError> {
-        self.authorize_mutation()?;
+    fn put_json(&self, path: &str, body: &serde_json::Value) -> Result<(), MutationOutcome> {
+        self.authorize_mutation()
+            .map_err(MutationOutcome::Refused)?;
         let response = self
             .http
             .put(format!("{}{}", self.base, path))
             .json(body)
             .send()
-            .map_err(|_| unavailable("dedicated_daemon_is_unreachable"))?;
-        Self::require_success(&response)?;
+            .map_err(|_| {
+                MutationOutcome::Unsettled(unavailable("dedicated_daemon_is_unreachable"))
+            })?;
+        Self::require_success(&response).map_err(MutationOutcome::Unsettled)?;
         Ok(())
     }
 
@@ -1378,14 +1426,14 @@ impl OwnToneClient {
 
     /// `PUT /api/outputs/set` rewrites the server-wide enabled set: it enables
     /// exactly `ids` and disables every other output (§4.3).
-    fn set_outputs(&self, ids: &[u64]) -> Result<(), SenderError> {
+    fn set_outputs(&self, ids: &[u64]) -> Result<(), MutationOutcome> {
         let body = serde_json::json!({
             "outputs": ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
         });
         self.put_json("/api/outputs/set", &body)
     }
 
-    fn clear_queue(&self) -> Result<(), SenderError> {
+    fn clear_queue(&self) -> Result<(), MutationOutcome> {
         self.put("/api/queue/clear")
     }
 
@@ -1413,9 +1461,10 @@ impl OwnToneClient {
 
     fn player_control(&self, action: &str) -> Result<(), SenderError> {
         self.put(&format!("/api/player/{action}"))
+            .map_err(MutationOutcome::into_error)
     }
 
-    fn set_volume(&self, percent: u8) -> Result<(), SenderError> {
+    fn set_volume(&self, percent: u8) -> Result<(), MutationOutcome> {
         let query = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("volume", &percent.to_string())
             .finish();
@@ -1440,13 +1489,19 @@ impl TakeoverRecord {
         // load until someone removes it by hand. Nothing has been sent to the
         // daemon when this runs, so the record is staged beside its final
         // name, synced and renamed into place; a failure removes the stage and
-        // leaves no record at all (pre-review audit, round 11).
+        // leaves no record at all (pre-review audit, round 11). A failure
+        // after the rename removes the final record too: a reported failure
+        // must never leave a record a later load would misread as
+        // crashed-takeover evidence and quiesce a daemon over, even though
+        // that load sent no mutation (PR #270 review, round 12).
         let stage = path.with_extension("json.partial");
+        let mut renamed = false;
         let staged = (|| -> std::io::Result<()> {
             let mut file = std::fs::File::create(&stage)?;
             std::io::Write::write_all(&mut file, &body)?;
             file.sync_all()?;
             std::fs::rename(&stage, path)?;
+            renamed = true;
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::File::open(parent)?.sync_all()?;
             }
@@ -1454,6 +1509,9 @@ impl TakeoverRecord {
         })();
         if staged.is_err() {
             let _ = std::fs::remove_file(&stage);
+            if renamed {
+                let _ = std::fs::remove_file(path);
+            }
         }
         staged.map_err(|_| unavailable("takeover_record_could_not_be_persisted"))
     }
@@ -2108,9 +2166,9 @@ fn restore_daemon(
         warn!(reason = %error.message(), "OwnTone restore: player stop failed");
         first_error.get_or_insert(error);
     }
-    if let Err(error) = client.set_outputs(&recorded.enabled_outputs) {
-        warn!(reason = %error.message(), "OwnTone restore: enabled-output set failed");
-        first_error.get_or_insert(error);
+    if let Err(outcome) = client.set_outputs(&recorded.enabled_outputs) {
+        warn!(reason = %outcome.message(), "OwnTone restore: enabled-output set failed");
+        first_error.get_or_insert_with(|| outcome.into_error());
     }
     if let Some(error) = first_error {
         return Err(error);
@@ -2898,7 +2956,16 @@ impl SenderSession for OwnToneSession {
     fn set_volume(&mut self, level: f64) -> bool {
         let percent = (level.clamp(0.0, 1.0) * 100.0).round() as u8;
         self.inner
-            .transmit_under_boundary(|| self.inner.client.set_volume(percent), None, true)
+            .transmit_under_boundary(
+                || {
+                    self.inner
+                        .client
+                        .set_volume(percent)
+                        .map_err(MutationOutcome::into_error)
+                },
+                None,
+                true,
+            )
             .is_ok()
     }
 
@@ -3426,7 +3493,10 @@ enum Unwind {
 /// S7) — observing cancellation between the steps. A mutating RPC that
 /// returned an error (or timed out) may still have been applied server-side,
 /// so its unwind is not clean: `unsettled` is reported `true` (review F3,
-/// review T1). A cancellation between two successful steps unwinds cleanly.
+/// review T1). A refusal the process guard raises before transmission —
+/// outer or inner — settles instead, because nothing was sent (PR #270
+/// review, round 12). A cancellation between two successful steps unwinds
+/// cleanly.
 fn take_over(
     client: &OwnToneClient,
     ctx: &SenderOpenContext,
@@ -4693,6 +4763,39 @@ mod tests {
         assert!(!missing.with_extension("json.partial").exists());
     }
 
+    /// A failure after the stage was renamed into place retracts the final
+    /// record: a reported failure must never leave a record a later load
+    /// would misread as crashed-takeover evidence and quiesce a daemon over
+    /// (PR #270 review, round 12). A parent directory without read permission
+    /// accepts the staging and the rename but refuses the open for the
+    /// directory sync, so the post-rename failure is reached deterministically
+    /// (as non-root; root bypasses the permission check).
+    #[test]
+    fn a_directory_sync_failure_after_the_rename_leaves_no_record() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join(".tributary-takeover.json");
+        let record = TakeoverRecord {
+            enabled_outputs: vec![7],
+            selected_output: 7,
+        };
+        std::fs::set_permissions(
+            directory.path(),
+            std::fs::Permissions::from_mode(0o300), // write+execute, no read
+        )
+        .expect("the directory mode is restricted");
+        let outcome = record.write(&path);
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("the directory mode is restored");
+        outcome.expect_err("the failed directory sync is reported");
+        assert!(
+            !path.exists(),
+            "the final record must not survive a reported failure"
+        );
+        assert!(!path.with_extension("json.partial").exists());
+    }
+
     /// The ownership record binds the endpoint as the adapter normalizes it:
     /// a record written with the exported URL's trailing slash still matches.
     #[test]
@@ -5712,7 +5815,12 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let inner = test_session_inner(directory.path());
         assert!(inner
-            .transmit_mutation(|| inner.client.set_volume(50))
+            .transmit_mutation(|| {
+                inner
+                    .client
+                    .set_volume(50)
+                    .map_err(MutationOutcome::into_error)
+            })
             .is_err());
         assert!(inner.unsettled_count() > 0);
     }
@@ -6302,7 +6410,12 @@ mod tests {
         // must refuse it.
         let control_inner = Arc::clone(&inner);
         let control = std::thread::spawn(move || {
-            control_inner.transmit_mutation(|| control_inner.client.set_volume(50))
+            control_inner.transmit_mutation(|| {
+                control_inner
+                    .client
+                    .set_volume(50)
+                    .map_err(MutationOutcome::into_error)
+            })
         });
         std::thread::sleep(Duration::from_millis(100));
         server.park.release();
@@ -8187,9 +8300,16 @@ fn serve(stream: std::net::TcpStream) {
         };
         let client = OwnToneClient::for_owned_instance(&config).unwrap();
         for result in [client.clear_queue(), client.set_outputs(&[1])] {
-            let error = result.expect_err("a foreign listener is refused");
+            let outcome = result.expect_err("a foreign listener is refused");
+            // The refusal is the primitive's typed pre-send outcome, so a
+            // takeover step can settle it instead of reporting a request
+            // that was never transmitted as unsettled (round 12).
+            assert!(
+                matches!(outcome, MutationOutcome::Refused(_)),
+                "a guard refusal must be typed as pre-send"
+            );
             assert_eq!(
-                error.message(),
+                outcome.message(),
                 unavailable_in("en", "endpoint_process_is_not_the_owntone_binary").message()
             );
         }
@@ -8223,6 +8343,44 @@ fn serve(stream: std::net::TcpStream) {
             .takeover_step(OwnToneClient::clear_queue)
             .expect_err("an unreachable daemon fails in flight");
         assert!(unsettled, "a request that failed in flight may still apply");
+    }
+
+    /// An inner guard refusal — the primitive's own proof at the transmission
+    /// boundary, which can flip after the outer authorization passed — is
+    /// settled like the outer one: the request was never sent, so it keeps
+    /// its own reason and does not enter the recovery path; a failure at or
+    /// after transmission stays unsettled (PR #270 review, round 12).
+    #[test]
+    fn an_inner_guard_refusal_is_a_settled_takeover_failure() {
+        let client = OwnToneClient::new("http://127.0.0.1:1").unwrap();
+        let (error, unsettled) = client
+            .takeover_step(|_| {
+                Err(MutationOutcome::Refused(unavailable_in(
+                    "en",
+                    "endpoint_process_is_not_the_owntone_binary",
+                )))
+            })
+            .expect_err("an inner pre-send refusal fails the step");
+        assert!(!unsettled, "nothing was transmitted");
+        assert_eq!(
+            error.message(),
+            unavailable_in("en", "endpoint_process_is_not_the_owntone_binary").message(),
+            "the refusal keeps its own reason"
+        );
+
+        let (error, unsettled) = client
+            .takeover_step(|_| {
+                Err(MutationOutcome::Unsettled(unavailable_in(
+                    "en",
+                    "dedicated_daemon_is_unreachable",
+                )))
+            })
+            .expect_err("a transmitted failure fails the step");
+        assert!(unsettled, "a transmitted failure may still have applied");
+        assert_eq!(
+            error.message(),
+            unavailable_in("en", "dedicated_daemon_is_unreachable").message()
+        );
     }
 
     /// A daemon that stops on its own while the session is paused makes every
