@@ -36,6 +36,10 @@ pub enum OutputTarget {
     AirPlay {
         host: String,
         port: u16,
+        /// Normalized discovery identifier (MAC/`deviceid`) retained from
+        /// mDNS, when the receiver publishes one. A sender that maps by
+        /// identifier fails closed without it rather than name-matching.
+        device_id: Option<String>,
     },
     Chromecast {
         address: SocketAddr,
@@ -433,7 +437,11 @@ pub fn setup_output_selector(
                 .with_runtime(rt_handle.clone());
                 OutputActivation::Remote(Box::new(output))
             }
-            OutputTarget::AirPlay { host, port } => {
+            OutputTarget::AirPlay {
+                host,
+                port,
+                device_id,
+            } => {
                 let output = AirPlayOutput::new(
                     &row_name,
                     host,
@@ -441,6 +449,7 @@ pub fn setup_output_selector(
                     event_sender.clone(),
                     volume_scale.value(),
                 )
+                .with_device_id(device_id.clone())
                 .with_runtime(rt_handle.clone());
                 OutputActivation::Remote(Box::new(output))
             }
@@ -544,8 +553,13 @@ fn target_for_row(
         return Some(OutputTarget::Chromecast { address });
     }
     if icon == "network-wireless-symbolic" {
-        let (host, port) = parse_host_port(&host_port, 7000);
-        return Some(OutputTarget::AirPlay { host, port });
+        let (endpoint, device_id) = decode_airplay_row_identity(&host_port);
+        let (host, port) = parse_host_port(&endpoint, 7000);
+        return Some(OutputTarget::AirPlay {
+            host,
+            port,
+            device_id,
+        });
     }
 
     let saved = load_saved_outputs();
@@ -620,6 +634,39 @@ fn parse_host_port(host_port: &str, default_port: u16) -> (String, u16) {
         (h.to_string(), p)
     } else {
         (host_port.to_string(), default_port)
+    }
+}
+
+/// Separator between a discovered AirPlay row's `host:port` endpoint and its
+/// retained discovery identifier in the row widget name.
+const AIRPLAY_ROW_ID_SEPARATOR: char = '|';
+
+/// Encode a discovered AirPlay row's endpoint and retained identifier into the
+/// row widget name.
+///
+/// Rows must be distinguishable by identity, not display name, so that two
+/// receivers sharing a name stay independently selectable. The identifier is
+/// appended after `|` and omitted when discovery published none.
+pub fn encode_airplay_row_identity(host_port: &str, device_id: Option<&str>) -> String {
+    match device_id {
+        Some(id) if !id.is_empty() => format!("{host_port}{AIRPLAY_ROW_ID_SEPARATOR}{id}"),
+        _ => host_port.to_string(),
+    }
+}
+
+/// The `host:port` endpoint portion of a discovered AirPlay row's identity,
+/// dropping any retained device identifier.
+pub(super) fn airplay_row_endpoint(raw: &str) -> &str {
+    raw.split_once(AIRPLAY_ROW_ID_SEPARATOR)
+        .map_or(raw, |(endpoint, _)| endpoint)
+}
+
+/// Decode an AirPlay row widget name into its `(host:port, device_id)` parts.
+fn decode_airplay_row_identity(raw: &str) -> (String, Option<String>) {
+    match raw.split_once(AIRPLAY_ROW_ID_SEPARATOR) {
+        Some((endpoint, id)) if !id.is_empty() => (endpoint.to_string(), Some(id.to_string())),
+        Some((endpoint, _)) => (endpoint.to_string(), None),
+        None => (raw.to_string(), None),
     }
 }
 
@@ -982,6 +1029,7 @@ mod tests {
         assert!(!supervision_rebuild_applies(&OutputTarget::AirPlay {
             host: "music.local".to_string(),
             port: 7000,
+            device_id: None,
         }));
         assert!(!supervision_rebuild_applies(&OutputTarget::Chromecast {
             address: "192.168.0.20:8009".parse().unwrap(),

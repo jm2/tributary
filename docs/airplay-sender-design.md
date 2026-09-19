@@ -2180,7 +2180,7 @@ What the implementation record must nail down, per §4.3:
     No channel documented upstream; bundling forbidden (§11).
 
   Targets marked available gain the "for AirPlay output, install
-  OwnTone ≥ 29.x" install-docs entry with the pinned source (upstream
+  OwnTone 29.x (29.3 or newer)" install-docs entry with the pinned source (upstream
   releases page); where OwnTone is absent even from a covered
   distro's own archives (no official Debian archive), the docs say so
   and the probe error repeats it. The arm64 `.deb` install entry

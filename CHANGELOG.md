@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AirPlay sender seam and OwnTone sender path** — Replace the `gst::Element`-shaped
+  `raopsink` tail with a GStreamer-independent sender seam (`src/audio/airplay_sender.rs`)
+  whose fail-closed `probe` gate still runs before any per-track media preparation, and add
+  the design-selected OwnTone 29.x process adapter (`src/audio/airplay_owntone.rs`) behind
+  explicit configuration (`TRIBUTARY_AIRPLAY_SENDER=owntone`); the GStreamer `raopsink` path
+  remains the default. The adapter drives an operator-provisioned, Tributary-owned loopback
+  daemon over its JSON API and a named-pipe PCM transport, maps the selected receiver to a
+  daemon output by its retained device identifier — never by display name — restores the
+  daemon's pre-takeover output set on every terminal path, and fails closed with a localized,
+  actionable message on any missing or unsafe condition. Discovery retains the receiver's
+  normalized device identifier (TXT `deviceid`, else the `HEXMAC@` instance prefix) and
+  carries it through the output selector, so two same-named receivers stay independently
+  selectable. AirPlay 2 rows remain filtered out until a path that can actually play to them
+  ships; multi-room sync remains out of scope.
 - **Folder browsing** — Browse the local library by configured root and folder, with
   distinct identities for multiple roots, lazy navigation, and visible reasons when a root
   is unavailable or has changed identity.

@@ -8,11 +8,13 @@
 //! Exact local-library file authority takes the same ticket boundary so the
 //! pipeline never reopens a mutable database pathname.
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use url::{Host, Url};
 
+use super::airplay_sender::OpenCancel;
 use super::cast_http_server::{CastHttpServer, UpstreamMediaClient};
 use crate::architecture::media::ResolvedHttpRequest;
 use crate::http_security::{classify_media_uri, MediaUriSecurity};
@@ -25,24 +27,69 @@ const MEDIA_PREPARATION_FAILED: &str = "protected media preparation failed";
 /// Deliberately not `Debug`: the direct variant is credential-free by
 /// classification, while the protected variant owns the proxy that retains
 /// the original authenticated URL.
-pub(super) enum PreparedGstreamerMedia {
+///
+/// The media carries the **preparation generation** it was minted under. An
+/// in-flight registration is accepted only while the proxy still owns that
+/// generation, so a superseded prepared load can never overwrite a newer
+/// load's authorization — the generation is the scheduling watermark, not a
+/// slot that supersession clears (review T4, review U4).
+pub(super) struct PreparedGstreamerMedia {
+    kind: PreparedMediaKind,
+    generation: Arc<PreparationGeneration>,
+}
+
+enum PreparedMediaKind {
     Direct(String),
     Protected(Arc<GstreamerMediaTicket>),
 }
 
 impl PreparedGstreamerMedia {
+    fn direct(uri: String, generation: Arc<PreparationGeneration>) -> Self {
+        Self {
+            kind: PreparedMediaKind::Direct(uri),
+            generation,
+        }
+    }
+
+    fn protected(
+        ticket: Arc<GstreamerMediaTicket>,
+        generation: Arc<PreparationGeneration>,
+    ) -> Self {
+        Self {
+            kind: PreparedMediaKind::Protected(ticket),
+            generation,
+        }
+    }
+
     pub(super) fn uri(&self) -> &str {
-        match self {
-            Self::Direct(uri) => uri,
-            Self::Protected(ticket) => ticket.uri(),
+        match &self.kind {
+            PreparedMediaKind::Direct(uri) => uri,
+            PreparedMediaKind::Protected(ticket) => ticket.uri(),
         }
     }
 
     pub(super) fn ticket(&self) -> Option<Arc<GstreamerMediaTicket>> {
-        match self {
-            Self::Direct(_) => None,
-            Self::Protected(ticket) => Some(Arc::clone(ticket)),
+        match &self.kind {
+            PreparedMediaKind::Direct(_) => None,
+            PreparedMediaKind::Protected(ticket) => Some(Arc::clone(ticket)),
         }
+    }
+
+    /// The preparation generation this media was minted under. An in-flight
+    /// registration binds to it, so a load whose preparation was superseded
+    /// registers nothing (review T4, review U4).
+    pub(super) fn generation(&self) -> &Arc<PreparationGeneration> {
+        &self.generation
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_direct(&self) -> bool {
+        matches!(self.kind, PreparedMediaKind::Direct(_))
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_protected(&self) -> bool {
+        matches!(self.kind, PreparedMediaKind::Protected(_))
     }
 }
 
@@ -64,18 +111,40 @@ impl GstreamerMediaTicket {
     pub(super) fn revoke(&self) {
         self.server.revoke_playback_routes();
     }
+
+    /// Test-only: the number of live playback routes this ticket's loopback
+    /// server currently has registered, so a terminal-release regression can
+    /// assert the route was actually revoked (not merely unreferenced).
+    #[cfg(test)]
+    pub(super) fn route_count(&self) -> usize {
+        self.server.registered_route_count()
+    }
 }
 
 struct ProxyState {
     runtime: Option<tokio::runtime::Handle>,
     active: Option<Arc<GstreamerMediaTicket>>,
+    /// Recovery custody, keyed by the ticket's pointer identity. A ticket
+    /// whose open is in flight or whose recovery is outstanding is moved here
+    /// instead of being revoked, so a replacement load's supersession can never
+    /// invalidate a route the still-running open needs (review F2, F3). Each
+    /// entry is released only by the identity-bound `take_and_release`.
+    custody: HashMap<usize, Arc<GstreamerMediaTicket>>,
+    /// In-flight `open_session` cancellation handles, keyed by the load's
+    /// `open_id` — never a single slot — so teardown reaches the exact load it
+    /// supersedes and a guard's `Drop` removes only its own entry (review F2).
+    inflight: HashMap<u64, OpenCancel>,
+    /// The load id currently authorized to negotiate. Cleared by any
+    /// supersession so a registration that loses the prepare-to-open race
+    /// observes it and installs nothing.
+    current_open: Option<u64>,
     /// Identity of the newest load or explicit revocation. An in-flight
     /// server start may install its ticket only while it still owns this
     /// generation.
     generation: Arc<PreparationGeneration>,
 }
 
-struct PreparationGeneration;
+pub(super) struct PreparationGeneration;
 
 /// Stateful last-mile resolver shared by local and AirPlay outputs.
 pub(super) struct GstreamerMediaProxy {
@@ -95,6 +164,9 @@ impl GstreamerMediaProxy {
             state: Mutex::new(ProxyState {
                 runtime,
                 active: None,
+                custody: HashMap::new(),
+                inflight: HashMap::new(),
+                current_open: None,
                 generation: Arc::new(PreparationGeneration),
             }),
             upstream: upstream.ok(),
@@ -178,7 +250,8 @@ impl GstreamerMediaProxy {
         let (previous, runtime) = {
             let mut state = self.lock_state();
             state.generation = Arc::clone(&generation);
-            (state.active.take(), state.runtime.clone())
+            let previous = Self::retire_active_locked(&mut state);
+            (previous, state.runtime.clone())
         };
         if let Some(previous) = previous {
             previous.revoke();
@@ -197,7 +270,7 @@ impl GstreamerMediaProxy {
             ticket.revoke();
             return Err(MEDIA_PREPARATION_FAILED);
         }
-        Ok(PreparedGstreamerMedia::Protected(ticket))
+        Ok(PreparedGstreamerMedia::protected(ticket, generation))
     }
 
     fn prepare_resolved_with_server_start<F>(
@@ -217,7 +290,8 @@ impl GstreamerMediaProxy {
         let (previous, runtime) = {
             let mut state = self.lock_state();
             state.generation = Arc::clone(&generation);
-            (state.active.take(), state.runtime.clone())
+            let previous = Self::retire_active_locked(&mut state);
+            (previous, state.runtime.clone())
         };
 
         if let Some(previous) = previous {
@@ -239,7 +313,7 @@ impl GstreamerMediaProxy {
             ticket.revoke();
             return Err(MEDIA_PREPARATION_FAILED);
         }
-        Ok(PreparedGstreamerMedia::Protected(ticket))
+        Ok(PreparedGstreamerMedia::protected(ticket, generation))
     }
 
     fn prepare_with_server_start<F>(
@@ -255,11 +329,12 @@ impl GstreamerMediaProxy {
         let (previous, runtime) = {
             let mut state = self.lock_state();
             state.generation = Arc::clone(&generation);
+            let previous = Self::retire_active_locked(&mut state);
             let runtime = match &classification {
                 MediaUriSecurity::Protected(_) => state.runtime.clone(),
                 MediaUriSecurity::Direct | MediaUriSecurity::Reject => None,
             };
-            (state.active.take(), runtime)
+            (previous, runtime)
         };
 
         // Revocation and server startup may both touch runtime-owned state.
@@ -273,7 +348,10 @@ impl GstreamerMediaProxy {
         match classification {
             MediaUriSecurity::Direct => {
                 if self.is_current_generation(&generation) {
-                    Ok(PreparedGstreamerMedia::Direct(raw_uri.to_string()))
+                    Ok(PreparedGstreamerMedia::direct(
+                        raw_uri.to_string(),
+                        generation,
+                    ))
                 } else {
                     Err(MEDIA_PREPARATION_FAILED)
                 }
@@ -293,21 +371,24 @@ impl GstreamerMediaProxy {
                     ticket.revoke();
                     return Err(MEDIA_PREPARATION_FAILED);
                 }
-                Ok(PreparedGstreamerMedia::Protected(ticket))
+                Ok(PreparedGstreamerMedia::protected(ticket, generation))
             }
         }
     }
 
-    /// Revoke and release the current ticket, if any.
+    /// Revoke and release the current ticket, if any. When an open is in
+    /// flight the route is preserved in keyed custody and its registered handle
+    /// is cancelled instead, so Stop never invalidates a route the running open
+    /// still needs (review F2).
     pub(super) fn revoke(&self) {
-        let active = {
+        let previous = {
             let mut state = self.lock_state();
             // Stop/teardown also supersedes a server start that has released
             // the mutex but has not installed its ticket yet.
             state.generation = Arc::new(PreparationGeneration);
-            state.active.take()
+            Self::retire_active_locked(&mut state)
         };
-        if let Some(ticket) = active {
+        if let Some(ticket) = previous {
             ticket.revoke();
         }
     }
@@ -316,7 +397,11 @@ impl GstreamerMediaProxy {
     ///
     /// The identity check is the stale-callback guard. A superseded callback
     /// still owns a dedicated server and is free to revoke that server
-    /// directly, but it must not clear the proxy's newer active lease.
+    /// directly, but it must not clear the proxy's newer active lease. Unlike
+    /// [`Self::take_and_release`] this does **not** remove a recovery-custody
+    /// entry, so it is reserved for paths that never move a ticket into custody;
+    /// the GStreamer session's terminal paths use the identity-bound release
+    /// (review T4).
     pub(super) fn revoke_if_current(&self, ticket: &Arc<GstreamerMediaTicket>) {
         let active = {
             let mut state = self.lock_state();
@@ -341,12 +426,139 @@ impl GstreamerMediaProxy {
         }
     }
 
+    /// Register `cancel` for the duration of one `open_session`, keyed by
+    /// `open_id`, **bound to the preparation generation** the media was minted
+    /// under (review T4, review U4).
+    ///
+    /// Superseded-checked on identity, not on a slot that supersession clears:
+    /// the load is accepted only while the proxy still owns `generation`. A
+    /// delayed worker whose preparation was already superseded (a replacement
+    /// preparation, a Stop, or the proxy's `Drop`) therefore installs nothing
+    /// and reports it, so the open yields `Cancelled` without negotiating.
+    ///
+    /// The registration must be taken **before scheduling the worker**, so a
+    /// replacement preparation that runs after this sees the load counted
+    /// in-flight and preserves its route in custody instead of revoking it.
+    pub(super) fn register_in_flight_cancel(
+        self: &Arc<Self>,
+        open_id: u64,
+        generation: &Arc<PreparationGeneration>,
+        cancel: &OpenCancel,
+    ) -> InFlightCancelRegistration {
+        let installed = {
+            let mut state = self.lock_state();
+            if !Arc::ptr_eq(&state.generation, generation) {
+                false
+            } else {
+                state.current_open = Some(open_id);
+                state.inflight.insert(open_id, cancel.clone());
+                true
+            }
+        };
+        InFlightCancelRegistration {
+            proxy: Arc::clone(self),
+            open_id,
+            installed,
+        }
+    }
+
+    /// Move `ticket` off the active lease into keyed recovery custody, so a
+    /// replacement load cannot revoke it before its recovery is terminal
+    /// (review F3). Idempotent for the same ticket.
+    pub(super) fn move_to_recovery_custody(&self, ticket: &Arc<GstreamerMediaTicket>) {
+        let key = Arc::as_ptr(ticket) as usize;
+        let mut state = self.lock_state();
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, ticket))
+        {
+            state.active = None;
+        }
+        state
+            .custody
+            .entry(key)
+            .or_insert_with(|| Arc::clone(ticket));
+    }
+
+    /// Release `ticket` from whichever structure holds it, identity-bound:
+    /// removes its custody entry (or its own active lease), revokes the route
+    /// and drops the taken handle so a custodied server is shut down. Never
+    /// touches another load's ticket or recovery entry (review F2, F3).
+    pub(super) fn take_and_release(&self, ticket: &Arc<GstreamerMediaTicket>) {
+        let key = Arc::as_ptr(ticket) as usize;
+        let taken = {
+            let mut state = self.lock_state();
+            if let Some(entry) = state.custody.remove(&key) {
+                Some(entry)
+            } else if state
+                .active
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, ticket))
+            {
+                state.active.take()
+            } else {
+                None
+            }
+        };
+        if let Some(taken) = taken {
+            taken.revoke();
+            drop(taken);
+        } else {
+            // Not in any proxy structure — already superseded or stale. Still
+            // revoke this ticket's own route so the loopback server is shut
+            // down; dropping the caller's handle then releases the server
+            // (review S5).
+            ticket.revoke();
+        }
+    }
+
+    /// `true` while `ticket` is held in recovery custody.
+    #[cfg(test)]
+    pub(super) fn is_custodied(&self, ticket: &Arc<GstreamerMediaTicket>) -> bool {
+        self.lock_state()
+            .custody
+            .contains_key(&(Arc::as_ptr(ticket) as usize))
+    }
+
+    /// `true` while any ticket holds the active lease.
+    #[cfg(test)]
+    pub(super) fn has_active_lease(&self) -> bool {
+        self.lock_state().active.is_some()
+    }
+
+    /// `true` while any ticket is held in recovery custody.
+    #[cfg(test)]
+    pub(super) fn has_custody_entries(&self) -> bool {
+        !self.lock_state().custody.is_empty()
+    }
+
+    /// Retire the superseded active lease at the start of a new preparation or
+    /// explicit teardown. When an open is in flight, preserve its route in
+    /// keyed recovery custody and cancel its registered handle — never revoke a
+    /// route the running open needs (review F2). Otherwise revoke as before, so
+    /// ordinary replacement semantics are unchanged.
+    fn retire_active_locked(state: &mut ProxyState) -> Option<Arc<GstreamerMediaTicket>> {
+        state.current_open = None;
+        if state.inflight.is_empty() {
+            state.active.take()
+        } else {
+            if let Some(active) = state.active.take() {
+                let key = Arc::as_ptr(&active) as usize;
+                state.custody.entry(key).or_insert(active);
+            }
+            for cancel in state.inflight.values() {
+                cancel.cancel();
+            }
+            None
+        }
+    }
+
     fn lock_state(&self) -> MutexGuard<'_, ProxyState> {
         self.state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     }
-
     fn is_current_generation(&self, generation: &Arc<PreparationGeneration>) -> bool {
         Arc::ptr_eq(&self.lock_state().generation, generation)
     }
@@ -372,8 +584,36 @@ impl Drop for GstreamerMediaProxy {
             .state
             .get_mut()
             .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(ticket) = state.active.take() {
+        // An in-flight open's route is preserved in custody (and never revoked
+        // early); otherwise the active lease is revoked as before. Custody
+        // entries themselves drop with the map, releasing their retained
+        // servers once the last handle drops.
+        let previous = Self::retire_active_locked(state);
+        if let Some(ticket) = previous {
             ticket.revoke();
+        }
+    }
+}
+
+/// RAII registration of one in-flight `open_session`. Its `Drop` removes only
+/// its own keyed entry — never a concurrent load's. `is_superseded` is true
+/// when the load lost the prepare-to-open race and installed nothing.
+pub(super) struct InFlightCancelRegistration {
+    proxy: Arc<GstreamerMediaProxy>,
+    open_id: u64,
+    installed: bool,
+}
+
+impl InFlightCancelRegistration {
+    pub(super) fn is_superseded(&self) -> bool {
+        !self.installed
+    }
+}
+
+impl Drop for InFlightCancelRegistration {
+    fn drop(&mut self) {
+        if self.installed {
+            self.proxy.lock_state().inflight.remove(&self.open_id);
         }
     }
 }
@@ -601,7 +841,7 @@ mod tests {
         let request = ResolvedHttpRequest::new(endpoint.clone()).expect("resolved request");
 
         let prepared = proxy.prepare_resolved(request).expect("typed media ticket");
-        assert!(matches!(&prepared, PreparedGstreamerMedia::Protected(_)));
+        assert!(prepared.is_protected());
         assert!(prepared.ticket().is_some());
         assert_ne!(prepared.uri(), endpoint.as_str());
         assert!(!prepared.uri().contains("music.test"));
@@ -646,6 +886,187 @@ mod tests {
     }
 
     #[test]
+    fn recovery_custody_preserves_the_route_and_releases_by_identity() {
+        let runtime = runtime();
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let (_root, media) = authorized_local_media();
+        let prepared = proxy
+            .prepare_local_with_server_start(media, |handle| {
+                Ok(CastHttpServer::detached_for_test(
+                    handle,
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 46_100)),
+                ))
+            })
+            .expect("prepare authorized local media");
+        let ticket = prepared.ticket().expect("local media ticket");
+        assert_eq!(ticket.server.registered_route_count(), 1);
+
+        // Recovery custody moves the route off the active lease, so a
+        // replacement load's supersession cannot invalidate it (review F3).
+        proxy.move_to_recovery_custody(&ticket);
+        assert!(proxy.is_custodied(&ticket));
+        assert!(!proxy.has_active_lease());
+        assert_eq!(ticket.server.registered_route_count(), 1);
+
+        // Release is identity-bound and shuts the route down; the S5 terminal
+        // cleanup empties custody as well as the active lease.
+        proxy.take_and_release(&ticket);
+        assert!(!proxy.is_custodied(&ticket));
+        assert!(!proxy.has_custody_entries());
+        assert!(!proxy.has_active_lease());
+        assert_eq!(ticket.server.registered_route_count(), 0);
+    }
+
+    /// S5: `take_and_release` is the single identity-bound release. A stale
+    /// ticket that is in neither the active lease nor custody revokes only its
+    /// own route and never clears a newer load's active lease.
+    #[test]
+    fn take_and_release_is_identity_bound_for_a_stale_ticket() {
+        let runtime = runtime();
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let (_root, media) = authorized_local_media();
+        let first = proxy
+            .prepare_local_with_server_start(media, |handle| {
+                Ok(CastHttpServer::detached_for_test(
+                    handle,
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 46_200)),
+                ))
+            })
+            .expect("prepare first local media");
+        let stale = first.ticket().expect("first ticket");
+
+        let request = ResolvedHttpRequest::new(
+            Url::parse("https://music.test/clean/track.flac").expect("endpoint"),
+        )
+        .expect("resolved request");
+        let second = proxy.prepare_resolved(request).expect("second ticket");
+        let active = second.ticket().expect("second ticket");
+
+        // The first ticket was retired by the replacement, so it is stale.
+        assert!(!proxy.is_custodied(&stale));
+        assert_eq!(stale.server.registered_route_count(), 0);
+
+        // Releasing the stale ticket must not touch the newer active lease.
+        proxy.take_and_release(&stale);
+        assert!(proxy.has_active_lease());
+        assert_eq!(active.server.registered_route_count(), 1);
+
+        proxy.take_and_release(&active);
+        assert!(!proxy.has_active_lease());
+        assert_eq!(active.server.registered_route_count(), 0);
+    }
+
+    #[test]
+    fn replacement_preparation_custodies_an_inflight_route_instead_of_revoking() {
+        let runtime = runtime();
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let (_root, media) = authorized_local_media();
+        let prepared = proxy
+            .prepare_local_with_server_start(media, |handle| {
+                Ok(CastHttpServer::detached_for_test(
+                    handle,
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 46_101)),
+                ))
+            })
+            .expect("prepare authorized local media");
+        let inflight = prepared.ticket().expect("local media ticket");
+
+        let cancel = OpenCancel::new();
+        let generation = Arc::clone(prepared.generation());
+        let registration = proxy.register_in_flight_cancel(7, &generation, &cancel);
+        assert!(!registration.is_superseded());
+
+        // Replacement preparation lands while the open is registered: the
+        // still-active route is preserved in custody and the registered handle
+        // is cancelled, never revoked (review F2/F3).
+        let request = ResolvedHttpRequest::new(
+            Url::parse("https://music.test/clean/track.flac").expect("endpoint"),
+        )
+        .expect("resolved request");
+        let replacement = proxy.prepare_resolved(request).expect("replacement ticket");
+        assert!(proxy.is_custodied(&inflight));
+        assert!(cancel.is_cancelled());
+        assert_eq!(inflight.server.registered_route_count(), 1);
+
+        proxy.take_and_release(&inflight);
+        assert!(!proxy.is_custodied(&inflight));
+        drop(registration);
+        drop(replacement);
+    }
+
+    /// U4: registration is bound to the prepared generation, so a load whose
+    /// preparation was superseded before it registered installs nothing and
+    /// cannot negotiate on a revoked prepared route.
+    #[test]
+    fn a_superseded_registration_installs_nothing() {
+        let runtime = runtime();
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let (_root, media) = authorized_local_media();
+        let older = proxy
+            .prepare_local_with_server_start(media, |handle| {
+                Ok(CastHttpServer::detached_for_test(
+                    handle,
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 46_150)),
+                ))
+            })
+            .expect("prepare older local media");
+        let generation = Arc::clone(older.generation());
+        let cancel = OpenCancel::new();
+        // A replacement preparation supersedes the older load before it
+        // registers.
+        let request = ResolvedHttpRequest::new(
+            Url::parse("https://music.test/clean/track.flac").expect("endpoint"),
+        )
+        .expect("resolved request");
+        let _replacement = proxy.prepare_resolved(request).expect("replacement ticket");
+        let registration = proxy.register_in_flight_cancel(11, &generation, &cancel);
+        assert!(registration.is_superseded());
+        assert!(!cancel.is_cancelled());
+    }
+
+    /// U4: registration is identity-bound to the preparation generation, not a
+    /// slot that supersession clears. A delayed worker for a superseded
+    /// preparation cannot install itself over a newer load's authorization.
+    #[test]
+    fn a_stale_registration_cannot_overwrite_a_newer_authorization() {
+        let runtime = runtime();
+        let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
+        let (_root, media) = authorized_local_media();
+        let older = proxy
+            .prepare_local_with_server_start(media, |handle| {
+                Ok(CastHttpServer::detached_for_test(
+                    handle,
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 46_160)),
+                ))
+            })
+            .expect("prepare older local media");
+        let older_generation = Arc::clone(older.generation());
+
+        let request = ResolvedHttpRequest::new(
+            Url::parse("https://music.test/clean/track.flac").expect("endpoint"),
+        )
+        .expect("resolved request");
+        let newer = proxy.prepare_resolved(request).expect("newer ticket");
+        let newer_generation = Arc::clone(newer.generation());
+
+        let stale_cancel = OpenCancel::new();
+        assert!(
+            proxy
+                .register_in_flight_cancel(4, &older_generation, &stale_cancel)
+                .is_superseded(),
+            "the stale load must not be authorized"
+        );
+        let newer_cancel = OpenCancel::new();
+        assert!(
+            !proxy
+                .register_in_flight_cancel(9, &newer_generation, &newer_cancel)
+                .is_superseded(),
+            "the newer load must keep its authorization"
+        );
+        assert!(!stale_cancel.is_cancelled());
+    }
+
+    #[test]
     fn delayed_typed_startup_cannot_replace_a_newer_load() {
         let runtime = runtime();
         let proxy = Arc::new(GstreamerMediaProxy::new(Some(runtime.handle().clone())));
@@ -674,7 +1095,7 @@ mod tests {
         let newer = proxy
             .prepare("https://radio.test/live.mp3")
             .expect("newer direct load");
-        assert!(matches!(newer, PreparedGstreamerMedia::Direct(_)));
+        assert!(newer.is_direct());
         release_startup_tx.send(()).expect("finish startup");
         assert_eq!(
             older.join().expect("typed preparation thread").err(),

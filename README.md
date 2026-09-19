@@ -696,13 +696,87 @@ Open **Preferences** from the hamburger menu (☰) to:
 
 ## AirPlay roadmap
 
-Legacy RAOP receivers are discovered today, but Tributary's AirPlay 1 path is only an integration
-seam for a GStreamer element named `raopsink`. Current official GStreamer, Homebrew, and MSYS2
-packages do not ship that element, so supported builds report AirPlay 1 as unavailable. AirPlay 2
-receivers (HomePod, recent Apple TVs, and AirPlay-2-certified third-party speakers) advertise via
-`_airplay._tcp.local.` and are also detected, but remain filtered out because AirPlay 2 needs a
-different sender protocol stack. Both paths need a maintained sender implementation and
-real-device validation.
+AirPlay sending runs behind a GStreamer-independent sender seam and can use a maintained
+OwnTone 29.x daemon (29.3 or newer; older releases and later major versions are refused
+as unverified) as its transport when explicitly configured
+(`TRIBUTARY_AIRPLAY_SENDER=owntone`, alongside the dedicated instance's
+`TRIBUTARY_OWNTONE_API`, `TRIBUTARY_OWNTONE_PIPE`, and `TRIBUTARY_OWNTONE_STATE_DIR`).
+`TRIBUTARY_OWNTONE_BIN` names the daemon binary and defaults to `/usr/bin/owntone`; set it
+whenever OwnTone is installed elsewhere (for example `/usr/sbin/owntone`), because the
+ownership record below must name the same binary. The
+adapter maps the selected receiver to the daemon by its retained device identifier — never
+by display name — and restores the daemon's pre-takeover output set when the session ends.
+
+The dedicated instance must carry an **ownership record** before the adapter will touch
+it: `probe()` refuses every load until `<TRIBUTARY_OWNTONE_STATE_DIR>/.tributary-owner`
+exists and binds the instance to exactly the endpoint, pipe, state directory and binary
+Tributary is configured with. The installation step that provisions the dedicated
+instance writes it once as JSON:
+
+```json
+{
+  "token": "tributary-airplay-owntone-v1",
+  "api_base": "http://127.0.0.1:3690",
+  "pipe_path": "/absolute/path/to/dedicated-input/airplay.pcm",
+  "state_dir": "/home/user/.local/state/tributary-owntone",
+  "binary": "/usr/sbin/owntone",
+  "restart_command": "systemctl --user restart tributary-owntone.service"
+}
+```
+
+`token` is the literal string above (a foreign or hand-edited value is refused, and a
+matching token cannot authorize an instance whose `api_base`, `pipe_path`, `state_dir`
+or `binary` differ from the configured ones — `TRIBUTARY_OWNTONE_API`,
+`TRIBUTARY_OWNTONE_PIPE`, `TRIBUTARY_OWNTONE_STATE_DIR` and the daemon binary
+(`TRIBUTARY_OWNTONE_BIN`, or `/usr/bin/owntone` when unset) must match the record byte
+for byte; the example above therefore needs `TRIBUTARY_OWNTONE_BIN=/usr/sbin/owntone`).
+`pipe_path` is the FIFO described under the library configuration below: a non-hidden
+`.pcm` file that is a direct child of the scanned directory. `restart_command` is optional: when the
+instance runs under a supervisor, put its restart invocation here so the adapter can
+bring the daemon back after it terminates a stuck instance; when absent, the adapter
+waits for the environment to restart the instance on its own. The adapter also keeps a
+runtime file next to it, `.tributary-takeover.json`, which records the daemon's
+pre-takeover output set for restoration; it is managed by Tributary and must not be
+created or edited by hand.
+When `TRIBUTARY_AIRPLAY_SENDER` is unset, the default is the GStreamer `raopsink` adapter,
+which is probe-gated: AirPlay 1 is offered only when a usable `raopsink` element is found.
+When the variable selects `owntone` on a target with no supported OwnTone acquisition path
+(the binary today limits that path to x86_64 Linux; Debian/Ubuntu amd64 is the documented
+package, and other x86_64 Linux builds are not fail-closed by the binary), the selected
+adapter refuses with a localized reason — it never falls back to `raopsink`. In both cases
+AirPlay 1 reports unavailable rather than silently using another sender: current official
+GStreamer, Homebrew, and MSYS2 packages still do not ship the `raopsink` element, and the
+`raopsink` adapter stays probe-gated for
+user-supplied elements. AirPlay 2 receivers (HomePod, recent Apple TVs, and
+AirPlay-2-certified third-party speakers) advertise via `_airplay._tcp.local.` and are
+detected, but remain filtered out until a path that can actually play to them ships. Both
+the OwnTone path and the eventual AirPlay 2 path need real-device validation.
+
+The dedicated OwnTone instance must use `<state_dir>/owntone.conf` via its explicit
+`-c`/`--config` launch option. Its input configuration uses OwnTone's library scanner:
+
+```conf
+library {
+    directories = { "/absolute/path/to/dedicated-input" }
+    pipe_autostart = true
+    pipe_sample_rate = 44100
+    pipe_bits_per_sample = 16
+}
+```
+
+Set `TRIBUTARY_OWNTONE_PIPE` to a direct child of that directory, such as
+`/absolute/path/to/dedicated-input/airplay.pcm`. Provision that directory and the
+FIFO for the dedicated daemon user. OwnTone has no `pipe_path` configuration key.
+The FIFO must be scanned before playback. Tributary sends PCM to trigger pipe
+autostart and reports Playing only after the daemon confirms playback. If the
+pipe cannot autostart, the load fails and the dedicated instance is restored.
+The authority check accepts a conservative subset: one absolute scanned directory,
+a non-hidden `.pcm` FIFO without a symlink, enabled scanning and autostart, 44.1 kHz
+16-bit samples, and no nonempty ignore filters. Additional library options are limited
+to `name`, `port`, `password`, and `follow_symlinks`; includes, expansion, escapes,
+duplicate sections/options and titled sections are refused. Existing endpoint,
+process, ownership-record and exclusive-lock requirements still apply. This check
+establishes the configured scan path; it does not certify physical receiver playback.
 
 Sender-side AirPlay 2 support requires, at minimum:
 

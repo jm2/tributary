@@ -1206,5 +1206,7 @@ mod tests {
 
         crate::ui::context_menu::tests::popover_from_menu_model_attaches_a_visible_child_widget();
         crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones();
+        crate::ui::discovery_handler::widget_tests::airplay_loss_removes_only_airplay_rows_at_a_shared_endpoint();
+        crate::ui::discovery_handler::widget_tests::airplay_found_is_not_deduplicated_against_a_chromecast_row();
     }
 }
