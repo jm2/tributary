@@ -6,10 +6,11 @@ representation plus an explicit unsupported-input boundary, for review before
 any behavior changes. It authorizes follow-up implementation beads; it does not
 ship them.
 
-Revision 5 (this head) continues the corrective chain over the independently
+Revision 6 (this head) continues the corrective chain over the independently
 rejected heads `16140be0d03d17c1f299cf7690adea6648722160` (Revision 2),
-`bc49dbe514334e94c081e3156ab97a12df11f066` (Revision 3), and
-`8f1a784f3973b92c05ac72fbca2bc9d7c3af56e4` (Revision 4). Revision 2 withdrew the size/mtime
+`bc49dbe514334e94c081e3156ab97a12df11f066` (Revision 3),
+`8f1a784f3973b92c05ac72fbca2bc9d7c3af56e4` (Revision 4), and
+`76ecfab4bbe8a197d52ecd945e39368852843921` (Revision 5). Revision 2 withdrew the size/mtime
 legacy-adoption rule (F1), made the rollout fail-closed-first so no authority
 consumer is ever exposed to a row it cannot prove (F2), and removed the
 older-binary compatibility claim in favor of an enforced version guard plus a
@@ -31,7 +32,13 @@ refused by the guard, an arbitrary pre-R11 binary only by the
 statement-preparation barrier when its statements name `file_path` (N1) — and
 a successful `down()` must revert both authority markers atomically with the
 table rebuild, so a downgraded database presents as pre-R11 to every
-contract-aware binary (N2).
+contract-aware binary (N2). Revision 6 answers the round-4 review finding
+verified at `76ecfab4` (§13.4): `down()` rebuilds `tracks` over
+`playlist_entries.local_track_id`'s `ON DELETE SET NULL` foreign key exactly as
+`up()` does, so the downgrade — not only the upgrade — must run §4.2's full
+FK-safe rebuild protocol (pre-BEGIN suppression prelude, exact binding-pair
+gate, verified restoration epilogue), and §8 gains the down()-grain
+preservation test counterpart (j9R3F).
 §13 is the finding-to-revision map. No behavior changes: every
 revision makes the contract stricter, not more permissive.
 
@@ -465,7 +472,27 @@ supported downgrade is the migration's `down()`, which restores the `file_path`
 column name and refuses whenever any row would be left ambiguous under the old
 schema — any non-`NULL` `native_path` whose decoded bytes differ from its
 display text, or any state-0/3 row — matching the `drop_if_lossless` refusal
-pattern of migration 20. `down()` is transactional and idempotent, and it must
+pattern of migration 20.
+
+**The downgrade rebuild runs the same preservation protocol as the upgrade.**
+`down()` rebuilds `tracks` on its own dedicated migration connection — the same
+drop/rename window as §4.2 — and while it does,
+`playlist_entries.local_track_id` still references `tracks(id)` with
+`ON DELETE SET NULL` (`fk_entry_local_track`, §2.1). A downgrade rebuild that
+runs with foreign-key enforcement active on the migration connection therefore
+fires `ON DELETE SET NULL` against every populated playlist binding —
+permanently detaching entries from their tracks — and the damage is invisible
+to `PRAGMA foreign_key_check`, because a NULL binding is legal (§4.2).
+Transactional and idempotent is not enough: `down()` and its dedicated
+migration connection must execute the same preservation protocol `up()` does
+(§4.2 steps 0, 5, and 8) — the connection-level prelude (`PRAGMA foreign_keys
+= OFF` issued before `BEGIN`, with a verified read-back that aborts closed
+before any write when it does not read `0`), the exact
+`(playlist_entries.id, local_track_id)` binding-pair snapshot taken before the
+drop and the same pair-set equality gate re-verified against the rebuilt table
+before `COMMIT`, and the verified restoration epilogue that restores
+`PRAGMA foreign_keys` to its recorded prior value on the success, error, and
+panic paths alike. `down()` is transactional and idempotent, and it must
 also revert the authority markers: `up()` writes the `schema_capabilities`
 authority singleton row and the mirrored `PRAGMA user_version` **last** inside
 its transaction (§4.2 step 6), so a successful `down()` deletes that singleton
@@ -480,9 +507,14 @@ the `schema_capabilities` marker write all execute in a single transaction
 (§4.2 steps 1–7). The connection-level foreign-key prelude and epilogue sit
 outside that transaction by necessity: the suppression must be in effect before
 `BEGIN`, and it is restored — with a verified read-back — after the transaction
-ends, on the success, error, and panic paths alike (§4.2 steps 0 and 8). A
-crash or power loss leaves either the fully pre-migration or the fully
-post-migration schema; the pragma is per-connection state, not stored data, so
+ends, on the success, error, and panic paths alike (§4.2 steps 0 and 8).
+`down()` has the identical structure: its table rebuild and its authority-marker
+reversion execute in a single transaction, and its suppression prelude and
+verified restoration epilogue sit outside that transaction by the same
+necessity, restored on the success, error, and panic paths alike (§4.2 steps 0
+and 8). A crash or power loss leaves either the fully pre-migration or the fully
+post-migration schema — and, for a downgrade, either the fully upgraded or the
+fully downgraded schema; the pragma is per-connection state, not stored data, so
 it never persists into the file. A restart re-runs idempotently. No partially
 activated intermediate schema is observable to a reader.
 
@@ -763,6 +795,26 @@ Required tests:
     a lossy destination and no track rows are retargeted. Reauthorization of
     descendants inside a valid UTF-8 destination root proceeds through the
     native codec as §5.5 specifies.
+15. **Downgrade reference preservation and failure injection (`down()` rebuild
+    gate).** The down()-grain counterpart of Test 13, exercising migration
+    `000021`'s `down()` on a populated-playlist database at the pre-downgrade
+    state — several `tracks` rows whose `native_path` keys decode exactly to
+    their display text (a downgrade must be lossless, so no quarantined or
+    ambiguous row is present; the refusal cases stay in Test 11), live
+    `playlist_entries` rows whose non-`NULL` `local_track_id` values reference
+    them, plus ratings, play counts, and history. Assert after a completed
+    `down()`: exact `(playlist_entries.id, local_track_id)` pair-set equality
+    across the downgrade — no binding became NULL, none was rebound, and no two
+    entries' bindings were swapped — track ids, ratings, play counts, and
+    history are byte-identical, the `file_path` column is restored (§4.5), and
+    `foreign_key_check` is empty. Additionally assert the failure paths at
+    `down()` grain: (a) a connection where `PRAGMA foreign_keys = OFF` does not
+    take effect (read-back not `0`) aborts before `BEGIN` with zero writes; (b)
+    an injected mid-rebuild failure rolls the transaction back to a
+    byte-identical pre-downgrade database with all playlist bindings intact;
+    and (c) the connection epilogue restores foreign-key enforcement with a
+    verified read-back, including when the downgrade body returns an error or
+    panics.
 
 Physical-platform validation remains separate from automated checks: APFS and
 Windows reject invalid-byte filenames, so the end-to-end scan/reproduction is a
@@ -868,7 +920,7 @@ Each acceptance item, with the sections where it is satisfied:
 - Display text separated from authoritative identity (enforced by the column
   rename) — §1, §3.4, §4.1, §4.2, §5, §6.4
 - Preserve IDs/history/ratings/playlists only where exact identity is provable —
-  §2.1, §4.2, §4.3, §5.4, §8.4a, §8.13
+  §2.1, §4.2, §4.3, §5.4, §8.4a, §8.13, §8.15
 - Quarantine ambiguous legacy rows, no guessing (heuristics withdrawn) — §4.3,
   §4.4, §5.4, §8.4a
 - Scanner lookup/reconciliation, migration, playback, tag writes, import/export —
@@ -1106,6 +1158,54 @@ doc-only; labeled N1–N2 to match the findings report.
 Nothing in this revision expands product behavior; every change makes the
 contract stricter. Threads stay unresolved until this head lands and the two
 fixes are independently re-verified.
+
+### 13.4 Revision 6 mapping (round-4 review of `76ecfab4`)
+
+Revision 6 answers the valid unresolved review thread verified in
+`refinery-20260919-76ecfab4-tr-ldhwt-round4/corrective-round4.md` (PR #283 at
+head `76ecfab4bbe8a197d52ecd945e39368852843921`). All corrections are
+doc-only; labeled j9R3F to match the review thread.
+
+#### j9R3F — `down()` was never required to use §4.2's FK-safe rebuild protocol
+
+- **Finding:** §4.5 specified the downgrade only as "transactional and
+  idempotent" with the authority-marker reversion in the same transaction as
+  the table rebuild, and the Rollback/restart paragraph scoped its protocol
+  citation to "§4.2 steps 1–7" — `up()` steps only. Nothing required
+  `down()`'s `tracks` rebuild to use §4.2's preservation protocol. On a
+  populated-playlist database, a downgrade rebuild run with foreign-key
+  enforcement active on the migration connection fires
+  `playlist_entries.local_track_id`'s `ON DELETE SET NULL` (`fk_entry_local_track`,
+  §2.1) and permanently nulls every playlist binding — damage
+  `PRAGMA foreign_key_check` cannot see, because a NULL binding is legal. Test 13
+  (§8.13) asserted the pair-set gate and the suppression failure paths for
+  `up()` only; no down()-grain counterpart existed.
+- **Required correction:** §4.5 must require `down()` and its dedicated
+  migration connection to use the same preservation protocol as `up()` — the
+  pre-BEGIN `PRAGMA foreign_keys = OFF` with verified read-back, the exact
+  `(playlist_entries.id, local_track_id)` binding-pair gate before and after
+  the rebuild, and the verified restoration of `PRAGMA foreign_keys` on the
+  success, error, and panic paths. A down()-grain test counterpart to Test 13
+  must assert, on a populated-playlist database at the pre-downgrade state:
+  pair-set equality across a completed `down()`; that the read-back-not-zero
+  abort leaves zero writes; that an injected mid-rebuild failure rolls back
+  with bindings intact; and that the epilogue restores enforcement even on
+  failure.
+- **Where changed:** added the "The downgrade rebuild runs the same
+  preservation protocol as the upgrade" requirement to §4.5's `down()`
+  paragraph, citing the `ON DELETE SET NULL` hazard and the §4.2 steps 0, 5,
+  and 8 protocol; extended the Rollback/restart paragraph so `down()`'s
+  rebuild shares the single-transaction structure with the prelude/epilogue
+  outside it; added the down()-grain Test 15 to §8.
+- **Validation added:** §8.15 — the `down()` rebuild gate: pair-set equality
+  across a completed `down()` on a populated-playlist database, the
+  read-back-not-zero abort leaving zero writes, the injected mid-rebuild
+  failure rolling back with bindings intact, and the epilogue restoring
+  enforcement with a verified read-back on error and panic paths.
+
+Nothing in this revision expands product behavior; every change makes the
+contract stricter. The thread stays unresolved until this head lands and the
+fix is independently re-verified.
 
 ## Appendix A — Lossy conversion inventory (`src/local/`)
 
