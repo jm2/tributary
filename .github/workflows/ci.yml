@@ -222,6 +222,91 @@ jobs:
           path: target/release/tributary
           if-no-files-found: error
 
+  # ── Real-display GTK production-widget gate (Linux x86_64) ────────────────
+  # Every other job runs headless, where the crate's GTK widget contracts
+  # silently skip (no X/Wayland socket, GTK cannot initialize). This job gives
+  # them a real X display and runs them in fail-on-skip mode, so a skipped
+  # widget body can never masquerade as a pass. GTK is exercised on the single
+  # thread that initializes it; see `src/ui/mod.rs::widget_test_session`.
+  gtk-display-gate:
+    name: GTK Display Gate (Linux x86_64)
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:44
+    steps:
+      - name: Install system dependencies (Fedora)
+        run: |
+          dnf install -y gcc gcc-c++ gtk4-devel libadwaita-devel \
+            dbus-devel \
+            gstreamer1-devel gstreamer1-plugins-base-devel \
+            pkgconf-pkg-config git curl xorg-x11-server-Xvfb
+
+      - uses: actions/checkout@v7
+        with:
+          # The job body runs cargo (and thus third-party build scripts)
+          # inside a container; it never needs Git credentials. Dropping the
+          # persisted token closes the artipacked credential-exposure finding
+          # on this checkout.
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: gtk-gate-cargo-${{ hashFiles('Cargo.lock') }}
+          # No restore-keys fallback here: a literal "keyword: value" line
+          # (e.g. restore-keys: gtk-gate-cargo-) triggers Codacy's gitleaks
+          # generic-api-key secret detection on newly added lines. The exact
+          # hashFiles key above keeps hits stable while Cargo.lock is
+          # unchanged; a lockfile bump simply rebuilds from a cold cache.
+
+      - name: Run production GTK widget contracts on one real display
+        shell: bash
+        env:
+          # Turn a would-be display skip into a hard failure.
+          TRIBUTARY_GTK_GATE: require
+          GDK_BACKEND: x11
+          # Xvfb has no GPU, and GL/Vulkan probing is slow and flaky here.
+          GSK_RENDERER: cairo
+          # Keep the harness output plain so the checks below can match it.
+          CARGO_TERM_COLOR: never
+        run: |
+          set -uo pipefail
+
+          scratch="${RUNNER_TEMP:-${TMPDIR:-/var/tmp}}"
+          log="${scratch}/gtk-display-gate.log"
+          runtime="${scratch}/gtk-runtime"
+          mkdir -p "$runtime"
+          chmod 700 "$runtime"
+          export XDG_RUNTIME_DIR="$runtime"
+
+          rc=0
+          xvfb-run -a --server-args="-screen 0 1280x1024x24" \
+            cargo test --bin tributary \
+              ui::browser::tests::gtk_widget_contracts_hold_on_one_session \
+              -- --exact --nocapture >"$log" 2>&1 || rc=$?
+          cat "$log"
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::cargo test exited $rc under the real-display GTK gate"
+            exit 1
+          fi
+          if ! grep -Eq 'gtk_widget_contracts_hold_on_one_session \.\.\. ok' "$log"; then
+            echo "::error::the production GTK widget contract never reported ok; it was skipped or filtered out"
+            exit 1
+          fi
+          if grep -q 'skipping' "$log"; then
+            echo "::error::a GTK contract skipped even though TRIBUTARY_GTK_GATE=require"
+            exit 1
+          fi
+
   # ── Representative line coverage + ratchet (Linux x86_64) ────────────────
   # This is deliberately a separate, exactly pinned aggregate. Native jobs
   # remain responsible for compiling and testing platform-only code, but they
