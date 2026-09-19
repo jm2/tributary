@@ -3506,10 +3506,14 @@ impl fmt::Debug for LastFmManualPauseRecovery {
 /// Load the exact vault authority and validate every retained row before
 /// exposing an active handle.
 ///
-/// The activation token is validated against the live policy first: if the
-/// issuing generation was superseded (disabled, replaced, or closed) between
-/// issuance and this async call, the start is refused before any vault lease,
-/// credential load, queue validation, or delivery worker can come into play.
+/// The activation token is validated against the live policy twice: before
+/// the vault lease (the live slot at the moment of use, not at issuance) and
+/// again immediately after the lease is held. The lease wait is an await
+/// point the runtime does not control, so a token can be superseded (the
+/// user revokes consent, disables the integration, or a replacement policy
+/// is published) while the start is parked behind another runtime's
+/// lifecycle; the second validation refuses a superseded token after the
+/// wait and before any storage query or credential load can observe it.
 pub async fn spawn_lastfm_runtime(
     activation: LastFmRuntimeActivation,
     live_policy: &LastFmLivePolicy,
@@ -3527,6 +3531,16 @@ pub async fn spawn_lastfm_runtime(
         return Err(LastFmRuntimeStartError::PolicySuperseded);
     }
     let vault_lease = acquire_vault_lifecycle().await;
+    // The lease wait can straddle a policy disable or replacement: re-snapshot
+    // the live slot now that this runtime holds the lease and before any
+    // storage or credential access, so a token superseded during the wait is
+    // refused exactly like one refused before the wait.
+    let leased_generation = live_policy.snapshot();
+    if !leased_generation.consented_and_enabled()
+        || leased_generation.generation() != activation.policy_generation
+    {
+        return Err(LastFmRuntimeStartError::PolicySuperseded);
+    }
     let empty_cleanup_tombstone = storage::has_empty_cleanup_tombstone(&database)
         .await
         .map_err(LastFmRuntimeStartError::from)?;
@@ -4081,6 +4095,119 @@ mod tests {
             store.load_attempts(),
             0,
             "no vault load may happen once the policy check refuses"
+        );
+    }
+
+    /// Drive exactly one poll of a future with a noop waker: this executes
+    /// the future's synchronous prefix — here, the pre-lease policy check and
+    /// the park on the held vault lease — without any scheduler involvement,
+    /// so the ordering between "pre-lease check ran" and "policy moved" is
+    /// deterministic.
+    fn poll_once<F: Future>(future: Pin<&mut F>) -> std::task::Poll<F::Output> {
+        let mut context = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        future.poll(&mut context)
+    }
+
+    /// Hold the process-global vault lease and prepare an unmigrated
+    /// in-memory database for a runtime start polled inside the lease wait.
+    ///
+    /// The database is deliberately left unmigrated: any storage access after
+    /// the lease would surface as a storage error instead of a policy refusal,
+    /// so an asserted [`LastFmRuntimeStartError::PolicySuperseded`] also proves
+    /// the refusal happened before the first storage touch.
+    async fn vault_lease_and_unmigrated_db() -> (LastFmVaultLifecycleLease, DatabaseConnection) {
+        let vault_lease = acquire_vault_lifecycle().await;
+        let unmigrated = Database::connect("sqlite::memory:").await.unwrap();
+        (vault_lease, unmigrated)
+    }
+
+    #[tokio::test]
+    async fn policy_disabled_during_lease_wait_refuses_before_storage_or_credentials() {
+        let live = LastFmLivePolicy::default();
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
+        let Some(activation) = LastFmRuntimeActivation::issue_after_consent_and_enablement(&live)
+        else {
+            panic!("an enabled generation issues the runtime activation");
+        };
+        let store = Arc::new(TestCredentialStore::new(session("lease-wait-listener")));
+        let (vault_lease, unmigrated) = vault_lease_and_unmigrated_db().await;
+        let mut spawn_future = std::pin::pin!(spawn_lastfm_runtime(
+            activation,
+            &live,
+            unmigrated,
+            Arc::clone(&store) as Arc<dyn SessionCredentialStore>,
+            pending_transport(),
+            fixed_clock(),
+        ));
+        // One manual poll drives the synchronous pre-lease check and parks
+        // the start on the lease; Pending proves both happened before the
+        // policy moves — no scheduler involvement, so the ordering is
+        // deterministic.
+        let parked = poll_once(spawn_future.as_mut());
+        assert!(
+            parked.is_pending(),
+            "the runtime start must park on the held vault lease after passing the pre-lease check"
+        );
+
+        // The policy is disabled while the start waits for the lease; the
+        // parked start only re-validates once the lease is released.
+        live.publish(LastFmPolicyGeneration::default());
+        drop(vault_lease);
+
+        let error = spawn_future
+            .await
+            .expect_err("a policy disabled during the lease wait must refuse the start");
+        assert_eq!(error, LastFmRuntimeStartError::PolicySuperseded);
+        assert_eq!(
+            store.load_attempts(),
+            0,
+            "no credential load may happen once the post-lease policy check refuses"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_replacement_during_lease_wait_refuses_before_storage_or_credentials() {
+        let live = LastFmLivePolicy::default();
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
+        let Some(activation) = LastFmRuntimeActivation::issue_after_consent_and_enablement(&live)
+        else {
+            panic!("an enabled generation issues the runtime activation");
+        };
+        let store = Arc::new(TestCredentialStore::new(session(
+            "lease-wait-replacement-listener",
+        )));
+        let (vault_lease, unmigrated) = vault_lease_and_unmigrated_db().await;
+        let mut spawn_future = std::pin::pin!(spawn_lastfm_runtime(
+            activation,
+            &live,
+            unmigrated,
+            Arc::clone(&store) as Arc<dyn SessionCredentialStore>,
+            pending_transport(),
+            fixed_clock(),
+        ));
+        // One manual poll drives the synchronous pre-lease check and parks
+        // the start on the lease; Pending proves both happened before the
+        // policy moves — no scheduler involvement, so the ordering is
+        // deterministic.
+        let parked = poll_once(spawn_future.as_mut());
+        assert!(
+            parked.is_pending(),
+            "the runtime start must park on the held vault lease after passing the pre-lease check"
+        );
+
+        // A replacement generation is consented and enabled, but it is not
+        // the generation that minted the frozen activation token.
+        live.publish(LastFmPolicyGeneration::for_test(2, HashSet::new()));
+        drop(vault_lease);
+
+        let error = spawn_future
+            .await
+            .expect_err("a replaced policy must refuse a token from the old generation");
+        assert_eq!(error, LastFmRuntimeStartError::PolicySuperseded);
+        assert_eq!(
+            store.load_attempts(),
+            0,
+            "no credential load may happen once the post-lease policy check refuses"
         );
     }
 
