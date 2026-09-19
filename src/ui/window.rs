@@ -37,8 +37,8 @@ use super::persistence::{
 use super::playback::{
     admit_history_credit, advance_track, advance_track_from_user, format_ms, play_or_start,
     play_track_at, previous_or_restart_from_user, refresh_projected_library_uris, replay_current,
-    stop_playback, toggle_or_start, BufferingTracker, PlaybackContext, PlaybackSession,
-    QueueTrackRefresh, PLAYLIST_SOURCE_PREFIX,
+    retry_pending_history_credit_before_transition, stop_playback, toggle_or_start,
+    BufferingTracker, PlaybackContext, PlaybackSession, QueueTrackRefresh, PLAYLIST_SOURCE_PREFIX,
 };
 use super::preferences;
 use super::root_trust;
@@ -3266,6 +3266,16 @@ pub(crate) fn build_window(
                         buffering_tracker.invalidate();
                         play_btn.set_child(Option::<&gtk::Widget>::None);
                         let mode = repeat_mode.get();
+
+                        // Last delivery chance before the transition retires
+                        // the occurrence: a play qualified at EOS and refused
+                        // during overload has no later sample to re-earn
+                        // through once this branch replays, advances, or
+                        // clears (PR #286 round-4 finding j9j83).
+                        retry_pending_history_credit_before_transition(
+                            &playback_history_commands,
+                            &playback_session,
+                        );
 
                         // Repeat-one: replay the same track.
                         if mode == RepeatMode::One
