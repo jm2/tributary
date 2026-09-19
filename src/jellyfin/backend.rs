@@ -447,13 +447,13 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
                     // Same authority as the full sync: the item's container
                     // from library metadata labels the stream, so a
                     // search-discovered track resolves to the same
-                    // representation it would have after a sync.
-                    representations.push((
-                        track_id.clone(),
-                        MediaRepresentation::buffered_from_suffix(
-                            item.container.as_deref().unwrap_or(""),
-                        ),
-                    ));
+                    // representation it would have after a sync. The raw
+                    // descriptor is carried to the cache write: a present
+                    // container replaces the cached representation, while an
+                    // absent one must not overwrite a known descriptor with
+                    // unknown — only a search-only track gets the explicit
+                    // unknown seeded.
+                    representations.push((track_id.clone(), item.container.clone()));
                     track_artwork_locators.push((track_id.clone(), item.album_id.clone()));
                     tracks.push(jellyfin_item_to_track(
                         item, track_id, uuid, artist_id, album_id,
@@ -490,7 +490,25 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
 
         let mut cache = self.cache.write().await;
         cache.stream_locator_by_track_id.extend(stream_locators);
-        cache.representation_by_track_id.extend(representations);
+        for (track_id, container) in representations {
+            match container
+                .as_deref()
+                .filter(|container| !container.is_empty())
+            {
+                Some(container) => {
+                    cache.representation_by_track_id.insert(
+                        track_id,
+                        MediaRepresentation::buffered_from_suffix(container),
+                    );
+                }
+                None => {
+                    cache
+                        .representation_by_track_id
+                        .entry(track_id)
+                        .or_insert_with(MediaRepresentation::buffered_unknown);
+                }
+            }
+        }
         for (track_id, artwork_item_id) in track_artwork_locators {
             if let Some(artwork_item_id) = artwork_item_id {
                 cache
@@ -807,6 +825,15 @@ mod tests {
                         "AlbumArtist": "Fixture Artist",
                         "ArtistItems": [{"Id": "artist-1", "Name": "Fixture Artist"}],
                         "UserData": {"Rating": 4.26}
+                    },
+                    {
+                        "Id": "track-1",
+                        "Name": "Fixture Song",
+                        "Type": "Audio",
+                        "Album": "Fixture Album",
+                        "AlbumId": "album-1",
+                        "AlbumArtist": "Fixture Artist",
+                        "ArtistItems": [{"Id": "artist-1", "Name": "Fixture Artist"}]
                     }],
                     "TotalRecordCount": 1
                 }))),
@@ -836,7 +863,7 @@ mod tests {
         drop(cache);
 
         let search = backend.search("Fixture", 10).await.expect("search fixture");
-        assert_eq!(search.tracks.len(), 1);
+        assert_eq!(search.tracks.len(), 2);
         assert_eq!(
             search.tracks[0].rating,
             TrackRating::read_only(Some(Rating::new(43).unwrap()))
@@ -855,6 +882,23 @@ mod tests {
             resolved.representation(),
             MediaRepresentation::buffered_from_suffix("flac"),
             "search result Container=flac must label the resolved stream"
+        );
+        // The second search result is the already-synced track-1 with its
+        // Container omitted: an absent search descriptor must not overwrite
+        // the synced flac representation with the explicit unknown.
+        let synced_id = search.tracks[1]
+            .native_track_id
+            .clone()
+            .expect("synced track native ID");
+        assert_eq!(synced_id.as_str(), "track-1");
+        let resolved = backend
+            .resolve_stream(&synced_id)
+            .await
+            .expect("resolve synced track");
+        assert_eq!(
+            resolved.representation(),
+            MediaRepresentation::buffered_from_suffix("flac"),
+            "an absent search Container must preserve the synced flac descriptor"
         );
 
         let requests = service.requests();

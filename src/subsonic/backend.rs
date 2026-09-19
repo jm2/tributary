@@ -585,11 +585,24 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
             // Same authority as the full sync: the song's suffix from
             // library metadata labels the stream, so a search-discovered
             // track resolves to the same representation it would have after
-            // a sync.
-            cache.representation_by_track_id.insert(
-                track_id.clone(),
-                MediaRepresentation::buffered_from_suffix(song.suffix.as_deref().unwrap_or("")),
-            );
+            // a sync. A present suffix replaces the cached representation;
+            // an absent one must not overwrite a known descriptor with
+            // unknown — only a search-only track gets the explicit unknown
+            // seeded.
+            match song.suffix.as_deref().filter(|suffix| !suffix.is_empty()) {
+                Some(suffix) => {
+                    cache.representation_by_track_id.insert(
+                        track_id.clone(),
+                        MediaRepresentation::buffered_from_suffix(suffix),
+                    );
+                }
+                None => {
+                    cache
+                        .representation_by_track_id
+                        .entry(track_id.clone())
+                        .or_insert_with(MediaRepresentation::buffered_unknown);
+                }
+            }
             if let Some(cover_art_id) = &song.cover_art {
                 cache
                     .track_artwork_locator_by_track_id
@@ -1206,9 +1219,11 @@ mod tests {
         .expect("descriptor fixture catalogue");
 
         // These tracks exist only in the search response — never synced — so
-        // their representations must come from the search path itself.
+        // their representations must come from the search path itself. The
+        // third result ("Lossless") is the already-synced flac-track with its
+        // suffix omitted by the search payload.
         let results = backend.search("Search", 10).await.expect("search fixture");
-        assert_eq!(results.tracks.len(), 2);
+        assert_eq!(results.tracks.len(), 3);
         for track in &results.tracks {
             let track_id = track
                 .native_track_id
@@ -1223,6 +1238,11 @@ mod tests {
                     resolved.representation(),
                     MediaRepresentation::buffered(MediaContainer::Flac),
                     "search suffix flac must label the resolved stream"
+                ),
+                "Lossless" => assert_eq!(
+                    resolved.representation(),
+                    MediaRepresentation::buffered(MediaContainer::Flac),
+                    "an absent search suffix must preserve the synced flac descriptor"
                 ),
                 _ => {
                     assert_eq!(track.title, "Search Opaque");
@@ -1318,6 +1338,10 @@ mod tests {
                                 "id": "search-ape-track",
                                 "title": "Search Opaque",
                                 "suffix": "ape"
+                            },
+                            {
+                                "id": "flac-track",
+                                "title": "Lossless"
                             }
                         ]
                     }
