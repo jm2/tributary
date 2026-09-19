@@ -2773,11 +2773,33 @@ fn open_windows_regular(
         } else {
             0
         };
-    let file = OpenOptions::new()
+    let file = match OpenOptions::new()
         .read(true)
         .share_mode(share_mode)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
+        .open(path)
+    {
+        Ok(file) => file,
+        // CreateFile cannot open a directory without FILE_FLAG_BACKUP_SEMANTICS,
+        // so a directory (or reparse) leaf fails this open with ACCESS_DENIED
+        // before the regular-file checks below can classify it. Probe the
+        // no-follow metadata and route that leaf to the same
+        // not-a-regular-file error the checks produce, so a non-regular
+        // selection keeps its own capability category on both platforms; a
+        // genuine access denial on a real file stays PermissionDenied.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata)
+                    if metadata.is_dir()
+                        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 =>
+                {
+                    return Err(invalid_marker("bound descendant is not a regular file"));
+                }
+                _ => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    };
     let metadata = file.metadata()?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(invalid_marker(
