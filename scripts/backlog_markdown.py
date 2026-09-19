@@ -48,12 +48,42 @@ HEADING = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<title>.*?)\s*#*\s*$")
 # both forms or valid ``[x](#title)`` links are reported missing.
 SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?P<underline>=+|-+)[ \t]*$")
 # A line that opens a block instead of extending a paragraph: blockquote,
-# bullet or ordered list item, thematic break, or 4-space-indented code.
-# GitHub never renders these as setext heading text, so a following
-# underline cannot turn them into an anchor.
+# bullet or ordered list item, or 4-space-indented code.  GitHub never
+# renders these as setext heading text, so a following underline cannot
+# turn them into an anchor.  The thematic break is matched separately by
+# ``_is_thematic_break``: a quantified group holding its own quantifier
+# (``([-_*][ \t]*){3,}$``) is the shape static analyzers reject as an
+# inefficient regular expression, and the flat character loop expresses
+# the same language without it.
 _NON_PARAGRAPH = re.compile(
-    r"^(?: {4}|\t| {0,3}(?:>|[-+*]\s|\d{1,9}[.)]\s|([-_*][ \t]*){3,}$))"
+    r"^(?: {4}|\t| {0,3}(?:>|[-+*]\s|\d{1,9}[.)]\s))"
 )
+
+
+def _is_thematic_break(line: str) -> bool:
+    """Return True when *line* is a ``-``/``_``/``*`` thematic break."""
+    # CommonMark: three or more delimiter characters, optionally separated
+    # by spaces or tabs, ending the line, after at most three leading
+    # spaces.  Mixed delimiters are accepted — the over-approximation can
+    # only ever classify a line as a block start, never as prose, so it
+    # cannot hide a real heading from the anchor set.
+    indent = 0
+    while indent < 3 and line[indent : indent + 1] == " ":
+        indent += 1
+    body = line[indent:]
+    if body[:1] not in ("-", "_", "*"):
+        # Includes the empty line and any tab-led or deeper-indented line:
+        # those belong to the other block alternatives, never to this one.
+        return False
+    count = 0
+    for char in body:
+        if char in "-_*":
+            count += 1
+        elif char not in " \t":
+            return False
+    return count >= 3
+
+
 # A link inside a heading title.  GitHub generates heading anchors from the
 # RENDERED heading text, so ``## [API](guide.md)`` exposes ``#api``; the link
 # is replaced by its text before the slug rules apply.  The destination may
@@ -126,6 +156,7 @@ def _blocks_paragraph(line: str) -> bool:
     """Return True when *line* starts a block that ends a paragraph."""
     return (
         _NON_PARAGRAPH.match(line) is not None
+        or _is_thematic_break(line)
         or SETEXT_UNDERLINE.match(line) is not None
         or HEADING.match(line) is not None
     )
@@ -141,8 +172,15 @@ class _ProseTracker:
         self.in_paragraph = False
 
     def _closes_fence(self, line: str) -> bool:
+        # The fence character is narrowed into a local so the type checker
+        # sees the non-None ``str`` that ``re.escape`` requires; the
+        # visitor only calls this while a fence is open, and a fence that
+        # was never opened can never be closed.
+        fence_char = self.fence_char
+        if fence_char is None:
+            return False
         closing = re.fullmatch(
-            r" {0,3}" + re.escape(self.fence_char) + "{%d,}[ \t]*" % self.fence_len,
+            r" {0,3}" + re.escape(fence_char) + "{%d,}[ \t]*" % self.fence_len,
             line,
         )
         return closing is not None
@@ -316,7 +354,7 @@ def document_anchors(path: Path) -> set[str]:
                 _record_slug(counts, " ".join(paragraph))
             paragraph = []
             continue
-        if line.strip() and _NON_PARAGRAPH.match(line) is None:
+        if line.strip() and not _blocks_paragraph(line):
             paragraph.append(line)
         else:
             paragraph = []

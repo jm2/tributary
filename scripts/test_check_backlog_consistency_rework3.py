@@ -279,5 +279,61 @@ class FragmentDecodeTests(unittest.TestCase):
         self.assertEqual((path_part, fragment), ("guide.md", "café"))
 
 
+class ThematicBreakTests(unittest.TestCase):
+    """The thematic-break match keeps the old ``_NON_PARAGRAPH`` behavior."""
+
+    # The regex alternative ``([-_*][ \t]*){3,}$`` was replaced by the flat
+    # ``_is_thematic_break`` helper to clear a static-analysis finding about
+    # an inefficient regular expression.  These tests pin the exact matching
+    # semantics of the removed alternative so the refactor cannot silently
+    # reclassify block starts as paragraph text (which would add anchors)
+    # or vice versa (which would drop them).
+
+    def make_root(self):
+        temporary = tempfile.TemporaryDirectory(prefix="tributary-backlog-")
+        self.addCleanup(temporary.cleanup)
+        return Path(temporary.name).resolve()
+
+    def write(self, root, name, text):
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_helper_accepts_three_or_more_delimiters(self):
+        for line in ("---", "- - -", "***", "_ _ _", "-\t-\t-", "*  *  *",
+                     "-_-*", "---   ", "   ---", "  ---", "- - - -", " -  -  -  "):
+            self.assertTrue(backlog_markdown._is_thematic_break(line), line)
+
+    def test_helper_rejects_fewer_than_three_delimiters(self):
+        for line in ("--", "- -", "* *", "", "   ", "-"):
+            self.assertFalse(backlog_markdown._is_thematic_break(line), line)
+
+    def test_helper_rejects_non_delimiter_content(self):
+        for line in ("- a - -", "---a", "- - - x", "-, -, -"):
+            self.assertFalse(backlog_markdown._is_thematic_break(line), line)
+
+    def test_helper_leaves_tab_and_deep_indent_to_other_alternatives(self):
+        # At most three leading spaces open a thematic break; a tab or a
+        # deeper indent belongs to the indented-code alternatives of
+        # ``_NON_PARAGRAPH``, exactly as in the removed regex branch.
+        self.assertFalse(backlog_markdown._is_thematic_break("\t---"))
+        self.assertFalse(backlog_markdown._is_thematic_break("  \t -"))
+        self.assertFalse(backlog_markdown._is_thematic_break("    ---"))
+
+    def test_blocks_paragraph_still_classifies_thematic_breaks(self):
+        for line in ("---", "- - -", "   ***", "    ---", "\t---", "***   "):
+            self.assertTrue(backlog_markdown._blocks_paragraph(line), line)
+
+    def test_thematic_break_contributes_no_anchor(self):
+        # A thematic break line must never be accumulated as paragraph text
+        # (with no pending paragraph its underline is not a setext heading).
+        root = self.make_root()
+        page = self.write(
+            root, "docs/guide.md", "***\n\n# Guide\n\n[jump](#guide)\n"
+        )
+        self.assertEqual(checker.check_links(root, [page]), [])
+
+
 if __name__ == "__main__":
     unittest.main()
