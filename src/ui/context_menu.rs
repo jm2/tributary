@@ -3601,11 +3601,63 @@ pub mod tests {
     /// interaction request refuses before the sink).
     #[cfg(not(target_os = "macos"))]
     pub fn keyboard_add_action_matches_the_drag_payload_contract() {
-        // Production activation dispatch (`ActionGroup::activate_action`)
-        // drives the real `connect_activate` callback.
-        use gtk::gio::prelude::ActionGroupExt;
-
         let (sort_model, selection) = sorted_track_selection_models();
+        let (sidebar, keyboard) =
+            assert_drag_and_keyboard_routes_build_identical_payloads(&sort_model, &selection);
+
+        // ── Production popup-plan → action-build → activate path ──────────
+        //
+        // The production construction the popup actually performs:
+        // `snapshot_popup_plan`'s computation (via `popup_plan_for_models`)
+        // over a real ColumnView/MultiSelection, `build_add_to_playlist_actions`
+        // over that plan, and one real activation through the action group,
+        // asserting the exact destination and the identical displayed-order
+        // candidates reach the commit sink.
+        //
+        // Residual seam: `snapshot_popup_plan` itself also takes the live
+        // `PlaylistMutationContext` through `ContextMenuPopupSession`, which
+        // no test harness can construct (window, tokio runtime, source
+        // registry); the extraction keeps that wrapper a one-line forward
+        // over exactly the logic it guards, and the commit sink injected
+        // below is wired in production to
+        // `PlaylistMutationContext::add_candidates_to_playlist`.
+        sidebar.append(&second_regular_playlist_source());
+        let column_view = gtk::ColumnView::new(Some(selection.clone()));
+        let popup_plan = popup_plan_for_models(&column_view, &sort_model)
+            .expect("the column view must carry the production MultiSelection");
+        assert_eq!(
+            popup_plan.selection.positions,
+            [0, 2],
+            "the production plan must snapshot the selected displayed positions"
+        );
+
+        assert_production_add_action_commits_displayed_order(
+            &sidebar,
+            &sort_model,
+            &popup_plan.selection,
+            &keyboard,
+        );
+        assert_add_action_without_interaction_request_refuses(
+            &sidebar,
+            &sort_model,
+            &popup_plan.selection,
+        );
+    }
+
+    /// The payload half of the keyboard-equivalence contract: the drag
+    /// source and the keyboard action builder must collect the identical
+    /// candidates in displayed position order, and the keyboard destination
+    /// guard `playlist_is_editable_regular` must accept exactly the editable
+    /// regular playlists the drop target's `position_source` check accepts.
+    ///
+    /// Returns the sidebar store (extended by the production-path half) and
+    /// the keyboard candidates, for the commit-sink equality assertion in
+    /// the production-path half.
+    #[cfg(not(target_os = "macos"))]
+    fn assert_drag_and_keyboard_routes_build_identical_payloads(
+        sort_model: &gtk::SortListModel,
+        selection: &gtk::MultiSelection,
+    ) -> (gtk::gio::ListStore, Vec<PlaylistAddCandidate>) {
         // The popup-plan selection snapshot: the same displayed positions the
         // context menu captures when it is opened over the selection.
         let keyboard_selection =
@@ -3618,9 +3670,9 @@ pub mod tests {
                 .collect()
         }
 
-        let drag = PlaylistDragPayload::from_selection(&sort_model, &selection)
+        let drag = PlaylistDragPayload::from_selection(sort_model, selection)
             .expect("a non-empty selection must produce a drag payload");
-        let keyboard = collect_selected_add_candidates(&sort_model, &keyboard_selection)
+        let keyboard = collect_selected_add_candidates(sort_model, &keyboard_selection)
             .expect("selected rows must resolve to add candidates");
 
         assert_eq!(
@@ -3654,63 +3706,39 @@ pub mod tests {
             !playlist_is_editable_regular(&sidebar, "missing-id"),
             "an unknown playlist id must refuse the keyboard add"
         );
+        (sidebar, keyboard)
+    }
 
-        // ── Production popup-plan → action-build → activate path ──────────
-        //
-        // The assertions above prove the payload equivalence; this tail
-        // drives the production construction the popup actually performs:
-        // `snapshot_popup_plan`'s computation (via `popup_plan_for_models`)
-        // over a real ColumnView/MultiSelection, `build_add_to_playlist_actions`
-        // over that plan, and one real activation through the action group,
-        // asserting the exact destination and the identical displayed-order
-        // candidates reach the commit sink.
-        //
-        // Residual seam: `snapshot_popup_plan` also takes the live
-        // `PlaylistMutationContext` through `ContextMenuPopupSession`, which
-        // no harness can construct (window, tokio runtime, source registry);
-        // the extraction keeps that wrapper a one-line forward over exactly
-        // the logic it guards, and the commit sink injected here is wired in
-        // production to `PlaylistMutationContext::add_candidates_to_playlist`.
-        sidebar.append(&second_regular_playlist_source());
-        let column_view = gtk::ColumnView::new(Some(selection.clone()));
-        let popup_plan = popup_plan_for_models(&column_view, &sort_model)
-            .expect("the column view must carry the production MultiSelection");
-        assert_eq!(
-            popup_plan.selection.positions,
-            [0, 2],
-            "the production plan must snapshot the selected displayed positions"
-        );
+    /// The production-path half of the keyboard-equivalence contract:
+    /// `build_add_to_playlist_actions` over the real popup plan, then one
+    /// real activation through the action group —
+    /// `ActionGroup::activate_action` drives the real `connect_activate`
+    /// callback — asserting the exact destination playlist and the
+    /// identical displayed-order candidates reach the commit sink.
+    #[cfg(not(target_os = "macos"))]
+    fn assert_production_add_action_commits_displayed_order(
+        sidebar: &gtk::gio::ListStore,
+        sort_model: &gtk::SortListModel,
+        selection: &SelectionSnapshot,
+        keyboard: &[PlaylistAddCandidate],
+    ) {
+        use gtk::gio::prelude::ActionGroupExt;
 
         let menu = gtk::gio::Menu::new();
         let action_group = gtk::gio::SimpleActionGroup::new();
         let activated: KeyboardActivations = Rc::new(RefCell::new(Vec::new()));
         let commit_add = recorded_keyboard_sink(Rc::clone(&activated));
-        // The popup's interaction request: a real navigation request, and an
-        // `owns_request` mirroring the production check over the real
-        // `SourceNavigation` staleness logic.
-        let navigation = Rc::new(RefCell::new(
-            crate::ui::source_navigation::SourceNavigation::new("playlist:regular-id"),
-        ));
-        let request = navigation.borrow_mut().select("playlist:regular-id");
-        let owns_request = {
-            let navigation = Rc::clone(&navigation);
-            Rc::new(
-                move |request: &crate::ui::source_navigation::SourceRequest| {
-                    navigation.borrow().is_current(request)
-                },
-            )
-        };
-        let show_unsupported = Rc::new(|| {});
+        let (request, owns_request) = keyboard_navigation_owns_request();
         build_add_to_playlist_actions(
             &menu,
             &action_group,
-            &sidebar,
-            &sort_model,
-            &popup_plan.selection,
+            sidebar,
+            sort_model,
+            selection,
             Some(&request),
             owns_request,
             commit_add,
-            show_unsupported,
+            Rc::new(|| {}),
         );
 
         // The menu carries the disabled header plus one entry per editable
@@ -3735,23 +3763,33 @@ pub mod tests {
             [(
                 "regular-id".to_string(),
                 "My Mix".to_string(),
-                keyboard.clone(),
+                keyboard.to_vec(),
             )],
             "activating the production action must forward the exact destination \
              playlist and the identical displayed-order candidates"
         );
+    }
 
-        // The guard tail: an activation built without the popup's interaction
-        // request must refuse before the commit sink.
+    /// The guard tail of the keyboard-equivalence contract: an activation
+    /// built without the popup's interaction request must refuse before the
+    /// commit sink.
+    #[cfg(not(target_os = "macos"))]
+    fn assert_add_action_without_interaction_request_refuses(
+        sidebar: &gtk::gio::ListStore,
+        sort_model: &gtk::SortListModel,
+        selection: &SelectionSnapshot,
+    ) {
+        use gtk::gio::prelude::ActionGroupExt;
+
         let refused: KeyboardActivations = Rc::new(RefCell::new(Vec::new()));
         let refusal_menu = gtk::gio::Menu::new();
         let refusal_group = gtk::gio::SimpleActionGroup::new();
         build_add_to_playlist_actions(
             &refusal_menu,
             &refusal_group,
-            &sidebar,
-            &sort_model,
-            &popup_plan.selection,
+            sidebar,
+            sort_model,
+            selection,
             None,
             Rc::new(|_: &crate::ui::source_navigation::SourceRequest| true),
             recorded_keyboard_sink(Rc::clone(&refused)),
@@ -3762,6 +3800,29 @@ pub mod tests {
             refused.borrow().is_empty(),
             "an activation without the popup's interaction request must not commit"
         );
+    }
+
+    /// The popup's interaction request — a real navigation request — plus an
+    /// `owns_request` mirroring the production check over the real
+    /// `SourceNavigation` staleness logic.
+    #[cfg(not(target_os = "macos"))]
+    fn keyboard_navigation_owns_request() -> (
+        crate::ui::source_navigation::SourceRequest,
+        KeyboardOwnsRequest,
+    ) {
+        let navigation = Rc::new(RefCell::new(
+            crate::ui::source_navigation::SourceNavigation::new("playlist:regular-id"),
+        ));
+        let request = navigation.borrow_mut().select("playlist:regular-id");
+        let owns_request = {
+            let navigation = Rc::clone(&navigation);
+            Rc::new(
+                move |request: &crate::ui::source_navigation::SourceRequest| {
+                    navigation.borrow().is_current(request)
+                },
+            )
+        };
+        (request, owns_request)
     }
 
     /// Drives the production per-row drop path through the real widgets: a
@@ -3992,6 +4053,12 @@ pub mod tests {
 
     #[cfg(not(target_os = "macos"))]
     type KeyboardActivations = RecordedDrops;
+
+    /// Mirrors the production `owns_request` closure type
+    /// `build_add_to_playlist_actions` installs: whether the popup's
+    /// navigation session still owns the interaction request.
+    #[cfg(not(target_os = "macos"))]
+    type KeyboardOwnsRequest = Rc<dyn Fn(&crate::ui::source_navigation::SourceRequest) -> bool>;
 
     #[cfg(not(target_os = "macos"))]
     fn recorded_keyboard_sink(activated: KeyboardActivations) -> PlaylistAddSink {
