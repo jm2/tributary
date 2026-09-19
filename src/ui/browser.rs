@@ -1185,6 +1185,46 @@ mod tests {
             .collect()
     }
 
+    /// Raw committed rows carrying the same synthetic identity as
+    /// [`q4_bench_track_objects`], so the timed FullSync unit starts where
+    /// production starts: from `architecture::Track` rows with the
+    /// Track→TrackObject conversion inside the measured region, not from
+    /// prebuilt `TrackObject`s.
+    fn q4_bench_arch_tracks(count: usize) -> Vec<crate::architecture::models::Track> {
+        let date_modified = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 9, 18, 0, 0, 0)
+            .single()
+            .expect("fixed bench date");
+        (0..count)
+            .map(|index| crate::architecture::models::Track {
+                id: uuid::Uuid::from_u128(index as u128),
+                native_track_id: None,
+                title: format!("Q4 Bench Track {index:05}"),
+                artist_name: format!("Q4 Artist {}", index % 5),
+                album_artist_name: None,
+                artist_id: None,
+                album_title: format!("Q4 Album {}", index % 4),
+                album_id: None,
+                track_number: Some((index % 12) as u32),
+                disc_number: None,
+                duration_secs: Some(180),
+                composer: None,
+                genre: Some(format!("Q4 Genre {}", index % 4)),
+                year: Some(2026),
+                file_path: Some(format!("/q4-bench/{index:05}.flac")),
+                stream_url: None,
+                cover_art_url: None,
+                date_added: None,
+                date_modified: Some(date_modified),
+                bitrate_kbps: Some(320),
+                sample_rate_hz: Some(44_100),
+                format: Some("FLAC".to_string()),
+                play_count: Some(0),
+                rating: crate::architecture::models::TrackRating::Unsupported,
+                last_played: None,
+            })
+            .collect()
+    }
+
     /// The genre/artist/album ListStores behind the browser panes, in pane
     /// order (same traversal contract as `rebuild_browser_data`).
     fn q4_browser_pane_stores(browser_box: &gtk::Box) -> Vec<gio::ListStore> {
@@ -1271,39 +1311,140 @@ mod tests {
 
     /// Timed publication at `rows` scale, on a browser built empty so the
     /// first publication mirrors the startup FullSync path (empty panes →
-    /// full snapshot). Prints `Q4_UI_METRIC` lines.
+    /// full snapshot). Times the complete production publication unit
+    /// ([`crate::ui::window::apply_full_sync_publication`]) — arch
+    /// Track→TrackObject conversion, playlist/queue refresh, the
+    /// per-source clone, and `display_local_tracks` (display + folder
+    /// model rebuild), everything the main loop blocks on during a
+    /// FullSync — alongside the display-only lower bound (`display_tracks`
+    /// alone on a second empty browser at the same scale, objects
+    /// preconverted outside the timer). Prints `Q4_UI_METRIC` lines.
     fn q4_measure_publication_rebuild(rows: usize) {
-        let objects = q4_bench_track_objects(rows);
+        let tracks = q4_bench_arch_tracks(rows);
         let (browser_box, browser_state) = build_browser(&[], false, Box::new(|_, _, _, _, _| {}));
         let track_store = gio::ListStore::new::<TrackObject>();
         let selection = gtk::SingleSelection::new(Some(track_store.clone()));
         let column_view = gtk::ColumnView::new(Some(selection));
-        let master_tracks = RefCell::new(Vec::new());
+        let master_tracks = Rc::new(RefCell::new(Vec::new()));
         let status_label = gtk::Label::default();
-        let publish = |objects: &[TrackObject]| {
-            crate::ui::window::display_tracks(
-                objects,
-                &track_store,
-                &master_tracks,
-                &browser_box,
-                &browser_state,
-                &status_label,
-                &column_view,
+        let active_source_key = Rc::new(RefCell::new("local".to_string()));
+        let playback_session =
+            Rc::new(RefCell::new(crate::ui::playback::PlaybackSession::default()));
+        let source_tracks = Rc::new(RefCell::new(std::collections::HashMap::<
+            String,
+            Vec<TrackObject>,
+        >::new()));
+        // One configured library root covering every synthetic track path,
+        // so the folder-model rebuild does real root matching per row the
+        // way production does.
+        let app_config = Rc::new(RefCell::new(crate::ui::preferences::AppConfig {
+            library_paths: vec!["/q4-bench".to_string()],
+            ..crate::ui::preferences::AppConfig::default()
+        }));
+        let publish_full_sync = |browser_box: &gtk::Box,
+                                 browser_state: &BrowserState,
+                                 track_store: &gio::ListStore,
+                                 master_tracks: &Rc<RefCell<Vec<TrackObject>>>,
+                                 status_label: &gtk::Label,
+                                 column_view: &gtk::ColumnView| {
+            crate::ui::window::apply_full_sync_publication(
+                &tracks,
+                &active_source_key,
+                &playback_session,
+                &source_tracks,
+                master_tracks,
+                track_store,
+                browser_box,
+                browser_state,
+                status_label,
+                column_view,
+                &app_config,
             );
         };
 
-        let first_started = std::time::Instant::now();
-        publish(&objects);
-        let first_ms = first_started.elapsed().as_micros() as f64 / 1_000.0;
+        let fullsync_started = std::time::Instant::now();
+        publish_full_sync(
+            &browser_box,
+            &browser_state,
+            &track_store,
+            &master_tracks,
+            &status_label,
+            &column_view,
+        );
+        let fullsync_first_ms = fullsync_started.elapsed().as_micros() as f64 / 1_000.0;
         let resync_started = std::time::Instant::now();
-        publish(&objects);
-        let resync_ms = resync_started.elapsed().as_micros() as f64 / 1_000.0;
+        publish_full_sync(
+            &browser_box,
+            &browser_state,
+            &track_store,
+            &master_tracks,
+            &status_label,
+            &column_view,
+        );
+        let fullsync_resync_ms = resync_started.elapsed().as_micros() as f64 / 1_000.0;
+
+        // The unit must have published everything it is contractually
+        // responsible for, not merely have run fast.
+        assert_eq!(
+            track_store.n_items() as usize,
+            rows,
+            "full-sync publication must replace the visible track store"
+        );
+        assert_eq!(
+            master_tracks.borrow().len(),
+            rows,
+            "full-sync publication must replace the master row set"
+        );
+        assert_eq!(
+            browser_state.tracks.borrow().len(),
+            rows,
+            "full-sync publication must replace the browser snapshot"
+        );
+        assert_eq!(
+            source_tracks.borrow().get("local").map(Vec::len),
+            Some(rows),
+            "full-sync publication must store the per-source projection"
+        );
+
+        // Display-only lower bound: same scale, a second browser built
+        // empty, objects preconverted outside the timer — `display_tracks`
+        // alone. The full-path unit above must exceed this at the same
+        // scale, or the timed region is not carrying the production stages
+        // (conversion, clone, folder-model rebuild) it claims to.
+        let objects = q4_bench_track_objects(rows);
+        let (display_box, display_state) = build_browser(&[], false, Box::new(|_, _, _, _, _| {}));
+        let display_store = gio::ListStore::new::<TrackObject>();
+        let display_selection = gtk::SingleSelection::new(Some(display_store.clone()));
+        let display_view = gtk::ColumnView::new(Some(display_selection));
+        let display_master = RefCell::new(Vec::new());
+        let display_status = gtk::Label::default();
+        let display_started = std::time::Instant::now();
+        crate::ui::window::display_tracks(
+            &objects,
+            &display_store,
+            &display_master,
+            &display_box,
+            &display_state,
+            &display_status,
+            &display_view,
+        );
+        let display_only_ms = display_started.elapsed().as_micros() as f64 / 1_000.0;
+        assert!(
+            fullsync_first_ms > display_only_ms,
+            "full-path FullSync publication ({fullsync_first_ms:.3} ms) must exceed the \
+             display_tracks-only lower bound ({display_only_ms:.3} ms) at {rows} rows — \
+             the timed region is missing production stages"
+        );
+
         let rebuild_started = std::time::Instant::now();
-        rebuild_browser_data(&browser_box, &browser_state, &objects);
+        rebuild_browser_data(&display_box, &display_state, &objects);
         let rebuild_ms = rebuild_started.elapsed().as_micros() as f64 / 1_000.0;
 
-        println!("Q4_UI_METRIC name=publication_first_ms rows={rows} value={first_ms:.3}");
-        println!("Q4_UI_METRIC name=publication_resync_ms rows={rows} value={resync_ms:.3}");
+        println!("Q4_UI_METRIC name=fullsync_publication_first_ms rows={rows} value={fullsync_first_ms:.3}");
+        println!("Q4_UI_METRIC name=fullsync_publication_resync_ms rows={rows} value={fullsync_resync_ms:.3}");
+        println!(
+            "Q4_UI_METRIC name=publication_display_only_ms rows={rows} value={display_only_ms:.3}"
+        );
         println!("Q4_UI_METRIC name=browser_rebuild_ms rows={rows} value={rebuild_ms:.3}");
     }
 
