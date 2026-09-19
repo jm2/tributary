@@ -45,7 +45,7 @@ needed.
 | `startup_fullsync_ms` | engine spawn → `FullSync` publication of the initial scan |
 | `startup_scan_settle_ms` | engine spawn → `ScanComplete` |
 | `post_scan_drain_ms` | `ScanComplete` → command channel drained |
-| `cancellation_flush_settle_ms` | engine spawn → `Flush` ack (scan settles first; recorded pre-abort — historical name) |
+| `cancellation_flush_settle_ms` | engine spawn → `Flush` ack (scan settles first; pre-abort) |
 | `scan_progress_events` | count of `ScanProgress` events (informational) |
 
 Time-to-interactive ≈ `startup_fullsync_ms` (engine side) +
