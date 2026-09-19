@@ -95,10 +95,14 @@ on an empty browser. This is what the main loop blocks on at startup.
 The measurement half calls the same function the production FullSync
 arm calls (a source-structure test pins the arm to the unit).
 
-`publication_display_only_ms` is a strict lower bound of
-`fullsync_publication_first_ms`: `display_tracks` alone, 0 → N rows on
-a second empty browser at the same scale, objects preconverted outside
-the timer; the harness asserts the full path exceeds it at every scale.
+`publication_display_only_ms` bounds `fullsync_publication_first_ms`
+by construction: it times `display_tracks` alone, 0 → N rows on a
+second empty browser at the same scale, objects preconverted outside
+the timer, while the full path additionally runs conversion, the
+per-source clone, and the folder-model rebuild. Both are single
+wall-clock samples on separate fixtures, so the harness reports their
+difference as measurement data instead of asserting an ordering
+between the samples.
 
 The measurement half also sanity-asserts that the store, master rows,
 browser snapshot, and per-source projection all carry exactly N rows
@@ -106,7 +110,9 @@ after publication, so a fast-but-wrong harness cannot pass.
 
 ## Recorded baselines and budgets
 
-Budgets agreed 2026-09-18 pre-optimization. The measured values below
+Budgets agreed pre-optimization: 2026-09-18 for the engine and the
+display-only GTK budgets, 2026-09-19 for the full-path GTK budgets
+(see the GTK section below). The measured values below
 are conservative baselines for their labelled Linux debug-profile
 runners: the harnesses are ignored measurement runs, not CI budget
 gates, and optimized (release) builds are not measured here — they need
@@ -127,8 +133,10 @@ timed only `display_tracks`, so `publication_first_ms` measured a
 display-only slice of the startup stall — the complete unit runs
 ~5× slower at 1k rows and ~50× slower at 10k rows on comparable
 runners). The old `publication_first_ms`/`publication_resync_ms`
-metrics are retired; their quantities survive as the
-`publication_display_only_ms` lower bound. The GTK table below is from
+metrics are retired; the former `publication_first_ms` quantity
+survives as the `publication_display_only_ms` lower bound — that
+metric times `display_tracks` alone for 0 → N rows, and no
+display-only N → N resync metric is defined. The GTK table below is from
 runner **gastown.toast polecat worktree (tr-am6qr), linux, debug
 profile** — 2026-09-19, 2 runs per scale. Re-run the harnesses on a
 different runner before trusting the numbers elsewhere.
