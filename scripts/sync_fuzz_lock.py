@@ -29,6 +29,7 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 ROOT_LOCK = REPOSITORY / "Cargo.lock"
 FUZZ_LOCK = REPOSITORY / "fuzz" / "Cargo.lock"
 ROOT_MANIFEST = REPOSITORY / "Cargo.toml"
+FUZZ_MANIFEST = REPOSITORY / "fuzz" / "Cargo.toml"
 FULL_COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
 
@@ -193,6 +194,110 @@ def production_dependency_declarations(
 def production_dependency_names(manifest: dict[str, Any]) -> set[str]:
     """Return package names inherited by fuzz through its Tributary path dep."""
     return set(production_dependency_declarations(manifest))
+
+
+def manifest_package_name(path: Path) -> str | None:
+    """Return the manifest's package name, or None for a virtual manifest."""
+    package = load_toml(path).get("package")
+    if isinstance(package, dict):
+        name = package.get("name")
+        if isinstance(name, str):
+            return name
+    return None
+
+
+def workspace_member_entry_names(
+    entry: str,
+    manifest_dir: Path,
+    origin: str,
+) -> set[str]:
+    """
+    Resolve one ``workspace.members`` entry to member package names.
+
+    The entry is a directory path or glob pattern relative to the workspace
+    root, exactly as cargo resolves it. A glob that matches nothing (or
+    matches directories without a manifest) contributes no member; an exact
+    path with no manifest is the layout error cargo itself refuses.
+    """
+    names: set[str] = set()
+    if any(character in entry for character in "*?["):
+        for resolved in sorted(manifest_dir.glob(entry)):
+            manifest_path = resolved / "Cargo.toml"
+            if manifest_path.is_file():
+                name = manifest_package_name(manifest_path)
+                if name is not None:
+                    names.add(name)
+        return names
+    manifest_path = manifest_dir / entry / "Cargo.toml"
+    if not manifest_path.is_file():
+        raise PolicyError(
+            f"fuzz workspace {origin} entry {entry!r} has no manifest at "
+            f"{manifest_path}"
+        )
+    name = manifest_package_name(manifest_path)
+    if name is not None:
+        names.add(name)
+    return names
+
+
+def fuzz_workspace_member_names(
+    fuzz_manifest: dict[str, Any],
+    manifest_dir: Path | None = None,
+) -> set[str]:
+    """
+    Return the fuzz workspace's member package names.
+
+    Membership is derived from the workspace manifest — the manifest's own
+    package plus every ``workspace.members``/``workspace.default-members``
+    entry resolved relative to the workspace root — never from
+    ``source``-absence in Cargo.lock records. Lock records omit ``source``
+    for every path dependency, not only for members: the fuzz lock's
+    source-less records include both the ``tributary-fuzz`` member and the
+    non-member ``tributary`` path dependency (Codex thread j_TiL), so
+    rooting reachability at source-absence promoted orphaned removal
+    carry-overs into reachability roots. Path dependencies that are not
+    members enter the reachability closure only through a member's
+    dependency edge, exactly like registry dependencies.
+
+    ``manifest_dir`` is the directory containing the fuzz manifest; it is
+    required to resolve member entries other than the workspace root itself.
+    When it is unavailable (pure in-memory contexts) an unresolvable entry
+    fails closed instead of silently under-deriving membership.
+    """
+    members: set[str] = set()
+    package = fuzz_manifest.get("package")
+    if isinstance(package, dict):
+        name = package.get("name")
+        if isinstance(name, str):
+            members.add(name)
+    workspace = fuzz_manifest.get("workspace")
+    if not isinstance(workspace, dict):
+        return members
+    for key in ("members", "default-members"):
+        entries = workspace.get(key, [])
+        if not isinstance(entries, list):
+            raise PolicyError(
+                f"fuzz workspace {key!r} must be a list of member paths"
+            )
+        for entry in entries:
+            if not isinstance(entry, str):
+                raise PolicyError(
+                    f"fuzz workspace {key!r} entries must be paths; "
+                    f"got {entry!r}"
+                )
+            if entry in (".", ""):
+                # Resolves to the workspace root manifest itself, whose
+                # package was already added above.
+                continue
+            if manifest_dir is None:
+                raise PolicyError(
+                    f"fuzz workspace {key!r} entry {entry!r} cannot be "
+                    "resolved without the fuzz manifest directory"
+                )
+            members.update(
+                workspace_member_entry_names(entry, manifest_dir, key)
+            )
+    return members
 
 
 def package_version_sets(lock: dict[str, Any]) -> dict[str, set[str]]:
@@ -853,6 +958,7 @@ def validate_bounded_package_changes(
     before_fuzz_lock: dict[str, Any],
     after_fuzz_lock: dict[str, Any],
     transitions: list[Transition],
+    member_names: set[str] | None = None,
 ) -> None:
     """Reject drift outside exact closures rooted at the requested transition."""
     #lizard forgives
@@ -955,28 +1061,42 @@ def validate_bounded_package_changes(
     # roots whose after-closure could require reachability. Real cargo
     # resolution prunes unreachable records, so every surviving member of a
     # removal closure must remain reachable from the fuzz workspace graph.
-    # That graph is rooted at the workspace itself, not at the inner
-    # tributary path package: Cargo.lock marks every workspace member by
-    # the absence of a source field, and cargo's unit graph reaches all of
-    # them, so a record kept alive by a fuzz-only member (Codex j9vog:
-    # tributary-fuzz -> libfuzzer-sys -> <removed dep>) is legitimately
-    # retained by a regenerated lock. A record reachable from no member is
-    # a true orphan cargo would prune. Unification survivors are
-    # unaffected: a retained consumer's edge keeps its record reachable,
-    # and only those true orphans are named here.
+    # That graph is rooted at the actual workspace membership taken from
+    # the workspace manifest — never at lock-record ``source``-absence,
+    # which also marks non-member path dependencies (Codex j_TiL: the fuzz
+    # lock's source-less records include the non-member ``tributary`` path
+    # dependency alongside the ``tributary-fuzz`` member, so a removed
+    # local path package retained with no referencing edge would otherwise
+    # be promoted to a reachability root and its stale carry-over
+    # accepted). A path dependency that is not a member enters the closure
+    # only through a member's dependency edge, exactly like a registry
+    # dependency. Reachability still spans every workspace member, not
+    # only the inner tributary path package: a record kept alive by a
+    # fuzz-only member (Codex j9vog: tributary-fuzz -> libfuzzer-sys ->
+    # <removed dep>) is legitimately retained by a regenerated lock. A
+    # record reachable from no member is a true orphan cargo would prune.
+    # Unification survivors are unaffected: a retained consumer's edge
+    # keeps its record reachable, and only those true orphans are named
+    # here.
     removal_roots = {
         (transition.name, transition.current_fuzz_version)
         for transition in transitions
         if transition.target_root_version is None
     }
     if removal_roots:
+        if member_names is None:
+            raise PolicyError(
+                "removal reachability requires the fuzz workspace member "
+                "names derived from the workspace manifest; refusing to "
+                "approximate membership from lock-record source absence"
+            )
         removal_closure = dependency_closure_identities(
             before_fuzz_lock, removal_roots
         )
         after_members = {
             (package["name"], package["version"])
             for package in after_fuzz_lock.get("package", [])
-            if "source" not in package
+            if package["name"] in member_names
         }
         after_reachable = dependency_closure_identities(
             after_fuzz_lock, after_members
@@ -998,6 +1118,7 @@ def validate_submitted_fuzz_update(
     current_manifest: dict[str, Any],
     *,
     retain_pending_removals: bool = False,
+    member_names: set[str] | None = None,
 ) -> tuple[list[Transition], list[Transition]]:
     """
     Apply the same base-fuzz-to-head proof used by CI `check` mode.
@@ -1042,6 +1163,7 @@ def validate_submitted_fuzz_update(
             base_fuzz_lock,
             current_fuzz_lock,
             requested_transitions,
+            member_names=member_names,
         )
     return requested_transitions, remaining_transitions
 
@@ -1221,6 +1343,14 @@ def main() -> int:
         current = load_toml(ROOT_LOCK)
         fuzz = load_toml(FUZZ_LOCK)
         manifest = load_toml(ROOT_MANIFEST)
+        # Removal reachability roots at actual fuzz workspace membership.
+        # The submitted fuzz manifest describes the submitted lock's
+        # workspace in both modes: check mode runs in the CI checkout under
+        # review, and write mode's graph refresh regenerates only the lock,
+        # never the manifest.
+        member_names = fuzz_workspace_member_names(
+            load_toml(FUZZ_MANIFEST), FUZZ_MANIFEST.parent
+        )
         # Write mode classifies a legitimately stale submitted lock without
         # refusing: a pending removal is retained here so the reviewed graph
         # refresh below can regenerate the lock first. The post-refresh
@@ -1234,6 +1364,7 @@ def main() -> int:
             fuzz,
             manifest,
             retain_pending_removals=args.mode == "write",
+            member_names=member_names,
         )
 
         if args.mode == "write":
@@ -1266,6 +1397,7 @@ def main() -> int:
                     base_fuzz,
                     repaired_fuzz,
                     manifest,
+                    member_names=member_names,
                 )
                 if transitions:
                     raise PolicyError(

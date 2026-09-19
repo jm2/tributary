@@ -288,6 +288,7 @@ class FuzzLockPolicyTests(unittest.TestCase):
             base_fuzz,
             submitted_fuzz,
             manifest,
+            member_names={"tributary-fuzz"},
         )
         self.assertEqual(
             requested,
@@ -404,6 +405,15 @@ class FuzzLockPolicyTests(unittest.TestCase):
         calls = {"refresh": 0, "metadata": 0}
         writes: list[bytes] = []
 
+        # The fixture fuzz manifest declares the same membership the real
+        # fuzz/Cargo.toml does: the tributary-fuzz package via the
+        # workspace root. With members ["."] no filesystem resolution is
+        # needed, so the patched FUZZ_MANIFEST path never has to exist.
+        fuzz_manifest_fixture = {
+            "package": {"name": "tributary-fuzz"},
+            "workspace": {"members": ["."]},
+        }
+
         def fake_load_toml(path):
             if path is sync_fuzz_lock.FUZZ_LOCK:
                 return views["fuzz"]
@@ -411,6 +421,8 @@ class FuzzLockPolicyTests(unittest.TestCase):
                 return current
             if path is sync_fuzz_lock.ROOT_MANIFEST:
                 return {"dependencies": {"kept": "1"}}
+            if path is sync_fuzz_lock.FUZZ_MANIFEST:
+                return fuzz_manifest_fixture
             raise AssertionError(f"unexpected load_toml path {path!r}")
 
         def fake_load_toml_from_git(_reference, path):
@@ -442,6 +454,7 @@ class FuzzLockPolicyTests(unittest.TestCase):
             "ROOT_LOCK",
             "ROOT_MANIFEST",
             "FUZZ_LOCK",
+            "FUZZ_MANIFEST",
             "load_toml",
             "load_toml_from_git",
             "parse_args",
@@ -453,6 +466,9 @@ class FuzzLockPolicyTests(unittest.TestCase):
         sync_fuzz_lock.ROOT_LOCK = object()
         sync_fuzz_lock.ROOT_MANIFEST = object()
         sync_fuzz_lock.FUZZ_LOCK = FakeLockFile()
+        # A real Path: main() resolves FUZZ_MANIFEST.parent as the member
+        # resolution root (never touched for members ["."]).
+        sync_fuzz_lock.FUZZ_MANIFEST = Path("/fixture/fuzz/Cargo.toml")
         sync_fuzz_lock.load_toml = fake_load_toml
         sync_fuzz_lock.load_toml_from_git = fake_load_toml_from_git
         sync_fuzz_lock.parse_args = lambda: argparse.Namespace(
@@ -611,6 +627,14 @@ class FuzzLockPolicyTests(unittest.TestCase):
         base["package"][2]["dependencies"] = ["shared 2.0.0"]
         base["package"][5]["dependencies"] = ["shared 1.0.0"]
         base["package"][6]["dependencies"] = ["shared 1.0.0"]
+        # The fuzz workspace member is a permanent lock record (j_TiL).
+        base["package"].append(
+            {
+                "name": "tributary-fuzz",
+                "version": "0.5.1",
+                "dependencies": ["tributary 0.5.1"],
+            }
+        )
         pruned_fuzz = lock(
             ["unrelated 1.0.0", "drift 1.0.0"],
             {
@@ -619,9 +643,19 @@ class FuzzLockPolicyTests(unittest.TestCase):
                 "drift": ["1.0.0"],
             },
         )
-        # package order: tributary, shared@1, unrelated, drift.
+        # package order: tributary, shared@1, unrelated, drift. The fuzz
+        # workspace member tributary-fuzz (manifest-derived, j_TiL) roots
+        # the after-lock reachability graph through the tributary path
+        # package, keeping the retained shared@1.0.0 record reachable.
         pruned_fuzz["package"][2]["dependencies"] = ["shared 1.0.0"]
         pruned_fuzz["package"][3]["dependencies"] = ["shared 1.0.0"]
+        pruned_fuzz["package"].append(
+            {
+                "name": "tributary-fuzz",
+                "version": "0.5.1",
+                "dependencies": ["tributary 0.5.1"],
+            }
+        )
 
         sync_fuzz_lock.validate_bounded_package_changes(
             base,
@@ -629,6 +663,7 @@ class FuzzLockPolicyTests(unittest.TestCase):
             base,
             pruned_fuzz,
             [sync_fuzz_lock.Transition("a", "1.0.0", None)],
+            member_names={"tributary-fuzz"},
         )
 
     def test_removed_closure_span_allows_unrelated_retained_consumer_edge(self):
@@ -660,6 +695,7 @@ class FuzzLockPolicyTests(unittest.TestCase):
             base,
             pruned_fuzz,
             [sync_fuzz_lock.Transition("local-ip", "1.0.0", None)],
+            member_names={"tributary-fuzz"},
         )
 
     def test_removed_closure_span_survivor_rejects_general_rebind(self):
@@ -727,6 +763,14 @@ class FuzzLockPolicyTests(unittest.TestCase):
         base["package"][1]["dependencies"] = ["shared 2.0.0", "x 1.0.0"]
         base["package"][2]["dependencies"] = ["x 1.0.0"]
         base["package"][5]["dependencies"] = ["shared 1.0.0", "shared 2.0.0"]
+        # The fuzz workspace member is a permanent lock record (j_TiL).
+        base["package"].append(
+            {
+                "name": "tributary-fuzz",
+                "version": "0.5.1",
+                "dependencies": ["tributary 0.5.1"],
+            }
+        )
         pruned_fuzz = lock(
             ["b 1.0.0"],
             {"b": ["1.0.0"], "shared": ["1.0.0"], "x": ["1.0.0"]},
@@ -734,9 +778,19 @@ class FuzzLockPolicyTests(unittest.TestCase):
         # package order: tributary, b, shared@1, x. x drops only the
         # span-internal shared@2.0.0 edge, and the shared@2.0.0 record is
         # pruned with it — nothing reaches it any more, and cargo never
-        # leaves unreachable records behind. shared@1.0.0 stays exact.
+        # leaves unreachable records behind. shared@1.0.0 stays exact. The
+        # manifest-derived fuzz member tributary-fuzz (j_TiL) roots
+        # after-lock reachability through the tributary path package, so
+        # x and shared@1.0.0 stay reachable through the retained b root.
         pruned_fuzz["package"][1]["dependencies"] = ["x 1.0.0"]
         pruned_fuzz["package"][3]["dependencies"] = ["shared 1.0.0"]
+        pruned_fuzz["package"].append(
+            {
+                "name": "tributary-fuzz",
+                "version": "0.5.1",
+                "dependencies": ["tributary 0.5.1"],
+            }
+        )
 
         sync_fuzz_lock.validate_bounded_package_changes(
             base,
@@ -744,6 +798,7 @@ class FuzzLockPolicyTests(unittest.TestCase):
             base,
             pruned_fuzz,
             [sync_fuzz_lock.Transition("a", "1.0.0", None)],
+            member_names={"tributary-fuzz"},
         )
 
     def test_removal_rejects_unreachable_old_closure_records(self):
@@ -785,6 +840,7 @@ class FuzzLockPolicyTests(unittest.TestCase):
                 base_fuzz,
                 orphaned_fuzz,
                 {"dependencies": {}},
+                member_names={"tributary-fuzz"},
             )
 
     def test_removal_performed_exactly_prunes_closure_records(self):
@@ -810,6 +866,7 @@ class FuzzLockPolicyTests(unittest.TestCase):
             base_fuzz,
             pruned_fuzz,
             {"dependencies": {}},
+            member_names={"tributary-fuzz"},
         )
         self.assertEqual(
             requested,
@@ -839,12 +896,33 @@ class FuzzLockPolicyTests(unittest.TestCase):
         )
         base_fuzz["package"][1]["dependencies"] = ["bar 2.0.0"]
         base_fuzz["package"][2]["dependencies"] = ["bar 2.0.0"]
+        # The fuzz workspace member is a permanent lock record: it exists
+        # before and after the update (j_TiL membership rooting).
+        base_fuzz["package"].append(
+            {
+                "name": "tributary-fuzz",
+                "version": "0.5.1",
+                "dependencies": ["tributary 0.5.1"],
+            }
+        )
         pruned_fuzz = lock(
             ["kept 1.0.0"],
             {"kept": ["1.0.0"], "bar": ["2.0.0"]},
         )
-        # package order: tributary, kept, bar. kept keeps its bar edge.
+        # package order: tributary, kept, bar. kept keeps its bar edge. The
+        # manifest-derived fuzz member tributary-fuzz (j_TiL) roots the
+        # after-lock reachability graph through the tributary path package,
+        # so kept and bar stay reachable — reachability here flows entirely
+        # through member -> path-package edges, never through record
+        # source-absence.
         pruned_fuzz["package"][1]["dependencies"] = ["bar 2.0.0"]
+        pruned_fuzz["package"].append(
+            {
+                "name": "tributary-fuzz",
+                "version": "0.5.1",
+                "dependencies": ["tributary 0.5.1"],
+            }
+        )
 
         requested, remaining = sync_fuzz_lock.validate_submitted_fuzz_update(
             base,
@@ -852,6 +930,7 @@ class FuzzLockPolicyTests(unittest.TestCase):
             base_fuzz,
             pruned_fuzz,
             {"dependencies": {"kept": "1"}},
+            member_names={"tributary-fuzz"},
         )
         self.assertEqual(
             requested,
@@ -918,6 +997,7 @@ class FuzzLockPolicyTests(unittest.TestCase):
             base_fuzz,
             shared_fuzz,
             {"dependencies": {}},
+            member_names={"tributary-fuzz"},
         )
         self.assertEqual(
             requested,
@@ -990,6 +1070,66 @@ class FuzzLockPolicyTests(unittest.TestCase):
                 base_fuzz,
                 orphaned_fuzz,
                 {"dependencies": {}},
+                member_names={"tributary-fuzz"},
+            )
+
+    def test_removal_rejects_orphaned_local_path_carry_over(self):
+        # Codex P2 regression (thread j_TiL): the removed dependency is a
+        # LOCAL PATH package, so its retained record is source-less exactly
+        # like a workspace member record. Rooting after-removal
+        # reachability at lock-record source-absence promoted the orphan
+        # into a reachability root and accepted the stale carry-over that
+        # cargo's regeneration would have pruned. Membership now comes
+        # from the workspace manifest, so the orphan is rejected even
+        # though the manifest-declared member's edge still reaches the
+        # inner tributary path package — a non-member path dependency
+        # enters the closure only through a member's dependency edge, and
+        # this orphan has no referencing edge at all.
+        base = lock(["local-dep 1.0.0"], {"local-dep": ["1.0.0"]})
+        current = lock([], {})
+        base_fuzz = lock(["local-dep 1.0.0"], {"local-dep": ["1.0.0"]})
+        # The fuzz workspace member is a permanent lock record, and its
+        # edge reaches the tributary path package.
+        base_fuzz["package"].append(
+            {
+                "name": "tributary-fuzz",
+                "version": "0.5.1",
+                "dependencies": ["tributary 0.5.1"],
+            }
+        )
+        # The fuzz view sees local-dep as a path dependency: its lock
+        # record carries no source, mirroring the real fuzz/Cargo.lock's
+        # source-less non-member tributary record.
+        for package in base_fuzz["package"]:
+            if package["name"] == "local-dep":
+                del package["source"]
+        # The submitted lock drops the tributary->local-dep edge but
+        # retains the source-less local-dep record with no referencing
+        # edge: an orphan cargo would prune.
+        orphaned_fuzz = lock([], {"local-dep": ["1.0.0"]})
+        for package in orphaned_fuzz["package"]:
+            if package["name"] == "local-dep":
+                del package["source"]
+        orphaned_fuzz["package"].append(
+            {
+                "name": "tributary-fuzz",
+                "version": "0.5.1",
+                "dependencies": ["tributary 0.5.1"],
+            }
+        )
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError,
+            r"retained unreachable old-closure package records: "
+            r"\[\('local-dep', '1\.0\.0'\)\]",
+        ):
+            sync_fuzz_lock.validate_submitted_fuzz_update(
+                base,
+                current,
+                base_fuzz,
+                orphaned_fuzz,
+                {"dependencies": {}},
+                member_names={"tributary-fuzz"},
             )
 
     def test_transition_tied_rebind_rejects_pure_edge_drop(self):
@@ -3595,6 +3735,49 @@ class FuzzLockPolicyTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_fuzz_workspace_member_names_resolves_manifest_membership(self):
+        # Membership comes from the workspace manifest, never from
+        # lock-record source-absence (j_TiL): the root package joins
+        # members declared as ".", exact member paths resolve relative to
+        # the manifest directory, globs tolerate matches without
+        # manifests, an exact path with no manifest fails closed, and an
+        # unresolvable entry without a manifest directory fails closed.
+        with TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            (root / "crates" / "helper").mkdir(parents=True)
+            (root / "crates" / "helper" / "Cargo.toml").write_text(
+                '[package]\nname = "helper"\n', encoding="utf-8"
+            )
+            (root / "crates" / "empty").mkdir()
+            # The parsed root manifest IS the workspace root: its package
+            # table is both the root package and the "." member entry.
+            fuzz_manifest = {
+                "package": {"name": "tributary-fuzz"},
+                "workspace": {
+                    "members": [".", "crates/helper", "crates/*"],
+                },
+            }
+            self.assertEqual(
+                sync_fuzz_lock.fuzz_workspace_member_names(
+                    fuzz_manifest, root
+                ),
+                {"tributary-fuzz", "helper"},
+            )
+            with self.assertRaisesRegex(
+                sync_fuzz_lock.PolicyError,
+                r"members entry 'crates/missing' has no manifest",
+            ):
+                sync_fuzz_lock.fuzz_workspace_member_names(
+                    {"workspace": {"members": ["crates/missing"]}}, root
+                )
+            with self.assertRaisesRegex(
+                sync_fuzz_lock.PolicyError,
+                r"entry 'crates/helper' cannot be resolved",
+            ):
+                sync_fuzz_lock.fuzz_workspace_member_names(
+                    {"workspace": {"members": ["crates/helper"]}}, None
+                )
 
 
 class RustToolchainPolicyTests(unittest.TestCase):
