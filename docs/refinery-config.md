@@ -34,6 +34,16 @@ bead as pending, naming the absent contexts, whenever an expected gating
 check never materialized as a run at all: a rollup that simply lacks an
 expected check is not a passing one. Checks still running park the bead as
 pending — but only when the unfinished check is a *gating* one.
+Hold-class dispositions are evaluated ahead of any CI state and are never
+converted into pending by it: a draft PR (or unknown draft status), an
+unresolved review hold, or an operator audit reject at the head parks the
+bead as `hold` for human disposition. The one exception is the explicit
+per-source `review.corrections_while_held = "true"` opt-in: an open held or
+draft bead inside corrective review whose current-head review evidence is
+missing, incomplete, or stale parks as `pending` until that evidence
+exists, and a new unresolved finding routes to the refinery as `review` —
+the hold itself remains in force throughout and is never cleared by that
+routing.
 Queued advisory jobs such as `SHA256 Checksums` — which GitHub's
 per-account Actions concurrency cap can hold for an hour or more — do not
 delay review or an operator landing that the ruleset itself would allow.
