@@ -45,7 +45,10 @@ pub mod window_state;
 // crate funnels through [`widget_test_session::acquire`], which
 // serializes them behind one process-wide mutex held across `gtk::init()`
 // AND all widget construction/assertions, while keeping the display-gated
-// skip messages on machines without a display session.
+// skip messages on machines without a display session. The session also
+// pushes a dedicated main context as the thread default, so widget
+// realization never dispatches sources other tests left on the
+// process-global default context (see `acquire`).
 //
 // Note that the mutex SERIALIZES but does not give THREAD AFFINITY: a
 // second GTK-initializing `#[test]` still runs on its own worker thread
@@ -68,6 +71,25 @@ pub mod widget_test_session {
     /// Acquires the process-wide GTK test lock, then — still holding it —
     /// applies the display-session gate and initializes GTK at most once
     /// per process.
+    ///
+    /// While the lock is held, the session also pushes a **dedicated main
+    /// context** as the calling thread's thread-default context; the guard
+    /// pops it again on drop. This is what makes main-context pumping safe
+    /// inside the session: parallel non-widget tests (the audio suite in
+    /// particular) construct players whose production code attaches
+    /// thread-affine glib sources — `timeout_add_local` position timers,
+    /// debounced `timeout_add_local_once` persistence saves — to the
+    /// process-global default context, and those tests never run a main
+    /// loop, so the sources stay pending there. Any test that pumped the
+    /// global default context would dispatch a foreign source on its own
+    /// worker thread, tripping glib's `ThreadGuard`
+    /// ("Value accessed from different thread than where it was created")
+    /// inside a non-unwinding C trampoline and aborting the entire test
+    /// binary (tr-8wtab). Pump the session's context instead — helpers can
+    /// fetch it with `MainContext::thread_default()`, which returns `Some`
+    /// exactly because the session pushed it — so only sources this same
+    /// thread scheduled ever dispatch. When the session pops the context,
+    /// its undrained sources are simply dropped with the thread.
     ///
     /// Returns the guard that the caller MUST hold across every widget
     /// construction and assertion in the test body (that is the whole
@@ -97,7 +119,7 @@ pub mod widget_test_session {
     /// skipping every widget assertion behind an otherwise-green suite.
     /// Leave the variable unset for the default headless behavior, where
     /// skipping is the intended, reported outcome.
-    pub fn acquire(label: &str) -> Option<MutexGuard<'static, ()>> {
+    pub fn acquire(label: &str) -> Option<SessionGuard> {
         let fail_closed = std::env::var_os("TRIBUTARY_WIDGET_TESTS_FAIL_CLOSED").is_some();
 
         // A panicked earlier test must not cascade into every later widget
@@ -144,6 +166,52 @@ pub mod widget_test_session {
             }
         }
 
-        Some(guard)
+        // Push the session's dedicated main context as the thread default
+        // (see the doc comment above for why the global default context is
+        // a cross-thread dispatch hazard here). `with_thread_default` is
+        // scoped to a closure, but the push must span the caller's entire
+        // widget session, so this mirrors glib's private
+        // `ThreadDefaultContext` RAII with an explicit pop on drop. A fresh
+        // context always acquires: nothing else owns it yet.
+        let thread_default = ThreadDefaultMainContext::push(gtk::glib::MainContext::new());
+
+        Some(SessionGuard {
+            _lock: guard,
+            _thread_default: thread_default,
+        })
+    }
+
+    /// Holds the GTK test mutex and the session's pushed thread-default
+    /// main context for the lifetime of a widget test session. Dropping it
+    /// pops the context first and then releases the lock.
+    pub struct SessionGuard {
+        _lock: MutexGuard<'static, ()>,
+        _thread_default: ThreadDefaultMainContext,
+    }
+
+    /// RAII for `g_main_context_push_thread_default` /
+    /// `g_main_context_pop_thread_default` (mirrors glib's private
+    /// `ThreadDefaultContext`, which is not public).
+    struct ThreadDefaultMainContext {
+        context: gtk::glib::MainContext,
+    }
+
+    impl ThreadDefaultMainContext {
+        fn push(context: gtk::glib::MainContext) -> Self {
+            use gtk::glib::translate::ToGlibPtr;
+            unsafe {
+                gtk::glib::ffi::g_main_context_push_thread_default(context.to_glib_none().0);
+            }
+            Self { context }
+        }
+    }
+
+    impl Drop for ThreadDefaultMainContext {
+        fn drop(&mut self) {
+            use gtk::glib::translate::ToGlibPtr;
+            unsafe {
+                gtk::glib::ffi::g_main_context_pop_thread_default(self.context.to_glib_none().0);
+            }
+        }
     }
 }
