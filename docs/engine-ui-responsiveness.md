@@ -81,16 +81,28 @@ GDK_BACKEND=broadway BROADWAY_DISPLAY=:97 DISPLAY=:97 \
 
 | Metric | Definition |
 | --- | --- |
-| `fullsync_publication_first_ms` | the complete production `LibraryEvent::FullSync` publication unit (`window::apply_full_sync_publication` — arch Track→TrackObject conversion, playlist/queue refresh, per-source clone, `display_local_tracks` including the folder-model rebuild), 0 → N rows on an empty browser; this is what the main loop blocks on at startup |
+| `fullsync_publication_first_ms` | the complete FullSync publication unit, 0 → N rows (see below) |
 | `fullsync_publication_resync_ms` | the same complete unit, N → N rows (idempotent republication) |
-| `publication_display_only_ms` | `display_tracks` alone, 0 → N rows on a second empty browser, objects preconverted outside the timer; a strict lower bound of `fullsync_publication_first_ms` — the harness asserts the full path exceeds it at every scale |
+| `publication_display_only_ms` | `display_tracks` alone, 0 → N rows (see below) |
 | `browser_rebuild_ms` | `rebuild_browser_data` alone at N rows |
 
+`fullsync_publication_first_ms` times the complete production
+`LibraryEvent::FullSync` publication unit —
+`window::apply_full_sync_publication`: arch Track→TrackObject
+conversion, playlist/queue refresh, the per-source clone, and
+`display_local_tracks` including the folder-model rebuild — 0 → N rows
+on an empty browser. This is what the main loop blocks on at startup.
 The measurement half calls the same function the production FullSync
-arm calls (a source-structure test pins the arm to the unit), and
-sanity-asserts that the store, master rows, browser snapshot, and
-per-source projection all carry exactly N rows after publication, so a
-fast-but-wrong harness cannot pass.
+arm calls (a source-structure test pins the arm to the unit).
+
+`publication_display_only_ms` is a strict lower bound of
+`fullsync_publication_first_ms`: `display_tracks` alone, 0 → N rows on
+a second empty browser at the same scale, objects preconverted outside
+the timer; the harness asserts the full path exceeds it at every scale.
+
+The measurement half also sanity-asserts that the store, master rows,
+browser snapshot, and per-source projection all carry exactly N rows
+after publication, so a fast-but-wrong harness cannot pass.
 
 ## Recorded baselines and budgets
 
