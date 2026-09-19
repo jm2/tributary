@@ -237,6 +237,12 @@ properties:
   write_invalid_file: "Tagbewerking is niet beschikbaar omdat ten minste één geselecteerd nummer geen gewoon lokaal bestand is."
   write_unavailable: "Tagbewerking is niet beschikbaar omdat ten minste één geselecteerd bestand of de map ervan alleen-lezen of niet beschikbaar is."
   write_device_unavailable: "Dit apparaat is momenteel alleen-lezen of niet beschikbaar. Voeg in Flatpak de map toe als aangepaste bibliotheek in Voorkeuren om schrijftoegang aan te vragen."
+  write_conflict: "Ten minste één geselecteerd bestand is op schijf gewijzigd sinds Eigenschappen werd geopend. Open Eigenschappen opnieuw om de huidige bestanden te bewerken."
+  save_conflict_heading: "Sommige bestanden zijn gewijzigd op schijf"
+  save_failure_heading: "Sommige bestanden konden niet worden opgeslagen"
+  save_conflict_all: "%{conflicts} van %{total} bestand(en) zijn op schijf gewijzigd sinds Eigenschappen werd geopend. De concurrerende bestanden zijn onaangeroerd gelaten — open Eigenschappen opnieuw om de huidige bestanden te bewerken."
+  save_conflict_mixed: "%{conflicts} van %{total} bestand(en) zijn op schijf gewijzigd en %{other} ander(e) bestand(en) konden niet worden opgeslagen; alle zijn ongewijzigd gelaten. Open Eigenschappen opnieuw voor de gewijzigde bestanden."
+  save_failure: "%{failed} van %{total} bestand(en) konden niet worden opgeslagen en zijn ongewijzigd gelaten."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:

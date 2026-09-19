@@ -237,6 +237,12 @@ properties:
   write_invalid_file: "Die Tag-Bearbeitung ist nicht verfügbar, da mindestens ein ausgewählter Titel keine reguläre lokale Datei ist."
   write_unavailable: "Die Tag-Bearbeitung ist nicht verfügbar, da mindestens eine ausgewählte Datei oder ihr Ordner schreibgeschützt oder nicht verfügbar ist."
   write_device_unavailable: "Dieses Gerät ist derzeit schreibgeschützt oder nicht verfügbar. Fügen Sie seinen Ordner in Flatpak unter Einstellungen als benutzerdefinierte Bibliothek hinzu, um Schreibzugriff anzufordern."
+  write_conflict: "Mindestens eine ausgewählte Datei wurde seit dem Öffnen von Eigenschaften auf dem Datenträger geändert. Öffnen Sie Eigenschaften erneut, um die aktuellen Dateien zu bearbeiten."
+  save_conflict_heading: "Einige Dateien wurden auf dem Datenträger geändert"
+  save_failure_heading: "Einige Dateien konnten nicht gespeichert werden"
+  save_conflict_all: "%{conflicts} von %{total} Datei(en) wurden seit dem Öffnen von Eigenschaften auf dem Datenträger geändert. Die konkurrierenden Dateien blieben unverändert – öffnen Sie Eigenschaften erneut, um die aktuellen Dateien zu bearbeiten."
+  save_conflict_mixed: "%{conflicts} von %{total} Datei(en) wurden auf dem Datenträger geändert und %{other} weitere Datei(en) konnten nicht gespeichert werden; alle blieben unverändert. Öffnen Sie Eigenschaften für die geänderten Dateien erneut."
+  save_failure: "%{failed} von %{total} Datei(en) konnten nicht gespeichert werden und blieben unverändert."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:

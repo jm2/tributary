@@ -15,6 +15,7 @@ use super::properties_dialog::SaveTarget;
 use super::window_state::WindowState;
 use crate::architecture::{MediaKey, SourceId, TrackId};
 use crate::local::playlist_manager::{PlaylistEntryAddOutcome, PlaylistEntryInput};
+use crate::local::tag_writer::LocalMutationTarget;
 use crate::source_registry::{RegularPlaylistTrackResolution, SourceRegistry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -990,15 +991,28 @@ fn collect_selected_add_candidates(
         .collect()
 }
 
-fn playlist_add_candidate(track: &TrackObject) -> Option<PlaylistAddCandidate> {
+/// The complete application identity of one row.
+///
+/// The track string alone is only a relative identity inside one source's
+/// namespace: two devices (or a device and the local library) can expose
+/// the same relative track ID. [`MediaKey`] pairs the track with its owning
+/// source, so selection snapshots and completion re-proofs compare full
+/// identities, never bare track strings. `None` means the row cannot prove
+/// an identity at all; every caller treats that as fail-closed — the row is
+/// dropped with the whole action at build time, and refused at completion.
+fn row_media_key(track: &TrackObject) -> Option<MediaKey> {
     let source_id = track.source_id()?;
     let track_id = if source_id == SourceId::local() {
         TrackId::new(track.track_id()).ok()?
     } else {
         TrackId::remote(track.track_id()).ok()?
     };
-    let media_key = MediaKey::new(source_id, track_id);
-    if source_id == SourceId::local() {
+    Some(MediaKey::new(source_id, track_id))
+}
+
+fn playlist_add_candidate(track: &TrackObject) -> Option<PlaylistAddCandidate> {
+    let media_key = row_media_key(track)?;
+    if media_key.source_id == SourceId::local() {
         Some(PlaylistAddCandidate::Local(media_key))
     } else {
         Some(PlaylistAddCandidate::Remote {
@@ -1146,10 +1160,13 @@ fn build_properties_action(
     // Snapshot the exact selection while building the menu. Properties is an
     // all-or-none operation: silently dropping a malformed, remote, or
     // pathless lifecycle row would let a batch edit only an unexpected
-    // subset. Local rows snapshot their validated native path; rows owned by
-    // a known removable device snapshot their exact source-scoped identity
-    // for resolution through the live session when the action fires.
+    // subset. Local rows snapshot their validated native pathname (admission
+    // to an exact object happens off-thread when the action fires, so menu
+    // build never blocks on the filesystem); rows owned by a known removable
+    // device snapshot their exact source-scoped identity for resolution
+    // through the live session when the action fires.
     let mut track_infos = Vec::new();
+    let mut media_keys = Vec::new();
     for &position in &selection.positions {
         let Some(item) = sm.item(position) else {
             return;
@@ -1160,6 +1177,14 @@ fn build_properties_action(
         let Some(target) = properties_save_target(track, sidebar_store) else {
             return;
         };
+        // The completion re-proves the live selection by complete
+        // source-scoped identity, so the snapshot must carry it. A row that
+        // cannot prove which source owns it is dropped with the whole
+        // action — never admitted under an unprovable identity.
+        let Some(media_key) = row_media_key(track) else {
+            return;
+        };
+        media_keys.push(media_key);
         track_infos.push(super::properties_dialog::TrackInfo {
             target,
             title: track.title(),
@@ -1187,6 +1212,46 @@ fn build_properties_action(
     if track_infos.is_empty() {
         return;
     }
+    // Re-proving evidence for the completion: menu build and target
+    // admission are separated by asynchronous work, during which the user
+    // can keep scrolling, reordering, or changing the selection. The
+    // completion re-proves the live selection before opening the dialog —
+    // every snapshotted position still selected and still naming the same
+    // source-scoped identity (MediaKey), with no additional selection — so
+    // admitted targets are stitched onto the rows the user actually
+    // activated, never onto rows that moved into place while the worker
+    // ran. A track string alone cannot decide this: two sources can expose
+    // equal relative track IDs, so only the full identity proves the row.
+    let selection_evidence = PropertiesSelectionEvidence {
+        positions: selection.positions.clone(),
+        media_keys,
+    };
+
+    // Selection-time filesystem evidence for the pending local pathnames.
+    // Menu build and admission are separated by the menu's whole visible
+    // lifetime, during which a pathname can be replaced; the admission
+    // validates its admitted objects against this capture before the dialog
+    // may open. The capture starts on a blocking worker the moment the menu
+    // is built — never the UI thread — and the residual gap is only its own
+    // scheduling: scheduler-scale, not the menu's human-scale lifetime.
+    let pending_local_paths = distinct_pending_local_paths(&track_infos);
+    let menu_time_locals = if pending_local_paths.is_empty() {
+        None
+    } else {
+        let (menu_time_tx, menu_time_rx) =
+            tokio::sync::oneshot::channel::<Option<MenuTimeLocals>>();
+        mutation_context.rt_handle.spawn(async move {
+            let captured =
+                tokio::task::spawn_blocking(move || capture_menu_time_locals(&pending_local_paths))
+                    .await;
+            let _ = menu_time_tx.send(captured.ok());
+        });
+        Some(menu_time_rx)
+    };
+    // The receiver is consumed exactly once, by the action's first
+    // activation; a Mutex lets the Fn closure hand it over without moving
+    // out of the capture.
+    let menu_time_locals = std::sync::Mutex::new(menu_time_locals);
 
     let props_action = gtk::gio::SimpleAction::new("properties", None);
     let win_for_props: Option<adw::ApplicationWindow> = mutation_context
@@ -1196,10 +1261,10 @@ fn build_properties_action(
     tracing::debug!(
         has_win = win_for_props.is_some(),
         track_count = track_infos.len(),
-        removable = track_infos.iter().any(|info| {
+        pending = track_infos.iter().any(|info| {
             matches!(
                 info.target,
-                SaveTarget::PendingRemovable(_) | SaveTarget::Removable(_)
+                SaveTarget::PendingLocal(_) | SaveTarget::PendingRemovable(_)
             )
         }),
         "build_properties_action"
@@ -1207,53 +1272,77 @@ fn build_properties_action(
     let registry_for_props = mutation_context.source_registry.clone();
     let rt_handle_for_props = mutation_context.rt_handle.clone();
     let failure_context_for_props = mutation_context.clone();
+    let column_view_for_props = mutation_context.column_view.clone();
 
     props_action.connect_activate(move |_, _| {
         let Some(ref win) = win_for_props else {
             tracing::warn!("properties action: win_for_props is None, cannot show dialog");
             return;
         };
-        if track_infos
-            .iter()
-            .all(|info| matches!(info.target, SaveTarget::LocalPath(_)))
-        {
-            // A local-path-only selection can never write through a removable
-            // authority, so no post-mutation catalogue refresh can apply.
-            super::properties_dialog::show_properties_dialog(
-                win,
-                &track_infos,
-                automatic_device,
-                None,
-            );
-            return;
-        }
 
-        // Exchange every distinct pending removable identity for a retained
-        // mutation authority through its exact live session. The action is
-        // all-or-none: one unavailable device, retired session, or changed
-        // epoch cancels the dialog entirely rather than editing a subset,
-        // and a native mount location is never surfaced.
-        let pending = distinct_pending_mutations(&track_infos);
+        // Admit every pending target off the UI thread before the dialog may
+        // open. The action is all-or-none: one unavailable device, retired
+        // session, changed epoch, or unadmittable pathname cancels the
+        // dialog entirely rather than editing a subset, and a native mount
+        // location is never surfaced.
+        let pending_removable = distinct_pending_mutations(&track_infos);
+        let pending_locals = distinct_pending_local_paths(&track_infos);
+        // The menu-time anchor is consumed exactly once, here at activation;
+        // the blocking worker then awaits the probe and validates against it.
+        let menu_time_locals = menu_time_locals
+            .lock()
+            .expect("menu-time capture mutex")
+            .take();
         let registry = registry_for_props.clone();
         let registry_for_catalogue = registry.clone();
         let rt_handle = rt_handle_for_props.clone();
         let win = win.clone();
         let track_infos_for_resolve = track_infos.clone();
         let failure_context = failure_context_for_props.clone();
-        let (tx, rx) = async_channel::bounded::<
-            Option<
-                std::collections::HashMap<
-                    (SourceId, String),
-                    crate::source_registry::RemovableMutationTarget,
-                >,
-            >,
-        >(1);
+        let column_view_for_completion = column_view_for_props.clone();
+        let selection_evidence = selection_evidence.clone();
+        let (tx, rx) = async_channel::bounded::<Option<PropertiesAdmission>>(1);
         rt_handle.spawn(async move {
-            let mut resolved: std::collections::HashMap<
+            // Phase 1: admit each distinct local pathname to an exact
+            // object — filesystem identification can block on removable and
+            // network media, so it must never run on the UI thread — and
+            // prove every admitted object is exactly the object the
+            // menu-time capture snapshotted before the dialog may see it.
+            let locals = if pending_locals.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                match tokio::task::spawn_blocking(move || {
+                    capture_and_validate_pending_locals(&pending_locals, menu_time_locals)
+                })
+                .await
+                {
+                    Ok(Ok(locals)) => locals,
+                    Ok(Err(reason)) => {
+                        tracing::warn!(
+                            "local properties admission refused ({reason}); surfacing the cancelled action"
+                        );
+                        let _ = tx.send_blocking(None);
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "local properties admission join failed; surfacing the cancelled action"
+                        );
+                        let _ = tx.send_blocking(None);
+                        return;
+                    }
+                }
+            };
+
+            // Phase 2: exchange every distinct pending removable identity
+            // for a retained mutation authority through its exact live
+            // session.
+            let mut removables: std::collections::HashMap<
                 (SourceId, String),
                 crate::source_registry::RemovableMutationTarget,
             > = std::collections::HashMap::new();
-            for mutation in &pending {
+            for mutation in &pending_removable {
                 match registry
                     .resolve_mutation_target(
                         mutation.source_id,
@@ -1263,7 +1352,7 @@ fn build_properties_action(
                     .await
                 {
                     Ok(target) => {
-                        resolved.insert(
+                        removables.insert(
                             (mutation.source_id, mutation.track_id.as_str().to_owned()),
                             target,
                         );
@@ -1280,47 +1369,74 @@ fn build_properties_action(
                     }
                 }
             }
-            let _ = tx.send_blocking(Some(resolved));
+            let _ = tx.send_blocking(Some(PropertiesAdmission { locals, removables }));
         });
         glib::MainContext::default().spawn_local(async move {
             // Every other failure path in this file presents an alert; a
-            // resolution refused between menu build and activation (device
-            // removed, session retired, epoch changed) must be visible too —
-            // the user activated Properties and must not watch the popover
-            // silently close.
-            let Ok(Some(resolved)) = rx.recv().await else {
+            // refusal between activation and admission (device removed,
+            // session retired, epoch changed, join failure) must be visible
+            // too — the user activated Properties and must not watch the
+            // popover silently close.
+            let Ok(Some(admission)) = rx.recv().await else {
                 failure_context.show_mutation_failed();
                 return;
             };
-            let mut infos = track_infos_for_resolve;
-            for info in &mut infos {
-                if let SaveTarget::PendingRemovable(pending) = &info.target {
-                    if let Some(target) =
-                        resolved.get(&(pending.source_id, pending.track_id.as_str().to_owned()))
-                    {
-                        info.target = SaveTarget::Removable(target.clone());
-                    }
+            // The selection the user activated may have changed while the
+            // worker ran. Stitch the admitted targets back only if the live
+            // selection still matches the activation snapshot exactly;
+            // otherwise refuse visibly instead of editing rows that moved
+            // into place.
+            let Some(live_selection) = column_view_for_completion
+                .model()
+                .and_downcast::<gtk::MultiSelection>()
+            else {
+                tracing::warn!("properties action: live selection model unavailable at admission");
+                failure_context.show_mutation_failed();
+                return;
+            };
+            let selected = live_selection.selection();
+            match resolve_properties_completion(
+                &selection_evidence,
+                selected.size() as usize,
+                &|position| selected.contains(position),
+                &|position| {
+                    live_selection
+                        .item(position)
+                        .and_downcast::<TrackObject>()
+                        .and_then(|track| row_media_key(&track))
+                },
+                track_infos_for_resolve,
+                &admission,
+            ) {
+                PropertiesCompletion::Open(infos) => {
+                    // Successful removable writes republish refreshed metadata for
+                    // exactly the written identities; the dialog triggers the
+                    // registry's catalogue refresh lane itself. A local-path-only
+                    // selection can never write through a removable authority, so no
+                    // post-mutation catalogue refresh can apply.
+                    let has_removable = infos
+                        .iter()
+                        .any(|info| matches!(info.target, SaveTarget::Removable(_)));
+                    super::properties_dialog::show_properties_dialog(
+                        &win,
+                        &infos,
+                        automatic_device,
+                        has_removable.then_some(registry_for_catalogue),
+                    );
+                }
+                PropertiesCompletion::SelectionChanged => {
+                    tracing::warn!(
+                        "properties selection changed while targets were admitted; surfacing the cancelled action"
+                    );
+                    failure_context.show_mutation_failed();
+                }
+                PropertiesCompletion::StitchFault => {
+                    // Unreachable: every pending target in `infos` came from the
+                    // same admitted set. An admission must be exact, never
+                    // partial.
+                    tracing::warn!("properties admission left a target unresolved");
                 }
             }
-            if infos
-                .iter()
-                .any(|info| matches!(info.target, SaveTarget::PendingRemovable(_)))
-            {
-                // Unreachable: every pending identity in `infos` came from
-                // the same resolved set. A retry-resolution must be exact,
-                // never partial.
-                tracing::warn!("removable properties resolution left an identity unresolved");
-                return;
-            }
-            // Successful removable writes republish refreshed metadata for
-            // exactly the written identities; the dialog triggers the
-            // registry's catalogue refresh lane itself.
-            super::properties_dialog::show_properties_dialog(
-                &win,
-                &infos,
-                automatic_device,
-                Some(registry_for_catalogue),
-            );
         });
     });
 
@@ -1379,6 +1495,14 @@ fn removable_row_source(
 ///
 /// `None` means the row cannot be authorized for a Properties edit at all;
 /// the whole action is dropped rather than editing an unexpected subset.
+///
+/// This runs while the menu is built — on the UI thread — so it must never
+/// touch the filesystem. A local row returns its validated pathname as a
+/// [`SaveTarget::PendingLocal`]; the action admits the pathname to an exact
+/// object on a worker when it fires, before the dialog may open. A
+/// removable row returns a [`SaveTarget::PendingRemovable`] identity, which
+/// the same admission exchanges for a retained authority through the live
+/// session.
 fn properties_save_target(
     track: &TrackObject,
     sidebar_store: &gtk::gio::ListStore,
@@ -1398,9 +1522,15 @@ fn properties_save_target(
             },
         ));
     }
-    // Every other row remains a path-authorized local-file edit.
+    // Every other row is a local-file edit, authorized by its validated
+    // native pathname. The pathname alone never authorizes a write: the
+    // admission step proves the exact object (filesystem identity,
+    // containing directory chain, content revision) before the dialog can
+    // open, and the later Save reproves it before the first byte.
     let path = local_file_path(&track.uri())?;
-    Some(SaveTarget::LocalPath(path))
+    Some(SaveTarget::PendingLocal(
+        super::properties_dialog::PendingLocalMutation { path },
+    ))
 }
 
 /// One pending mutation per distinct removable identity, in selection order.
@@ -1426,6 +1556,265 @@ fn distinct_pending_mutations(
         }
     }
     pending
+}
+
+/// One pending pathname per distinct local row, in selection order.
+///
+/// Repeated playlist rows may refer to the same file; admitting the same
+/// pathname twice would run the blocking identification twice over one
+/// exact object.
+fn distinct_pending_local_paths(
+    track_infos: &[super::properties_dialog::TrackInfo],
+) -> Vec<std::path::PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    let mut pending = Vec::new();
+    for info in track_infos {
+        if let SaveTarget::PendingLocal(mutation) = &info.target {
+            if seen.insert(mutation.path.clone()) {
+                pending.push(mutation.path.clone());
+            }
+        }
+    }
+    pending
+}
+
+/// Admission test hook (mirrors the tag-writer interpose pattern): a test
+/// installs a receiver here and the worker blocks inside
+/// `capture_pending_locals` until it is released, making the otherwise
+/// racy "worker still running" window deterministic.
+#[cfg(test)]
+static HELD_ADMISSION_GATE: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Admit each distinct local pathname to an exact mutation target.
+///
+/// Runs on the blocking worker, never the UI thread: identification can
+/// block on removable and network media. Capture is best-effort — a file
+/// that cannot be identified carries no evidence and every write refuses,
+/// so a transient failure never authorizes a blind write.
+fn capture_pending_locals(
+    paths: &[std::path::PathBuf],
+) -> std::collections::HashMap<std::path::PathBuf, LocalMutationTarget> {
+    #[cfg(test)]
+    if let Ok(guard) = HELD_ADMISSION_GATE.lock() {
+        if let Some(rx) = guard.as_ref() {
+            let _ = rx.recv();
+        }
+    }
+    paths
+        .iter()
+        .map(|path| (path.clone(), LocalMutationTarget::capture(path)))
+        .collect()
+}
+
+/// The menu-time capture one action's probe delivers, awaited by the
+/// admission worker before it may validate its own capture.
+type MenuTimeLocals = std::collections::HashMap<std::path::PathBuf, LocalMutationTarget>;
+
+/// The receiver half of the menu-time probe: `Some(capture)` delivers the
+/// evidence, `None` means the probe's worker failed before it could capture.
+type MenuTimeLocalsRx = tokio::sync::oneshot::Receiver<Option<MenuTimeLocals>>;
+
+/// Capture selection-time filesystem evidence for the pending local
+/// pathnames — the menu-time anchor the admission validates against.
+///
+/// Started the moment the menu is built, on a blocking worker:
+/// identification can block on removable and network media, so it must never
+/// run on the UI thread. Deliberately not `capture_pending_locals`: that fn
+/// parks while a test holds the admission gate, and this capture is
+/// evidence, not admission — it must complete regardless of any held gate.
+fn capture_menu_time_locals(paths: &[std::path::PathBuf]) -> MenuTimeLocals {
+    paths
+        .iter()
+        .map(|path| (path.clone(), LocalMutationTarget::capture(path)))
+        .collect()
+}
+
+/// Whether every admitted target is exactly the object captured when the
+/// menu was built: for each admitted pathname, the menu-time map must hold
+/// a target for the same pathname admitting the same selection — identical
+/// evidence, or the identical capture-failure category when the selection
+/// carried no evidence. A pathname the menu-time capture never saw is a
+/// wiring fault and refuses; the admitted map always covers exactly the
+/// pending pathnames, so the admitted side drives the comparison.
+fn menu_time_capture_still_holds(menu_time: &MenuTimeLocals, admitted: &MenuTimeLocals) -> bool {
+    admitted.iter().all(|(path, admitted_target)| {
+        menu_time
+            .get(path)
+            .is_some_and(|captured| captured.admits_same_selection(admitted_target))
+    })
+}
+
+/// Phase 1 of the Properties admission: admit every distinct pending local
+/// pathname, then prove each admitted object is exactly the object the
+/// menu-time capture snapshotted before the dialog may see it.
+///
+/// Menu build and admission are separated by the menu's whole visible
+/// lifetime, during which a pathname can be replaced; without the anchor, a
+/// replacement would be admitted and later overwritten under the selection's
+/// catalogue metadata. The comparison is fail-closed: any mismatch, missing
+/// menu-time target, lost probe, or an already-consumed anchor refuses the
+/// whole activation — surfaced as the cancelled action, never a partial
+/// dialog. The residual gap is only the probe's own start after menu build —
+/// scheduler-scale, not the menu's human-scale lifetime.
+fn capture_and_validate_pending_locals(
+    paths: &[std::path::PathBuf],
+    menu_time: Option<MenuTimeLocalsRx>,
+) -> Result<MenuTimeLocals, &'static str> {
+    let menu_time = match menu_time {
+        Some(rx) => match rx.blocking_recv() {
+            Ok(Some(capture)) => capture,
+            Ok(None) => return Err("the menu-time local capture failed"),
+            Err(_) => return Err("the menu-time local capture was lost"),
+        },
+        // The receiver is consumed by the first activation of an action, and
+        // the menu never offers a second activation of the same action; an
+        // unanchored admission refuses rather than trusting a pathname
+        // nobody captured.
+        None => return Err("the menu-time local evidence was already consumed"),
+    };
+    let admitted = capture_pending_locals(paths);
+    if !menu_time_capture_still_holds(&menu_time, &admitted) {
+        return Err("a selected pathname's object changed between menu build and admission");
+    }
+    Ok(admitted)
+}
+
+/// The admitted targets a Properties activation opens the dialog with.
+///
+/// Built entirely off the UI thread; both maps cover exactly the pending
+/// values the activation snapshot carried, so an exact stitch is possible.
+struct PropertiesAdmission {
+    locals: std::collections::HashMap<std::path::PathBuf, LocalMutationTarget>,
+    removables: std::collections::HashMap<
+        (SourceId, String),
+        crate::source_registry::RemovableMutationTarget,
+    >,
+}
+
+/// The selection a Properties activation was built from, as exact row
+/// positions plus each row's complete source-scoped identity.
+///
+/// Menu build and target admission are separated by asynchronous work,
+/// during which the user can keep scrolling, reordering, or changing the
+/// selection. Re-proving the live selection at completion — every
+/// snapshotted position still selected and still naming the same
+/// [`MediaKey`] — guarantees admitted targets are stitched back onto the
+/// rows the user actually activated, never onto rows that moved into place
+/// while the worker ran. The identity is the full `(source, track)` pair,
+/// never the track string alone: different sources can expose equal
+/// relative track IDs, and a row that cannot prove any identity fails
+/// closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PropertiesSelectionEvidence {
+    positions: Vec<u32>,
+    media_keys: Vec<MediaKey>,
+}
+
+impl PropertiesSelectionEvidence {
+    /// The selection-model-free core, testable headless: the live selected
+    /// set must have exactly the snapshotted size — no row deselected, none
+    /// added — and every snapshotted position must still be selected and
+    /// still name the source-scoped identity that was activated. A live row
+    /// whose identity cannot be proven at all counts as changed: the
+    /// refusal is fail-closed.
+    fn matches(
+        &self,
+        selected_count: usize,
+        is_selected: &dyn Fn(u32) -> bool,
+        media_key_at: &dyn Fn(u32) -> Option<MediaKey>,
+    ) -> bool {
+        if selected_count != self.positions.len() {
+            return false;
+        }
+        for (&position, media_key) in self.positions.iter().zip(&self.media_keys) {
+            if !is_selected(position) {
+                return false;
+            }
+            if media_key_at(position).as_ref() != Some(media_key) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// What the Properties completion does once the worker delivers an admitted
+/// target set.
+#[derive(Debug)]
+enum PropertiesCompletion {
+    /// The live selection still names the activated rows exactly and every
+    /// admitted target stitched: open the dialog over this write set.
+    Open(Vec<super::properties_dialog::TrackInfo>),
+    /// The live selection no longer names the activated rows — deselected,
+    /// extended, moved, or replaced by rows carrying the same track strings
+    /// under different sources: refuse visibly.
+    SelectionChanged,
+    /// Wiring fault: the admitted set cannot be stitched exactly. The
+    /// dialog must never open over a partial stitch.
+    StitchFault,
+}
+
+/// The completion core the UI dispatch runs once the worker delivers its
+/// admitted set, with the live-selection probes passed in so tests drive
+/// the exact decision the dialog opening depends on.
+///
+/// The re-proof compares complete source-scoped identities
+/// ([`PropertiesSelectionEvidence::matches`]); the stitch must cover every
+/// pending target exactly. Only then is the write set handed back for the
+/// dialog to open.
+fn resolve_properties_completion(
+    evidence: &PropertiesSelectionEvidence,
+    selected_count: usize,
+    is_selected: &dyn Fn(u32) -> bool,
+    media_key_at: &dyn Fn(u32) -> Option<MediaKey>,
+    infos: Vec<super::properties_dialog::TrackInfo>,
+    admission: &PropertiesAdmission,
+) -> PropertiesCompletion {
+    if !evidence.matches(selected_count, is_selected, media_key_at) {
+        return PropertiesCompletion::SelectionChanged;
+    }
+    let mut infos = infos;
+    if !stitch_admitted_targets(&mut infos, admission) {
+        return PropertiesCompletion::StitchFault;
+    }
+    PropertiesCompletion::Open(infos)
+}
+
+/// Replace every pending target with its admitted exact form.
+///
+/// Returns `false` when any pending value lacks its admitted counterpart,
+/// telling the caller to refuse: the dialog must never open over a partial
+/// stitch. That refusal is a wiring fault — the admission step covers
+/// exactly the pending values the activation snapshot carried.
+fn stitch_admitted_targets(
+    infos: &mut [super::properties_dialog::TrackInfo],
+    admission: &PropertiesAdmission,
+) -> bool {
+    for info in infos.iter_mut() {
+        match &info.target {
+            SaveTarget::PendingLocal(pending) => match admission.locals.get(&pending.path) {
+                Some(target) => info.target = SaveTarget::Local(target.clone()),
+                None => return false,
+            },
+            SaveTarget::PendingRemovable(pending) => {
+                match admission
+                    .removables
+                    .get(&(pending.source_id, pending.track_id.as_str().to_owned()))
+                {
+                    Some(target) => info.target = SaveTarget::Removable(target.clone()),
+                    None => return false,
+                }
+            }
+            _ => {}
+        }
+    }
+    !infos.iter().any(|info| {
+        matches!(
+            info.target,
+            SaveTarget::PendingLocal(_) | SaveTarget::PendingRemovable(_)
+        )
+    })
 }
 
 /// Match the active lifecycle source against exact sidebar metadata. Opaque
@@ -1544,6 +1933,7 @@ pub mod tests {
     // `super` inside this test module is `context_menu`, so the sibling
     // dialog module must be named from the `ui` parent directly.
     use crate::ui::properties_dialog;
+    use crate::ui::properties_dialog::PendingLocalMutation;
 
     fn remote_catalogue_track(
         track_id: TrackId,
@@ -2481,5 +2871,457 @@ pub mod tests {
             !body.contains("} else {"),
             "add-to-playlist actions must be offered in every tracklist view"
         );
+    }
+
+    fn local_ctx_track(id: &str, uri: &str) -> TrackObject {
+        let track = TrackObject::new(
+            1,
+            "Context title",
+            60,
+            "Artist",
+            "Album",
+            "",
+            "",
+            0,
+            "",
+            0,
+            0,
+            0,
+            "",
+            uri,
+        );
+        track.set_track_id(id);
+        assert!(track.set_source_id(SourceId::local()));
+        track
+    }
+
+    fn track_info_with_target(target: SaveTarget) -> super::super::properties_dialog::TrackInfo {
+        super::super::properties_dialog::TrackInfo {
+            target,
+            title: "Context title".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            genre: String::new(),
+            composer: String::new(),
+            year: String::new(),
+            track_number: String::new(),
+            disc_number: String::new(),
+            format: "FLAC".to_string(),
+            bitrate: String::new(),
+            sample_rate: String::new(),
+            duration: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_local_row_snapshots_a_pending_path_without_probing_the_filesystem() {
+        // Menu build runs on the UI thread, so the local classification must
+        // be a pure pathname snapshot: the file does not exist, and the
+        // classification still succeeds without touching the filesystem.
+        // Admission to an exact object happens on the worker when the
+        // action fires. The fixture path is platform-native because
+        // Url::to_file_path requires a drive letter on Windows (a
+        // drive-less file:/// path cannot authorize a write there); the
+        // asserted behavior is identical on both platforms: a nonexistent
+        // file classifies from the pathname alone.
+        #[cfg(windows)]
+        let (uri, expected_path) = (
+            "file:///C:/definitely/not/here.flac",
+            PathBuf::from(r"C:\definitely\not\here.flac"),
+        );
+        #[cfg(not(windows))]
+        let (uri, expected_path) = (
+            "file:///definitely/not/here.flac",
+            PathBuf::from("/definitely/not/here.flac"),
+        );
+        let sidebar_store = gtk::gio::ListStore::new::<SourceObject>();
+        let track = local_ctx_track("ctx-local", uri);
+
+        let target = properties_save_target(&track, &sidebar_store)
+            .expect("a pathless local row classifies");
+
+        match target {
+            SaveTarget::PendingLocal(pending) => {
+                assert_eq!(pending.path, expected_path);
+            }
+            other => panic!("local row must classify as pending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_local_paths_deduplicate_in_selection_order() {
+        let repeated = super::super::properties_dialog::PendingLocalMutation {
+            path: PathBuf::from("/music/first.flac"),
+        };
+        let infos = vec![
+            track_info_with_target(SaveTarget::Local(
+                crate::local::tag_writer::LocalMutationTarget::capture(&PathBuf::from(
+                    "/music/kept.flac",
+                )),
+            )),
+            track_info_with_target(SaveTarget::PendingLocal(repeated.clone())),
+            track_info_with_target(SaveTarget::PendingLocal(PendingLocalMutation {
+                path: PathBuf::from("/music/second.flac"),
+            })),
+            track_info_with_target(SaveTarget::PendingLocal(repeated)),
+        ];
+
+        assert_eq!(
+            distinct_pending_local_paths(&infos),
+            vec![
+                PathBuf::from("/music/first.flac"),
+                PathBuf::from("/music/second.flac"),
+            ]
+        );
+    }
+
+    #[test]
+    fn menu_time_capture_holds_when_every_admitted_path_still_matches() {
+        // The menu-time map is the anchor: a pathname captured at menu build
+        // that admits the same selection at activation — here, the same
+        // twice-failing capture category — holds the comparison, and an
+        // admitted set with nothing to validate holds vacuously.
+        let path = PathBuf::from("/definitely/not/here.flac");
+        let menu_time: AdmittedLocals = std::iter::once((
+            path.clone(),
+            crate::local::tag_writer::LocalMutationTarget::capture(&path),
+        ))
+        .collect();
+        let admitted_target = crate::local::tag_writer::LocalMutationTarget::capture(&path);
+        let admitted: AdmittedLocals = std::iter::once((path, admitted_target)).collect();
+
+        assert!(
+            menu_time_capture_still_holds(&menu_time, &admitted),
+            "the unchanged selection must hold the menu-time comparison"
+        );
+        assert!(
+            menu_time_capture_still_holds(&menu_time, &AdmittedLocals::new()),
+            "nothing admitted means nothing to refuse"
+        );
+    }
+
+    #[test]
+    fn menu_time_capture_refuses_an_admitted_path_the_menu_never_captured() {
+        // An admitted pathname with no menu-time counterpart means the
+        // admission covers something the menu never anchored: a wiring
+        // fault that must refuse, never stitch.
+        let path = PathBuf::from("/definitely/not/here.flac");
+        let admitted_target = crate::local::tag_writer::LocalMutationTarget::capture(&path);
+        let admitted: AdmittedLocals = std::iter::once((path, admitted_target)).collect();
+
+        assert!(
+            !menu_time_capture_still_holds(&AdmittedLocals::new(), &admitted),
+            "an unanchored admitted pathname must fail the menu-time comparison"
+        );
+    }
+
+    type AdmittedLocals =
+        std::collections::HashMap<PathBuf, crate::local::tag_writer::LocalMutationTarget>;
+
+    fn device_media_key(source: &SourceId) -> MediaKey {
+        MediaKey::new(
+            *source,
+            TrackId::remote("track-9").expect("device track id"),
+        )
+    }
+
+    /// Spawn the admission worker for `paths` and park it inside the test
+    /// gate exactly as the dispatch's spawn_blocking worker can park. The
+    /// `at_gate` flag marks the parked state without any timed sleep; the
+    /// returned sender releases the worker.
+    fn parked_admission_worker(
+        paths: Vec<PathBuf>,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<AdmittedLocals>,
+    ) {
+        let (release, gate) = std::sync::mpsc::channel();
+        *HELD_ADMISSION_GATE.lock().expect("gate lock") = Some(gate);
+        let at_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let at_gate_worker = at_gate.clone();
+        let worker = std::thread::spawn(move || {
+            at_gate_worker.store(true, std::sync::atomic::Ordering::SeqCst);
+            capture_pending_locals(&paths)
+        });
+        let mut waited = 0;
+        while !at_gate.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                waited < 10_000,
+                "the admission worker never reached the test gate"
+            );
+            waited += 1;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        (release, worker)
+    }
+
+    /// Pumps the main context until `done` turns true, failing with
+    /// `timeout_message` instead of hanging.
+    fn pump_main_context_until(
+        context: &glib::MainContext,
+        done: impl Fn() -> bool,
+        timeout_message: &str,
+    ) {
+        let mut pumped = 0;
+        while !done() {
+            assert!(pumped < 10_000, "{timeout_message}");
+            pumped += 1;
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Builds the single-path admitted set the completion stitches. This is
+    /// deliberately not `capture_pending_locals`: that fn parks while
+    /// another test holds the admission gate, and this suite's tests run
+    /// concurrently.
+    fn admitted_by_path(path: &std::path::Path) -> PropertiesAdmission {
+        PropertiesAdmission {
+            locals: std::iter::once((
+                path.to_path_buf(),
+                crate::local::tag_writer::LocalMutationTarget::capture(path),
+            ))
+            .collect(),
+            removables: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Delivers `admission` through the same async-channel + main-context
+    /// transport the dispatch uses, decides with the same completion core
+    /// the dialog opening depends on, and pumps until the decision has run
+    /// on the main context.
+    fn deliver_admission_and_resolve_completion(
+        context: &glib::MainContext,
+        evidence: PropertiesSelectionEvidence,
+        media_key_at: impl Fn(u32) -> Option<MediaKey> + 'static,
+        admission: PropertiesAdmission,
+        pending_path: &std::path::Path,
+    ) -> std::rc::Rc<std::cell::RefCell<Option<PropertiesCompletion>>> {
+        let outcome: std::rc::Rc<std::cell::RefCell<Option<PropertiesCompletion>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let outcome_for_task = outcome.clone();
+        let infos_for_task = vec![track_info_with_target(SaveTarget::PendingLocal(
+            PendingLocalMutation {
+                path: pending_path.to_path_buf(),
+            },
+        ))];
+        let (tx, rx) = async_channel::bounded::<PropertiesAdmission>(1);
+        tx.send_blocking(admission)
+            .expect("deliver the admitted set");
+        context.spawn_local(async move {
+            let Ok(admission) = rx.recv().await else {
+                panic!("the admitted set must arrive");
+            };
+            *outcome_for_task.borrow_mut() = Some(resolve_properties_completion(
+                &evidence,
+                1,
+                &|position| position == 0,
+                &media_key_at,
+                infos_for_task,
+                &admission,
+            ));
+        });
+        pump_main_context_until(
+            context,
+            || outcome.borrow().is_some(),
+            "the completion never ran on the main context",
+        );
+        outcome
+    }
+
+    #[test]
+    fn held_admission_worker_parks_while_the_main_context_stays_responsive() {
+        // The worker parks inside the admission gate exactly as the
+        // dispatch's spawn_blocking worker can, and while it is parked the
+        // main context the UI runs on must keep dispatching — that is the
+        // responsiveness the off-thread admission buys.
+        let pending_path = PathBuf::from("/definitely/not/here.flac");
+        let (release, worker) = parked_admission_worker(vec![pending_path.clone()]);
+
+        let dispatched = std::rc::Rc::new(std::cell::Cell::new(false));
+        let dispatched_for_idle = dispatched.clone();
+        glib::idle_add_local_once(move || dispatched_for_idle.set(true));
+        let context = glib::MainContext::default();
+        pump_main_context_until(
+            &context,
+            || dispatched.get(),
+            "the main context stopped dispatching while the admission worker was parked",
+        );
+        assert!(
+            !worker.is_finished(),
+            "the responsiveness proof must run while the worker is still parked"
+        );
+
+        release.send(()).expect("release admission gate");
+        let admitted = worker.join().expect("admission worker");
+        assert_eq!(admitted.len(), 1, "admission must admit by path");
+        *HELD_ADMISSION_GATE.lock().expect("gate lock") = None;
+    }
+
+    #[test]
+    fn a_source_swapped_row_refuses_the_completion_with_selection_changed() {
+        // Two devices exposing the same relative track ID form the live
+        // view. The activation snapshotted device A's row, but the live rows
+        // now name device B at the same position: equal track string,
+        // different source-scoped identity. The completion must refuse.
+        let device_a = SourceId::from_uuid(uuid::Uuid::new_v4());
+        let device_b = SourceId::from_uuid(uuid::Uuid::new_v4());
+        let pending_path = PathBuf::from("/definitely/not/here.flac");
+        let evidence = PropertiesSelectionEvidence {
+            positions: vec![0],
+            media_keys: vec![device_media_key(&device_a)],
+        };
+        let outcome = deliver_admission_and_resolve_completion(
+            &glib::MainContext::default(),
+            evidence,
+            move |position| (position == 0).then(|| device_media_key(&device_b)),
+            admitted_by_path(&pending_path),
+            &pending_path,
+        );
+        assert!(
+            matches!(
+                outcome.borrow().as_ref(),
+                Some(PropertiesCompletion::SelectionChanged)
+            ),
+            "a same-track-ID row from another source must refuse the completion, got {:?}",
+            outcome.borrow()
+        );
+    }
+
+    #[test]
+    fn the_unchanged_selection_opens_with_a_stitched_local_target() {
+        // The unchanged control: the same activation snapshot over rows that
+        // still name device A stitches the admitted set and opens, through
+        // the same delivery transport.
+        let device_a = SourceId::from_uuid(uuid::Uuid::new_v4());
+        let pending_path = PathBuf::from("/definitely/not/here.flac");
+        let evidence = PropertiesSelectionEvidence {
+            positions: vec![0],
+            media_keys: vec![device_media_key(&device_a)],
+        };
+        let admission = admitted_by_path(&pending_path);
+        assert_eq!(admission.locals.len(), 1, "admission must admit by path");
+        let outcome = deliver_admission_and_resolve_completion(
+            &glib::MainContext::default(),
+            evidence,
+            move |position| (position == 0).then(|| device_media_key(&device_a)),
+            admission,
+            &pending_path,
+        );
+        match outcome.borrow().as_ref() {
+            Some(PropertiesCompletion::Open(opened)) => {
+                assert!(matches!(opened[0].target, SaveTarget::Local(_)));
+            }
+            other => panic!("the unchanged selection must open, got {other:?}"),
+        };
+    }
+
+    #[test]
+    fn selection_evidence_refuses_a_selection_that_changed_during_admission() {
+        // Selection-model types assert gtk::init, so the selection mechanics
+        // are exercised through the headless core: the live selected count,
+        // the same per-position membership test, and the same per-position
+        // source-scoped identity lookup (row_media_key) the model view
+        // performs.
+        let store = gtk::gio::ListStore::new::<TrackObject>();
+        for id in ["row-0", "row-1", "row-2"] {
+            store.append(&local_ctx_track(id, &format!("file:///music/{id}.flac")));
+        }
+        let media_key_at = |position: u32| {
+            store
+                .item(position)
+                .and_downcast::<TrackObject>()
+                .and_then(|track| row_media_key(&track))
+        };
+        let mask = std::rc::Rc::new(std::cell::RefCell::new(vec![false, false, false]));
+        let is_selected = {
+            let mask = mask.clone();
+            move |position: u32| mask.borrow()[position as usize]
+        };
+        let evidence = PropertiesSelectionEvidence {
+            positions: vec![1],
+            media_keys: vec![media_key_at(1).expect("row 1 proves its identity")],
+        };
+
+        // Activation snapshot: only row 1 is selected and still row 1.
+        *mask.borrow_mut() = vec![false, true, false];
+        assert!(evidence.matches(1, &is_selected, &media_key_at));
+
+        // The row was deselected while the worker ran.
+        *mask.borrow_mut() = vec![false, false, false];
+        assert!(!evidence.matches(0, &is_selected, &media_key_at));
+
+        // The user extended the selection while the worker ran.
+        *mask.borrow_mut() = vec![false, true, true];
+        assert!(!evidence.matches(2, &is_selected, &media_key_at));
+
+        // A row moved into place at the same position: the position is
+        // still selected but no longer names the activated track.
+        *mask.borrow_mut() = vec![false, true, false];
+        let moved = local_ctx_track("row-moved", "file:///music/moved.flac");
+        store.splice(1, 1, &[moved]);
+        assert!(!evidence.matches(1, &is_selected, &media_key_at));
+
+        // A replacement row that cannot prove any identity at all refuses
+        // fail-closed: an unprovable row is never accepted as the row that
+        // was activated. (No source id is ever assigned, so row_media_key
+        // has nothing to prove.)
+        let anonymous = TrackObject::new(
+            1,
+            "Context title",
+            60,
+            "Artist",
+            "Album",
+            "",
+            "",
+            0,
+            "",
+            0,
+            0,
+            0,
+            "",
+            "file:///music/anonymous.flac",
+        );
+        store.splice(1, 1, &[anonymous]);
+        assert!(!evidence.matches(1, &is_selected, &media_key_at));
+    }
+
+    #[test]
+    fn a_partial_admission_never_stitches_a_dialog_write_set() {
+        let infos = vec![
+            track_info_with_target(SaveTarget::PendingLocal(PendingLocalMutation {
+                path: PathBuf::from("/music/admitted.flac"),
+            })),
+            track_info_with_target(SaveTarget::PendingLocal(PendingLocalMutation {
+                path: PathBuf::from("/music/missing.flac"),
+            })),
+        ];
+        let mut partial_admission = PropertiesAdmission {
+            locals: std::collections::HashMap::new(),
+            removables: std::collections::HashMap::new(),
+        };
+        partial_admission.locals.insert(
+            PathBuf::from("/music/admitted.flac"),
+            LocalMutationTarget::capture(&PathBuf::from("/music/admitted.flac")),
+        );
+
+        // One missing counterpart must refuse the whole stitch: an exact
+        // admission covers every pending value, so a partial stitch is a
+        // wiring fault and the dialog must never open over it.
+        assert!(!stitch_admitted_targets(
+            &mut infos.clone(),
+            &partial_admission
+        ));
+
+        // A complete admission stitches every row onto its exact target.
+        partial_admission.locals.insert(
+            PathBuf::from("/music/missing.flac"),
+            LocalMutationTarget::capture(&PathBuf::from("/music/missing.flac")),
+        );
+        let mut complete = infos.clone();
+        assert!(stitch_admitted_targets(&mut complete, &partial_admission));
+        for info in &complete {
+            assert!(matches!(info.target, SaveTarget::Local(_)));
+        }
     }
 }

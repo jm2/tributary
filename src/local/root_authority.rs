@@ -112,6 +112,46 @@ enum WindowsFileId {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ObjectIdentity;
 
+/// Point-in-time evidence of one retained file object's content revision.
+///
+/// The tag writer copies the admitted file to a staged sibling and later
+/// replaces the admitted object with the tagged copy. The object identity
+/// alone cannot detect an external writer that edits the *same* object in
+/// place inside that window: the leaf still names the admitted object, but its
+/// bytes changed, and the replacement would silently discard the competing
+/// edit. The revision — the exact byte length together with the
+/// last-modification time read from the retained handle — is captured when the
+/// file is selected, re-proven when a write starts, and re-proven again
+/// immediately before the commit displaces anything. A changed revision
+/// refuses the write and preserves both the competing edit and the staged
+/// copy.
+///
+/// Residual limitation, stated honestly: a filesystem with a coarse
+/// modification timestamp (or one whose handle cannot report a modification
+/// time) can miss an in-place edit that keeps the exact byte length and lands
+/// inside the timestamp granularity. The length is always compared; the
+/// timestamp narrows the window but cannot close it without reading the whole
+/// file at selection time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContentRevision {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl ContentRevision {
+    /// Capture the revision of the exact file object `file` names.
+    ///
+    /// Reading from the retained handle — never through a pathname — binds the
+    /// captured revision to the object an authority admitted.
+    pub fn capture(file: &File) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BoundaryIdentity(u64);
@@ -434,6 +474,16 @@ impl MountedRootAuthority {
         &self.root
     }
 
+    /// The exact filesystem identity of the retained root directory.
+    ///
+    /// A local write target captures this when it is selected and compares it
+    /// against the authority it re-admits at write time, so a root or ancestor
+    /// directory replaced in between refuses the write instead of retargeting
+    /// it.
+    pub(crate) fn root_identity(&self) -> ObjectIdentity {
+        self.root_handle.identity
+    }
+
     /// Open a real regular file using only normal components relative to the
     /// retained mounted root.
     pub(super) fn open_relative_regular_file(&self, relative: &Path) -> io::Result<BoundFile> {
@@ -564,6 +614,33 @@ impl MountedMutationTarget {
         validate_mounted_bound(self.authority.as_ref(), &file)
     }
 
+    /// The exact filesystem identity of the file object this target admitted.
+    ///
+    /// This is the identity a local write target captured when the user
+    /// selected the file; a write compares it against the object the authority
+    /// admits now so a replacement at the same pathname refuses.
+    pub(crate) fn admitted_identity(&self) -> io::Result<ObjectIdentity> {
+        let file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("mutation target commit section is unavailable"))?;
+        file.object.validate_live()?;
+        Ok(file.object.identity)
+    }
+
+    /// The current content revision of the exact retained file object.
+    ///
+    /// Read from the retained handle, never through a pathname, so the value
+    /// describes the admitted object even after its leaf name was disturbed.
+    pub(crate) fn content_revision(&self) -> io::Result<ContentRevision> {
+        let file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("mutation target commit section is unavailable"))?;
+        file.object.validate_live()?;
+        ContentRevision::capture(&file.object.file)
+    }
+
     /// Begin one serialized commit section over this exact target.
     ///
     /// The retained mount binding and exact file object are revalidated
@@ -667,6 +744,42 @@ impl MountedMutationTarget {
         }
         self.authority.validate()
     }
+}
+
+/// The complete selection-time location evidence a local save must re-prove
+/// at its final commit gate.
+///
+/// The commit's own revalidation proves the retained mount binding and the
+/// exact retained file object — but on unix the retained binding pins only
+/// the immediate parent directory, and the full ancestor comparison in the
+/// binding validation runs on Windows. This evidence carries the resolved
+/// identity of the containing directory plus every directory above it,
+/// captured when the user selected the file, so the commit can refuse an
+/// ancestor that was replaced inside the save window even when the parent
+/// object, the file object, and the content revision all still match.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectionLocationEvidence {
+    /// The resolved identity of the selection's containing directory — the
+    /// same object the retained authority is rooted at.
+    pub(crate) parent_identity: ObjectIdentity,
+    /// The resolved identities of every directory above the containing
+    /// directory, in [`Path::ancestors`] order (nearest first, filesystem
+    /// root last), as captured at selection time.
+    pub(crate) ancestor_identities: Vec<ObjectIdentity>,
+}
+
+/// Resolve the identity of every directory above `parent`.
+///
+/// [`Path::ancestors`] yields `parent` itself first; the caller retains that
+/// identity as its authority root or as
+/// [`SelectionLocationEvidence::parent_identity`], so the chain recorded here
+/// starts at the parent's parent and ends at the filesystem root. Ancestor
+/// identities resolve through [`directory_identity`], so symlinked components
+/// compare by resolved object and reparse points (Windows) refuse, exactly as
+/// the authority bindings do. The resolution is fail-closed: an ancestor that
+/// cannot be identified at all is an error, never an absent link.
+pub fn resolve_ancestor_chain(parent: &Path) -> io::Result<Vec<ObjectIdentity>> {
+    parent.ancestors().skip(1).map(directory_identity).collect()
 }
 
 /// One serialized commit section over a [`MountedMutationTarget`].
@@ -871,19 +984,96 @@ impl MountedMutationCommit<'_> {
         staged: &Path,
         expected_staged_identity: Option<&ObjectIdentity>,
     ) -> io::Result<()> {
+        self.commit_replacement_checked(staged, expected_staged_identity, None, None)
+    }
+
+    /// Confirm and commit with an additional content-revision gate and the
+    /// selection's complete location evidence.
+    ///
+    /// The retained object's identity alone cannot detect an external writer
+    /// that edits the admitted file in place: the leaf still names the admitted
+    /// object, but its bytes changed. When `expected_revision` is supplied, the
+    /// retained handle's exact length and modification time must still match it
+    /// immediately before anything is displaced. A local-library write supplies
+    /// the revision captured at selection time; authority flows that never
+    /// captured one pass `None` and keep their prior contract.
+    ///
+    /// The same holds for the selection's location. On unix the retained
+    /// binding proves the immediate parent object only, so an ancestor above
+    /// it can be replaced inside the save window — with the unchanged deeper
+    /// chain moved back beneath the replacement — while every retained
+    /// identity, the leaf, and the revision still match. When `selection` is
+    /// supplied, the complete capture-time ancestor chain is re-proven here,
+    /// inside the commit lock and before anything is displaced, so the
+    /// replacement is refused and the selection is preserved untouched.
+    pub(crate) fn commit_replacement_checked(
+        &mut self,
+        staged: &Path,
+        expected_staged_identity: Option<&ObjectIdentity>,
+        expected_revision: Option<&ContentRevision>,
+        selection: Option<&SelectionLocationEvidence>,
+    ) -> io::Result<()> {
         #[cfg(unix)]
         let key = self.leaf_commit_key()?;
         #[cfg(not(unix))]
         let key = self.leaf_commit_key();
         with_leaf_commit_lock(key, || {
             self.confirm_replacement_target()?;
+            if let Some(selection) = selection {
+                self.confirm_selection_location(selection)?;
+            }
             #[cfg(test)]
             run_post_confirm_interpose(self);
+            if let Some(expected) = expected_revision {
+                self.confirm_content_revision(expected)?;
+            }
             let installed = self.replace_confirmed_staging(staged, expected_staged_identity)?;
             #[cfg(test)]
             run_pre_reanchor_interpose(self);
             self.reanchor_target_to_installed(installed)
         })
+    }
+
+    /// Prove the selection-time location evidence is still intact.
+    ///
+    /// The retained binding proves the containing directory object; the chain
+    /// above it is re-resolved through the exact pathname the selection still
+    /// lives under and compared against the capture-time identities. A chain
+    /// that no longer resolves to them — an ancestor replaced, renamed away,
+    /// or retargeted after the save started — refuses the commit before
+    /// anything is displaced. The proof is fail-closed: an ancestor that
+    /// cannot be re-identified at all is treated as changed.
+    fn confirm_selection_location(&self, selection: &SelectionLocationEvidence) -> io::Result<()> {
+        if self.target.authority.root_identity() != selection.parent_identity {
+            return Err(authority_changed(
+                "the selection's containing directory changed before the commit",
+            ));
+        }
+        let current =
+            resolve_ancestor_chain(self.target.path.parent().unwrap_or_else(|| Path::new("")))?;
+        if current != selection.ancestor_identities {
+            return Err(authority_changed(
+                "the selection's ancestor directory chain changed before the commit",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Prove the retained source object's content revision is unchanged.
+    ///
+    /// The revision is read from the retained handle — the exact object the
+    /// confirm step just proved the leaf still names — so a competing in-place
+    /// edit that keeps the identity but changes the bytes fails the commit
+    /// before anything is displaced, preserving the competing edit.
+    fn confirm_content_revision(&self, expected: &ContentRevision) -> io::Result<()> {
+        let current = ContentRevision::capture(&self.file.object.file)?;
+        if current == *expected {
+            Ok(())
+        } else {
+            Err(authority_changed(
+                "the retained mutation target changed content before the commit",
+            ))
+        }
     }
 
     /// Re-anchor the target's retained binding to the installed replacement.
@@ -2233,6 +2423,38 @@ pub(crate) fn object_identity(_file: &File) -> io::Result<ObjectIdentity> {
     Err(unsupported_platform())
 }
 
+/// Identify the directory currently named by `path`.
+///
+/// This is the selection-evidence twin of the mounted authority's ancestor
+/// treatment. On unix the whole pathname is resolved: the authority itself
+/// tolerates intermediate symlink components (notably `/var` on macOS), so an
+/// ancestor is compared by its resolved object identity and a symlink whose
+/// target is unchanged still matches. On Windows the final component is
+/// opened no-follow and any reparse point is refused, exactly as the mounted
+/// authority's per-ancestor prefix walk treats each ancestor. A capture-time
+/// and save-time comparison of these identities therefore proves the complete
+/// location of a selection, not just its immediate containing directory.
+pub fn directory_identity(path: &Path) -> io::Result<ObjectIdentity> {
+    #[cfg(unix)]
+    {
+        // A plain open resolves every component, including the final one.
+        // Directory reads are never attempted; only the identity is
+        // consulted.
+        let file = File::open(path)?;
+        object_identity(&file)
+    }
+    #[cfg(windows)]
+    {
+        let opened = open_windows_directory(path, true, false)?;
+        object_identity(&opened.target)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(unsupported_platform())
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn boundary_identity(file: &File) -> io::Result<BoundaryIdentity> {
     root_mount_generation(file)?
@@ -2551,11 +2773,33 @@ fn open_windows_regular(
         } else {
             0
         };
-    let file = OpenOptions::new()
+    let file = match OpenOptions::new()
         .read(true)
         .share_mode(share_mode)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
+        .open(path)
+    {
+        Ok(file) => file,
+        // CreateFile cannot open a directory without FILE_FLAG_BACKUP_SEMANTICS,
+        // so a directory (or reparse) leaf fails this open with ACCESS_DENIED
+        // before the regular-file checks below can classify it. Probe the
+        // no-follow metadata and route that leaf to the same
+        // not-a-regular-file error the checks produce, so a non-regular
+        // selection keeps its own capability category on both platforms; a
+        // genuine access denial on a real file stays PermissionDenied.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata)
+                    if metadata.is_dir()
+                        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 =>
+                {
+                    return Err(invalid_marker("bound descendant is not a regular file"));
+                }
+                _ => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    };
     let metadata = file.metadata()?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(invalid_marker(
