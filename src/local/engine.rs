@@ -1530,20 +1530,34 @@ impl ScanDiscoveryHold {
     }
 }
 
-/// Shared flag the initial-scan driver reads before servicing library
-/// commands: it is held whenever the scan has a SQLite write transaction open
-/// across an await point (per-root status persist, track upsert, stale-row
-/// delete, and their retained-authority probes).
+/// Shared flags between the initial-scan driver and its command selector.
 ///
-/// The scan and the command selector share one engine task, so the flag can
-/// only change while the selector is polling the scan. While it is set, the
-/// selector's `select!` disables the command branch entirely and keeps
-/// polling the scan until the transaction settles. Servicing a library
-/// command meanwhile would queue its write behind the open transaction and
-/// fail at the production five-second busy timeout (PR #286 finding jq5lG).
+/// `open` is held whenever the scan has a SQLite write transaction open across
+/// an await point (per-root status persist, track upsert, stale-row delete,
+/// and their retained-authority probes). While it is set, the selector's
+/// `select!` disables the command branch entirely and keeps polling the scan
+/// until the transaction settles: servicing a library command meanwhile would
+/// queue its write behind the open transaction and fail at the production
+/// five-second busy timeout (PR #286 finding jq5lG).
+///
+/// `command_in_flight` is the reciprocal invariant (PR #286 round-3 finding
+/// cid 4051684281): it is held while *dispatched* command work is still
+/// settling inside the selector's interleave. The scan's write boundaries
+/// consult it just before opening a write transaction and park THERE — still
+/// polled, never holding a connection — until the work settles. Without it,
+/// the scan could cross a write boundary after a command was dispatched, park
+/// across a retained-authority probe, and hold the writer while the command's
+/// own DB write queued at the same five-second busy timeout.
+///
+/// The scan and the command selector share one engine task, so both flags can
+/// only change while the selector is polling the scan.
 #[derive(Clone, Default)]
 struct ScanWriteTxnGate {
     open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    command_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes scan write boundaries parked on `command_in_flight` when the
+    /// in-flight work settles.
+    work_settled: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl ScanWriteTxnGate {
@@ -1574,6 +1588,74 @@ impl Drop for ScanWriteTxnGuard<'_> {
             .open
             .store(false, std::sync::atomic::Ordering::Release);
     }
+}
+
+/// RAII arm of the command-in-flight invariant for one dispatched command.
+///
+/// Armed by the selector around the inner `work`/`scan` interleave and held
+/// until that work settles — including when the interleave is abandoned
+/// because the scan itself settled first. Clearing the flag also wakes every
+/// scan write boundary parked on it.
+struct CommandInFlightGuard<'a> {
+    gate: &'a ScanWriteTxnGate,
+}
+
+impl<'a> CommandInFlightGuard<'a> {
+    fn arm(gate: &'a ScanWriteTxnGate) -> Self {
+        gate.command_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+        Self { gate }
+    }
+}
+
+impl Drop for CommandInFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.gate
+            .command_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.gate.work_settled.notify_waiters();
+    }
+}
+
+/// Parks the scan AT a write boundary until dispatched command work settles.
+///
+/// Called immediately before a [`ScanWriteTxnGuard::open`] so the scan's
+/// write transaction can never overlap in-flight command work: the scan waits
+/// here — holding no connection, still polled by the selector's interleave —
+/// rather than parking inside the open transaction. The flag/waker pair is
+/// race-free for a waiter created inside this poll: the flag is re-read after
+/// the waker registration, and the guard stores the flag before notifying.
+async fn wait_for_command_settlement(gate: &ScanWriteTxnGate) {
+    if !gate
+        .command_in_flight
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return;
+    }
+    std::future::poll_fn(|cx| loop {
+        use std::future::Future as _;
+        if !gate
+            .command_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return std::task::Poll::Ready(());
+        }
+        let notified = gate.work_settled.notified();
+        tokio::pin!(notified);
+        if notified.as_mut().poll(cx).is_ready() {
+            // A settlement notification fired before this waiter registered;
+            // loop and re-read the flag.
+            continue;
+        }
+        if !gate
+            .command_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return std::task::Poll::Ready(());
+        }
+        return std::task::Poll::Pending;
+    })
+    .await;
 }
 
 /// Command receive that goes quiet while a scan write transaction is open.
@@ -3948,6 +4030,15 @@ async fn process_library_commands_without_watcher(
 /// a transaction is serviced immediately after it commits — never lost, never
 /// starved behind a stuck one.
 ///
+/// The invariant is reciprocal. A command dispatched while the scan is between
+/// write boundaries keeps its `command_in_flight` arm held for as long as its
+/// work settles, and every scan write boundary parks there — still polled,
+/// holding no connection — instead of opening a transaction the in-flight
+/// work's own writes would queue behind (PR #286 round-3 finding
+/// cid 4051684281). Command service and scan mutations therefore never hold
+/// competing SQLite write transactions in either direction, and the wait
+/// always resolves because dispatched command work is finite.
+///
 /// `Flush` is the reserved drain marker. By the time the loop receives it,
 /// every earlier admitted command has settled in FIFO order, so the loop waits
 /// for the (cancelled) scan to reach settlement before acknowledging. That
@@ -3998,8 +4089,18 @@ where
                 // command at the acquire timeout (observed as a 30s sqlx pool
                 // timeout in the jq5lG regression). Interleave both futures;
                 // if the scan settles first, the pool is idle and the
-                // remaining work finishes alone before the scan result is
+                // Remaining work finishes alone before the scan result is
                 // returned.
+                //
+                // Hold the reciprocal write-boundary invariant for the whole
+                // interleave (PR #286 round-3 finding cid 4051684281): while
+                // this work is still settling, the scan's write boundaries
+                // park instead of opening a transaction the work's own writes
+                // would queue behind. Declared before `work` so the guard
+                // outlives it and clears — waking any parked boundary — on
+                // every exit path, including the scan-settled-first
+                // abandonment below.
+                let _command_in_flight_guard = CommandInFlightGuard::arm(scan_write_txn);
                 let mut work = Box::pin(async {
                     if let Some(pending) = process_library_command(
                         db,
@@ -4456,6 +4557,10 @@ async fn initial_scan_with_control(
         // over the whole span so the command-service selector does not
         // dispatch a library command into the open transaction (jq5lG). The
         // RootStatus rendezvous is a test-only seam parked at this boundary.
+        // Reciprocal invariant: if a command was already dispatched, park
+        // here — outside the transaction — until its work settles instead of
+        // making its own writes queue behind this transaction (cid 4051684281).
+        wait_for_command_settlement(scan_write_txn).await;
         let _scan_write_txn = ScanWriteTxnGuard::open(scan_write_txn);
         discovery.arrive(ScanDiscoveryStage::RootStatus).await;
         match persist_root_scan_status(
@@ -4695,7 +4800,10 @@ async fn initial_scan_with_control(
                     // the commit guard probes the retained authority handle, so
                     // the write-transaction gate spans the whole call: the
                     // command-service selector defers library commands until the
-                    // transaction commits or rolls back (jq5lG).
+                    // transaction commits or rolls back (jq5lG). Reciprocally,
+                    // park here while a dispatched command's work is still in
+                    // flight (cid 4051684281).
+                    wait_for_command_settlement(scan_write_txn).await;
                     let _scan_write_txn = ScanWriteTxnGuard::open(scan_write_txn);
                     match upsert_track_with_commit_guard(db, &parsed, existing, || async {
                         // Deterministic test rendezvous: suspend INSIDE the open
@@ -4944,6 +5052,9 @@ async fn initial_scan_with_control(
             // The delete keeps its SQLite write transaction open while the
             // commit guard revalidates the absence proof and the root lease, so
             // the write-transaction gate spans the whole call (jq5lG).
+            // Reciprocally, park here while a dispatched command's work is
+            // still in flight (cid 4051684281).
+            wait_for_command_settlement(scan_write_txn).await;
             let _scan_write_txn = ScanWriteTxnGuard::open(scan_write_txn);
             match delete_track_with_commit_guard(db, &row.id, || async {
                 let guard_absence = absence.clone();
@@ -11084,6 +11195,234 @@ mod tests {
             rated.rating,
             Some(80),
             "the command deferred behind the scan write transaction must still commit"
+        );
+    }
+
+    /// Round-3 regression: a command deferred behind an open scan write
+    /// transaction must settle PROMPTLY once that transaction commits — its
+    /// write runs against an idle database, far below the production
+    /// five-second busy timeout. Fail-closed: if the reciprocal gate ever
+    /// regresses to dispatching into the open transaction, the write stalls
+    /// at the busy timeout (or errors) and this assertion fires.
+    #[tokio::test]
+    async fn command_deferred_behind_open_scan_txn_settles_far_below_busy_timeout() {
+        let db = rename_test_database().await;
+        let rating_path = std::env::temp_dir().join("tributary-txn-settle-rating.flac");
+        insert_rename_test_track(
+            &db,
+            "txn-settle-rating-track",
+            rating_path.to_string_lossy().as_ref(),
+            "Settle",
+            0,
+        )
+        .await;
+        let directory = TestDirectory::new("scan-txn-settle");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join("present.wav"));
+
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let cancellation = CancellationToken::new();
+        let (hold, control) = ScanDiscoveryHold::controlling();
+        let scan_write_txn = ScanWriteTxnGate::default();
+        let mut completed = HashMap::new();
+
+        let engine = service_commands_while_scanning(
+            initial_scan_shutdown_aware(
+                &db,
+                &music_dirs,
+                &event_tx,
+                &refresh,
+                &cancellation,
+                &hold,
+                &scan_write_txn,
+            ),
+            &scan_write_txn,
+            &db,
+            &music_dirs,
+            &event_tx,
+            &command_rx,
+            &mut completed,
+            &refresh,
+        );
+        let driver = async {
+            control.release(ScanDiscoveryStage::Traversal);
+            control.release(ScanDiscoveryStage::RootStatus);
+            control.release(ScanDiscoveryStage::PostParse);
+            control
+                .wait_until_reached(ScanDiscoveryStage::CommitGuard)
+                .await;
+            command_tx
+                .send(LibraryCommand::SetTrackRating {
+                    track_id: TrackId::new("txn-settle-rating-track").expect("valid track ID"),
+                    rating: Some(Rating::new(80).expect("valid rating")),
+                })
+                .await
+                .expect("admit the rating command");
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            while let Ok(event) = event_rx.try_recv() {
+                assert!(
+                    !matches!(event, LibraryEvent::TrackRatingUpdated(_)),
+                    "a command must not be serviced while a scan write transaction is open"
+                );
+            }
+            let started = std::time::Instant::now();
+            control.release(ScanDiscoveryStage::CommitGuard);
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(30), event_rx.recv())
+                    .await
+                    .expect("the deferred rating must be serviced after the transaction settles")
+                    .expect("event channel stays open");
+                if matches!(event, LibraryEvent::TrackRatingUpdated(_)) {
+                    break;
+                }
+            }
+            let settle_elapsed = started.elapsed();
+            assert!(
+                settle_elapsed < Duration::from_secs(4),
+                "the deferred command settled in {settle_elapsed:?}; it must run against an \
+                 idle database well below the five-second busy timeout"
+            );
+        };
+
+        let (scan_result, ()) = tokio::join!(engine, async {
+            tokio::time::timeout(Duration::from_secs(60), driver)
+                .await
+                .expect("the settle-promptness driver must finish");
+        });
+        scan_result.expect("scan completes after the write-transaction hold is released");
+        drop(command_tx);
+        let _ = event_rx.try_recv();
+
+        let rated = track::Entity::find_by_id("txn-settle-rating-track")
+            .one(&db)
+            .await
+            .expect("query rated track")
+            .expect("rated track exists");
+        assert_eq!(
+            rated.rating,
+            Some(80),
+            "the deferred command must still commit promptly"
+        );
+    }
+
+    /// Round-3 reciprocal regression (cid 4051684281): dispatched command work
+    /// that is still in flight must hold the scan AT its write boundaries —
+    /// the scan may not open a write transaction the work's own writes would
+    /// queue behind. Ordering proof: the rating is dispatched while the scan
+    /// is parked at the post-parse rendezvous, and by the time the scan
+    /// reaches the in-transaction CommitGuard rendezvous the rating has
+    /// already settled, because every boundary crossing requires the in-flight
+    /// flag to be clear.
+    #[tokio::test]
+    async fn scan_write_boundary_defers_while_dispatched_command_work_is_in_flight() {
+        let db = rename_test_database().await;
+        let rating_path = std::env::temp_dir().join("tributary-inflight-rating.flac");
+        insert_rename_test_track(
+            &db,
+            "inflight-rating-track",
+            rating_path.to_string_lossy().as_ref(),
+            "InFlight",
+            0,
+        )
+        .await;
+        let directory = TestDirectory::new("scan-boundary-inflight");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join("present.wav"));
+
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let cancellation = CancellationToken::new();
+        let (hold, control) = ScanDiscoveryHold::controlling();
+        let scan_write_txn = ScanWriteTxnGate::default();
+        let mut completed = HashMap::new();
+
+        let engine = service_commands_while_scanning(
+            initial_scan_shutdown_aware(
+                &db,
+                &music_dirs,
+                &event_tx,
+                &refresh,
+                &cancellation,
+                &hold,
+                &scan_write_txn,
+            ),
+            &scan_write_txn,
+            &db,
+            &music_dirs,
+            &event_tx,
+            &command_rx,
+            &mut completed,
+            &refresh,
+        );
+        let driver = async {
+            // Hold the scan at the per-file post-parse rendezvous — still
+            // OUTSIDE every write transaction.
+            control.release(ScanDiscoveryStage::Traversal);
+            control.release(ScanDiscoveryStage::RootStatus);
+            control
+                .wait_until_reached(ScanDiscoveryStage::PostParse)
+                .await;
+            // Dispatch the rating while the scan is parked before its
+            // boundaries. The yields guarantee the command was received and
+            // its work armed, not that the work has settled.
+            command_tx
+                .send(LibraryCommand::SetTrackRating {
+                    track_id: TrackId::new("inflight-rating-track").expect("valid track ID"),
+                    rating: Some(Rating::new(80).expect("valid rating")),
+                })
+                .await
+                .expect("admit the rating command");
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            // Now let the scan approach its write boundaries. With the
+            // reciprocal gate it parks there until the rating settles; with a
+            // regression it opens the transaction immediately and reaches the
+            // CommitGuard rendezvous first.
+            control.release(ScanDiscoveryStage::PostParse);
+            control
+                .wait_until_reached(ScanDiscoveryStage::CommitGuard)
+                .await;
+            let mut settled = false;
+            while let Ok(event) = event_rx.try_recv() {
+                if matches!(event, LibraryEvent::TrackRatingUpdated(_)) {
+                    settled = true;
+                    break;
+                }
+            }
+            assert!(
+                settled,
+                "the scan reached its in-transaction commit guard while dispatched command \
+                 work was still in flight — the write-boundary wait regressed"
+            );
+            control.release(ScanDiscoveryStage::CommitGuard);
+        };
+
+        let (scan_result, ()) = tokio::join!(engine, async {
+            tokio::time::timeout(Duration::from_secs(60), driver)
+                .await
+                .expect("the in-flight boundary driver must settle");
+        });
+        scan_result.expect("scan completes after the boundary hold is released");
+        drop(command_tx);
+        let _ = event_rx.try_recv();
+
+        let rated = track::Entity::find_by_id("inflight-rating-track")
+            .one(&db)
+            .await
+            .expect("query rated track")
+            .expect("rated track exists");
+        assert_eq!(
+            rated.rating,
+            Some(80),
+            "the command serviced before the scan's write boundary must still commit"
         );
     }
 

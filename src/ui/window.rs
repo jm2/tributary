@@ -18,8 +18,7 @@ use crate::audio::output::AudioOutput;
 use crate::audio::{PlayerEvent, PlayerEventGeneration, PlayerState};
 use crate::desktop_integration::MediaAction;
 use crate::local::engine::{
-    LibraryCommand, LibraryEngine, LibraryEvent, RootReauthorizationOutcome,
-    RootReauthorizationRequest,
+    LibraryEngine, LibraryEvent, RootReauthorizationOutcome, RootReauthorizationRequest,
 };
 use crate::local::playlist_sidebar::{
     PlaylistSidebarEntry, PlaylistSidebarRevision, PlaylistSidebarSnapshot, PlaylistSidebarState,
@@ -36,10 +35,10 @@ use super::persistence::{
     restore_sort_state, save_repeat_mode, save_shuffle, save_sort_state, save_window_geometry,
 };
 use super::playback::{
-    advance_track, advance_track_from_user, format_ms, play_or_start, play_track_at,
-    previous_or_restart_from_user, refresh_projected_library_uris, replay_current, stop_playback,
-    toggle_or_start, BufferingTracker, PlaybackContext, PlaybackSession, QueueTrackRefresh,
-    PLAYLIST_SOURCE_PREFIX,
+    admit_history_credit, advance_track, advance_track_from_user, format_ms, play_or_start,
+    play_track_at, previous_or_restart_from_user, refresh_projected_library_uris, replay_current,
+    stop_playback, toggle_or_start, BufferingTracker, PlaybackContext, PlaybackSession,
+    QueueTrackRefresh, PLAYLIST_SOURCE_PREFIX,
 };
 use super::preferences;
 use super::root_trust;
@@ -3148,26 +3147,24 @@ pub(crate) fn build_window(
                 }
 
                 // Account before EOS repeat/advance or error recovery mutates
-                // the occurrence. The session latches exactly once and the
-                // unbounded FIFO accepts synchronously, so no detached send
-                // task can outlive the normal-shutdown drain marker.
-                let history_track_id = observe_player_event_before_history(
+                // the occurrence. The session returns a qualified credit
+                // candidate; the one-shot latch commits only when the bounded
+                // FIFO admits the durable command. An overload retains the
+                // credit inside the session so the next qualifying sample
+                // re-earns it; an explicit shutdown close drops it quietly
+                // because the FIFO has already been drained.
+                let history_credit = observe_player_event_before_history(
                     || {
                         let _ = playback_lastfm.observe_event(&event);
                     },
                     || playback_session.borrow_mut().observe_history_event(&event),
                 );
-                if let Some(track_id) = history_track_id {
-                    let counted_at_ms = Utc::now().timestamp_millis();
-                    let admission_outcome =
-                        playback_history_commands.try_send(LibraryCommand::RecordPlaybackHistory {
-                            track_id,
-                            counted_at_ms,
-                        });
-                    if !admission_outcome.is_accepted() {
-                        warn!(?admission_outcome, "Playback history command was not admitted");
-                    }
-                }
+                admit_history_credit(
+                    &playback_history_commands,
+                    &playback_session,
+                    history_credit,
+                    Utc::now().timestamp_millis(),
+                );
                 match event {
                     PlayerEvent::StateChanged { state, .. } => {
                         match state {

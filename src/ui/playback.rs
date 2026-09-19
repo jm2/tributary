@@ -25,6 +25,7 @@ use crate::lastfm::playback_owner::{
     LastFmAcceptedOutputFreshness, LastFmAcceptedOutputLoad, LastFmAcceptedPlayback,
     LastFmOutputIntent, LastFmPlaybackOccurrenceIdentity, LastFmPlaybackSource,
 };
+use crate::local::engine::LibraryCommand;
 use crate::local::playback_history::PlaybackHistoryProgress;
 use crate::source_registry::{
     PlaybackAttributionProfile, PlaybackSourceReference, RegularPlaylistCatalogueGuard,
@@ -34,6 +35,7 @@ use crate::ui::header_bar::RepeatMode;
 use crate::ui::objects::{PlaylistOccurrenceState, TrackObject};
 
 use super::album_art;
+use super::library_commands::{CommandAdmissionOutcome, LibraryCommandAdmission};
 
 /// The source key of the local library.
 pub const LOCAL_SOURCE_KEY: &str = "local";
@@ -717,6 +719,69 @@ impl PlaybackHistoryOccurrence {
     }
 }
 
+/// A qualified durable-play credit candidate produced by
+/// [`PlaybackSession::observe_history_event`].
+///
+/// Observing the qualifying event already consumes the occurrence's one-shot
+/// progress latch, but the durable command is what commits the play — so the
+/// candidate carries a pre-observation snapshot of the occurrence. If the
+/// bounded command FIFO refuses admission, the snapshot un-consumes the latch
+/// (see [`PlaybackSession::retain_history_credit`]) and the next qualifying
+/// sample re-earns the play instead of the event being lost forever.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingHistoryCredit {
+    track_id: TrackId,
+    occurrence_snapshot: PlaybackHistoryOccurrence,
+}
+
+impl PendingHistoryCredit {
+    pub fn track_id(&self) -> &TrackId {
+        &self.track_id
+    }
+}
+
+/// Admit one qualified playback-history credit through the bounded command
+/// FIFO.
+///
+/// Shared production sequence for the GTK player-event loop, factored out so
+/// the overload contract is first-hand testable without a GTK main loop:
+/// [`CommandAdmissionOutcome::Accepted`] commits the durable command;
+/// [`CommandAdmissionOutcome::Overloaded`] retains the credit inside the
+/// session so a later qualifying sample re-earns it; the explicit shutdown
+/// [`CommandAdmissionOutcome::Closed`] drops the credit quietly because
+/// normal shutdown has already closed and drained the FIFO — the pending
+/// command would never be serviced, so a shutdown drop is not an overload
+/// drop and must not be surfaced as one.
+pub(super) fn admit_history_credit(
+    admission: &LibraryCommandAdmission,
+    session: &RefCell<PlaybackSession>,
+    credit: Option<PendingHistoryCredit>,
+    counted_at_ms: i64,
+) {
+    let Some(credit) = credit else {
+        return;
+    };
+    let track_id = credit.track_id().clone();
+    let outcome = admission.try_send(LibraryCommand::RecordPlaybackHistory {
+        track_id,
+        counted_at_ms,
+    });
+    match outcome {
+        CommandAdmissionOutcome::Accepted => {}
+        CommandAdmissionOutcome::Overloaded => {
+            session.borrow_mut().retain_history_credit(credit);
+            warn!(
+                ?outcome,
+                "Playback history command was not admitted; the credit was retained so a \
+                 later qualifying sample can re-earn it"
+            );
+        }
+        CommandAdmissionOutcome::Closed => {
+            // Explicit quiet drop at shutdown; see the fn documentation.
+        }
+    }
+}
+
 /// Maximum number of real queue occurrences retained before the current one.
 const SHUFFLE_PRIOR_LIMIT: usize = 10;
 const SHUFFLE_TIMELINE_CAPACITY: usize = SHUFFLE_PRIOR_LIMIT + 1;
@@ -976,9 +1041,16 @@ impl PlaybackSession {
     /// state and delivery generation are independent: pause, buffering,
     /// retry, and resume re-anchor the next position without replacing the
     /// occurrence, while stale and rejected deliveries cannot contribute.
-    /// The exact stable local [`TrackId`] is returned once, at the point the
-    /// occurrence first qualifies for persistence.
-    pub(crate) fn observe_history_event(&mut self, event: &PlayerEvent) -> Option<TrackId> {
+    /// A [`PendingHistoryCredit`] candidate is returned once, at the point
+    /// the occurrence first qualifies for persistence. The observation has
+    /// already consumed the one-shot progress latch; only admitting the
+    /// durable command commits the credit, and a refused admission restores
+    /// the snapshot via [`Self::retain_history_credit`] so the next
+    /// qualifying sample re-earns the play.
+    pub(crate) fn observe_history_event(
+        &mut self,
+        event: &PlayerEvent,
+    ) -> Option<PendingHistoryCredit> {
         let generation = event.generation();
         if !self.accepts_event_generation(generation) {
             return None;
@@ -1000,6 +1072,10 @@ impl PlaybackSession {
         {
             return None;
         }
+        // Snapshot BEFORE the match below advances the occurrence: if
+        // admission later refuses the durable command, the snapshot
+        // un-consumes the one-shot latch so the credit is not lost.
+        let occurrence_snapshot = occurrence.clone();
 
         let counted = match event {
             PlayerEvent::StateChanged { state, .. } => {
@@ -1062,7 +1138,30 @@ impl PlaybackSession {
             }
         };
 
-        counted.then_some(current_track_id)
+        counted.then_some(PendingHistoryCredit {
+            track_id: current_track_id,
+            occurrence_snapshot,
+        })
+    }
+
+    /// Restore a credit candidate whose durable command was not admitted.
+    ///
+    /// The pre-observation snapshot replaces the live occurrence accounting
+    /// only while the queue still carries the same local track and accepted
+    /// generation; a queue transition in between invalidates the candidate
+    /// and the snapshot is dropped. Restoring also un-consumes the one-shot
+    /// progress latch (it is part of the snapshot), so the next qualifying
+    /// position sample re-earns the credit.
+    pub(crate) fn retain_history_credit(&mut self, credit: PendingHistoryCredit) {
+        let Some(occurrence) = self.history_occurrence.as_mut() else {
+            return;
+        };
+        if occurrence.track_id != credit.track_id
+            || occurrence.accepted_generation != credit.occurrence_snapshot.accepted_generation
+        {
+            return;
+        }
+        *occurrence = credit.occurrence_snapshot;
     }
 
     /// Re-anchor one accepted local occurrence around an explicit user seek.
@@ -2813,6 +2912,8 @@ mod tests {
     use std::cell::Cell;
     use std::collections::HashSet;
 
+    use crate::ui::library_commands::COMMAND_FIFO_CAPACITY;
+
     use super::*;
 
     #[derive(Debug, Default)]
@@ -3106,7 +3207,9 @@ mod tests {
         position_ms: u64,
         duration_ms: u64,
     ) -> Option<TrackId> {
-        session.observe_history_event(&PlayerEvent::position(generation, position_ms, duration_ms))
+        session
+            .observe_history_event(&PlayerEvent::position(generation, position_ms, duration_ms))
+            .map(|credit| credit.track_id().clone())
     }
 
     fn protected_item(source: &str, id: &str) -> QueueItem {
@@ -5914,6 +6017,126 @@ mod tests {
         );
     }
 
+    /// Round-3 regression: the one-shot history latch must not be consumed by
+    /// an event the bounded command FIFO refuses. A qualifying position
+    /// sample that arrives during overload retains its credit — a later
+    /// qualifying sample re-earns it, and once the FIFO drains the durable
+    /// command lands. Under the previous latch-on-observe behavior the play
+    /// was lost forever the moment the FIFO was full.
+    #[test]
+    fn history_credit_survives_fifo_overload_and_lands_after_drain() {
+        let (admission, receiver) = LibraryCommandAdmission::channel();
+        let session = RefCell::new({
+            let mut session = PlaybackSession::default();
+            assert!(
+                session.replace_queue(vec![history_item("local", "overload", Some(20_000))], 0,)
+            );
+            session
+        });
+        let generation = accept_history_load(&mut session.borrow_mut());
+        observe_playing(&mut session.borrow_mut(), generation);
+
+        // Saturate every ordinary slot; one stays reserved for Flush.
+        for ordinal in 0..(COMMAND_FIFO_CAPACITY - 1) {
+            let command = LibraryCommand::SetTrackRating {
+                track_id: TrackId::new(format!("filler-{ordinal}")).expect("valid track ID"),
+                rating: None,
+            };
+            assert_eq!(
+                admission.try_send(command),
+                CommandAdmissionOutcome::Accepted
+            );
+        }
+
+        // The first qualifying sample is refused by the saturated FIFO. With
+        // a 20s track the count threshold is 10s of cumulative advance, so
+        // the anchor at 0 does not qualify while the jump to 10_001 does.
+        assert_eq!(
+            observe_position(&mut session.borrow_mut(), generation, 0, 20_000),
+            None
+        );
+        let credit = session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::position(generation, 10_001, 20_000))
+            .expect("the sample must qualify for a durable credit");
+        admit_history_credit(&admission, &session, Some(credit), 1_000);
+
+        // Nothing durable landed, and the retained latch is unconsumed.
+        let mut landed_history = 0;
+        while let Ok(command) = receiver.try_recv() {
+            if matches!(command, LibraryCommand::RecordPlaybackHistory { .. }) {
+                landed_history += 1;
+            }
+        }
+        assert_eq!(
+            landed_history, 0,
+            "an overloaded FIFO must not admit a history command"
+        );
+
+        // A later qualifying sample re-earns the retained credit.
+        let retried = session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::position(generation, 11_000, 20_000))
+            .expect("the retained credit must re-earn on the next qualifying sample");
+        while receiver.try_recv().is_ok() {}
+        admit_history_credit(&admission, &session, Some(retried), 2_000);
+        match receiver
+            .try_recv()
+            .expect("the durable command must land after drain")
+        {
+            LibraryCommand::RecordPlaybackHistory {
+                track_id,
+                counted_at_ms,
+            } => {
+                assert_eq!(track_id.as_str(), "overload");
+                assert_eq!(counted_at_ms, 2_000);
+            }
+            LibraryCommand::Flush { .. } => {
+                panic!("the reserved shutdown slot must not be consumed by a retry")
+            }
+            LibraryCommand::ConfirmRootTrust(_)
+            | LibraryCommand::SetTrackRating { .. }
+            | LibraryCommand::ApplyRhythmboxMigration(_) => {
+                panic!("expected a history command after drain")
+            }
+        }
+
+        // Shutdown boundary: an explicitly closed admission drops the credit
+        // quietly — normal shutdown drained the FIFO, so the pending command
+        // would never be serviced. A fresh occurrence provides the candidate.
+        let (completion_tx, _completion_rx) = async_channel::bounded(1);
+        assert!(admission.close_and_flush(completion_tx));
+        let closed_session = RefCell::new({
+            let mut session = PlaybackSession::default();
+            assert!(session.replace_queue(vec![history_item("local", "closed", Some(20_000))], 0));
+            session
+        });
+        let closed_generation = accept_history_load(&mut closed_session.borrow_mut());
+        observe_playing(&mut closed_session.borrow_mut(), closed_generation);
+        assert_eq!(
+            observe_position(
+                &mut closed_session.borrow_mut(),
+                closed_generation,
+                0,
+                20_000
+            ),
+            None
+        );
+        let post_close = closed_session
+            .borrow_mut()
+            .observe_history_event(&PlayerEvent::position(closed_generation, 10_001, 20_000))
+            .expect("qualification is independent of the admission boundary");
+        admit_history_credit(&admission, &closed_session, Some(post_close), 3_000);
+        match receiver.try_recv().expect("only the drain marker remains") {
+            LibraryCommand::Flush { .. } => {}
+            other => panic!("expected only the drain marker after close, got {other:?}"),
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "no durable command may land after close"
+        );
+    }
+
     #[test]
     fn pause_buffer_and_missing_playing_state_reanchor_without_jump_credit() {
         let mut session = PlaybackSession::default();
@@ -6057,7 +6280,7 @@ mod tests {
             restarted
                 .observe_history_event(&PlayerEvent::ended(generation))
                 .as_ref()
-                .map(TrackId::as_str),
+                .map(|credit| credit.track_id().as_str()),
             Some("restarted"),
             "a backward Previous restart is not skip evidence"
         );
@@ -6224,7 +6447,7 @@ mod tests {
             unknown
                 .observe_history_event(&PlayerEvent::ended(unknown_generation))
                 .as_ref()
-                .map(TrackId::as_str),
+                .map(|credit| credit.track_id().as_str()),
             Some("unknown-eos")
         );
         assert_eq!(
