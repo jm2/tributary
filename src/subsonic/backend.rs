@@ -1889,6 +1889,13 @@ mod tests {
     }
 
     fn search_eviction_routes() -> Vec<MockRoute> {
+        let mut routes = search_eviction_catalogue_routes();
+        routes.push(search_eviction_catalogue_album_route());
+        routes.extend(search_eviction_fresh_routes());
+        routes
+    }
+
+    fn search_eviction_catalogue_routes() -> Vec<MockRoute> {
         vec![
             MockRoute::get("/rest/ping.view").reply(MockResponse::json(
                 serde_json::json!({"subsonic-response": {"status": "ok"}}),
@@ -1913,72 +1920,62 @@ mod tests {
                         }
                     }
                 }))),
-            MockRoute::get("/rest/getAlbum.view")
-                .with_query("id", "eviction-album")
-                .reply(MockResponse::json(serde_json::json!({
-                    "subsonic-response": {
-                        "status": "ok",
-                        "album": {
-                            "id": "eviction-album",
-                            "name": "Catalogue Album",
-                            "song": [{
-                                "id": "catalogue-song",
-                                "title": "Catalogue Song",
-                                "artist": "Eviction Artist",
-                                "album": "Catalogue Album",
-                                "track": 1,
-                                "duration": 100
-                            }]
-                        }
+        ]
+    }
+
+    fn search_eviction_catalogue_album_route() -> MockRoute {
+        MockRoute::get("/rest/getAlbum.view")
+            .with_query("id", "eviction-album")
+            .reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "album": {
+                        "id": "eviction-album",
+                        "name": "Catalogue Album",
+                        "song": [{
+                            "id": "catalogue-song",
+                            "title": "Catalogue Song",
+                            "artist": "Eviction Artist",
+                            "album": "Catalogue Album",
+                            "track": 1,
+                            "duration": 100
+                        }]
                     }
-                }))),
+                }
+            })))
+    }
+
+    fn search_eviction_fresh_routes() -> Vec<MockRoute> {
+        vec![
             MockRoute::get("/rest/search3.view")
                 .with_query("query", "Fresh A")
                 .replies([
-                    MockResponse::json(serde_json::json!({
-                        "subsonic-response": {
-                            "status": "ok",
-                            "searchResult3": {"song": [{
-                                "id": "fresh-a",
-                                "title": "Fresh A",
-                                "artist": "Fresh Artist",
-                                "album": "Fresh Album",
-                                "track": 2,
-                                "duration": 120
-                            }]}
-                        }
-                    })),
                     // The repeat search below hits the same query again.
-                    MockResponse::json(serde_json::json!({
-                        "subsonic-response": {
-                            "status": "ok",
-                            "searchResult3": {"song": [{
-                                "id": "fresh-a",
-                                "title": "Fresh A",
-                                "artist": "Fresh Artist",
-                                "album": "Fresh Album",
-                                "track": 2,
-                                "duration": 120
-                            }]}
-                        }
-                    })),
+                    MockResponse::json(eviction_search_song("fresh-a", "Fresh A", 2, 120)),
+                    MockResponse::json(eviction_search_song("fresh-a", "Fresh A", 2, 120)),
                 ]),
             MockRoute::get("/rest/search3.view")
                 .with_query("query", "Fresh B")
-                .reply(MockResponse::json(serde_json::json!({
-                    "subsonic-response": {
-                        "status": "ok",
-                        "searchResult3": {"song": [{
-                            "id": "fresh-b",
-                            "title": "Fresh B",
-                            "artist": "Fresh Artist",
-                            "album": "Fresh Album",
-                            "track": 3,
-                            "duration": 130
-                        }]}
-                    }
-                }))),
+                .reply(MockResponse::json(eviction_search_song(
+                    "fresh-b", "Fresh B", 3, 130,
+                ))),
         ]
+    }
+
+    fn eviction_search_song(id: &str, title: &str, track: i64, duration: i64) -> serde_json::Value {
+        serde_json::json!({
+            "subsonic-response": {
+                "status": "ok",
+                "searchResult3": {"song": [{
+                    "id": id,
+                    "title": title,
+                    "artist": "Fresh Artist",
+                    "album": "Fresh Album",
+                    "track": track,
+                    "duration": duration
+                }]}
+            }
+        })
     }
 
     /// Pre-fill the bounded search-only store so a couple of real searches

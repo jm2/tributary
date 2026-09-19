@@ -1350,6 +1350,12 @@ mod tests {
     }
 
     fn search_eviction_routes() -> Vec<MockRoute> {
+        let mut routes = search_eviction_catalogue_routes();
+        routes.extend(search_eviction_fresh_routes());
+        routes
+    }
+
+    fn search_eviction_catalogue_routes() -> Vec<MockRoute> {
         vec![
             MockRoute::get("/System/Ping").reply(MockResponse::text("Jellyfin Server")),
             MockRoute::get("/Users/fixture-user/Views").reply(MockResponse::json(
@@ -1381,6 +1387,11 @@ mod tests {
                     "Items": [],
                     "TotalRecordCount": 0
                 }))),
+        ]
+    }
+
+    fn search_eviction_fresh_routes() -> Vec<MockRoute> {
+        vec![
             MockRoute::get("/Users/fixture-user/Items")
                 .with_query("SearchTerm", "Fresh A")
                 .with_query("IncludeItemTypes", "Audio,MusicAlbum,MusicArtist")
